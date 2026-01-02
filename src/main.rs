@@ -2,6 +2,7 @@ mod db;
 mod events;
 mod ingestor;
 mod nntp;
+mod patch;
 mod settings;
 
 use db::Database;
