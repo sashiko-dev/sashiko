@@ -11,7 +11,7 @@
 
 ## Phase 2: Git Ops & Patch Processing
 - [x] Implement Patch/Patchset parsing from raw emails.
-- [ ] Develop baseline detection logic (explicit and heuristic).
+- [x] Develop baseline detection logic (explicit and heuristic).
 - [ ] Set up sandboxed `git am` environment.
 - [ ] Implement Worktree Garbage Collector (pruning & disk limits).
 - [ ] Implement patchset assembly (handling multi-part messages).

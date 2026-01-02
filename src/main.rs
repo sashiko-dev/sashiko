@@ -1,3 +1,4 @@
+mod baseline;
 mod db;
 mod events;
 mod ingestor;
