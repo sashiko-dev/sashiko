@@ -34,8 +34,16 @@
             <!-- Rows will be inserted here -->
         </tbody>
     </table>
+    <div id="pagination" style="margin-top: 20px; text-align: center;">
+        <button id="prevBtn" onclick="changePage(-1)" disabled>Previous</button>
+        <span id="pageInfo" style="margin: 0 10px;">Page 1</span>
+        <button id="nextBtn" onclick="changePage(1)">Next</button>
+    </div>
 
     <script>
+        let currentPage = 1;
+        const perPage = 50;
+
         async function fetchStats() {
             const res = await fetch('/api/stats');
             const data = await res.json();
@@ -49,11 +57,30 @@
             });
         }
 
+        async function changePage(delta) {
+            const newPage = currentPage + delta;
+            if (newPage < 1) return;
+            currentPage = newPage;
+            await fetchPatchsets();
+        }
+
         async function fetchPatchsets() {
-            const res = await fetch('/api/patchsets');
+            const res = await fetch(`/api/patchsets?page=${currentPage}&per_page=${perPage}`);
             const data = await res.json();
             const tbody = document.querySelector('#patchsets tbody');
             tbody.innerHTML = '';
+            
+            if (data.length === 0 && currentPage > 1) {
+                // If current page is empty and we are not on page 1, go back (optional, or just show empty)
+                // For now, let's just show empty table but disable Next
+                document.getElementById('nextBtn').disabled = true;
+            } else {
+                document.getElementById('nextBtn').disabled = data.length < perPage;
+            }
+            
+            document.getElementById('prevBtn').disabled = currentPage <= 1;
+            document.getElementById('pageInfo').textContent = `Page ${currentPage}`;
+
             data.forEach(p => {
                 const row = document.createElement('tr');
                 const date = new Date(p.date * 1000).toISOString().split('T')[0];

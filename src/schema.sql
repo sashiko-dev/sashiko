@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS patchsets (
     status TEXT DEFAULT 'Pending' -- Pending, Assembled, Applied, Failed, Reviewed
 );
 
+CREATE INDEX IF NOT EXISTS idx_patchsets_date ON patchsets(date);
+
 CREATE TABLE IF NOT EXISTS patches (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER NOT NULL,
