@@ -104,8 +104,12 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
 
     // Detection logic
     let subject_lower = subject.to_lowercase();
-    let is_reply = subject_lower.trim().starts_with("re:");
-    let has_patch_tag = subject_lower.contains("patch") || subject_lower.contains("rfc");
+    let subject_clean = subject_lower.trim();
+    let is_reply = subject_clean.starts_with("re:")
+        || subject_clean.starts_with("fwd:")
+        || subject_clean.starts_with("forwarded:")
+        || subject_clean.starts_with("aw:"); // German 'Antwort'
+    let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
     let has_diff = !diff.is_empty();
 
     // A message is part of a series if it's a cover letter (index 0) or has multiple parts (total > 1)
@@ -291,5 +295,41 @@ mod tests {
         let (index, total) = parse_subject_index(subject);
         assert_eq!(index, 1);
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn test_missed_cover_letter_parsing() {
+        let subject = "[PATCH 6.18 000/430] 6.18.3-rc1 review";
+        let (index, total) = parse_subject_index(subject);
+        assert_eq!(index, 0);
+        assert_eq!(total, 430);
+
+        let raw = format!("Message-ID: <123>\r\nSubject: {}\r\n\r\nBody", subject);
+        let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+        assert!(meta.is_patch_or_cover, "Should be detected as patch/cover");
+    }
+
+    #[test]
+    fn test_forwarded_reply_is_not_patch() {
+        // "Forwarded: Re: ..." should be treated as reply/skip if it has no diff,
+        // or if it has diff but looks like a forwarded reply.
+        // If it has diff, it might be a forwarded patch.
+        // But if it starts with "Re:", it's usually a reply.
+        // "Forwarded: Re:" -> effectively a reply.
+        let subject = "Forwarded: Re: [syzbot] WARNING in cm109_urb_irq_callback";
+        let raw = format!(
+            "Message-ID: <456>\r\nSubject: {}\r\n\r\nDiff:\n--- a\n+++ b\n@@ -1 +1 @@",
+            subject
+        );
+        let (meta, _) = parse_email(raw.as_bytes()).unwrap();
+
+        // Current logic might think this is a patch because it has diff and doesn't start with "Re:" (starts with "Forwarded:")
+        // We want to ensure it is handled correctly (either as patch if it IS a patch, or ignored if it's just a reply).
+        // If it's "Forwarded: Re:", it's likely a discussion.
+        // Let's assert what we expect. I expect it NOT to be a patchset root.
+        assert!(
+            !meta.is_patch_or_cover,
+            "Forwarded Re: should not be a patchset"
+        );
     }
 }
