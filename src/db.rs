@@ -320,14 +320,15 @@ impl Database {
         diff: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)",
             libsql::params![patchset_id, message_id, part_index, diff]
         ).await?;
 
+        // Update received_parts based on actual patch count to be idempotent
         self.conn
             .execute(
-                "UPDATE patchsets SET received_parts = received_parts + 1 WHERE id = ?",
-                libsql::params![patchset_id],
+                "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
+                libsql::params![patchset_id, patchset_id],
             )
             .await?;
         Ok(())

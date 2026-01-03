@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
 CREATE TABLE IF NOT EXISTS patches (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER NOT NULL,
-    message_id TEXT NOT NULL,
+    message_id TEXT NOT NULL UNIQUE,
     part_index INTEGER,
     diff TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
