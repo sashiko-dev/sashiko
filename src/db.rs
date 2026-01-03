@@ -173,22 +173,54 @@ impl Database {
         cc: &str,
         baseline_id: Option<i64>,
     ) -> Result<i64> {
+        // Find candidate patchsets in this thread
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patchsets WHERE thread_id = ?",
+                "SELECT id, date, author FROM patchsets WHERE thread_id = ?",
                 libsql::params![thread_id],
             )
             .await?;
-        if let Ok(Some(row)) = rows.next().await {
+
+        let mut matched_id = None;
+
+        while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
+            let existing_date: i64 = row.get(1)?;
+            let existing_author: String = row.get(2)?;
+
+            // Matching logic:
+            // 1. Author must match (patches in a set are from same person)
+            // 2. Time must be close (within 15 mins / 900s)
+            if existing_author == author && (date - existing_date).abs() < 900 {
+                matched_id = Some(id);
+                break;
+            }
+        }
+
+        if let Some(id) = matched_id {
+            // Update existing patchset
+            // Note: We do NOT update 'date' to prevent the window from creeping. 
+            // We assume the existing date (from first received part) is the anchor.
+            // We update other fields that might be better defined now (e.g. subject from cover letter).
             self.conn.execute(
-                "UPDATE patchsets SET subject = ?, author = ?, date = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ?, baseline_id = ? WHERE id = ?",
-                libsql::params![subject, author, date, total_parts, parser_version, to, cc, baseline_id, id],
+                "UPDATE patchsets SET subject = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ?, baseline_id = ? WHERE id = ?",
+                libsql::params![subject, author, total_parts, parser_version, to, cc, baseline_id, id],
             ).await?;
+            
+            // If this message is explicitly a cover letter (has cover_letter_message_id and index 0 logic from caller passed here as cover_letter_message_id arg),
+            // we should update the cover_letter_message_id field.
+            if let Some(clid) = cover_letter_message_id {
+                 self.conn.execute(
+                    "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                    libsql::params![clid, id],
+                ).await?;
+            }
+
             return Ok(id);
         }
 
+        // No match found, create new patchset
         self.conn
             .execute(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, baseline_id) 
@@ -367,5 +399,56 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::DatabaseSettings;
+    use std::sync::Arc;
+
+    async fn setup_db() -> Arc<Database> {
+        let settings = DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn test_create_multiple_patchsets_in_thread() {
+        let db = setup_db().await;
+
+        // Create a thread
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        // 1. Create first patchset (Author A, Time 1000)
+        let ps1 = db.create_patchset(
+            thread_id, None, "Patchset 1", "Author A", 1000, 2, 1, "to", "cc", None
+        ).await.unwrap();
+
+        // 2. Add another patch to same patchset (Author A, Time 1005 - within 15 mins)
+        // Should return same ID
+        let ps1_update = db.create_patchset(
+            thread_id, None, "Patchset 1", "Author A", 1005, 2, 1, "to", "cc", None
+        ).await.unwrap();
+        assert_eq!(ps1, ps1_update, "Should match existing patchset based on author and time");
+
+        // 3. Create NEW patchset in same thread (Author A, Time 2000 - > 15 mins later)
+        // Should create new ID
+        let ps2 = db.create_patchset(
+            thread_id, None, "Patchset 2", "Author A", 2000, 2, 1, "to", "cc", None
+        ).await.unwrap();
+        assert_ne!(ps1, ps2, "Should create new patchset for later time");
+
+        // 4. Create NEW patchset in same thread (Author B, Time 1000 - same time but diff author)
+        // Should create new ID
+        let ps3 = db.create_patchset(
+            thread_id, None, "Patchset 3", "Author B", 1000, 2, 1, "to", "cc", None
+        ).await.unwrap();
+        assert_ne!(ps1, ps3, "Should create new patchset for different author");
     }
 }
