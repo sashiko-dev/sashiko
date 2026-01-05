@@ -85,6 +85,19 @@ impl ToolBox {
                     }),
                 },
                 FunctionDeclaration {
+                    name: "write_file".to_string(),
+                    description: "Write content to a file in the worktree. Primarily used for 'review-inline.txt'."
+                        .to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative path to the file (e.g., 'review-inline.txt')." },
+                            "content": { "type": "string", "description": "Content to write." }
+                        },
+                        "required": ["path", "content"]
+                    }),
+                },
+                FunctionDeclaration {
                     name: "read_prompt".to_string(),
                     description: "Read a specific prompt documentation file.".to_string(),
                     parameters: json!({
@@ -102,6 +115,7 @@ impl ToolBox {
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         match name {
             "read_file" => self.read_file(args).await,
+            "write_file" => self.write_file(args).await,
             "git_blame" => self.git_blame(args).await,
             "git_diff" => self.git_diff(args).await,
             "git_show" => self.git_show(args).await,
@@ -160,6 +174,20 @@ impl ToolBox {
             "start_line": start + 1,
             "end_line": end
         }))
+    }
+
+    async fn write_file(&self, args: Value) -> Result<Value> {
+        let path_str = args["path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing path"))?;
+        let content = args["content"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing content"))?;
+
+        let path = self.validate_path(path_str, &self.worktree_path)?;
+        fs::write(path, content).await?;
+
+        Ok(json!({ "status": "success" }))
     }
 
     async fn git_blame(&self, args: Value) -> Result<Value> {

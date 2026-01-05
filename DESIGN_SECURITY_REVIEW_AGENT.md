@@ -13,7 +13,7 @@ This document outlines the security architecture for the `sashiko-review` agent.
 ### 3.1. Linux Source Code & Git History
 *   **Requirement**: Full **READ** access.
 *   **Scope**: The agent must be able to read any file within the Linux kernel source tree and query the full git history (logs, blames, diffs).
-*   **Restriction**: **NO WRITE** access. The agent must never be able to modify the repository configuration, commit history, or working directory files (except for applying the patch under review in a disposable worktree).
+*   **Restriction**: **LIMITED WRITE** access. The agent is primarily read-only but is granted the ability to write specific files (e.g., `review-inline.txt`) to the disposable worktree using the `write_file` tool. It must never be able to modify the repository configuration, commit history, or other critical files.
 
 ### 3.2. Prompts
 *   **Requirement**: Full **READ** access.
@@ -58,6 +58,7 @@ Implemented via `git` CLI, strictly parameterized.
 ### 5.2. File System Operations
 *   `read_file(path, range)`: Restricted to repo root.
 *   `list_dir(path)`: Restricted to repo root.
+*   `write_file(path, content)`: Restricted to repo root (specifically intended for `review-inline.txt`).
 
 ### 5.3. Prompt Access
 *   `read_prompt(name)`: Restricted to `review-prompts` directory.

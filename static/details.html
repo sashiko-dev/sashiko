@@ -174,6 +174,18 @@
                         `;
                     }
 
+                    let inlineSection = '';
+                    if (r.inline_review) {
+                        inlineSection = `
+                            <div style="margin-top: 10px;">
+                                <button class="toggle-btn" onclick="toggleDetails('inline-${uniqueId}')">Show Inline Review</button>
+                                <div id="inline-${uniqueId}" class="review-details open">
+                                    <div class="log-block" style="background:#f8f9fa; color:#333; border: 1px solid #ddd;">${escapeHtml(r.inline_review, true)}</div>
+                                </div>
+                            </div>
+                        `;
+                    }
+
                     return `
                         <div class="review-card">
                             <div class="review-header">
@@ -189,6 +201,7 @@
                             </div>
 
                             ${r.summary ? `<div class="review-summary">${escapeHtml(r.summary)}</div>` : ''}
+                            ${inlineSection}
                             
                             <div class="token-stats">
                                 <strong>Token Usage:</strong> ${tokensIn.toLocaleString()} in + ${tokensOut.toLocaleString()} out = ${totalTokens.toLocaleString()} total

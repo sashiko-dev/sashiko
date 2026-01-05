@@ -88,26 +88,22 @@ mod tests {
     }
 
     #[test]
-    fn test_git_diff_head() {
-        let (linux_path, prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, prompts_path);
+    fn test_write_file() {
+        let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_path = temp_dir.path().to_path_buf();
+        let prompts_path = root.join("review-prompts");
+        let toolbox = ToolBox::new(worktree_path.clone(), prompts_path);
         let rt = Runtime::new().unwrap();
 
-        // Diff HEAD~1 HEAD
-        let args = json!({ "args": ["HEAD~1", "HEAD"] });
-        let result = rt.block_on(toolbox.call("git_diff", args));
+        let filename = "test-write.txt";
+        let content = "Hello, world!";
+        let args = json!({ "path": filename, "content": content });
 
-        // This might fail if repo is shallow with depth 1, let's see.
-        // We know from bootstrap we did depth 20 or 500, so it should be fine.
-        // But `linux` dir might be the original checkout.
-        if let Ok(val) = result {
-            let content = val["content"].as_str().unwrap();
-            // Diff might be empty if no changes, but command should succeed
-            assert!(!content.is_empty() || content.is_empty());
-        } else {
-            // If HEAD~1 doesn't exist (e.g. initial commit), we accept error but log it
-            // Actually, verify success of command execution at least
-            // panic!("Git diff failed: {:?}", result.err());
-        }
+        let result = rt.block_on(toolbox.call("write_file", args)).unwrap();
+        assert_eq!(result["status"], "success");
+
+        let written_content = std::fs::read_to_string(worktree_path.join(filename)).unwrap();
+        assert_eq!(written_content, content);
     }
 }

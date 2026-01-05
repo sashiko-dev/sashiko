@@ -271,8 +271,10 @@ impl Database {
         let _ = self.try_add_column("reviews", "status", "TEXT").await;
         let _ = self.try_add_column("reviews", "logs", "TEXT").await;
         let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
+        let _ = self
+            .try_add_column("reviews", "inline_review", "TEXT")
+            .await;
 
-        info!("Database schema applied");
         Ok(())
     }
 
@@ -345,11 +347,12 @@ impl Database {
         result: &str,
         summary: Option<&str>,
         interaction_id: Option<&str>,
+        inline_review: Option<&str>,
     ) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, review_id],
+                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ? WHERE id = ?",
+                libsql::params![status, result, summary, interaction_id, inline_review, review_id],
             )
             .await?;
         Ok(())
@@ -1322,7 +1325,7 @@ impl Database {
                     "SELECT r.model_name, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                             b.repo_url, b.branch, b.last_known_commit,
                             r.provider, r.prompts_git_hash, r.result_description,
-                            r.status, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id
+                            r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -1348,10 +1351,11 @@ impl Database {
                     "prompts_hash": r.get::<Option<String>>(9).ok(),
                     "result": r.get::<Option<String>>(10).ok(),
                     "status": r.get::<Option<String>>(11).ok(),
-                    "logs": r.get::<Option<String>>(12).ok(),
-                    "tokens_in": r.get::<Option<u32>>(13).ok(),
-                    "tokens_out": r.get::<Option<u32>>(14).ok(),
-                    "patch_id": r.get::<Option<i64>>(15).ok(),
+                    "inline_review": r.get::<Option<String>>(12).ok(),
+                    "logs": r.get::<Option<String>>(13).ok(),
+                    "tokens_in": r.get::<Option<u32>>(14).ok(),
+                    "tokens_out": r.get::<Option<u32>>(15).ok(),
+                    "patch_id": r.get::<Option<i64>>(16).ok(),
                 }));
             }
 

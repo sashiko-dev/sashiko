@@ -222,13 +222,17 @@ impl Reviewer {
                     let mut candidate_success = true;
 
                     for (patch_id, index, _diff) in &diffs {
-                        info!("Reviewing patch {}/{} (ID: {})", patchset_id, index, patch_id);
+                        info!(
+                            "Reviewing patch {}/{} (ID: {})",
+                            patchset_id, index, patch_id
+                        );
 
                         loop {
                             let prompts_hash = get_commit_hash(Path::new("review-prompts"), "HEAD")
                                 .await
                                 .ok();
-                            let baseline_commit = get_commit_hash(&repo_path, &baseline_ref).await.ok();
+                            let baseline_commit =
+                                get_commit_hash(&repo_path, &baseline_ref).await.ok();
 
                             let baseline_id = if let Some(commit) = &baseline_commit {
                                 let (repo_url, branch) = match &candidate {
@@ -297,7 +301,7 @@ impl Reviewer {
                                         .and_then(|arr| arr.iter().find(|p| p["index"] == *index))
                                         .map(|p| p["status"] == "applied")
                                         .unwrap_or(false);
-                                    
+
                                     // Also check if ANY previous patch failed, which would prevent this one?
                                     // If target applied, we are good.
 
@@ -306,8 +310,9 @@ impl Reviewer {
                                             if !review_content.is_null() {
                                                 // Record Interaction
                                                 let interaction_id = generate_id();
-                                                let input_ctx =
-                                                    json_output["input_context"].as_str().unwrap_or("");
+                                                let input_ctx = json_output["input_context"]
+                                                    .as_str()
+                                                    .unwrap_or("");
                                                 let output_raw = review_content.to_string();
 
                                                 let _ = db
@@ -336,6 +341,9 @@ impl Reviewer {
                                                     .to_string();
                                                 let result_desc = "Review completed successfully.";
 
+                                                let inline_review =
+                                                    json_output["inline_review"].as_str();
+
                                                 let _ = db
                                                     .complete_review(
                                                         review_id,
@@ -343,6 +351,7 @@ impl Reviewer {
                                                         result_desc,
                                                         Some(&summary),
                                                         Some(&interaction_id),
+                                                        inline_review,
                                                     )
                                                     .await;
                                                 break; // Success for this patch
@@ -352,6 +361,7 @@ impl Reviewer {
                                                         review_id,
                                                         "Failed",
                                                         "AI returned null response",
+                                                        None,
                                                         None,
                                                         None,
                                                     )
@@ -364,12 +374,13 @@ impl Reviewer {
                                                     );
                                                     continue;
                                                 } else {
-                                                     // If max retries reached, we mark as failed but continue to next patch?
-                                                     // Or fail the whole set? 
-                                                     // Prompt says "reviews all patches... Each review should be independent".
-                                                     // So we continue.
-                                                     final_status = "Review Failed (Partial)".to_string();
-                                                     break;
+                                                    // If max retries reached, we mark as failed but continue to next patch?
+                                                    // Or fail the whole set?
+                                                    // Prompt says "reviews all patches... Each review should be independent".
+                                                    // So we continue.
+                                                    final_status =
+                                                        "Review Failed (Partial)".to_string();
+                                                    break;
                                                 }
                                             }
                                         } else {
@@ -381,14 +392,15 @@ impl Reviewer {
                                                     "Missing review content",
                                                     None,
                                                     None,
+                                                    None,
                                                 )
                                                 .await;
-                                             if retries < MAX_RETRIES {
+                                            if retries < MAX_RETRIES {
                                                 retries += 1;
                                                 continue;
-                                             }
-                                             final_status = "Review Failed (Partial)".to_string();
-                                             break;
+                                            }
+                                            final_status = "Review Failed (Partial)".to_string();
+                                            break;
                                         }
                                     } else {
                                         // Patch application failed
@@ -406,9 +418,11 @@ impl Reviewer {
                                             )
                                             .await;
                                         let _ = db
-                                            .complete_review(review_id, "Failed", error_msg, None, None)
+                                            .complete_review(
+                                                review_id, "Failed", error_msg, None, None, None,
+                                            )
                                             .await;
-                                        
+
                                         candidate_success = false;
                                         final_status = "Failed".to_string();
                                         break; // If application fails, we probably can't apply subsequent patches?
@@ -423,6 +437,7 @@ impl Reviewer {
                                             review_id,
                                             "Failed",
                                             &format!("Tool error: {}", e),
+                                            None,
                                             None,
                                             None,
                                         )

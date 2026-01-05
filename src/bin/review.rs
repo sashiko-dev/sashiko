@@ -179,16 +179,20 @@ async fn main() -> Result<()> {
 
     // Determine patches to review
     let patches_to_review: Vec<PatchInput> = if let Some(target_idx) = args.review_patch_index {
-        patches.iter().filter(|p| p.index == target_idx).cloned().collect()
+        patches
+            .iter()
+            .filter(|p| p.index == target_idx)
+            .cloned()
+            .collect()
     } else {
         patches.clone() // Review all
     };
 
     if all_applied {
         if patches_to_review.is_empty() {
-             info!("No patches matched review index or list empty. Skipping AI review.");
-             // Return success with patches status (even if we didn't review anything)
-              let result_json = json!({
+            info!("No patches matched review index or list empty. Skipping AI review.");
+            // Return success with patches status (even if we didn't review anything)
+            let result_json = json!({
                 "patchset_id": patchset_id,
                 "baseline": baseline,
                 "patches": patch_results,
@@ -199,7 +203,10 @@ async fn main() -> Result<()> {
             });
             println!("{}", serde_json::to_string_pretty(&result_json)?);
         } else {
-            info!("Patches applied. Starting AI review for {} patches...", patches_to_review.len());
+            info!(
+                "Patches applied. Starting AI review for {} patches...",
+                patches_to_review.len()
+            );
             let model_name = args.model.unwrap_or_else(|| settings.ai.model.clone());
             let client = GeminiClient::new(model_name);
             let tools = ToolBox::new(worktree.path.clone(), args.prompts.clone());
@@ -216,11 +223,26 @@ async fn main() -> Result<()> {
                 Ok(result) => {
                     info!("AI review completed.");
 
+                    // Check for review-inline.txt
+                    let inline_path = worktree.path.join("review-inline.txt");
+                    let inline_content = if inline_path.exists() {
+                        match std::fs::read_to_string(&inline_path) {
+                            Ok(content) => Some(content),
+                            Err(e) => {
+                                error!("Failed to read review-inline.txt: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     let result_json = json!({
                         "patchset_id": patchset_id,
                         "baseline": baseline,
                         "patches": patch_results,
                         "review": result.output,
+                        "inline_review": inline_content,
                         "input_context": result.input_context,
                         "tokens_in": result.tokens_in,
                         "tokens_out": result.tokens_out
