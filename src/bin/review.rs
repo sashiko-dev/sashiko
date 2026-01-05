@@ -20,9 +20,10 @@ struct Args {
     #[arg(long)]
     message_id: Option<String>,
 
-    /// Git revision to use as baseline (e.g. "HEAD", "v6.12", or commit hash)
+    /// Git revision to use as baseline (e.g. "HEAD", "v6.12", or commit hash).
+    /// Defaults to "next/master" (linux-next) if not specified.
     #[arg(long)]
-    baseline: String,
+    baseline: Option<String>,
 
     #[arg(long, default_value = "review-prompts")]
     prompts: PathBuf,
@@ -42,7 +43,7 @@ async fn main() -> Result<()> {
     // Check patchset exists
     let patchset_json = if let Some(id) = args.patchset {
         db.get_patchset_details(id).await?
-            .ok_or_else(|| anyhow::anyhow!("Patchset {} not found", id))?
+            .ok_or_else(|| anyhow::anyhow!("Patchset {} not found", id))? 
     } else if let Some(msg_id) = args.message_id {
         db.get_patchset_details_by_msgid(&msg_id).await?
             .ok_or_else(|| anyhow::anyhow!("Patchset for message ID {} not found", msg_id))?
@@ -53,11 +54,14 @@ async fn main() -> Result<()> {
     let patchset_id = patchset_json["id"].as_i64()
         .ok_or_else(|| anyhow::anyhow!("Patchset ID not found in database response"))?;
 
+    let baseline = args.baseline.unwrap_or_else(|| "next/master".to_string());
+
     info!("Reviewing patchset: {} (ID: {})", patchset_json["subject"], patchset_id);
+    info!("Using baseline: {}", baseline);
 
     let repo_path = PathBuf::from(&settings.git.repository_path);
-    // Use provided baseline
-    let worktree = GitWorktree::new(&repo_path, &args.baseline).await?;
+    // Use provided or default baseline
+    let worktree = GitWorktree::new(&repo_path, &baseline).await?;
 
     info!("Created worktree at {:?}", worktree.path);
 
@@ -99,7 +103,7 @@ async fn main() -> Result<()> {
 
     let result = json!({
         "patchset_id": patchset_id,
-        "baseline": args.baseline,
+        "baseline": baseline,
         "patches": patch_results,
         "review": null
     });
