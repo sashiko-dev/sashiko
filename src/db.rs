@@ -1159,6 +1159,22 @@ impl Database {
         ).await?;
         Ok(count)
     }
+
+    pub async fn get_patchset_counts_by_status(&self) -> Result<std::collections::HashMap<String, usize>> {
+        let mut rows = self.conn.query(
+            "SELECT status, COUNT(*) FROM patchsets GROUP BY status",
+            (),
+        ).await?;
+
+        let mut counts = std::collections::HashMap::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let status: Option<String> = row.get(0).ok();
+            let count: i64 = row.get(1)?;
+            let status_key = status.unwrap_or_else(|| "Unknown".to_string());
+            counts.insert(status_key, count as usize);
+        }
+        Ok(counts)
+    }
 }
 
 #[cfg(test)]

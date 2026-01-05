@@ -13,6 +13,7 @@
         tr.selected { background-color: #d0d0d0; outline: 1px solid #aaa; }
         .status-Incomplete { color: gray; }
         .status-Pending { color: orange; }
+        .status-Reviewing { color: blue; }
         .status-Applied { color: green; }
         .status-Failed { color: red; }
         .copy-btn { cursor: pointer; border: 1px solid #ccc; background: #fff; padding: 2px 5px; border-radius: 3px; font-size: 12px; }
@@ -68,9 +69,14 @@
         async function fetchStats() {
             const res = await fetch('/api/stats');
             const data = await res.json();
+            const b = data.breakdown || {};
             document.getElementById('stats').innerHTML = `
                 System Status: ${data.status} (v${data.version}) <br>
-                Messages: ${data.messages} | Patchsets: ${data.patchsets}
+                Messages: ${data.messages} | Patchsets: ${data.patchsets} <br>
+                <strong>Pending:</strong> ${b.pending || 0} | 
+                <strong>In Review:</strong> ${b.reviewing || 0} | 
+                <strong>Reviewed:</strong> ${b.reviewed || 0} 
+                <span style="font-size: 0.8em; color: gray;">(Applied: ${b.applied || 0}, Failed: ${b.failed || 0})</span>
             `;
         }
 

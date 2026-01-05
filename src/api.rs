@@ -221,11 +221,25 @@ async fn get_message(
 async fn get_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let messages = state.db.count_messages(None).await.unwrap_or(0);
     let patchsets = state.db.count_patchsets(None).await.unwrap_or(0);
+    let counts = state.db.get_patchset_counts_by_status().await.unwrap_or_default();
+
+    let pending = *counts.get("Pending").unwrap_or(&0);
+    let reviewing = *counts.get("Reviewing").unwrap_or(&0);
+    let applied = *counts.get("Applied").unwrap_or(&0);
+    let failed = *counts.get("Failed").unwrap_or(&0);
+    let reviewed = applied + failed;
 
     Json(serde_json::json!({
         "status": "ok",
         "version": "0.1.0",
         "messages": messages,
-        "patchsets": patchsets
+        "patchsets": patchsets,
+        "breakdown": {
+            "pending": pending,
+            "reviewing": reviewing,
+            "reviewed": reviewed,
+            "applied": applied,
+            "failed": failed
+        }
     }))
 }
