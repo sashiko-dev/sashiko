@@ -12,4 +12,5 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 - Make sure all new code is safe and performant. Always prioritize making code clear and easy to support.
 - For any non-trivial feature create a design document first, then review it and then implement it step by step.
 - If not sure, ask the user, don't proceed without confidence. Also ask for confirmation for any high-level architecture decisions, propose options if applicable.
+- Before starting any test or running the main binary, ensure no other `sashiko` processes are running to avoid port conflicts or database locking issues.
 - Introduced 'Subsystems' entity. Subsystems are identified from To/Cc headers (e.g. 'netdev', 'bpf', 'usb') and linked to Messages, Threads, Patches, and Patchsets via junction tables.
