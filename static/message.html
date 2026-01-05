@@ -108,7 +108,10 @@
                 document.getElementById('cc').innerText = data.cc || '-';
                 document.getElementById('date').innerText = new Date(data.date * 1000).toLocaleString();
                 document.getElementById('msgid').innerText = data.message_id;
-                document.getElementById('body').innerText = data.body || '(No body content)';
+
+                const bodyElem = document.getElementById('body');
+                const subjectLine = `Subject: ${data.subject || '(No Subject)'}\n\n`;
+                bodyElem.innerText = subjectLine + (data.body || '(No body content)');
 
                 if (data.thread && data.thread.length > 0) {
                     renderThreadTree(data.thread, data.id);
