@@ -10,7 +10,6 @@ groups = ["org.kernel.vger.linux-kernel"]
 [ai]
 provider = "gemini"
 model = "gemini-3-pro"
-# Provide api_key via environment variable: SASHIKO_AI__API_KEY
 
 [server]
 host = "127.0.0.1"

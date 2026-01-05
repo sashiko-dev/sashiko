@@ -32,7 +32,8 @@ pub struct OpenAiProvider {
 
 #[allow(dead_code)]
 impl OpenAiProvider {
-    pub fn new(api_key: String) -> Self {
+    pub fn new() -> Self {
+        let api_key = std::env::var("LLM_API_KEY").unwrap_or_default();
         Self {
             api_key,
             client: reqwest::Client::new(),
