@@ -624,12 +624,26 @@ impl Database {
                         libsql::params![thread_id, old_thread_id],
                     )
                     .await?;
+                // Delete any remaining (conflicting) subsystem mappings for the old thread
+                self.conn
+                    .execute(
+                        "DELETE FROM threads_subsystems WHERE thread_id = ?",
+                        libsql::params![old_thread_id],
+                    )
+                    .await?;
 
                 // 4. Merge tags
                 self.conn
                     .execute(
                         "UPDATE OR IGNORE threads_tags SET thread_id = ? WHERE thread_id = ?",
                         libsql::params![thread_id, old_thread_id],
+                    )
+                    .await?;
+                // Delete any remaining (conflicting) tag mappings for the old thread
+                self.conn
+                    .execute(
+                        "DELETE FROM threads_tags WHERE thread_id = ?",
+                        libsql::params![old_thread_id],
                     )
                     .await?;
 
