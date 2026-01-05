@@ -21,6 +21,7 @@ impl GitWorktree {
 
         let output = Command::new("git")
             .current_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
             .arg("add")
             .arg("--detach")
@@ -49,6 +50,7 @@ impl GitWorktree {
 
         let mut child = Command::new("git")
             .current_dir(&self.path)
+            .args(["-c", "safe.bareRepository=all"])
             .arg("am")
             .arg("--3way")
             .stdin(std::process::Stdio::piped())
@@ -66,6 +68,7 @@ impl GitWorktree {
         if !output.status.success() {
             let _ = Command::new("git")
                 .current_dir(&self.path)
+                .args(["-c", "safe.bareRepository=all"])
                 .arg("am")
                 .arg("--abort")
                 .output()
@@ -85,6 +88,7 @@ impl GitWorktree {
         info!("Removing worktree at {:?}", self.path);
         let output = Command::new("git")
             .current_dir(&self.repo_path)
+            .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
             .arg("remove")
             .arg("-f")
@@ -106,6 +110,7 @@ impl GitWorktree {
 pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
         .arg("cat-file")
         .arg("-p")
         .arg(hash)
@@ -126,6 +131,7 @@ pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     info!("Pruning git worktrees in {:?}", repo_path);
     let output = Command::new("git")
         .current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
         .arg("worktree")
         .arg("prune")
         .output()
