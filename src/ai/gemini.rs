@@ -1,3 +1,4 @@
+use crate::ai::token_budget::{TokenBudget, TokenRateLimiter};
 use crate::ai::{AiProvider, AiRequest, AiResponse};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -5,6 +6,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -196,15 +198,62 @@ pub struct GeminiClient {
     api_key: String,
     model: String,
     client: Client,
+    rate_limiter: Arc<Mutex<TokenRateLimiter>>,
 }
 
 impl GeminiClient {
-    pub fn new(model: String) -> Self {
+    pub fn new(model: String, rate_limit_tokens_per_minute: usize) -> Self {
         let api_key = std::env::var("LLM_API_KEY").unwrap_or_default();
         Self {
             api_key,
             model,
             client: Client::new(),
+            rate_limiter: Arc::new(Mutex::new(TokenRateLimiter::new(
+                rate_limit_tokens_per_minute,
+            ))),
+        }
+    }
+
+    fn estimate_tokens(request: &GenerateContentRequest) -> usize {
+        let mut total = 0;
+        for content in &request.contents {
+            for part in &content.parts {
+                match part {
+                    Part::Text { text, .. } => total += TokenBudget::estimate_tokens(text),
+                    Part::FunctionCall { function_call, .. } => {
+                        total += TokenBudget::estimate_tokens(&function_call.name);
+                        let args = function_call.args.to_string();
+                        total += TokenBudget::estimate_tokens(&args);
+                    }
+                    Part::FunctionResponse { function_response } => {
+                        total += TokenBudget::estimate_tokens(&function_response.name);
+                        let resp = function_response.response.to_string();
+                        total += TokenBudget::estimate_tokens(&resp);
+                    }
+                }
+            }
+        }
+        if let Some(sys) = &request.system_instruction {
+            for part in &sys.parts {
+                if let Part::Text { text, .. } = part {
+                    total += TokenBudget::estimate_tokens(text);
+                }
+            }
+        }
+        total
+    }
+
+    async fn check_rate_limit(&self, tokens: usize) {
+        let wait_duration = {
+            let mut limiter = self.rate_limiter.lock().unwrap();
+            limiter.check_and_withdraw(tokens)
+        };
+        if !wait_duration.is_zero() {
+            tracing::info!(
+                "Rate limit engaged. Waiting for {:.2}s",
+                wait_duration.as_secs_f64()
+            );
+            sleep(wait_duration).await;
         }
     }
 
@@ -212,6 +261,9 @@ impl GeminiClient {
         &self,
         request: &GenerateContentRequest,
     ) -> Result<GenerateContentResponse> {
+        let estimated = Self::estimate_tokens(request);
+        self.check_rate_limit(estimated).await;
+
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
             self.model, self.api_key
@@ -223,6 +275,27 @@ impl GeminiClient {
         &self,
         request: &GenerateContentWithCacheRequest,
     ) -> Result<GenerateContentResponse> {
+        // Estimate tokens for the new content in the request
+        let mut total = 0;
+        for content in &request.contents {
+            for part in &content.parts {
+                match part {
+                    Part::Text { text, .. } => total += TokenBudget::estimate_tokens(text),
+                    Part::FunctionCall { function_call, .. } => {
+                        total += TokenBudget::estimate_tokens(&function_call.name);
+                        let args = function_call.args.to_string();
+                        total += TokenBudget::estimate_tokens(&args);
+                    }
+                    Part::FunctionResponse { function_response } => {
+                        total += TokenBudget::estimate_tokens(&function_response.name);
+                        let resp = function_response.response.to_string();
+                        total += TokenBudget::estimate_tokens(&resp);
+                    }
+                }
+            }
+        }
+        self.check_rate_limit(total).await;
+
         // When using cached content, the URL model parameter is effectively ignored by the backend
         // in favor of the 'cached_content' field, but we still need a valid endpoint.
         // The documentation says: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent

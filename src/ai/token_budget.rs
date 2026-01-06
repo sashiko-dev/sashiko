@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 pub struct TokenBudget {
     pub max_tokens: usize,
     pub current: usize,
@@ -38,6 +40,43 @@ impl TokenBudget {
     }
 }
 
+pub struct TokenRateLimiter {
+    capacity: usize,
+    tokens: f64,
+    last_refill: Instant,
+    refill_rate_per_sec: f64,
+}
+
+impl TokenRateLimiter {
+    pub fn new(tokens_per_minute: usize) -> Self {
+        let refill_rate_per_sec = tokens_per_minute as f64 / 60.0;
+        Self {
+            capacity: tokens_per_minute,
+            tokens: tokens_per_minute as f64,
+            last_refill: Instant::now(),
+            refill_rate_per_sec,
+        }
+    }
+
+    pub fn check_and_withdraw(&mut self, amount: usize) -> Duration {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        // Refill
+        self.tokens = (self.tokens + elapsed * self.refill_rate_per_sec).min(self.capacity as f64);
+        self.last_refill = now;
+
+        if self.tokens >= amount as f64 {
+            self.tokens -= amount as f64;
+            Duration::ZERO
+        } else {
+            let deficit = amount as f64 - self.tokens;
+            let wait_secs = deficit / self.refill_rate_per_sec;
+            self.tokens -= amount as f64;
+            Duration::from_secs_f64(wait_secs)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +99,19 @@ mod tests {
         assert_eq!(TokenBudget::estimate_tokens(""), 0);
         assert_eq!(TokenBudget::estimate_tokens("1234"), 1);
         assert_eq!(TokenBudget::estimate_tokens("12345"), 2);
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        // 60 tokens per minute = 1 per second
+        let mut limiter = TokenRateLimiter::new(60);
+
+        // Immediate consume
+        assert_eq!(limiter.check_and_withdraw(10), Duration::ZERO);
+
+        // Consume more than available (starts full at 60, used 10, left 50)
+        // Request 60. Deficit 10. Wait 10s.
+        let wait = limiter.check_and_withdraw(60);
+        assert!(wait.as_secs_f64() >= 9.9 && wait.as_secs_f64() <= 10.1);
     }
 }

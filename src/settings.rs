@@ -27,6 +27,12 @@ pub struct AiSettings {
     pub model: String,
     #[serde(default = "default_max_input_words")]
     pub max_input_words: usize,
+    #[serde(default = "default_rate_limit_tokens_per_minute")]
+    pub rate_limit_tokens_per_minute: usize,
+}
+
+fn default_rate_limit_tokens_per_minute() -> usize {
+    900_000
 }
 
 #[derive(Debug, Deserialize, Clone)]

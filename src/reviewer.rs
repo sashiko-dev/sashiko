@@ -59,7 +59,10 @@ impl Reviewer {
         // Initialize CacheManager
         // Assuming prompts are in "review-prompts" in CWD.
         let prompts_dir = PathBuf::from("review-prompts");
-        let client = Box::new(GeminiClient::new(settings.ai.model.clone()));
+        let client = Box::new(GeminiClient::new(
+            settings.ai.model.clone(),
+            settings.ai.rate_limit_tokens_per_minute,
+        ));
 
         // We need tool definitions for the cache.
         // We use dummy paths for ToolBox here because we only need declarations,
@@ -670,7 +673,10 @@ async fn run_review_tool(
 
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
-            let client = GeminiClient::new(settings.ai.model.clone());
+            let client = GeminiClient::new(
+                settings.ai.model.clone(),
+                settings.ai.rate_limit_tokens_per_minute,
+            );
             let mut final_result: Option<Value> = None;
 
             while let Ok(Some(line)) = lines.next_line().await {
