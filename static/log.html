@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sashiko - Review Log</title>
+    <title>LLM Interaction Log</title>
     <style>
         body { 
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
@@ -51,6 +51,7 @@
             position: relative;
             box-shadow: 0 1px 2px rgba(0,0,0,0.1);
             overflow-wrap: break-word;
+            min-width: 300px;
         }
 
         .user .message-bubble {
@@ -66,13 +67,16 @@
         }
 
         .tool .message-bubble {
-            background-color: #f6f8fa;
+            background-color: #fff8c5; /* Light yellow/warning for tool calls */
             border: 1px solid #d0d7de;
-            border-top: 4px solid #cf222e; /* Red for tool/system */
+            border-top: 4px solid #9a6700; 
             max-width: 95%;
-            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-            font-size: 0.85em;
+            font-size: 0.9em;
         }
+
+        /* Differentiate Function Response from Function Call visually if possible, 
+           but they are often in the same 'function' role or mixed. 
+           Let's handle inside the content rendering. */
 
         .role-badge {
             font-size: 0.75em;
@@ -81,10 +85,19 @@
             margin-bottom: 5px;
             text-transform: uppercase;
             display: block;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 3px;
         }
         
         .content-block {
             white-space: pre-wrap;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+            font-size: 0.9em;
+            margin-bottom: 8px;
+        }
+        
+        .text-part {
+            margin-bottom: 10px;
         }
 
         /* Collapsible formatting */
@@ -105,13 +118,15 @@
             justify-content: space-between;
             align-items: center;
             user-select: none;
+            color: #0969da;
         }
-        .collapsible-header:hover { background: #eef1f4; }
+        .collapsible-header:hover { background: #eef1f4; text-decoration: underline; }
         .collapsible-content {
             padding: 10px;
             display: none;
             overflow-x: auto;
             border-top: 1px solid #d0d7de;
+            background-color: #fff;
         }
         .collapsible.open .collapsible-content { display: block; }
         .collapsible.open .arrow::after { content: '▼'; }
@@ -121,26 +136,41 @@
         code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
 
         /* Function Call Styling */
-        .fn-call {
+        .fn-call-box {
             background: #fffbdd;
             border: 1px solid #e3d06f;
             border-radius: 4px;
             padding: 8px;
-            font-family: monospace;
-            margin-bottom: 5px;
+            margin-bottom: 10px;
         }
-        .fn-name { color: #d9534f; font-weight: bold; }
-        .fn-args { color: #333; }
+        .fn-resp-box {
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 4px;
+            padding: 8px;
+            margin-bottom: 10px;
+        }
+        
+        .fn-name { font-weight: bold; font-family: monospace; font-size: 1.1em; display: inline-block; margin-bottom: 5px; }
+        .fn-call-box .fn-name { color: #d9534f; } /* Reddish for call */
+        .fn-resp-box .fn-name { color: #15803d; } /* Greenish for response */
 
         a { color: #0969da; text-decoration: none; }
         a:hover { text-decoration: underline; }
 
         .back-link { display: inline-block; margin-bottom: 15px; }
+        
+        .truncated-hint {
+            color: #666;
+            font-style: italic;
+            font-size: 0.85em;
+            margin-top: 4px;
+        }
     </style>
 </head>
 <body>
     <a href="javascript:history.back()" class="back-link">← Back</a>
-    <h1>Review Interaction Log</h1>
+    <h1>LLM Interaction Log</h1>
     <div id="meta" class="header-meta">Loading metadata...</div>
     <div id="chat" class="chat-container">
         <div style="text-align: center; padding: 20px; color: #555;">Loading conversation...</div>
@@ -208,36 +238,44 @@
                 let contentHtml = '';
                 
                 parts.forEach(part => {
+                    // Check Part types: text, functionCall, functionResponse
+                    // Note: Rust Serialize might use "functionCall" or "function_call" depending on rename_all="camelCase".
+                    // src/ai/gemini.rs uses #[serde(rename_all = "camelCase")] for Content/Part/etc.
+                    // So keys should be: "text", "functionCall", "functionResponse".
+                    
                     if (part.text) {
-                        contentHtml += `<div class="content-block">${formatText(part.text)}</div>`;
+                        contentHtml += `<div class="text-part">${formatText(part.text)}</div>`;
                     }
-                    if (part.function_call) {
+                    else if (part.functionCall) {
                         contentHtml += `
-                            <div class="fn-call">
-                                <div class="fn-name">🔧 Call: ${escapeHtml(part.function_call.name)}</div>
-                                <div class="collapsible">
-                                    <div class="collapsible-header" onclick="this.parentElement.classList.toggle('open')">
-                                        Arguments <span class="arrow"></span>
-                                    </div>
-                                    <div class="collapsible-content">
-                                        <pre>${escapeHtml(JSON.stringify(part.function_call.args, null, 2))}</pre>
-                                    </div>
-                                </div>
+                            <div class="fn-call-box">
+                                <span class="fn-name">🔧 Call: ${escapeHtml(part.functionCall.name)}</span>
+                                ${formatJson(part.functionCall.args, "Arguments")}
                             </div>
                         `;
                     }
-                    if (part.function_response) {
+                    else if (part.functionResponse) {
                         contentHtml += `
-                            <div class="fn-call" style="background: #f0fdf4; border-color: #bbf7d0;">
-                                <div class="fn-name" style="color: #15803d;">✅ Response: ${escapeHtml(part.function_response.name)}</div>
-                                <div class="collapsible">
-                                    <div class="collapsible-header" onclick="this.parentElement.classList.toggle('open')">
-                                        Return Value <span class="arrow"></span>
-                                    </div>
-                                    <div class="collapsible-content">
-                                        <pre>${escapeHtml(JSON.stringify(part.function_response.response, null, 2))}</pre>
-                                    </div>
-                                </div>
+                            <div class="fn-resp-box">
+                                <span class="fn-name">✅ Response: ${escapeHtml(part.functionResponse.name)}</span>
+                                ${formatJson(part.functionResponse.response, "Return Value")}
+                            </div>
+                        `;
+                    }
+                    // Handle snake_case fallbacks just in case (e.g. if DB stored older version)
+                    else if (part.function_call) {
+                         contentHtml += `
+                            <div class="fn-call-box">
+                                <span class="fn-name">🔧 Call: ${escapeHtml(part.function_call.name)}</span>
+                                ${formatJson(part.function_call.args, "Arguments")}
+                            </div>
+                        `;
+                    }
+                    else if (part.function_response) {
+                         contentHtml += `
+                            <div class="fn-resp-box">
+                                <span class="fn-name">✅ Response: ${escapeHtml(part.function_response.name)}</span>
+                                ${formatJson(part.function_response.response, "Return Value")}
                             </div>
                         `;
                     }
@@ -263,24 +301,57 @@
         }
 
         function formatText(text) {
-            // Check if text is large (e.g. > 500 chars)
-            if (text.length > 1000) {
-                const preview = text.substring(0, 300);
-                const full = escapeHtml(text);
-                const uniqueId = Math.random().toString(36).substr(2, 9);
+            if (!text) return '';
+            const lines = text.split('\n');
+            const maxLines = 5;
+            
+            if (lines.length > maxLines + 2) { // +2 buffer so we don't collapse just 1 extra line
+                const preview = lines.slice(0, maxLines).join('\n');
+                const rest = lines.slice(maxLines).join('\n');
+                
                 return `
-                    ${escapeHtml(preview)}...
+                    <div class="content-block">${escapeHtml(preview)}</div>
+                    <div class="truncated-hint">... ${lines.length - maxLines} lines hidden ...</div>
                     <div class="collapsible">
                         <div class="collapsible-header" onclick="this.parentElement.classList.toggle('open')">
-                            Show Full Text (${text.length} chars) <span class="arrow"></span>
+                            Show Full Text <span class="arrow"></span>
                         </div>
                         <div class="collapsible-content">
-                            <pre>${full}</pre>
+                            <pre class="content-block">${escapeHtml(text)}</pre>
                         </div>
                     </div>
                 `;
             }
-            return escapeHtml(text);
+            return `<div class="content-block">${escapeHtml(text)}</div>`;
+        }
+
+        function formatJson(obj, label) {
+            const jsonStr = JSON.stringify(obj, null, 2);
+            const lines = jsonStr.split('\n');
+            const maxLines = 5;
+
+            // Always use collapsible for JSON if it's multiline? 
+            // Or use the same 5-line rule.
+            
+            if (lines.length > maxLines + 2) {
+                 const preview = lines.slice(0, maxLines).join('\n');
+                 return `
+                    <div class="content-block" style="font-size:0.85em; opacity:0.8;">${escapeHtml(preview)} ... }</div>
+                    <div class="collapsible">
+                        <div class="collapsible-header" onclick="this.parentElement.classList.toggle('open')">
+                            ${label} (Full JSON) <span class="arrow"></span>
+                        </div>
+                        <div class="collapsible-content">
+                            <pre class="content-block">${escapeHtml(jsonStr)}</pre>
+                        </div>
+                    </div>
+                 `;
+            } else {
+                return `
+                    <div style="margin-top:5px; font-weight:bold; font-size:0.8em; color:#555;">${label}:</div>
+                    <pre class="content-block" style="background:rgba(255,255,255,0.5); padding:5px; border-radius:3px;">${escapeHtml(jsonStr)}</pre>
+                `;
+            }
         }
 
         function escapeHtml(text) {
