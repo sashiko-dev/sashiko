@@ -30,7 +30,7 @@ mod tests {
             _req: GenerateContentRequest,
         ) -> anyhow::Result<GenerateContentResponse> {
             let mut responses = self.responses.lock().unwrap();
-            
+
             // Check if we have a response queued
             if let Some(res) = responses.pop_front() {
                 return res;
@@ -88,7 +88,10 @@ mod tests {
         })
     }
 
-    fn create_tool_call_response(name: &str, args: serde_json::Value) -> anyhow::Result<GenerateContentResponse> {
+    fn create_tool_call_response(
+        name: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<GenerateContentResponse> {
         Ok(GenerateContentResponse {
             candidates: Some(vec![Candidate {
                 content: Content {
@@ -124,11 +127,11 @@ mod tests {
             "verdict": "Pass",
             "findings": []
         });
-        
-        let client = Box::new(StatefulMockClient::new(vec![
-            create_text_response(&format!("```json\n{}\n```", mock_response))
-        ]));
-        
+
+        let client = Box::new(StatefulMockClient::new(vec![create_text_response(
+            &format!("```json\n{}\n```", mock_response),
+        )]));
+
         let tools = ToolBox::new(linux_path, prompts_path);
         let prompts = PromptRegistry::new(PathBuf::from("review-prompts"));
         let mut agent = Agent::new(client, tools, prompts, 150_000);
@@ -152,7 +155,7 @@ mod tests {
         // Sequence of responses:
         // 1. Tool call: read_file("README")
         // 2. Final JSON response (after receiving tool output)
-        
+
         let final_response = json!({
             "analysis_trace": ["Read README", "Analyzed"],
             "summary": "README is good",
@@ -163,7 +166,7 @@ mod tests {
 
         let client = Box::new(StatefulMockClient::new(vec![
             create_tool_call_response("read_file", json!({"path": "README"})),
-            create_text_response(&format!("```json\n{}\n```", final_response))
+            create_text_response(&format!("```json\n{}\n```", final_response)),
         ]));
 
         let tools = ToolBox::new(linux_path, prompts_path);
@@ -177,18 +180,21 @@ mod tests {
         });
 
         let result = agent.run(patchset).await.expect("Agent run failed");
-        
+
         // Verify history has the tool call and response
-        // History: 
+        // History:
         // 0: User (System+Prompt) - Handled by Agent setup but history only contains what's pushed.
         // In Agent::run:
         // history[0] = User message (Task)
         // history[1] = Model response (Tool Call)
         // history[2] = Function response (Tool Output)
         // history[3] = Model response (Final JSON)
-        
-        assert!(result.history.len() >= 4, "History should contain at least 4 turns (User, Model-Call, Function-Res, Model-Final)");
-        
+
+        assert!(
+            result.history.len() >= 4,
+            "History should contain at least 4 turns (User, Model-Call, Function-Res, Model-Final)"
+        );
+
         let tool_call = &result.history[1];
         if let Part::FunctionCall { function_call, .. } = &tool_call.parts[0] {
             assert_eq!(function_call.name, "read_file");
@@ -201,7 +207,10 @@ mod tests {
             assert_eq!(function_response.name, "read_file");
             // Verify content is from the actual README file on disk
             let content_str = function_response.response["content"].as_str().unwrap();
-            assert!(content_str.contains("Linux kernel"), "README content should contain 'Linux kernel'");
+            assert!(
+                content_str.contains("Linux kernel"),
+                "README content should contain 'Linux kernel'"
+            );
         } else {
             panic!("Expected function response in history[2]");
         }
