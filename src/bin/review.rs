@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::Parser;
 use sashiko::{
     agent::{Agent, prompts::PromptRegistry, tools::ToolBox},
-    db::Database,
     git_ops::GitWorktree,
     settings::Settings,
 };
@@ -14,13 +13,7 @@ use tracing::{error, info};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long)]
-    patchset: Option<i64>,
-
-    #[arg(long)]
-    message_id: Option<String>,
-
-    /// Read patchset data from JSON via Stdin.
+    /// Read patchset data from JSON via Stdin (Deprecated: Always true).
     #[arg(long)]
     json: bool,
 
@@ -63,55 +56,18 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let settings = Settings::new().unwrap();
 
-    // Data Loading Strategy: DB vs JSON Stdin
-    let (patchset_id, subject, patches) = if args.json {
-        // Read from Stdin (Line-based for conversational support)
-        let mut buffer = String::new();
-        std::io::stdin().read_line(&mut buffer)?;
-        let input: ReviewInput = serde_json::from_str(&buffer)?;
+    // Data Loading: Always from Stdin (JSON)
+    let mut buffer = String::new();
+    if std::io::stdin().read_line(&mut buffer)? == 0 {
+         anyhow::bail!("No input provided on stdin");
+    }
+    let input: ReviewInput = serde_json::from_str(&buffer)?;
 
-        info!(
-            "Loaded patchset via JSON: {} (ID: {})",
-            input.subject, input.id
-        );
-        (input.id, input.subject, input.patches)
-    } else {
-        // Read from DB
-        let db = Database::new(&settings.database).await?;
-
-        // Check patchset exists
-        let patchset_json = if let Some(id) = args.patchset {
-            db.get_patchset_details(id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Patchset {} not found", id))?
-        } else if let Some(ref msg_id) = args.message_id {
-            db.get_patchset_details_by_msgid(msg_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Patchset for message ID {} not found", msg_id))?
-        } else {
-            return Err(anyhow::anyhow!(
-                "Either --patchset, --message-id, or --json must be provided"
-            ));
-        };
-
-        let pid = patchset_json["id"]
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("Patchset ID not found in database response"))?;
-        let subj = patchset_json["subject"]
-            .as_str()
-            .unwrap_or("Unknown")
-            .to_string();
-
-        info!("Reviewing patchset: {} (ID: {})", subj, pid);
-
-        let db_diffs = db.get_patch_diffs(pid).await?;
-        let patches = db_diffs
-            .into_iter()
-            .map(|(_id, idx, diff)| PatchInput { index: idx, diff })
-            .collect();
-
-        (pid, subj, patches)
-    };
+    info!(
+        "Loaded patchset via JSON: {} (ID: {})",
+        input.subject, input.id
+    );
+    let (patchset_id, subject, patches) = (input.id, input.subject, input.patches);
 
     let baseline = args.baseline.unwrap_or_else(|| "HEAD".to_string());
     info!("Using baseline: {}", baseline);
