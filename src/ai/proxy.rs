@@ -1,4 +1,4 @@
-use crate::ai::gemini::{GeminiClient, GenerateContentRequest, QuotaError};
+use crate::ai::gemini::{GeminiClient, GenerateContentRequest, GeminiError};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -91,10 +91,11 @@ pub async fn handle_generate(
                 return (StatusCode::OK, Json(response)).into_response();
             }
             Err(e) => {
-                if let Some(retry_after) = e.downcast_ref::<QuotaError>() {
-                    state.quota_manager.report_quota_error(retry_after.0).await;
-                    // Loop will wait in step 1
-                    continue;
+                if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
+                    if let GeminiError::QuotaExceeded(duration) = gemini_err {
+                        state.quota_manager.report_quota_error(*duration).await;
+                        continue;
+                    }
                 }
 
                 error!("Gemini Proxy Error: {}", e);

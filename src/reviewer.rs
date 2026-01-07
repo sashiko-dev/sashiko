@@ -1,7 +1,7 @@
 use crate::ReviewStatus;
 use crate::ai::cache::CacheManager;
 use crate::ai::gemini::{
-    GeminiClient, GenerateContentRequest, GenerateContentWithCacheRequest, QuotaError,
+    GeminiClient, GenerateContentRequest, GenerateContentWithCacheRequest, GeminiError,
 };
 use crate::ai::proxy::QuotaManager;
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
@@ -162,6 +162,8 @@ impl Reviewer {
             let patchset_id = patchset.id;
             let subject = patchset.subject.clone().unwrap_or("Unknown".to_string());
             let cache_name = current_cache_name.clone();
+            let cache_manager = self.cache_manager.clone();
+            let active_cache_name = self.active_cache_name.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -350,6 +352,8 @@ impl Reviewer {
                                 Some(*index),
                                 quota_manager.clone(),
                                 cache_name.as_deref(),
+                                cache_manager.clone(),
+                                active_cache_name.clone(),
                                 review_id,
                             )
                             .await
@@ -603,6 +607,8 @@ async fn run_review_tool(
     review_index: Option<i64>,
     quota_manager: Arc<QuotaManager>,
     cache_name: Option<&str>,
+    cache_manager: Arc<CacheManager>,
+    active_cache_name: Arc<Mutex<Option<String>>>,
     review_id: i64,
 ) -> Result<serde_json::Value> {
     let exe_path = std::env::current_exe()?;
@@ -714,9 +720,11 @@ async fn run_review_tool(
                                         match client.generate_content_single(&req).await {
                                             Ok(resp) => break Ok(resp),
                                             Err(e) => {
-                                                if let Some(qe) = e.downcast_ref::<QuotaError>() {
-                                                    quota_manager.report_quota_error(qe.0).await;
-                                                    continue;
+                                                if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
+                                                    if let GeminiError::QuotaExceeded(d) = gemini_err {
+                                                        quota_manager.report_quota_error(*d).await;
+                                                        continue;
+                                                    }
                                                 }
                                                 break Err(e);
                                             }
@@ -756,15 +764,37 @@ async fn run_review_tool(
                                     )
                                 {
                                     // Handle Cached AI Request
+                                    let mut current_req = req;
                                     let resp_payload = loop {
                                         quota_manager.wait_for_access().await;
-                                        match client.generate_content_with_cache_single(&req).await
+                                        match client.generate_content_with_cache_single(&current_req).await
                                         {
                                             Ok(resp) => break Ok(resp),
                                             Err(e) => {
-                                                if let Some(qe) = e.downcast_ref::<QuotaError>() {
-                                                    quota_manager.report_quota_error(qe.0).await;
-                                                    continue;
+                                                if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
+                                                    match gemini_err {
+                                                        GeminiError::QuotaExceeded(d) => {
+                                                            quota_manager.report_quota_error(*d).await;
+                                                            continue;
+                                                        }
+                                                        GeminiError::PermissionDenied(_) => {
+                                                            warn!("Permission denied for cache. Refreshing cache...");
+                                                            match cache_manager.ensure_cache().await {
+                                                                Ok(new_name) => {
+                                                                    info!("Refreshed cache: {}", new_name);
+                                                                    current_req.cached_content = new_name.clone();
+                                                                    let mut guard = active_cache_name.lock().await;
+                                                                    *guard = Some(new_name);
+                                                                    continue;
+                                                                }
+                                                                Err(create_err) => {
+                                                                    error!("Failed to recreate cache: {}", create_err);
+                                                                    break Err(e);
+                                                                }
+                                                            }
+                                                        }
+                                                        _ => break Err(e),
+                                                    }
                                                 }
                                                 break Err(e);
                                             }

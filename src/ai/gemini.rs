@@ -186,13 +186,25 @@ pub trait GenAiClient: Send + Sync {
 }
 
 #[derive(Debug)]
-pub struct QuotaError(pub Duration);
-impl std::fmt::Display for QuotaError {
+pub enum GeminiError {
+    QuotaExceeded(Duration),
+    PermissionDenied(String),
+    ApiError(reqwest::StatusCode, String),
+    Other(String),
+}
+
+impl std::fmt::Display for GeminiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Quota exceeded, retry in {:?}", self.0)
+        match self {
+            GeminiError::QuotaExceeded(d) => write!(f, "Quota exceeded, retry in {:?}", d),
+            GeminiError::PermissionDenied(msg) => write!(f, "Permission denied: {}", msg),
+            GeminiError::ApiError(s, msg) => write!(f, "Gemini API error ({}): {}", s, msg),
+            GeminiError::Other(msg) => write!(f, "{}", msg),
+        }
     }
 }
-impl std::error::Error for QuotaError {}
+
+impl std::error::Error for GeminiError {}
 
 pub struct GeminiClient {
     api_key: String,
@@ -331,14 +343,20 @@ impl GeminiClient {
             } else {
                 30.0
             };
-            return Err(anyhow::Error::new(QuotaError(Duration::from_secs_f64(
+            return Err(GeminiError::QuotaExceeded(Duration::from_secs_f64(
                 retry_seconds + 1.0,
-            ))));
+            ))
+            .into());
         }
 
         let status = res.status();
         let error_text = res.text().await?;
-        anyhow::bail!("Gemini API error ({}): {}", status, error_text);
+        
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(GeminiError::PermissionDenied(error_text).into());
+        }
+
+        Err(GeminiError::ApiError(status, error_text).into())
     }
 }
 
@@ -352,14 +370,15 @@ impl GenAiClient for GeminiClient {
             match self.generate_content_single(&request).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if let Some(quota_err) = e.downcast_ref::<QuotaError>() {
-                        let sleep_duration = quota_err.0;
-                        tracing::warn!(
-                            "Gemini API quota exceeded. Retrying in {:.2}s...",
-                            sleep_duration.as_secs_f64()
-                        );
-                        sleep(sleep_duration).await;
-                        continue;
+                    if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
+                        if let GeminiError::QuotaExceeded(sleep_duration) = gemini_err {
+                            tracing::warn!(
+                                "Gemini API quota exceeded. Retrying in {:.2}s...",
+                                sleep_duration.as_secs_f64()
+                            );
+                            sleep(*sleep_duration).await;
+                            continue;
+                        }
                     }
                     return Err(e);
                 }
@@ -419,14 +438,15 @@ impl GenAiClient for GeminiClient {
             match self.generate_content_with_cache_single(&request).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if let Some(quota_err) = e.downcast_ref::<QuotaError>() {
-                        let sleep_duration = quota_err.0;
-                        tracing::warn!(
-                            "Gemini API quota exceeded (cache). Retrying in {:.2}s...",
-                            sleep_duration.as_secs_f64()
-                        );
-                        sleep(sleep_duration).await;
-                        continue;
+                    if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
+                        if let GeminiError::QuotaExceeded(sleep_duration) = gemini_err {
+                            tracing::warn!(
+                                "Gemini API quota exceeded (cache). Retrying in {:.2}s...",
+                                sleep_duration.as_secs_f64()
+                            );
+                            sleep(*sleep_duration).await;
+                            continue;
+                        }
                     }
                     return Err(e);
                 }
