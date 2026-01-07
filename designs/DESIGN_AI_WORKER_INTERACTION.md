@@ -1,17 +1,17 @@
-# Sashiko AI Agent Interaction Design
+# Sashiko AI Worker Interaction Design
 
 ## Overview
 
-This document describes the architecture and protocol for the interaction between the main `sashiko` application (Parent) and the isolated AI Review Agents (Child processes).
+This document describes the architecture and protocol for the interaction between the main `sashiko` application (Parent) and the isolated AI Review Workers (Child processes).
 
-To ensure robust resource management, centralized rate limiting, and process isolation, the AI agents do not communicate directly with external LLM providers. Instead, they act as "dumb" workers that delegate all LLM generation requests to the parent process via a JSON-based IPC (Inter-Process Communication) protocol over standard input/output streams.
+To ensure robust resource management, centralized rate limiting, and process isolation, the AI workers do not communicate directly with external LLM providers. Instead, they act as "dumb" workers that delegate all LLM generation requests to the parent process via a JSON-based IPC (Inter-Process Communication) protocol over standard input/output streams.
 
 ## Architecture
 
 ```mermaid
 sequenceDiagram
     participant P as Sashiko (Parent)
-    participant C as Review Agent (Child)
+    participant C as Review Worker (Child)
     participant LLM as External Provider (Gemini)
 
     P->>C: Spawn Process (stdin/stdout/stderr piped)
@@ -50,7 +50,7 @@ sequenceDiagram
 
 *   **Stdin (Parent -> Child)**: Used for sending the initial configuration payload and subsequent AI responses (or errors).
 *   **Stdout (Child -> Parent)**: Used for sending AI requests (wrapped in a protocol envelope) and the final review result.
-*   **Stderr (Child -> Parent)**: Used exclusively for unstructured logging (info, warn, error). The parent monitors this stream to log agent activities to the main system log.
+*   **Stderr (Child -> Parent)**: Used exclusively for unstructured logging (info, warn, error). The parent monitors this stream to log worker activities to the main system log.
 
 ## Protocol Definition
 
@@ -69,8 +69,8 @@ The parent starts the child process and immediately sends the **Review Input** p
     }
     ```
 
-### 2. AI Request (Agent -> Parent)
-When the agent needs to query the LLM, it emits a request message.
+### 2. AI Request (Worker -> Parent)
+When the worker needs to query the LLM, it emits a request message.
 
 *   **Direction**: Child -> Parent
 *   **Format**:
@@ -86,7 +86,7 @@ When the agent needs to query the LLM, it emits a request message.
     ```
 *   **Payload Schema**: Maps to `GenerateContentRequest` (Google Gemini API).
 
-### 3. AI Response (Parent -> Agent)
+### 3. AI Response (Parent -> Worker)
 The parent processes the request (handling authentication, networking, and quotas) and returns the result.
 
 *   **Direction**: Parent -> Child
@@ -102,7 +102,7 @@ The parent processes the request (handling authentication, networking, and quota
     ```
 *   **Payload Schema**: Maps to `GenerateContentResponse`.
 
-### 4. Protocol Error (Parent -> Agent)
+### 4. Protocol Error (Parent -> Worker)
 If the parent fails to execute the request (e.g., network failure after retries, invalid request), it returns an error.
 
 *   **Direction**: Parent -> Child
@@ -114,8 +114,8 @@ If the parent fails to execute the request (e.g., network failure after retries,
     }
     ```
 
-### 5. Final Result (Agent -> Parent)
-Upon completion, the agent outputs the final review data. This message **does not** have a `type` wrapper, allowing it to be distinct from protocol messages, or identified by specific fields (e.g., `patchset_id`).
+### 5. Final Result (Worker -> Parent)
+Upon completion, the worker outputs the final review data. This message **does not** have a `type` wrapper, allowing it to be distinct from protocol messages, or identified by specific fields (e.g., `patchset_id`).
 
 *   **Direction**: Child -> Parent
 *   **Format**:
@@ -135,10 +135,10 @@ Upon completion, the agent outputs the final review data. This message **does no
 *   **Strategy**: **Transparent Retry in Parent**.
     *   The child process is **blocked** on `stdin.read_line()`.
     *   The parent detects the 429 error.
-    *   The parent enters a global `QuotaManager` wait loop, pausing *all* competing requests from other agents.
+    *   The parent enters a global `QuotaManager` wait loop, pausing *all* competing requests from other workers.
     *   Once the quota resets (or backoff expires), the parent retries the request.
     *   The child eventually receives a successful `ai_response`, completely unaware of the delay.
-    *   **Benefit**: Agents do not need complex retry logic; the system naturally throttles.
+    *   **Benefit**: Workers do not need complex retry logic; the system naturally throttles.
 
 ### 2. Transport Failures (Broken Pipe)
 *   **Scenario**: The child process crashes or exits unexpectedly.
@@ -156,9 +156,9 @@ Upon completion, the agent outputs the final review data. This message **does no
 
 ### 4. Timeout Safety
 *   **Strategy**: While the LLM interaction can take time (especially with retries), there should be an upper bound on the *entire* review process or individual read operations if necessary.
-*   **Implementation**: The parent runs the IPC loop within a `tokio::select!` with a timeout (e.g., 30 minutes). If the agent hangs, the parent kills the child process.
+*   **Implementation**: The parent runs the IPC loop within a `tokio::select!` with a timeout (e.g., 30 minutes). If the worker hangs, the parent kills the child process.
 
 ## Implementation Details
 
-*   **StdioGeminiClient**: A structural implementation of the `GenAiClient` trait in the child process. It abstracts the serialization/deserialization of the IPC messages, making the `Agent` logic agnostic to the transport.
+*   **StdioGeminiClient**: A structural implementation of the `GenAiClient` trait in the child process. It abstracts the serialization/deserialization of the IPC messages, making the `Worker` logic agnostic to the transport.
 *   **QuotaManager**: A shared synchronization primitive (`Arc<QuotaManager>`) in the parent. It uses a `Mutex<Option<Instant>>` to track the "blocked until" timestamp, ensuring all threads respect the backoff signal from a single 429 response.

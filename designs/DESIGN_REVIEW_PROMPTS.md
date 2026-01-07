@@ -1,7 +1,7 @@
 # Design: Review Prompts Integration
 
 ## Goal
-Integrate the `masoncl/review-prompts` repository into `sashiko-review`. The agent must dynamically select and apply specific prompt modules based on the code being reviewed (e.g., specific subsystem rules, language-specific guidelines) and allow the LLM to access this knowledge base.
+Integrate the `masoncl/review-prompts` repository into `sashiko-review`. The worker must dynamically select and apply specific prompt modules based on the code being reviewed (e.g., specific subsystem rules, language-specific guidelines) and allow the LLM to access this knowledge base.
 
 ## 1. Prompt Repository Structure (Assumed/Standardized)
 We expect the external repository to follow a hierarchical structure:
@@ -30,10 +30,10 @@ The `sashiko-review` binary will accept a path to this repository:
 -   Env: `SASHIKO_PROMPTS_DIR`
 -   Default: `./review-prompts`
 
-## 3. Dynamic Prompt Resolution (`src/agent/prompts.rs`)
+## 3. Dynamic Prompt Resolution (`src/worker/prompts.rs`)
 
 ### A. Context Mapping
-The agent will analyze the `Patchset` to generate a `ContextProfile`:
+The worker will analyze the `Patchset` to generate a `ContextProfile`:
 -   **Touched Paths**: List of all modified files.
 -   **Detected Subsystems**: (e.g., if `net/core/dev.c` is touched -> `net`).
 -   **Detected Languages**: (e.g., `.rs` -> `Rust`, `.c` -> `C`).
@@ -75,7 +75,7 @@ To allow the LLM to "consult" the manual if the context is too large or if it ne
 
 ## 5. Implementation Plan (Addendum)
 
-### Update `src/agent/mod.rs`
+### Update `src/worker/mod.rs`
 -   Add `PromptRegistry` struct.
 -   Method `load_context(patchset) -> String`.
 
@@ -83,5 +83,5 @@ To allow the LLM to "consult" the manual if the context is too large or if it ne
 -   Check for `review-prompts` directory existence on startup.
 -   Error if missing (since we rely on it).
 
-### Update `src/agent/tools.rs`
+### Update `src/worker/tools.rs`
 -   Add `PromptTool` to the toolbox.

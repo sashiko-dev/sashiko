@@ -1,7 +1,7 @@
-# Design: Sashiko Review Agent
+# Design: Sashiko Review Worker
 
 ## Goal
-Implement an automated AI agent (`sashiko-review`) that uses **Gemini 3 Pro** to review Linux kernel patchsets. The agent should emulate a maintainer's review process, leveraging the `masoncl/review-prompts` philosophy. It requires read-only access to the git repository to inspect context (blame, history, file content) before delivering a verdict.
+Implement an automated AI worker (`sashiko-review`) that uses **Gemini 3 Pro** to review Linux kernel patchsets. The worker should emulate a maintainer's review process, leveraging the `masoncl/review-prompts` philosophy. It requires read-only access to the git repository to inspect context (blame, history, file content) before delivering a verdict.
 
 ## Architecture
 
@@ -15,7 +15,7 @@ A standalone CLI tool that interfaces with the existing `sashiko` database and t
 
 ### 2. Core Components
 
-#### A. `Agent` (`src/agent.rs`)
+#### A. `Worker` (`src/worker.rs`)
 The central orchestrator.
 - **Responsibility**: Manages the conversation loop with the LLM.
 - **State**: Holds conversation history (Messages), available Tools, and the DB connection.
@@ -34,7 +34,7 @@ A specialized client for the Google Generative AI API.
     -   Function Calling (`tools`, `function_declarations`).
     -   Streaming (optional, but good for long reviews).
 
-#### C. `ToolBox` (`src/agent/tools.rs`)
+#### C. `ToolBox` (`src/worker/tools.rs`)
 Provides a safe, read-only interface to the system.
 - **Git Tools**:
     - `git_show(ref, path)`: Read file content at specific revision.
@@ -44,8 +44,8 @@ Provides a safe, read-only interface to the system.
 - **Analysis Tools**:
     - `read_file_lines(path, start, end)`: Read specific line range.
     - `list_dir(path)`: Explore directory structure.
-- **Agent Tools**:
-    - `todo_write(task, status)`: Help agent track progress as required by prompts.
+- **Worker Tools**:
+    - `todo_write(task, status)`: Help worker track progress as required by prompts.
     - `read_prompt(name)`: Read specific guideline from `review-prompts/`.
 - **Safety**: Strictly validates paths to ensure they stay within the repo or submodule.
 
@@ -55,13 +55,13 @@ Provides a safe, read-only interface to the system.
 - **Worktree**: A dedicated `git worktree` where the patch is applied for analysis.
 
 
-#### D. `PromptRegistry` (`src/agent/prompts.rs`)
+#### D. `PromptRegistry` (`src/worker/prompts.rs`)
 -   **Dynamic Loading**: Instead of static prompts, implements the logic defined in `DESIGN_REVIEW_PROMPTS.md`.
 -   **Responsibility**:
     -   Scans the external `review-prompts` repository.
     -   Matches Patchset file paths to specific subsystem/language prompt files.
     -   Constructs the full System Prompt and Context block.
-    -   Provides tools for the Agent to browse these rules (`read_prompt`, `list_guidelines`).
+    -   Provides tools for the Worker to browse these rules (`read_prompt`, `list_guidelines`).
 -   **Config**: Requires `--prompts <PATH>` argument.
 
 ### 3. Data Flow
@@ -72,11 +72,11 @@ Provides a safe, read-only interface to the system.
     -   Fetch associated `Patches` and `Messages`.
     -   Identify the base git repo/commit (using `baselines` table).
 3.  **Analysis Loop**:
-    -   Agent constructs prompt: "Review patchset: [Subject]..."
+    -   Worker constructs prompt: "Review patchset: [Subject]..."
     -   **Gemini**: "I need to see `net/core/dev.c` lines 100-150 to check locking."
-    -   **Agent**: Runs `read_file` -> Returns content.
+    -   **Worker**: Runs `read_file` -> Returns content.
     -   **Gemini**: "Checks out. But who touched this last? `git blame` please."
-    -   **Agent**: Runs `git blame` -> Returns result.
+    -   **Worker**: Runs `git blame` -> Returns result.
     -   **Gemini**: "Looks good. Reviewed-by: Gemini <...>"
 4.  **Storage**:
     -   Save output to `reviews` table.

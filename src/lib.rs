@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod ai;
 pub mod api;
 pub mod baseline;
@@ -11,6 +10,7 @@ pub mod nntp;
 pub mod patch;
 pub mod reviewer;
 pub mod settings;
+pub mod worker;
 
 use std::fmt;
 use std::str::FromStr;

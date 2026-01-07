@@ -1,10 +1,10 @@
-# Design: Security - Sashiko Review Agent
+# Design: Security - Sashiko Review Worker
 
 ## 1. Overview
-This document outlines the security architecture for the `sashiko-review` agent. The agent is a high-privilege automated component that interacts with the Linux kernel source code, git history, and AI models. The primary security goal is to enable the agent to perform deep code analysis while preventing unauthorized system access, data exfiltration, or integrity violations.
+This document outlines the security architecture for the `sashiko-review` worker. The worker is a high-privilege automated component that interacts with the Linux kernel source code, git history, and AI models. The primary security goal is to enable the worker to perform deep code analysis while preventing unauthorized system access, data exfiltration, or integrity violations.
 
 ## 2. Core Security Principles
-*   **Least Privilege**: The agent is granted only the permissions strictly necessary for analysis (Read-Only).
+*   **Least Privilege**: The worker is granted only the permissions strictly necessary for analysis (Read-Only).
 *   **Input Sanitization**: All inputs from the LLM (tool arguments) are treated as untrusted.
 *   **Isolation**: Git operations run in a restricted context.
 
@@ -12,13 +12,13 @@ This document outlines the security architecture for the `sashiko-review` agent.
 
 ### 3.1. Linux Source Code & Git History
 *   **Requirement**: Full **READ** access.
-*   **Scope**: The agent must be able to read any file within the Linux kernel source tree and query the full git history (logs, blames, diffs).
-*   **Restriction**: **LIMITED WRITE** access. The agent is primarily read-only but is granted the ability to write specific files (e.g., `review-inline.txt`) to the disposable worktree using the `write_file` tool. It must never be able to modify the repository configuration, commit history, or other critical files.
+*   **Scope**: The worker must be able to read any file within the Linux kernel source tree and query the full git history (logs, blames, diffs).
+*   **Restriction**: **LIMITED WRITE** access. The worker is primarily read-only but is granted the ability to write specific files (e.g., `review-inline.txt`) to the disposable worktree using the `write_file` tool. It must never be able to modify the repository configuration, commit history, or other critical files.
 
 ### 3.2. Prompts
 *   **Requirement**: Full **READ** access.
-*   **Scope**: The agent must be able to read all prompt templates and configuration files in the `review-prompts` directory.
-*   **Restriction**: **NO WRITE** access. The agent cannot modify its own instructions.
+*   **Scope**: The worker must be able to read all prompt templates and configuration files in the `review-prompts` directory.
+*   **Restriction**: **NO WRITE** access. The worker cannot modify its own instructions.
 
 ## 4. Threat Model & Mitigations
 
@@ -67,7 +67,7 @@ Implemented via `git` CLI, strictly parameterized.
 
 1.  **Worktree Isolation**:
     *   Each review session should ideally spawn a temporary `git worktree` in `review_trees/`.
-    *   This ensures that even if the agent *could* modify files (e.g. via a bug in `git apply` before the review), it only affects a disposable directory.
+    *   This ensures that even if the worker *could* modify files (e.g. via a bug in `git apply` before the review), it only affects a disposable directory.
     *   Cleanup: The worktree must be strictly removed after the session.
 
 2.  **Path Sanitization Logic (Rust)**:

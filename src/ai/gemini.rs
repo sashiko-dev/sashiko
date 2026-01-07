@@ -274,7 +274,10 @@ impl GeminiClient {
         request: &GenerateContentRequest,
     ) -> Result<GenerateContentResponse> {
         let estimated = Self::estimate_tokens(request);
-        tracing::info!("Sending Gemini request. Estimated prompt tokens: {}", estimated);
+        tracing::info!(
+            "Sending Gemini request. Estimated prompt tokens: {}",
+            estimated
+        );
         self.check_rate_limit(estimated).await;
 
         let url = format!(
@@ -307,7 +310,10 @@ impl GeminiClient {
                 }
             }
         }
-        tracing::info!("Sending Gemini request (cached). Estimated prompt tokens: {}", total);
+        tracing::info!(
+            "Sending Gemini request (cached). Estimated prompt tokens: {}",
+            total
+        );
         self.check_rate_limit(total).await;
 
         // When using cached content, the URL model parameter is effectively ignored by the backend
@@ -368,15 +374,14 @@ impl GeminiClient {
                 retry_seconds,
                 error_text
             );
-            return Err(GeminiError::QuotaExceeded(Duration::from_secs_f64(
-                retry_seconds + 1.0,
-            ))
-            .into());
+            return Err(
+                GeminiError::QuotaExceeded(Duration::from_secs_f64(retry_seconds + 1.0)).into(),
+            );
         }
 
         let status = res.status();
         let error_text = res.text().await?;
-        
+
         if status == reqwest::StatusCode::FORBIDDEN {
             tracing::error!("Gemini Permission Denied (403): {}", error_text);
             return Err(GeminiError::PermissionDenied(error_text).into());

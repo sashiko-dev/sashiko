@@ -1,7 +1,7 @@
 use crate::ReviewStatus;
 use crate::ai::cache::CacheManager;
 use crate::ai::gemini::{
-    GeminiClient, GenerateContentRequest, GenerateContentWithCacheRequest, GeminiError,
+    GeminiClient, GeminiError, GenerateContentRequest, GenerateContentWithCacheRequest,
 };
 use crate::ai::proxy::QuotaManager;
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
@@ -37,7 +37,7 @@ pub struct Reviewer {
     active_cache_name: Arc<Mutex<Option<String>>>,
 }
 
-use crate::agent::tools::ToolBox;
+use crate::worker::tools::ToolBox;
 
 impl Reviewer {
     pub fn new(db: Arc<Database>, settings: Settings) -> Self {
@@ -900,7 +900,10 @@ async fn run_review_tool(
         }
         Err(_) => {
             // Timeout occurred
-            error!("Review tool timed out after {} seconds. Killing process.", settings.review.timeout_seconds);
+            error!(
+                "Review tool timed out after {} seconds. Killing process.",
+                settings.review.timeout_seconds
+            );
             let _ = child.kill().await;
 
             if let Some(idx) = review_index {

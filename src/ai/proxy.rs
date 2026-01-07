@@ -1,4 +1,4 @@
-use crate::ai::gemini::{GeminiClient, GenerateContentRequest, GeminiError};
+use crate::ai::gemini::{GeminiClient, GeminiError, GenerateContentRequest};
 use axum::{
     extract::{Json, State},
     http::StatusCode,

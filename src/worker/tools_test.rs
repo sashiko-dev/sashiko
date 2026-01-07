@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::agent::tools::ToolBox;
+    use crate::worker::tools::ToolBox;
     use serde_json::json;
     use std::path::PathBuf;
     use tokio::runtime::Runtime;

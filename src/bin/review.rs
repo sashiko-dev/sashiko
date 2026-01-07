@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use sashiko::{
-    agent::{Agent, prompts::PromptRegistry, tools::ToolBox},
     git_ops::GitWorktree,
     settings::Settings,
+    worker::{Worker, prompts::PromptRegistry, tools::ToolBox},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
 
             let tools = ToolBox::new(worktree.path.clone());
             let prompts = PromptRegistry::new(args.prompts.clone());
-            let mut agent = Agent::new(
+            let mut worker = Worker::new(
                 client,
                 tools,
                 prompts,
@@ -234,7 +234,7 @@ async fn main() -> Result<()> {
                 "patches": patches_to_review
             });
 
-            match agent.run(patchset_val).await {
+            match worker.run(patchset_val).await {
                 Ok(result) => {
                     info!("AI review completed (or stopped).");
 

@@ -5,18 +5,18 @@ pub mod tools;
 #[cfg(test)]
 mod tools_test;
 
-use crate::agent::prompts::PromptRegistry;
-use crate::agent::tools::ToolBox;
 use crate::ai::gemini::{
     Content, FunctionResponse, GenAiClient, GenerateContentRequest,
     GenerateContentWithCacheRequest, GenerationConfig, Part,
 };
 use crate::ai::token_budget::TokenBudget;
+use crate::worker::prompts::PromptRegistry;
+use crate::worker::tools::ToolBox;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-pub struct Agent {
+pub struct Worker {
     client: Box<dyn GenAiClient>,
     tools: ToolBox,
     prompts: PromptRegistry,
@@ -25,7 +25,7 @@ pub struct Agent {
     cache_name: Option<String>,
 }
 
-pub struct AgentResult {
+pub struct WorkerResult {
     pub output: Option<Value>,
     pub error: Option<String>,
     pub input_context: String,
@@ -34,7 +34,7 @@ pub struct AgentResult {
     pub tokens_out: u32,
 }
 
-impl Agent {
+impl Worker {
     pub fn new(
         client: Box<dyn GenAiClient>,
         tools: ToolBox,
@@ -116,7 +116,7 @@ impl Agent {
         }
     }
 
-    pub async fn run(&mut self, _patchset: Value) -> Result<AgentResult> {
+    pub async fn run(&mut self, _patchset: Value) -> Result<WorkerResult> {
         let system_prompt = self.prompts.get_system_prompt().await?;
 
         let initial_user_message = if self.cache_name.is_some() {
@@ -172,9 +172,9 @@ impl Agent {
         loop {
             turns += 1;
             if turns > MAX_TURNS {
-                return Ok(AgentResult {
+                return Ok(WorkerResult {
                     output: None,
-                    error: Some(format!("Agent exceeded maximum turns ({})", MAX_TURNS)),
+                    error: Some(format!("Worker exceeded maximum turns ({})", MAX_TURNS)),
                     input_context,
                     history: self.history.clone(),
                     tokens_in: total_tokens_in,
@@ -327,7 +327,7 @@ impl Agent {
                     anyhow!("Failed to parse JSON response: {}. Text: {}", e, final_text)
                 })?;
 
-                return Ok(AgentResult {
+                return Ok(WorkerResult {
                     output: Some(json_val),
                     error: None,
                     input_context,

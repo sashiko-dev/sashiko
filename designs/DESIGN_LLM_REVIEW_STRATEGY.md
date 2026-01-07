@@ -36,11 +36,11 @@ The System Prompt must strictly define the persona to avoid "helpful assistant" 
 ## 3. Context Management & Token Efficiency
 
 ### A. The "Needle in a Haystack" Problem
-The Linux kernel is too large for the context window. The agent must *retrieval-augment* itself.
+The Linux kernel is too large for the context window. The worker must *retrieval-augment* itself.
 -   **Initial Context**: Cover letter + Patch diffs (limited to N lines).
--   **Active Retrieval**: The Agent *must* use tools (`git_grep`, `read_file`) to fetch definitions of modified functions.
+-   **Active Retrieval**: The Worker *must* use tools (`git_grep`, `read_file`) to fetch definitions of modified functions.
     -   *Rule*: "If a patch modifies `foo()`, you must read the definition of `foo()` unless it's trivial."
--   **Diff Context Expansion**: Allow the agent to request `git_diff -U20` if the default context is insufficient.
+-   **Diff Context Expansion**: Allow the worker to request `git_diff -U20` if the default context is insufficient.
 
 ### B. Smart Pruning
 -   **Ignore**: Documentation files (unless checking typos), `MAINTAINERS` updates (unless verifying logic), generated files.
@@ -51,8 +51,8 @@ The Linux kernel is too large for the context window. The agent must *retrieval-
 ### A. Tool Use Enforcement
 -   **Problem**: LLMs might hallucinate file content or API existence.
 -   **Solution**:
-    -   **Mandatory Verification**: Before claiming "function X does not exist", the agent must execute `git_grep X`.
-    -   **Loop Prevention**: If the agent asks for the same file twice, interrupt and prompt: "You already have this. Proceed to analysis."
+    -   **Mandatory Verification**: Before claiming "function X does not exist", the worker must execute `git_grep X`.
+    -   **Loop Prevention**: If the worker asks for the same file twice, interrupt and prompt: "You already have this. Proceed to analysis."
 
 ### B. Structured Output (JSON Mode)
 For the final verdict, we rely on JSON to ensure machine-readability by `sashiko`.
@@ -77,12 +77,12 @@ If the LLM generates a review, we can run a second "Critic" pass (cheaper model 
 ## 5. Linux Kernel Specific Tricks
 
 ### A. API Evolution Check
-If the patch uses a deprecated API (e.g., `simple_strtol`), the agent should suggest the modern alternative (`kstrtol`) by referencing internal knowledge bases or previously ingested examples.
+If the patch uses a deprecated API (e.g., `simple_strtol`), the worker should suggest the modern alternative (`kstrtol`) by referencing internal knowledge bases or previously ingested examples.
 
 ## 6. Limitations & Mitigation
 
 ### A. Compilation (The Missing Link)
--   **Limitation**: The agent cannot reliably compile the kernel (takes too long, requires huge dependencies/config).
+-   **Limitation**: The worker cannot reliably compile the kernel (takes too long, requires huge dependencies/config).
 -   **Mitigation**: Acknowledge this. "I have performed a static analysis. I cannot verify runtime behavior or compilation success."
 
 ### B. Hallucination
@@ -96,6 +96,6 @@ If the patch uses a deprecated API (e.g., `simple_strtol`), the agent should sug
 ## 7. Implementation Roadmap (Features)
 
 1.  **Phase 1**: Basic Review (Text output, diff-only context).
-2.  **Phase 2**: Tool-Assisted (Agent can `read_file`, `grep`).
+2.  **Phase 2**: Tool-Assisted (Worker can `read_file`, `grep`).
 3.  **Phase 3**: Structured JSON Output & Database Integration.
 4.  **Phase 4**: Multi-turn "Critic" Loop.

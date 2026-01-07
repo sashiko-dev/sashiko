@@ -9,7 +9,7 @@ groups = ["org.kernel.vger.linux-kernel"]
 
 [ai]
 provider = "gemini"
-model = "gemini-3-pro-preview"
+model = "gemini-3-flash-preview"
 max_input_words = 150000
 rate_limit_tokens_per_minute = 900000
 

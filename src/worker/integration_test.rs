@@ -1,11 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use crate::agent::{Agent, prompts::PromptRegistry, tools::ToolBox};
     use crate::ai::gemini::{
         CachedContent, Candidate, Content, CreateCachedContentRequest, FunctionCall, GenAiClient,
         GenerateContentRequest, GenerateContentResponse, GenerateContentWithCacheRequest, Part,
         UsageMetadata,
     };
+    use crate::worker::{Worker, prompts::PromptRegistry, tools::ToolBox};
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::VecDeque;
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_integration_sanity() {
+    async fn test_worker_integration_sanity() {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
@@ -153,7 +153,7 @@ mod tests {
 
         let tools = ToolBox::new(linux_path);
         let prompts = PromptRegistry::new(PathBuf::from("review-prompts"));
-        let mut agent = Agent::new(client, tools, prompts, 150_000, None);
+        let mut worker = Worker::new(client, tools, prompts, 150_000, None);
 
         let patchset = json!({
             "subject": "Test Patch",
@@ -161,13 +161,13 @@ mod tests {
             "patches": []
         });
 
-        let result = agent.run(patchset).await.expect("Agent run failed");
+        let result = worker.run(patchset).await.expect("Worker run failed");
         let review = result.output.expect("No output");
         assert_eq!(review["summary"], "Mock summary");
     }
 
     #[tokio::test]
-    async fn test_agent_tool_use() {
+    async fn test_worker_tool_use() {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
@@ -190,7 +190,7 @@ mod tests {
 
         let tools = ToolBox::new(linux_path);
         let prompts = PromptRegistry::new(PathBuf::from("review-prompts"));
-        let mut agent = Agent::new(client, tools, prompts, 150_000, None);
+        let mut worker = Worker::new(client, tools, prompts, 150_000, None);
 
         let patchset = json!({
             "subject": "Docs update",
@@ -198,7 +198,7 @@ mod tests {
             "patches": []
         });
 
-        let result = agent.run(patchset).await.expect("Agent run failed");
+        let result = worker.run(patchset).await.expect("Worker run failed");
 
         // Verify history has the tool call and response
         // History:
