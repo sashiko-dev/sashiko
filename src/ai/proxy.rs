@@ -91,11 +91,9 @@ pub async fn handle_generate(
                 return (StatusCode::OK, Json(response)).into_response();
             }
             Err(e) => {
-                if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
-                    if let GeminiError::QuotaExceeded(duration) = gemini_err {
-                        state.quota_manager.report_quota_error(*duration).await;
-                        continue;
-                    }
+                if let Some(GeminiError::QuotaExceeded(duration)) = e.downcast_ref::<GeminiError>() {
+                    state.quota_manager.report_quota_error(*duration).await;
+                    continue;
                 }
 
                 error!("Gemini Proxy Error: {}", e);

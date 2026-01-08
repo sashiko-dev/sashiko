@@ -364,12 +364,11 @@ mod tests {
     use super::*;
 
     fn create_registry() -> BaselineRegistry {
-        let mut entries = Vec::new();
-        entries.push(MaintainersEntry {
+        let entries = vec![MaintainersEntry {
             subsystem: "NETWORKING".to_string(),
             trees: vec![("git://net-next.git".to_string(), None)],
             patterns: vec!["net/".to_string()],
-        });
+        }];
         let mut remote_map = HashMap::new();
         remote_map.insert("git://net-next.git".to_string(), "net-next".to_string());
         BaselineRegistry {

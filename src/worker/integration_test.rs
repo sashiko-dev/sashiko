@@ -137,7 +137,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_integration_sanity() {
         let _ = tracing_subscriber::fmt::try_init();
-        let (linux_path, prompts_path) = get_test_paths();
+        let (linux_path, _prompts_path) = get_test_paths();
 
         let mock_response = json!({
             "analysis_trace": ["Trace 1"],
@@ -169,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_tool_use() {
         let _ = tracing_subscriber::fmt::try_init();
-        let (linux_path, prompts_path) = get_test_paths();
+        let (linux_path, _prompts_path) = get_test_paths();
 
         // Sequence of responses:
         // 1. Tool call: read_files([{"path": "README"}])
