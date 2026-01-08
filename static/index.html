@@ -798,9 +798,9 @@
             if (!thead) return;
 
             if (state.listMode === 'patchsets') {
-                thead.innerHTML = `<tr><th>Subject</th><th style="width:120px">Author</th><th style="width:50px">Parts</th><th style="width:80px">Date</th><th style="width:80px">Status</th></tr>`;
+                thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:50px">Parts</th><th style="width:100px">Date</th><th style="width:90px">Regressions</th><th style="width:80px">Status</th></tr>`;
             } else {
-                thead.innerHTML = `<tr><th>Subject</th><th style="width:120px">Author</th><th style="width:80px">Date</th><th style="width:30px"></th></tr>`;
+                thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:30px"></th></tr>`;
             }
         }
 
@@ -826,6 +826,24 @@
                 const row = document.createElement('tr');
                 const date = formatDate(p.date);
 
+                // Parse author
+                let authorName = p.author || 'unknown';
+                let authorEmail = '';
+                const emailMatch = authorName.match(/^(.*?)\s*<(.+)>$/);
+                if (emailMatch) {
+                    authorName = emailMatch[1].trim();
+                    authorEmail = emailMatch[2].trim();
+                } else if (authorName.includes('@')) {
+                    // Just an email?
+                    authorEmail = authorName;
+                    authorName = '';
+                }
+
+                const authorHtml = `
+                    <div>${escapeHtml(authorName)}</div>
+                    <div style="color:#666; font-size:0.9em;">${escapeHtml(authorEmail)}</div>
+                `;
+
                 if (state.listMode === 'patchsets') {
                     const parts = (p.received_parts === p.total_parts && p.total_parts > 0)
                         ? `${p.total_parts}`
@@ -841,11 +859,16 @@
                         tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
                     }
 
+                    const regressionCount = p.regression_count || 0;
+                    const regStyle = regressionCount > 0 ? 'color:#d32f2f; font-weight:bold;' : 'color:#2e7d32;';
+                    const regText = regressionCount > 0 ? `${regressionCount} found` : '-';
+
                     row.innerHTML = `
                         <td>${escapeHtml(p.subject) || '(no subject)'}${tagsHtml}</td>
-                        <td>${escapeHtml(p.author) || 'unknown'}</td>
+                        <td style="line-height:1.2;">${authorHtml}</td>
                         <td>${parts}</td>
                         <td>${date}</td>
+                        <td style="${regStyle}">${regText}</td>
                         <td><span class="status-badge status-${p.status}">${p.status || 'Pending'}</span></td>
                     `;
                 } else {
@@ -856,7 +879,7 @@
 
                     row.innerHTML = `
                         <td>${escapeHtml(p.subject) || '(no subject)'}</td>
-                        <td>${escapeHtml(p.author) || 'unknown'}</td>
+                        <td style="line-height:1.2;">${authorHtml}</td>
                         <td>${date}</td>
                         <td><button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard('${escapeHtml(p.message_id)}')">📋</button></td>
                     `;

@@ -29,6 +29,7 @@ pub struct PatchsetRow {
     pub total_parts: Option<u32>,
     pub received_parts: Option<u32>,
     pub subsystems: Vec<String>,
+    pub regression_count: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1456,7 +1457,21 @@ impl Database {
         // build_search returns "WHERE author ...".
 
         let sql = format!(
-            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ',') 
+            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
+             (
+                SELECT SUM(
+                    CASE 
+                        WHEN json_type(ai.output_raw, '$.findings') = 'array' 
+                        THEN json_array_length(ai.output_raw, '$.findings')
+                        WHEN json_type(ai.output_raw, '$.regressions') = 'array' 
+                        THEN json_array_length(ai.output_raw, '$.regressions')
+                        ELSE 0
+                    END
+                )
+                FROM reviews r 
+                JOIN ai_interactions ai ON r.interaction_id = ai.id
+                WHERE r.patchset_id = p.id
+             ) as regression_count
              FROM patchsets p
              LEFT JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
              LEFT JOIN subsystems s ON ps.subsystem_id = s.id
@@ -1498,6 +1513,7 @@ impl Database {
                 total_parts: row.get(7).ok(),
                 received_parts: row.get(8).ok(),
                 subsystems,
+                regression_count: row.get(10).ok(),
             });
         }
         Ok(patchsets)
@@ -1820,6 +1836,7 @@ impl Database {
                 total_parts: row.get(7).ok(),
                 received_parts: row.get(8).ok(),
                 subsystems: Vec::new(),
+                regression_count: None,
             });
         }
         Ok(patchsets)
