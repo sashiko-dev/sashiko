@@ -223,8 +223,8 @@
             gap: 12px;
             font-size: 0.9em;
             color: var(--text-muted);
-            background: #fff;
-            border: 1px solid var(--border-light);
+            /* background: #fff; */
+            /* border: 1px solid var(--border-light); */
             border-radius: 4px;
             padding: 8px 12px;
             margin-top: 20px;
@@ -929,7 +929,7 @@
 
                     const regressionCount = p.regression_count || 0;
                     const regStyle = regressionCount > 0 ? 'color:#d32f2f; font-weight:bold;' : 'color:#2e7d32;';
-                    const regText = regressionCount > 0 ? `${regressionCount} found` : '-';
+                    const regText = regressionCount > 0 ? `${regressionCount}` : '-';
 
                     row.innerHTML = `
                         <td><div>${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
