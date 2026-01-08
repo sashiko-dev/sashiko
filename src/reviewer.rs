@@ -542,7 +542,6 @@ impl Reviewer {
                                                 );
                                                 continue;
                                             }
-
                                         }
                                     } else {
                                         // Patch application failed
@@ -572,7 +571,7 @@ impl Reviewer {
                                             .await;
 
                                         candidate_success = false;
-                                                                                    break;
+                                        break;
                                     }
                                 }
                                 Err(e) => {

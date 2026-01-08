@@ -402,13 +402,15 @@ impl GenAiClient for GeminiClient {
             match self.generate_content_single(&request).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if let Some(GeminiError::QuotaExceeded(sleep_duration)) = e.downcast_ref::<GeminiError>() {
-                            tracing::warn!(
-                                "Gemini API quota exceeded. Retrying in {:.2}s...",
-                                sleep_duration.as_secs_f64()
-                            );
-                            sleep(*sleep_duration).await;
-                            continue;
+                    if let Some(GeminiError::QuotaExceeded(sleep_duration)) =
+                        e.downcast_ref::<GeminiError>()
+                    {
+                        tracing::warn!(
+                            "Gemini API quota exceeded. Retrying in {:.2}s...",
+                            sleep_duration.as_secs_f64()
+                        );
+                        sleep(*sleep_duration).await;
+                        continue;
                     }
                     return Err(e);
                 }
@@ -468,13 +470,15 @@ impl GenAiClient for GeminiClient {
             match self.generate_content_with_cache_single(&request).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if let Some(GeminiError::QuotaExceeded(sleep_duration)) = e.downcast_ref::<GeminiError>() {
-                            tracing::warn!(
-                                "Gemini API quota exceeded (cache). Retrying in {:.2}s...",
-                                sleep_duration.as_secs_f64()
-                            );
-                            sleep(*sleep_duration).await;
-                            continue;
+                    if let Some(GeminiError::QuotaExceeded(sleep_duration)) =
+                        e.downcast_ref::<GeminiError>()
+                    {
+                        tracing::warn!(
+                            "Gemini API quota exceeded (cache). Retrying in {:.2}s...",
+                            sleep_duration.as_secs_f64()
+                        );
+                        sleep(*sleep_duration).await;
+                        continue;
                     }
                     return Err(e);
                 }
