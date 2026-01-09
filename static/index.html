@@ -261,7 +261,6 @@
 
         .stats-link {
             font-weight: 500;
-            margin-left: auto;
         }
 
         .status-dot {
@@ -1007,6 +1006,8 @@
                     <div class="stats-container" id="stats">
                         <div class="stats-group">
                             <span class="stats-label">Sashiko</span> v${data.version}
+                            <span class="stats-sep"></span>
+                            <a href="#/stats" style="font-weight:500;">Stats</a>
                         </div>
                         <div class="stats-sep"></div>
                         <div class="stats-group">
@@ -1035,7 +1036,6 @@
                          <div class="stats-group" title="Cancelled">
                             <span class="status-dot status-Cancelled"></span> ${b.cancelled || 0}
                         </div>
-                        <a href="#/stats" class="stats-link">📊 Detailed Stats</a>
                     </div>
                 `;
             } catch (e) {
