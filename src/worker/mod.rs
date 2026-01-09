@@ -23,6 +23,7 @@ pub struct Worker {
     history: Vec<Content>,
     max_input_words: usize,
     max_interactions: usize,
+    temperature: f32,
     cache_name: Option<String>,
 }
 
@@ -42,6 +43,7 @@ impl Worker {
         prompts: PromptRegistry,
         max_input_words: usize,
         max_interactions: usize,
+        temperature: f32,
         cache_name: Option<String>,
     ) -> Self {
         Self {
@@ -51,6 +53,7 @@ impl Worker {
             history: Vec::new(),
             max_input_words,
             max_interactions,
+            temperature,
             cache_name,
         }
     }
@@ -202,7 +205,7 @@ impl Worker {
             let generation_config = Some(GenerationConfig {
                 response_mime_type: Some("application/json".to_string()),
                 response_schema: Some(response_schema),
-                temperature: Some(0.2),
+                temperature: Some(self.temperature),
             });
 
             let resp = if let Some(cache_name) = &self.cache_name {

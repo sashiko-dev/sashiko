@@ -226,6 +226,7 @@ async fn main() -> Result<()> {
                 prompts,
                 settings.ai.max_input_words,
                 settings.ai.max_interactions,
+                settings.ai.temperature,
                 args.gemini_cache,
             );
 

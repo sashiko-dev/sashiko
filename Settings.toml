@@ -15,6 +15,7 @@ model = "gemini-3-flash-preview"
 max_input_words = 150000
 rate_limit_tokens_per_minute = 900000
 max_interactions = 50
+temperature = 1.0
 
 [server]
 host = "127.0.0.1"

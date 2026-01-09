@@ -31,8 +31,14 @@ pub struct AiSettings {
     pub rate_limit_tokens_per_minute: usize,
     #[serde(default = "default_max_interactions")]
     pub max_interactions: usize,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
     #[serde(skip, default)]
     pub no_ai: bool,
+}
+
+fn default_temperature() -> f32 {
+    1.0
 }
 
 fn default_rate_limit_tokens_per_minute() -> usize {
