@@ -34,6 +34,7 @@ pub struct WorkerResult {
     pub history: Vec<Content>,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    pub tokens_cached: u32,
 }
 
 impl Worker {
@@ -153,6 +154,7 @@ impl Worker {
         let mut turns = 0;
         let mut total_tokens_in = 0;
         let mut total_tokens_out = 0;
+        let mut total_tokens_cached = 0;
         let mut last_tool_call: Option<(String, Value)> = None;
         let mut consecutive_tool_count = 0;
 
@@ -169,6 +171,7 @@ impl Worker {
                     history: self.history.clone(),
                     tokens_in: total_tokens_in,
                     tokens_out: total_tokens_out,
+                    tokens_cached: total_tokens_cached,
                 });
             }
 
@@ -251,6 +254,7 @@ impl Worker {
             if let Some(usage) = &resp.usage_metadata {
                 total_tokens_in += usage.prompt_token_count;
                 total_tokens_out += usage.candidates_token_count.unwrap_or(0);
+                total_tokens_cached += usage.cached_content_token_count.unwrap_or(0);
             }
 
             let candidate = resp
@@ -301,6 +305,7 @@ impl Worker {
                                 history: self.history.clone(),
                                 tokens_in: total_tokens_in,
                                 tokens_out: total_tokens_out,
+                                tokens_cached: total_tokens_cached,
                             });
                         }
 
@@ -365,6 +370,7 @@ impl Worker {
                     history: self.history.clone(),
                     tokens_in: total_tokens_in,
                     tokens_out: total_tokens_out,
+                    tokens_cached: total_tokens_cached,
                 });
             }
         }

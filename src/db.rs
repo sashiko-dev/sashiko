@@ -72,6 +72,7 @@ pub struct AiInteractionParams<'a> {
     pub output: &'a str,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    pub tokens_cached: u32,
 }
 
 pub struct ToolUsage {
@@ -289,6 +290,9 @@ impl Database {
         let _ = self
             .try_add_column("reviews", "inline_review", "TEXT")
             .await;
+        let _ = self
+            .try_add_column("ai_interactions", "tokens_cached", "INTEGER")
+            .await;
 
         let _ = self
             .conn
@@ -417,8 +421,8 @@ impl Database {
 
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO ai_interactions (id, parent_interaction_id, workflow_id, provider, model, input_context, output_raw, tokens_in, tokens_out, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ai_interactions (id, parent_interaction_id, workflow_id, provider, model, input_context, output_raw, tokens_in, tokens_out, tokens_cached, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
                 params.id,
                 params.parent_id,
@@ -429,6 +433,7 @@ impl Database {
                 params.output,
                 params.tokens_in,
                 params.tokens_out,
+                params.tokens_cached,
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64
             ],
         ).await?;
@@ -1676,7 +1681,7 @@ impl Database {
                     "SELECT r.model_name, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                             b.repo_url, b.branch, b.last_known_commit,
                             r.provider, r.prompts_git_hash, r.result_description,
-                            r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id
+                            r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -1708,6 +1713,7 @@ impl Database {
                     "tokens_out": r.get::<Option<u32>>(15).ok(),
                     "patch_id": r.get::<Option<i64>>(16).ok(),
                     "id": r.get::<i64>(17).ok(),
+                    "tokens_cached": r.get::<Option<u32>>(18).ok(),
                 }));
             }
 
@@ -1796,7 +1802,7 @@ impl Database {
                 "SELECT r.id, r.model_name, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_git_hash, r.result_description,
-                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id
+                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -1827,6 +1833,7 @@ impl Database {
                 "tokens_in": r.get::<Option<u32>>(15).ok(),
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
+                "tokens_cached": r.get::<Option<u32>>(18).ok(),
             })))
         } else {
             Ok(None)
@@ -3032,5 +3039,35 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let count: i64 = row.get(0).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_ai_interaction_with_cached_tokens() {
+        let db = setup_db().await;
+        
+        // Create interaction
+        let params = AiInteractionParams {
+            id: "test_id",
+            parent_id: None,
+            workflow_id: None,
+            provider: "test_provider",
+            model: "test_model",
+            input: "input",
+            output: "output",
+            tokens_in: 100,
+            tokens_out: 50,
+            tokens_cached: 25,
+        };
+        
+        db.create_ai_interaction(params).await.unwrap();
+        
+        // Verify via raw query since there is no direct get_ai_interaction method exposed 
+        // (get_review_details joins it, but requires a review)
+        
+        let mut rows = db.conn.query("SELECT tokens_cached FROM ai_interactions WHERE id = 'test_id'", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let cached: u32 = row.get(0).unwrap();
+        
+        assert_eq!(cached, 25);
     }
 }

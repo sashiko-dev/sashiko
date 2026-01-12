@@ -16,6 +16,7 @@ pub struct AiResponse {
     pub content: String,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    pub tokens_cached: u32,
 }
 
 #[async_trait]
@@ -92,6 +93,7 @@ impl AiProvider for OpenAiProvider {
             content,
             tokens_in,
             tokens_out,
+            tokens_cached: 0,
         })
     }
 }

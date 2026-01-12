@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS ai_interactions (
     output_raw TEXT,
     tokens_in INTEGER,
     tokens_out INTEGER,
+    tokens_cached INTEGER,
     created_at INTEGER
 );
 

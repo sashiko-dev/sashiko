@@ -1136,7 +1136,7 @@
                     : `Patch ID ${pid}`;
 
                 let totalTokens = 0;
-                reviews.forEach(r => totalTokens += (r.tokens_in || 0) + (r.tokens_out || 0));
+                reviews.forEach(r => totalTokens += (r.tokens_in || 0) + (r.tokens_out || 0) + (r.tokens_cached || 0));
 
                 const borderStyle = index === 0 ? '' : 'border-top:1px solid #eee; padding-top:8px;';
 
@@ -1307,6 +1307,11 @@
                 baselineStr = parts.join(' / ');
             }
 
+            const tokensIn = (r.tokens_in || 0).toLocaleString();
+            const tokensOut = (r.tokens_out || 0).toLocaleString();
+            const tokensCached = (r.tokens_cached || 0).toLocaleString();
+            const tokenStr = `In: ${tokensIn} · Out: ${tokensOut} · Cached: ${tokensCached}`;
+
             let inlineHtml = '';
             if (r.inline_review) {
                 // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
@@ -1333,6 +1338,7 @@
                         </div>
                         <div class="review-meta-label">Baseline:</div><div>${baselineStr}</div>
                         <div class="review-meta-label">Model:</div><div>${providerModel}</div>
+                        <div class="review-meta-label">Tokens:</div><div>${tokenStr}</div>
                         <div class="review-meta-sep"></div>
                         <div class="review-meta-label">Result:</div><div>${displayResult}</div>
                     </div>
@@ -1459,7 +1465,7 @@
             if (!res.ok) throw new Error('Review not found');
             const data = await res.json();
 
-            const totalTokens = (data.tokens_in || 0) + (data.tokens_out || 0);
+            const totalTokens = (data.tokens_in || 0) + (data.tokens_out || 0) + (data.tokens_cached || 0);
             let logs = [];
             try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
 

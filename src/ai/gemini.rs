@@ -108,6 +108,8 @@ pub struct UsageMetadata {
     pub prompt_token_count: u32,
     pub candidates_token_count: Option<u32>,
     pub total_token_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content_token_count: Option<u32>,
     #[serde(flatten)]
     pub extra: Option<std::collections::HashMap<String, Value>>,
 }
@@ -634,6 +636,7 @@ impl AiProvider for GeminiClient {
             prompt_token_count: 0,
             candidates_token_count: Some(0),
             total_token_count: 0,
+            cached_content_token_count: None,
             extra: None,
         });
 
@@ -641,6 +644,7 @@ impl AiProvider for GeminiClient {
             content,
             tokens_in: usage.prompt_token_count,
             tokens_out: usage.candidates_token_count.unwrap_or(0),
+            tokens_cached: usage.cached_content_token_count.unwrap_or(0),
         })
     }
 }

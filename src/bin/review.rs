@@ -207,7 +207,8 @@ async fn main() -> Result<()> {
                 "review": null, // Indicate no review
                 "input_context": "",
                 "tokens_in": 0,
-                "tokens_out": 0
+                "tokens_out": 0,
+                "tokens_cached": 0
             });
             println!("{}", serde_json::to_string(&result_json)?);
         } else {
@@ -271,7 +272,8 @@ async fn main() -> Result<()> {
                         "input_context": result.input_context,
                         "history": result.history,
                         "tokens_in": result.tokens_in,
-                        "tokens_out": result.tokens_out
+                        "tokens_out": result.tokens_out,
+                        "tokens_cached": result.tokens_cached
                     });
                     println!("{}", serde_json::to_string(&result_json)?);
                 }

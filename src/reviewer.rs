@@ -540,6 +540,8 @@ impl Reviewer {
                                             as u32,
                                         tokens_out: json_output["tokens_out"].as_u64().unwrap_or(0)
                                             as u32,
+                                        tokens_cached: json_output["tokens_cached"].as_u64().unwrap_or(0)
+                                            as u32,
                                     })
                                     .await;
 
@@ -912,6 +914,7 @@ async fn run_review_tool(
                                                 prompt_token_count: 0,
                                                 candidates_token_count: None,
                                                 total_token_count: 0,
+                                                cached_content_token_count: None,
                                                 extra: Some(std::collections::HashMap::new()),
                                             });
                                             let extra = usage.extra.get_or_insert_with(std::collections::HashMap::new);

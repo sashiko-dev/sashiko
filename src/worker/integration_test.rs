@@ -55,6 +55,7 @@ mod tests {
                     prompt_token_count: 0,
                     candidates_token_count: Some(0),
                     total_token_count: 0,
+                    cached_content_token_count: None,
                     extra: None,
                 }),
             })
@@ -106,6 +107,7 @@ mod tests {
                 prompt_token_count: 10,
                 candidates_token_count: Some(10),
                 total_token_count: 20,
+                cached_content_token_count: None,
                 extra: None,
             }),
         })
@@ -133,6 +135,7 @@ mod tests {
                 prompt_token_count: 10,
                 candidates_token_count: Some(10),
                 total_token_count: 20,
+                cached_content_token_count: None,
                 extra: None,
             }),
         })
