@@ -400,7 +400,11 @@ async fn process_parsed_article(worker_db: &Database, article: ParsedArticle) ->
     }
 
     // Subsystem Identification and Linking
-    let subsystems = identify_subsystems(&metadata.to, &metadata.cc);
+    let mut subsystems = identify_subsystems(&metadata.to, &metadata.cc);
+    if group == "git-import" {
+        subsystems.push(("from git".to_string(), "git-import".to_string()));
+    }
+
     let mut subsystem_ids = Vec::new();
     for (name, email) in subsystems {
         match worker_db.ensure_subsystem(&name, &email).await {

@@ -1432,7 +1432,7 @@ impl Database {
             };
 
             if author_or_series_match
-                && (date - existing_date).abs() < 86400
+                && (!strict_author || (date - existing_date).abs() < 86400)
                 && versions_compatible
                 && total_parts == existing_total
                 && subject_match
