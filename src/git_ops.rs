@@ -67,6 +67,10 @@ impl GitWorktree {
 
         let mut child = Command::new("git")
             .current_dir(&self.path)
+            .env("GIT_AUTHOR_NAME", "Sashiko Bot")
+            .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
+            .env("GIT_COMMITTER_NAME", "Sashiko Bot")
+            .env("GIT_COMMITTER_EMAIL", "sashiko@localhost")
             .args(["-c", "safe.bareRepository=all"])
             .arg("am")
             .arg("--3way")
