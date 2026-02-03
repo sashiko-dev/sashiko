@@ -1578,7 +1578,8 @@
                 
                 ${threadHtml ? `<div class="section"><h2>Thread</h2>${threadHtml}</div>` : ''}
                 
-                <pre class="body">${escapeHtml(`Subject: ${data.subject || '(no subject)'}\n\n${data.body || '(no body)'}`, true, false)}</pre>
+                <pre class="body"><div style="font-weight: bold; color: var(--text);">${escapeHtml(data.subject || '(no subject)')}</div>
+${escapeHtml(data.body || '(no body)', true, false)}</pre>
             `;
         }
 
