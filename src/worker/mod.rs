@@ -24,6 +24,7 @@ use crate::ai::gemini::{
     GenerateContentWithCacheRequest, GenerationConfig, Part,
 };
 use crate::ai::token_budget::TokenBudget;
+use crate::ai::truncator::Truncator;
 use crate::worker::prompts::PromptRegistry;
 use crate::worker::tools::ToolBox;
 use anyhow::Result;
@@ -145,12 +146,39 @@ impl Worker {
         (before_pruning, self.history.clone())
     }
 
-    pub async fn run(&mut self, _patchset: Value) -> Result<WorkerResult> {
+    pub async fn run(&mut self, patchset: Value) -> Result<WorkerResult> {
         let system_prompt = PromptRegistry::get_system_identity().to_string();
-        let initial_user_message = self
+        let mut initial_user_message = self
             .prompts
             .get_user_task_prompt(self.cache_name.is_some())
             .await?;
+
+        // Extract and append patch content
+        let mut patch_content = String::new();
+        patch_content.push_str(&format!(
+            "Patchset ID: {}\nSubject: {}\n\n",
+            patchset["id"],
+            patchset["subject"].as_str().unwrap_or("Unknown")
+        ));
+
+        if let Some(patches) = patchset["patches"].as_array() {
+            for p in patches {
+                let idx = p["index"].as_i64().unwrap_or(0);
+                let subject = p["subject"].as_str().unwrap_or("No Subject");
+                let diff = p["diff"].as_str().unwrap_or("");
+
+                patch_content.push_str(&format!("Patch {}/{}: {}\n", idx, patches.len(), subject));
+                patch_content.push_str("```diff\n");
+                patch_content.push_str(diff);
+                patch_content.push_str("\n```\n\n");
+            }
+        }
+
+        // Truncate if too large. Using max_input_words as token limit approximation.
+        let truncated_patch = Truncator::truncate_diff(&patch_content, self.max_input_words);
+
+        initial_user_message.push_str("\n\n---\n\n");
+        initial_user_message.push_str(&truncated_patch);
 
         let input_context = format!(
             "System: {}\n\nUser: {}",
