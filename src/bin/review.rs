@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
     info!("Applying {} patches...", patches_to_apply.len());
 
     let mut patch_shas = std::collections::HashMap::new();
+    let mut patch_shows = std::collections::HashMap::new();
 
     for p in &patches_to_apply {
         info!("Applying patch part {}", p.index);
@@ -160,7 +161,10 @@ async fn main() -> Result<()> {
                 Ok(_) => {
                     applied_via_am = true;
                     if let Ok(sha) = sashiko::git_ops::get_commit_hash(&worktree.path, "HEAD").await {
-                        patch_shas.insert(p.index, sha);
+                        patch_shas.insert(p.index, sha.clone());
+                        if let Ok(show) = worktree.get_commit_show(&sha).await {
+                             patch_shows.insert(p.index, show);
+                        }
                     }
                     patch_results.push(json!({
                         "index": p.index,
@@ -221,25 +225,10 @@ async fn main() -> Result<()> {
         patches
             .iter()
             .filter(|p| p.index == target_idx)
-            .map(|p| {
-                let mut p = p.clone();
-                if let Some(sha) = patch_shas.get(&p.index) {
-                    p.commit_id = Some(sha.clone());
-                }
-                p
-            })
+            .cloned()
             .collect()
     } else {
-        patches
-            .iter()
-            .map(|p| {
-                let mut p = p.clone();
-                if let Some(sha) = patch_shas.get(&p.index) {
-                    p.commit_id = Some(sha.clone());
-                }
-                p
-            })
-            .collect()
+        patches.clone() // Review all
     };
 
     if all_applied {
@@ -303,7 +292,8 @@ async fn main() -> Result<()> {
                     "author": p.author,
                     "date_string": date_str,
                     "diff": p.diff,
-                    "commit_id": p.commit_id
+                    "commit_id": patch_shas.get(&p.index).cloned(),
+                    "git_show": patch_shows.get(&p.index).cloned()
                 })
             }).collect();
 

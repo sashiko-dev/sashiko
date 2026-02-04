@@ -158,20 +158,28 @@ impl Worker {
 
         if let Some(patches) = patchset["patches"].as_array() {
             for p in patches {
-                let subject = p["subject"].as_str().unwrap_or("No Subject");
-                let diff = p["diff"].as_str().unwrap_or("");
-                let author = p["author"].as_str().unwrap_or("Unknown");
-                let date = p["date_string"].as_str().unwrap_or("");
-                let commit_id = p["commit_id"].as_str().unwrap_or("0000000000000000000000000000000000000000");
-
                 patch_content.push_str("```\n");
-                patch_content.push_str(&format!("commit {}\n", commit_id));
-                patch_content.push_str(&format!("Author: {}\n", author));
-                if !date.is_empty() {
-                    patch_content.push_str(&format!("Date:   {}\n", date));
+
+                if let Some(show) = p["git_show"].as_str() {
+                    patch_content.push_str(show);
+                } else {
+                    let subject = p["subject"].as_str().unwrap_or("No Subject");
+                    let diff = p["diff"].as_str().unwrap_or("");
+                    let author = p["author"].as_str().unwrap_or("Unknown");
+                    let date = p["date_string"].as_str().unwrap_or("");
+                    let commit_id = p["commit_id"].as_str().unwrap_or("0000000000000000000000000000000000000000");
+
+                    patch_content.push_str(&format!("commit {}\n", commit_id));
+                    patch_content.push_str(&format!("Author: {}\n", author));
+                    if !date.is_empty() {
+                        patch_content.push_str(&format!("Date:   {}\n", date));
+                    }
+                    patch_content.push('\n');
+                    // Indent subject by 4 spaces
+                    patch_content.push_str(&format!("    {}\n\n", subject));
+                    patch_content.push_str(diff);
                 }
-                patch_content.push_str(&format!("Subject: {}\n\n", subject));
-                patch_content.push_str(diff);
+
                 patch_content.push_str("\n```\n\n");
             }
         }

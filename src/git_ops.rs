@@ -142,6 +142,23 @@ impl GitWorktree {
         Ok(output)
     }
 
+    pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
+        let output = Command::new("git")
+            .current_dir(&self.path)
+            .args(["show", hash])
+            .output()
+            .await?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(anyhow!(
+                "git show failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn remove(self) -> Result<()> {
         info!("Removing worktree at {:?}", self.path);
