@@ -188,7 +188,8 @@ impl ToolBox {
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
-        match name {
+        let name_normalized = name.trim().to_lowercase();
+        match name_normalized.as_str() {
             "read_files" => self.read_files(args).await,
             "write_file" => self.write_file(args).await,
             "git_blame" => self.git_blame(args).await,
@@ -691,6 +692,24 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("TODO.md"))?;
         assert!(content.contains("- [ ] Implement more features"));
         assert!(content.contains("- [ ] Fix bugs"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_normalization() -> Result<()> {
+        let dir = tempdir()?;
+        let toolbox = ToolBox::new(dir.path().to_path_buf(), None);
+
+        // Test with whitespace and mixed case
+        let args = json!({
+            "content": "Normalization test"
+        });
+        toolbox.call("  TodoWrite  ", args).await?;
+
+        let todo_path = dir.path().join("TODO.md");
+        let content = std::fs::read_to_string(todo_path)?;
+        assert!(content.contains("- [ ] Normalization test"));
 
         Ok(())
     }
