@@ -620,6 +620,7 @@ impl ToolBox {
 
         file.write_all(format!("- [ ] {}\n", content).as_bytes())
             .await?;
+        file.flush().await?;
 
         Ok(json!({ "status": "success", "message": "TODO added." }))
     }
