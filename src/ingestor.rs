@@ -419,6 +419,12 @@ impl Ingestor {
         let mut remaining = limit;
 
         for group in &self.settings.nntp.groups {
+            // Ensure the mailing list exists in the DB so messages can be linked to it
+            if let Err(e) = self.db.ensure_mailing_list(group, group).await {
+                error!("Failed to ensure mailing list {} exists: {}", group, e);
+                // Continue anyway, maybe it exists? Or we just fail linking.
+            }
+
             match self.resolve_git_info(group).await {
                 Ok((epochs, base_path)) => {
                     for (epoch, url) in epochs {
