@@ -904,7 +904,9 @@ mod tests {
 
     #[test]
     fn test_is_mbox_separator() {
-        assert!(is_mbox_separator(b"From user@example.com Mon Jan 1 00:00:00 2023\n"));
+        assert!(is_mbox_separator(
+            b"From user@example.com Mon Jan 1 00:00:00 2023\n"
+        ));
         assert!(!is_mbox_separator(b"From: user@example.com\n"));
         assert!(!is_mbox_separator(b"Subject: Test\n"));
         assert!(!is_mbox_separator(b"Some body text\n"));
@@ -952,7 +954,7 @@ Body 2\n";
         assert!(msg2.contains("Body 2"));
         assert!(!msg2.contains("From user@example.com"));
     }
-    
+
     #[test]
     fn test_split_mbox_single() {
         let mbox = b"From user@example.com Mon Jan 1 00:00:00 2023\n\
@@ -1252,15 +1254,23 @@ index bbc440c93e08..1123ef3ccf90 100644
         assert_eq!(messages.len(), 3);
 
         let msg1 = String::from_utf8_lossy(&messages[0]);
-        assert!(msg1.contains("Subject: [PATCH 1/5] x86/cpu: Add model number for Intel Arrow Lake mobile"));
+        assert!(msg1.contains(
+            "Subject: [PATCH 1/5] x86/cpu: Add model number for Intel Arrow Lake mobile"
+        ));
         assert!(msg1.contains("arch/x86/include/asm/intel-family.h | 2 ++"));
 
         let msg2 = String::from_utf8_lossy(&messages[1]);
-        assert!(msg2.contains("Subject: [PATCH 2/5] x86/i8259: Skip probing when ACPI/MADT advertises PCAT"));
-        assert!(msg2.contains("arch/x86/kernel/i8259.c      | 38 ++++++++++++++++++++++++++++--------"));
+        assert!(msg2.contains(
+            "Subject: [PATCH 2/5] x86/i8259: Skip probing when ACPI/MADT advertises PCAT"
+        ));
+        assert!(
+            msg2.contains("arch/x86/kernel/i8259.c      | 38 ++++++++++++++++++++++++++++--------")
+        );
 
         let msg3 = String::from_utf8_lossy(&messages[2]);
-        assert!(msg3.contains("Subject: [PATCH 3/5] x86/tsc: Defer marking TSC unstable to a worker"));
+        assert!(
+            msg3.contains("Subject: [PATCH 3/5] x86/tsc: Defer marking TSC unstable to a worker")
+        );
         assert!(msg3.contains("static DECLARE_WORK(tsc_sync_work, tsc_sync_mark_tsc_unstable);"));
     }
 
