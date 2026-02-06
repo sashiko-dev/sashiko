@@ -320,6 +320,7 @@ impl Reviewer {
                     Some(ctx.settings.ai.model.as_str()),
                     prompts_hash.as_deref(),
                     Some(logs.as_str()),
+                    Some(ctx.settings.ai.provider.as_str()),
                 )
                 .await;
 
@@ -400,7 +401,6 @@ impl Reviewer {
                     Some(baseline_id),
                     &input_payload,
                     commit_sha,
-                    prompts_hash.as_deref(),
                     Some(&worktree.path),
                 )
                 .await
@@ -439,6 +439,7 @@ impl Reviewer {
                     Some(ctx.settings.ai.model.as_str()),
                     prompts_hash.as_deref(),
                     Some(logs.as_str()),
+                    Some(ctx.settings.ai.provider.as_str()),
                 )
                 .await;
 
@@ -611,7 +612,6 @@ impl Reviewer {
         baseline_id: Option<i64>,
         input_payload: &Value,
         commit_sha: Option<String>,
-        prompts_hash: Option<&str>,
         worktree_path: Option<&Path>,
     ) -> Result<PatchResult> {
         info!(
@@ -641,10 +641,6 @@ impl Reviewer {
                 .create_review(
                     patchset_id,
                     Some(patch_id),
-                    &ctx.settings.ai.provider,
-                    &ctx.settings.ai.model,
-                    baseline_id,
-                    prompts_hash,
                 )
                 .await?;
 

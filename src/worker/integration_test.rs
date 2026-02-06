@@ -301,7 +301,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_file_duplicate_prevention() {
         let _ = tracing_subscriber::fmt::try_init();
-        let (linux_path, _prompts_path) = get_test_paths();
+        // Use a temporary directory to avoid writing to the actual source tree
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_path = temp_dir.path().to_path_buf();
 
         // 1. write_file (Success)
         // 2. write_file (Duplicate -> Blocked by worker, returns Error to LLM)
@@ -320,7 +322,7 @@ mod tests {
             ),
         ]));
 
-        let tools = ToolBox::new(linux_path, None);
+        let tools = ToolBox::new(worktree_path, None);
         let prompts = PromptRegistry::new(PathBuf::from("review-prompts/kernel"));
         let mut worker = Worker::new(client, tools, prompts, 150_000, 25, 1.0, None);
 

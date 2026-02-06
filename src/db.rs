@@ -53,6 +53,7 @@ pub struct PatchsetRow {
     pub model_name: Option<String>,
     pub prompts_git_hash: Option<String>,
     pub baseline_logs: Option<String>,
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,16 +71,6 @@ pub struct MessageRow {
     pub thread: Option<Vec<serde_json::Value>>,
     pub git_blob_hash: Option<String>,
     pub mailing_list: Option<String>,
-}
-
-pub struct ReviewExperimentParams<'a> {
-    pub patchset_id: i64,
-    pub provider: &'a str,
-    pub model: &'a str,
-    pub prompts_hash: Option<&'a str>,
-    pub baseline_id: Option<i64>,
-    pub result_description: &'a str,
-    pub interaction_id: Option<&'a str>,
 }
 
 pub struct AiInteractionParams<'a> {
@@ -375,6 +366,9 @@ impl Database {
         let _ = self
             .try_add_column("patchsets", "baseline_logs", "TEXT")
             .await;
+        let _ = self
+            .try_add_column("patchsets", "provider", "TEXT")
+            .await;
 
         let _ = self
             .conn
@@ -474,22 +468,14 @@ impl Database {
         &self,
         patchset_id: i64,
         patch_id: Option<i64>,
-        provider: &str,
-        model: &str,
-        baseline_id: Option<i64>,
-        prompts_hash: Option<&str>,
     ) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO reviews (patchset_id, patch_id, provider, model_name, prompts_git_hash, baseline_id, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?)",
+                "INSERT INTO reviews (patchset_id, patch_id, status, created_at)
+             VALUES (?, ?, 'Pending', ?)",
                 libsql::params![
                     patchset_id,
                     patch_id,
-                    provider,
-                    model,
-                    prompts_hash,
-                    baseline_id,
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)?
                         .as_secs() as i64
@@ -524,23 +510,14 @@ impl Database {
         &self,
         patchset_id: i64,
         patch_id: i64,
-        baseline_id: Option<i64>,
+        _baseline_id: Option<i64>,
     ) -> Result<usize> {
-        let mut rows = if let Some(bid) = baseline_id {
-            self.conn
-                .query(
-                    "SELECT COUNT(*) FROM reviews WHERE patchset_id = ? AND patch_id = ? AND baseline_id = ? AND status = 'Reviewed'",
-                    libsql::params![patchset_id, patch_id, bid],
-                )
-                .await?
-        } else {
-            self.conn
-                .query(
-                    "SELECT COUNT(*) FROM reviews WHERE patchset_id = ? AND patch_id = ? AND baseline_id IS NULL AND status = 'Reviewed'",
-                    libsql::params![patchset_id, patch_id],
-                )
-                .await?
-        };
+        let mut rows = self.conn
+            .query(
+                "SELECT COUNT(*) FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status = 'Reviewed'",
+                libsql::params![patchset_id, patch_id],
+            )
+            .await?;
 
         if let Ok(Some(row)) = rows.next().await {
             let count: i64 = row.get(0)?;
@@ -554,23 +531,14 @@ impl Database {
         &self,
         patchset_id: i64,
         patch_id: i64,
-        baseline_id: Option<i64>,
+        _baseline_id: Option<i64>,
     ) -> Result<bool> {
-        let mut rows = if let Some(bid) = baseline_id {
-            self.conn
-                .query(
-                    "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id = ? AND baseline_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
-                    libsql::params![patchset_id, patch_id, bid],
-                )
-                .await?
-        } else {
-            self.conn
-                .query(
-                    "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id = ? AND baseline_id IS NULL AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
-                    libsql::params![patchset_id, patch_id],
-                )
-                .await?
-        };
+        let mut rows = self.conn
+            .query(
+                "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
+                libsql::params![patchset_id, patch_id],
+            )
+            .await?;
 
         Ok(rows.next().await.ok().flatten().is_some())
     }
@@ -616,24 +584,6 @@ impl Database {
                 libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
             )
             .await?;
-        Ok(())
-    }
-
-    pub async fn create_review_experiment(&self, params: ReviewExperimentParams<'_>) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO reviews (patchset_id, provider, model_name, prompts_git_hash, baseline_id, result_description, interaction_id, created_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Finished')",
-            libsql::params![
-                params.patchset_id,
-                params.provider,
-                params.model,
-                params.prompts_hash,
-                params.baseline_id,
-                params.result_description,
-                params.interaction_id,
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64
-            ],
-        ).await?;
         Ok(())
     }
 
@@ -1226,72 +1176,6 @@ impl Database {
             .execute(
                 "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
                 libsql::params![patchset_id, subsystem_id],
-            )
-            .await?;
-        Ok(())
-    }
-
-    // Tags
-    #[allow(dead_code)]
-    pub async fn ensure_tag(&self, name: &str) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO tags (name) VALUES (?)",
-                libsql::params![name],
-            )
-            .await?;
-
-        let mut rows = self
-            .conn
-            .query("SELECT id FROM tags WHERE name = ?", libsql::params![name])
-            .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to ensure tag"))
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn add_tag_to_message(&self, message_id: i64, tag_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO messages_tags (message_id, tag_id) VALUES (?, ?)",
-                libsql::params![message_id, tag_id],
-            )
-            .await?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn add_tag_to_thread(&self, thread_id: i64, tag_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO threads_tags (thread_id, tag_id) VALUES (?, ?)",
-                libsql::params![thread_id, tag_id],
-            )
-            .await?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn add_tag_to_patch(&self, patch_id: i64, tag_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO patches_tags (patch_id, tag_id) VALUES (?, ?)",
-                libsql::params![patch_id, tag_id],
-            )
-            .await?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn add_tag_to_patchset(&self, patchset_id: i64, tag_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO patchsets_tags (patchset_id, tag_id) VALUES (?, ?)",
-                libsql::params![patchset_id, tag_id],
             )
             .await?;
         Ok(())
@@ -2177,6 +2061,7 @@ impl Database {
                 model_name: None,
                 prompts_git_hash: None,
                 baseline_logs: None,
+                provider: None,
             });
         }
         Ok(patchsets)
@@ -2276,7 +2161,7 @@ impl Database {
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients, 
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
-                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id
+                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider
              FROM patchsets p 
              WHERE p.id = ?",
                 libsql::params![id],
@@ -2300,6 +2185,7 @@ impl Database {
             let prompts_git_hash: Option<String> = row.get(13).ok();
             let baseline_logs: Option<String> = row.get(14).ok();
             let baseline_id: Option<i64> = row.get(15).ok();
+            let provider: Option<String> = row.get(16).ok();
             
             // Fetch baseline details if needed
             let baseline = if let Some(bid) = baseline_id {
@@ -2322,13 +2208,11 @@ impl Database {
             let mut rev_rows = self
                 .conn
                 .query(
-                    "SELECT r.model_name, r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                            b.repo_url, b.branch, b.last_known_commit,
-                            r.provider, r.prompts_git_hash, r.result_description,
+                    "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
+                            r.result_description,
                             r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-                 LEFT JOIN baselines b ON r.baseline_id = b.id
                  WHERE r.patchset_id = ?
                  ORDER BY r.created_at ASC",
                     libsql::params![pid],
@@ -2337,27 +2221,24 @@ impl Database {
 
             while let Ok(Some(r)) = rev_rows.next().await {
                 reviews.push(serde_json::json!({
-                    "model": r.get::<Option<String>>(0).ok(),
-                    "summary": r.get::<Option<String>>(1).ok(),
-                    "created_at": r.get::<Option<i64>>(2).ok(),
-                    "input": r.get::<Option<String>>(3).ok(),
-                    "output": r.get::<Option<String>>(4).ok(),
-                    "baseline": {
-                        "repo_url": r.get::<Option<String>>(5).ok(),
-                        "branch": r.get::<Option<String>>(6).ok(),
-                        "commit": r.get::<Option<String>>(7).ok(),
-                    },
-                    "provider": r.get::<Option<String>>(8).ok(),
-                    "prompts_hash": r.get::<Option<String>>(9).ok(),
-                    "result": r.get::<Option<String>>(10).ok(),
-                    "status": r.get::<Option<String>>(11).ok(),
-                    "inline_review": r.get::<Option<String>>(12).ok(),
-                    "logs": r.get::<Option<String>>(13).ok(),
-                    "tokens_in": r.get::<Option<u32>>(14).ok(),
-                    "tokens_out": r.get::<Option<u32>>(15).ok(),
-                    "patch_id": r.get::<Option<i64>>(16).ok(),
-                    "id": r.get::<i64>(17).ok(),
-                    "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                    "summary": r.get::<Option<String>>(0).ok(),
+                    "created_at": r.get::<Option<i64>>(1).ok(),
+                    "input": r.get::<Option<String>>(2).ok(),
+                    "output": r.get::<Option<String>>(3).ok(),
+                    "result": r.get::<Option<String>>(4).ok(),
+                    "status": r.get::<Option<String>>(5).ok(),
+                    "inline_review": r.get::<Option<String>>(6).ok(),
+                    "logs": r.get::<Option<String>>(7).ok(),
+                    "tokens_in": r.get::<Option<u32>>(8).ok(),
+                    "tokens_out": r.get::<Option<u32>>(9).ok(),
+                    "patch_id": r.get::<Option<i64>>(10).ok(),
+                    "id": r.get::<i64>(11).ok(),
+                    "tokens_cached": r.get::<Option<u32>>(12).ok(),
+                    // Inject patchset-level info for UI compatibility
+                    "model": model_name,
+                    "provider": provider,
+                    "prompts_hash": prompts_git_hash,
+                    "baseline": baseline
                 }));
             }
 
@@ -2439,7 +2320,8 @@ impl Database {
                 "model_name": model_name,
                 "prompts_git_hash": prompts_git_hash,
                 "baseline_logs": baseline_logs,
-                "baseline": baseline
+                "baseline": baseline,
+                "provider": provider
             })))
         } else {
             Ok(None)
@@ -2551,6 +2433,7 @@ impl Database {
                 model_name: None,
                 prompts_git_hash: None,
                 baseline_logs: None,
+                provider: None,
             });
         }
         Ok(patchsets)
@@ -2664,11 +2547,12 @@ impl Database {
         model_name: Option<&str>,
         prompts_hash: Option<&str>,
         logs: Option<&str>,
+        provider: Option<&str>,
     ) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ? WHERE id = ?",
-                libsql::params![baseline_id, model_name, prompts_hash, logs, id],
+                "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
+                libsql::params![baseline_id, model_name, prompts_hash, logs, provider, id],
             )
             .await?;
         Ok(())
@@ -3794,16 +3678,7 @@ mod tests {
 
         // 2. Add dependencies to ps1 (Review, Tag, Subsystem)
         let review_id = db
-            .create_review(ps1, None, "test_provider", "test_model", None, None)
-            .await
-            .unwrap();
-
-        let tag_id = db.ensure_tag("test_tag").await.unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO patchsets_tags (patchset_id, tag_id) VALUES (?, ?)",
-                libsql::params![ps1, tag_id],
-            )
+            .create_review(ps1, None)
             .await
             .unwrap();
 
@@ -3872,19 +3747,6 @@ mod tests {
             .conn
             .query(
                 "SELECT count(*) FROM patchsets_subsystems WHERE patchset_id = ?",
-                libsql::params![ps1],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        let count: i64 = row.get(0).unwrap();
-        assert_eq!(count, 1);
-
-        // Check tag
-        let mut rows = db
-            .conn
-            .query(
-                "SELECT count(*) FROM patchsets_tags WHERE patchset_id = ?",
                 libsql::params![ps1],
             )
             .await
@@ -3969,7 +3831,7 @@ mod tests {
 
         // 2. Failed Review (No interaction) -> Should be detected
         let review_id = db
-            .create_review(ps_id, Some(patch_id), "p", "m", None, None)
+            .create_review(ps_id, Some(patch_id))
             .await
             .unwrap();
         db.update_review_status(review_id, "FailedToApply", None)

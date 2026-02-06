@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS patchsets (
     baseline_logs TEXT,
     failed_reason TEXT,
     target_review_count INTEGER DEFAULT 1,
+    provider TEXT,
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)
@@ -96,21 +97,16 @@ CREATE TABLE IF NOT EXISTS reviews (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER NOT NULL,
     patch_id INTEGER, -- Optional link to specific patch
-    model_name TEXT,
-    provider TEXT,
-    prompts_git_hash TEXT,
     summary TEXT,
     result_description TEXT,
     created_at INTEGER,
     interaction_id TEXT,
-    baseline_id INTEGER,
     status TEXT DEFAULT 'Pending', -- Pending, Applying, In Review, Cancelled, Reviewed, Failed
     logs TEXT,
     inline_review TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(patch_id) REFERENCES patches(id),
-    FOREIGN KEY(interaction_id) REFERENCES ai_interactions(id),
-    FOREIGN KEY(baseline_id) REFERENCES baselines(id)
+    FOREIGN KEY(interaction_id) REFERENCES ai_interactions(id)
 );
 
 -- Deprecated: comments table was never really used, replaced by findings
