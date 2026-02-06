@@ -1368,7 +1368,12 @@
                          let hasSuccessful = false;
                          let errors = [];
 
+                         let validRunCount = 0;
                          reviews.forEach(r => {
+                            if (r.status !== 'Failed To Apply') {
+                                validRunCount++;
+                            }
+
                             if (r.status === 'Reviewed') {
                                 hasSuccessful = true;
                                 try {
@@ -1399,8 +1404,8 @@
                          
                          if (hasSuccessful) {
                             summaryStatus = renderFindingsBadges(maxCounts, 'Reviewed');
-                            if (reviews.length > 1) {
-                                summaryStatus += ` <span style="color:#888; font-size:0.85em; font-style:italic;">(max of ${reviews.length} runs)</span>`;
+                            if (validRunCount > 1) {
+                                summaryStatus += ` <span style="color:#888; font-size:0.85em; font-style:italic;">(max of ${validRunCount} runs)</span>`;
                             }
                          } else if (errors.length > 0) {
                             summaryStatus = `<span style="color:#d73a49; font-weight:bold">${escapeHtml(errors[0])}</span>`;
