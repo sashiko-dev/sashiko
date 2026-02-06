@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS patchsets (
     to_recipients TEXT,
     cc_recipients TEXT,
     baseline_id INTEGER,
+    model_name TEXT,
+    prompts_git_hash TEXT,
+    baseline_logs TEXT,
+    failed_reason TEXT,
+    target_review_count INTEGER DEFAULT 1,
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)

@@ -263,7 +263,7 @@ impl Reviewer {
             "patches": patches_json
         });
 
-        // Determine Baseline
+        // Determine Baseline Candidates
         let mut all_files = Vec::new();
         for p in patches_json.iter() {
             if let Some(diff_str) = p["diff"].as_str() {
@@ -272,7 +272,6 @@ impl Reviewer {
             }
         }
 
-        // Fetch body for base-commit detection
         let body = if let Some(mid) = &patchset.message_id {
             ctx.db.get_message_body(mid).await.unwrap_or(None)
         } else if let Some(first_patch_msg_id) =
@@ -303,302 +302,322 @@ impl Reviewer {
                 .resolve_candidates(&all_files, &subject, body.as_deref())
         };
 
-        let mut review_success = false;
-        let mut any_patch_failed_to_apply = false;
+        // 1. Find a working baseline (apply series)
+        let (found_baseline, patch_commits, logs) =
+            Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
 
-        for candidate in candidates {
-            let (success, failed_apply) =
-                Self::process_candidate(&ctx, &candidate, patchset_id, &diffs, &input_payload)
-                    .await;
-
-            if failed_apply {
-                any_patch_failed_to_apply = true;
-            }
-
-            if success {
-                review_success = true;
-                break;
-            }
-        }
-
-        let final_status = if review_success {
-            ReviewStatus::Reviewed.as_str().to_string()
-        } else if any_patch_failed_to_apply {
-            ReviewStatus::FailedToApply.as_str().to_string()
-        } else {
-            ReviewStatus::Failed.as_str().to_string()
-        };
-
-        info!(
-            "Review process finished for {}: {}",
-            patchset_id, final_status
-        );
-        if let Err(e) = ctx
-            .db
-            .update_patchset_status(patchset_id, &final_status)
+        let prompts_hash = get_commit_hash(Path::new("third_party/review-prompts"), "HEAD")
             .await
-        {
-            error!("Failed to update status for {}: {}", patchset_id, e);
-        }
-    }
+            .ok();
 
-    async fn process_candidate(
-        ctx: &ReviewContext,
-        candidate: &BaselineResolution,
-        patchset_id: i64,
-        diffs: &[(i64, i64, String, String, String, i64, String)],
-        input_payload: &Value,
-    ) -> (bool, bool) {
-        let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
-        let baseline_ref = candidate.as_str();
+        // Save findings to patchset
+        if let Some((resolution, baseline_id, worktree)) = found_baseline {
+            let _ = ctx
+                .db
+                .update_patchset_baseline_info(
+                    patchset_id,
+                    Some(baseline_id),
+                    Some(ctx.settings.ai.model.as_str()),
+                    prompts_hash.as_deref(),
+                    Some(logs.as_str()),
+                )
+                .await;
 
-        match candidate {
-            BaselineResolution::Commit(h) => {
-                info!("Using base-commit for {}: {}", patchset_id, h);
-            }
-            BaselineResolution::LocalRef(r) => {
-                info!("Using local baseline for {}: {}", patchset_id, r);
-            }
-            BaselineResolution::RemoteTarget { url, name, .. } => {
-                info!(
-                    "Fetching remote baseline for {}: {} ({})",
-                    patchset_id, name, url
-                );
-                if let Err(e) = ensure_remote(&repo_path, name, url, false).await {
-                    error!("Failed to fetch remote {}: {}. Skipping candidate.", url, e);
-                    return (false, false);
-                }
-            }
-        }
+            // 2. Run Reviews
+            let mut review_success = true; // Optimistic
+            let mut failed_patches = 0;
 
-        // 1. Validate Series by applying all patches to a temporary worktree
-        info!("Validating series application on baseline: {}", baseline_ref);
-        let baseline_sha = match get_commit_hash(&repo_path, &baseline_ref).await {
-            Ok(sha) => sha,
-            Err(e) => {
-                error!("Failed to resolve baseline {}: {}", baseline_ref, e);
-                return (false, false);
-            }
-        };
-
-        let worktree = match GitWorktree::new(
-            &repo_path,
-            &baseline_sha,
-            Some(Path::new(&ctx.settings.review.worktree_dir)),
-        )
-        .await
-        {
-            Ok(wt) => wt,
-            Err(e) => {
-                error!("Failed to create worktree: {}", e);
-                return (false, false);
-            }
-        };
-
-        // Wrap logic to ensure cleanup
-        let (candidate_success, application_failed) = async {
-            let mut patch_commits = HashMap::new();
-            let mut application_failed = false;
-
-            for (patch_id, index, diff, subject, author, date_ts, _msg_id) in diffs {
-                 // Construct mbox
-                 let date_str = std::process::Command::new("date")
-                    .arg("-R")
-                    .arg("-d")
-                    .arg(format!("@{}", date_ts))
-                    .output()
-                    .ok()
-                    .and_then(|o| {
-                        if o.status.success() {
-                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-
-                let mbox = format!(
-                    "From: {}\nDate: {}\nSubject: {}\n\n{}\n",
-                    author, date_str, subject, diff
-                );
-
-                // Try git am first
-                let applied = match worktree.apply_patch(&mbox).await {
-                    Ok(_) => true,
-                    Err(_) => {
-                         // Fallback to raw diff
-                         match worktree.apply_raw_diff(diff).await {
-                            Ok(o) => o.status.success(),
-                            Err(_) => false,
-                         }
-                    }
-                };
-
-                if applied {
-                    let head_sha = if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
-                        sha
-                    } else {
-                        "unknown".to_string()
-                    };
-                    patch_commits.insert(*index, head_sha);
-                } else {
-                     error!("Patch {}/{} (ID: {}) failed to apply.", patchset_id, index, patch_id);
-                     application_failed = true;
-                     break;
-                }
-            }
-            
-            // Re-implementing the loop properly to handle commit creation
-            patch_commits.clear();
-            if application_failed || worktree.reset_hard(&baseline_sha).await.is_err() {
-                 return (false, true);
-            }
-
-            for (patch_id, index, diff, subject, author, date_ts, _msg_id) in diffs {
-                 let date_str = std::process::Command::new("date")
-                    .arg("-R")
-                    .arg("-d")
-                    .arg(format!("@{}", date_ts))
-                    .output()
-                    .ok()
-                    .and_then(|o| {
-                        if o.status.success() {
-                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-
-                let mbox = format!(
-                    "From: {}\nDate: {}\nSubject: {}\n\n{}\n",
-                    author, date_str, subject, diff
-                );
-
-                if let Ok(_) = worktree.apply_patch(&mbox).await {
-                     if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
-                         patch_commits.insert(*index, sha);
-                         continue;
-                     }
-                }
-
-                // Fallback: apply raw diff and commit
-                match worktree.apply_raw_diff(diff).await {
-                    Ok(out) if out.status.success() => {
-                         let _ = Command::new("git")
-                            .current_dir(&worktree.path)
-                            .args(["add", "."])
-                            .output()
-                            .await;
-                         
-                         let commit_msg = format!("{}\n\n(Applied via git apply)", subject);
-                         let commit = Command::new("git")
-                            .current_dir(&worktree.path)
-                            .env("GIT_AUTHOR_NAME", author)
-                            .env("GIT_AUTHOR_EMAIL", "sashiko@localhost") // simplified
-                            .args(["commit", "-m", &commit_msg])
-                            .output()
-                            .await;
-                        
-                        if commit.is_ok() && commit.unwrap().status.success() {
-                            if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
-                                 patch_commits.insert(*index, sha);
-                                 continue;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                error!("Patch {}/{} (ID: {}) failed to apply during series validation.", patchset_id, index, patch_id);
-                return (false, true);
-            }
-
-            info!("Series validation successful for baseline {}. Commits generated: {:?}", baseline_ref, patch_commits.len());
-
-            let mut candidate_success = true;
-
-            for (patch_id, index, _diff, _subj, _auth, _date, _msg_id) in diffs {
-                // Retrieve the commit SHA we just created/verified
+            for (patch_id, index, _diff, _subj, _auth, _date, _msg_id) in &diffs {
                 let commit_sha = patch_commits.get(index).cloned();
+                let baseline_ref = resolution.as_str();
 
-                let result = Self::process_patch_in_candidate(
-                    ctx,
+                match Self::process_patch_review(
+                    &ctx,
                     patchset_id,
                     *patch_id,
                     *index,
                     &baseline_ref,
-                    candidate,
-                    input_payload,
-                    commit_sha, // Pass the commit SHA
+                    Some(baseline_id),
+                    &input_payload,
+                    commit_sha,
+                    prompts_hash.as_deref(),
+                    Some(&worktree.path),
                 )
-                .await;
-
-                match result {
-                    Ok(PatchResult::Success) => {
-                        // Continue to next patch
-                    }
-                    Ok(PatchResult::ApplyFailed) => {
-                        candidate_success = false;
-                        application_failed = true;
-                        break;
-                    }
-                    Ok(PatchResult::ReviewFailed) => {
-                        candidate_success = false;
-                        break;
-                    }
-                    Err(_) => {
-                        candidate_success = false;
-                        break;
+                .await
+                {
+                    Ok(PatchResult::Success) => {}
+                    _ => {
+                        review_success = false;
+                        failed_patches += 1;
                     }
                 }
             }
 
-            (candidate_success, application_failed)
-        }.await;
+            // Cleanup worktree here since we kept it alive for reuse
+            let _ = worktree.remove().await;
 
-        if let Err(e) = worktree.remove().await {
-            error!("Failed to remove worktree: {}", e);
+            let final_status = if review_success {
+                ReviewStatus::Reviewed.as_str().to_string()
+            } else if failed_patches == diffs.len() {
+                ReviewStatus::Failed.as_str().to_string() // All failed
+            } else {
+                ReviewStatus::Reviewed.as_str().to_string() // Partial success
+            };
+             
+            let _ = ctx
+                .db
+                .update_patchset_status(patchset_id, &final_status)
+                .await;
+        } else {
+            // No baseline found
+            warn!("No working baseline found for patchset {}", patchset_id);
+            let _ = ctx
+                .db
+                .update_patchset_baseline_info(
+                    patchset_id,
+                    None,
+                    Some(ctx.settings.ai.model.as_str()),
+                    prompts_hash.as_deref(),
+                    Some(logs.as_str()),
+                )
+                .await;
+
+            let _ = ctx
+                .db
+                .update_patchset_status(patchset_id, ReviewStatus::FailedToApply.as_str())
+                .await;
         }
+    }
+                let commit_sha = patch_commits.get(index).cloned();
+                let baseline_ref = resolution.as_str();
 
-        (candidate_success, application_failed)
+                match Self::process_patch_review(
+                    &ctx,
+                    patchset_id,
+                    *patch_id,
+                    *index,
+                    &baseline_ref,
+                    Some(baseline_id),
+                    &input_payload,
+                    commit_sha,
+                    prompts_hash.as_deref(),
+                    Some(&worktree.path),
+                )
+                .await
+                {
+                    Ok(PatchResult::Success) => {}
+                    _ => {
+                        review_success = false;
+                        failed_patches += 1;
+                    }
+                }
+            }
+
+            // Cleanup worktree here since we kept it alive for reuse
+            let _ = worktree.remove().await;
+
+            let final_status = if review_success {
+                ReviewStatus::Reviewed.as_str().to_string()
+            } else if failed_patches == diffs.len() {
+                ReviewStatus::Failed.as_str().to_string() // All failed
+            } else {
+                ReviewStatus::Reviewed.as_str().to_string() // Partial success
+            };
+             
+            let _ = ctx
+                .db
+                .update_patchset_status(patchset_id, &final_status)
+                .await;
+        } else {
+            // No baseline found
+            warn!("No working baseline found for patchset {}", patchset_id);
+            let _ = ctx
+                .db
+                .update_patchset_baseline_info(
+                    patchset_id,
+                    None,
+                    Some(ctx.settings.ai.model.as_str()),
+                    prompts_hash.as_deref(),
+                    Some(logs.as_str()),
+                )
+                .await;
+
+            let _ = ctx
+                .db
+                .update_patchset_status(patchset_id, ReviewStatus::FailedToApply.as_str())
+                .await;
+        }
     }
 
-    async fn process_patch_in_candidate(
+    async fn prepare_baseline_worktree(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        candidates: &[BaselineResolution],
+        diffs: &[(i64, i64, String, String, String, i64, String)],
+    ) -> (
+        Option<(BaselineResolution, i64, GitWorktree)>,
+        HashMap<i64, String>,
+        String,
+    ) {
+        let mut full_logs = String::new();
+        let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
+
+        for candidate in candidates {
+            let baseline_ref = candidate.as_str();
+            full_logs.push_str(&format!("Trying baseline: {}\n", baseline_ref));
+            
+            // Check remote
+            if let BaselineResolution::RemoteTarget { url, name, .. } = candidate {
+                if let Err(e) = ensure_remote(&repo_path, name, url, false).await {
+                    let msg = format!("Failed to fetch remote {}: {}\n", url, e);
+                    full_logs.push_str(&msg);
+                    error!("{}", msg.trim());
+                    continue;
+                }
+            }
+
+            // Resolve SHA
+            let baseline_sha = match get_commit_hash(&repo_path, &baseline_ref).await {
+                Ok(sha) => sha,
+                Err(e) => {
+                    let msg = format!("Failed to resolve baseline ref {}: {}\n", baseline_ref, e);
+                    full_logs.push_str(&msg);
+                    continue;
+                }
+            };
+
+            // Worktree
+            let worktree = match GitWorktree::new(
+                &repo_path,
+                &baseline_sha,
+                Some(Path::new(&ctx.settings.review.worktree_dir)),
+            )
+            .await
+            {
+                Ok(wt) => wt,
+                Err(e) => {
+                    let msg = format!("Failed to create worktree: {}\n", e);
+                    full_logs.push_str(&msg);
+                    continue;
+                }
+            };
+
+            // Apply patches
+            let mut patch_commits = HashMap::new();
+            let mut application_failed = false;
+            let mut apply_logs = String::new();
+
+            for (patch_id, index, diff, subject, author, date_ts, _msg_id) in diffs {
+                 let date_str = std::process::Command::new("date")
+                    .arg("-R")
+                    .arg("-d")
+                    .arg(format!("@{}", date_ts))
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let mbox = format!(
+                    "From: {}\nDate: {}\nSubject: {}\n\n{}\n",
+                    author, date_str, subject, diff
+                );
+
+                // Try git am
+                let mut applied = false;
+                if let Ok(_) = worktree.apply_patch(&mbox).await {
+                     applied = true;
+                } else {
+                     // Fallback raw diff
+                     if let Ok(o) = worktree.apply_raw_diff(diff).await {
+                         if o.status.success() {
+                             applied = true;
+                              // Commit raw diff
+                             let _ = Command::new("git")
+                                .current_dir(&worktree.path)
+                                .args(["add", "."])
+                                .output()
+                                .await;
+                             let commit_msg = format!("{}\n\n(Applied via git apply)", subject);
+                             let _ = Command::new("git")
+                                .current_dir(&worktree.path)
+                                .env("GIT_AUTHOR_NAME", author)
+                                .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
+                                .args(["commit", "-m", &commit_msg])
+                                .output()
+                                .await;
+                         }
+                     }
+                }
+
+                if applied {
+                    if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
+                        patch_commits.insert(*index, sha);
+                    }
+                } else {
+                    let msg = format!("Patch {}/{} (ID: {}) failed to apply.\n", patchset_id, index, patch_id);
+                    apply_logs.push_str(&msg);
+                    application_failed = true;
+                    break;
+                }
+            }
+
+            if !application_failed {
+                full_logs.push_str("Application successful.\n");
+                
+                // Create baseline in DB
+                let baseline_id = {
+                    let (repo_url, branch) = match candidate {
+                        BaselineResolution::RemoteTarget { url, .. } => {
+                            (Some(url.as_str()), Some(baseline_ref.as_str()))
+                        }
+                        _ => (None, Some(baseline_ref.as_str())),
+                    };
+                    ctx.db
+                        .create_baseline(repo_url, branch, Some(&baseline_sha))
+                        .await
+                        .ok() // If fail, we just proceed? Better to have it.
+                };
+
+                if let Some(bid) = baseline_id {
+                    return (Some((candidate.clone(), bid, worktree)), patch_commits, full_logs);
+                } else {
+                    full_logs.push_str("Failed to record baseline in DB.\n");
+                }
+            } else {
+                full_logs.push_str(&apply_logs);
+                full_logs.push_str("Application failed.\n");
+            }
+            
+            // Clean up failed worktree
+            let _ = worktree.remove().await;
+        }
+
+        (None, HashMap::new(), full_logs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn process_patch_review(
         ctx: &ReviewContext,
         patchset_id: i64,
         patch_id: i64,
         index: i64,
         baseline_ref: &str,
-        candidate: &BaselineResolution,
+        baseline_id: Option<i64>,
         input_payload: &Value,
         commit_sha: Option<String>,
+        prompts_hash: Option<&str>,
+        worktree_path: Option<&Path>,
     ) -> Result<PatchResult> {
         info!(
             "Reviewing patch {}/{} (ID: {})",
             patchset_id, index, patch_id
         );
-
-        let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
-        let prompts_hash = get_commit_hash(Path::new("third_party/review-prompts"), "HEAD")
-            .await
-            .ok();
-        let baseline_commit = get_commit_hash(&repo_path, baseline_ref).await.ok();
-
-        let baseline_id = if let Some(commit) = &baseline_commit {
-            let (repo_url, branch) = match candidate {
-                BaselineResolution::RemoteTarget { url, .. } => {
-                    (Some(url.as_str()), Some(baseline_ref))
-                }
-                _ => (None, Some(baseline_ref)),
-            };
-            ctx.db
-                .create_baseline(repo_url, branch, Some(commit))
-                .await
-                .ok()
-        } else {
-            None
-        };
 
         let successful_count = ctx
             .db
@@ -608,19 +627,12 @@ impl Reviewer {
         if successful_count >= ctx.target_review_count {
             info!(
                 "Patch {}/{} (ID: {}) already has {} successful reviews with baseline {:?} (target: {}). Skipping.",
-                patchset_id,
-                index,
-                patch_id,
-                successful_count,
-                baseline_id,
-                ctx.target_review_count
+                patchset_id, index, patch_id, successful_count, baseline_id, ctx.target_review_count
             );
             return Ok(PatchResult::Success);
         }
 
         let mut retries = 0;
-        // Disable retries in this loop to fail fast on patch application or tool errors.
-        // The review binary already handles AI retries internally.
         let max_retries = 0;
 
         loop {
@@ -632,7 +644,7 @@ impl Reviewer {
                     &ctx.settings.ai.provider,
                     &ctx.settings.ai.model,
                     baseline_id,
-                    prompts_hash.as_deref(),
+                    prompts_hash,
                 )
                 .await?;
 
@@ -654,6 +666,7 @@ impl Reviewer {
                 ctx.cache_manager.clone(),
                 ctx.active_cache_name.clone(),
                 review_id,
+                worktree_path,
             )
             .await;
 
@@ -673,7 +686,8 @@ impl Reviewer {
                     };
 
                     if let Some(h) = history.and_then(|h| h.as_array()) {
-                        for item in h {
+                         // Tool usage recording (same as before)
+                         for item in h {
                             if let Some(parts) = item.get("parts").and_then(|p| p.as_array()) {
                                 for part in parts {
                                     if let Some(call) = part.get("functionCall") {
@@ -696,7 +710,6 @@ impl Reviewer {
                         }
                     }
 
-                    // Always try to record AI interaction stats if available, even on failure
                     let interaction_id = if let Some(tokens_in) = json_output["tokens_in"].as_u64()
                     {
                         let i_id = generate_id();
@@ -734,7 +747,7 @@ impl Reviewer {
                         if let Some(error_msg) = json_output["error"].as_str() {
                             if error_msg == "Patch application failed" {
                                 error!(
-                                    "Patch application failed for ps={} idx={} (series validation failed)",
+                                    "Patch application failed for ps={} idx={}",
                                     patchset_id, index
                                 );
                                 let _ = ctx
@@ -771,17 +784,12 @@ impl Reviewer {
 
                             if retries < max_retries {
                                 retries += 1;
-                                warn!(
-                                    "AI failed for ps={} idx={}. Retrying (attempt {}/{})...",
-                                    patchset_id, index, retries, max_retries
-                                );
                                 continue;
                             } else {
                                 return Ok(PatchResult::ReviewFailed);
                             }
                         } else if let Some(review_content) = json_output.get("review") {
                             if !review_content.is_null() {
-                                // Parse and save findings
                                 if let Some(findings_arr) =
                                     review_content.get("findings").and_then(|f| f.as_array())
                                 {
@@ -865,10 +873,6 @@ impl Reviewer {
                                     .await;
                                 if retries < max_retries {
                                     retries += 1;
-                                    warn!(
-                                        "AI failed for ps={} idx={}. Retrying (attempt {}/{})...",
-                                        patchset_id, index, retries, max_retries
-                                    );
                                     continue;
                                 } else {
                                     return Ok(PatchResult::ReviewFailed);
@@ -878,13 +882,7 @@ impl Reviewer {
                             let error_msg = json_output["error"]
                                 .as_str()
                                 .unwrap_or("Missing review content");
-
-                            error!(
-                                "Review tool returned no content for ps={} idx={}. Error: {}",
-                                patchset_id, index, error_msg
-                            );
-
-                            let _ = ctx
+                             let _ = ctx
                                 .db
                                 .complete_review(
                                     review_id,
@@ -896,36 +894,14 @@ impl Reviewer {
                                     logs_str.as_deref(),
                                 )
                                 .await;
-                            if retries < max_retries {
-                                retries += 1;
-                                warn!(
-                                    "Review content missing for ps={} idx={}. Retrying (attempt {}/{})...",
-                                    patchset_id, index, retries, max_retries
-                                );
-                                continue;
-                            } else {
-                                return Ok(PatchResult::ReviewFailed);
-                            }
+                             return Ok(PatchResult::ReviewFailed);
                         }
                     } else {
-                        let patches_debug = serde_json::to_string_pretty(&json_output["patches"])
-                            .unwrap_or_default();
-                        let error_msg = json_output["error"]
+                         // Apply failed in tool
+                         let error_msg = json_output["error"]
                             .as_str()
                             .unwrap_or("Patch application failed");
-                        error!(
-                            "Patch application failed for ps={} review={}: {}",
-                            patchset_id, review_id, error_msg
-                        );
-                        let _ = ctx
-                            .db
-                            .update_review_status(
-                                review_id,
-                                ReviewStatus::FailedToApply.as_str(),
-                                Some(&patches_debug),
-                            )
-                            .await;
-                        let _ = ctx
+                         let _ = ctx
                             .db
                             .complete_review(
                                 review_id,
@@ -937,7 +913,6 @@ impl Reviewer {
                                 logs_str.as_deref(),
                             )
                             .await;
-
                         return Ok(PatchResult::ApplyFailed);
                     }
                 }
@@ -957,10 +932,6 @@ impl Reviewer {
                         .await;
                     if retries < max_retries {
                         retries += 1;
-                        warn!(
-                            "Tool execution failed for ps={} idx={}. Retrying (attempt {}/{})...",
-                            patchset_id, index, retries, max_retries
-                        );
                         continue;
                     }
                     return Ok(PatchResult::ReviewFailed);
@@ -984,6 +955,7 @@ async fn run_review_tool(
     cache_manager: Arc<CacheManager>,
     active_cache_name: Arc<Mutex<Option<String>>>,
     review_id: i64,
+    worktree_path: Option<&Path>,
 ) -> Result<serde_json::Value> {
     let exe_path = std::env::current_exe()?;
     let bin_dir = exe_path
@@ -1030,6 +1002,10 @@ async fn run_review_tool(
 
     if settings.ai.no_ai {
         cmd.arg("--no-ai");
+    }
+
+    if let Some(path) = worktree_path {
+        cmd.arg("--reuse-worktree").arg(path);
     }
 
     cmd.stdin(Stdio::piped());

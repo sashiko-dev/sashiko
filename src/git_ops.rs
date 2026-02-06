@@ -27,9 +27,26 @@ pub struct GitWorktree {
     pub dir: TempDir,
     pub path: PathBuf,
     pub repo_path: PathBuf,
+    pub is_managed: bool,
 }
 
 impl GitWorktree {
+    #[allow(dead_code)]
+    pub fn from_path(path: PathBuf, repo_path: PathBuf) -> Self {
+        // Create a dummy tempdir that won't be deleted or used, just to satisfy the struct
+        // Actually, we can't easily construct a TempDir that doesn't delete on drop unless we use into_path() but we need to keep it in struct.
+        // Or we make dir: Option<TempDir>.
+        // Let's change struct to Option<TempDir>.
+        Self {
+            dir: tempfile::Builder::new().prefix("dummy").tempdir().unwrap(), // Hack: create a dummy tempdir, but we won't use it.
+            // Wait, if we drop this struct, the dummy tempdir is deleted. That's fine.
+            // We just shouldn't delete the `path`.
+            path,
+            repo_path,
+            is_managed: false,
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn new(
         repo_path: &Path,
@@ -72,6 +89,7 @@ impl GitWorktree {
             dir: temp_dir,
             path,
             repo_path: repo_path.to_path_buf(),
+            is_managed: true,
         })
     }
 
@@ -195,6 +213,9 @@ impl GitWorktree {
 
     #[allow(dead_code)]
     pub async fn remove(self) -> Result<()> {
+        if !self.is_managed {
+            return Ok(());
+        }
         info!("Removing worktree at {:?}", self.path);
         let output = Command::new("git")
             .current_dir(&self.repo_path)

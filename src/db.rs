@@ -50,6 +50,9 @@ pub struct PatchsetRow {
     pub baseline_id: Option<i64>,
     pub failed_reason: Option<String>,
     pub target_review_count: Option<u32>,
+    pub model_name: Option<String>,
+    pub prompts_git_hash: Option<String>,
+    pub baseline_logs: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,6 +365,15 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("patchsets", "target_review_count", "INTEGER DEFAULT 1")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "model_name", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "prompts_git_hash", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "baseline_logs", "TEXT")
             .await;
 
         let _ = self
@@ -2162,6 +2174,9 @@ impl Database {
                 baseline_id: row.get(14).ok(),
                 failed_reason: row.get(15).ok(),
                 target_review_count: row.get(16).ok(),
+                model_name: None,
+                prompts_git_hash: None,
+                baseline_logs: None,
             });
         }
         Ok(patchsets)
@@ -2260,7 +2275,8 @@ impl Database {
             .query(
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients, 
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
-                    p.total_parts, p.received_parts, p.failed_reason
+                    p.total_parts, p.received_parts, p.failed_reason,
+                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id
              FROM patchsets p 
              WHERE p.id = ?",
                 libsql::params![id],
@@ -2280,6 +2296,26 @@ impl Database {
             let total_parts: Option<u32> = row.get(9).ok();
             let received_parts: Option<u32> = row.get(10).ok();
             let failed_reason: Option<String> = row.get(11).ok();
+            let model_name: Option<String> = row.get(12).ok();
+            let prompts_git_hash: Option<String> = row.get(13).ok();
+            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_id: Option<i64> = row.get(15).ok();
+            
+            // Fetch baseline details if needed
+            let baseline = if let Some(bid) = baseline_id {
+                 let mut browse = self.conn.query("SELECT repo_url, branch, last_known_commit FROM baselines WHERE id = ?", libsql::params![bid]).await?;
+                 if let Ok(Some(brow)) = browse.next().await {
+                     Some(serde_json::json!({
+                        "repo_url": brow.get::<Option<String>>(0).ok(),
+                        "branch": brow.get::<Option<String>>(1).ok(),
+                        "commit": brow.get::<Option<String>>(2).ok(),
+                     }))
+                 } else {
+                     None
+                 }
+            } else {
+                None
+            };
 
             // Fetch reviews
             let mut reviews = Vec::new();
@@ -2399,7 +2435,11 @@ impl Database {
                 "reviews": reviews,
                 "patches": patches,
                 "thread": messages,
-                "subsystems": subsystems
+                "subsystems": subsystems,
+                "model_name": model_name,
+                "prompts_git_hash": prompts_git_hash,
+                "baseline_logs": baseline_logs,
+                "baseline": baseline
             })))
         } else {
             Ok(None)
@@ -2508,6 +2548,9 @@ impl Database {
                 baseline_id: row.get(9).ok(),
                 failed_reason: row.get(10).ok(),
                 target_review_count: row.get(11).ok(),
+                model_name: None,
+                prompts_git_hash: None,
+                baseline_logs: None,
             });
         }
         Ok(patchsets)
@@ -2609,6 +2652,23 @@ impl Database {
             .execute(
                 "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
                 libsql::params![error, root_msg_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_patchset_baseline_info(
+        &self,
+        id: i64,
+        baseline_id: Option<i64>,
+        model_name: Option<&str>,
+        prompts_hash: Option<&str>,
+        logs: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ? WHERE id = ?",
+                libsql::params![baseline_id, model_name, prompts_hash, logs, id],
             )
             .await?;
         Ok(())

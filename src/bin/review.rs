@@ -60,6 +60,11 @@ struct Args {
     /// If set, skip AI review but still apply patches for verification.
     #[arg(long)]
     no_ai: bool,
+
+    /// If set, use this existing worktree path instead of creating a new one.
+    /// The caller is responsible for cleanup.
+    #[arg(long)]
+    reuse_worktree: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -123,11 +128,15 @@ async fn main() -> Result<()> {
         info!("Using baseline: {} ({})", baseline_arg, baseline_sha);
 
         // Use provided or default baseline
-        let worktree =
-            GitWorktree::new(&repo_path, &baseline_sha, args.worktree_dir.as_deref()).await?;
+        let worktree = if let Some(path) = &args.reuse_worktree {
+            info!("Reusing existing worktree at {:?}", path);
+            GitWorktree::from_path(path.clone(), repo_path.clone())
+        } else {
+            GitWorktree::new(&repo_path, &baseline_sha, args.worktree_dir.as_deref()).await?
+        };
 
         let result = async {
-            info!("Created worktree at {:?}", worktree.path);
+            info!("Worktree at {:?}", worktree.path);
             info!("Found {} patches total", patches.len());
 
             let mut patch_results = Vec::new();

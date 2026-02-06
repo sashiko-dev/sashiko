@@ -1449,6 +1449,40 @@
                 `;
             }
 
+            const modelName = data.model_name || '-';
+            const promptsHash = data.prompts_git_hash ? data.prompts_git_hash.substring(0, 8) : '-';
+            
+            let baselineStr = '-';
+            if (data.baseline) {
+                 const parts = [];
+                 if (data.baseline.branch) parts.push(data.baseline.branch);
+                 if (data.baseline.commit) parts.push(data.baseline.commit.substring(0, 8));
+                 if (parts.length > 0) baselineStr = parts.join(' / ');
+            }
+
+            let baselineLogsHtml = '';
+            if (data.baseline_logs) {
+                 const logId = 'baseline-logs-' + Math.random().toString(36).substr(2, 9);
+                 const formattedLogs = escapeHtml(data.baseline_logs)
+                    .replace(/ - passed/g, ' - <span style="color:#2e7d32; font-weight:bold">passed</span>')
+                    .replace(/ - failed/g, ' - <span style="color:#d73a49; font-weight:bold">failed</span>')
+                    .replace(/Application successful./g, '<span style="color:#2e7d32; font-weight:bold">Application successful.</span>')
+                    .replace(/Application failed./g, '<span style="color:#d73a49; font-weight:bold">Application failed.</span>');
+
+                 baselineLogsHtml = `
+                    <div class="section">
+                        <h2 style="display:flex; align-items:center; gap:10px;">
+                            Baseline
+                            <button class="toggle-btn" onclick="toggleCollapsible('${logId}', this)" style="font-size:0.8em; font-weight:normal;">▼ Show Logs</button>
+                        </h2>
+                        <div class="kv"><div class="label">Selected:</div><div>${baselineStr}</div></div>
+                        <div id="${logId}" class="collapsible open">
+                            <div class="log-block" style="max-height:300px;">${formattedLogs}</div>
+                        </div>
+                    </div>
+                 `;
+            }
+
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
                 <h1>
@@ -1463,12 +1497,16 @@
                     <div class="kv"><div class="label">Date:</div><div>${date}</div></div>
                     <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
                     <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
+                    <div class="kv"><div class="label">Model:</div><div>${escapeHtml(modelName)}</div></div>
+                    <div class="kv"><div class="label">Prompts:</div><div>${escapeHtml(promptsHash)}</div></div>
                 </div>
                 
                 <div class="section">
                     <h2>Thread</h2>
                     ${threadHtml}
                 </div>
+
+                ${baselineLogsHtml}
                 
                 <div class="section">
                     <h2 id="ai-reviews">AI Reviews</h2>
