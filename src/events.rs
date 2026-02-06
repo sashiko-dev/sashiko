@@ -37,6 +37,11 @@ pub enum Event {
         index: u32,
         total: u32,
     },
+    RawMboxSubmitted {
+        raw: String,
+        group: String,
+        baseline: Option<String>,
+    },
     IngestionFailed {
         article_id: String,
         error: String,

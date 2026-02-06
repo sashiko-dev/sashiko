@@ -84,27 +84,11 @@ pub struct InjectRequest {
 }
 
 #[derive(Deserialize)]
-pub struct LocalPatch {
-    pub subject: String,
-    pub message: String,
-    pub diff: String,
-}
-
-#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SubmitRequest {
-    Local {
-        author: String,
-        subject: String,
-        message: String,
-        diff: String,
+    Inject {
+        raw: String,
         base_commit: Option<String>,
-    },
-    #[serde(rename = "local-multiple")]
-    LocalMultiple {
-        author: String,
-        base_commit: Option<String>,
-        patches: Vec<LocalPatch>,
     },
     Remote {
         sha: String,
@@ -192,109 +176,32 @@ async fn submit_patch(
     }
 
     match payload {
-        SubmitRequest::Local {
-            author,
-            subject,
-            message,
-            diff,
-            base_commit,
-        } => {
-            let id = generate_synthetic_id("local");
-            info!("Received local patch submission: {}", id);
-
-            // Create a placeholder record so the user can track status immediately
-            if let Err(e) = state.db.create_fetching_patchset(&id, &subject).await {
-                error!("Failed to create placeholder for local patch: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        SubmitRequest::Inject { raw, base_commit } => {
+            if raw.trim().is_empty() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            // Basic guardrail
+            if !raw.contains("From ") && !raw.contains("Subject:") {
+                return Err(StatusCode::BAD_REQUEST);
             }
 
-            let event = Event::PatchSubmitted {
+            let id = generate_synthetic_id("inject");
+            info!("Received raw mbox injection: {} (len: {})", id, raw.len());
+
+            let event = Event::RawMboxSubmitted {
+                raw,
                 group: "api-submit".to_string(),
-                article_id: id.clone(),
-                message_id: id.clone(),
-                subject,
-                author,
-                message,
-                diff,
-                base_commit,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                index: 1,
-                total: 1,
+                baseline: base_commit,
             };
 
             if let Err(e) = state.sender.send(event).await {
-                error!("Failed to send local patch to queue: {}", e);
+                error!("Failed to send raw mbox to queue: {}", e);
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
 
             Ok(Json(SubmitResponse {
                 status: "accepted".to_string(),
                 id,
-            }))
-        }
-        SubmitRequest::LocalMultiple {
-            author,
-            base_commit,
-            patches,
-        } => {
-            let total = patches.len();
-            if total == 0 {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-            if total > 100 {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
-            }
-
-            let series_id = generate_synthetic_id("series");
-            info!(
-                "Received local series submission: {} ({} patches)",
-                series_id, total
-            );
-
-            // Create a placeholder for the entire series
-            let first_subject = &patches[0].subject;
-            if let Err(e) = state
-                .db
-                .create_fetching_patchset(&series_id, first_subject)
-                .await
-            {
-                error!("Failed to create placeholder for local series: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-
-            for (i, patch) in patches.into_iter().enumerate() {
-                let patch_id = format!("{}-{}", series_id, i + 1);
-                let event = Event::PatchSubmitted {
-                    group: "api-submit".to_string(),
-                    article_id: series_id.clone(),
-                    message_id: patch_id,
-                    subject: patch.subject,
-                    author: author.clone(),
-                    message: patch.message,
-                    diff: patch.diff,
-                    base_commit: base_commit.clone(),
-                    timestamp: now,
-                    index: (i + 1) as u32,
-                    total: total as u32,
-                };
-
-                if let Err(e) = state.sender.send(event).await {
-                    error!("Failed to send series patch {} to queue: {}", i + 1, e);
-                    // We continue anyway, some might have succeeded
-                }
-            }
-
-            Ok(Json(SubmitResponse {
-                status: "accepted".to_string(),
-                id: series_id,
             }))
         }
         SubmitRequest::Remote { sha, repo } | SubmitRequest::RemoteRange { sha, repo } => {

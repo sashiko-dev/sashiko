@@ -293,6 +293,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             error!("Failed to send pre-parsed article: {}", e);
                         }
                     }
+                                        Event::RawMboxSubmitted { raw, group, baseline } => {
+                                            let messages = sashiko::ingestor::split_mbox(raw.as_bytes());
+                                            let count = messages.len();
+                    
+                                            if count > 100 {
+                                                error!("Too many messages in mbox submission: {} (limit 100)", count);
+                                                return;
+                                            }
+                    
+                                            info!("Processing {} messages from raw mbox submission", count);
+                    
+                                            for msg_raw in messages {
+                                                let msg_id = sashiko::ingestor::extract_message_id(&msg_raw);
+                                                let group_clone = group.clone();
+                                                let tx_clone = tx.clone();
+                                                let baseline_clone = baseline.clone();
+                    
+                                                // Offload parsing
+                                                let parse_result = tokio::task::spawn_blocking(move || {
+                                                    sashiko::patch::parse_email(&msg_raw)
+                                                })
+                                                .await;
+                    
+                                                match parse_result {
+                                                    Ok(Ok((metadata, patch_opt))) => {
+                                                        // Check cutoff
+                                                        if let Some(cutoff) = cutoff_timestamp {
+                                                            if metadata.date < cutoff {
+                                                                continue;
+                                                            }
+                                                        }
+                    
+                                                        // Override group "api-submit" -> "manual" to avoid synthetic ID logic
+                                                        let effective_group = if group_clone == "api-submit" {
+                                                            "manual".to_string()
+                                                        } else {
+                                                            group_clone
+                                                        };
+                    
+                                                        if let Err(e) = tx_clone
+                                                            .send(ParsedArticle {
+                                                                group: effective_group,
+                                                                article_id: msg_id,
+                                                                metadata: Some(metadata),
+                                                                patch: patch_opt,
+                                                                baseline: baseline_clone,
+                                                                failed_error: None,
+                                                            })
+                                                            .await
+                                                        {
+                                                            error!("Failed to send parsed article: {}", e);
+                                                        }
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        info!("Parse error for {}: {}", msg_id, e);
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Join error in parser: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
                     Event::ArticleFetched {
                         group,
                         article_id,
