@@ -366,6 +366,20 @@ impl FetchAgent {
         index: u32,
         total: u32,
     ) -> Result<Event> {
+        // Resolve parent to use as base_commit
+        let parent_output = Command::new("git")
+            .current_dir(&self.repo_path)
+            .args(["rev-parse", &format!("{}^", commit)])
+            .output()
+            .await?;
+
+        let base_commit = if parent_output.status.success() {
+            Some(String::from_utf8_lossy(&parent_output.stdout).trim().to_string())
+        } else {
+            warn!("Failed to resolve parent for {}, using commit as base", commit);
+            Some(commit.to_string())
+        };
+
         // Format: AuthorName%nAuthorEmail%nSubject%nBody...%n---SASHIKO-END-HEADER---%nDiff...
         let format = "format:%an%n%ae%n%s%n%b%n---SASHIKO-END-HEADER---";
 
@@ -411,7 +425,7 @@ impl FetchAgent {
             author,
             message,
             diff,
-            base_commit: Some(commit.to_string()), // The commit itself is the point of reference
+            base_commit,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64,
