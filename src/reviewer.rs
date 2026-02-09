@@ -564,6 +564,12 @@ impl Reviewer {
                 let logs_json = serde_json::to_string(&attempts).unwrap_or_default();
 
                 if let Some(bid) = baseline_id {
+                    info!(
+                        "Baseline found for patchset {}: {} ({} attempts)",
+                        patchset_id,
+                        candidate.as_str(),
+                        attempts.len()
+                    );
                     return (
                         Some((candidate.clone(), bid, worktree)),
                         patch_commits,
