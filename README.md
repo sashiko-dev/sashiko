@@ -64,6 +64,30 @@ cargo run --release
 
 This will start the Sashiko daemon, which will begin ingesting and reviewing patches based on your configuration.
 
+## Benchmarking
+
+Sashiko includes a benchmarking suite to evaluate the effectiveness of its AI reviews against known kernel bugs. The benchmark uses a dataset of commits (`benchmark.json`) where bugs were fixed, and checks if Sashiko can identify the issues in the original buggy commits.
+
+1.  **Start the Sashiko Server**:
+    Ensure the main application is running to handle ingestion requests.
+    ```bash
+    cargo run --release
+    ```
+
+2.  **Ingest Benchmark Data**:
+    In a separate terminal, run the ingestion tool to submit the benchmark commits to the running server.
+    ```bash
+    cargo run --release --bin ingest_benchmark
+    ```
+    This reads `benchmark.json` and submits each commit to the local Sashiko instance for review. Wait for the server to process these reviews (check the server logs).
+
+3.  **Run Evaluation**:
+    Once the reviews are complete, run the evaluation tool. This compares the AI's findings against the ground truth in `benchmark.json`.
+    ```bash
+    cargo run --release --bin benchmark_review
+    ```
+    The results will be printed to the console and saved to `benchmark_results.json`.
+
 ## License
 
 Licensed under the Apache License, Version 2.0 (the "License");
