@@ -101,7 +101,7 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         let filename = "review-inline.txt";
-        let content = "Hello, world!";
+        let content = "commit 123456\nAuthor: Test User\n\nSubject";
         let args = json!({ "path": filename, "content": content });
 
         let result = rt.block_on(toolbox.call("write_file", args)).unwrap();
@@ -109,6 +109,28 @@ mod tests {
 
         let written_content = std::fs::read_to_string(worktree_path.join(filename)).unwrap();
         assert_eq!(written_content, content);
+    }
+
+    #[test]
+    fn test_write_file_invalid_format() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_path = temp_dir.path().to_path_buf();
+        let toolbox = ToolBox::new(worktree_path, None);
+
+        let rt = Runtime::new().unwrap();
+
+        let filename = "review-inline.txt";
+        let content = "Hello, world!";
+        let args = json!({ "path": filename, "content": content });
+
+        let result = rt.block_on(toolbox.call("write_file", args));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Please check `inline-template.md` for the correct output format.")
+        );
     }
 
     #[test]
@@ -120,10 +142,10 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         let filename = "review-inline.txt";
-        let initial_content = "Initial content";
+        let initial_content = "commit 111111\nAuthor: User1\n\nOld content";
         std::fs::write(worktree_path.join(filename), initial_content).unwrap();
 
-        let new_content = "New overwritten content";
+        let new_content = "commit 222222\nAuthor: User2\n\nNew overwritten content";
         let args = json!({ "path": filename, "content": new_content });
 
         let result = rt.block_on(toolbox.call("write_file", args)).unwrap();

@@ -306,11 +306,11 @@ mod tests {
         let client = Box::new(StatefulMockClient::new(vec![
             create_tool_call_response(
                 "write_file",
-                json!({ "path": "review-inline.txt", "content": "test" }),
+                json!({ "path": "review-inline.txt", "content": "commit 123456\nAuthor: Test User" }),
             ),
             create_tool_call_response(
                 "write_file",
-                json!({ "path": "review-inline.txt", "content": "test" }),
+                json!({ "path": "review-inline.txt", "content": "commit 123456\nAuthor: Test User" }),
             ),
             create_text_response(
                 "```json\n{\"summary\": \"Done\", \"findings\": [], \"analysis_trace\": []}\n```",

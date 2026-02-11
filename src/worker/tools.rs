@@ -332,6 +332,26 @@ impl ToolBox {
             .as_str()
             .ok_or_else(|| anyhow!("Missing content"))?;
 
+        if path_str == "review-inline.txt" {
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.is_empty() {
+                return Err(anyhow!(
+                    "Invalid format for review-inline.txt: File is empty. Please check `inline-template.md` for the correct output format."
+                ));
+            }
+            if !lines[0].starts_with("commit ") {
+                return Err(anyhow!(
+                    "Invalid format for review-inline.txt: First line must start with 'commit <SHA>'. Found: '{}'. Please check `inline-template.md` for the correct output format.",
+                    lines[0]
+                ));
+            }
+            if lines.len() < 2 || !lines[1].starts_with("Author: ") {
+                return Err(anyhow!(
+                    "Invalid format for review-inline.txt: Second line must start with 'Author: <name>'. Please check `inline-template.md` for the correct output format."
+                ));
+            }
+        }
+
         let path = self.validate_path(path_str, &self.worktree_path)?;
         fs::write(path, content).await?;
 
