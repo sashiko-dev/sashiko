@@ -1,0 +1,38 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "functionCall": {
+              "name": "read_prompt",
+              "args": {
+                "name": "technical-patterns.md"
+              }
+            },
+            "thoughtSignature": "Esw=="
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0,
+      "finishMessage": "Model generated function call(s)."
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 5667,
+    "candidatesTokenCount": 20,
+    "totalTokenCount": 5940,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 5667
+      }
+    ],
+    "thoughtsTokenCount": 253
+  },
+  "modelVersion": "gemini-3-pro-preview",
+  "responseId": "X3GGab65KYiAqtsPv4-ssQw",
+  "turnToken": "v1_ChdYM0dHYWI2NUtZaUFxdHNQdjQtc3NRdxIXWDNHR2FiNjVLWWlBcXRzUHY0LXNzUXc"
+}

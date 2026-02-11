@@ -1,0 +1,43 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "functionCall": {
+              "name": "read_files",
+              "args": {
+                "files": [
+                  {
+                    "path": "mm/mempool.c"
+                  }
+                ],
+                "mode": "smart"
+              }
+            },
+            "thoughtSignature": "EocGCoQGAb4+9vtWyIAG+JmiZXGlAa4d5LVaOmnWmE/um3qcX+Mr6qYmp/gBn26MwEUSEwtqzTfmYrgVqYIqyf9olARzlFJW8aCSlb7irJysIUScy11cot6x3Af5yXkbDf7O38p7HuLwFn9htMfj5QAVbetosVmvjAWazhnwcm7SKIIw+e1svbdPx2EtxYvpDKps5rynA3Pnu9qI0QyCILLTFs/XK/LotmClL6I2ABXzbWiO7D9n0kwBUTZsothF+GYDxjoFXoIn1uj0RsE98r4/PMQCZsGSg0oezvIa3ts0M72RICGpivWerZF3+caD6ajXH4Ra7LGr8gCqi+/9vbTtXM2RsFGb8+SMlKgSC4DwGfshJZeLCyaiMDlP9Ft4D1yw2Jb/SBK9j73RHvnlnEaeqMBhrG8plpv1qgQx9sFwpoDSmb2YA8dwIxBzv+KJkIlEHVN+o2EhA1BIw6YD3RxwsSFwR91zBYcVP2up4raapCSwCgGTkB2b4YAr+G6WHICAt53oVNT1wiiU/4sZC4XewuQ739qtFELD+VNBkVG82Re+T/WMwGEZPOpfeRcdvT/wUCZRezseS6kOQuep6RXdRJGcogvD4B3F3ap1w4/BfVUNAQtRpVweYVww2XqsA816rLz1iAWGAw1SIaanBfuckE37w6TiWyAiVPR+wl2KzfXPM5N+oKkgtAwDE/BA1BUwcNaGRdJjNww3bcpJhPt8GDIewI/railPgoSU8WFb1ikJqGj5DYE3VJwS9bLCfedpcT7Opsid6I8VPo+D5qyMVhwjGGf9p6yFPZV3OkUyukpt5Oks7MZoJuOaCQvJUSPz/ZsKzEL+68AOIlqyPu2c1UgU3wXvZAJlSnz45eoZEtw8Pn0BINdgqMftOF8f+CaLQjMee/xfSg80yMFJZs2H0w+HBuZ6HKM6jkPgOsPsgfq8blz+UhnRNuS0+41RLAfPbtcjh3ARzHj5SgC3sZ5s4D5Dn6irunaumy2J/PV1JFna/dN1JeYKia6MpZeVLoJNTwaOcM2m7w=="
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0,
+      "finishMessage": "Model generated function call(s)."
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 8448,
+    "candidatesTokenCount": 31,
+    "totalTokenCount": 8697,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 8448
+      }
+    ],
+    "thoughtsTokenCount": 218
+  },
+  "modelVersion": "gemini-3-pro-preview",
+  "responseId": "anGGacjgDoS-qtsP9POe4A8",
+  "turnToken": "v1_ChdhbkdHYWNqZ0RvUy1xdHNQOVBPZTRBOBIXYW5HR2FjamdEb1MtcXRzUDlQT2U0QTg"
+}

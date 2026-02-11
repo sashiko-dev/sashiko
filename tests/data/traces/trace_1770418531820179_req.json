@@ -1,0 +1,132 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "initial prompt"
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "name": "read_prompt",
+            "args": {
+              "name": "technical-patterns.md"
+            }
+          },
+          "thoughtSignature": "EswGCskGAb4+"
+        }
+      ]
+    },
+    {
+      "role": "function",
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "read_prompt",
+            "response": {
+              "content": "prompt content"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "name": "read_prompt",
+            "args": {
+              "name": "mm.md"
+            }
+          },
+          "thoughtSignature": "Et8FCtwFAb4+"
+        }
+      ]
+    },
+    {
+      "role": "function",
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "read_prompt",
+            "response": {
+              "content": "prompt content"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "systemInstruction": {
+    "role": "user",
+    "parts": [
+      {
+        "text": "You're an expert Linux kernel developer and upstream maintainer with deep knowledge of Linux kernel, Operating Systems, CPU architectures, modern hardware and Linux kernel community standards and processes."
+      }
+    ]
+  },
+  "generationConfig": {
+    "responseMimeType": "application/json",
+    "responseSchema": {
+      "properties": {
+        "analysis_trace": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "findings": {
+          "items": {
+            "properties": {
+              "file": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              },
+              "severity": {
+                "enum": [
+                  "Low",
+                  "Medium",
+                  "High",
+                  "Critical"
+                ],
+                "type": "string"
+              },
+              "suggestion": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "line",
+              "severity",
+              "message"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_trace",
+        "verdict",
+        "findings"
+      ],
+      "type": "object"
+    },
+    "temperature": 1.0
+  }
+}

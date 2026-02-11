@@ -1,0 +1,339 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "initial prompt"
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "name": "read_prompt",
+            "args": {
+              "name": "technical-patterns.md"
+            }
+          },
+          "thoughtSignature": "EswGCskGAb4+"
+        }
+      ]
+    },
+    {
+      "role": "function",
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "read_prompt",
+            "response": {
+              "content": "prompt content"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "read_files",
+          "description": "Read the content of one or more files. In 'smart' mode, it collapses irrelevant code around the focus lines.",
+          "parameters": {
+            "properties": {
+              "files": {
+                "description": "List of files to read.",
+                "items": {
+                  "properties": {
+                    "end_line": {
+                      "description": "1-based end line (optional). In smart mode, this is the end of the focus area.",
+                      "type": "integer"
+                    },
+                    "path": {
+                      "description": "Relative path to the file.",
+                      "type": "string"
+                    },
+                    "start_line": {
+                      "description": "1-based start line (optional). In smart mode, this is the start of the focus area.",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "path"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "mode": {
+                "description": "Read mode. Defaults to 'raw'.",
+                "enum": [
+                  "raw",
+                  "smart"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "files"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "git_blame",
+          "description": "Show what revision and author last modified each line of a file.",
+          "parameters": {
+            "properties": {
+              "end_line": {
+                "description": "1-based end line (optional).",
+                "type": "integer"
+              },
+              "path": {
+                "description": "Relative path to the file.",
+                "type": "string"
+              },
+              "start_line": {
+                "description": "1-based start line (optional).",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "git_diff",
+          "description": "Show changes between commits, commit and working tree, etc.",
+          "parameters": {
+            "properties": {
+              "args": {
+                "description": "Arguments for git diff (e.g., ['HEAD^', 'HEAD']).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "args"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "git_show",
+          "description": "Show various types of objects (blobs, trees, tags and commits). Supports line filtering for blobs and diff suppression for commits.",
+          "parameters": {
+            "properties": {
+              "end_line": {
+                "description": "1-based end line (optional).",
+                "type": "integer"
+              },
+              "object": {
+                "description": "The object to show (e.g. 'HEAD:README.md' or 'HEAD').",
+                "type": "string"
+              },
+              "start_line": {
+                "description": "1-based start line (optional). Useful for reading specific parts of a file (blob).",
+                "type": "integer"
+              },
+              "suppress_diff": {
+                "description": "If true, suppresses the diff output for commits (shows only metadata). Useful for checking commit details cheaply.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "object"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "list_dir",
+          "description": "List files in a directory.",
+          "parameters": {
+            "properties": {
+              "path": {
+                "description": "Directory path.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "write_file",
+          "description": "Write content to a file in the worktree. Only 'review-metadata.json' and 'review-inline.txt' are allowed. Overwrites existing files.",
+          "parameters": {
+            "properties": {
+              "content": {
+                "description": "Content to write.",
+                "type": "string"
+              },
+              "path": {
+                "description": "Relative path to the file (e.g., 'review-inline.txt').",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "search_file_content",
+          "description": "Search for a pattern in files using grep. Returns matching lines with context.",
+          "parameters": {
+            "properties": {
+              "context_lines": {
+                "description": "Number of context lines to show (default 0).",
+                "type": "integer"
+              },
+              "path": {
+                "description": "Directory to search in (defaults to root).",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex pattern to search for.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pattern"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "find_files",
+          "description": "Find files matching a glob pattern (e.g., '*.rs', 'src/**/mod.rs').",
+          "parameters": {
+            "properties": {
+              "path": {
+                "description": "Directory to search in (defaults to root).",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Glob pattern to match.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pattern"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "todowrite",
+          "description": "Add a new TODO item to the TODO.md file.",
+          "parameters": {
+            "properties": {
+              "content": {
+                "description": "The TODO item content.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "content"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "read_prompt",
+          "description": "Read a specific prompt file from the prompt registry (e.g., 'mm.md', 'locking.md').",
+          "parameters": {
+            "properties": {
+              "name": {
+                "description": "Name of the prompt file (e.g., 'patterns/BPF-001.md').",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ],
+  "systemInstruction": {
+    "role": "user",
+    "parts": [
+      {
+        "text": "You're an expert Linux kernel developer and upstream maintainer with deep knowledge of Linux kernel, Operating Systems, CPU architectures, modern hardware and Linux kernel community standards and processes."
+      }
+    ]
+  },
+  "generationConfig": {
+    "responseMimeType": "application/json",
+    "responseSchema": {
+      "properties": {
+        "analysis_trace": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "findings": {
+          "items": {
+            "properties": {
+              "file": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              },
+              "severity": {
+                "enum": [
+                  "Low",
+                  "Medium",
+                  "High",
+                  "Critical"
+                ],
+                "type": "string"
+              },
+              "suggestion": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "line",
+              "severity",
+              "message"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_trace",
+        "verdict",
+        "findings"
+      ],
+      "type": "object"
+    },
+    "temperature": 1.0
+  }
+}
