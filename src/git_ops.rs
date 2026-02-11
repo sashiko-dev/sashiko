@@ -20,7 +20,18 @@ use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Creates a new Git command with isolated environment.
+fn isolated_git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd
+}
 
 #[allow(dead_code)]
 pub struct GitWorktree {
@@ -53,6 +64,9 @@ impl GitWorktree {
         commit_hash: &str,
         parent_dir: Option<&Path>,
     ) -> Result<Self> {
+        let lock = get_repo_lock(repo_path);
+        let _guard = lock.lock().await;
+
         let temp_dir = if let Some(parent) = parent_dir {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)?;
@@ -63,12 +77,30 @@ impl GitWorktree {
         } else {
             TempDir::new()?
         };
-        let path = temp_dir.path().to_path_buf();
+        let path = temp_dir.path().canonicalize()?;
 
         info!("Creating worktree at {:?}", path);
 
-        let output = Command::new("git")
+        let dot_git = repo_path.join(".git");
+        let git_dir = if dot_git.exists() {
+            dot_git
+        } else {
+            repo_path.to_path_buf()
+        };
+
+        // Ensure we prune any stale worktrees first to avoid "already exists" errors if temp dirs were reused
+        let _ = isolated_git_command()
             .current_dir(repo_path)
+            .env("GIT_DIR", &git_dir)
+            .env("GIT_WORK_TREE", repo_path)
+            .args(["worktree", "prune"])
+            .output()
+            .await;
+
+        let output = isolated_git_command()
+            .current_dir(repo_path)
+            .env("GIT_DIR", &git_dir)
+            .env("GIT_WORK_TREE", repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
             .arg("add")
@@ -79,6 +111,14 @@ impl GitWorktree {
             .await?;
 
         if !output.status.success() {
+            let envs: Vec<String> = std::env::vars()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            error!(
+                "Failed to create worktree: {}\nEnvironment: {:?}",
+                String::from_utf8_lossy(&output.stderr),
+                envs
+            );
             return Err(anyhow!(
                 "Failed to create worktree: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -97,8 +137,17 @@ impl GitWorktree {
     pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
         info!("Applying patch in {:?}", self.path);
 
-        let mut child = Command::new("git")
+        let dot_git = self.path.join(".git");
+        let git_dir = if dot_git.exists() {
+            dot_git
+        } else {
+            self.path.to_path_buf()
+        };
+
+        let mut child = isolated_git_command()
             .current_dir(&self.path)
+            .env("GIT_DIR", git_dir)
+            .env("GIT_WORK_TREE", &self.path)
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
             .env("GIT_COMMITTER_NAME", "Sashiko Bot")
@@ -119,8 +168,28 @@ impl GitWorktree {
         let output = child.wait_with_output().await?;
 
         if !output.status.success() {
-            let _ = Command::new("git")
+            let envs: Vec<String> = std::env::vars()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            error!(
+                "git am failed in {:?}.\nstdout: {}\nstderr: {}\nEnvironment: {:?}",
+                self.path,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                envs
+            );
+
+            let dot_git = self.path.join(".git");
+            let git_dir = if dot_git.exists() {
+                dot_git
+            } else {
+                self.path.to_path_buf()
+            };
+
+            let _ = isolated_git_command()
                 .current_dir(&self.path)
+                .env("GIT_DIR", git_dir)
+                .env("GIT_WORK_TREE", &self.path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("am")
                 .arg("--abort")
@@ -141,7 +210,7 @@ impl GitWorktree {
     pub async fn apply_raw_diff(&self, diff_content: &str) -> Result<std::process::Output> {
         info!("Applying raw diff in {:?}", self.path);
 
-        let mut child = Command::new("git")
+        let mut child = isolated_git_command()
             .current_dir(&self.path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("apply")
@@ -163,7 +232,7 @@ impl GitWorktree {
     }
 
     pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
-        let output = Command::new("git")
+        let output = isolated_git_command()
             .current_dir(&self.path)
             .args(["show", hash])
             .output()
@@ -181,7 +250,7 @@ impl GitWorktree {
 
     pub async fn reset_hard(&self, ref_name: &str) -> Result<()> {
         info!("Resetting worktree to {}", ref_name);
-        let output = Command::new("git")
+        let output = isolated_git_command()
             .current_dir(&self.path)
             .args(["reset", "--hard", ref_name])
             .output()
@@ -195,7 +264,7 @@ impl GitWorktree {
         }
 
         // Also clean untracked files to be safe
-        let clean_output = Command::new("git")
+        let clean_output = isolated_git_command()
             .current_dir(&self.path)
             .args(["clean", "-fdx"])
             .output()
@@ -216,9 +285,23 @@ impl GitWorktree {
         if !self.is_managed {
             return Ok(());
         }
+
+        let lock = get_repo_lock(&self.repo_path);
+        let _guard = lock.lock().await;
+
         info!("Removing worktree at {:?}", self.path);
-        let output = Command::new("git")
+
+        let dot_git = self.repo_path.join(".git");
+        let git_dir = if dot_git.exists() {
+            dot_git
+        } else {
+            self.repo_path.to_path_buf()
+        };
+
+        let output = isolated_git_command()
             .current_dir(&self.repo_path)
+            .env("GIT_DIR", git_dir)
+            .env("GIT_WORK_TREE", &self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
             .arg("remove")
@@ -239,7 +322,7 @@ impl GitWorktree {
 
 #[allow(dead_code)]
 pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
-    let output = Command::new("git")
+    let output = isolated_git_command()
         .current_dir(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .arg("cat-file")
@@ -260,7 +343,7 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
 #[allow(dead_code)]
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     info!("Pruning git worktrees in {:?}", repo_path);
-    let output = Command::new("git")
+    let output = isolated_git_command()
         .current_dir(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .arg("worktree")
@@ -300,6 +383,16 @@ impl Drop for GitWorktree {
     }
 }
 
+fn get_repo_lock(path: &Path) -> Arc<AsyncMutex<()>> {
+    static REPO_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let map_mutex = REPO_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map_mutex.lock().unwrap();
+    let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    map.entry(abs_path)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
 fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
     let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -334,7 +427,7 @@ pub async fn ensure_remote(
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
-        let check = Command::new("git")
+        let check = isolated_git_command()
             .current_dir(repo_path)
             .args(["remote", "get-url", name])
             .output()
@@ -342,7 +435,7 @@ pub async fn ensure_remote(
 
         if !check.status.success() {
             info!("Adding remote {} ({})", name, url);
-            let add = Command::new("git")
+            let add = isolated_git_command()
                 .current_dir(repo_path)
                 .args(["remote", "add", name, url])
                 .output()
@@ -371,7 +464,7 @@ pub async fn ensure_remote(
 
     // Check if HEAD exists
     let head_ref = format!("refs/remotes/{}/HEAD", name);
-    let head_exists = Command::new("git")
+    let head_exists = isolated_git_command()
         .current_dir(repo_path)
         .args(["show-ref", "--verify", "-q", &head_ref])
         .status()
@@ -406,7 +499,7 @@ pub async fn ensure_remote(
     // 4. Fetch
     if should_fetch {
         info!("Fetching remote {}", name);
-        let fetch = Command::new("git")
+        let fetch = isolated_git_command()
             .current_dir(repo_path)
             .args(["fetch", "--prune", name])
             .output()
@@ -433,7 +526,7 @@ pub async fn ensure_remote(
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
-        let set_head = Command::new("git")
+        let set_head = isolated_git_command()
             .current_dir(repo_path)
             .args(["remote", "set-head", name, "--auto"])
             .output()
@@ -452,7 +545,7 @@ pub async fn ensure_remote(
 }
 
 pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
-    let output = Command::new("git")
+    let output = isolated_git_command()
         .current_dir(path)
         .args(["rev-parse", ref_name])
         .output()
@@ -549,7 +642,7 @@ pub async fn get_git_log(params: GitLogParams) -> Result<String> {
         args.extend(params.paths.clone());
     }
 
-    let output = Command::new("git")
+    let output = isolated_git_command()
         .current_dir(&params.repo_path)
         .args(&args)
         .output()
@@ -571,7 +664,7 @@ pub async fn get_range_base(repo_path: &Path, rev_range: &str) -> Result<String>
         // Symmetric difference: use merge-base
         let parts: Vec<&str> = rev_range.split("...").collect();
         if parts.len() == 2 {
-            let output = Command::new("git")
+            let output = isolated_git_command()
                 .current_dir(repo_path)
                 .args(["merge-base", parts[0], parts[1]])
                 .output()
@@ -613,19 +706,19 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["init"])
             .output()
             .await?;
 
         // Configure user
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
@@ -636,14 +729,18 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello World")?;
 
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
 
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .args(["commit", "-m", "Initial commit"])
             .output()
             .await?;
@@ -652,7 +749,7 @@ mod tests {
         let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
         writeln!(file, "Change 1")?;
 
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["commit", "-am", "Second commit"])
             .output()
@@ -689,24 +786,24 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["init"])
             .output()
             .await?;
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
 
         // C1
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["commit", "--allow-empty", "-m", "C1"])
             .output()
@@ -714,14 +811,14 @@ mod tests {
         let c1 = get_commit_hash(&repo_path, "HEAD").await?;
 
         // Tag v1
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["tag", "v1"])
             .output()
             .await?;
 
         // C2
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["commit", "--allow-empty", "-m", "C2"])
             .output()
@@ -729,14 +826,14 @@ mod tests {
         let c2 = get_commit_hash(&repo_path, "HEAD").await?;
 
         // Branch feature
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["branch", "feature"])
             .output()
             .await?;
 
         // C3
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["commit", "--allow-empty", "-m", "C3"])
             .output()
@@ -776,17 +873,17 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["init"])
             .output()
             .await?;
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
@@ -796,13 +893,17 @@ mod tests {
         let file_path = repo_path.join("test.txt");
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello World")?;
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
+        isolated_git_command()
             .current_dir(&repo_path)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .args(["commit", "-m", "Initial commit"])
             .output()
             .await?;
