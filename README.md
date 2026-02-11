@@ -45,7 +45,7 @@ This repository is included as a submodule in the `third_party/review-prompts/` 
     *   **Git**: Path to the reference kernel repository.
     *   **Review**: Concurrency and worktree settings.
 
-    You can also configure settings via environment variables using the `SASHIKO` prefix and double underscores for nesting (e.g., `SASHIKO_SERVER__PORT=8081`).
+    You can also configure settings via environment variables using the `SASHIKO` prefix and double underscores for nesting (e.g., `SASHIKO__SERVER__PORT=8081`).
 
     **Important**: You must set your Gemini API key. This is typically done via an environment variable, depending on the underlying client library, or potentially in a secrets file if supported. Ensure your environment has the necessary credentials loaded.
 

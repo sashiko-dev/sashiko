@@ -15,12 +15,11 @@
 use crate::db::Database;
 use crate::events::Event;
 use crate::fetcher::FetchRequest;
-use crate::settings::ServerSettings;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Query, State},
     http::StatusCode,
-    routing::{get, get_service, post},
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -32,6 +31,7 @@ use tracing::{error, info};
 
 pub struct AppState {
     pub db: Arc<Database>,
+    pub settings: Arc<crate::settings::Settings>,
     pub sender: mpsc::Sender<Event>,
     pub fetch_sender: mpsc::Sender<FetchRequest>,
 }
@@ -108,13 +108,15 @@ pub struct SubmitResponse {
 }
 
 pub async fn run_server(
-    settings: ServerSettings,
+    settings: crate::settings::Settings,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let server_settings = settings.server.clone();
     let state = Arc::new(AppState {
         db,
+        settings: Arc::new(settings),
         sender,
         fetch_sender,
     });
@@ -133,11 +135,18 @@ pub async fn run_server(
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
-        .route("/", get_service(ServeFile::new("static/index.html")))
-        .nest_service("/static", ServeDir::new("static"))
+        .route_service(
+            "/",
+            ServeFile::new(
+                std::path::PathBuf::from(&server_settings.static_dir).join("index.html"),
+            ),
+        )
+        .nest_service("/static", ServeDir::new(&server_settings.static_dir))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], settings.port));
+    let addr: SocketAddr = format!("{}:{}", server_settings.host, server_settings.port)
+        .parse()
+        .map_err(|e| format!("Invalid address: {}", e))?;
     info!("Web API listening on {}", addr);
 
     let listener = TcpListener::bind(addr).await?;
@@ -384,7 +393,8 @@ async fn get_message(
         Ok(Some(mut details)) => {
             if details.body.is_none() || details.body.as_deref() == Some("") {
                 if let (Some(hash), Some(group)) = (&details.git_blob_hash, &details.mailing_list) {
-                    let repo_root = std::path::PathBuf::from("archives").join(group);
+                    let repo_root =
+                        std::path::PathBuf::from(&state.settings.git.archives_dir).join(group);
 
                     // 1. Find all potential repo paths (root + epochs)
                     let mut candidate_paths = Vec::new();

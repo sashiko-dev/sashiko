@@ -93,3 +93,16 @@ impl ReviewStatus {
         }
     }
 }
+
+pub fn setup_test_tracing() {
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_test_writer()
+        .try_init();
+}

@@ -67,9 +67,9 @@ struct Cli {
     #[arg(long)]
     baseline: Option<String>,
 
-    /// Enable debug logging (overrides settings)
-    #[arg(long)]
-    debug: bool,
+    /// Enable debug logging (overrides settings). Use twice for verbose debug logs.
+    #[arg(long, short = 'd', action = clap::ArgAction::Count)]
+    debug: u8,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -91,10 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_result = Settings::new();
 
     // Determine log level
-    // 1. CLI --debug takes precedence (implies "info")
+    // 1. CLI --debug takes precedence
+    //    - One -d -> "info"
+    //    - Two or more -d -> "debug"
     // 2. Settings log_level
     // 3. Fallback to "warn" (if settings failed)
-    let log_level = if cli.debug {
+    let log_level = if cli.debug >= 2 {
+        "debug"
+    } else if cli.debug == 1 {
         "info"
     } else {
         match &settings_result {
@@ -110,8 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fmt().with_env_filter(env_filter).init();
 
-    if cli.debug {
-        info!("Debug logging enabled");
+    if cli.debug > 0 {
+        info!("Debug logging enabled (level: {})", log_level);
     }
 
     // Now handle settings result properly
@@ -477,8 +481,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start Web API
-    let api_settings = settings.server.clone();
     let api_db = db.clone();
+    let api_settings = settings.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
     tokio::spawn(async move {
@@ -949,21 +953,37 @@ mod tests {
 
     #[test]
     fn test_cli_parsing() {
-        let args = vec!["sashiko", "--download", "100", "--track", "--api"];
+        sashiko::setup_test_tracing();
+        let args = vec![
+            "sashiko",
+            "--download",
+            "100",
+            "--track",
+            "--api",
+            "-d",
+            "-d",
+        ];
         let cli = Cli::parse_from(args);
         assert_eq!(cli.download, Some(100));
         assert!(cli.track);
         assert!(cli.api);
+        assert_eq!(cli.debug, 2);
 
         let args = vec!["sashiko"];
         let cli = Cli::parse_from(args);
         assert_eq!(cli.download, None);
         assert!(!cli.track);
         assert!(!cli.api);
+        assert_eq!(cli.debug, 0);
+
+        let args = vec!["sashiko", "--debug"];
+        let cli = Cli::parse_from(args);
+        assert_eq!(cli.debug, 1);
     }
 
     #[test]
     fn test_cli_no_ai() {
+        sashiko::setup_test_tracing();
         let args = vec!["sashiko", "--no-ai"];
         let cli = Cli::parse_from(args);
         assert!(cli.no_ai);
@@ -975,6 +995,7 @@ mod tests {
 
     #[test]
     fn test_cli_port() {
+        sashiko::setup_test_tracing();
         let args = vec!["sashiko", "--port", "8080"];
         let cli = Cli::parse_from(args);
         assert_eq!(cli.port, Some(8080));
@@ -986,6 +1007,7 @@ mod tests {
 
     #[test]
     fn test_cli_message_thread() {
+        sashiko::setup_test_tracing();
         let args = vec!["sashiko", "--message", "123", "--thread", "456"];
         let cli = Cli::parse_from(args);
         assert_eq!(cli.message, Some(vec!["123".to_string()]));
@@ -1003,6 +1025,7 @@ mod tests {
 
     #[test]
     fn test_identify_subsystems() {
+        sashiko::setup_test_tracing();
         // Test known subsystem
         let to = "linux-kernel@vger.kernel.org";
         let cc = "netdev@vger.kernel.org";
