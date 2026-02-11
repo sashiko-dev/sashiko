@@ -48,13 +48,16 @@ impl PromptRegistry {
 
         // 2. Core Protocol & Patterns
         self.append_file(&mut content, "review-core.md").await?;
-        self.append_file(&mut content, "technical-patterns.md").await?;
+        self.append_file(&mut content, "inline-template.md").await?;
+        self.append_file(&mut content, "technical-patterns.md")
+            .await?;
 
         // 3. Subsystem Guidelines (root *.md files)
         self.append_directory(&mut content, &self.base_dir, |name| {
             !matches!(
                 name,
                 "review-core.md"
+                    | "inline-template.md"
                     | "technical-patterns.md"
                     | "README.md"
                     | "review-one.md"
@@ -317,5 +320,24 @@ mod tests {
         assert!(context.contains("Important: If you have ANY findings"));
         // Ensure JSON schema is NOT present
         assert!(!context.contains("Your final response must be a valid JSON object"));
+    }
+
+    #[tokio::test]
+    async fn test_build_context_includes_inline_template_after_review_core() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+        std::fs::write(root.join("review-core.md"), "CORE CONTENT").unwrap();
+        std::fs::write(root.join("inline-template.md"), "TEMPLATE CONTENT").unwrap();
+        std::fs::write(root.join("technical-patterns.md"), "PATTERNS CONTENT").unwrap();
+
+        let registry = PromptRegistry::new(root.to_path_buf());
+        let context = registry.build_context().await.unwrap();
+
+        let core_idx = context.find("CORE CONTENT").unwrap();
+        let template_idx = context.find("TEMPLATE CONTENT").unwrap();
+        let patterns_idx = context.find("PATTERNS CONTENT").unwrap();
+
+        assert!(core_idx < template_idx);
+        assert!(template_idx < patterns_idx);
     }
 }
