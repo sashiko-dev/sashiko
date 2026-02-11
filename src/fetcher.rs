@@ -488,6 +488,10 @@ mod tests {
             .await?;
         Command::new("git")
             .current_dir(&repo_path)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .args(["commit", "-m", "Subject Line\n\nBody Line"])
             .output()
             .await?;

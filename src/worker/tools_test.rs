@@ -28,6 +28,7 @@ mod tests {
 
     #[test]
     fn test_list_dir_linux() {
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
@@ -42,6 +43,7 @@ mod tests {
 
     #[test]
     fn test_read_files_linux_readme() {
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
@@ -63,6 +65,7 @@ mod tests {
 
     #[test]
     fn test_git_show_head() {
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
@@ -77,6 +80,7 @@ mod tests {
 
     #[test]
     fn test_git_blame_readme() {
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
@@ -93,6 +97,7 @@ mod tests {
     #[test]
     fn test_write_file() {
         let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        crate::setup_test_tracing();
         let temp_dir = tempfile::tempdir().unwrap();
         let worktree_path = temp_dir.path().to_path_buf();
         let _prompts_path = root.join("third_party/review-prompts/kernel");
@@ -135,6 +140,7 @@ mod tests {
 
     #[test]
     fn test_write_file_overwrite() {
+        crate::setup_test_tracing();
         let temp_dir = tempfile::tempdir().unwrap();
         let worktree_path = temp_dir.path().to_path_buf();
         let toolbox = ToolBox::new(worktree_path.clone(), None);
@@ -157,6 +163,7 @@ mod tests {
 
     #[test]
     fn test_write_file_forbidden() {
+        crate::setup_test_tracing();
         let temp_dir = tempfile::tempdir().unwrap();
         let worktree_path = temp_dir.path().to_path_buf();
         let toolbox = ToolBox::new(worktree_path, None);
@@ -179,6 +186,7 @@ mod tests {
 
     #[test]
     fn test_search_file_content_relative_path() {
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
@@ -231,7 +239,7 @@ mod tests {
             assert!(content.contains("Protocol"));
         } else {
             // If file doesn't exist (e.g. CI), skip assertion on content but check tool availability
-            println!("Skipping read_prompt content check: review-core.md not found");
+            tracing::warn!("Skipping read_prompt content check: review-core.md not found");
         }
 
         // Test disabled tool

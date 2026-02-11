@@ -12,8 +12,11 @@ async fn setup_db() -> Arc<Database> {
     Arc::new(db)
 }
 
+mod common;
+
 #[tokio::test]
 async fn test_singleton_root_overwrite_prevention() {
+    common::setup_tracing();
     let db = setup_db().await;
     let root_id = "root_msg";
     // Ensure thread and placeholder message exist

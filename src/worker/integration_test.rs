@@ -156,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_integration_sanity() {
-        let _ = tracing_subscriber::fmt::try_init();
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
 
         let mock_response = json!({
@@ -186,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_tool_use() {
-        let _ = tracing_subscriber::fmt::try_init();
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
 
         // Sequence of responses:
@@ -258,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_loop_detection() {
-        let _ = tracing_subscriber::fmt::try_init();
+        crate::setup_test_tracing();
         let (linux_path, _prompts_path) = get_test_paths();
 
         // New logic requires >= 5 repetitions (so 6th call triggers it) for non-write_file tools.
@@ -295,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_file_duplicate_prevention() {
-        let _ = tracing_subscriber::fmt::try_init();
+        crate::setup_test_tracing();
         // Use a temporary directory to avoid writing to the actual source tree
         let temp_dir = tempfile::tempdir().unwrap();
         let worktree_path = temp_dir.path().to_path_buf();

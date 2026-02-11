@@ -492,7 +492,7 @@ impl Ingestor {
         group: &str,
     ) -> Result<(Vec<(i32, String)>, std::path::PathBuf)> {
         // Dynamic path: archives/<group_name>
-        let path = std::path::PathBuf::from("archives").join(group);
+        let path = std::path::PathBuf::from(&self.settings.git.archives_dir).join(group);
 
         // Dynamic URL heuristic
         // org.kernel.vger.linux-kernel -> lkml

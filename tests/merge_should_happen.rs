@@ -12,8 +12,11 @@ async fn setup_db() -> Arc<Database> {
     Arc::new(db)
 }
 
+mod common;
+
 #[tokio::test]
 async fn test_merge_same_email_different_name_format() {
+    common::setup_tracing();
     let db = setup_db().await;
 
     // 1. Create Thread

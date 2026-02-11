@@ -13,8 +13,11 @@ async fn setup_db() -> Arc<Database> {
     Arc::new(db)
 }
 
+mod common;
+
 #[tokio::test]
 async fn test_merge_loose_patch_count() {
+    common::setup_tracing();
     let db = setup_db().await;
 
     // Simulate loose patch subject

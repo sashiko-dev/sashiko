@@ -51,6 +51,7 @@ impl PromptRegistry {
         self.append_file(&mut content, "technical-patterns.md").await?;
 
         // 3. Subsystem Guidelines (root *.md files)
+        content.push_str("# Subsystem Guidelines\n\n");
         self.append_directory(&mut content, &self.base_dir, |name| {
             !matches!(
                 name,
@@ -114,7 +115,11 @@ impl PromptRegistry {
         if !dir.exists() {
             return Ok(());
         }
-        let mut entries = fs::read_dir(dir).await?;
+
+        let mut entries = fs::read_dir(dir).await.map_err(|e| {
+            anyhow::anyhow!("Failed to read directory {:?}: {}", dir, e)
+        })?;
+
         let mut paths = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();

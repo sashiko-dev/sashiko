@@ -12,8 +12,11 @@ async fn setup_db() -> Arc<Database> {
     Arc::new(db)
 }
 
+mod common;
+
 #[tokio::test]
 async fn test_merge_different_series_same_author_should_not_merge() {
+    common::setup_tracing();
     let db = setup_db().await;
 
     // 1. Create Thread

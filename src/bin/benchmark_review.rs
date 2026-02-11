@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     // Initialize Gemini Client for Evaluation
     // We use the model configured in settings to act as the judge.
     let eval_model = settings.ai.model.clone();
-    let gemini_client = Arc::new(GeminiClient::new(eval_model));
+    let gemini_client = Arc::new(GeminiClient::new(eval_model, settings.ai.base_url.clone()));
 
     let processed_count = Arc::new(AtomicUsize::new(0));
 
