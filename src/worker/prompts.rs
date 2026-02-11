@@ -431,4 +431,21 @@ mod tests {
 
         assert!(inline_idx < task_idx);
     }
+
+    #[tokio::test]
+    async fn test_user_task_prompt_non_cached_includes_inline_template() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("review-core.md"), "Protocol").unwrap();
+        std::fs::write(
+            temp_dir.path().join("inline-template.md"),
+            "Inline Template Content",
+        )
+        .unwrap();
+
+        let registry = PromptRegistry::new(temp_dir.path().to_path_buf());
+        let prompt = registry.get_user_task_prompt(false).await.unwrap();
+
+        assert!(prompt.contains("## inline-template.md"));
+        assert!(prompt.contains("Inline Template Content"));
+    }
 }
