@@ -72,7 +72,7 @@ For a robust, continuously updated mirror of the entire history, the kernel infr
 
 ## Sashiko Directory Structure
 
-Sashiko expects archives to be placed in the `archives/` directory at the project root.
+Sashiko expects archives to be placed in the `archives/` directory at the project root by default. This can be configured via `git.archives_dir` in `Settings.toml`.
 
 ```text
 sashiko/
