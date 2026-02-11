@@ -40,8 +40,8 @@ struct Args {
     #[arg(long)]
     worktree_dir: Option<PathBuf>,
 
-    #[arg(long, default_value = "third_party/review-prompts/kernel")]
-    prompts: PathBuf,
+    #[arg(long)]
+    prompts: Option<PathBuf>,
 
     /// If set, only review the patch with this index (1-based usually).
     /// Previous patches (with lower index) will be applied but not reviewed.
@@ -105,7 +105,18 @@ async fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+
+    for (k, v) in std::env::vars() {
+        if k.starts_with("SASHIKO_") {
+            info!("ENV: {}={}", k, v);
+        }
+    }
+
     let settings = Settings::new().expect("Failed to load settings");
+    info!(
+        "Loaded settings: AI provider={}, model={}, base_url={:?}",
+        settings.ai.provider, settings.ai.model, settings.ai.base_url
+    );
 
     // Data Loading: Always from Stdin (JSON)
     let mut buffer = String::new();
@@ -349,6 +360,11 @@ async fn main() -> Result<()> {
 
                     let mut review_result_to_print = None;
 
+                    let prompts_path = args
+                        .prompts
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(&settings.review.prompts_dir));
+
                     for attempt in 1..=3 {
                         if attempt > 1 {
                             info!("Restarting AI review (attempt {}/3)...", attempt);
@@ -358,13 +374,13 @@ async fn main() -> Result<()> {
 
                         // Enable read_prompt tool only if explicit caching is NOT used.
                         let prompts_tool_path = if args.gemini_cache.is_none() {
-                            Some(args.prompts.clone())
+                            Some(prompts_path.clone())
                         } else {
                             None
                         };
 
                         let tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
-                        let prompts = PromptRegistry::new(args.prompts.clone());
+                        let prompts = PromptRegistry::new(prompts_path.clone());
                         let mut worker = Worker::new(
                             client,
                             tools,

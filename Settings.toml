@@ -20,14 +20,17 @@ temperature = 1.0
 explicit_prompts_caching = true
 
 [server]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 8080
+static_dir = "static"
 
 [git]
 repository_path = "third_party/linux"
+archives_dir = "archives"
 
 [review]
 concurrency = 24
 worktree_dir = "review_trees"
+prompts_dir = "third_party/review-prompts/kernel"
 timeout_seconds = 3600
 max_retries = 3

@@ -99,9 +99,11 @@ impl Reviewer {
         };
 
         // Initialize CacheManager
-        // Assuming prompts are in "third_party/review-prompts/kernel" in CWD.
-        let prompts_dir = PathBuf::from("third_party/review-prompts/kernel");
-        let client = Box::new(GeminiClient::new(settings.ai.model.clone()));
+        let prompts_dir = PathBuf::from(&settings.review.prompts_dir);
+        let client = Box::new(GeminiClient::new(
+            settings.ai.model.clone(),
+            settings.ai.base_url.clone(),
+        ));
 
         // We need tool definitions for the cache.
         // We use dummy paths for ToolBox here because we only need declarations,
@@ -141,6 +143,10 @@ impl Reviewer {
 
         // Ensure Gemini Cache
         if self.settings.ai.explicit_prompts_caching {
+            info!(
+                "Initializing Gemini Context Cache using prompts from: {:?}",
+                self.settings.review.prompts_dir
+            );
             match self.cache_manager.ensure_cache(None).await {
                 Ok(name) => {
                     info!("Gemini Context Cache initialized: {}", name);
@@ -186,7 +192,10 @@ impl Reviewer {
                 Ok(_) => {}
                 Err(e) => error!("Error in reviewer loop: {}", e),
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                self.settings.review.poll_interval,
+            ))
+            .await;
         }
     }
 
@@ -996,6 +1005,8 @@ async fn run_review_tool(
         baseline,
         "--worktree-dir",
         &settings.review.worktree_dir,
+        "--prompts",
+        &settings.review.prompts_dir,
     ]);
 
     cmd.env("NO_COLOR", "1");
@@ -1076,11 +1087,13 @@ async fn run_review_tool(
             let mut lines = reader.lines();
             let client = GeminiClient::new(
                 settings.ai.model.clone(),
+                settings.ai.base_url.clone(),
             );
             let mut final_result: Option<Value> = None;
             let mut ai_started = false;
 
             while let Ok(Some(line)) = lines.next_line().await {
+                // info!("Review tool stdout line: {}", line);
                 // Try to parse as JSON
                 if let Ok(json_msg) = serde_json::from_str::<Value>(&line) {
                     if let Some(type_str) = json_msg.get("type").and_then(|v| v.as_str()) {

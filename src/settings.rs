@@ -44,6 +44,7 @@ fn default_max_input_tokens() -> usize {
 pub struct AiSettings {
     pub provider: String,
     pub model: String,
+    pub base_url: Option<String>,
     #[serde(default = "default_max_input_tokens")]
     pub max_input_tokens: usize,
     #[serde(default = "default_max_interactions")]
@@ -69,12 +70,14 @@ fn default_max_interactions() -> usize {
 pub struct ServerSettings {
     pub host: String,
     pub port: u16,
+    pub static_dir: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct GitSettings {
     pub repository_path: String,
+    pub archives_dir: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -82,10 +85,17 @@ pub struct GitSettings {
 pub struct ReviewSettings {
     pub concurrency: usize,
     pub worktree_dir: String,
+    pub prompts_dir: String,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval: u64,
+}
+
+fn default_poll_interval() -> u64 {
+    10
 }
 
 fn default_review_timeout() -> u64 {
