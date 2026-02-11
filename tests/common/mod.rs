@@ -13,7 +13,6 @@
 // limitations under the License.
 #![allow(dead_code)]
 
-
 use sashiko::settings::Settings;
 use std::fs;
 use std::net::TcpListener;

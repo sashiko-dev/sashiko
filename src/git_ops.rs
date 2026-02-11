@@ -44,14 +44,10 @@ pub struct GitWorktree {
 impl GitWorktree {
     #[allow(dead_code)]
     pub fn from_path(path: PathBuf, repo_path: PathBuf) -> Self {
-        // Create a dummy tempdir that won't be deleted or used, just to satisfy the struct
-        // Actually, we can't easily construct a TempDir that doesn't delete on drop unless we use into_path() but we need to keep it in struct.
-        // Or we make dir: Option<TempDir>.
-        // Let's change struct to Option<TempDir>.
+        let path = path.canonicalize().unwrap_or(path);
+        let repo_path = repo_path.canonicalize().unwrap_or(repo_path);
         Self {
-            dir: tempfile::Builder::new().prefix("dummy").tempdir().unwrap(), // Hack: create a dummy tempdir, but we won't use it.
-            // Wait, if we drop this struct, the dummy tempdir is deleted. That's fine.
-            // We just shouldn't delete the `path`.
+            dir: tempfile::Builder::new().prefix("dummy").tempdir().unwrap(),
             path,
             repo_path,
             is_managed: false,
@@ -64,7 +60,8 @@ impl GitWorktree {
         commit_hash: &str,
         parent_dir: Option<&Path>,
     ) -> Result<Self> {
-        let lock = get_repo_lock(repo_path);
+        let repo_path = repo_path.canonicalize()?;
+        let lock = get_repo_lock(&repo_path);
         let _guard = lock.lock().await;
 
         let temp_dir = if let Some(parent) = parent_dir {
@@ -90,17 +87,17 @@ impl GitWorktree {
 
         // Ensure we prune any stale worktrees first to avoid "already exists" errors if temp dirs were reused
         let _ = isolated_git_command()
-            .current_dir(repo_path)
+            .current_dir(&repo_path)
             .env("GIT_DIR", &git_dir)
-            .env("GIT_WORK_TREE", repo_path)
+            .env("GIT_WORK_TREE", &repo_path)
             .args(["worktree", "prune"])
             .output()
             .await;
 
         let output = isolated_git_command()
-            .current_dir(repo_path)
+            .current_dir(&repo_path)
             .env("GIT_DIR", &git_dir)
-            .env("GIT_WORK_TREE", repo_path)
+            .env("GIT_WORK_TREE", &repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
             .arg("add")
@@ -146,7 +143,7 @@ impl GitWorktree {
 
         let mut child = isolated_git_command()
             .current_dir(&self.path)
-            .env("GIT_DIR", git_dir)
+            .env("GIT_DIR", &git_dir)
             .env("GIT_WORK_TREE", &self.path)
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
@@ -188,7 +185,7 @@ impl GitWorktree {
 
             let _ = isolated_git_command()
                 .current_dir(&self.path)
-                .env("GIT_DIR", git_dir)
+                .env("GIT_DIR", &git_dir)
                 .env("GIT_WORK_TREE", &self.path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("am")
@@ -300,7 +297,7 @@ impl GitWorktree {
 
         let output = isolated_git_command()
             .current_dir(&self.repo_path)
-            .env("GIT_DIR", git_dir)
+            .env("GIT_DIR", &git_dir)
             .env("GIT_WORK_TREE", &self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
