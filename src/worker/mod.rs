@@ -149,7 +149,7 @@ impl Worker {
 
     pub async fn run(&mut self, patchset: Value) -> Result<WorkerResult> {
         let system_prompt = PromptRegistry::get_system_identity().to_string();
-        let mut initial_user_message = self
+        let initial_user_message = self
             .prompts
             .get_user_task_prompt(self.cache_name.is_some())
             .await?;
@@ -184,8 +184,6 @@ impl Worker {
                 patch_content.push_str("\n```\n\n");
             }
         }
-
-        initial_user_message.push_str("\nThe diff content is omitted. You are reviewing the currently checked out commit. Use `git_diff` and other tools to analyze the changes.\n");
 
         let input_context = format!(
             "System: {}\n\nUser: {}",
@@ -261,7 +259,7 @@ impl Worker {
                                 },
                                 "severity_explanation": {
                                     "type": "string",
-                                    "description": "Explain why this severity level was chosen, referencing guidelines in severity.md."
+                                    "description": "Concise explanation (e.g. 'memory leak on a hot path' or 'use after free can cause a memory corruption')."
                                 },
                                 "problem": {
                                     "type": "string",

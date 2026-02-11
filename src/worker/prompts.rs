@@ -87,10 +87,10 @@ impl PromptRegistry {
             // We provide a minimal trigger that references the specific section.
             Ok("Refer to the `# review-core.md` section in the pre-loaded context and run a deep dive regression analysis as described in the protocol of the top commit in the Linux source tree. Do NOT attempt to load any additional prompts.".to_string())
         } else {
-            // In non-cached mode, we must provide the Identity and Output Instructions explicitly,
+            // In non-cached mode, we must provide the Output Instructions explicitly,
             // followed by the trigger to load the protocol.
             let trigger = "Load the protocol from `review-core.md` and run a deep dive regression analysis as described in the protocol of the top commit in the Linux source tree.";
-            Ok(format!("{}\n\n{}\n\n{}", SYSTEM_IDENTITY, OUTPUT_FORMAT_INSTRUCTION, trigger))
+            Ok(format!("{}\n\n{}", OUTPUT_FORMAT_INSTRUCTION, trigger))
         }
     }
 
@@ -265,7 +265,7 @@ mod tests {
         let registry = PromptRegistry::new(temp_dir.path().to_path_buf());
         let prompt = registry.get_user_task_prompt(false).await.unwrap();
 
-        assert!(prompt.contains(SYSTEM_IDENTITY));
+        assert!(!prompt.contains(SYSTEM_IDENTITY));
         assert!(prompt.contains("Load the protocol from `review-core.md`"));
         assert!(!prompt.contains("Refer to the protocol in the pre-loaded context"));
         assert!(prompt.contains("Important: If you have ANY findings"));
