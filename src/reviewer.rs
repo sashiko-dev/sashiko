@@ -331,9 +331,7 @@ impl Reviewer {
         let (found_baseline, patch_commits, logs) =
             Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
 
-        let prompts_hash = get_commit_hash(Path::new("."), "HEAD")
-            .await
-            .ok();
+        let prompts_hash = get_commit_hash(Path::new("."), "HEAD").await.ok();
 
         // Save findings to patchset
         if let Some((resolution, baseline_id, worktree)) = found_baseline {

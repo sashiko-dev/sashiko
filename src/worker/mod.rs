@@ -431,12 +431,15 @@ impl Worker {
                                     same_call_count + 1
                                 );
                                 warn!("{}", error_msg);
-                                
+
                                 // Hard limit: terminate to save resources
                                 if same_call_count >= 10 {
-                                     return Ok(WorkerResult {
+                                    return Ok(WorkerResult {
                                         output: None,
-                                        error: Some(format!("Terminating due to persistent tool loop: {}", error_msg)),
+                                        error: Some(format!(
+                                            "Terminating due to persistent tool loop: {}",
+                                            error_msg
+                                        )),
                                         input_context: input_context.clone(),
                                         history: self.history.clone(),
                                         history_before_pruning: final_history_before_pruning,
@@ -560,7 +563,10 @@ impl Worker {
                     }
 
                     if let Err(e) = self.validate_review_inline(review_inline.unwrap()) {
-                        let error_msg = format!("Validation Error: {}. Please retry and strictly follow `inline-template.md`.", e);
+                        let error_msg = format!(
+                            "Validation Error: {}. Please retry and strictly follow `inline-template.md`.",
+                            e
+                        );
                         warn!("{}", error_msg);
 
                         let error_content = Content {
@@ -600,7 +606,8 @@ mod tests {
 
     #[test]
     fn test_validate_inline_format_valid() {
-        let content = "Commit 123\n\n> diff --git a/file b/file\n> index 123..456\n\nThis looks bad.";
+        let content =
+            "Commit 123\n\n> diff --git a/file b/file\n> index 123..456\n\nThis looks bad.";
         assert!(validate_inline_format(content).is_ok());
     }
 
@@ -618,7 +625,7 @@ mod tests {
 
     #[test]
     fn test_validate_inline_format_headers_in_diff_ok() {
-         let content = "> #include <stdio.h>\n> void main() {}";
-         assert!(validate_inline_format(content).is_ok());
+        let content = "> #include <stdio.h>\n> void main() {}";
+        assert!(validate_inline_format(content).is_ok());
     }
 }

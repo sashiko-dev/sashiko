@@ -58,7 +58,8 @@ mod tests {
                     content: Content {
                         role: "model".to_string(),
                         parts: vec![Part::Text {
-                            text: "```json\n{\"summary\": \"Fallback\", \"findings\": []}\n```".to_string(),
+                            text: "```json\n{\"summary\": \"Fallback\", \"findings\": []}\n```"
+                                .to_string(),
                             thought_signature: None,
                             thought: false,
                         }],

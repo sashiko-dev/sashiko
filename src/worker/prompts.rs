@@ -364,4 +364,3 @@ mod tests {
         assert!(!context.contains("Template Content"));
     }
 }
-
