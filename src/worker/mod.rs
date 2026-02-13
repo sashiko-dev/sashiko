@@ -19,10 +19,11 @@ pub mod tools;
 #[cfg(test)]
 mod tools_test;
 
-use crate::ai::{AiMessage, AiProvider, AiRequest, AiRole};
+use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
 use crate::worker::prompts::PromptRegistry;
 use crate::worker::tools::ToolBox;
 use anyhow::Result;
+use regex::Regex;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -98,6 +99,7 @@ impl Worker {
             tools: Some(self.tools.get_declarations_generic()),
             temperature: Some(self.temperature),
             preloaded_context: self.cache_name.clone(),
+            response_format: Some(AiResponseFormat::Json { schema: None }),
         };
 
         self.provider.estimate_tokens(&request)
@@ -224,7 +226,7 @@ impl Worker {
                 });
             }
 
-            let _response_schema = json!({
+            let response_schema = json!({
                 "type": "object",
                 "properties": {
                     "summary": { "type": "string", "description": "High-level summary of the original change being reviewed." },
@@ -277,6 +279,9 @@ impl Worker {
                 tools: Some(self.tools.get_declarations_generic()),
                 temperature: Some(self.temperature),
                 preloaded_context: self.cache_name.clone(),
+                response_format: Some(AiResponseFormat::Json {
+                    schema: Some(response_schema),
+                }),
             };
 
             let resp = match self.provider.generate_content(request).await {
@@ -411,20 +416,45 @@ impl Worker {
                 let json_val: Value = match serde_json::from_str(clean_text) {
                     Ok(v) => v,
                     Err(e) => {
-                        return Ok(WorkerResult {
-                            output: None,
-                            error: Some(format!(
-                                "Failed to parse JSON response: {}. Text: {}",
-                                e, final_text
-                            )),
-                            input_context,
-                            history: self.history.clone(),
-                            history_before_pruning: final_history_before_pruning,
-                            history_after_pruning: final_history_after_pruning,
-                            tokens_in: total_tokens_in,
-                            tokens_out: total_tokens_out,
-                            tokens_cached: total_tokens_cached,
-                        });
+                        // Fallback: try to find the first '{' and last '}'
+                        let re = Regex::new(r"(?s)\{.*\}").unwrap();
+                        if let Some(mat) = re.find(final_text.as_str()) {
+                            let possible_json = mat.as_str();
+                            match serde_json::from_str(possible_json) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    return Ok(WorkerResult {
+                                        output: None,
+                                        error: Some(format!(
+                                            "Failed to parse JSON response (even after extraction): {}. Text: {}",
+                                            e, final_text
+                                        )),
+                                        input_context,
+                                        history: self.history.clone(),
+                                        history_before_pruning: final_history_before_pruning,
+                                        history_after_pruning: final_history_after_pruning,
+                                        tokens_in: total_tokens_in,
+                                        tokens_out: total_tokens_out,
+                                        tokens_cached: total_tokens_cached,
+                                    });
+                                }
+                            }
+                        } else {
+                            return Ok(WorkerResult {
+                                output: None,
+                                error: Some(format!(
+                                    "Failed to parse JSON response: {}. Text: {}",
+                                    e, final_text
+                                )),
+                                input_context,
+                                history: self.history.clone(),
+                                history_before_pruning: final_history_before_pruning,
+                                history_after_pruning: final_history_after_pruning,
+                                tokens_in: total_tokens_in,
+                                tokens_out: total_tokens_out,
+                                tokens_cached: total_tokens_cached,
+                            });
+                        }
                     }
                 };
 

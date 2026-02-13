@@ -62,6 +62,20 @@ pub struct ToolCall {
     pub thought_signature: Option<String>,
 }
 
+/// Definition of the expected response format from the AI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AiResponseFormat {
+    /// Standard text response.
+    Text,
+    /// JSON response with optional schema.
+    Json {
+        /// Optional JSON Schema defining the expected structure.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        schema: Option<serde_json::Value>,
+    },
+}
+
 /// Definition of a tool that can be called by the AI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiTool {
@@ -87,6 +101,9 @@ pub struct AiRequest {
     /// Optional reference to pre-loaded context (e.g. Gemini Cache name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preloaded_context: Option<String>,
+    /// Optional expected response format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<AiResponseFormat>,
 }
 
 /// A generic AI response containing generated content and/or tool calls.

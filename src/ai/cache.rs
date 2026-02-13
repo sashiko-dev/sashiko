@@ -119,6 +119,7 @@ impl CacheManager {
             tools: self.tools.clone(),
             temperature: None,
             preloaded_context: None,
+            response_format: None,
         };
 
         self.provider

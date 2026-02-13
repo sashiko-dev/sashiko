@@ -642,15 +642,32 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
         }]
     });
 
+    let mut response_mime_type = None;
+    let mut response_schema = None;
+
+    if let Some(format) = request.response_format {
+        match format {
+            crate::ai::AiResponseFormat::Text => {
+                response_mime_type = Some("text/plain".to_string());
+            }
+            crate::ai::AiResponseFormat::Json { schema } => {
+                response_mime_type = Some("application/json".to_string());
+                response_schema = schema;
+            }
+        }
+    }
+
     Ok(GenerateContentRequest {
         contents,
         tools,
         system_instruction,
         generation_config: Some(GenerationConfig {
-            response_mime_type: None,
-            response_schema: None,
+            response_mime_type,
+            response_schema,
             temperature: request.temperature,
-            thinking_config: None,
+            thinking_config: Some(ThinkingConfig {
+                include_thoughts: true,
+            }),
         }),
     })
 }

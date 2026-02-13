@@ -240,4 +240,38 @@ mod tests {
         assert!(err_msg.contains("Loop detected"));
         assert!(err_msg.contains("read_files"));
     }
+
+    #[tokio::test]
+    async fn test_worker_json_extraction_from_conversational_text() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let (linux_path, prompts_path) = get_test_paths();
+
+        let final_json = json!({
+            "summary": "Extracted",
+            "findings": []
+        });
+
+        let conversational_text = format!(
+            "Hello! This is a conversational response.\n\nHere is the JSON you requested:\n\n```json\n{}\n```\n\nHope this helps!",
+            final_json
+        );
+
+        let client = Arc::new(StatefulMockClient::new(vec![create_text_response(
+            &conversational_text,
+        )]));
+
+        let tools = ToolBox::new(linux_path, None);
+        let prompts = PromptRegistry::new(prompts_path);
+        let mut worker = Worker::new(client, tools, prompts, 150_000, 25, 1.0, None);
+
+        let patchset = json!({
+            "subject": "Extraction Test",
+            "author": "Test",
+            "patches": []
+        });
+
+        let result = worker.run(patchset).await.expect("Worker run failed");
+        let review = result.output.expect("No output extracted");
+        assert_eq!(review["summary"], "Extracted");
+    }
 }
