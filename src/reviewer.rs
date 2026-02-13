@@ -15,7 +15,7 @@
 use crate::ReviewStatus;
 use crate::ai::cache::CacheManager;
 use crate::ai::proxy::QuotaManager;
-use crate::ai::{AiProvider, AiRequest, create_provider};
+use crate::ai::{AiProvider, AiRequest, AiResponse, create_provider};
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, ToolUsage};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash, git_command};
@@ -1103,27 +1103,29 @@ async fn run_review_tool(
                 // Try to parse as JSON
                 if let Ok(json_msg) = serde_json::from_str::<Value>(&line) {
                     if let Some(type_str) = json_msg.get("type").and_then(|v| v.as_str()) {
-                        if type_str == "ai_request" || type_str == "ai_request_with_cache" {
-                            if !ai_started {
-                                let _ = db
-                                    .update_review_status(
-                                        review_id,
-                                        ReviewStatus::InReview.as_str(),
-                                        None,
-                                    )
-                                    .await;
-                                ai_started = true;
-                            }
-                            if let Some(payload_val) = json_msg.get("payload") {
-                                if let Ok(mut req) = serde_json::from_value::<AiRequest>(
-                                    payload_val.clone(),
-                                ) {
-                                    // Handle AI Request
-                                    if type_str == "ai_request_with_cache" {
+                        match type_str {
+                            "ai_request" | "ai_request_with_cache" => {
+                                if !ai_started {
+                                    let _ = db
+                                        .update_review_status(
+                                            review_id,
+                                            ReviewStatus::InReview.as_str(),
+                                            None,
+                                        )
+                                        .await;
+                                    ai_started = true;
+                                }
+                                if let Some(payload_val) = json_msg.get("payload") {
+                                    if let Ok(mut req) =
+                                        serde_json::from_value::<AiRequest>(payload_val.clone())
+                                    {
                                         // Update stale cache name if needed
                                         let guard = active_cache_name.lock().await;
                                         if let Some(active_name) = guard.as_ref() {
-                                            if req.preloaded_context.as_ref() != Some(active_name) {
+                                            if req.preloaded_context.is_some()
+                                                && req.preloaded_context.as_ref()
+                                                    != Some(active_name)
+                                            {
                                                 info!(
                                                     "Updating stale cache name in request: {:?} -> {}",
                                                     req.preloaded_context, active_name
@@ -1131,42 +1133,86 @@ async fn run_review_tool(
                                                 req.preloaded_context = Some(active_name.clone());
                                             }
                                         }
-                                    }
 
-                                    let resp_payload = loop {
-                                        quota_manager.wait_for_access().await;
-                                        match provider.generate_content(req.clone()).await {
-                                            Ok(resp) => break Ok(resp),
-                                            Err(e) => {
-                                                // TODO: Generic quota error handling
-                                                // For now, assume some standard way to report quota issues if we can downcast.
-                                                // Gemini-specific logic moved into GeminiClient::generate_content loop
-                                                // but we still have QuotaManager here.
-                                                break Err(e);
+                                        let resp_payload = loop {
+                                            quota_manager.wait_for_access().await;
+                                            match provider.generate_content(req.clone()).await {
+                                                Ok(resp) => break Ok(resp),
+                                                Err(e) => {
+                                                    break Err(e);
+                                                }
                                             }
-                                        }
-                                    };
+                                        };
 
-                                    let reply = match resp_payload {
-                                        Ok(p) => json!({ "type": "ai_response", "payload": p }),
-                                        Err(e) => {
-                                            json!({ "type": "error", "payload": e.to_string() })
+                                        let reply = match resp_payload {
+                                            Ok(p) => json!({ "type": "ai_response", "payload": p }),
+                                            Err(e) => {
+                                                json!({ "type": "error", "payload": e.to_string() })
+                                            }
+                                        };
+                                        let mut reply_str = serde_json::to_string(&reply)?;
+                                        reply_str.push('\n');
+                                        if let Err(e) = stdin.write_all(reply_str.as_bytes()).await {
+                                            error!("Failed to write AI response to child: {}", e);
+                                            break;
                                         }
+                                        let _ = stdin.flush().await;
+                                    }
+                                }
+                            }
+                            "ai_create_cache" => {
+                                if let Some(payload) = json_msg.get("payload") {
+                                    if let Ok(req) =
+                                        serde_json::from_value::<AiRequest>(payload["request"].clone())
+                                    {
+                                        let ttl = payload["ttl"].as_str().unwrap_or("3600s").to_string();
+                                        let display_name = payload["display_name"].as_str().map(|s| s.to_string());
+
+                                        let result = provider.create_context_cache(req, ttl, display_name).await;
+                                        let reply = match result {
+                                            Ok(name) => json!({
+                                                "type": "ai_response",
+                                                "payload": AiResponse {
+                                                    content: Some(name),
+                                                    tool_calls: None,
+                                                    usage: None,
+                                                }
+                                            }),
+                                            Err(e) => json!({ "type": "error", "payload": e.to_string() }),
+                                        };
+                                        let mut reply_str = serde_json::to_string(&reply)?;
+                                        reply_str.push('\n');
+                                        stdin.write_all(reply_str.as_bytes()).await?;
+                                        stdin.flush().await?;
+                                    }
+                                }
+                            }
+                            "ai_delete_cache" => {
+                                if let Some(name) = json_msg.get("payload").and_then(|v| v.as_str()) {
+                                    let result = provider.delete_context_cache(name).await;
+                                    let reply = match result {
+                                        Ok(_) => json!({
+                                            "type": "ai_response",
+                                            "payload": AiResponse {
+                                                content: None,
+                                                tool_calls: None,
+                                                usage: None,
+                                            }
+                                        }),
+                                        Err(e) => json!({ "type": "error", "payload": e.to_string() }),
                                     };
                                     let mut reply_str = serde_json::to_string(&reply)?;
                                     reply_str.push('\n');
-                                    if let Err(e) = stdin.write_all(reply_str.as_bytes()).await {
-                                        error!("Failed to write AI response to child: {}", e);
-                                        break;
-                                    }
-                                    let _ = stdin.flush().await;
+                                    stdin.write_all(reply_str.as_bytes()).await?;
+                                    stdin.flush().await?;
                                 }
                             }
-                        } else {
-                            // Unknown type. Assume it's result if it matches result structure.
-                            if json_msg.get("patchset_id").is_some() {
-                                final_result = Some(json_msg);
-                                break;
+                            _ => {
+                                // Unknown type. Assume it's result if it matches result structure.
+                                if json_msg.get("patchset_id").is_some() {
+                                    final_result = Some(json_msg);
+                                    break;
+                                }
                             }
                         }
                     } else {

@@ -468,48 +468,67 @@ impl GenAiClient for GeminiClient {
 pub struct StdioGeminiClient;
 
 #[async_trait]
-impl GenAiClient for StdioGeminiClient {
-    async fn generate_content(
-        &self,
-        request: GenerateContentRequest,
-    ) -> Result<GenerateContentResponse> {
+impl AiProvider for StdioGeminiClient {
+    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        let type_str = if request.preloaded_context.is_some() {
+            "ai_request_with_cache"
+        } else {
+            "ai_request"
+        };
         let msg = json!({
-            "type": "ai_request",
+            "type": type_str,
             "payload": request
         });
         self.exec_stdio(msg).await
     }
 
-    async fn create_cached_content(
+    fn estimate_tokens(&self, request: &AiRequest) -> usize {
+        estimate_tokens_generic(request)
+    }
+
+    fn get_capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            model_name: "stdio-gemini".to_string(),
+            context_window_size: 1_000_000,
+        }
+    }
+
+    async fn create_context_cache(
         &self,
-        _request: CreateCachedContentRequest,
-    ) -> Result<CachedContent> {
-        anyhow::bail!("StdioGeminiClient does not support caching yet")
+        request: AiRequest,
+        ttl: String,
+        display_name: Option<String>,
+    ) -> Result<String> {
+        let msg = json!({
+            "type": "ai_create_cache",
+            "payload": {
+                "request": request,
+                "ttl": ttl,
+                "display_name": display_name,
+            }
+        });
+        let resp = self.exec_stdio(msg).await?;
+        resp.content
+            .ok_or_else(|| anyhow::anyhow!("Created cache has no name in response"))
     }
 
-    async fn list_cached_contents(&self) -> Result<Vec<CachedContent>> {
-        Ok(vec![])
-    }
-
-    async fn delete_cached_content(&self, _name: &str) -> Result<()> {
+    async fn delete_context_cache(&self, name: &str) -> Result<()> {
+        let msg = json!({
+            "type": "ai_delete_cache",
+            "payload": name
+        });
+        self.exec_stdio(msg).await?;
         Ok(())
     }
 
-    async fn generate_content_with_cache(
-        &self,
-        request: GenerateContentWithCacheRequest,
-    ) -> Result<GenerateContentResponse> {
-        let msg = json!({
-            "type": "ai_request_with_cache",
-            "payload": request
-        });
-        self.exec_stdio(msg).await
+    async fn list_context_caches(&self) -> Result<Vec<(String, String)>> {
+        Ok(vec![])
     }
 }
 
 impl StdioGeminiClient {
-    async fn exec_stdio(&self, msg: Value) -> Result<GenerateContentResponse> {
-        tokio::task::spawn_blocking(move || -> Result<GenerateContentResponse> {
+    async fn exec_stdio(&self, msg: Value) -> Result<AiResponse> {
+        tokio::task::spawn_blocking(move || -> Result<AiResponse> {
             println!("{}", serde_json::to_string(&msg)?);
             use std::io::Write;
             std::io::stdout().flush()?;
@@ -760,75 +779,6 @@ impl AiProvider for GeminiClient {
             ttl: Some(ttl),
         };
 
-        let res = GenAiClient::create_cached_content(self, cache_req).await?;
-        res.name
-            .ok_or_else(|| anyhow::anyhow!("Created cache has no name"))
-    }
-
-    async fn delete_context_cache(&self, name: &str) -> Result<()> {
-        GenAiClient::delete_cached_content(self, name).await
-    }
-
-    async fn list_context_caches(&self) -> Result<Vec<(String, String)>> {
-        let existing = GenAiClient::list_cached_contents(self).await?;
-        Ok(existing
-            .into_iter()
-            .map(|c| {
-                (
-                    c.display_name.unwrap_or_default(),
-                    c.name.unwrap_or_default(),
-                )
-            })
-            .collect())
-    }
-}
-
-#[async_trait]
-impl AiProvider for StdioGeminiClient {
-    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        if let Some(cache_name) = request.preloaded_context.clone() {
-            let gen_req = translate_ai_request(request)?;
-            let cached_req = GenerateContentWithCacheRequest {
-                cached_content: cache_name,
-                contents: gen_req.contents,
-                tools: None,
-                generation_config: gen_req.generation_config,
-            };
-            let resp = GenAiClient::generate_content_with_cache(self, cached_req).await?;
-            translate_ai_response(resp)
-        } else {
-            let gen_req = translate_ai_request(request)?;
-            let resp = GenAiClient::generate_content(self, gen_req).await?;
-            translate_ai_response(resp)
-        }
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
-    }
-
-    fn get_capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            model_name: "stdio-gemini".to_string(),
-            context_window_size: 1_000_000,
-        }
-    }
-
-    async fn create_context_cache(
-        &self,
-        request: AiRequest,
-        ttl: String,
-        _display_name: Option<String>,
-    ) -> Result<String> {
-        let gen_req = translate_ai_request(request)?;
-        let cache_req = CreateCachedContentRequest {
-            model: "stdio-model".to_string(),
-            display_name: None,
-            system_instruction: gen_req.system_instruction,
-            contents: Some(gen_req.contents),
-            tools: gen_req.tools,
-            ttl: Some(ttl),
-        };
         let res = GenAiClient::create_cached_content(self, cache_req).await?;
         res.name
             .ok_or_else(|| anyhow::anyhow!("Created cache has no name"))
