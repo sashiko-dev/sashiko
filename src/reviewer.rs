@@ -992,7 +992,7 @@ async fn run_review_tool(
     review_commit: Option<String>,
     quota_manager: Arc<QuotaManager>,
     cache_name: Option<&str>,
-    _cache_manager: Arc<CacheManager>,
+    cache_manager: Arc<CacheManager>,
     active_cache_name: Arc<Mutex<Option<String>>>,
     review_id: i64,
     worktree_path: Option<&Path>,
@@ -1120,25 +1120,90 @@ async fn run_review_tool(
                                         serde_json::from_value::<AiRequest>(payload_val.clone())
                                     {
                                         // Update stale cache name if needed
-                                        let guard = active_cache_name.lock().await;
-                                        if let Some(active_name) = guard.as_ref() {
-                                            if req.preloaded_context.is_some()
-                                                && req.preloaded_context.as_ref()
-                                                    != Some(active_name)
-                                            {
-                                                info!(
-                                                    "Updating stale cache name in request: {:?} -> {}",
-                                                    req.preloaded_context, active_name
-                                                );
-                                                req.preloaded_context = Some(active_name.clone());
+                                        {
+                                            let guard = active_cache_name.lock().await;
+                                            if let Some(active_name) = guard.as_ref() {
+                                                if req.preloaded_context.is_some()
+                                                    && req.preloaded_context.as_ref()
+                                                        != Some(active_name)
+                                                {
+                                                    info!(
+                                                        "Updating stale cache name in request: {:?} -> {}",
+                                                        req.preloaded_context, active_name
+                                                    );
+                                                    req.preloaded_context =
+                                                        Some(active_name.clone());
+                                                }
                                             }
                                         }
 
+                                        let mut cache_retry_done = false;
                                         let resp_payload = loop {
                                             quota_manager.wait_for_access().await;
                                             match provider.generate_content(req.clone()).await {
                                                 Ok(resp) => break Ok(resp),
                                                 Err(e) => {
+                                                    let err_str = e.to_string();
+                                                    // Handle Gemini context cache expiration (403 Permission Denied: CachedContent not found)
+                                                    if !cache_retry_done
+                                                        && err_str.contains("403")
+                                                        && err_str.contains("CachedContent not found")
+                                                    {
+                                                        warn!("AI Context Cache expired or not found. Refreshing...");
+                                                        cache_retry_done = true;
+
+                                                        let mut guard =
+                                                            active_cache_name.lock().await;
+
+                                                        let stale_cache =
+                                                            req.preloaded_context.clone();
+
+                                                        // Check if another task already refreshed it
+                                                        if let Some(active_name) = guard.as_ref() {
+                                                            if stale_cache.as_ref()
+                                                                != Some(active_name)
+                                                            {
+                                                                info!(
+                                                                    "Cache already refreshed by another task: {:?} -> {}",
+                                                                    stale_cache, active_name
+                                                                );
+                                                                req.preloaded_context =
+                                                                    Some(active_name.clone());
+                                                                drop(guard);
+                                                                continue;
+                                                            }
+                                                        }
+
+                                                        // Clear the current active cache name as requested
+                                                        *guard = None;
+
+                                                        // Refresh cache via manager
+                                                        match cache_manager
+                                                            .ensure_cache(stale_cache.as_deref())
+                                                            .await
+                                                        {
+                                                            Ok(new_name) => {
+                                                                info!(
+                                                                    "AI Context Cache refreshed: {}",
+                                                                    new_name
+                                                                );
+                                                                *guard = Some(new_name.clone());
+                                                                req.preloaded_context =
+                                                                    Some(new_name);
+                                                                drop(guard);
+                                                                continue;
+                                                            }
+                                                            Err(refresh_err) => {
+                                                                error!(
+                                                                    "Failed to refresh AI Context Cache: {}",
+                                                                    refresh_err
+                                                                );
+                                                                // If refresh failed, we break with original error or refresh error
+                                                                break Err(refresh_err);
+                                                            }
+                                                        }
+                                                    }
+
                                                     break Err(e);
                                                 }
                                             }
