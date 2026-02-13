@@ -134,7 +134,7 @@ against?
 
 ## NEVER EVER ALL CAPS
 
-The only time it is acceptable to use ALL CAPS in the review-inline.txt
+The only time it is acceptable to use ALL CAPS in the `review_inline` field
 is when you're directly quoting code.
 
 ### AVOID
@@ -215,7 +215,7 @@ fs/btrfs/send.c:__get_cur_name_and_parent() {
 ```
 
 ## Structure
-Create a TodoWrite for these items, all of which your report should include:
+Create a note for these items, all of which your report should include:
 
 - [ ] git sha of the commit
 - [ ] Author: line from the commit
@@ -224,7 +224,7 @@ Create a TodoWrite for these items, all of which your report should include:
 - [ ] Any Link: tags from the commit header
 - [ ] A unified diff of the commit, quoted as though it's in an email reply.
   - [ ] The diff must not be generated from existing context.
-  - [ ] You must regenerate the diff by calling out to semcode's commit function,
+  - [ ] You must obtain the diff by using git tools like `git_show`,
     using git log, or re-reading any patch files you were asked to review.
   - [ ] You must ensure the quoted portions of the diff exactly match the
     original commit or patch.
@@ -234,8 +234,7 @@ Create a TodoWrite for these items, all of which your report should include:
   front of your new text.
 - [ ] Place your questions as close as possible to the buggy section of code.
 - [ ] Snip portions of the quoted content unrelated to your review
-  - [ ] Create a TodoWrite with every hunk in the diff.  Check every hunk
-        to see if it is relevant to the review comments.
+  - [ ] Check every hunk to see if it is relevant to the review comments.
   - [ ] ensure diff headers are retained for the files owning any hunks keep
     - Never include diff headers for entirely snipped files
   - [ ] Replace any content you snip with [ ... ]
