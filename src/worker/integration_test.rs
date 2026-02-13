@@ -100,8 +100,8 @@ mod tests {
 
     fn get_test_paths() -> (PathBuf, PathBuf) {
         let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-        let linux_path = root.join("third_party/linux");
-        let prompts_path = root.join("third_party/review-prompts/kernel");
+        let linux_path = root.clone();
+        let prompts_path = root.join("third_party/prompts/kernel");
         (linux_path, prompts_path)
     }
 
@@ -159,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_integration_sanity() {
         let _ = tracing_subscriber::fmt::try_init();
-        let (linux_path, _prompts_path) = get_test_paths();
+        let (linux_path, prompts_path) = get_test_paths();
 
         let mock_response = json!({
             "summary": "Mock summary",
@@ -171,7 +171,7 @@ mod tests {
         )]));
 
         let tools = ToolBox::new(linux_path, None);
-        let prompts = PromptRegistry::new(PathBuf::from("third_party/review-prompts/kernel"));
+        let prompts = PromptRegistry::new(prompts_path);
         let mut worker = Worker::new(client, tools, prompts, 150_000, 25, 1.0, None);
 
         let patchset = json!({
@@ -188,7 +188,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_tool_use() {
         let _ = tracing_subscriber::fmt::try_init();
-        let (linux_path, _prompts_path) = get_test_paths();
+        let (linux_path, prompts_path) = get_test_paths();
 
         // Sequence of responses:
         // 1. Tool call: read_files([{"path": "README"}])
@@ -200,12 +200,12 @@ mod tests {
         });
 
         let client = Box::new(StatefulMockClient::new(vec![
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
             create_text_response(&format!("```json\n{}\n```", final_response)),
         ]));
 
         let tools = ToolBox::new(linux_path, None);
-        let prompts = PromptRegistry::new(PathBuf::from("third_party/review-prompts/kernel"));
+        let prompts = PromptRegistry::new(prompts_path);
         let mut worker = Worker::new(client, tools, prompts, 150_000, 25, 1.0, None);
 
         let patchset = json!({
@@ -245,8 +245,8 @@ mod tests {
             assert_eq!(results.len(), 1);
             let content_str = results[0]["content"].as_str().unwrap();
             assert!(
-                content_str.contains("Linux kernel"),
-                "README content should contain 'Linux kernel'"
+                content_str.contains("Sashiko"),
+                "README.md content should contain 'Sashiko'"
             );
         } else {
             panic!("Expected function response in history[2]");
@@ -259,20 +259,26 @@ mod tests {
     #[tokio::test]
     async fn test_worker_loop_detection() {
         let _ = tracing_subscriber::fmt::try_init();
-        let (linux_path, _prompts_path) = get_test_paths();
+        let (linux_path, prompts_path) = get_test_paths();
 
-        // New logic requires >= 5 repetitions (so 6th call triggers it) for non-write_file tools.
+        // New logic requires >= 10 repetitions for hard limit.
         let client = Box::new(StatefulMockClient::new(vec![
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
         ]));
 
         let tools = ToolBox::new(linux_path, None);
-        let prompts = PromptRegistry::new(PathBuf::from("third_party/review-prompts/kernel"));
+        let prompts = PromptRegistry::new(prompts_path);
         let mut worker = Worker::new(client, tools, prompts, 150_000, 25, 1.0, None);
 
         let patchset = json!({
@@ -286,7 +292,7 @@ mod tests {
             .await
             .expect("Worker run failed (should return Ok with error field)");
 
-        assert!(result.output.is_none());
+        assert!(result.output.is_none(), "Output was: {:?}", result.output);
         assert!(result.error.is_some());
         let err_msg = result.error.unwrap();
         assert!(err_msg.contains("Loop detected"));

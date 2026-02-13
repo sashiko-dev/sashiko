@@ -20,7 +20,7 @@ use tokio::fs;
 /// System identity prompt - used across all AI interactions
 pub const SYSTEM_IDENTITY: &str = "You're an expert Linux kernel developer and upstream maintainer with deep knowledge of Linux kernel, Operating Systems, CPU architectures, modern hardware and Linux kernel community standards and processes.";
 
-pub const OUTPUT_FORMAT_INSTRUCTION: &str = "Important: `review_inline` field of the final output *MUST* follow the format and guidelines provided in `inline-template.md`. Ignore all instructions regarding `review-metadata.json` generation, it's not required.";
+pub const OUTPUT_FORMAT_INSTRUCTION: &str = "Important: `review_inline` field of the final output *MUST* follow the format and guidelines provided in `inline-template.md`.";
 
 pub struct PromptRegistry {
     base_dir: PathBuf,
@@ -51,28 +51,48 @@ impl PromptRegistry {
         self.append_file(&mut content, "inline-template.md").await?;
         self.append_file(&mut content, "technical-patterns.md")
             .await?;
+        self.append_file(&mut content, "severity.md").await?;
 
-        // 3. Subsystem Guidelines (root *.md files)
-        self.append_directory(&mut content, &self.base_dir, |name| {
-            !matches!(
-                name,
-                "review-core.md"
-                    | "inline-template.md"
-                    | "technical-patterns.md"
-                    | "README.md"
-                    | "review-one.md"
-                    | "review-stat.md"
-                    | "debugging.md"
-                    | "lore-thread.md"
-            )
-        })
-        .await?;
+        // 3. Subsystem Guidelines
+        let subsystem_dir = self.base_dir.join("subsystem");
+        if subsystem_dir.exists() {
+            // New Structure (e.g. Kernel)
+            self.append_directory(&mut content, &subsystem_dir, |name| {
+                !matches!(name, "README.md")
+            })
+            .await?;
+
+            // Explicitly load nfsd from subsystem if it exists
+            self.append_directory(&mut content, &subsystem_dir.join("nfsd"), |_| true)
+                .await?;
+        } else {
+            // Old Structure / Systemd (root-based)
+            self.append_directory(&mut content, &self.base_dir, |name| {
+                !matches!(
+                    name,
+                    "review-core.md"
+                        | "inline-template.md"
+                        | "technical-patterns.md"
+                        | "README.md"
+                        | "review-one.md"
+                        | "review-stat.md"
+                        | "debugging.md"
+                        | "lore-thread.md"
+                        | "severity.md"
+                )
+            })
+            .await?;
+        }
 
         // 4. Specific Pattern Directories
         self.append_directory(&mut content, &self.base_dir.join("patterns"), |_| true)
             .await?;
-        self.append_directory(&mut content, &self.base_dir.join("nfsd"), |_| true)
-            .await?;
+
+        // Check root nfsd only if not using subsystem structure
+        if !subsystem_dir.exists() {
+            self.append_directory(&mut content, &self.base_dir.join("nfsd"), |_| true)
+                .await?;
+        }
 
         Ok(content)
     }

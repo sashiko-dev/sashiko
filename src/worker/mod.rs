@@ -419,6 +419,8 @@ impl Worker {
                             .filter(|(n, a)| *n == call.name && *a == call.args)
                             .count();
 
+                        session_tool_history.push((call.name.clone(), call.args.clone()));
+
                         if same_call_count > 0 {
                             // For tools, allow some repetition but prevent infinite loops.
                             // Soft limit: returning error to model to let it self-correct
@@ -454,8 +456,6 @@ impl Worker {
                                 continue;
                             }
                         }
-
-                        session_tool_history.push((call.name.clone(), call.args.clone()));
 
                         let result = match self.tools.call(&call.name, call.args.clone()).await {
                             Ok(val) => val,

@@ -21,8 +21,9 @@ mod tests {
 
     fn get_test_paths() -> (PathBuf, PathBuf) {
         let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-        let linux_path = root.join("third_party/linux");
-        let prompts_path = root.join("third_party/review-prompts/kernel");
+        // Use current repo as the test repo
+        let linux_path = root.clone();
+        let prompts_path = root.join("third_party/prompts/kernel");
         (linux_path, prompts_path)
     }
 
@@ -36,8 +37,8 @@ mod tests {
         let result = rt.block_on(toolbox.call("list_dir", args)).unwrap();
         let entries = result["entries"].as_array().unwrap();
 
-        assert!(entries.iter().any(|e| e["name"] == "README"));
-        assert!(entries.iter().any(|e| e["name"] == "Makefile"));
+        assert!(entries.iter().any(|e| e["name"] == "README.md"));
+        assert!(entries.iter().any(|e| e["name"] == "Cargo.toml"));
     }
 
     #[test]
@@ -48,7 +49,7 @@ mod tests {
 
         let args = json!({
             "files": [
-                { "path": "README", "start_line": 1, "end_line": 5 }
+                { "path": "README.md", "start_line": 1, "end_line": 5 }
             ]
         });
         let result = rt.block_on(toolbox.call("read_files", args)).unwrap();
@@ -58,7 +59,7 @@ mod tests {
         let content = results[0]["content"].as_str().unwrap();
 
         assert!(!content.is_empty());
-        assert!(content.contains("Linux kernel"));
+        assert!(content.contains("Sashiko"));
     }
 
     #[test]
@@ -81,7 +82,7 @@ mod tests {
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
 
-        let args = json!({ "path": "README", "start_line": 1, "end_line": 3 });
+        let args = json!({ "path": "README.md", "start_line": 1, "end_line": 3 });
         let result = rt.block_on(toolbox.call("git_blame", args)).unwrap();
         let content = result["content"].as_str().unwrap();
 
@@ -96,9 +97,9 @@ mod tests {
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
 
-        // Search for "Linux kernel" which should be in README
+        // Search for "Sashiko" which should be in README.md
         let args = json!({
-            "pattern": "Linux kernel",
+            "pattern": "Sashiko",
             "path": "."
         });
 
@@ -118,8 +119,8 @@ mod tests {
             );
         }
 
-        // Check if README matches are found (it might not be the first match)
-        assert!(content.contains("README") || content.contains("./README"));
+        // Check if README.md matches are found (it might not be the first match)
+        assert!(content.contains("README.md") || content.contains("./README.md"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ set -e
 # Resolve paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-STAT_FILE="$REPO_ROOT/third_party/review-prompts/kernel/examples/review-stat.txt"
+STAT_FILE="$REPO_ROOT/third_party/prompts/kernel/examples/review-stat.txt"
 
 if [[ ! -f "$STAT_FILE" ]]; then
     echo "Error: File $STAT_FILE not found!"

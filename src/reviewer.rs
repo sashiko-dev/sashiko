@@ -112,8 +112,8 @@ impl Reviewer {
         };
 
         // Initialize CacheManager
-        // Assuming prompts are in "third_party/review-prompts/kernel" in CWD.
-        let prompts_dir = PathBuf::from("third_party/review-prompts/kernel");
+        // Assuming prompts are in "third_party/prompts/kernel" in CWD.
+        let prompts_dir = PathBuf::from("third_party/prompts/kernel");
         let client = Box::new(GeminiClient::new(settings.ai.model.clone()));
 
         // We need tool definitions for the cache.
@@ -331,7 +331,7 @@ impl Reviewer {
         let (found_baseline, patch_commits, logs) =
             Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
 
-        let prompts_hash = get_commit_hash(Path::new("third_party/review-prompts"), "HEAD")
+        let prompts_hash = get_commit_hash(Path::new("."), "HEAD")
             .await
             .ok();
 
