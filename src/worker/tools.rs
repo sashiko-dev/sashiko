@@ -14,6 +14,7 @@
 
 use crate::ai::gemini::{FunctionDeclaration, Tool};
 use crate::ai::truncator::Truncator;
+use crate::git_ops::git_command;
 use anyhow::{Result, anyhow};
 use grep::printer::StandardBuilder;
 use grep::regex::RegexMatcher;
@@ -310,7 +311,7 @@ impl ToolBox {
         let start_line = args["start_line"].as_u64();
         let end_line = args["end_line"].as_u64();
 
-        let mut cmd = Command::new("git");
+        let mut cmd = git_command();
         cmd.current_dir(&self.worktree_path).arg("blame");
 
         if let (Some(s), Some(e)) = (start_line, end_line) {
@@ -337,7 +338,7 @@ impl ToolBox {
             .ok_or_else(|| anyhow!("Missing args"))?;
         let diff_args_str: Vec<&str> = diff_args.iter().filter_map(|v| v.as_str()).collect();
 
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(&self.worktree_path)
             .arg("diff")
             .arg("--diff-algorithm=histogram")
@@ -368,7 +369,7 @@ impl ToolBox {
         let start_line = args["start_line"].as_u64().map(|v| v as usize);
         let end_line = args["end_line"].as_u64().map(|v| v as usize);
 
-        let mut cmd = Command::new("git");
+        let mut cmd = git_command();
         cmd.current_dir(&self.worktree_path).arg("show");
 
         if suppress_diff {

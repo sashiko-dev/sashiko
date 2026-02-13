@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::events::Event;
+use crate::git_ops::git_command;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
@@ -134,7 +134,7 @@ impl FetchAgent {
                     let range = &commit_or_range;
 
                     // 1. Count commits
-                    let count_output = Command::new("git")
+                    let count_output = git_command()
                         .current_dir(&self.repo_path)
                         .args(["-c", "safe.bareRepository=all"])
                         .args(["rev-list", "--count", range])
@@ -186,7 +186,7 @@ impl FetchAgent {
                     }
 
                     // 2. Get list of SHAs
-                    let list_output = Command::new("git")
+                    let list_output = git_command()
                         .current_dir(&self.repo_path)
                         .args(["-c", "safe.bareRepository=all"])
                         .args(["rev-list", "--reverse", range])
@@ -282,7 +282,7 @@ impl FetchAgent {
 
     async fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
         // Check if remote exists
-        let status = Command::new("git")
+        let status = git_command()
             .current_dir(&self.repo_path)
             .args(["remote", "get-url", name])
             .stdout(Stdio::null())
@@ -292,7 +292,7 @@ impl FetchAgent {
 
         if status.success() {
             // Check if URL matches, if not update it
-            let output = Command::new("git")
+            let output = git_command()
                 .current_dir(&self.repo_path)
                 .args(["remote", "get-url", name])
                 .output()
@@ -301,7 +301,7 @@ impl FetchAgent {
 
             if current_url != url {
                 info!("Updating remote {} from {} to {}", name, current_url, url);
-                Command::new("git")
+                git_command()
                     .current_dir(&self.repo_path)
                     .args(["remote", "set-url", name, url])
                     .output()
@@ -309,7 +309,7 @@ impl FetchAgent {
             }
         } else {
             info!("Adding remote {} -> {}", name, url);
-            let output = Command::new("git")
+            let output = git_command()
                 .current_dir(&self.repo_path)
                 .args(["remote", "add", name, url])
                 .output()
@@ -326,7 +326,7 @@ impl FetchAgent {
     }
 
     async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
-        let mut cmd = Command::new("git");
+        let mut cmd = git_command();
         cmd.current_dir(&self.repo_path).arg("fetch").arg(remote);
 
         for commit in commits {
@@ -344,7 +344,7 @@ impl FetchAgent {
     }
 
     async fn fetch_all(&self, remote: &str) -> Result<()> {
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(&self.repo_path)
             .args(["fetch", remote])
             .output()
@@ -367,7 +367,7 @@ impl FetchAgent {
         total: u32,
     ) -> Result<Event> {
         // Resolve parent to use as base_commit
-        let parent_output = Command::new("git")
+        let parent_output = git_command()
             .current_dir(&self.repo_path)
             .args(["rev-parse", &format!("{}^", commit)])
             .output()
@@ -390,7 +390,7 @@ impl FetchAgent {
         // Format: AuthorName%nAuthorEmail%nSubject%nBody...%n---SASHIKO-END-HEADER---%nDiff...
         let format = "format:%an%n%ae%n%s%n%b%n---SASHIKO-END-HEADER---";
 
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(&self.repo_path)
             .args(["show", &format!("--format={}", format), commit])
             .output()
@@ -461,17 +461,17 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Setup dummy repo
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .arg("init")
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
@@ -481,12 +481,12 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "content")?;
 
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["commit", "-m", "Subject Line\n\nBody Line"])
             .output()
@@ -495,7 +495,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx);
 
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(&repo_path)
             .args(["rev-parse", "HEAD"])
             .output()

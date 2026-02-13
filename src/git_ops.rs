@@ -22,6 +22,50 @@ use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
+/// Returns a new tokio::process::Command for "git" with environment variables
+/// that might redirect git to the wrong repository removed.
+/// This is important when running from inside git hooks or when the user
+/// has these variables set in their environment.
+pub fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_QUARANTINE_PATH")
+        .env_remove("GIT_REFLOG_ACTION")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_AUTHOR_DATE")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .env_remove("GIT_COMMITTER_DATE");
+    cmd
+}
+
+/// Returns a new std::process::Command for "git" with environment variables
+/// that might redirect git to the wrong repository removed.
+pub fn sync_git_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_QUARANTINE_PATH")
+        .env_remove("GIT_REFLOG_ACTION")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_AUTHOR_DATE")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .env_remove("GIT_COMMITTER_DATE");
+    cmd
+}
+
 #[allow(dead_code)]
 pub struct GitWorktree {
     pub dir: TempDir,
@@ -67,7 +111,7 @@ impl GitWorktree {
 
         info!("Creating worktree at {:?}", path);
 
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
@@ -97,7 +141,7 @@ impl GitWorktree {
     pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
         info!("Applying patch in {:?}", self.path);
 
-        let mut child = Command::new("git")
+        let mut child = git_command()
             .current_dir(&self.path)
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
@@ -119,7 +163,7 @@ impl GitWorktree {
         let output = child.wait_with_output().await?;
 
         if !output.status.success() {
-            let _ = Command::new("git")
+            let _ = git_command()
                 .current_dir(&self.path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("am")
@@ -141,7 +185,7 @@ impl GitWorktree {
     pub async fn apply_raw_diff(&self, diff_content: &str) -> Result<std::process::Output> {
         info!("Applying raw diff in {:?}", self.path);
 
-        let mut child = Command::new("git")
+        let mut child = git_command()
             .current_dir(&self.path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("apply")
@@ -163,7 +207,7 @@ impl GitWorktree {
     }
 
     pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(&self.path)
             .args(["show", hash])
             .output()
@@ -181,7 +225,7 @@ impl GitWorktree {
 
     pub async fn reset_hard(&self, ref_name: &str) -> Result<()> {
         info!("Resetting worktree to {}", ref_name);
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(&self.path)
             .args(["reset", "--hard", ref_name])
             .output()
@@ -195,7 +239,7 @@ impl GitWorktree {
         }
 
         // Also clean untracked files to be safe
-        let clean_output = Command::new("git")
+        let clean_output = git_command()
             .current_dir(&self.path)
             .args(["clean", "-fdx"])
             .output()
@@ -217,7 +261,7 @@ impl GitWorktree {
             return Ok(());
         }
         info!("Removing worktree at {:?}", self.path);
-        let output = Command::new("git")
+        let output = git_command()
             .current_dir(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
@@ -239,7 +283,7 @@ impl GitWorktree {
 
 #[allow(dead_code)]
 pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
-    let output = Command::new("git")
+    let output = git_command()
         .current_dir(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .arg("cat-file")
@@ -260,7 +304,7 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
 #[allow(dead_code)]
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     info!("Pruning git worktrees in {:?}", repo_path);
-    let output = Command::new("git")
+    let output = git_command()
         .current_dir(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .arg("worktree")
@@ -334,7 +378,7 @@ pub async fn ensure_remote(
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
-        let check = Command::new("git")
+        let check = git_command()
             .current_dir(repo_path)
             .args(["remote", "get-url", name])
             .output()
@@ -342,7 +386,7 @@ pub async fn ensure_remote(
 
         if !check.status.success() {
             info!("Adding remote {} ({})", name, url);
-            let add = Command::new("git")
+            let add = git_command()
                 .current_dir(repo_path)
                 .args(["remote", "add", name, url])
                 .output()
@@ -371,7 +415,7 @@ pub async fn ensure_remote(
 
     // Check if HEAD exists
     let head_ref = format!("refs/remotes/{}/HEAD", name);
-    let head_exists = Command::new("git")
+    let head_exists = git_command()
         .current_dir(repo_path)
         .args(["show-ref", "--verify", "-q", &head_ref])
         .status()
@@ -406,7 +450,7 @@ pub async fn ensure_remote(
     // 4. Fetch
     if should_fetch {
         info!("Fetching remote {}", name);
-        let fetch = Command::new("git")
+        let fetch = git_command()
             .current_dir(repo_path)
             .args(["fetch", "--prune", name])
             .output()
@@ -433,7 +477,7 @@ pub async fn ensure_remote(
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
-        let set_head = Command::new("git")
+        let set_head = git_command()
             .current_dir(repo_path)
             .args(["remote", "set-head", name, "--auto"])
             .output()
@@ -452,7 +496,7 @@ pub async fn ensure_remote(
 }
 
 pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .current_dir(path)
         .args(["rev-parse", ref_name])
         .output()
@@ -549,7 +593,7 @@ pub async fn get_git_log(params: GitLogParams) -> Result<String> {
         args.extend(params.paths.clone());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .current_dir(&params.repo_path)
         .args(&args)
         .output()
@@ -571,7 +615,7 @@ pub async fn get_range_base(repo_path: &Path, rev_range: &str) -> Result<String>
         // Symmetric difference: use merge-base
         let parts: Vec<&str> = rev_range.split("...").collect();
         if parts.len() == 2 {
-            let output = Command::new("git")
+            let output = git_command()
                 .current_dir(repo_path)
                 .args(["merge-base", parts[0], parts[1]])
                 .output()
@@ -613,19 +657,19 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["init"])
             .output()
             .await?;
 
         // Configure user
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
@@ -636,13 +680,13 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello World")?;
 
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
 
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["commit", "-m", "Initial commit"])
             .output()
@@ -652,7 +696,7 @@ mod tests {
         let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
         writeln!(file, "Change 1")?;
 
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["commit", "-am", "Second commit"])
             .output()
@@ -689,24 +733,24 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["init"])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
 
         // C1
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["commit", "--allow-empty", "-m", "C1"])
             .output()
@@ -714,14 +758,14 @@ mod tests {
         let c1 = get_commit_hash(&repo_path, "HEAD").await?;
 
         // Tag v1
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["tag", "v1"])
             .output()
             .await?;
 
         // C2
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["commit", "--allow-empty", "-m", "C2"])
             .output()
@@ -729,14 +773,14 @@ mod tests {
         let c2 = get_commit_hash(&repo_path, "HEAD").await?;
 
         // Branch feature
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["branch", "feature"])
             .output()
             .await?;
 
         // C3
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["commit", "--allow-empty", "-m", "C3"])
             .output()
@@ -776,17 +820,17 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["init"])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
@@ -796,12 +840,12 @@ mod tests {
         let file_path = repo_path.join("test.txt");
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello World")?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
+        git_command()
             .current_dir(&repo_path)
             .args(["commit", "-m", "Initial commit"])
             .output()

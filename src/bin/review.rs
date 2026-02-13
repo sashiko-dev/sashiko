@@ -15,7 +15,7 @@
 use anyhow::Result;
 use clap::Parser;
 use sashiko::{
-    git_ops::GitWorktree,
+    git_ops::{GitWorktree, sync_git_command},
     settings::Settings,
     worker::{Worker, prompts::PromptRegistry, tools::ToolBox},
 };
@@ -494,7 +494,7 @@ async fn apply_single_patch(
     if let Some(sha) = &p.message_id {
         if sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
             // Check if object exists
-            let status = std::process::Command::new("git")
+            let status = sync_git_command()
                 .current_dir(&worktree.path)
                 .args(["cat-file", "-e", &format!("{}^{{commit}}", sha)])
                 .stdout(std::process::Stdio::null())
@@ -632,9 +632,9 @@ async fn apply_single_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sashiko::git_ops::sync_git_command;
     use std::fs::File;
     use std::io::Write;
-    use std::process::Command;
 
     #[tokio::test]
     async fn test_apply_single_patch_remote_checkout() -> Result<()> {
@@ -642,15 +642,15 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let repo_path = temp_dir.path().to_path_buf();
 
-        Command::new("git")
+        sync_git_command()
             .current_dir(&repo_path)
             .arg("init")
             .output()?;
-        Command::new("git")
+        sync_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()?;
-        Command::new("git")
+        sync_git_command()
             .current_dir(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()?;
@@ -659,11 +659,11 @@ mod tests {
         let file_path = repo_path.join("file.txt");
         let mut file = File::create(&file_path)?;
         writeln!(file, "Initial")?;
-        Command::new("git")
+        sync_git_command()
             .current_dir(&repo_path)
             .args(["add", "."])
             .output()?;
-        Command::new("git")
+        sync_git_command()
             .current_dir(&repo_path)
             .args(["commit", "-m", "Initial"])
             .output()?;
@@ -672,11 +672,11 @@ mod tests {
 
         // Second commit (The one we want to checkout)
         writeln!(file, "Change")?;
-        Command::new("git")
+        sync_git_command()
             .current_dir(&repo_path)
             .args(["add", "."])
             .output()?;
-        Command::new("git")
+        sync_git_command()
             .current_dir(&repo_path)
             .args(["commit", "-m", "Feature"])
             .output()?;

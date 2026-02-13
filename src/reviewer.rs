@@ -20,7 +20,7 @@ use crate::ai::gemini::{
 use crate::ai::proxy::QuotaManager;
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, ToolUsage};
-use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
+use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash, git_command};
 use crate::settings::Settings;
 use anyhow::Result;
 use serde::Serialize;
@@ -519,13 +519,13 @@ impl Reviewer {
                         if o.status.success() {
                             applied = true;
                             // Commit raw diff
-                            let _ = Command::new("git")
+                            let _ = git_command()
                                 .current_dir(&worktree.path)
                                 .args(["add", "."])
                                 .output()
                                 .await;
                             let commit_msg = format!("{}\n\n(Applied via git apply)", subject);
-                            let _ = Command::new("git")
+                            let _ = git_command()
                                 .current_dir(&worktree.path)
                                 .env("GIT_AUTHOR_NAME", author)
                                 .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")

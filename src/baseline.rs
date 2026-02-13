@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::git_ops::sync_git_command;
 use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
@@ -107,8 +108,7 @@ impl BaselineRegistry {
     }
 
     fn read_file_from_git(repo_path: &Path, rev: &str, file_path: &str) -> Result<String> {
-        use std::process::Command;
-        let output = Command::new("git")
+        let output = sync_git_command()
             .current_dir(repo_path)
             .args(["show", &format!("{}:{}", rev, file_path)])
             .output()?;
@@ -188,9 +188,7 @@ impl BaselineRegistry {
     }
 
     fn load_git_remotes(repo_path: &Path) -> Result<HashMap<String, String>> {
-        use std::process::Command;
-
-        let output = Command::new("git")
+        let output = sync_git_command()
             .current_dir(repo_path)
             .args(["remote", "-v"])
             .output()?;

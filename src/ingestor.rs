@@ -14,6 +14,7 @@
 
 use crate::db::Database;
 use crate::events::Event;
+use crate::git_ops::git_command;
 use crate::nntp::NntpClient;
 use crate::settings::Settings;
 use anyhow::{Result, anyhow};
@@ -334,7 +335,7 @@ impl Ingestor {
         };
 
         // Calculate commit count for the range to set total_parts correctly
-        let count_output = Command::new("git")
+        let count_output = git_command()
             .current_dir(&repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("rev-list")
@@ -362,7 +363,7 @@ impl Ingestor {
             range, repo_path, total_count
         );
 
-        let mut cmd = Command::new("git");
+        let mut cmd = git_command();
         cmd.current_dir(&repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("format-patch")
@@ -565,7 +566,7 @@ impl Ingestor {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let output = Command::new("git")
+            let output = git_command()
                 .arg("clone")
                 .arg("--bare")
                 .arg(format!("--depth={}", n))
@@ -582,7 +583,7 @@ impl Ingestor {
             }
         } else {
             // Repo exists, ensure remote is correct then fetch
-            let remote_output = Command::new("git")
+            let remote_output = git_command()
                 .arg("-c")
                 .arg("safe.bareRepository=all")
                 .current_dir(path)
@@ -598,7 +599,7 @@ impl Ingestor {
                     .to_string();
                 if current_url != url {
                     info!("Updating remote origin from {} to {}", current_url, url);
-                    let set_url_output = Command::new("git")
+                    let set_url_output = git_command()
                         .arg("-c")
                         .arg("safe.bareRepository=all")
                         .current_dir(path)
@@ -619,7 +620,7 @@ impl Ingestor {
             }
 
             info!("Fetching latest changes in {:?} with depth {}", path, n);
-            let output = Command::new("git")
+            let output = git_command()
                 .arg("-c")
                 .arg("safe.bareRepository=all")
                 .current_dir(path)
@@ -735,7 +736,7 @@ impl Ingestor {
 
         // 1. Start git rev-list (Producer)
         info!("Starting object enumeration...");
-        let mut rev_list_cmd = Command::new("git");
+        let mut rev_list_cmd = git_command();
         rev_list_cmd
             .arg("-c")
             .arg("safe.bareRepository=all")
@@ -760,7 +761,7 @@ impl Ingestor {
         let mut rev_list_reader = BufReader::new(rev_list_stdout).lines();
 
         // 2. Start git cat-file --batch (Consumer)
-        let mut cat_file_cmd = Command::new("git");
+        let mut cat_file_cmd = git_command();
         cat_file_cmd
             .arg("-c")
             .arg("safe.bareRepository=all")

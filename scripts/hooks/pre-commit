@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Function to run a command and handle output
+run_step() {
+    local step_name="$1"
+    shift
+    
+    printf "Running %s... " "$step_name"
+    
+    local output_file
+    output_file=$(mktemp)
+    
+    # Run the command and capture both stdout and stderr
+    if "$@" > "$output_file" 2>&1; then
+        echo "Done."
+        rm "$output_file"
+    else
+        echo "Failed!"
+        echo "========================================"
+        cat "$output_file"
+        echo "========================================"
+        rm "$output_file"
+        exit 1
+    fi
+}
+
+# 1. Run cargo fmt
+run_step "cargo fmt" cargo fmt --all
+
+# 2. Re-stage files that were modified by cargo fmt
+# Filter out deleted files (D) to avoid "pathspec ... did not match" errors
+# Use -z and xargs -0 for safe filename handling
+if git diff --name-only --cached --diff-filter=ACMR | grep -q .; then
+    git diff --name-only --cached --diff-filter=ACMR -z | xargs -0 git add
+fi
+
+# 3. Run cargo test
+run_step "cargo test" cargo test
