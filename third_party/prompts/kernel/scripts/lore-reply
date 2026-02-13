@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+Usage:
+    lore-reply [--dry-run] [--force] [--b4] <COMMIT-REF>
+    lore-reply [--dry-run] [--force] --mbox <MBOX-FILE> <COMMIT-REF>
+
+In the first form, semcode dig (or b4 dig with --b4) is used to find
+the message ID and download the thread from lore.kernel.org.
+
+In the second form, the mbox file is provided directly instead of
+downloading.
+
+Options:
+    --dry-run     Do not actually send the email
+    --force       Skip patch-id verification and claude analysis
+    --b4          Use b4 dig instead of semcode dig
+    --mbox FILE   Use existing mbox file instead of downloading
+"""
+
+import sys
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from email import policy
+from email.parser import BytesParser
+from urllib.parse import quote
+
+def dig_commit(commit_ref: str, use_b4: bool = False) -> tuple[str, str]:
+    """Use semcode/b4 dig to find the msgid and download mbox for a commit.
+
+    Returns (msgid, mbox_path).
+    """
+    tmpdir = tempfile.mkdtemp(prefix="lore-dig-")
+    mbox_path = os.path.join(tmpdir, "thread.mbox")
+
+    print(f"Searching for patch on lore.kernel.org...")
+
+    # Try semcode first (unless --b4 was specified)
+    if not use_b4:
+        result = subprocess.run(
+            ["semcode", "-q", f"dig --mbox --thread -o {mbox_path} {commit_ref}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and os.path.exists(mbox_path):
+            # Get the commit subject to find the matching message
+            subject_result = subprocess.run(
+                ["git", "log", "-1", "--format=%s", commit_ref],
+                capture_output=True,
+                text=True,
+            )
+            if subject_result.returncode == 0 and subject_result.stdout.strip():
+                commit_subject = subject_result.stdout.strip()
+                msg = find_message_by_subject(mbox_path, commit_subject)
+                if msg:
+                    msgid = msg.get("Message-ID", "").strip("<>")
+                    if msgid:
+                        print(f"Downloaded thread to {mbox_path}")
+                        return msgid, mbox_path
+            # If we couldn't find matching message, clean up and try b4
+            os.remove(mbox_path)
+
+    # Use b4 dig
+    result = subprocess.run(
+        ["b4", "dig", "-m", mbox_path, "-c", commit_ref],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stderr, end='')
+        print("b4 dig failed, trying claude lore search...")
+
+        # Try using claude with lore search as fallback
+        claude_result = subprocess.run(
+            ["claude", "--model", "haiku", "-p",
+             f"Use lore to search for the latest mailing list submission corresponding to git commit {commit_ref}, "
+             f"saving it in mbox format to {mbox_path}"],
+            capture_output=True,
+            text=True,
+        )
+
+        if claude_result.returncode == 0 and os.path.exists(mbox_path):
+            print("Claude found and saved the thread")
+            # Extract msgid from first message in mbox
+            first_msg = get_first_message_in_mbox(mbox_path)
+            if first_msg:
+                msgid = first_msg.get("Message-ID", "").strip("<>")
+                if msgid:
+                    return msgid, mbox_path
+            shutil.rmtree(tmpdir)
+            raise SystemExit("Could not extract message ID from mbox saved by Claude")
+        else:
+            shutil.rmtree(tmpdir)
+            if claude_result.stdout.strip():
+                print(claude_result.stdout)
+            # Get commit subject for manual search suggestion
+            subject_result = subprocess.run(
+                ["git", "log", "-1", "--format=%s", commit_ref],
+                capture_output=True,
+                text=True,
+            )
+            if subject_result.returncode == 0 and subject_result.stdout.strip():
+                subject = subject_result.stdout.strip()
+                encoded_subject = quote(f'"{subject}"')
+                print(f"Try searching manually: https://lore.kernel.org/all/?q=s:{encoded_subject}")
+            sys.exit(1)
+    print(f"Downloaded thread to {mbox_path}")
+
+    # Look for the patch.msgid.link URL in the output
+    msgid = None
+    for line in result.stdout.splitlines():
+        if "patch.msgid.link/" in line:
+            # Extract msgid from URL like https://patch.msgid.link/20260107141015.25819-16-mark@harmstone.com
+            msgid = line.split("patch.msgid.link/")[-1].strip()
+            break
+
+    if not msgid:
+        shutil.rmtree(tmpdir)
+        print(f"Could not find msgid for commit {commit_ref}. b4 dig output:\n{result.stdout}")
+        # Get commit subject for manual search suggestion
+        subject_result = subprocess.run(
+            ["git", "log", "-1", "--format=%s", commit_ref],
+            capture_output=True,
+            text=True,
+        )
+        if subject_result.returncode == 0 and subject_result.stdout.strip():
+            subject = subject_result.stdout.strip()
+            encoded_subject = quote(f'"{subject}"')
+            print(f"Try searching manually: https://lore.kernel.org/all/?q=s:{encoded_subject}")
+        sys.exit(1)
+
+    if not os.path.exists(mbox_path):
+        shutil.rmtree(tmpdir)
+        raise SystemExit(f"b4 dig did not create mbox file")
+
+    return msgid, mbox_path
+
+
+def summarize_replies(msgid: str, mbox_path: str, force: bool = False) -> None:
+    """Use claude to summarize replies in the mbox."""
+    if force:
+        return
+
+    review_file = "./review-inline.txt"
+    review_context = ""
+    if os.path.exists(review_file):
+        review_context = f". Also check if any of the replies relate to the review in {review_file}, and whether anyone has reported a similar bug to what is described in {review_file}"
+
+    prompt = f"Summarize replies to message id {msgid} in mbox {mbox_path}{review_context}"
+    print("Analyzing thread replies...")
+    result = subprocess.run(
+        ["claude", "--model", "haiku", "-p", prompt],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        print("Reply summary:")
+        print(result.stdout)
+        print()
+        response = input("Continue? [Y/n] ").strip().lower()
+        if response == 'n':
+            sys.exit(0)
+
+
+def find_message_in_mbox(mbox_path: str, msgid: str):
+    """Find a message by Message-ID in an mbox file."""
+    target_msgid = f"<{msgid}>" if not msgid.startswith("<") else msgid
+
+    # Parse each message with email.policy.default to get EmailMessage objects
+    # which support get_body()
+    with open(mbox_path, "rb") as f:
+        content = f.read()
+
+    # Split mbox into individual messages (separated by "From " lines)
+    messages = re.split(rb'^From ', content, flags=re.MULTILINE)
+
+    for i, msg_bytes in enumerate(messages):
+        if i == 0 and not msg_bytes.strip():
+            continue
+        if i > 0:
+            msg_bytes = b'From ' + msg_bytes
+
+        try:
+            msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
+            msg_msgid = msg.get("Message-ID", "")
+            if msg_msgid == target_msgid or msg_msgid == msgid:
+                return msg
+        except Exception:
+            continue
+
+    return None
+
+
+def get_first_message_in_mbox(mbox_path: str):
+    """Get the first message from an mbox file."""
+    with open(mbox_path, "rb") as f:
+        content = f.read()
+
+    # Split mbox into individual messages (separated by "From " lines)
+    messages = re.split(rb'^From ', content, flags=re.MULTILINE)
+
+    for i, msg_bytes in enumerate(messages):
+        if i == 0 and not msg_bytes.strip():
+            continue
+        if i > 0:
+            msg_bytes = b'From ' + msg_bytes
+
+        try:
+            msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
+            return msg
+        except Exception:
+            continue
+
+    return None
+
+
+def is_cover_letter(subject: str) -> bool:
+    """Check if subject is a cover letter ([PATCH 0/N] or [PATCH vX 0/N])."""
+    return bool(re.search(r'\[PATCH[^\]]*\s+0/', subject))
+
+
+def is_reply(subject: str) -> bool:
+    """Check if subject is a reply (starts with Re:)."""
+    return subject.strip().lower().startswith("re:")
+
+
+def is_original_patch(subject: str) -> bool:
+    """Check if subject is an original patch (not a reply, not a cover letter)."""
+    return not is_reply(subject) and not is_cover_letter(subject)
+
+
+def find_message_by_subject(mbox_path: str, commit_subject: str):
+    """Find a message in mbox whose subject contains the commit subject.
+
+    Prefers original patches over cover letters and replies.
+    """
+    with open(mbox_path, "rb") as f:
+        content = f.read()
+
+    # Split mbox into individual messages (separated by "From " lines)
+    messages = re.split(rb'^From ', content, flags=re.MULTILINE)
+
+    matches = []
+    for i, msg_bytes in enumerate(messages):
+        if i == 0 and not msg_bytes.strip():
+            continue
+        if i > 0:
+            msg_bytes = b'From ' + msg_bytes
+
+        try:
+            msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
+            msg_subject = str(msg.get("Subject", ""))
+            # Strip [PATCH n/m] prefix and compare
+            # Subject may have Re:, [PATCH x/y], etc. prefixes
+            if commit_subject in msg_subject:
+                matches.append(msg)
+        except Exception:
+            continue
+
+    if not matches:
+        return None
+
+    # Prefer original patches over cover letters and replies
+    if len(matches) > 1:
+        original = [m for m in matches if is_original_patch(str(m.get("Subject", "")))]
+        if original:
+            return original[0]
+        # Fall back to non-reply (cover letter is better than reply)
+        non_reply = [m for m in matches if not is_reply(str(m.get("Subject", "")))]
+        if non_reply:
+            return non_reply[0]
+
+    return matches[0]
+
+
+def get_patch_id(input_bytes: bytes) -> str:
+    """Compute git patch-id from patch content."""
+    result = subprocess.run(
+        ["git", "patch-id", "--stable"],
+        input=input_bytes,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return ""
+    # Output format: "<patch-id> <commit-id>\n"
+    parts = result.stdout.decode().strip().split()
+    return parts[0] if parts else ""
+
+
+def get_commit_patch_id(commit_ref: str) -> str:
+    """Get patch-id for a commit."""
+    # Use format-patch to get the same format as lore emails
+    show = subprocess.run(
+        ["git", "format-patch", "-1", "--stdout", commit_ref],
+        capture_output=True,
+    )
+    if show.returncode != 0:
+        raise SystemExit(f"git format-patch failed for {commit_ref}")
+    return get_patch_id(show.stdout)
+
+
+def verify_patch_id(msg, mbox_path: str, commit_ref: str) -> None:
+    """Verify that the email patch matches the commit."""
+    # Get the decoded body content for patch-id comparison
+    # The email might be quoted-printable encoded
+    body = msg.get_body(preferencelist=('plain',))
+    if body:
+        email_content = body.get_content().encode('utf-8')
+    else:
+        # Fallback to raw bytes
+        email_content = msg.as_bytes()
+
+    email_patch_id = get_patch_id(email_content)
+    commit_patch_id = get_commit_patch_id(commit_ref)
+
+    if not email_patch_id:
+        print("Warning: could not compute patch-id from email")
+        return
+    if not commit_patch_id:
+        print("Warning: could not compute patch-id from commit")
+        return
+
+    if email_patch_id != commit_patch_id:
+        print(
+            f"Patch-id mismatch!\n"
+            f"  Email:  {email_patch_id}\n"
+            f"  Commit: {commit_patch_id}\n"
+        )
+
+        # Get a summary of the differences using claude
+        prompt = f"Briefly explain the differences between the patch in {mbox_path} and git commit {commit_ref}. Conclude whether the patches are basically the same or substantially different. Be concise."
+        print("Analyzing patch differences...")
+        result = subprocess.run(
+            ["claude", "--model", "haiku", "-p", prompt],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            print("Difference summary:")
+            print(result.stdout)
+        else:
+            print("(Could not generate difference summary)")
+
+        print()
+        response = input("Continue anyway? [y/N] ").strip().lower()
+        if response != 'y':
+            print("Use --force to skip this check entirely.")
+            sys.exit(1)
+        return
+
+    print(f"Verified patch-id: {email_patch_id}")
+
+
+def print_message_info(msg, msgid: str) -> None:
+    """Print message details: msgid, subject, author, date."""
+    subject = str(msg.get("Subject", "(no subject)"))
+    author = str(msg.get("From", "(unknown)"))
+    date = str(msg.get("Date", "(unknown)"))
+
+    print(f"Found msgid: {msgid}")
+    print(f"  Subject: {subject}")
+    print(f"  From: {author}")
+    print(f"  Date: {date}")
+    print(f"  https://lore.kernel.org/all/{msgid}")
+
+
+def make_reply_file(orig_msg, msgid: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="lore-reply-", suffix=".txt")
+    os.close(fd)
+
+    orig_subject = orig_msg.get("Subject", "")
+    # Decode RFC 2047 encoded subject if necessary
+    if orig_subject:
+        orig_subject = str(orig_subject)
+    if orig_subject and not orig_subject.lower().startswith("re:"):
+        subject = f"Re: {orig_subject}"
+    else:
+        subject = orig_subject or "(no subject)"
+
+    in_reply_to = orig_msg.get("Message-ID") or f"<{msgid}>"
+    references = orig_msg.get("References", "")
+    if references:
+        references = f"{references} {in_reply_to}"
+    else:
+        references = in_reply_to
+
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        # Reply-To takes precedence over From for the To header
+        reply_to = orig_msg.get("Reply-To") or orig_msg.get("From")
+        orig_to = orig_msg.get("To")
+        orig_cc = orig_msg.get("Cc")
+        orig_from = orig_msg.get("From")
+
+        # Build Cc list from original To and Cc
+        cc_parts = []
+        if orig_to:
+            cc_parts.append(str(orig_to))
+        if orig_cc:
+            cc_parts.append(str(orig_cc))
+        cc_combined = ", ".join(cc_parts) if cc_parts else None
+
+        if reply_to:
+            f.write(f"To: {reply_to}\n")
+        if cc_combined:
+            f.write(f"Cc: {cc_combined}\n")
+
+        f.write(f"Subject: {subject}\n")
+        f.write(f"In-Reply-To: {in_reply_to}\n")
+        f.write(f"References: {references}\n")
+        f.write("\n")
+
+        # Attribution line
+        if orig_from:
+            f.write(f"{orig_from} wrote:\n")
+
+        # Quote the original message body
+        body = orig_msg.get_body(preferencelist=('plain',))
+        if body:
+            body_text = body.get_content()
+            for line in body_text.splitlines():
+                f.write(f"> {line}\n")
+
+    return path
+
+def main(argv):
+    dry_run = False
+    force = False
+    use_b4 = False
+    mbox_file = None
+
+    # Simple arg parsing: optional flags then args
+    args = list(argv)
+    while args and args[0].startswith("--"):
+        if args[0] == "--dry-run":
+            dry_run = True
+            args = args[1:]
+        elif args[0] == "--force":
+            force = True
+            args = args[1:]
+        elif args[0] == "--b4":
+            use_b4 = True
+            args = args[1:]
+        elif args[0] == "--mbox":
+            args = args[1:]
+            if not args:
+                print("--mbox requires a file argument", file=sys.stderr)
+                sys.exit(1)
+            mbox_file = args[0]
+            args = args[1:]
+        else:
+            print(f"Unknown option: {args[0]}", file=sys.stderr)
+            sys.exit(1)
+
+    # --mbox mode requires COMMIT-REF, otherwise COMMIT-REF required
+    if mbox_file:
+        if len(args) != 1:
+            print(f"Usage: {sys.argv[0]} [--dry-run] [--force] --mbox <MBOX-FILE> <COMMIT-REF>", file=sys.stderr)
+            sys.exit(1)
+        mbox_path = mbox_file
+        commit_ref = args[0]
+
+        # Get the commit subject to find the matching message
+        subject_result = subprocess.run(
+            ["git", "log", "-1", "--format=%s", commit_ref],
+            capture_output=True,
+            text=True,
+        )
+        if subject_result.returncode != 0 or not subject_result.stdout.strip():
+            raise SystemExit(f"Could not get subject for commit {commit_ref}")
+        commit_subject = subject_result.stdout.strip()
+
+        orig_msg = find_message_by_subject(mbox_path, commit_subject)
+        if not orig_msg:
+            raise SystemExit(f"Could not find message with subject matching '{commit_subject}' in mbox")
+        msgid = orig_msg.get("Message-ID", "").strip("<>")
+        print_message_info(orig_msg, msgid)
+
+        # Summarize any replies in the thread
+        summarize_replies(msgid, mbox_path, force)
+
+        if not force:
+            verify_patch_id(orig_msg, mbox_path, commit_ref)
+    else:
+        if len(args) != 1:
+            print(f"Usage: {sys.argv[0]} [--dry-run] [--force] [--b4] <COMMIT-REF>", file=sys.stderr)
+            sys.exit(1)
+
+        commit_ref = args[0]
+        msgid, mbox_path = dig_commit(commit_ref, use_b4)
+        mbox_dir = os.path.dirname(mbox_path)
+
+        try:
+            # Find the specific message in the mbox
+            orig_msg = find_message_in_mbox(mbox_path, msgid)
+            if not orig_msg:
+                raise SystemExit(f"Could not find message {msgid} in mbox")
+
+            print_message_info(orig_msg, msgid)
+
+            # Summarize any replies in the thread
+            summarize_replies(msgid, mbox_path, force)
+
+            if not force:
+                verify_patch_id(orig_msg, mbox_path, commit_ref)
+        finally:
+            shutil.rmtree(mbox_dir)
+
+    reply_path = make_reply_file(orig_msg, msgid)
+
+    cmd = [
+        "git", "send-email",
+        "--annotate",
+        "--to", "",
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+    cmd.append(reply_path)
+
+    print("Running:", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        # Save a copy of the email after editing (even if send failed)
+        shutil.copy(reply_path, "./review-email.txt")
+        print(f"Saved email to ./review-email.txt")
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

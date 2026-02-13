@@ -1,0 +1,657 @@
+commit 786eb990cfb78aab94eb74fb32a030e14723a620
+Author: Donet Tom <donettom@linux.ibm.com>
+
+drivers/base/node: handle error properly in register_one_node()
+
+The patch adds error handling after register_node() to prevent continuing
+with CPU registration when node registration fails. However, it introduces
+a resource management issue.
+
+Link: https://lkml.kernel.org/r/20250822084845.19219-1-donettom@linux.ibm.com
+
+> diff --git a/drivers/base/node.c b/drivers/base/node.c
+> index 3399594136b2a..45d512939c408 100644
+> --- a/drivers/base/node.c
+> +++ b/drivers/base/node.c
+> @@ -885,6 +885,11 @@ int register_one_node(int nid)
+>  	node_devices[nid] = node;
+>  
+>  	error = register_node(node_devices[nid], nid);
+> +	if (error) {
+> +		node_devices[nid] = NULL;
+> +		kfree(node);
+> +		return error;
+> +	}
+
+Can this cause a double-free? Looking at register_node(), when 
+device_register() fails, it calls put_device(&node->dev). The put_device() 
+call triggers node_device_release() which does kfree(to_node(dev)), freeing
+the entire node structure. So when register_node() returns an error, the 
+node memory is already freed, but this code calls kfree(node) again on the
+same memory.
+
+The call chain is: register_node()->device_register() fails->
+put_device()->node_device_release()->kfree(to_node(dev)).
+
+commit e699dfe81775b45c81a90eefaa26a81c0c4c2edd
+Author: Suren Baghdasaryan <surenb@google.com>
+
+fs/proc/task_mmu: execute PROCMAP_QUERY ioctl under per-vma locks
+
+This patch converts the PROCMAP_QUERY ioctl implementation to use per-VMA
+locks instead of mmap_lock for better performance. It includes a fallback
+mechanism that uses mmap_lock when per-VMA locking fails due to contention.
+
+Link: https://lkml.kernel.org/r/20250808152850.2580887-4-surenb@google.com
+
+> diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+> index c0968d293b61a..e64cf40ce9c48 100644
+> --- a/fs/proc/task_mmu.c
+> +++ b/fs/proc/task_mmu.c
+
+[ ... ]
+
+> @@ -522,28 +527,90 @@ static int pid_maps_open(struct inode *inode, struct file *file)
+>  		PROCMAP_QUERY_VMA_FLAGS				\
+>  )
+>  
+> -static int query_vma_setup(struct mm_struct *mm)
+> +#ifdef CONFIG_PER_VMA_LOCK
+> +
+> +static int query_vma_setup(struct proc_maps_locking_ctx *lock_ctx)
+>  {
+> -	return mmap_read_lock_killable(mm);
+> +	reset_lock_ctx(lock_ctx);
+> +
+> +	return 0;
+>  }
+
+The original implementation used mmap_read_lock_killable() which allows the
+process to be interrupted by signals while waiting for the lock. In the
+new CONFIG_PER_VMA_LOCK version, query_vma_setup() no longer acquires any
+locks immediately.
+
+> +static struct vm_area_struct *query_vma_find_by_addr(struct proc_maps_locking_ctx *lock_ctx,
+> +						     unsigned long addr)
+> +{
+> +	struct mm_struct *mm = lock_ctx->mm;
+> +	struct vm_area_struct *vma;
+> +	struct vma_iterator vmi;
+> +
+> +	if (lock_ctx->mmap_locked)
+> +		return find_vma(mm, addr);
+> +
+> +	/* Unlock previously locked VMA and find the next one under RCU */
+> +	unlock_ctx_vma(lock_ctx);
+> +	rcu_read_lock();
+> +	vma_iter_init(&vmi, mm, addr);
+> +	vma = lock_next_vma(mm, &vmi, addr);
+> +	rcu_read_unlock();
+> +
+> +	if (!vma)
+> +		return NULL;
+> +
+> +	if (!IS_ERR(vma)) {
+> +		lock_ctx->locked_vma = vma;
+> +		return vma;
+> +	}
+> +
+> +	if (PTR_ERR(vma) == -EAGAIN) {
+> +		/* Fallback to mmap_lock on vma->vm_refcnt overflow */
+> +		mmap_read_lock(mm);
+> +		vma = find_vma(mm, addr);
+> +		lock_ctx->mmap_locked = true;
+> +	}
+> +
+> +	return vma;
+> +}
+
+When falling back to mmap_lock due to contention or refcount overflow, the
+code calls mmap_read_lock() instead of mmap_read_lock_killable(). Can this
+make processes unkillable when they hit the fallback path? The original
+behavior allowed signal interruption during lock acquisition, but the
+fallback path removes this capability.
+
+> +#else /* CONFIG_PER_VMA_LOCK */
+> +
+> +static int query_vma_setup(struct proc_maps_locking_ctx *lock_ctx)
+> +{
+> +	return mmap_read_lock_killable(lock_ctx->mm);
+> +}
+
+[ ... ]
+
+commit fed2efb3603ea53ba7af8e7110ccfe0fb2225080
+Author: liuqiqi <liuqiqi@kylinos.cn>
+
+mm: fix duplicate accounting of free pages in should_reclaim_retry()
+
+This patch fixes double-counting of free pages in memory reclaim logic
+by removing a fallback case in zone_reclaimable_pages() and adjusting
+the condition in allow_direct_reclaim().
+
+Link: https://lkml.kernel.org/r/20250812070210.1624218-1-liuqiqi@kylinos.cn
+
+> diff --git a/mm/vmscan.c b/mm/vmscan.c
+> index 0f489976fa2be..ca9e1cd3cd680 100644
+> --- a/mm/vmscan.c
+> +++ b/mm/vmscan.c
+> @@ -398,14 +398,7 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
+>  	if (can_reclaim_anon_pages(NULL, zone_to_nid(zone), NULL))
+>  		nr += zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_ANON) +
+>  			zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_ANON);
+> -	/*
+> -	 * If there are no reclaimable file-backed or anonymous pages,
+> -	 * ensure zones with sufficient free pages are not skipped.
+> -	 * This prevents zones like DMA32 from being ignored in reclaim
+> -	 * scenarios where they can still help alleviate memory pressure.
+> -	 */
+> -	if (nr == 0)
+> -		nr = zone_page_state_snapshot(zone, NR_FREE_PAGES);
+> +
+
+The removal of this fallback correctly fixes the double-counting issue
+described in should_reclaim_retry().
+
+>  	return nr;
+>  }
+>  
+> @@ -6495,7 +6488,7 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
+>  		return true;
+>  
+>  	for_each_managed_zone_pgdat(zone, pgdat, i, ZONE_NORMAL) {
+> -		if (!zone_reclaimable_pages(zone))
+> +		if (!zone_reclaimable_pages(zone) && zone_page_state_snapshot(zone, NR_FREE_PAGES))
+>  			continue;
+
+Does this condition have the wrong logic? The new condition skips zones
+that have no reclaimable pages but DO have free pages. This appears
+backwards - shouldn't zones with free pages contribute to the memory
+pressure calculation? The comment removed from zone_reclaimable_pages()
+mentioned that zones with free pages should not be skipped. Should this
+condition be "!zone_reclaimable_pages(zone) && 
+!zone_page_state_snapshot(zone, NR_FREE_PAGES)" instead?
+
+>  
+>  		pfmemalloc_reserve += min_wmark_pages(zone);
+
+commit b91c113ac0ff9ef02b056e00563965102ccd8c99
+Author: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+
+mm: add ability to take further action in vm_area_desc
+
+This patch adds a new mmap_action system to vm_area_desc that allows drivers
+and filesystems to specify deferred actions like PFN remapping or mixed map
+insertion to be performed after VMA setup is complete.
+
+Link: https://lkml.kernel.org/r/d85cc08dd7c5f0a4d5a3c5a5a1b75556461392a1.1757534913.git.lorenzo.stoakes@oracle.com
+
+> diff --git a/include/linux/mm.h b/include/linux/mm.h
+> index cca149bb8ef12..2ceead3ffcf08 100644
+> --- a/include/linux/mm.h
+> +++ b/include/linux/mm.h
+
+[ ... ]
+
+> diff --git a/mm/util.c b/mm/util.c
+> index 6c1d64ed02211..eaf6de2c3faeb 100644
+> --- a/mm/util.c
+> +++ b/mm/util.c
+
+[ ... ]
+
+> @@ -1279,6 +1282,149 @@ void snapshot_page(struct page_snapshot *ps, const struct page *page)
+>  	}
+>  }
+>  
+> +/**
+> + * mmap_action_complete - Execute VMA descriptor action.
+> + * @action: The action to perform.
+> + * @vma: The VMA to perform the action upon.
+> + *
+> + * Similar to mmap_action_prepare(), other than internal mm usage this is
+> + * intended for mmap_prepare users who implement a custom hook - with this
+> + * function being called from the custom hook itself.
+> + *
+> + * Return: 0 on success, or error, at which point the VMA will be unmapped.
+> + */
+> +int mmap_action_complete(struct mmap_action *action,
+> +			     struct vm_area_struct *vma)
+> +{
+> +	int err = 0;
+> +
+> +	switch (action->type) {
+> +	case MMAP_NOTHING:
+> +		break;
+> +	case MMAP_REMAP_PFN:
+> +		VM_WARN_ON_ONCE((vma->vm_flags & VM_REMAP_FLAGS) !=
+> +				VM_REMAP_FLAGS);
+> +
+> +		err = remap_pfn_range_complete(vma, action->remap.addr,
+> +				action->remap.pfn, action->remap.size,
+> +				action->remap.pgprot);
+> +
+> +		break;
+> +	case MMAP_INSERT_MIXED:
+> +	{
+> +		unsigned long pgnum = 0;
+> +		unsigned long pfn = action->mixedmap.pfn;
+> +		unsigned long addr = action->mixedmap.addr;
+> +		unsigned long vaddr = vma->vm_start;
+> +
+> +		VM_WARN_ON_ONCE(!(vma->vm_flags & VM_MIXEDMAP));
+> +
+> +		for (; pgnum < action->mixedmap.num_pages;
+> +		     pgnum++, pfn++, addr += PAGE_SIZE, vaddr += PAGE_SIZE) {
+> +			vm_fault_t vmf;
+> +
+> +			vmf = vmf_insert_mixed(vma, vaddr, addr);
+> +			if (vmf & VM_FAULT_ERROR) {
+> +				err = vm_fault_to_errno(vmf, 0);
+> +				break;
+> +			}
+> +		}
+
+Should vmf_insert_mixed() be called with pfn instead of addr for the third
+parameter? The addr variable is a virtual address that gets incremented by
+PAGE_SIZE each iteration, but vmf_insert_mixed() expects a PFN. This would
+cause the function to insert wrong physical pages into the VMA.
+
+> +		break;
+> +	}
+> +	case MMAP_INSERT_MIXED_PAGES:
+> +	{
+> +		struct page **pages = action->mixedmap_pages.pages;
+> +		unsigned long nr_pages = action->mixedmap_pages.num_pages;
+> +
+> +		VM_WARN_ON_ONCE(!(vma->vm_flags & VM_MIXEDMAP));
+> +
+> +		err = vm_insert_pages(vma, action->mixedmap_pages.addr,
+> +				pages, &nr_pages);
+> +		if (action->mixedmap_pages.kfree_pages)
+> +			kfree(pages);
+> +		break;
+> +	}
+> +	case MMAP_CUSTOM_ACTION:
+> +		err = action->custom.action_hook(vma);
+> +		break;
+> +	}
+> +
+> +	/*
+> +	 * If an error occurs, unmap the VMA altogether and return an error. We
+> +	 * only clear the newly allocated VMA, since this function is only
+> +	 * invoked if we do NOT merge, so we only clean up the VMA we created.
+> +	 */
+> +	if (err) {
+> +		const size_t len = vma_pages(vma) << PAGE_SHIFT;
+> +
+> +		do_munmap(current->mm, vma->vm_start, len, NULL);
+> +
+> +		if (action->error_hook) {
+> +			/* We may want to filter the error. */
+> +			err = action->error_hook(err);
+> +
+> +			/* The caller should not clear the error. */
+> +			VM_WARN_ON_ONCE(!err);
+> +		}
+> +		return err;
+> +	}
+
+When mmap_action_complete() fails and calls do_munmap(), how does the caller
+in __mmap_region() know that the VMA was already unmapped? The caller will
+return the error to user space, but the VMA has been removed by do_munmap()
+which might confuse error handling or cause the user to think the mapping
+still exists when it doesn't.
+
+> +
+> +	if (action->success_hook)
+> +		err = action->success_hook(vma);
+> +
+> +	return 0;
+> +}
+
+[ ... ]
+
+commit 2d812311c2b28cc9096e29862a957aeb32bfdb76
+Author: Tao Chen <chen.dylane@linux.dev>
+
+bpftool: Add bpf_token show
+
+Add `bpftool token show` command to get token info from bpffs in 
+/proc/mounts. The patch adds a new token subcommand that parses mount 
+options and displays BPF token delegation information.
+
+Link: https://lore.kernel.org/r/20250723144442.1427943-1-chen.dylane@linux.dev
+
+> diff --git a/tools/bpf/bpftool/main.c b/tools/bpf/bpftool/main.c
+> index 2b7f2bd3a7dbc..0f1183b2ed0a0 100644
+> --- a/tools/bpf/bpftool/main.c
+> +++ b/tools/bpf/bpftool/main.c
+> @@ -61,7 +61,7 @@ static int do_help(int argc, char **argv)
+>  		"       %s batch file FILE\n"
+>  		"       %s version\n"
+>  		"\n"
+> -		"       OBJECT := { prog | map | link | cgroup | perf | net | feature | btf | gen | struct_ops | iter }\n"
+> +		"       OBJECT := { prog | map | link | cgroup | perf | net | feature | btf | gen | struct_ops | iter | token }\n"
+>  		"       " HELP_SPEC_OPTIONS " |\n"
+>  		"                    {-V|--version} }\n"
+>  		"",
+> @@ -87,6 +87,7 @@ static const struct cmd commands[] = {
+>  	{ "gen",	do_gen },
+>  	{ "struct_ops",	do_struct_ops },
+>  	{ "iter",	do_iter },
+> +	{ "token",	do_token },
+>  	{ "version",	do_version },
+>  	{ 0 }
+>  };
+
+> diff --git a/tools/bpf/bpftool/main.h b/tools/bpf/bpftool/main.h
+> index 6db704fda5c00..a2bb0714b3d6c 100644
+> --- a/tools/bpf/bpftool/main.h
+> +++ b/tools/bpf/bpftool/main.h
+> @@ -166,6 +166,7 @@ int do_tracelog(int argc, char **arg) __weak;
+>  int do_feature(int argc, char **argv) __weak;
+>  int do_struct_ops(int argc, char **argv) __weak;
+>  int do_iter(int argc, char **argv) __weak;
+> +int do_token(int argc, char **argv) __weak;
+>  
+>  int parse_u32_arg(int *argc, char ***argv, __u32 *val, const char *what);
+>  int prog_parse_fd(int *argc, char ***argv);
+
+> diff --git a/tools/bpf/bpftool/token.c b/tools/bpf/bpftool/token.c
+> new file mode 100644
+> index 0000000000000..6312e662a1299
+> --- /dev/null
+> +++ b/tools/bpf/bpftool/token.c
+> @@ -0,0 +1,225 @@
+> +// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+> +/* Copyright (C) 2025 Didi Technology Co., Tao Chen */
+> +
+> +#ifndef _GNU_SOURCE
+> +#define _GNU_SOURCE
+> +#endif
+> +#include <errno.h>
+> +#include <fcntl.h>
+> +#include <stdbool.h>
+> +#include <stdio.h>
+> +#include <stdlib.h>
+> +#include <string.h>
+> +#include <unistd.h>
+> +#include <mntent.h>
+> +#include <sys/types.h>
+> +#include <sys/stat.h>
+> +
+> +#include "json_writer.h"
+> +#include "main.h"
+> +
+> +#define MOUNTS_FILE "/proc/mounts"
+> +
+> +static bool has_delegate_options(const char *mnt_ops)
+> +{
+> +	return strstr(mnt_ops, "delegate_cmds") ||
+> +	       strstr(mnt_ops, "delegate_maps") ||
+> +	       strstr(mnt_ops, "delegate_progs") ||
+> +	       strstr(mnt_ops, "delegate_attachs");
+> +}
+> +
+> +static char *get_delegate_value(const char *opts, const char *key)
+> +{
+> +	char *token, *rest, *ret = NULL;
+> +	char *opts_copy = strdup(opts);
+> +
+> +	if (!opts_copy)
+> +		return NULL;
+> +
+> +	for (token = strtok_r(opts_copy, ",", &rest); token;
+> +			token = strtok_r(NULL, ",", &rest)) {
+> +		if (strncmp(token, key, strlen(key)) == 0 &&
+> +		    token[strlen(key)] == '=') {
+> +			ret = token + strlen(key) + 1;
+> +			break;
+> +		}
+> +	}
+> +	free(opts_copy);
+> +
+> +	return ret;
+> +}
+
+Could this function return freed memory? The ret pointer is set to point 
+inside opts_copy, but opts_copy gets freed before returning ret. This 
+would make any subsequent access to the returned pointer access freed 
+memory.
+
+[ ... ]
+
+commit 77620d1267392b1a34bfc437d2adea3006f95865
+Author: Eduard Zingerman <eddyz87@gmail.com>
+
+bpf: use realloc in bpf_patch_insn_data
+
+This patch replaces vzalloc/vfree calls with vrealloc in bpf_patch_insn_data
+to reduce memory allocation overhead during BPF instruction patching. The 
+vzalloc/vfree pattern was showing up as hot in performance profiles.
+
+Link: https://lore.kernel.org/r/20250807010205.3210608-3-eddyz87@gmail.com
+
+> diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+> index 69eb2b5c2218b..a61d579966923 100644
+> --- a/kernel/bpf/verifier.c
+> +++ b/kernel/bpf/verifier.c
+> @@ -20699,12 +20699,11 @@ static void convert_pseudo_ld_imm64(struct bpf_verifier_env *env)
+>   * [0, off) and [off, end) to new locations, so the patched range stays zero
+>   */
+>  static void adjust_insn_aux_data(struct bpf_verifier_env *env,
+> -				 struct bpf_insn_aux_data *new_data,
+>  				 struct bpf_prog *new_prog, u32 off, u32 cnt)
+>  {
+> -	struct bpf_insn_aux_data *old_data = env->insn_aux_data;
+> +	struct bpf_insn_aux_data *data = env->insn_aux_data;
+>  	struct bpf_insn *insn = new_prog->insnsi;
+> -	u32 old_seen = old_data[off].seen;
+> +	u32 old_seen = data[off].seen;
+>  	u32 prog_len;
+>  	int i;
+> 
+> @@ -20712,22 +20711,20 @@ static void adjust_insn_aux_data(struct bpf_verifier_env *env,
+>  	 * (cnt == 1) is taken or not. There is no guarantee INSN at OFF is the
+>  	 * original insn at old prog.
+>  	 */
+> -	old_data[off].zext_dst = insn_has_def32(insn + off + cnt - 1);
+> +	data[off].zext_dst = insn_has_def32(insn + off + cnt - 1);
+> 
+>  	if (cnt == 1)
+>  		return;
+>  	prog_len = new_prog->len;
+> 
+> -	memcpy(new_data, old_data, sizeof(struct bpf_insn_aux_data) * off);
+> -	memcpy(new_data + off + cnt - 1, old_data + off,
+> -	       sizeof(struct bpf_insn_aux_data) * (prog_len - off - cnt + 1));
+> +	memmove(data + off + cnt - 1, data + off,
+> +		sizeof(struct bpf_insn_aux_data) * (prog_len - off - cnt + 1));
+> +	memset(data + off, 0, sizeof(struct bpf_insn_aux_data) * (cnt - 1));
+>  	for (i = off; i < off + cnt - 1; i++) {
+>  		/* Expand insni[off]'s seen count to the patched range. */
+> -		new_data[i].seen = old_seen;
+> -		new_data[i].zext_dst = insn_has_def32(insn + i);
+> +		data[i].seen = old_seen;
+> +		data[i].zext_dst = insn_has_def32(insn + i);
+>  	}
+> -	env->insn_aux_data = new_data;
+> -	vfree(old_data);
+>  }
+> 
+>  static void adjust_subprog_starts(struct bpf_verifier_env *env, u32 off, u32 len)
+> @@ -20765,10 +20762,14 @@ static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 of
+>  	struct bpf_insn_aux_data *new_data = NULL;
+> 
+>  	if (len > 1) {
+> -		new_data = vzalloc(array_size(env->prog->len + len - 1,
+> -					      sizeof(struct bpf_insn_aux_data)));
+> +		new_data = vrealloc(env->insn_aux_data,
+> +				    array_size(env->prog->len + len - 1,
+> +					       sizeof(struct bpf_insn_aux_data)),
+> +				    GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+>  		if (!new_data)
+>  			return NULL;
+> +
+> +		env->insn_aux_data = new_data;
+>  	}
+> 
+>  	new_prog = bpf_patch_insn_single(env->prog, off, patch, len);
+> @@ -20780,7 +20781,7 @@ static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 of
+>  		vfree(new_data);
+>  		return NULL;
+>  	}
+
+Could this create a use-after-free in bpf_patch_insn_data()? The code now
+sets env->insn_aux_data to new_data immediately after vrealloc succeeds,
+but if bpf_patch_insn_single() fails and we reach this error path, we call
+vfree(new_data) while env->insn_aux_data still points to new_data. This
+would leave env->insn_aux_data pointing to freed memory for any subsequent
+access.
+
+> -	adjust_insn_aux_data(env, new_data, new_prog, off, len);
+> +	adjust_insn_aux_data(env, new_prog, off, len);
+>  	adjust_subprog_starts(env, off, len);
+>  	adjust_poke_descs(new_prog, off, len);
+>  	return new_prog;
+
+commit c265ae75f900cea4e415230a77b5d152377627dd
+Author: Pavel Begunkov <asml.silence@gmail.com>
+
+io_uring: introduce io_uring querying
+
+This patch introduces a new query interface for io_uring allowing users to
+query supported opcodes and flags. The interface uses a linked list of query
+headers that can chain multiple queries together.
+
+> diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+> index 04ebff33d0e62..1ce17c535944c 100644
+> --- a/include/uapi/linux/io_uring.h
+> +++ b/include/uapi/linux/io_uring.h
+> @@ -686,6 +686,9 @@ enum io_uring_register_op {
+>  
+>  	IORING_REGISTER_MEM_REGION		= 34,
+>  
+> +	/* query various aspects of io_turing, see linux/io_uring/query.h */
+> +	IORING_REGISTER_QUERY			= 35,
+> +
+>  	/* this goes last */
+>  	IORING_REGISTER_LAST,
+>  
+
+[ ... ]
+
+> diff --git a/io_uring/query.c b/io_uring/query.c
+> new file mode 100644
+> index 0000000000000..9eed0f371956a
+> --- /dev/null
+> +++ b/io_uring/query.c
+> @@ -0,0 +1,93 @@
+> +// SPDX-License-Identifier: GPL-2.0
+> +
+> +#include "linux/io_uring/query.h"
+> +
+> +#include "query.h"
+> +#include "io_uring.h"
+> +
+> +#define IO_MAX_QUERY_SIZE		(sizeof(struct io_uring_query_opcode))
+> +
+> +static ssize_t io_query_ops(void *data)
+> +{
+> +	struct io_uring_query_opcode *e = data;
+> +
+> +	BUILD_BUG_ON(sizeof(*e) > IO_MAX_QUERY_SIZE);
+> +
+> +	e->nr_request_opcodes = IORING_OP_LAST;
+> +	e->nr_register_opcodes = IORING_REGISTER_LAST;
+> +	e->feature_flags = IORING_FEAT_FLAGS;
+> +	e->ring_setup_flags = IORING_SETUP_FLAGS;
+> +	e->enter_flags = IORING_ENTER_FLAGS;
+> +	e->sqe_flags = SQE_VALID_FLAGS;
+> +	return sizeof(*e);
+> +}
+> +
+> +static int io_handle_query_entry(struct io_ring_ctx *ctx,
+> +				 void *data, void __user *uhdr,
+> +				 u64 *next_entry)
+> +{
+> +	struct io_uring_query_hdr hdr;
+> +	size_t usize, res_size = 0;
+> +	ssize_t ret = -EINVAL;
+> +	void __user *udata;
+> +
+> +	if (copy_from_user(&hdr, uhdr, sizeof(hdr)))
+> +		return -EFAULT;
+> +	usize = hdr.size;
+> +	hdr.size = min(hdr.size, IO_MAX_QUERY_SIZE);
+
+Is it correct to preserve the original usize here while validating hdr.size
+separately? The size validation logic appears to work on hdr.size but later
+operations use usize for copy_struct_to_user() at line 65.
+
+> +	udata = u64_to_user_ptr(hdr.query_data);
+> +
+> +	if (hdr.query_op >= __IO_URING_QUERY_MAX) {
+> +		ret = -EOPNOTSUPP;
+> +		goto out;
+> +	}
+> +	if (!mem_is_zero(hdr.__resv, sizeof(hdr.__resv)) || hdr.result || !hdr.size)
+> +		goto out;
+> +	if (copy_from_user(data, udata, hdr.size))
+> +		return -EFAULT;
+> +
+> +	switch (hdr.query_op) {
+> +	case IO_URING_QUERY_OPCODES:
+> +		ret = io_query_ops(data);
+> +		break;
+> +	}
+> +
+> +	if (ret >= 0) {
+> +		if (WARN_ON_ONCE(ret > IO_MAX_QUERY_SIZE))
+> +			return -EFAULT;
+> +		res_size = ret;
+> +		ret = 0;
+> +	}
+> +out:
+> +	hdr.result = ret;
+> +	hdr.size = min_t(size_t, usize, res_size);
+> +
+> +	if (copy_struct_to_user(udata, usize, data, hdr.size, NULL))
+> +		return -EFAULT;
+> +	if (copy_to_user(uhdr, &hdr, sizeof(hdr)))
+> +		return -EFAULT;
+> +	*next_entry = hdr.next_entry;
+> +	return 0;
+> +}
+> +
+> +int io_query(struct io_ring_ctx *ctx, void __user *arg, unsigned nr_args)
+> +{
+> +	char entry_buffer[IO_MAX_QUERY_SIZE];
+> +	void __user *uhdr = arg;
+> +	int ret;
+> +
+> +	memset(entry_buffer, 0, sizeof(entry_buffer));
+> +
+> +	if (nr_args)
+> +		return -EINVAL;
+> +
+> +	while (uhdr) {
+
+Does this while loop have bounds checking? The loop follows the user-
+controlled next_entry field via hdr.next_entry without any limit or cycle
+detection. Can userspace create a circular linked list that would cause
+an infinite loop in the kernel?
+
+> +		u64 next_hdr;
+> +
+> +		ret = io_handle_query_entry(ctx, entry_buffer, uhdr, &next_hdr);
+> +		if (ret)
+> +			return ret;
+> +		uhdr = u64_to_user_ptr(next_hdr);
+> +	}
+> +	return 0;
+> +}
+
+[ ... ]
+
