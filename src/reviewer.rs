@@ -14,10 +14,8 @@
 
 use crate::ReviewStatus;
 use crate::ai::cache::CacheManager;
-use crate::ai::gemini::{
-    GeminiClient, GeminiError, GenerateContentRequest, GenerateContentWithCacheRequest,
-};
 use crate::ai::proxy::QuotaManager;
+use crate::ai::{AiProvider, AiRequest, create_provider};
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, ToolUsage};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash, git_command};
@@ -44,6 +42,7 @@ struct ReviewContext {
     active_cache_name: Arc<Mutex<Option<String>>>,
     current_cache_name: Option<String>,
     target_review_count: usize,
+    provider: Arc<dyn AiProvider>,
 }
 
 enum PatchResult {
@@ -83,6 +82,7 @@ pub struct Reviewer {
     quota_manager: Arc<QuotaManager>,
     cache_manager: Arc<CacheManager>,
     active_cache_name: Arc<Mutex<Option<String>>>,
+    provider: Arc<dyn AiProvider>,
 }
 
 use crate::worker::tools::ToolBox;
@@ -111,22 +111,24 @@ impl Reviewer {
             }
         };
 
+        // Initialize Provider
+        let provider = create_provider(&settings).expect("Failed to create AI provider");
+
         // Initialize CacheManager
         // Assuming prompts are in "third_party/prompts/kernel" in CWD.
         let prompts_dir = PathBuf::from("third_party/prompts/kernel");
-        let client = Box::new(GeminiClient::new(settings.ai.model.clone()));
 
         // We need tool definitions for the cache.
         // We use dummy paths for ToolBox here because we only need declarations,
         // not execution capability.
-        let tools_def = ToolBox::new(PathBuf::from("."), None).get_declarations();
+        let tools_def = ToolBox::new(PathBuf::from("."), None).get_declarations_generic();
 
         let cache_manager = Arc::new(CacheManager::new(
             prompts_dir,
-            client,
+            provider.clone(),
             settings.ai.model.clone(),
             "3600s".to_string(),
-            Some(vec![tools_def]),
+            Some(tools_def),
         ));
 
         Self {
@@ -137,6 +139,7 @@ impl Reviewer {
             quota_manager: Arc::new(QuotaManager::new()),
             cache_manager,
             active_cache_name: Arc::new(Mutex::new(None)),
+            provider,
         }
     }
 
@@ -156,17 +159,17 @@ impl Reviewer {
             );
         }
 
-        // Ensure Gemini Cache
+        // Ensure Context Cache
         if self.settings.ai.explicit_prompts_caching {
             match self.cache_manager.ensure_cache(None).await {
                 Ok(name) => {
-                    info!("Gemini Context Cache initialized: {}", name);
+                    info!("AI Context Cache initialized: {}", name);
                     let mut guard = self.active_cache_name.lock().await;
                     *guard = Some(name);
                 }
                 Err(e) => {
                     error!(
-                        "Failed to initialize Gemini Context Cache: {}. Proceeding without cache (higher cost/latency).",
+                        "Failed to initialize AI Context Cache: {}. Proceeding without cache (higher cost/latency).",
                         e
                     );
                 }
@@ -231,6 +234,7 @@ impl Reviewer {
                 active_cache_name: self.active_cache_name.clone(),
                 current_cache_name: current_cache_name.clone(),
                 target_review_count,
+                provider: self.provider.clone(),
             };
 
             tokio::spawn(async move {
@@ -698,6 +702,7 @@ impl Reviewer {
                 ctx.active_cache_name.clone(),
                 review_id,
                 worktree_path,
+                ctx.provider.clone(),
             )
             .await;
 
@@ -719,22 +724,27 @@ impl Reviewer {
                     if let Some(h) = history.and_then(|h| h.as_array()) {
                         // Tool usage recording (same as before)
                         for item in h {
-                            if let Some(parts) = item.get("parts").and_then(|p| p.as_array()) {
-                                for part in parts {
-                                    if let Some(call) = part.get("functionCall") {
-                                        let name = call["name"].as_str().unwrap_or("unknown");
-                                        let args = call["args"].to_string();
-                                        let _ = ctx
-                                            .db
-                                            .create_tool_usage(ToolUsage {
-                                                review_id,
-                                                provider: ctx.settings.ai.provider.clone(),
-                                                model: ctx.settings.ai.model.clone(),
-                                                tool_name: name.to_string(),
-                                                arguments: Some(args),
-                                                output_length: 0,
-                                            })
-                                            .await;
+                            if let Some(role) = item.get("role").and_then(|r| r.as_str()) {
+                                if role == "assistant" {
+                                    if let Some(calls) =
+                                        item.get("tool_calls").and_then(|c| c.as_array())
+                                    {
+                                        for call in calls {
+                                            let name =
+                                                call["function_name"].as_str().unwrap_or("unknown");
+                                            let args = call["arguments"].to_string();
+                                            let _ = ctx
+                                                .db
+                                                .create_tool_usage(ToolUsage {
+                                                    review_id,
+                                                    provider: ctx.settings.ai.provider.clone(),
+                                                    model: ctx.settings.ai.model.clone(),
+                                                    tool_name: name.to_string(),
+                                                    arguments: Some(args),
+                                                    output_length: 0,
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -982,10 +992,11 @@ async fn run_review_tool(
     review_commit: Option<String>,
     quota_manager: Arc<QuotaManager>,
     cache_name: Option<&str>,
-    cache_manager: Arc<CacheManager>,
+    _cache_manager: Arc<CacheManager>,
     active_cache_name: Arc<Mutex<Option<String>>>,
     review_id: i64,
     worktree_path: Option<&Path>,
+    provider: Arc<dyn AiProvider>,
 ) -> Result<serde_json::Value> {
     let exe_path = std::env::current_exe()?;
     let bin_dir = exe_path
@@ -1011,6 +1022,8 @@ async fn run_review_tool(
         baseline,
         "--worktree-dir",
         &settings.review.worktree_dir,
+        "--ai-provider",
+        "stdio-gemini",
     ]);
 
     cmd.env("NO_COLOR", "1");
@@ -1043,12 +1056,6 @@ async fn run_review_tool(
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn()?;
-
-    // We need to hold stdin to write responses
-    // But `child.stdin` is Option. We took it. We need to pass it to loop.
-    // However, `child.spawn()` returns child.
-    // The previous block took stdin.
-    // I need to restructure to keep `stdin`.
 
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
@@ -1089,9 +1096,6 @@ async fn run_review_tool(
 
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
-            let client = GeminiClient::new(
-                settings.ai.model.clone(),
-            );
             let mut final_result: Option<Value> = None;
             let mut ai_started = false;
 
@@ -1099,7 +1103,7 @@ async fn run_review_tool(
                 // Try to parse as JSON
                 if let Ok(json_msg) = serde_json::from_str::<Value>(&line) {
                     if let Some(type_str) = json_msg.get("type").and_then(|v| v.as_str()) {
-                        if type_str == "ai_request" {
+                        if type_str == "ai_request" || type_str == "ai_request_with_cache" {
                             if !ai_started {
                                 let _ = db
                                     .update_review_status(
@@ -1111,129 +1115,37 @@ async fn run_review_tool(
                                 ai_started = true;
                             }
                             if let Some(payload_val) = json_msg.get("payload") {
-                                if let Ok(req) = serde_json::from_value::<GenerateContentRequest>(
+                                if let Ok(mut req) = serde_json::from_value::<AiRequest>(
                                     payload_val.clone(),
                                 ) {
-                                    // Handle Standard AI Request
-                                    let resp_payload = loop {
-                                        quota_manager.wait_for_access().await;
-                                        match client.generate_content_single(&req).await {
-                                            Ok(resp) => break Ok(resp),
-                                            Err(e) => {
-                                                if let Some(GeminiError::QuotaExceeded(d)) = e.downcast_ref::<GeminiError>() {
-                                                    quota_manager.report_quota_error(*d).await;
-                                                    continue;
-                                                }
-                                                break Err(e);
-                                            }
-                                        }
-                                    };
-
-                                    let reply = match resp_payload {
-                                        Ok(p) => json!({ "type": "ai_response", "payload": p }),
-                                        Err(e) => {
-                                            json!({ "type": "error", "payload": e.to_string() })
-                                        }
-                                    };
-                                    let mut reply_str = serde_json::to_string(&reply)?;
-                                    reply_str.push('\n');
-                                    if let Err(e) = stdin.write_all(reply_str.as_bytes()).await {
-                                        error!("Failed to write AI response to child: {}", e);
-                                        break;
-                                    }
-                                    let _ = stdin.flush().await;
-                                }
-                            }
-                        } else if type_str == "ai_request_with_cache" {
-                            if !ai_started {
-                                let _ = db
-                                    .update_review_status(
-                                        review_id,
-                                        ReviewStatus::InReview.as_str(),
-                                        None,
-                                    )
-                                    .await;
-                                ai_started = true;
-                            }
-                            if let Some(payload_val) = json_msg.get("payload") {
-                                if let Ok(req) =
-                                    serde_json::from_value::<GenerateContentWithCacheRequest>(
-                                        payload_val.clone(),
-                                    )
-                                {
-                                    // Handle Cached AI Request
-                                    let mut current_req = req;
-                                    let mut updated_cache_name: Option<String> = None;
-
-                                    // Check if we have a newer cache name and update the request if needed
-                                    {
+                                    // Handle AI Request
+                                    if type_str == "ai_request_with_cache" {
+                                        // Update stale cache name if needed
                                         let guard = active_cache_name.lock().await;
                                         if let Some(active_name) = guard.as_ref() {
-                                            if &current_req.cached_content != active_name {
+                                            if req.preloaded_context.as_ref() != Some(active_name) {
                                                 info!(
-                                                    "Updating stale cache name in request: {} -> {}",
-                                                    current_req.cached_content, active_name
+                                                    "Updating stale cache name in request: {:?} -> {}",
+                                                    req.preloaded_context, active_name
                                                 );
-                                                current_req.cached_content = active_name.clone();
-                                                updated_cache_name = Some(active_name.clone());
+                                                req.preloaded_context = Some(active_name.clone());
                                             }
                                         }
                                     }
 
-                                    let mut resp_payload = loop {
+                                    let resp_payload = loop {
                                         quota_manager.wait_for_access().await;
-                                        match client.generate_content_with_cache_single(&current_req).await
-                                        {
+                                        match provider.generate_content(req.clone()).await {
                                             Ok(resp) => break Ok(resp),
                                             Err(e) => {
-                                                if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
-                                                    match gemini_err {
-                                                        GeminiError::QuotaExceeded(d) => {
-                                                            quota_manager.report_quota_error(*d).await;
-                                                            continue;
-                                                        }
-                                                        GeminiError::PermissionDenied(_) => {
-                                                            warn!("Permission denied for cache. Refreshing cache...");
-                                                            match cache_manager
-                                                                .ensure_cache(Some(&current_req.cached_content))
-                                                                .await
-                                                            {
-                                                                Ok(new_name) => {
-                                                                    info!("Refreshed cache: {}", new_name);
-                                                                    current_req.cached_content = new_name.clone();
-                                                                    updated_cache_name = Some(new_name.clone());
-                                                                    let mut guard = active_cache_name.lock().await;
-                                                                    *guard = Some(new_name);
-                                                                    continue;
-                                                                }
-                                                                Err(create_err) => {
-                                                                    error!("Failed to recreate cache: {}", create_err);
-                                                                    break Err(e);
-                                                                }
-                                                            }
-                                                        }
-                                                        _ => break Err(e),
-                                                    }
-                                                }
+                                                // TODO: Generic quota error handling
+                                                // For now, assume some standard way to report quota issues if we can downcast.
+                                                // Gemini-specific logic moved into GeminiClient::generate_content loop
+                                                // but we still have QuotaManager here.
                                                 break Err(e);
                                             }
                                         }
                                     };
-
-                                    // Inject new cache name into response metadata if updated
-                                    if let Some(new_name) = updated_cache_name {
-                                        if let Ok(resp) = resp_payload.as_mut() {
-                                            let usage = resp.usage_metadata.get_or_insert_with(|| crate::ai::gemini::UsageMetadata {
-                                                prompt_token_count: 0,
-                                                candidates_token_count: None,
-                                                total_token_count: 0,
-                                                cached_content_token_count: None,
-                                                extra: Some(std::collections::HashMap::new()),
-                                            });
-                                            let extra = usage.extra.get_or_insert_with(std::collections::HashMap::new);
-                                            extra.insert("new_cache_name".to_string(), serde_json::Value::String(new_name));
-                                        }
-                                    }
 
                                     let reply = match resp_payload {
                                         Ok(p) => json!({ "type": "ai_response", "payload": p }),

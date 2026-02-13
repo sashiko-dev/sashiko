@@ -19,23 +19,19 @@ pub mod tools;
 #[cfg(test)]
 mod tools_test;
 
-use crate::ai::gemini::{
-    Content, FunctionResponse, GenAiClient, GenerateContentRequest,
-    GenerateContentWithCacheRequest, GenerationConfig, Part, ThinkingConfig,
-};
-use crate::ai::token_budget::TokenBudget;
+use crate::ai::{AiMessage, AiProvider, AiRequest, AiRole};
 use crate::worker::prompts::PromptRegistry;
 use crate::worker::tools::ToolBox;
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 pub struct Worker {
-    client: Box<dyn GenAiClient>,
+    provider: Arc<dyn AiProvider>,
     tools: ToolBox,
     prompts: PromptRegistry,
-    history: Vec<Content>,
-    history_tokens: Vec<usize>,
+    history: Vec<AiMessage>,
     max_input_tokens: usize,
     max_interactions: usize,
     temperature: f32,
@@ -46,9 +42,9 @@ pub struct WorkerResult {
     pub output: Option<Value>,
     pub error: Option<String>,
     pub input_context: String,
-    pub history: Vec<Content>,
-    pub history_before_pruning: Vec<Content>,
-    pub history_after_pruning: Vec<Content>,
+    pub history: Vec<AiMessage>,
+    pub history_before_pruning: Vec<AiMessage>,
+    pub history_after_pruning: Vec<AiMessage>,
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub tokens_cached: u32,
@@ -70,7 +66,7 @@ fn validate_inline_format(content: &str) -> Result<(), String> {
 
 impl Worker {
     pub fn new(
-        client: Box<dyn GenAiClient>,
+        provider: Arc<dyn AiProvider>,
         tools: ToolBox,
         prompts: PromptRegistry,
         max_input_tokens: usize,
@@ -79,11 +75,10 @@ impl Worker {
         cache_name: Option<String>,
     ) -> Self {
         Self {
-            client,
+            provider,
             tools,
             prompts,
             history: Vec::new(),
-            history_tokens: Vec::new(),
             max_input_tokens,
             max_interactions,
             temperature,
@@ -91,47 +86,30 @@ impl Worker {
         }
     }
 
-    fn estimate_history_tokens(&self, system_instruction: &Option<Content>) -> usize {
-        let mut count = 0;
-
-        // Count system instruction
-        if let Some(content) = system_instruction {
-            count += self.estimate_content_tokens(content);
+    fn estimate_history_tokens(&self, system_message: &Option<AiMessage>) -> usize {
+        let mut messages = Vec::new();
+        if let Some(msg) = system_message {
+            messages.push(msg.clone());
         }
+        messages.extend(self.history.clone());
 
-        // Count history
-        count += self.history_tokens.iter().sum::<usize>();
+        let request = AiRequest {
+            messages,
+            tools: Some(self.tools.get_declarations_generic()),
+            temperature: Some(self.temperature),
+            preloaded_context: self.cache_name.clone(),
+        };
 
-        count
-    }
-
-    fn estimate_content_tokens(&self, content: &Content) -> usize {
-        let mut count = 0;
-        for part in &content.parts {
-            match part {
-                Part::Text { text, .. } => {
-                    count += TokenBudget::estimate_tokens(text);
-                }
-                Part::FunctionCall { function_call, .. } => {
-                    count += TokenBudget::estimate_tokens(&function_call.name);
-                    count += TokenBudget::estimate_tokens(&function_call.args.to_string());
-                }
-                Part::FunctionResponse { function_response } => {
-                    count += TokenBudget::estimate_tokens(&function_response.name);
-                    count += TokenBudget::estimate_tokens(&function_response.response.to_string());
-                }
-            }
-        }
-        count
+        self.provider.estimate_tokens(&request)
     }
 
     fn prune_history(
         &mut self,
-        system_instruction: &Option<Content>,
-    ) -> (Vec<Content>, Vec<Content>) {
+        system_message: &Option<AiMessage>,
+    ) -> (Vec<AiMessage>, Vec<AiMessage>) {
         let before_pruning = self.history.clone();
         let limit = self.max_input_tokens;
-        let mut current_tokens = self.estimate_history_tokens(system_instruction);
+        let mut current_tokens = self.estimate_history_tokens(system_message);
 
         debug!(
             "Pruning check: {} tokens vs limit {}",
@@ -143,19 +121,13 @@ impl Worker {
         }
 
         // Keep index 0 (Task Prompt). Prune from index 1.
-        // We also want to avoid pruning the very last message if possible, but budget is strict.
-        // Prune oldest messages first (after index 0).
         while current_tokens > limit && self.history.len() > 1 {
             // Remove the oldest message after the prompt.
             let removed_idx = 1;
             let _removed = self.history.remove(removed_idx);
-            let removed_tokens = self.history_tokens.remove(removed_idx);
 
-            current_tokens = current_tokens.saturating_sub(removed_tokens);
-            debug!(
-                "Pruned message with {} tokens. New total: {}",
-                removed_tokens, current_tokens
-            );
+            current_tokens = self.estimate_history_tokens(system_message);
+            debug!("Pruned message. New total: {}", current_tokens);
         }
 
         (before_pruning, self.history.clone())
@@ -208,26 +180,20 @@ impl Worker {
             system_prompt, initial_user_message
         );
 
-        let system_content = Content {
-            role: "user".to_string(),
-            parts: vec![Part::Text {
-                text: system_prompt,
-                thought_signature: None,
-                thought: false,
-            }],
+        let system_message = AiMessage {
+            role: AiRole::System,
+            content: Some(system_prompt),
+            tool_calls: None,
+            tool_call_id: None,
         };
 
-        let initial_content = Content {
-            role: "user".to_string(),
-            parts: vec![Part::Text {
-                text: initial_user_message,
-                thought_signature: None,
-                thought: false,
-            }],
+        let initial_message = AiMessage {
+            role: AiRole::User,
+            content: Some(initial_user_message),
+            tool_calls: None,
+            tool_call_id: None,
         };
-        self.history_tokens
-            .push(self.estimate_content_tokens(&initial_content));
-        self.history.push(initial_content);
+        self.history.push(initial_message);
 
         let mut turns = 0;
         let mut total_tokens_in = 0;
@@ -258,7 +224,7 @@ impl Worker {
                 });
             }
 
-            let response_schema = json!({
+            let _response_schema = json!({
                 "type": "object",
                 "properties": {
                     "summary": { "type": "string", "description": "High-level summary of the original change being reviewed." },
@@ -297,204 +263,132 @@ impl Worker {
             });
 
             // Enforce token budget by pruning
-            let (before, after) = self.prune_history(&Some(system_content.clone()));
+            let (before, after) = self.prune_history(&Some(system_message.clone()));
             final_history_before_pruning = before;
             final_history_after_pruning = after;
 
-            let tools_config = Some(vec![self.tools.get_declarations()]);
-            let generation_config = Some(GenerationConfig {
-                response_mime_type: Some("application/json".to_string()),
-                response_schema: Some(response_schema),
+            let request = AiRequest {
+                messages: {
+                    let mut msgs = Vec::new();
+                    msgs.push(system_message.clone());
+                    msgs.extend(self.history.clone());
+                    msgs
+                },
+                tools: Some(self.tools.get_declarations_generic()),
                 temperature: Some(self.temperature),
-                thinking_config: Some(ThinkingConfig {
-                    include_thoughts: true,
-                }),
-            });
+                preloaded_context: self.cache_name.clone(),
+            };
 
-            let resp = if let Some(cache_name) = &self.cache_name {
-                let req = GenerateContentWithCacheRequest {
-                    cached_content: cache_name.clone(),
-                    contents: self.history.clone(),
-                    tools: None, // Tools are baked into the cache
-                    generation_config,
-                };
-                match self.client.generate_content_with_cache(req).await {
-                    Ok(resp) => {
-                        // Check for cache update from parent
-                        if let Some(usage) = &resp.usage_metadata {
-                            if let Some(extra) = &usage.extra {
-                                if let Some(new_name) =
-                                    extra.get("new_cache_name").and_then(|v| v.as_str())
-                                {
-                                    self.cache_name = Some(new_name.to_string());
-                                }
-                            }
-                        }
-                        resp
+            let resp = match self.provider.generate_content(request).await {
+                Ok(resp) => {
+                    // Check for cache update from provider (currently via metadata extra)
+                    if resp.usage.is_some() {
+                        // TODO: Add generic way to handle provider-specific session updates
                     }
-                    Err(e) => {
-                        return Ok(WorkerResult {
-                            output: None,
-                            error: Some(format!("Gemini API Error (Cached): {}", e)),
-                            input_context,
-                            history: self.history.clone(),
-                            history_before_pruning: final_history_before_pruning,
-                            history_after_pruning: final_history_after_pruning,
-                            tokens_in: total_tokens_in,
-                            tokens_out: total_tokens_out,
-                            tokens_cached: total_tokens_cached,
-                        });
-                    }
+                    resp
                 }
-            } else {
-                let req = GenerateContentRequest {
-                    contents: self.history.clone(),
-                    tools: tools_config,
-                    system_instruction: Some(system_content.clone()),
-                    generation_config,
-                };
-
-                match self.client.generate_content(req).await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        return Ok(WorkerResult {
-                            output: None,
-                            error: Some(format!("Gemini API Error: {}", e)),
-                            input_context,
-                            history: self.history.clone(),
-                            history_before_pruning: final_history_before_pruning,
-                            history_after_pruning: final_history_after_pruning,
-                            tokens_in: total_tokens_in,
-                            tokens_out: total_tokens_out,
-                            tokens_cached: total_tokens_cached,
-                        });
-                    }
+                Err(e) => {
+                    return Ok(WorkerResult {
+                        output: None,
+                        error: Some(format!("AI Provider Error: {}", e)),
+                        input_context,
+                        history: self.history.clone(),
+                        history_before_pruning: final_history_before_pruning,
+                        history_after_pruning: final_history_after_pruning,
+                        tokens_in: total_tokens_in,
+                        tokens_out: total_tokens_out,
+                        tokens_cached: total_tokens_cached,
+                    });
                 }
             };
 
-            if let Some(usage) = &resp.usage_metadata {
-                total_tokens_in += usage.prompt_token_count;
-                total_tokens_out += usage.candidates_token_count.unwrap_or(0);
-                total_tokens_cached += usage.cached_content_token_count.unwrap_or(0);
+            if let Some(usage) = &resp.usage {
+                total_tokens_in += usage.prompt_tokens as u32;
+                total_tokens_out += usage.completion_tokens as u32;
+                total_tokens_cached += usage.cached_tokens.unwrap_or(0) as u32;
             }
 
-            let candidate = if let Some(c) = resp.candidates.as_ref().and_then(|c| c.first()) {
-                c
-            } else {
-                return Ok(WorkerResult {
-                    output: None,
-                    error: Some("No candidates returned from Gemini".to_string()),
-                    input_context,
-                    history: self.history.clone(),
-                    history_before_pruning: final_history_before_pruning,
-                    history_after_pruning: final_history_after_pruning,
-                    tokens_in: total_tokens_in,
-                    tokens_out: total_tokens_out,
-                    tokens_cached: total_tokens_cached,
-                });
+            let assistant_message = AiMessage {
+                role: AiRole::Assistant,
+                content: resp.content.clone(),
+                tool_calls: resp.tool_calls.clone(),
+                tool_call_id: None,
             };
+            self.history.push(assistant_message);
 
-            let content = &candidate.content;
-            self.history_tokens
-                .push(self.estimate_content_tokens(content));
-            self.history.push(content.clone());
+            // Check for tool calls
+            if let Some(tool_calls) = resp.tool_calls {
+                let mut tool_responses = Vec::new();
+                for call in tool_calls {
+                    debug!("Tool Call: {} args: {}", call.function_name, call.arguments);
 
-            // Check for function calls
-            let mut function_responses = Vec::new();
-            let mut has_calls = false;
-            let mut final_text = String::new();
+                    // Loop Detection & Prevention
+                    let same_call_count = session_tool_history
+                        .iter()
+                        .filter(|(n, a)| *n == call.function_name && *a == call.arguments)
+                        .count();
 
-            for part in &content.parts {
-                match part {
-                    Part::FunctionCall {
-                        function_call: call,
-                        ..
-                    } => {
-                        has_calls = true;
-                        debug!("Tool Call: {} args: {}", call.name, call.args);
+                    session_tool_history.push((call.function_name.clone(), call.arguments.clone()));
 
-                        // Loop Detection & Prevention
-                        let same_call_count = session_tool_history
-                            .iter()
-                            .filter(|(n, a)| *n == call.name && *a == call.args)
-                            .count();
+                    if same_call_count > 0 {
+                        if same_call_count >= 2 {
+                            let error_msg = format!(
+                                "Error: Loop detected. You have already called tool '{}' with these exact arguments {} times. Please stop repeating yourself and proceed to the next step.",
+                                call.function_name,
+                                same_call_count + 1
+                            );
+                            warn!("{}", error_msg);
 
-                        session_tool_history.push((call.name.clone(), call.args.clone()));
-
-                        if same_call_count > 0 {
-                            // For tools, allow some repetition but prevent infinite loops.
-                            // Soft limit: returning error to model to let it self-correct
-                            if same_call_count >= 2 {
-                                let error_msg = format!(
-                                    "Error: Loop detected. You have already called tool '{}' with these exact arguments {} times. Please stop repeating yourself and proceed to the next step.",
-                                    call.name,
-                                    same_call_count + 1
-                                );
-                                warn!("{}", error_msg);
-
-                                // Hard limit: terminate to save resources
-                                if same_call_count >= 10 {
-                                    return Ok(WorkerResult {
-                                        output: None,
-                                        error: Some(format!(
-                                            "Terminating due to persistent tool loop: {}",
-                                            error_msg
-                                        )),
-                                        input_context: input_context.clone(),
-                                        history: self.history.clone(),
-                                        history_before_pruning: final_history_before_pruning,
-                                        history_after_pruning: final_history_after_pruning,
-                                        tokens_in: total_tokens_in,
-                                        tokens_out: total_tokens_out,
-                                        tokens_cached: total_tokens_cached,
-                                    });
-                                }
-
-                                function_responses.push(Part::FunctionResponse {
-                                    function_response: FunctionResponse {
-                                        name: call.name.clone(),
-                                        response: json!({ "error": error_msg }),
-                                    },
+                            if same_call_count >= 10 {
+                                return Ok(WorkerResult {
+                                    output: None,
+                                    error: Some(format!(
+                                        "Terminating due to persistent tool loop: {}",
+                                        error_msg
+                                    )),
+                                    input_context: input_context.clone(),
+                                    history: self.history.clone(),
+                                    history_before_pruning: final_history_before_pruning,
+                                    history_after_pruning: final_history_after_pruning,
+                                    tokens_in: total_tokens_in,
+                                    tokens_out: total_tokens_out,
+                                    tokens_cached: total_tokens_cached,
                                 });
-                                continue;
                             }
-                        }
 
-                        let result = match self.tools.call(&call.name, call.args.clone()).await {
-                            Ok(val) => val,
-                            Err(e) => {
-                                debug!("Tool execution failed: {}", e);
-                                json!({ "error": e.to_string() })
-                            }
-                        };
-
-                        function_responses.push(Part::FunctionResponse {
-                            function_response: FunctionResponse {
-                                name: call.name.clone(),
-                                response: result,
-                            },
-                        });
-                    }
-                    Part::Text { text, thought, .. } => {
-                        if !*thought {
-                            final_text.push_str(text);
+                            tool_responses.push(AiMessage {
+                                role: AiRole::Tool,
+                                content: Some(json!({ "error": error_msg }).to_string()),
+                                tool_calls: None,
+                                tool_call_id: Some(call.id.clone()),
+                            });
+                            continue;
                         }
                     }
-                    _ => {}
+
+                    let result = match self
+                        .tools
+                        .call(&call.function_name, call.arguments.clone())
+                        .await
+                    {
+                        Ok(val) => val.to_string(),
+                        Err(e) => {
+                            debug!("Tool execution failed: {}", e);
+                            json!({ "error": e.to_string() }).to_string()
+                        }
+                    };
+
+                    tool_responses.push(AiMessage {
+                        role: AiRole::Tool,
+                        content: Some(result),
+                        tool_calls: None,
+                        tool_call_id: Some(call.id.clone()),
+                    });
                 }
-            }
-
-            if has_calls {
-                let response_content = Content {
-                    role: "function".to_string(),
-                    parts: function_responses,
-                };
-                self.history_tokens
-                    .push(self.estimate_content_tokens(&response_content));
-                self.history.push(response_content);
+                self.history.extend(tool_responses);
                 // Continue loop to get model response to tool outputs
-            } else {
-                // Try to clean up markdown code blocks if present (some models still add them despite JSON mode)
+            } else if let Some(final_text) = resp.content {
+                // Try to clean up markdown code blocks if present
                 let clean_text = final_text.trim();
                 let clean_text = if clean_text.starts_with("```json") {
                     clean_text
@@ -548,17 +442,12 @@ impl Worker {
                         let error_msg = "Validation Error: 'findings' were detected but 'review_inline' is missing or empty. You must provide the inline review in 'review_inline' when reporting findings. Please retry.".to_string();
                         warn!("{}", error_msg);
 
-                        let error_content = Content {
-                            role: "user".to_string(),
-                            parts: vec![Part::Text {
-                                text: error_msg,
-                                thought_signature: None,
-                                thought: false,
-                            }],
-                        };
-                        self.history_tokens
-                            .push(self.estimate_content_tokens(&error_content));
-                        self.history.push(error_content);
+                        self.history.push(AiMessage {
+                            role: AiRole::User,
+                            content: Some(error_msg),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
                         continue;
                     }
 
@@ -569,17 +458,12 @@ impl Worker {
                         );
                         warn!("{}", error_msg);
 
-                        let error_content = Content {
-                            role: "user".to_string(),
-                            parts: vec![Part::Text {
-                                text: error_msg,
-                                thought_signature: None,
-                                thought: false,
-                            }],
-                        };
-                        self.history_tokens
-                            .push(self.estimate_content_tokens(&error_content));
-                        self.history.push(error_content);
+                        self.history.push(AiMessage {
+                            role: AiRole::User,
+                            content: Some(error_msg),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
                         continue;
                     }
                 }
@@ -587,6 +471,18 @@ impl Worker {
                 return Ok(WorkerResult {
                     output: Some(json_val),
                     error: None,
+                    input_context,
+                    history: self.history.clone(),
+                    history_before_pruning: final_history_before_pruning,
+                    history_after_pruning: final_history_after_pruning,
+                    tokens_in: total_tokens_in,
+                    tokens_out: total_tokens_out,
+                    tokens_cached: total_tokens_cached,
+                });
+            } else {
+                return Ok(WorkerResult {
+                    output: None,
+                    error: Some("AI returned no content or tool calls".to_string()),
                     input_context,
                     history: self.history.clone(),
                     history_before_pruning: final_history_before_pruning,

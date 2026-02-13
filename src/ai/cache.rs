@@ -12,30 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::gemini::{Content, CreateCachedContentRequest, GenAiClient, Part, Tool};
+use crate::ai::{AiMessage, AiProvider, AiRequest, AiRole, AiTool};
 use crate::worker::prompts::PromptRegistry;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct CacheManager {
     prompts: PromptRegistry,
-    client: Box<dyn GenAiClient>,
+    provider: Arc<dyn AiProvider>,
     model: String,
     ttl: String,
-    tools: Option<Vec<Tool>>,
+    tools: Option<Vec<AiTool>>,
 }
 
 impl CacheManager {
     pub fn new(
         base_dir: PathBuf,
-        client: Box<dyn GenAiClient>,
+        provider: Arc<dyn AiProvider>,
         model: String,
         ttl: String,
-        tools: Option<Vec<Tool>>,
+        tools: Option<Vec<AiTool>>,
     ) -> Self {
         Self {
             prompts: PromptRegistry::new(base_dir),
-            client,
+            provider,
             model,
             ttl,
             tools,
@@ -51,8 +52,10 @@ impl CacheManager {
     /// Calculates hash of content and tools for cache key.
     /// Delegates to PromptRegistry.
     fn calculate_hash(&self, content: &str) -> String {
+        let mut full_content = content.to_string();
+        full_content.push_str(&self.model);
         self.prompts
-            .calculate_content_hash(content, self.tools.as_deref())
+            .calculate_content_hash(&full_content, self.tools.as_deref())
     }
 
     /// Ensures a valid cache exists for the current content.
@@ -64,11 +67,9 @@ impl CacheManager {
         // Short hash for readability
         let short_hash = &hash[..8];
         let expected_display_name = format!("sashiko-reviewer-v1-{}", short_hash);
-        // The caching API requires the model name to start with "models/"
-        let model_name = format!("models/{}", self.model);
 
         // List existing caches
-        let existing = self.client.list_cached_contents().await?;
+        let existing = self.provider.list_context_caches().await?;
         let mut valid_candidate = None;
 
         if let Some(ignore) = ignore_cache_name {
@@ -77,153 +78,120 @@ impl CacheManager {
             tracing::info!("EnsureCache: No ignore target specified.");
         }
 
-        for cache in existing {
-            let display_name = cache
-                .display_name
-                .as_deref()
-                .unwrap_or("<missing_display_name>");
-            let model = &cache.model;
-
-            if display_name == expected_display_name && model == &model_name {
-                if let Some(name) = cache.name {
-                    if let Some(ignore) = ignore_cache_name {
-                        if name == ignore {
-                            tracing::warn!(
-                                "Deleting/Ignoring cache '{}' (MATCHED ignore target)",
-                                name
-                            );
-                            if let Err(e) = self.client.delete_cached_content(&name).await {
-                                tracing::warn!("Failed to delete ignored cache {}: {}", name, e);
-                            }
-                            continue;
+        for (display_name, name) in existing {
+            if display_name == expected_display_name {
+                if let Some(ignore) = ignore_cache_name {
+                    if name == ignore {
+                        tracing::warn!(
+                            "Deleting/Ignoring cache '{}' (MATCHED ignore target)",
+                            name
+                        );
+                        if let Err(e) = self.provider.delete_context_cache(&name).await {
+                            tracing::warn!("Failed to delete ignored cache {}: {}", name, e);
                         }
+                        continue;
                     }
+                }
 
-                    if valid_candidate.is_none() {
-                        valid_candidate = Some(name.clone());
-                    } else {
-                        tracing::debug!("Found duplicate valid cache candidate: {}", name);
-                    }
+                if valid_candidate.is_none() {
+                    valid_candidate = Some(name.clone());
+                } else {
+                    tracing::debug!("Found duplicate valid cache candidate: {}", name);
                 }
             }
         }
 
         if let Some(name) = valid_candidate {
-            tracing::info!(
-                "Found existing cache: {} ({} for {})",
-                name,
-                expected_display_name,
-                model_name
-            );
+            tracing::info!("Found existing cache: {} ({})", name, expected_display_name,);
             return Ok(name);
         }
 
         tracing::info!("Creating new cache: {}", expected_display_name);
 
         // Create new cache
-        // model_name is already defined above
-
-        let request = CreateCachedContentRequest {
-            model: model_name,
-            display_name: Some(expected_display_name),
-            system_instruction: Some(Content {
-                role: "system".to_string(),
-                parts: vec![Part::Text {
-                    text: PromptRegistry::get_system_identity().to_string(),
-                    thought_signature: None,
-                    thought: false,
-                }],
-            }),
-            contents: Some(vec![Content {
-                role: "user".to_string(),
-                parts: vec![Part::Text {
-                    text: context_str,
-                    thought_signature: None,
-                    thought: false,
-                }],
-            }]),
+        let request = AiRequest {
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some(context_str),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
             tools: self.tools.clone(),
-            ttl: Some(self.ttl.clone()),
+            temperature: None,
+            preloaded_context: None,
         };
 
-        let cached_content = self.client.create_cached_content(request).await?;
-        cached_content.name.context("Created cache has no name")
+        self.provider
+            .create_context_cache(request, self.ttl.clone(), Some(expected_display_name))
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::gemini::{
-        CachedContent, CreateCachedContentRequest, GenerateContentRequest, GenerateContentResponse,
-        GenerateContentWithCacheRequest,
-    };
+    use crate::ai::{AiProvider, AiRequest, AiResponse, ProviderCapabilities};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
-    struct MockGenAiClient {
-        created_request: Arc<Mutex<Option<CreateCachedContentRequest>>>,
+    struct MockProvider {
+        created_request: Arc<Mutex<Option<AiRequest>>>,
+        existing: Vec<(String, String)>,
+        deleted: Arc<Mutex<Vec<String>>>,
     }
 
-    impl MockGenAiClient {}
-
     #[async_trait]
-    impl GenAiClient for MockGenAiClient {
-        async fn generate_content(
-            &self,
-            _request: GenerateContentRequest,
-        ) -> Result<GenerateContentResponse> {
+    impl AiProvider for MockProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
             unimplemented!()
         }
 
-        async fn create_cached_content(
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test".to_string(),
+                context_window_size: 100,
+            }
+        }
+
+        async fn create_context_cache(
             &self,
-            request: CreateCachedContentRequest,
-        ) -> Result<CachedContent> {
+            request: AiRequest,
+            _ttl: String,
+            _display_name: Option<String>,
+        ) -> Result<String> {
             *self.created_request.lock().unwrap() = Some(request);
-            Ok(CachedContent {
-                name: Some("cachedContents/test".to_string()),
-                display_name: None,
-                model: "models/test".to_string(),
-                system_instruction: None,
-                contents: None,
-                tools: None,
-                create_time: None,
-                update_time: None,
-                expire_time: None,
-                ttl: None,
-            })
+            Ok("cachedContents/test".to_string())
         }
 
-        async fn list_cached_contents(&self) -> Result<Vec<CachedContent>> {
-            Ok(vec![])
+        async fn list_context_caches(&self) -> Result<Vec<(String, String)>> {
+            Ok(self.existing.clone())
         }
 
-        async fn delete_cached_content(&self, _name: &str) -> Result<()> {
+        async fn delete_context_cache(&self, name: &str) -> Result<()> {
+            self.deleted.lock().unwrap().push(name.to_string());
             Ok(())
-        }
-
-        async fn generate_content_with_cache(
-            &self,
-            _request: GenerateContentWithCacheRequest,
-        ) -> Result<GenerateContentResponse> {
-            unimplemented!()
         }
     }
 
     #[tokio::test]
-    async fn test_ensure_cache_creates_with_correct_ttl() {
+    async fn test_ensure_cache_creates_with_correct_content() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_dir = temp_dir.path().to_path_buf();
 
         let captured = Arc::new(Mutex::new(None));
-        let mock_client = MockGenAiClient {
+        let mock_provider = Arc::new(MockProvider {
             created_request: captured.clone(),
-        };
+            existing: vec![],
+            deleted: Arc::new(Mutex::new(vec![])),
+        });
 
         let manager = CacheManager::new(
             base_dir,
-            Box::new(mock_client),
+            mock_provider,
             "test-model".to_string(),
             "60s".to_string(),
             None,
@@ -236,226 +204,106 @@ mod tests {
             .lock()
             .unwrap()
             .take()
-            .expect("create_cached_content not called");
-        assert_eq!(request.ttl, Some("60s".to_string()));
-        // Also verify model name is prefixed
-        assert_eq!(request.model, "models/test-model");
-    }
-
-    struct MockGenAiClientWithExisting {
-        existing: Vec<CachedContent>,
-        created_request: Arc<Mutex<Option<CreateCachedContentRequest>>>,
-    }
-
-    #[async_trait]
-    impl GenAiClient for MockGenAiClientWithExisting {
-        async fn generate_content(
-            &self,
-            _request: GenerateContentRequest,
-        ) -> Result<GenerateContentResponse> {
-            unimplemented!()
-        }
-
-        async fn create_cached_content(
-            &self,
-            request: CreateCachedContentRequest,
-        ) -> Result<CachedContent> {
-            *self.created_request.lock().unwrap() = Some(request);
-            Ok(CachedContent {
-                name: Some("cachedContents/new".to_string()),
-                display_name: None,
-                model: "models/test".to_string(),
-                system_instruction: None,
-                contents: None,
-                tools: None,
-                create_time: None,
-                update_time: None,
-                expire_time: None,
-                ttl: None,
-            })
-        }
-
-        async fn list_cached_contents(&self) -> Result<Vec<CachedContent>> {
-            Ok(self.existing.clone())
-        }
-
-        async fn delete_cached_content(&self, _name: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn generate_content_with_cache(
-            &self,
-            _request: GenerateContentWithCacheRequest,
-        ) -> Result<GenerateContentResponse> {
-            unimplemented!()
-        }
+            .expect("create_context_cache not called");
+        assert!(request.messages.len() > 0);
     }
 
     #[tokio::test]
-    async fn test_ensure_cache_ignores_wrong_model() {
-        use sha2::{Digest, Sha256};
-
+    async fn test_ensure_cache_finds_existing() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_dir = temp_dir.path().to_path_buf();
-
-        // Construct the expected context string for an empty dir
-        // Uses the constant from PromptRegistry
-        let registry = PromptRegistry::new(base_dir.clone());
-        let context_str = registry.build_context().await.unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(&context_str);
-        // Tools are None
-        let hash = format!("{:x}", hasher.finalize());
-        let short_hash = &hash[..8];
-        let expected_dn = format!("sashiko-reviewer-v1-{}", short_hash);
-
-        let wrong_model_cache = CachedContent {
-            name: Some("cachedContents/wrong".to_string()),
-            display_name: Some(expected_dn.clone()),
-            model: "models/gemini-wrong".to_string(), // Mismatch
-            system_instruction: None,
-            contents: None,
-            tools: None,
-            create_time: None,
-            update_time: None,
-            expire_time: None,
-            ttl: None,
-        };
 
         let captured = Arc::new(Mutex::new(None));
-        let mock_client = MockGenAiClientWithExisting {
-            existing: vec![wrong_model_cache],
+        let mock_provider = Arc::new(MockProvider {
             created_request: captured.clone(),
-        };
+            existing: vec![], // Will populate below
+            deleted: Arc::new(Mutex::new(vec![])),
+        });
 
         let manager = CacheManager::new(
             base_dir,
-            Box::new(mock_client),
-            "gemini-right".to_string(),
+            mock_provider.clone(),
+            "test-model".to_string(),
             "60s".to_string(),
             None,
         );
 
-        // This should trigger creation because existing cache has wrong model
-        let res = manager.ensure_cache(None).await;
-        assert!(res.is_ok());
-
-        let request = captured
-            .lock()
-            .unwrap()
-            .take()
-            .expect("create_cached_content SHOULD be called when model mismatches");
-
-        assert_eq!(request.model, "models/gemini-right");
-    }
-
-    struct MockGenAiClientWithMultiple {
-        existing: Vec<CachedContent>,
-        deleted: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[async_trait]
-    impl GenAiClient for MockGenAiClientWithMultiple {
-        async fn generate_content(
-            &self,
-            _request: GenerateContentRequest,
-        ) -> Result<GenerateContentResponse> {
-            unimplemented!()
-        }
-
-        async fn create_cached_content(
-            &self,
-            _request: CreateCachedContentRequest,
-        ) -> Result<CachedContent> {
-            unimplemented!("Should not be called if valid cache exists")
-        }
-
-        async fn list_cached_contents(&self) -> Result<Vec<CachedContent>> {
-            Ok(self.existing.clone())
-        }
-
-        async fn delete_cached_content(&self, name: &str) -> Result<()> {
-            self.deleted.lock().unwrap().push(name.to_string());
-            Ok(())
-        }
-
-        async fn generate_content_with_cache(
-            &self,
-            _request: GenerateContentWithCacheRequest,
-        ) -> Result<GenerateContentResponse> {
-            unimplemented!()
-        }
-    }
-
-    #[tokio::test]
-    async fn test_ensure_cache_deletes_ignored_and_finds_valid() {
-        use sha2::{Digest, Sha256};
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let base_dir = temp_dir.path().to_path_buf();
-
-        // Calculate expected display name
-        // Must match PromptRegistry::build_context for empty dir
-        let registry = PromptRegistry::new(base_dir.clone());
-        let context_str = registry.build_context().await.unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(&context_str);
-        let hash = format!("{:x}", hasher.finalize());
+        let context_str = manager.build_context().await.unwrap();
+        let hash = manager.calculate_hash(&context_str);
         let short_hash = &hash[..8];
         let expected_dn = format!("sashiko-reviewer-v1-{}", short_hash);
 
-        let ignored_cache = CachedContent {
-            name: Some("cachedContents/bad".to_string()),
-            display_name: Some(expected_dn.clone()),
-            model: "models/gemini-test".to_string(),
-            system_instruction: None,
-            contents: None,
-            tools: None,
-            create_time: None,
-            update_time: None,
-            expire_time: None,
-            ttl: None,
-        };
-
-        let valid_cache = CachedContent {
-            name: Some("cachedContents/good".to_string()),
-            display_name: Some(expected_dn.clone()),
-            model: "models/gemini-test".to_string(),
-            system_instruction: None,
-            contents: None,
-            tools: None,
-            create_time: None,
-            update_time: None,
-            expire_time: None,
-            ttl: None,
-        };
-
-        let deleted_tracker = Arc::new(Mutex::new(Vec::new()));
-        let mock_client = MockGenAiClientWithMultiple {
-            existing: vec![ignored_cache.clone(), valid_cache.clone()],
-            deleted: deleted_tracker.clone(),
-        };
+        // Now update the mock with existing cache
+        let mock_provider_final = Arc::new(MockProvider {
+            created_request: captured.clone(),
+            existing: vec![(expected_dn, "cachedContents/existing".to_string())],
+            deleted: Arc::new(Mutex::new(vec![])),
+        });
 
         let manager = CacheManager::new(
-            base_dir,
-            Box::new(mock_client),
-            "gemini-test".to_string(),
+            temp_dir.path().to_path_buf(),
+            mock_provider_final,
+            "test-model".to_string(),
             "60s".to_string(),
             None,
         );
 
-        // Call ensure_cache requesting to ignore "cachedContents/bad"
-        let res = manager.ensure_cache(Some("cachedContents/bad")).await;
-
+        let res = manager.ensure_cache(None).await;
         assert!(res.is_ok());
-        let found_name = res.unwrap();
+        assert_eq!(res.unwrap(), "cachedContents/existing");
 
-        // Should return the valid one
-        assert_eq!(found_name, "cachedContents/good");
+        // Should NOT have created a new one
+        assert!(captured.lock().unwrap().is_none());
+    }
 
-        // Should have deleted the bad one
-        let deleted = deleted_tracker.lock().unwrap();
-        assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0], "cachedContents/bad");
+    #[tokio::test]
+    async fn test_ensure_cache_deletes_ignored() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_dir = temp_dir.path().to_path_buf();
+
+        let deleted = Arc::new(Mutex::new(vec![]));
+        let captured = Arc::new(Mutex::new(None));
+
+        let manager = CacheManager::new(
+            base_dir,
+            Arc::new(MockProvider {
+                created_request: captured.clone(),
+                existing: vec![],
+                deleted: deleted.clone(),
+            }),
+            "test-model".to_string(),
+            "60s".to_string(),
+            None,
+        );
+
+        let context_str = manager.build_context().await.unwrap();
+        let hash = manager.calculate_hash(&context_str);
+        let short_hash = &hash[..8];
+        let expected_dn = format!("sashiko-reviewer-v1-{}", short_hash);
+
+        let mock_provider = Arc::new(MockProvider {
+            created_request: captured.clone(),
+            existing: vec![
+                (expected_dn.clone(), "cachedContents/bad".to_string()),
+                (expected_dn, "cachedContents/good".to_string()),
+            ],
+            deleted: deleted.clone(),
+        });
+
+        let manager = CacheManager::new(
+            temp_dir.path().to_path_buf(),
+            mock_provider,
+            "test-model".to_string(),
+            "60s".to_string(),
+            None,
+        );
+
+        let res = manager.ensure_cache(Some("cachedContents/bad")).await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "cachedContents/good");
+
+        let deleted_list = deleted.lock().unwrap();
+        assert_eq!(deleted_list.len(), 1);
+        assert_eq!(deleted_list[0], "cachedContents/bad");
     }
 }

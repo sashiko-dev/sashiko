@@ -14,8 +14,7 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, LegacyAiProvider, LegacyAiRequest,
-    LegacyAiResponse, ProviderCapabilities, ToolCall,
+    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -667,6 +666,7 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
         prompt_tokens: m.prompt_token_count as usize,
         completion_tokens: m.candidates_token_count.unwrap_or(0) as usize,
         total_tokens: m.total_token_count as usize,
+        cached_tokens: m.cached_content_token_count.map(|c| c as usize),
     });
 
     Ok(AiResponse {
@@ -710,9 +710,21 @@ fn estimate_tokens_generic(request: &AiRequest) -> usize {
 #[async_trait]
 impl AiProvider for GeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let gen_req = translate_ai_request(request)?;
-        let resp = GenAiClient::generate_content(self, gen_req).await?;
-        translate_ai_response(resp)
+        if let Some(cache_name) = request.preloaded_context.clone() {
+            let gen_req = translate_ai_request(request)?;
+            let cached_req = GenerateContentWithCacheRequest {
+                cached_content: cache_name,
+                contents: gen_req.contents,
+                tools: None, // Tools are in the cache
+                generation_config: gen_req.generation_config,
+            };
+            let resp = GenAiClient::generate_content_with_cache(self, cached_req).await?;
+            translate_ai_response(resp)
+        } else {
+            let gen_req = translate_ai_request(request)?;
+            let resp = GenAiClient::generate_content(self, gen_req).await?;
+            translate_ai_response(resp)
+        }
     }
 
     fn estimate_tokens(&self, request: &AiRequest) -> usize {
@@ -725,14 +737,70 @@ impl AiProvider for GeminiClient {
             context_window_size: 1_000_000, // Gemini 1.5 Pro default
         }
     }
+
+    async fn create_context_cache(
+        &self,
+        request: AiRequest,
+        ttl: String,
+        display_name: Option<String>,
+    ) -> Result<String> {
+        let gen_req = translate_ai_request(request)?;
+        let model_name = if self.model.starts_with("models/") {
+            self.model.clone()
+        } else {
+            format!("models/{}", self.model)
+        };
+
+        let cache_req = CreateCachedContentRequest {
+            model: model_name,
+            display_name,
+            system_instruction: gen_req.system_instruction,
+            contents: Some(gen_req.contents),
+            tools: gen_req.tools,
+            ttl: Some(ttl),
+        };
+
+        let res = GenAiClient::create_cached_content(self, cache_req).await?;
+        res.name
+            .ok_or_else(|| anyhow::anyhow!("Created cache has no name"))
+    }
+
+    async fn delete_context_cache(&self, name: &str) -> Result<()> {
+        GenAiClient::delete_cached_content(self, name).await
+    }
+
+    async fn list_context_caches(&self) -> Result<Vec<(String, String)>> {
+        let existing = GenAiClient::list_cached_contents(self).await?;
+        Ok(existing
+            .into_iter()
+            .map(|c| {
+                (
+                    c.display_name.unwrap_or_default(),
+                    c.name.unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
 impl AiProvider for StdioGeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let gen_req = translate_ai_request(request)?;
-        let resp = GenAiClient::generate_content(self, gen_req).await?;
-        translate_ai_response(resp)
+        if let Some(cache_name) = request.preloaded_context.clone() {
+            let gen_req = translate_ai_request(request)?;
+            let cached_req = GenerateContentWithCacheRequest {
+                cached_content: cache_name,
+                contents: gen_req.contents,
+                tools: None,
+                generation_config: gen_req.generation_config,
+            };
+            let resp = GenAiClient::generate_content_with_cache(self, cached_req).await?;
+            translate_ai_response(resp)
+        } else {
+            let gen_req = translate_ai_request(request)?;
+            let resp = GenAiClient::generate_content(self, gen_req).await?;
+            translate_ai_response(resp)
+        }
     }
 
     fn estimate_tokens(&self, request: &AiRequest) -> usize {
@@ -745,64 +813,41 @@ impl AiProvider for StdioGeminiClient {
             context_window_size: 1_000_000,
         }
     }
-}
 
-#[async_trait]
-impl LegacyAiProvider for GeminiClient {
-    async fn completion(&self, request: LegacyAiRequest) -> Result<LegacyAiResponse> {
-        let contents = vec![Content {
-            role: "user".to_string(),
-            parts: vec![Part::Text {
-                text: request.prompt,
-                thought_signature: None,
-                thought: false,
-            }],
-        }];
-
-        let system_instruction = request.system_prompt.map(|s| Content {
-            role: "user".to_string(),
-            parts: vec![Part::Text {
-                text: s,
-                thought_signature: None,
-                thought: false,
-            }],
-        });
-
-        let gen_req = GenerateContentRequest {
-            contents,
-            tools: None,
-            system_instruction,
-            generation_config: None,
+    async fn create_context_cache(
+        &self,
+        request: AiRequest,
+        ttl: String,
+        _display_name: Option<String>,
+    ) -> Result<String> {
+        let gen_req = translate_ai_request(request)?;
+        let cache_req = CreateCachedContentRequest {
+            model: "stdio-model".to_string(),
+            display_name: None,
+            system_instruction: gen_req.system_instruction,
+            contents: Some(gen_req.contents),
+            tools: gen_req.tools,
+            ttl: Some(ttl),
         };
+        let res = GenAiClient::create_cached_content(self, cache_req).await?;
+        res.name
+            .ok_or_else(|| anyhow::anyhow!("Created cache has no name"))
+    }
 
-        let resp = GenAiClient::generate_content(self, gen_req).await?;
+    async fn delete_context_cache(&self, name: &str) -> Result<()> {
+        GenAiClient::delete_cached_content(self, name).await
+    }
 
-        let candidate = resp
-            .candidates
-            .as_ref()
-            .and_then(|c| c.first())
-            .ok_or_else(|| anyhow::anyhow!("No candidates returned from Gemini"))?;
-
-        let mut content = String::new();
-        for part in &candidate.content.parts {
-            if let Part::Text { text, .. } = part {
-                content.push_str(text);
-            }
-        }
-
-        let usage = resp.usage_metadata.unwrap_or(UsageMetadata {
-            prompt_token_count: 0,
-            candidates_token_count: Some(0),
-            total_token_count: 0,
-            cached_content_token_count: None,
-            extra: None,
-        });
-
-        Ok(LegacyAiResponse {
-            content,
-            tokens_in: usage.prompt_token_count,
-            tokens_out: usage.candidates_token_count.unwrap_or(0),
-            tokens_cached: usage.cached_content_token_count.unwrap_or(0),
-        })
+    async fn list_context_caches(&self) -> Result<Vec<(String, String)>> {
+        let existing = GenAiClient::list_cached_contents(self).await?;
+        Ok(existing
+            .into_iter()
+            .map(|c| {
+                (
+                    c.display_name.unwrap_or_default(),
+                    c.name.unwrap_or_default(),
+                )
+            })
+            .collect())
     }
 }

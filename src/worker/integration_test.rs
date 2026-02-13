@@ -14,10 +14,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::ai::gemini::{
-        CachedContent, Candidate, Content, CreateCachedContentRequest, FunctionCall, GenAiClient,
-        GenerateContentRequest, GenerateContentResponse, GenerateContentWithCacheRequest, Part,
-        UsageMetadata,
+    use crate::ai::{
+        AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
     };
     use crate::worker::{Worker, prompts::PromptRegistry, tools::ToolBox};
     use async_trait::async_trait;
@@ -27,11 +25,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     struct StatefulMockClient {
-        responses: Arc<Mutex<VecDeque<anyhow::Result<GenerateContentResponse>>>>,
+        responses: Arc<Mutex<VecDeque<anyhow::Result<AiResponse>>>>,
     }
 
     impl StatefulMockClient {
-        fn new(responses: Vec<anyhow::Result<GenerateContentResponse>>) -> Self {
+        fn new(responses: Vec<anyhow::Result<AiResponse>>) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(VecDeque::from(responses))),
             }
@@ -39,63 +37,37 @@ mod tests {
     }
 
     #[async_trait]
-    impl GenAiClient for StatefulMockClient {
-        async fn generate_content(
-            &self,
-            _req: GenerateContentRequest,
-        ) -> anyhow::Result<GenerateContentResponse> {
+    impl AiProvider for StatefulMockClient {
+        async fn generate_content(&self, _req: AiRequest) -> anyhow::Result<AiResponse> {
             let mut responses = self.responses.lock().unwrap();
 
-            // Check if we have a response queued
             if let Some(res) = responses.pop_front() {
                 return res;
             }
 
-            // Fallback if we run out of responses (shouldn't happen in well-defined tests)
-            // Return a generic "Stop" response to avoid infinite loops if the test is buggy
-            Ok(GenerateContentResponse {
-                candidates: Some(vec![Candidate {
-                    content: Content {
-                        role: "model".to_string(),
-                        parts: vec![Part::Text {
-                            text: "```json\n{\"summary\": \"Fallback\", \"findings\": []}\n```"
-                                .to_string(),
-                            thought_signature: None,
-                            thought: false,
-                        }],
-                    },
-                    finish_reason: Some("STOP".to_string()),
-                }]),
-                usage_metadata: Some(UsageMetadata {
-                    prompt_token_count: 0,
-                    candidates_token_count: Some(0),
-                    total_token_count: 0,
-                    cached_content_token_count: None,
-                    extra: None,
+            Ok(AiResponse {
+                content: Some(
+                    "```json\n{\"summary\": \"Fallback\", \"findings\": []}\n```".to_string(),
+                ),
+                tool_calls: None,
+                usage: Some(AiUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cached_tokens: None,
                 }),
             })
         }
 
-        async fn create_cached_content(
-            &self,
-            _request: CreateCachedContentRequest,
-        ) -> anyhow::Result<CachedContent> {
-            unimplemented!("Mock not implemented for create_cached_content")
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
         }
 
-        async fn list_cached_contents(&self) -> anyhow::Result<Vec<CachedContent>> {
-            Ok(vec![])
-        }
-
-        async fn delete_cached_content(&self, _name: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn generate_content_with_cache(
-            &self,
-            _request: GenerateContentWithCacheRequest,
-        ) -> anyhow::Result<GenerateContentResponse> {
-            unimplemented!("Mock not implemented for generate_content_with_cache")
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
         }
     }
 
@@ -106,25 +78,15 @@ mod tests {
         (linux_path, prompts_path)
     }
 
-    fn create_text_response(text: &str) -> anyhow::Result<GenerateContentResponse> {
-        Ok(GenerateContentResponse {
-            candidates: Some(vec![Candidate {
-                content: Content {
-                    role: "model".to_string(),
-                    parts: vec![Part::Text {
-                        text: text.to_string(),
-                        thought_signature: None,
-                        thought: false,
-                    }],
-                },
-                finish_reason: Some("STOP".to_string()),
-            }]),
-            usage_metadata: Some(UsageMetadata {
-                prompt_token_count: 10,
-                candidates_token_count: Some(10),
-                total_token_count: 20,
-                cached_content_token_count: None,
-                extra: None,
+    fn create_text_response(text: &str) -> anyhow::Result<AiResponse> {
+        Ok(AiResponse {
+            content: Some(text.to_string()),
+            tool_calls: None,
+            usage: Some(AiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                total_tokens: 20,
+                cached_tokens: None,
             }),
         })
     }
@@ -132,27 +94,19 @@ mod tests {
     fn create_tool_call_response(
         name: &str,
         args: serde_json::Value,
-    ) -> anyhow::Result<GenerateContentResponse> {
-        Ok(GenerateContentResponse {
-            candidates: Some(vec![Candidate {
-                content: Content {
-                    role: "model".to_string(),
-                    parts: vec![Part::FunctionCall {
-                        function_call: FunctionCall {
-                            name: name.to_string(),
-                            args,
-                        },
-                        thought_signature: Some("I need to check the file.".to_string()),
-                    }],
-                },
-                finish_reason: Some("STOP".to_string()),
+    ) -> anyhow::Result<AiResponse> {
+        Ok(AiResponse {
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: name.to_string(),
+                function_name: name.to_string(),
+                arguments: args,
             }]),
-            usage_metadata: Some(UsageMetadata {
-                prompt_token_count: 10,
-                candidates_token_count: Some(10),
-                total_token_count: 20,
-                cached_content_token_count: None,
-                extra: None,
+            usage: Some(AiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                total_tokens: 20,
+                cached_tokens: None,
             }),
         })
     }
@@ -167,7 +121,7 @@ mod tests {
             "findings": []
         });
 
-        let client = Box::new(StatefulMockClient::new(vec![create_text_response(
+        let client = Arc::new(StatefulMockClient::new(vec![create_text_response(
             &format!("```json\n{}\n```", mock_response),
         )]));
 
@@ -191,16 +145,12 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
-        // Sequence of responses:
-        // 1. Tool call: read_files([{"path": "README"}])
-        // 2. Final JSON response (after receiving tool output)
-
         let final_response = json!({
             "summary": "README is good",
             "findings": []
         });
 
-        let client = Box::new(StatefulMockClient::new(vec![
+        let client = Arc::new(StatefulMockClient::new(vec![
             create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
             create_text_response(&format!("```json\n{}\n```", final_response)),
         ]));
@@ -217,41 +167,32 @@ mod tests {
 
         let result = worker.run(patchset).await.expect("Worker run failed");
 
-        // Verify history has the tool call and response
-        // History:
-        // 0: User (System+Prompt) - Handled by Agent setup but history only contains what's pushed.
-        // In Agent::run:
-        // history[0] = User message (Task)
-        // history[1] = Model response (Tool Call)
-        // history[2] = Function response (Tool Output)
-        // history[3] = Model response (Final JSON)
-
         assert!(
             result.history.len() >= 4,
-            "History should contain at least 4 turns (User, Model-Call, Function-Res, Model-Final)"
+            "History should contain at least 4 turns (User, Assistant-Call, Tool-Res, Assistant-Final)"
         );
 
-        let tool_call = &result.history[1];
-        if let Part::FunctionCall { function_call, .. } = &tool_call.parts[0] {
-            assert_eq!(function_call.name, "read_files");
-        } else {
-            panic!("Expected tool call in history[1]");
-        }
+        let tool_call_msg = &result.history[1];
+        assert_eq!(tool_call_msg.role, AiRole::Assistant);
+        let tool_calls = tool_call_msg
+            .tool_calls
+            .as_ref()
+            .expect("Expected tool calls");
+        assert_eq!(tool_calls[0].function_name, "read_files");
 
-        let tool_res = &result.history[2];
-        if let Part::FunctionResponse { function_response } = &tool_res.parts[0] {
-            assert_eq!(function_response.name, "read_files");
-            // Verify content is from the actual README file on disk
-            let results = function_response.response["results"].as_array().unwrap();
-            assert_eq!(results.len(), 1);
-            let content_str = results[0]["content"].as_str().unwrap();
-            assert!(
-                content_str.contains("Sashiko"),
-                "README.md content should contain 'Sashiko'"
-            );
-        } else {
-            panic!("Expected function response in history[2]");
-        }
+        let tool_res_msg = &result.history[2];
+        assert_eq!(tool_res_msg.role, AiRole::Tool);
+        assert_eq!(tool_res_msg.tool_call_id, Some("read_files".to_string()));
+        let content = tool_res_msg.content.as_ref().expect("Expected content");
+        let content_json: serde_json::Value = serde_json::from_str(content).expect("Valid JSON");
+
+        let results = content_json["results"].as_array().expect("Results array");
+        assert_eq!(results.len(), 1);
+        let content_str = results[0]["content"].as_str().expect("Content string");
+        assert!(
+            content_str.contains("Sashiko"),
+            "README.md content should contain 'Sashiko'"
+        );
 
         let review = result.output.expect("No output");
         assert_eq!(review["summary"], "README is good");
@@ -262,8 +203,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
-        // New logic requires >= 10 repetitions for hard limit.
-        let client = Box::new(StatefulMockClient::new(vec![
+        let client = Arc::new(StatefulMockClient::new(vec![
             create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
             create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
             create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),

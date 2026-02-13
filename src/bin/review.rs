@@ -65,6 +65,10 @@ struct Args {
     /// The caller is responsible for cleanup.
     #[arg(long)]
     reuse_worktree: Option<PathBuf>,
+
+    /// AI provider to use. Overrides settings.
+    #[arg(long)]
+    ai_provider: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -105,7 +109,11 @@ async fn main() -> Result<()> {
     }
 
     let args = Args::parse();
-    let settings = Settings::new().expect("Failed to load settings");
+    let mut settings = Settings::new().expect("Failed to load settings");
+
+    if let Some(p) = &args.ai_provider {
+        settings.ai.provider = p.clone();
+    }
 
     // Data Loading: Always from Stdin (JSON)
     let mut buffer = String::new();
@@ -354,7 +362,8 @@ async fn main() -> Result<()> {
                             info!("Restarting AI review (attempt {}/3)...", attempt);
                         }
 
-                        let client = Box::new(sashiko::ai::gemini::StdioGeminiClient);
+                        // Use stdio-gemini for the binary as it expects to communicate with parent
+                        let provider = sashiko::ai::create_provider(&settings).expect("Failed to create AI provider");
 
                         // Enable read_prompt tool only if explicit caching is NOT used.
                         let prompts_tool_path = if args.gemini_cache.is_none() {
@@ -366,7 +375,7 @@ async fn main() -> Result<()> {
                         let tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
                         let prompts = PromptRegistry::new(args.prompts.clone());
                         let mut worker = Worker::new(
-                            client,
+                            provider,
                             tools,
                             prompts,
                             settings.ai.max_input_tokens,

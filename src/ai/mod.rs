@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use crate::settings::Settings;
 
 /// Represents the role of a message in an AI conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,7 +49,7 @@ pub struct AiMessage {
 }
 
 /// Represents a request from the AI to call a specific tool/function.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     /// Unique identifier for this tool call.
     pub id: String,
@@ -78,6 +81,9 @@ pub struct AiRequest {
     /// Optional sampling temperature (0.0 to 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Optional reference to pre-loaded context (e.g. Gemini Cache name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preloaded_context: Option<String>,
 }
 
 /// A generic AI response containing generated content and/or tool calls.
@@ -101,6 +107,9 @@ pub struct AiUsage {
     pub completion_tokens: usize,
     /// Total tokens used (prompt + completion).
     pub total_tokens: usize,
+    /// Optional number of tokens served from cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<usize>,
 }
 
 /// Information about the capabilities and constraints of an AI provider.
@@ -123,39 +132,40 @@ pub trait AiProvider: Send + Sync {
 
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
+
+    /// Creates a persistent context cache from the given request.
+    /// Returns the resource name/ID of the created cache.
+    async fn create_context_cache(
+        &self,
+        _request: AiRequest,
+        _ttl: String,
+        _display_name: Option<String>,
+    ) -> Result<String> {
+        bail!("Context caching not supported by this provider")
+    }
+
+    /// Deletes a context cache.
+    async fn delete_context_cache(&self, _name: &str) -> Result<()> {
+        bail!("Context caching not supported by this provider")
+    }
+
+    /// Lists existing context caches.
+    /// Returns a list of (display_name, resource_name).
+    async fn list_context_caches(&self) -> Result<Vec<(String, String)>> {
+        Ok(vec![])
+    }
 }
 
-// --- Legacy Types (to be refactored in Phase 2) ---
-
-/// Legacy AI request type.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LegacyAiRequest {
-    /// Model name.
-    pub model: String,
-    /// Prompt text.
-    pub prompt: String,
-    /// Optional system prompt.
-    pub system_prompt: Option<String>,
-}
-
-/// Legacy AI response type.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LegacyAiResponse {
-    /// Generated content.
-    pub content: String,
-    /// Input tokens used.
-    pub tokens_in: u32,
-    /// Output tokens used.
-    pub tokens_out: u32,
-    /// Cached tokens used.
-    pub tokens_cached: u32,
-}
-
-/// Legacy AI provider trait.
-#[async_trait]
-pub trait LegacyAiProvider: Send + Sync {
-    /// Performs a single completion.
-    async fn completion(&self, request: LegacyAiRequest) -> Result<LegacyAiResponse>;
+/// Creates an AI provider based on the application settings.
+pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
+    match settings.ai.provider.to_lowercase().as_str() {
+        "gemini" => {
+            let model = settings.ai.model.clone();
+            Ok(Arc::new(gemini::GeminiClient::new(model)))
+        }
+        "stdio-gemini" => Ok(Arc::new(gemini::StdioGeminiClient)),
+        p => bail!("Unsupported AI provider: {}", p),
+    }
 }
 
 pub mod cache;
