@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::{LegacyAiProvider, LegacyAiRequest, LegacyAiResponse};
-use anyhow::Result;
+use crate::ai::token_budget::TokenBudget;
+use crate::ai::{
+    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, LegacyAiProvider, LegacyAiRequest,
+    LegacyAiResponse, ProviderCapabilities, ToolCall,
+};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Client;
@@ -532,21 +536,220 @@ impl StdioGeminiClient {
     }
 }
 
+// --- Translation Helpers ---
+
+fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
+    let mut contents = Vec::new();
+    let mut system_instruction = None;
+
+    for msg in request.messages {
+        match msg.role {
+            AiRole::System => {
+                if let Some(content) = msg.content {
+                    system_instruction = Some(Content {
+                        role: "user".to_string(), // role is ignored for system_instruction but required by struct
+                        parts: vec![Part::Text {
+                            text: content,
+                            thought_signature: None,
+                            thought: false,
+                        }],
+                    });
+                }
+            }
+            AiRole::User => {
+                contents.push(Content {
+                    role: "user".to_string(),
+                    parts: vec![Part::Text {
+                        text: msg.content.unwrap_or_default(),
+                        thought_signature: None,
+                        thought: false,
+                    }],
+                });
+            }
+            AiRole::Assistant => {
+                let mut parts = Vec::new();
+                if let Some(text) = msg.content {
+                    parts.push(Part::Text {
+                        text,
+                        thought_signature: None,
+                        thought: false,
+                    });
+                }
+                if let Some(tool_calls) = msg.tool_calls {
+                    for call in tool_calls {
+                        parts.push(Part::FunctionCall {
+                            function_call: FunctionCall {
+                                name: call.function_name,
+                                args: call.arguments,
+                            },
+                            thought_signature: None,
+                        });
+                    }
+                }
+                contents.push(Content {
+                    role: "model".to_string(),
+                    parts,
+                });
+            }
+            AiRole::Tool => {
+                // Gemini expects a 'function' role for tool responses
+                contents.push(Content {
+                    role: "function".to_string(),
+                    parts: vec![Part::FunctionResponse {
+                        function_response: FunctionResponse {
+                            name: msg
+                                .tool_call_id
+                                .context("Tool message missing tool_call_id")?,
+                            response: serde_json::from_str(
+                                &msg.content.unwrap_or_else(|| "{}".to_string()),
+                            )
+                            .unwrap_or(json!({})),
+                        },
+                    }],
+                });
+            }
+        }
+    }
+
+    let tools = request.tools.map(|t| {
+        vec![Tool {
+            function_declarations: t
+                .into_iter()
+                .map(|tool| FunctionDeclaration {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                })
+                .collect(),
+        }]
+    });
+
+    Ok(GenerateContentRequest {
+        contents,
+        tools,
+        system_instruction,
+        generation_config: Some(GenerationConfig {
+            response_mime_type: None,
+            response_schema: None,
+            temperature: request.temperature,
+            thinking_config: None,
+        }),
+    })
+}
+
+fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
+    let candidate = resp
+        .candidates
+        .as_ref()
+        .and_then(|c| c.first())
+        .ok_or_else(|| anyhow::anyhow!("No candidates returned from Gemini"))?;
+
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+
+    for part in &candidate.content.parts {
+        match part {
+            Part::Text { text, .. } => {
+                content.push_str(text);
+            }
+            Part::FunctionCall { function_call, .. } => {
+                tool_calls.push(ToolCall {
+                    id: function_call.name.clone(), // Gemini doesn't have explicit call IDs in v1beta
+                    function_name: function_call.name.clone(),
+                    arguments: function_call.args.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let usage = resp.usage_metadata.map(|m| AiUsage {
+        prompt_tokens: m.prompt_token_count as usize,
+        completion_tokens: m.candidates_token_count.unwrap_or(0) as usize,
+        total_tokens: m.total_token_count as usize,
+    });
+
+    Ok(AiResponse {
+        content: if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        },
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
+        usage,
+    })
+}
+
+fn estimate_tokens_generic(request: &AiRequest) -> usize {
+    let mut total = 0;
+    for msg in &request.messages {
+        if let Some(content) = &msg.content {
+            total += TokenBudget::estimate_tokens(content);
+        }
+        if let Some(tool_calls) = &msg.tool_calls {
+            for call in tool_calls {
+                total += TokenBudget::estimate_tokens(&call.function_name);
+                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
+            }
+        }
+    }
+    if let Some(tools) = &request.tools {
+        for tool in tools {
+            total += TokenBudget::estimate_tokens(&tool.name);
+            total += TokenBudget::estimate_tokens(&tool.description);
+            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
+        }
+    }
+    total
+}
+
+#[async_trait]
+impl AiProvider for GeminiClient {
+    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        let gen_req = translate_ai_request(request)?;
+        let resp = GenAiClient::generate_content(self, gen_req).await?;
+        translate_ai_response(resp)
+    }
+
+    fn estimate_tokens(&self, request: &AiRequest) -> usize {
+        estimate_tokens_generic(request)
+    }
+
+    fn get_capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            model_name: self.model.clone(),
+            context_window_size: 1_000_000, // Gemini 1.5 Pro default
+        }
+    }
+}
+
+#[async_trait]
+impl AiProvider for StdioGeminiClient {
+    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        let gen_req = translate_ai_request(request)?;
+        let resp = GenAiClient::generate_content(self, gen_req).await?;
+        translate_ai_response(resp)
+    }
+
+    fn estimate_tokens(&self, request: &AiRequest) -> usize {
+        estimate_tokens_generic(request)
+    }
+
+    fn get_capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            model_name: "stdio-gemini".to_string(),
+            context_window_size: 1_000_000,
+        }
+    }
+}
+
 #[async_trait]
 impl LegacyAiProvider for GeminiClient {
     async fn completion(&self, request: LegacyAiRequest) -> Result<LegacyAiResponse> {
-        // Implementation remains same, assuming AiRequest to GenerateContentRequest mapping
-        // For brevity, I'll copy the existing logic or simpler:
-        // Agent uses GenAiClient, so AiProvider might be legacy.
-        // review.rs uses Agent.
-        // Reviewer.rs uses AiProvider for DB logging.
-        // reviewer.rs: `db.create_review(..., &settings.ai.provider, ...)`
-        // `reviewer.rs` does NOT call `completion`.
-        // AiProvider is maintained for compatibility.
-        // It's used in `src/ai/mod.rs` trait definition.
-        // `src/ai/gemini.rs` implemented it.
-        // I will keep it implemented for `GeminiClient` to be safe.
-
         let contents = vec![Content {
             role: "user".to_string(),
             parts: vec![Part::Text {
@@ -572,7 +775,6 @@ impl LegacyAiProvider for GeminiClient {
             generation_config: None,
         };
 
-        // Use the trait method
         let resp = GenAiClient::generate_content(self, gen_req).await?;
 
         let candidate = resp
