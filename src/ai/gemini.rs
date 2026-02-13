@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::{AiProvider, AiRequest, AiResponse};
+use crate::ai::{LegacyAiProvider, LegacyAiRequest, LegacyAiResponse};
 use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
@@ -533,8 +533,8 @@ impl StdioGeminiClient {
 }
 
 #[async_trait]
-impl AiProvider for GeminiClient {
-    async fn completion(&self, request: AiRequest) -> Result<AiResponse> {
+impl LegacyAiProvider for GeminiClient {
+    async fn completion(&self, request: LegacyAiRequest) -> Result<LegacyAiResponse> {
         // Implementation remains same, assuming AiRequest to GenerateContentRequest mapping
         // For brevity, I'll copy the existing logic or simpler:
         // Agent uses GenAiClient, so AiProvider might be legacy.
@@ -596,7 +596,7 @@ impl AiProvider for GeminiClient {
             extra: None,
         });
 
-        Ok(AiResponse {
+        Ok(LegacyAiResponse {
             content,
             tokens_in: usage.prompt_token_count,
             tokens_out: usage.candidates_token_count.unwrap_or(0),
