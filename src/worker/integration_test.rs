@@ -101,6 +101,7 @@ mod tests {
                 id: name.to_string(),
                 function_name: name.to_string(),
                 arguments: args,
+                thought_signature: None,
             }]),
             usage: Some(AiUsage {
                 prompt_tokens: 10,

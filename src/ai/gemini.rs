@@ -600,7 +600,7 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                                 name: call.function_name,
                                 args: call.arguments,
                             },
-                            thought_signature: None,
+                            thought_signature: call.thought_signature,
                         });
                     }
                 }
@@ -670,11 +670,15 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
             Part::Text { text, .. } => {
                 content.push_str(text);
             }
-            Part::FunctionCall { function_call, .. } => {
+            Part::FunctionCall {
+                function_call,
+                thought_signature,
+            } => {
                 tool_calls.push(ToolCall {
                     id: function_call.name.clone(), // Gemini doesn't have explicit call IDs in v1beta
                     function_name: function_call.name.clone(),
                     arguments: function_call.args.clone(),
+                    thought_signature: thought_signature.clone(),
                 });
             }
             _ => {}

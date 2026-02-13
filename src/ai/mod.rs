@@ -57,6 +57,9 @@ pub struct ToolCall {
     pub function_name: String,
     /// Arguments for the function call as a JSON object.
     pub arguments: serde_json::Value,
+    /// Optional thought signature from the AI model (required by some providers like Gemini).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Definition of a tool that can be called by the AI.
