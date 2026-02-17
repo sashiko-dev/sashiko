@@ -366,6 +366,23 @@ impl Reviewer {
                 let commit_sha = patch_commits.get(index).cloned();
                 let baseline_ref = resolution.as_str();
 
+                if let Some(sha) = &commit_sha {
+                    if let Ok(true) = worktree.is_merge_commit(sha).await {
+                        info!(
+                            "Skipping review for merge commit {} (ps={} idx={})",
+                            sha, patchset_id, index
+                        );
+                        continue;
+                    }
+                    if let Ok(true) = worktree.is_empty_commit(sha).await {
+                        info!(
+                            "Skipping review for empty commit {} (ps={} idx={})",
+                            sha, patchset_id, index
+                        );
+                        continue;
+                    }
+                }
+
                 match Self::process_patch_review(
                     &ctx,
                     patchset_id,

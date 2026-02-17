@@ -179,6 +179,36 @@ impl GitWorktree {
         }
     }
 
+    pub async fn is_merge_commit(&self, hash: &str) -> Result<bool> {
+        let output = Command::new("git")
+            .current_dir(&self.path)
+            .args(["rev-list", "--parents", "-n", "1", hash])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow!("git rev-list failed"));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Output: commit parent1 parent2 ...
+        let parts: Vec<&str> = stdout.split_whitespace().collect();
+        Ok(parts.len() > 2)
+    }
+
+    pub async fn is_empty_commit(&self, hash: &str) -> Result<bool> {
+        let output = Command::new("git")
+            .current_dir(&self.path)
+            .args(["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", hash])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow!("git diff-tree failed"));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.trim().is_empty())
+    }
+
     pub async fn reset_hard(&self, ref_name: &str) -> Result<()> {
         info!("Resetting worktree to {}", ref_name);
         let output = Command::new("git")
@@ -858,6 +888,72 @@ mod tests {
         assert!(err_msg.contains("stderr:"));
         assert!(err_msg.contains("git am failed"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_and_empty_commit_detection() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        // Init git repo
+        Command::new("git").current_dir(&repo_path).args(["init"]).output().await?;
+        let _ = Command::new("git").current_dir(&repo_path).args(["branch", "-m", "master"]).output().await;
+        Command::new("git").current_dir(&repo_path).args(["config", "user.email", "test@example.com"]).output().await?;
+        Command::new("git").current_dir(&repo_path).args(["config", "user.name", "Test User"]).output().await?;
+
+        // 1. Initial commit
+        let file_path = repo_path.join("test.txt");
+        {
+             let mut file = File::create(&file_path)?;
+             writeln!(file, "Initial content")?;
+        }
+        Command::new("git").current_dir(&repo_path).args(["add", "."]).output().await?;
+        Command::new("git").current_dir(&repo_path).args(["commit", "-m", "Initial commit"]).output().await?;
+        
+        let initial_hash = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // 2. Create a branch and add a commit
+        Command::new("git").current_dir(&repo_path).args(["checkout", "-b", "feature"]).output().await?;
+        {
+             let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
+             writeln!(file, "Feature content")?;
+        }
+        Command::new("git").current_dir(&repo_path).args(["commit", "-am", "Feature commit"]).output().await?;
+        let feature_hash = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // 3. Back to master and add a commit
+        Command::new("git").current_dir(&repo_path).args(["checkout", "master"]).output().await?;
+        let other_file = repo_path.join("other.txt");
+        {
+             let mut file = File::create(&other_file)?;
+             writeln!(file, "Other content")?;
+        }
+        Command::new("git").current_dir(&repo_path).args(["add", "."]).output().await?;
+        Command::new("git").current_dir(&repo_path).args(["commit", "-m", "Master commit"]).output().await?;
+        let master_hash = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // 4. Merge feature into master
+        Command::new("git").current_dir(&repo_path).args(["merge", "feature", "--no-ff", "-m", "Merge commit"]).output().await?;
+        let merge_hash = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // 5. Create an empty commit
+        Command::new("git").current_dir(&repo_path).args(["commit", "--allow-empty", "-m", "Empty commit"]).output().await?;
+        let empty_hash = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // Use GitWorktree to inspect
+        let worktree = GitWorktree::new(&repo_path, &merge_hash, None).await?;
+
+        // Check Merge Commit
+        assert!(worktree.is_merge_commit(&merge_hash).await?, "Should be a merge commit");
+        assert!(!worktree.is_merge_commit(&initial_hash).await?, "Initial should not be merge");
+        assert!(!worktree.is_merge_commit(&feature_hash).await?, "Feature should not be merge");
+        assert!(!worktree.is_merge_commit(&master_hash).await?, "Master should not be merge");
+        
+        // Check Empty Commit
+        assert!(worktree.is_empty_commit(&empty_hash).await?, "Should be empty commit");
+        assert!(!worktree.is_empty_commit(&initial_hash).await?, "Initial should not be empty");
+        
         Ok(())
     }
 }
