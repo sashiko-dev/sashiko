@@ -204,19 +204,7 @@ impl FetchAgent {
                         continue;
                     }
 
-                    if count > 100 {
-                        let _ = self
-                            .main_tx
-                            .send(Event::IngestionFailed {
-                                article_id: range.clone(),
-                                error: format!(
-                                    "Git range contains {} commits, which exceeds the limit of 100",
-                                    count
-                                ),
-                            })
-                            .await;
-                        continue;
-                    }
+
 
                     // 2. Get list of SHAs
                     let list_output = Command::new("git")
