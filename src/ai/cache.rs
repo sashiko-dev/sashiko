@@ -207,7 +207,7 @@ mod tests {
             .unwrap()
             .take()
             .expect("create_context_cache not called");
-        assert!(request.messages.len() > 0);
+        assert!(!request.messages.is_empty());
     }
 
     #[tokio::test]

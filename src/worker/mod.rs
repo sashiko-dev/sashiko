@@ -12,6 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+fn find_json_candidates(text: &str) -> Vec<Value> {
+    let mut candidates = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '{' {
+            if let Some(end) = find_matching_brace(&chars, i) {
+                let candidate: String = chars[i..=end].iter().collect();
+                if let Ok(v) = serde_json::from_str(&candidate) {
+                    candidates.push(v);
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    candidates
+}
+
+fn find_matching_brace(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, c) in chars.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if *c == '\\' {
+                escape = true;
+            } else if *c == '"' {
+                in_string = false;
+            }
+        } else if *c == '"' {
+            in_string = true;
+        } else if *c == '{' {
+            depth += 1;
+        } else if *c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
 #[cfg(test)]
 mod integration_test;
 pub mod prompts;
@@ -330,44 +378,6 @@ impl Worker {
                 });
             }
 
-            let response_schema = json!({
-                "type": "object",
-                "properties": {
-                    "summary": { "type": "string", "description": "High-level summary of the original change being reviewed." },
-                    "review_inline": {
-                        "type": "string",
-                        "description": "The full content of the inline review (formatted according to inline-template.md). This MUST be populated if there are any findings."
-                    },
-                    "findings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "severity": {
-                                    "type": "string",
-                                    "enum": ["Low", "Medium", "High", "Critical"],
-                                    "description": "Severity of the finding."
-                                },
-                                "severity_explanation": {
-                                    "type": "string",
-                                    "description": "Concise explanation (e.g. 'memory leak on a hot path' or 'use after free can cause a memory corruption')."
-                                },
-                                "problem": {
-                                    "type": "string",
-                                    "description": "Description of the problem."
-                                },
-                                "suggestion": {
-                                    "type": "string",
-                                    "description": "Suggested fix."
-                                }
-                            },
-                            "required": ["severity", "severity_explanation", "problem"]
-                        }
-                    }
-                },
-                "required": ["summary", "findings"]
-            });
-
             // Enforce token budget by pruning
             let (before, after) = self.prune_history(&Some(system_message.clone()));
             final_history_before_pruning = before;
@@ -384,9 +394,7 @@ impl Worker {
                 tools: Some(self.tools.get_declarations_generic()),
                 temperature: Some(self.temperature),
                 preloaded_context: self.cache_name.clone(),
-                response_format: Some(AiResponseFormat::Json {
-                    schema: Some(response_schema),
-                }),
+                response_format: None,
             };
 
             let resp = match self.provider.generate_content(request).await {
@@ -767,57 +775,4 @@ mod tests {
             Some("base..sha2_resolved".to_string())
         );
     }
-}
-
-fn find_json_candidates(text: &str) -> Vec<Value> {
-    let mut candidates = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i] == '{' {
-            if let Some(end) = find_matching_brace(&chars, i) {
-                let candidate: String = chars[i..=end].iter().collect();
-                if let Ok(v) = serde_json::from_str(&candidate) {
-                    candidates.push(v);
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    candidates
-}
-
-fn find_matching_brace(chars: &[char], start: usize) -> Option<usize> {
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape = false;
-
-    for i in start..chars.len() {
-        let c = chars[i];
-
-        if in_string {
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-        } else {
-            if c == '"' {
-                in_string = true;
-            } else if c == '{' {
-                depth += 1;
-            } else if c == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-        }
-    }
-    None
 }

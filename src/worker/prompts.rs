@@ -20,7 +20,23 @@ use tokio::fs;
 /// System identity prompt - used across all AI interactions
 pub const SYSTEM_IDENTITY: &str = "You're an expert Linux kernel developer and upstream maintainer with deep knowledge of Linux kernel, Operating Systems, CPU architectures, modern hardware and Linux kernel community standards and processes.";
 
-pub const OUTPUT_FORMAT_INSTRUCTION: &str = "Important: `review_inline` field of the final output *MUST* follow the format and guidelines provided in `inline-template.md`.";
+pub const OUTPUT_FORMAT_INSTRUCTION: &str = r#"Important: `review_inline` field of the final output *MUST* follow the format and guidelines provided in `inline-template.md`.
+
+When you are completely finished with your investigation and have no more tools to call, output the final result strictly as a JSON object matching this schema:
+```json
+{
+  "summary": "High-level summary of the original change being reviewed.",
+  "review_inline": "The full content of the inline review (formatted according to inline-template.md). This MUST be populated if there are any findings.",
+  "findings": [
+    {
+      "severity": "Low|Medium|High|Critical",
+      "severity_explanation": "Concise explanation (e.g. 'memory leak on a hot path')",
+      "problem": "Description of the problem",
+      "suggestion": "Suggested fix"
+    }
+  ]
+}
+```"#;
 
 pub struct PromptRegistry {
     base_dir: PathBuf,
