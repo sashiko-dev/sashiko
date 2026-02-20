@@ -89,32 +89,37 @@ mod tests {
         let client = Arc::new(MultiTurnMockClient::new(vec![
             // 1. Exploration Stage
             create_tool_response(
-                "cmd_submit_exploration",
+                "cmd_submit_results",
                 json!({
-                    "hypotheses": [{"problem_description": "Possible NULL deref", "potential_impact": "Panic"}],
-                    "exploration_complete": true
+                    "json_text": json!({
+                        "hypotheses": [{"id": 1, "problem_description": "Possible NULL deref", "potential_impact": "Panic"}],
+                        "exploration_complete": true
+                    }).to_string()
                 }),
             ),
             // 2. Verification Stage
             create_tool_response(
-                "cmd_submit_verification",
+                "cmd_submit_results",
                 json!({
-                    "verifications": [{"evidence": "Path X leads to NULL", "suggestion": "Add check", "is_confirmed": true}],
-                    "verification_complete": true
+                    "json_text": json!({
+                        "verifications": [{"evidence": "Path X leads to NULL", "suggestion": "Add check", "is_confirmed": true, "hypothesis_id": 1}],
+                        "verification_complete": true
+                    }).to_string()
                 }),
             ),
             // 3. Reporting Stage
             create_tool_response(
-                "cmd_submit_report",
+                "cmd_submit_results",
                 json!({
-                    "findings": [{
-                        "problem": "Confirmed NULL deref",
-                        "suggestion": "Fix it",
-                        "severity_explanation": "HOT path",
-                        "severity": "High"
-                    }],
-                    "summary": "Found one bug",
-                    "review_inline": "commit 123
+                    "json_text": json!({
+                        "findings": [{
+                            "problem": "Confirmed NULL deref",
+                            "suggestion": "Fix it",
+                            "severity_explanation": "HOT path",
+                            "severity": "High"
+                        }],
+                        "summary": "Found one bug",
+                        "review_inline": "commit 123
 Author: Me
 
 Summary
@@ -122,6 +127,7 @@ Summary
 > diff
 
 Fix it"
+                    }).to_string()
                 }),
             ),
         ]));
@@ -154,24 +160,28 @@ Fix it"
         let client = Arc::new(MultiTurnMockClient::new(vec![
             // 1. Exploration Stage - No findings
             create_tool_response(
-                "cmd_submit_exploration",
+                "cmd_submit_results",
                 json!({
-                    "hypotheses": [],
-                    "exploration_complete": true
+                    "json_text": json!({
+                        "hypotheses": [],
+                        "exploration_complete": true
+                    }).to_string()
                 }),
             ),
             // 2. Reporting Stage - Generates report directly
             create_tool_response(
-                "cmd_submit_report",
+                "cmd_submit_results",
                 json!({
-                    "findings": [],
-                    "summary": "Clean patch",
-                    "review_inline": "commit 123
+                    "json_text": json!({
+                        "findings": [],
+                        "summary": "Clean patch",
+                        "review_inline": "commit 123
 Author: Me
 
 Summary
 
 Clean!"
+                    }).to_string()
                 }),
             ),
         ]));

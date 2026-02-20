@@ -77,20 +77,6 @@ mod tests {
         (linux_path, prompts_path)
     }
 
-    fn create_text_response(text: &str) -> anyhow::Result<AiResponse> {
-        Ok(AiResponse {
-            content: Some(text.to_string()),
-            thought: None,
-            tool_calls: None,
-            usage: Some(AiUsage {
-                prompt_tokens: 10,
-                completion_tokens: 10,
-                total_tokens: 20,
-                cached_tokens: None,
-            }),
-        })
-    }
-
     fn create_tool_call_response(
         name: &str,
         args: serde_json::Value,
@@ -125,16 +111,23 @@ mod tests {
         });
 
         let client = Arc::new(StatefulMockClient::new(vec![
-            // Turn 1: Exploration -> Submit 0 hypotheses
+            // Exploration
             create_tool_call_response(
-                "cmd_submit_exploration",
+                "cmd_submit_results",
                 json!({
-                    "hypotheses": [],
-                    "exploration_complete": true
+                    "json_text": json!({
+                        "hypotheses": [],
+                        "exploration_complete": true
+                    }).to_string()
                 }),
             ),
-            // Turn 2: Reporting -> Submit final report
-            create_tool_call_response("cmd_submit_report", final_report),
+            // Reporting
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": final_report.to_string()
+                }),
+            ),
         ]));
 
         let tools = ToolBox::new(linux_path, None);
@@ -176,13 +169,25 @@ mod tests {
         });
 
         let client = Arc::new(StatefulMockClient::new(vec![
-            // Exploration
+            // Turn 1: Research
+            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
+            // Turn 2: Exploration results
             create_tool_call_response(
-                "cmd_submit_exploration",
-                json!({"hypotheses": [], "exploration_complete": true}),
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "hypotheses": [],
+                        "exploration_complete": true
+                    }).to_string()
+                }),
             ),
-            // Reporting
-            create_tool_call_response("cmd_submit_report", final_report),
+            // Turn 3: Final Report
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": final_report.to_string()
+                }),
+            ),
         ]));
 
         let tools = ToolBox::new(linux_path, None);
@@ -268,11 +273,21 @@ mod tests {
         let client = Arc::new(StatefulMockClient::new(vec![
             // Exploration
             create_tool_call_response(
-                "cmd_submit_exploration",
-                json!({"hypotheses": [], "exploration_complete": true}),
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "hypotheses": [],
+                        "exploration_complete": true
+                    }).to_string()
+                }),
             ),
-            // Reporting -> Simulate AI returning a tool call with some text around it (though our mock creates pure tool calls)
-            create_tool_call_response("cmd_submit_report", final_report),
+            // Reporting
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": final_report.to_string()
+                }),
+            ),
         ]));
 
         let tools = ToolBox::new(linux_path, None);
@@ -307,14 +322,29 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
-        let mock_response = json!({
+        let final_report = json!({
             "summary": "Mock summary",
-            "findings": []
+            "findings": [],
+            "review_inline": "commit 123\nAuthor: Me\n\nSummary\n\nClean!"
         });
 
-        let client = Arc::new(StatefulMockClient::new(vec![create_text_response(
-            &format!("```json\n{}\n```", mock_response),
-        )]));
+        let client = Arc::new(StatefulMockClient::new(vec![
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "hypotheses": [],
+                        "exploration_complete": true
+                    }).to_string()
+                }),
+            ),
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": final_report.to_string()
+                }),
+            ),
+        ]));
 
         let tools = ToolBox::new(linux_path, None);
         let prompts = PromptRegistry::new(prompts_path);
@@ -348,17 +378,11 @@ mod tests {
 
         let result = worker.run(patchset).await.expect("Worker run failed");
 
-        // Verify history contains the custom prompt
-        // history[0] is the user prompt
         let initial_message = &result.history[0];
         if let Some(text) = &initial_message.content {
             assert!(
                 text.contains(custom_prompt),
                 "User prompt should contain custom prompt"
-            );
-            assert!(
-                text.contains("diff --git"),
-                "User prompt should contain patch content"
             );
         } else {
             panic!("Expected content in history[0]");

@@ -209,75 +209,14 @@ impl ToolBox {
                 }),
             },
             AiTool {
-                name: "cmd_submit_exploration".to_string(),
-                description: "Submit the list of hypotheses generated during the exploration stage.".to_string(),
+                name: "cmd_submit_results".to_string(),
+                description: "Submit the structured results for the current stage. This tool MUST be called to progress to the next stage or to finish the review.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "hypotheses": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "problem_description": { "type": "string", "description": "Clear description of a potential regression or edge case." },
-                                    "potential_impact": { "type": "string", "description": "The possible technical impact if this hypothesis is true." }
-                                },
-                                "required": ["problem_description", "potential_impact"]
-                            }
-                        },
-                        "exploration_complete": { "type": "boolean", "description": "Set to true to signal that the exploration stage is finished." }
+                        "json_text": { "type": "string", "description": "The raw JSON string containing the findings for this stage." }
                     },
-                    "required": ["hypotheses", "exploration_complete"]
-                }),
-            },
-            AiTool {
-                name: "cmd_submit_verification".to_string(),
-                description: "Submit the research results for the hypothesized regressions.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "verifications": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "evidence": { "type": "string", "description": "Detailed technical evidence, trace, or code path proving/disproving the finding." },
-                                    "suggestion": { "type": "string", "description": "The potential fix or mitigation for the confirmed regression." },
-                                    "is_confirmed": { "type": "boolean", "description": "True if the regression is confirmed, False if disproven." },
-                                    "hypothesis_id": { "type": "string", "description": "Optional: reference to the original hypothesis ID." }
-                                },
-                                "required": ["evidence", "suggestion", "is_confirmed"]
-                            }
-                        },
-                        "verification_complete": { "type": "boolean", "description": "Set to true to signal that research is exhausted." }
-                    },
-                    "required": ["verifications", "verification_complete"]
-                }),
-            },
-            AiTool {
-                name: "cmd_submit_report".to_string(),
-                description: "Submit the final review report containing confirmed findings and a summary.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "findings": {
-                            "type": "array",
-                            "description": "List of confirmed regressions. Must be provided before the summary to ensure bottom-up reasoning.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "problem": { "type": "string", "description": "Detailed description of the bug." },
-                                    "suggestion": { "type": "string", "description": "How to fix it." },
-                                    "severity_explanation": { "type": "string", "description": "Justification for the severity based on the escalation protocol." },
-                                    "severity": { "type": "string", "enum": ["Low", "Medium", "High", "Critical"] }
-                                },
-                                "required": ["problem", "suggestion", "severity_explanation", "severity"]
-                            }
-                        },
-                        "summary": { "type": "string", "description": "High-level summary of the patch review." },
-                        "review_inline": { "type": "string", "description": "The final formatted review text following inline-template.md." }
-                    },
-                    "required": ["findings", "summary", "review_inline"]
+                    "required": ["json_text"]
                 }),
             },
         ];

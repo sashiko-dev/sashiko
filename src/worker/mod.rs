@@ -21,13 +21,13 @@ pub mod tools;
 #[cfg(test)]
 mod tools_test;
 
-use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
+use crate::ai::{AiMessage, AiProvider, AiRequest, AiRole};
 use crate::worker::prompts::{PromptRegistry, ReviewStage};
 use crate::worker::tools::ToolBox;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct Worker {
     provider: Arc<dyn AiProvider>,
@@ -200,7 +200,7 @@ impl Worker {
             tools: Some(self.tools.get_declarations_generic()),
             temperature: Some(self.temperature),
             preloaded_context: self.cache_name.clone(),
-            response_format: Some(AiResponseFormat::Json { schema: None }),
+            response_format: None,
         };
 
         self.provider.estimate_tokens(&request)
@@ -351,7 +351,7 @@ impl Worker {
                 tools: Some(self.tools.get_declarations_generic()),
                 temperature: Some(self.temperature),
                 preloaded_context: self.cache_name.clone(),
-                response_format: None, // Always standard text/tool mode for cache prefix stability
+                response_format: None,
             };
 
             let resp = match self.provider.generate_content(request).await {
@@ -392,72 +392,100 @@ impl Worker {
                 for call in tool_calls {
                     debug!("Tool Call: {} args: {}", call.function_name, call.arguments);
 
-                    // Stage Completion Interception
-                    match call.function_name.as_str() {
-                        "cmd_submit_exploration" => {
-                            if current_stage == ReviewStage::Exploration {
-                                let hypotheses_len = call.arguments["hypotheses"]
-                                    .as_array()
-                                    .map(|a| a.len())
-                                    .unwrap_or(0);
-                                if hypotheses_len == 0 {
-                                    info!("No hypotheses submitted. Skipping to Reporting.");
+                    // Submission Interception
+                    if call.function_name == "cmd_submit_results" {
+                        let json_text = call.arguments["json_text"].as_str().unwrap_or("{}");
+                        let json_val: Value = match serde_json::from_str(json_text) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tool_responses.push(AiMessage {
+                                    role: AiRole::Tool,
+                                    content: Some(
+                                        json!({ "error": format!("Invalid JSON submitted: {}", e) })
+                                            .to_string(),
+                                    ),
+                                    thought: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(call.id.clone()),
+                                });
+                                continue;
+                            }
+                        };
+
+                        match current_stage {
+                            ReviewStage::Exploration => {
+                                if json_val["exploration_complete"].as_bool().unwrap_or(false) {
+                                    let hypotheses_len = json_val["hypotheses"]
+                                        .as_array()
+                                        .map(|a| a.len())
+                                        .unwrap_or(0);
+                                    if hypotheses_len == 0 {
+                                        info!("No hypotheses submitted. Skipping to Reporting.");
+                                        current_stage = ReviewStage::Reporting;
+                                        self.history.push(AiMessage {
+                                            role: AiRole::User,
+                                            content: Some(
+                                                self.prompts.get_reporting_instructions().await?,
+                                            ),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        });
+                                    } else {
+                                        current_stage = ReviewStage::Verification;
+                                        self.history.push(AiMessage {
+                                            role: AiRole::User,
+                                            content: Some(
+                                                self.prompts
+                                                    .get_verification_instructions()
+                                                    .await?,
+                                            ),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        });
+                                    }
+                                    tool_responses.push(AiMessage {
+                                        role: AiRole::Tool,
+                                        content: Some(
+                                            json!({ "status": "exploration_results_received" })
+                                                .to_string(),
+                                        ),
+                                        thought: None,
+                                        tool_calls: None,
+                                        tool_call_id: Some(call.id.clone()),
+                                    });
+                                    continue;
+                                }
+                            }
+                            ReviewStage::Verification => {
+                                if json_val["verification_complete"].as_bool().unwrap_or(false) {
                                     current_stage = ReviewStage::Reporting;
                                     self.history.push(AiMessage {
                                         role: AiRole::User,
-                                        content: Some(self.prompts.get_stage_reporting_prompt()),
+                                        content: Some(
+                                            self.prompts.get_reporting_instructions().await?,
+                                        ),
                                         thought: None,
                                         tool_calls: None,
                                         tool_call_id: None,
                                     });
-                                } else {
-                                    current_stage = ReviewStage::Verification;
-                                    self.history.push(AiMessage {
-                                        role: AiRole::User,
-                                        content: Some(self.prompts.get_stage_verification_prompt()),
+                                    tool_responses.push(AiMessage {
+                                        role: AiRole::Tool,
+                                        content: Some(
+                                            json!({ "status": "verification_results_received" })
+                                                .to_string(),
+                                        ),
                                         thought: None,
                                         tool_calls: None,
-                                        tool_call_id: None,
+                                        tool_call_id: Some(call.id.clone()),
                                     });
+                                    continue;
                                 }
-                                tool_responses.push(AiMessage {
-                                    role: AiRole::Tool,
-                                    content: Some(
-                                        json!({ "status": "exploration_received" }).to_string(),
-                                    ),
-                                    thought: None,
-                                    tool_calls: None,
-                                    tool_call_id: Some(call.id.clone()),
-                                });
-                                continue;
                             }
-                        }
-                        "cmd_submit_verification" => {
-                            if current_stage == ReviewStage::Verification {
-                                current_stage = ReviewStage::Reporting;
-                                self.history.push(AiMessage {
-                                    role: AiRole::User,
-                                    content: Some(self.prompts.get_stage_reporting_prompt()),
-                                    thought: None,
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                });
-                                tool_responses.push(AiMessage {
-                                    role: AiRole::Tool,
-                                    content: Some(
-                                        json!({ "status": "verification_received" }).to_string(),
-                                    ),
-                                    thought: None,
-                                    tool_calls: None,
-                                    tool_call_id: Some(call.id.clone()),
-                                });
-                                continue;
-                            }
-                        }
-                        "cmd_submit_report" => {
-                            if current_stage == ReviewStage::Reporting {
-                                let findings = call.arguments["findings"].as_array();
-                                let review_inline = call.arguments["review_inline"].as_str();
+                            ReviewStage::Reporting => {
+                                let findings = json_val["findings"].as_array();
+                                let review_inline = json_val["review_inline"].as_str();
 
                                 if findings.is_some_and(|f| !f.is_empty()) {
                                     if review_inline.is_none()
@@ -487,7 +515,7 @@ impl Worker {
                                 }
 
                                 return Ok(WorkerResult {
-                                    output: Some(call.arguments.clone()),
+                                    output: Some(json_val),
                                     error: None,
                                     input_context,
                                     history: self.history.clone(),
@@ -499,7 +527,6 @@ impl Worker {
                                 });
                             }
                         }
-                        _ => {}
                     }
 
                     // Loop Detection
@@ -541,6 +568,32 @@ impl Worker {
                 }
                 self.history.extend(tool_responses);
                 continue;
+            }
+
+            // The "Passive Loop" / "System Nudge" Logic
+            if resp.content.is_some() {
+                let nudge = format!("Error: You provided a conversational response without calling a tool. 
+Please either use a tool (like `read_files` or `search_file_content`) to conduct research, or call `cmd_submit_results` with your findings to finish the current stage ({:?}).", current_stage);
+                warn!("AI returned text only. Nudging agent to use tools.");
+                self.history.push(AiMessage {
+                    role: AiRole::User,
+                    content: Some(nudge),
+                    thought: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            } else {
+                return Ok(WorkerResult {
+                    output: None,
+                    error: Some("AI returned neither content nor tool calls".to_string()),
+                    input_context,
+                    history: self.history.clone(),
+                    history_before_pruning: final_history_before_pruning,
+                    history_after_pruning: final_history_after_pruning,
+                    tokens_in: total_tokens_in,
+                    tokens_out: total_tokens_out,
+                    tokens_cached: total_tokens_cached,
+                });
             }
         }
     }
