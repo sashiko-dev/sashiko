@@ -172,13 +172,16 @@ Once you have exhausted your research, set `verification_complete` to true.".to_
     }
 
     pub fn get_stage_reporting_prompt(&self) -> String {
-        format!("STAGE 3: REPORTING.
+        format!(
+            "STAGE 3: REPORTING.
 Review your confirmed findings from the verification stage. 
 Apply the `severity.md` escalation protocol to each confirmed regression. 
 Provide the mandatory justification for the assigned severity. 
 Finally, generate the final JSON output following the provided schema.
 
-{}", OUTPUT_FORMAT_INSTRUCTION)
+{}",
+            OUTPUT_FORMAT_INSTRUCTION
+        )
     }
 
     async fn append_file(&self, buffer: &mut String, filename: &str) -> Result<()> {
@@ -355,7 +358,7 @@ mod tests {
         assert!(!prompt.contains(SYSTEM_IDENTITY));
         assert!(prompt.contains("Load the protocol from `review-core.md`"));
         assert!(!prompt.contains("Refer to the protocol in the pre-loaded context"));
-        assert!(prompt.contains("Important: `review_inline` field"));
+        assert!(prompt.contains("STAGE 1: EXPLORATION"));
     }
 
     #[tokio::test]

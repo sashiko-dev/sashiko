@@ -7,51 +7,55 @@ Currently, Sashiko sends a single, comprehensive prompt to the AI agent ("do eve
 3. **Inconsistent Severity**: Severity is often assigned before the full impact is researched, leading to "severity inflation" or random guesses.
 
 ## Proposed Solution
-Transition from a "one-shot" interaction to a programmatic, multi-turn orchestration led by the `Worker`. The review process will be broken into discrete stages, each enforced by a **Stage-Specific JSON Schema**.
+Transition from a "one-shot" interaction to a programmatic, multi-turn orchestration led by the `Worker`. The review process will be broken into discrete stages, each enforced by a **Stage-Specific Submission Tool**.
+
+To preserve **Gemini/Claude Context Caching**, the AI `response_format` will remain static (Generic JSON or Text), while the structured output will be delivered via constant tool definitions.
+
+## Bottom-Up Reasoning (Anti-Bullshit Protocol)
+To prevent the agent from "anchoring" on a guess, all submission tools will require fields in an order that forces reasoning before conclusion:
+1. **Evidence/Problem**: What is actually wrong?
+2. **Mitigation/Suggestion**: How would we fix it? (Thinking about the fix often reveals the bug is minor).
+3. **Justification**: Why does this meet a specific escalation gate?
+4. **Severity/Summary**: The final label/overview.
 
 ## Interaction Stages
 
-### Stage 1: Hypothesis Generation (The "Exploration" Phase)
-* **Goal**: Force the agent to consider every possible way the patch could fail before verifying any of them.
-* **Schema**: 
-  ```json
-  {
-    "hypotheses": [{"id": 1, "description": "...", "potential_impact": "..."}],
-    "exploration_complete": true
-  }
-  ```
-* **Worker Logic**: Injects the exploration prompt. 
-  * **Early Exit**: If `hypotheses` is empty and `exploration_complete` is `true`, the Worker jumps directly to Stage 3 (Reporting) to generate a "Clean" summary.
+### Stage 1: Hypothesis Generation (`cmd_submit_exploration`)
+* **Goal**: Brainstorm potential failure modes.
+* **Tool Parameters**:
+  - `hypotheses`: List of `{ problem_description, potential_impact }`.
+  - `exploration_complete`: Boolean.
 
-### Stage 2: Research & Verification (The "Deep Dive" Phase)
-* **Goal**: Systematically prove or disprove hypotheses, and allow for serendipitous discovery of new issues.
-* **Schema**:
-  ```json
-  {
-    "verifications": [
-      {"hypothesis_id": 1, "status": "confirmed/disproven", "proof": "..."},
-      {"id": "serendipitous_N", "status": "confirmed", "problem": "...", "proof": "..."}
-    ],
-    "verification_complete": true
-  }
-  ```
-* **Worker Logic**: Injects the verification prompt. The agent is explicitly told it can add new findings not listed in the exploration phase.
-  * **Early Exit**: If all `verifications` have status `disproven` and no new findings are added, the Worker jumps to reporting with "no findings".
+### Stage 2: Research & Verification (`cmd_submit_verification`)
+* **Goal**: Systematically prove or disprove hypotheses.
+* **Tool Parameters**:
+  - `verifications`: List of:
+    - `evidence`: Detailed trace or code proof.
+    - `suggestion`: Potential fix.
+    - `is_confirmed`: Boolean.
+    - `hypothesis_id`: Link to stage 1.
+  - `verification_complete`: Boolean.
 
-### Stage 3: Severity & Final Report (The "Reporting" Phase)
-* **Goal**: Consolidate confirmed regressions and apply the `severity.md` Escalation Protocol.
-* **Schema**: Existing `summary`, `findings`, and `review_inline` structure.
-* **Worker Logic**: Injects the reporting prompt. 
+### Stage 3: Severity & Final Report (`cmd_submit_report`)
+* **Goal**: Final consolidation using the `severity.md` protocol.
+* **Tool Parameters**:
+  - `findings`: List of:
+    - `problem`: The technical defect.
+    - `suggestion`: The fix.
+    - `severity_explanation`: Why it meets the escalation gate.
+    - `severity`: The final label (**Low/Medium/High/Critical**).
+  - `summary`: High-level overview of the patch (generated *after* findings).
+  - `review_inline`: Final formatted text.
 
 ## Technical Changes
 
 ### 1. `PromptRegistry` (`src/worker/prompts.rs`)
-Added the `ReviewStage` enum to track the sequence.
+* Updated prompts to explicitly command the use of the new submission tools.
 
 ### 2. `Worker` (`src/worker/mod.rs`)
-* **Dynamic Schema Selection**: The `response_schema` in the loop is now determined by the current `ReviewStage`.
-* **State Progression**: The `Worker` will transition stages when the respective `complete` flag is detected in the JSON response.
-* **Parsing**: Use `serde_json` to validate and extract stage flags.
+* **Static Schema**: The `response_format` in `AiRequest` will be set to a static "Submission Schema" or standard `Text` mode to ensure the context prefix remains identical across all turns, maximizing cache hits.
+* **Tool Interception**: The `Worker` will intercept calls to `cmd_submit_*` tools. These tools won't execute shell commands; they will serve as the "Return" statement for each stage.
+* **State Progression**: Stages transition upon successful call of the respective submission tool.
 
 ## Benefits
 * **Rigorous Discovery**: Hypotheses are documented before research begins.

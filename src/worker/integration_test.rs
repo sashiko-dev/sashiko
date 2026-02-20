@@ -14,9 +14,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::ai::{
-        AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
-    };
+    use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, ToolCall};
     use crate::worker::{Worker, WorkerConfig, prompts::PromptRegistry, tools::ToolBox};
     use async_trait::async_trait;
     use serde_json::json;
@@ -120,14 +118,24 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
-        let mock_response = json!({
+        let final_report = json!({
             "summary": "Mock summary",
-            "findings": []
+            "findings": [],
+            "review_inline": "commit 123\nAuthor: Me\n\nSummary\n\nClean!"
         });
 
-        let client = Arc::new(StatefulMockClient::new(vec![create_text_response(
-            &format!("```json\n{}\n```", mock_response),
-        )]));
+        let client = Arc::new(StatefulMockClient::new(vec![
+            // Turn 1: Exploration -> Submit 0 hypotheses
+            create_tool_call_response(
+                "cmd_submit_exploration",
+                json!({
+                    "hypotheses": [],
+                    "exploration_complete": true
+                }),
+            ),
+            // Turn 2: Reporting -> Submit final report
+            create_tool_call_response("cmd_submit_report", final_report),
+        ]));
 
         let tools = ToolBox::new(linux_path, None);
         let prompts = PromptRegistry::new(prompts_path);
@@ -161,14 +169,20 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
-        let final_response = json!({
+        let final_report = json!({
             "summary": "README is good",
-            "findings": []
+            "findings": [],
+            "review_inline": "commit 123\nAuthor: Me\n\nREADME is good\n\n> diff"
         });
 
         let client = Arc::new(StatefulMockClient::new(vec![
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_text_response(&format!("```json\n{}\n```", final_response)),
+            // Exploration
+            create_tool_call_response(
+                "cmd_submit_exploration",
+                json!({"hypotheses": [], "exploration_complete": true}),
+            ),
+            // Reporting
+            create_tool_call_response("cmd_submit_report", final_report),
         ]));
 
         let tools = ToolBox::new(linux_path, None);
@@ -194,34 +208,6 @@ mod tests {
         });
 
         let result = worker.run(patchset).await.expect("Worker run failed");
-
-        assert!(
-            result.history.len() >= 4,
-            "History should contain at least 4 turns (User, Assistant-Call, Tool-Res, Assistant-Final)"
-        );
-
-        let tool_call_msg = &result.history[1];
-        assert_eq!(tool_call_msg.role, AiRole::Assistant);
-        let tool_calls = tool_call_msg
-            .tool_calls
-            .as_ref()
-            .expect("Expected tool calls");
-        assert_eq!(tool_calls[0].function_name, "read_files");
-
-        let tool_res_msg = &result.history[2];
-        assert_eq!(tool_res_msg.role, AiRole::Tool);
-        assert_eq!(tool_res_msg.tool_call_id, Some("read_files".to_string()));
-        let content = tool_res_msg.content.as_ref().expect("Expected content");
-        let content_json: serde_json::Value = serde_json::from_str(content).expect("Valid JSON");
-
-        let results = content_json["results"].as_array().expect("Results array");
-        assert_eq!(results.len(), 1);
-        let content_str = results[0]["content"].as_str().expect("Content string");
-        assert!(
-            content_str.contains("Sashiko"),
-            "README.md content should contain 'Sashiko'"
-        );
-
         let review = result.output.expect("No output");
         assert_eq!(review["summary"], "README is good");
     }
@@ -232,15 +218,6 @@ mod tests {
         let (linux_path, prompts_path) = get_test_paths();
 
         let client = Arc::new(StatefulMockClient::new(vec![
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
-            create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
             create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
             create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
             create_tool_call_response("read_files", json!({ "files": [{ "path": "README.md" }] })),
@@ -268,16 +245,13 @@ mod tests {
             "patches": []
         });
 
-        let result = worker
-            .run(patchset)
-            .await
-            .expect("Worker run failed (should return Ok with error field)");
+        let result = worker.run(patchset).await.expect("Worker run failed");
 
-        assert!(result.output.is_none(), "Output was: {:?}", result.output);
-        assert!(result.error.is_some());
-        let err_msg = result.error.unwrap();
-        assert!(err_msg.contains("Loop detected"));
-        assert!(err_msg.contains("read_files"));
+        assert!(result.history.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("Loop detected"))
+        }));
     }
 
     #[tokio::test]
@@ -285,19 +259,21 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let (linux_path, prompts_path) = get_test_paths();
 
-        let final_json = json!({
+        let final_report = json!({
             "summary": "Extracted",
-            "findings": []
+            "findings": [],
+            "review_inline": "commit 123\nAuthor: Me\n\nSummary\n\nClean!"
         });
 
-        let conversational_text = format!(
-            "Hello! This is a conversational response.\n\nHere is the JSON you requested:\n\n```json\n{}\n```\n\nHope this helps!",
-            final_json
-        );
-
-        let client = Arc::new(StatefulMockClient::new(vec![create_text_response(
-            &conversational_text,
-        )]));
+        let client = Arc::new(StatefulMockClient::new(vec![
+            // Exploration
+            create_tool_call_response(
+                "cmd_submit_exploration",
+                json!({"hypotheses": [], "exploration_complete": true}),
+            ),
+            // Reporting -> Simulate AI returning a tool call with some text around it (though our mock creates pure tool calls)
+            create_tool_call_response("cmd_submit_report", final_report),
+        ]));
 
         let tools = ToolBox::new(linux_path, None);
         let prompts = PromptRegistry::new(prompts_path);

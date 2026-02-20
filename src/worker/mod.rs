@@ -12,59 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-fn find_json_candidates(text: &str) -> Vec<Value> {
-    let mut candidates = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i] == '{' {
-            if let Some(end) = find_matching_brace(&chars, i) {
-                let candidate: String = chars[i..=end].iter().collect();
-                let clean_candidate = crate::utils::clean_json_string(&candidate);
-                if let Ok(v) = serde_json::from_str(&clean_candidate)
-                    .or_else(|_| serde_json::from_str(&candidate))
-                {
-                    candidates.push(v);
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    candidates
-}
-
-fn find_matching_brace(chars: &[char], start: usize) -> Option<usize> {
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape = false;
-
-    for (i, c) in chars.iter().enumerate().skip(start) {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if *c == '\\' {
-                escape = true;
-            } else if *c == '"' {
-                in_string = false;
-            }
-        } else if *c == '"' {
-            in_string = true;
-        } else if *c == '{' {
-            depth += 1;
-        } else if *c == '}' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
 #[cfg(test)]
 mod integration_test;
+#[cfg(test)]
+mod multi_turn_test;
 pub mod prompts;
 pub mod tools;
 #[cfg(test)]
@@ -384,69 +335,6 @@ impl Worker {
                 });
             }
 
-            let response_schema = match current_stage {
-                ReviewStage::Exploration => json!({
-                    "type": "object",
-                    "properties": {
-                        "hypotheses": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": { "type": "integer" },
-                                    "description": { "type": "string" },
-                                    "potential_impact": { "type": "string" }
-                                },
-                                "required": ["id", "description", "potential_impact"]
-                            }
-                        },
-                        "exploration_complete": { "type": "boolean" }
-                    },
-                    "required": ["hypotheses", "exploration_complete"]
-                }),
-                ReviewStage::Verification => json!({
-                    "type": "object",
-                    "properties": {
-                        "verifications": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "hypothesis_id": { "type": "integer" },
-                                    "status": { "type": "string", "enum": ["confirmed", "disproven"] },
-                                    "problem": { "type": "string" },
-                                    "proof": { "type": "string" }
-                                },
-                                "required": ["status", "proof"]
-                            }
-                        },
-                        "verification_complete": { "type": "boolean" }
-                    },
-                    "required": ["verifications", "verification_complete"]
-                }),
-                ReviewStage::Reporting => json!({
-                    "type": "object",
-                    "properties": {
-                        "summary": { "type": "string" },
-                        "review_inline": { "type": "string" },
-                        "findings": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "severity": { "type": "string", "enum": ["Low", "Medium", "High", "Critical"] },
-                                    "severity_explanation": { "type": "string" },
-                                    "problem": { "type": "string" },
-                                    "suggestion": { "type": "string" }
-                                },
-                                "required": ["severity", "severity_explanation", "problem"]
-                            }
-                        }
-                    },
-                    "required": ["summary", "findings"]
-                }),
-            };
-
             // Enforce token budget by pruning
             let (before, after) = self.prune_history(&Some(system_message.clone()));
             final_history_before_pruning = before;
@@ -463,9 +351,7 @@ impl Worker {
                 tools: Some(self.tools.get_declarations_generic()),
                 temperature: Some(self.temperature),
                 preloaded_context: self.cache_name.clone(),
-                response_format: Some(AiResponseFormat::Json {
-                    schema: Some(response_schema),
-                }),
+                response_format: None, // Always standard text/tool mode for cache prefix stability
             };
 
             let resp = match self.provider.generate_content(request).await {
@@ -506,6 +392,116 @@ impl Worker {
                 for call in tool_calls {
                     debug!("Tool Call: {} args: {}", call.function_name, call.arguments);
 
+                    // Stage Completion Interception
+                    match call.function_name.as_str() {
+                        "cmd_submit_exploration" => {
+                            if current_stage == ReviewStage::Exploration {
+                                let hypotheses_len = call.arguments["hypotheses"]
+                                    .as_array()
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                if hypotheses_len == 0 {
+                                    info!("No hypotheses submitted. Skipping to Reporting.");
+                                    current_stage = ReviewStage::Reporting;
+                                    self.history.push(AiMessage {
+                                        role: AiRole::User,
+                                        content: Some(self.prompts.get_stage_reporting_prompt()),
+                                        thought: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                    });
+                                } else {
+                                    current_stage = ReviewStage::Verification;
+                                    self.history.push(AiMessage {
+                                        role: AiRole::User,
+                                        content: Some(self.prompts.get_stage_verification_prompt()),
+                                        thought: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                    });
+                                }
+                                tool_responses.push(AiMessage {
+                                    role: AiRole::Tool,
+                                    content: Some(
+                                        json!({ "status": "exploration_received" }).to_string(),
+                                    ),
+                                    thought: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(call.id.clone()),
+                                });
+                                continue;
+                            }
+                        }
+                        "cmd_submit_verification" => {
+                            if current_stage == ReviewStage::Verification {
+                                current_stage = ReviewStage::Reporting;
+                                self.history.push(AiMessage {
+                                    role: AiRole::User,
+                                    content: Some(self.prompts.get_stage_reporting_prompt()),
+                                    thought: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                });
+                                tool_responses.push(AiMessage {
+                                    role: AiRole::Tool,
+                                    content: Some(
+                                        json!({ "status": "verification_received" }).to_string(),
+                                    ),
+                                    thought: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(call.id.clone()),
+                                });
+                                continue;
+                            }
+                        }
+                        "cmd_submit_report" => {
+                            if current_stage == ReviewStage::Reporting {
+                                let findings = call.arguments["findings"].as_array();
+                                let review_inline = call.arguments["review_inline"].as_str();
+
+                                if findings.is_some_and(|f| !f.is_empty()) {
+                                    if review_inline.is_none()
+                                        || review_inline.unwrap().trim().is_empty()
+                                    {
+                                        tool_responses.push(AiMessage {
+                                            role: AiRole::Tool,
+                                            content: Some(json!({ "error": "Validation Error: 'findings' provided but 'review_inline' is missing." }).to_string()),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: Some(call.id.clone()),
+                                        });
+                                        continue;
+                                    }
+                                    if let Err(e) =
+                                        self.validate_review_inline(review_inline.unwrap())
+                                    {
+                                        tool_responses.push(AiMessage {
+                                            role: AiRole::Tool,
+                                            content: Some(json!({ "error": format!("Validation Error: {}", e) }).to_string()),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: Some(call.id.clone()),
+                                        });
+                                        continue;
+                                    }
+                                }
+
+                                return Ok(WorkerResult {
+                                    output: Some(call.arguments.clone()),
+                                    error: None,
+                                    input_context,
+                                    history: self.history.clone(),
+                                    history_before_pruning: final_history_before_pruning,
+                                    history_after_pruning: final_history_after_pruning,
+                                    tokens_in: total_tokens_in,
+                                    tokens_out: total_tokens_out,
+                                    tokens_cached: total_tokens_cached,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+
                     // Loop Detection
                     let same_call_count = session_tool_history
                         .iter()
@@ -514,7 +510,8 @@ impl Worker {
                     session_tool_history.push((call.function_name.clone(), call.arguments.clone()));
 
                     if same_call_count >= 2 {
-                        let error_msg = format!("Loop detected in tool usage. Proceed to next step.");
+                        let error_msg =
+                            format!("Loop detected in tool usage. Proceed to next step.");
                         tool_responses.push(AiMessage {
                             role: AiRole::Tool,
                             content: Some(json!({ "error": error_msg }).to_string()),
@@ -544,138 +541,6 @@ impl Worker {
                 }
                 self.history.extend(tool_responses);
                 continue;
-            }
-
-            if let Some(final_text) = resp.content {
-                // Try to clean up markdown code blocks if present
-                let mut clean_text = final_text.trim();
-                if let Some(start) = clean_text.find("```json\n") {
-                    let rest = &clean_text[start + 8..];
-                    if let Some(end) = rest.find("```") {
-                        clean_text = rest[..end].trim();
-                    }
-                } else if let Some(start) = clean_text.find("```\n") {
-                    let rest = &clean_text[start + 4..];
-                    if let Some(end) = rest.find("```") {
-                        clean_text = rest[..end].trim();
-                    }
-                }
-
-                let cleaned_json = crate::utils::clean_json_string(clean_text);
-                let json_val: Value = match serde_json::from_str(&cleaned_json)
-                    .or_else(|_| serde_json::from_str(clean_text))
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // Scan for JSON candidates as fallback
-                        let candidates = find_json_candidates(&final_text);
-                        let valid_candidate = candidates.into_iter().rev().find(|v| {
-                            match current_stage {
-                                ReviewStage::Exploration => v.get("hypotheses").is_some(),
-                                ReviewStage::Verification => v.get("verifications").is_some(),
-                                ReviewStage::Reporting => v.get("findings").is_some() || v.get("summary").is_some(),
-                            }
-                        });
-
-                        if let Some(v) = valid_candidate {
-                            v
-                        } else {
-                            return Ok(WorkerResult {
-                                output: None,
-                                error: Some(format!("Failed to parse JSON for stage {:?}: {}", current_stage, final_text)),
-                                input_context,
-                                history: self.history.clone(),
-                                history_before_pruning: final_history_before_pruning,
-                                history_after_pruning: final_history_after_pruning,
-                                tokens_in: total_tokens_in,
-                                tokens_out: total_tokens_out,
-                                tokens_cached: total_tokens_cached,
-                            });
-                        }
-                    }
-                };
-
-                match current_stage {
-                    ReviewStage::Exploration => {
-                        if json_val["exploration_complete"].as_bool().unwrap_or(false) {
-                            let hypotheses = json_val["hypotheses"].as_array().map(|a| a.len()).unwrap_or(0);
-                            if hypotheses == 0 {
-                                info!("No hypotheses generated. Jumping to Reporting.");
-                                current_stage = ReviewStage::Reporting;
-                                self.history.push(AiMessage {
-                                    role: AiRole::User,
-                                    content: Some(self.prompts.get_stage_reporting_prompt()),
-                                    thought: None,
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                });
-                            } else {
-                                current_stage = ReviewStage::Verification;
-                                self.history.push(AiMessage {
-                                    role: AiRole::User,
-                                    content: Some(self.prompts.get_stage_verification_prompt()),
-                                    thought: None,
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                });
-                            }
-                        }
-                    }
-                    ReviewStage::Verification => {
-                        if json_val["verification_complete"].as_bool().unwrap_or(false) {
-                            current_stage = ReviewStage::Reporting;
-                            self.history.push(AiMessage {
-                                role: AiRole::User,
-                                content: Some(self.prompts.get_stage_reporting_prompt()),
-                                thought: None,
-                                tool_calls: None,
-                                tool_call_id: None,
-                            });
-                        }
-                    }
-                    ReviewStage::Reporting => {
-                        // Validation logic for reporting
-                        if let Some(findings) = json_val["findings"].as_array() {
-                            if !findings.is_empty() {
-                                let review_inline = json_val.get("review_inline").and_then(|v| v.as_str());
-                                if review_inline.is_none() || review_inline.unwrap().trim().is_empty() {
-                                     let error_msg = "Validation Error: 'findings' were detected but 'review_inline' is missing. Please provide it.";
-                                     self.history.push(AiMessage {
-                                         role: AiRole::User,
-                                         content: Some(error_msg.to_string()),
-                                         thought: None,
-                                         tool_calls: None,
-                                         tool_call_id: None,
-                                     });
-                                     continue;
-                                }
-                                if let Err(e) = self.validate_review_inline(review_inline.unwrap()) {
-                                    let error_msg = format!("Validation Error: {}. Please retry.", e);
-                                    self.history.push(AiMessage {
-                                        role: AiRole::User,
-                                        content: Some(error_msg),
-                                        thought: None,
-                                        tool_calls: None,
-                                        tool_call_id: None,
-                                    });
-                                    continue;
-                                }
-                            }
-                        }
-
-                        return Ok(WorkerResult {
-                            output: Some(json_val),
-                            error: None,
-                            input_context,
-                            history: self.history.clone(),
-                            history_before_pruning: final_history_before_pruning,
-                            history_after_pruning: final_history_after_pruning,
-                            tokens_in: total_tokens_in,
-                            tokens_out: total_tokens_out,
-                            tokens_cached: total_tokens_cached,
-                        });
-                    }
-                }
             }
         }
     }
@@ -816,7 +681,7 @@ mod tests {
             author: None,
             date: None,
             message_id: None,
-            commit_id: None, // Missing in input
+            commit_id: None,
         };
         let p2 = PatchInput {
             index: 2,
@@ -825,15 +690,24 @@ mod tests {
             author: None,
             date: None,
             message_id: None,
-            commit_id: None, // Missing in input
+            commit_id: None,
         };
         let patches = vec![p1.clone(), p2.clone()];
-        let patches_to_review = vec![1.clone().into()]; // Fix test case
-        
+        let patches_to_review = vec![p1.clone()];
+
         let mut patch_shas = std::collections::HashMap::new();
         patch_shas.insert(2, "sha2_resolved".to_string());
 
-        // The test above was broken in original file too, let's fix it properly.
-        // Actually, the previous implementation was simpler.
+        assert_eq!(
+            calculate_series_range(&patches, &patches_to_review, &patch_shas, "base"),
+            Some("base..sha2_resolved".to_string())
+        );
+    }
+
+    #[test]
+    fn test_review_stage_transitions() {
+        assert_eq!(ReviewStage::Exploration as i32, 0);
+        // This is just a basic sanity check for the enum.
+        // Logic transitions are handled in Worker::run loop.
     }
 }
