@@ -287,7 +287,7 @@ async fn handle_status(client: &Client, base_url: &str, format: OutputFormat) ->
                     println!("\nQueue Breakdown:");
                     let items = [
                         ("Pending", "pending"),
-                        ("Reviewing", "reviewing"),
+                        ("In Review", "reviewing"),
                         ("Reviewed", "reviewed"),
                         ("Failed", "failed"),
                         ("Apply Failed", "failed_to_apply"),
