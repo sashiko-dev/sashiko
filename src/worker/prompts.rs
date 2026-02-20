@@ -111,9 +111,9 @@ impl PromptRegistry {
     }
 
     pub fn get_exploration_instructions(&self) -> String {
-        "STAGE 1: EXPLORATION.
-    Brainstorm every possible way this code could fail. Focus on edge cases, race conditions, and boundary violations. 
-    Do not verify them yet.
+        "Brainstorm every possible way this code could fail. Focus on edge cases, race conditions, and boundary violations. 
+    Don't read any files yet. I want you to figure be bold and focused. Give me all possible ways this code could break the kernel.
+
     Output your hypotheses as a JSON string using the `cmd_submit_results` tool.
 
     Expected JSON Structure:
@@ -130,13 +130,13 @@ impl PromptRegistry {
     }
 
     pub async fn get_verification_instructions(&self) -> Result<String> {
-        let mut content = "STAGE 2: VERIFICATION.
-    Now, using your available tools, systematically verify each hypothesis from the brainstorming phase. 
+        let mut content = "That is great.
+    Now, using your available tools, systematically verify each hypothesis from the brainstorming phase. Build your context, read the appropriate files, disregard hypothesis that have no base, and explore those that do.
 
-    INSTRUCTIONS:
+    So, I would like you to:
     1. For each hypothesis: Trace the execution flow and provide proof if it is a real regression.
     2. If you discover new, unexpected issues during research, include them in the `verifications` list.
-    3. Once research is exhausted, set `verification_complete` to true and submit via `cmd_submit_results`.
+    3. Once research is exhausted, set `verification_complete` to true and submit via `cmd_submit_results` (expected structure below).
 
     USE THESE PATTERNS FOR VERIFICATION:\n".to_string();
 
@@ -161,10 +161,9 @@ impl PromptRegistry {
     }
 
     pub async fn get_reporting_instructions(&self) -> Result<String> {
-        let mut content = "STAGE 3: REPORTING.
-    Consolidate your confirmed findings into a final report. 
+        let mut content = "Excellent! Finally, consolidate your confirmed findings into a final report. 
 
-    INSTRUCTIONS:
+    Instructions:
     1. Apply the provided `severity.md` escalation protocol to each confirmed regression.
     2. Use BOTTOM-UP REASONING: For each finding, document the technical problem and suggestion BEFORE assigning the severity label.
     3. Generate the final summary AFTER you have processed all findings.
@@ -280,7 +279,7 @@ mod tests {
         let prompt = registry.get_user_task_prompt(true, None).await.unwrap();
 
         assert!(prompt.contains("Refer to the `# review-philosophy.md` section"));
-        assert!(prompt.contains("STAGE 1: EXPLORATION"));
+        assert!(prompt.contains("Brainstorm every possible way"));
     }
 
     #[tokio::test]
@@ -290,7 +289,7 @@ mod tests {
         let prompt = registry.get_user_task_prompt(false, None).await.unwrap();
 
         assert!(prompt.contains("Load the `# review-philosophy.md`"));
-        assert!(prompt.contains("STAGE 1: EXPLORATION"));
+        assert!(prompt.contains("Brainstorm every possible way"));
     }
 
     #[tokio::test]
@@ -318,7 +317,7 @@ mod tests {
         let registry = PromptRegistry::new(temp_dir.path().to_path_buf());
         let instructions = registry.get_verification_instructions().await.unwrap();
 
-        assert!(instructions.contains("STAGE 2: VERIFICATION"));
+        assert!(instructions.contains("systematically verify each hypothesis"));
         assert!(instructions.contains("# Patterns"));
         assert!(instructions.contains("EH-001"));
     }
@@ -332,7 +331,7 @@ mod tests {
         let registry = PromptRegistry::new(temp_dir.path().to_path_buf());
         let instructions = registry.get_reporting_instructions().await.unwrap();
 
-        assert!(instructions.contains("STAGE 3: REPORTING"));
+        assert!(instructions.contains("consolidate your confirmed findings"));
         assert!(instructions.contains("# Severity"));
         assert!(instructions.contains("# Template"));
     }
