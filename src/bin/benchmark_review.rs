@@ -187,11 +187,11 @@ async fn process_entry(
     }
     let patch_id = patch_id.unwrap();
 
-    // 2. Find Review
+    // 2. Find the latest successful review
     let review_result = db
         .conn
         .query(
-            "SELECT id, summary, result_description FROM reviews WHERE patch_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT id, summary, result_description, status FROM reviews WHERE patch_id = ? ORDER BY id DESC LIMIT 1",
             libsql::params![patch_id],
         )
         .await;
@@ -202,7 +202,8 @@ async fn process_entry(
                 let id: i64 = row.get(0).unwrap_or_default();
                 let summary: Option<String> = row.get(1).ok();
                 let result_desc: Option<String> = row.get(2).ok();
-                Some((id, summary, result_desc))
+                let status: String = row.get(3).unwrap_or_default();
+                Some((id, summary, result_desc, status))
             } else {
                 None
             }
@@ -210,142 +211,166 @@ async fn process_entry(
         Err(_) => None,
     };
 
-    if review_data.is_none() {
-        warn!("Review not found for patch {}", patch_id);
-        return BenchmarkResult {
+    if let Some((review_id, summary, result_desc, status)) = review_data {
+        if status == "Reviewed" {
+            // Proceed to evaluate
+            let findings_result = db
+                .conn
+                .query(
+                    "SELECT problem, suggestion, severity, severity_explanation FROM findings WHERE review_id = ?",
+                    libsql::params![review_id],
+                )
+                .await;
+
+            let mut findings_text = String::new();
+            let mut findings_count = 0;
+
+            if let Ok(mut rows) = findings_result {
+                while let Ok(Some(row)) = rows.next().await {
+                    let msg: String = row.get(0).unwrap_or_default();
+                    let suggestion: Option<String> = row.get(1).ok();
+                    let severity: i32 = row.get(2).unwrap_or(0);
+                    let explanation: Option<String> = row.get(3).ok();
+
+                    findings_text.push_str(&format!("- [Severity {}] {}\n", severity, msg));
+                    if let Some(e) = explanation {
+                        findings_text.push_str(&format!("  Explanation: {}\n", e));
+                    }
+                    if let Some(s) = suggestion {
+                        findings_text.push_str(&format!("  Suggestion: {}\n", s));
+                    }
+                    findings_count += 1;
+                }
+            }
+
+            if findings_count == 0 {
+                findings_text.push_str("(No structured findings recorded in DB)\n");
+            }
+
+            // 4. Evaluate with Gemini
+            let review_summary = format!(
+                "{}\n{}",
+                summary.unwrap_or_default(),
+                result_desc.unwrap_or_default()
+            );
+
+            let prompt = format!(
+                "I am benchmarking an automated code review tool.\n\n\
+                The known issue (ground truth) is:\n\
+                {}\n\n\
+                The tool produced the following findings:\n\
+                {}\n\n\
+                The review summary was:\n\
+                {}\n\n\
+                Task:\n\
+                Determine if ANY of the findings or the review summary EXACTLY describes the known issue.\n\
+                - The description must match the specific problem (e.g., 'memory leak in function X', 'double free', 'missing lock').\n\
+                - General warnings about code style, complexity, or unrelated bugs do NOT count.\n\
+                - If a finding describes the problem but with slight inaccuracy (e.g. wrong variable name but correct logic), it is PARTIALLY_DETECTED.\n\
+                - If no finding matches the problem, it is MISSED.\n\n\
+                Respond with EXACTLY one of: [DETECTED, PARTIALLY_DETECTED, MISSED].\n\
+                Then provide a short one-sentence explanation referencing the specific finding that matches (if any).",
+                problem_description, findings_text, review_summary
+            );
+
+            let req = GenerateContentRequest {
+                contents: vec![Content {
+                    role: "user".to_string(),
+                    parts: vec![Part::Text {
+                        text: prompt,
+                        thought_signature: None,
+                        thought: false,
+                    }],
+                }],
+                tools: None,
+                system_instruction: None,
+                generation_config: None,
+            };
+
+            info!("Evaluating commit {} with Gemini...", entry.commit);
+            let resp = client.generate_content(req).await;
+
+            let (eval_status, eval_explanation) = match resp {
+                Ok(r) => {
+                    let text = r
+                        .candidates
+                        .as_ref()
+                        .and_then(|c| c.first())
+                        .and_then(|c| c.content.parts.first())
+                        .map(|p| {
+                            if let Part::Text { text, .. } = p {
+                                text.clone()
+                            } else {
+                                "Unknown".to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "Unknown".to_string());
+
+                    let re_status =
+                        Regex::new(r"(?i)\b(DETECTED|PARTIALLY_DETECTED|MISSED)\b").unwrap();
+                    let (status_raw, expl_raw) = if let Some(cap) = re_status.captures(&text) {
+                        let s = cap[1].to_uppercase();
+                        let remaining = re_status.replace(&text, "").to_string();
+                        (s, remaining)
+                    } else {
+                        ("UNKNOWN".to_string(), text.clone())
+                    };
+
+                    let expl = expl_raw
+                        .trim()
+                        .trim_start_matches([':', '-', ' ', '\n'])
+                        .to_string();
+                    (status_raw, expl)
+                }
+                Err(e) => {
+                    error!("Error calling Gemini for commit {}: {}", entry.commit, e);
+                    ("ERROR".to_string(), e.to_string())
+                }
+            };
+
+            let found = eval_status == "DETECTED" || eval_status == "PARTIALLY_DETECTED";
+            info!(
+                "Commit {}: {} ({})",
+                entry.commit, eval_status, eval_explanation
+            );
+
+            BenchmarkResult {
+                commit: entry.commit,
+                problem_description,
+                found,
+                status: eval_status,
+                explanation: eval_explanation,
+                findings_count,
+            }
+        } else if status == "Pending" || status == "In Review" {
+            BenchmarkResult {
+                commit: entry.commit,
+                problem_description,
+                found: false,
+                status: "IN_PROGRESS".to_string(),
+                explanation: "Review is currently being processed by a worker.".to_string(),
+                findings_count: 0,
+            }
+        } else {
+            // Failed or FailedToApply
+            BenchmarkResult {
+                commit: entry.commit,
+                problem_description,
+                found: false,
+                status: "FAILED_TO_REVIEW".to_string(),
+                explanation: format!("Review attempt failed: {}", status),
+                findings_count: 0,
+            }
+        }
+    } else {
+        warn!("No review found for commit {}", entry.commit);
+        BenchmarkResult {
             commit: entry.commit,
             problem_description,
             found: false,
             status: "NOT_REVIEWED".to_string(),
-            explanation: "Patch found but no review exists.".to_string(),
+            explanation: "No review entries found in database.".to_string(),
             findings_count: 0,
-        };
-    }
-    let (review_id, summary, result_desc) = review_data.unwrap();
-
-    // 3. Find Findings
-    let findings_result = db
-        .conn
-        .query(
-            "SELECT problem, suggestion, severity, severity_explanation FROM findings WHERE review_id = ?",
-            libsql::params![review_id],
-        )
-        .await;
-
-    let mut findings_text = String::new();
-    let mut findings_count = 0;
-
-    if let Ok(mut rows) = findings_result {
-        while let Ok(Some(row)) = rows.next().await {
-            let msg: String = row.get(0).unwrap_or_default();
-            let suggestion: Option<String> = row.get(1).ok();
-            let severity: i32 = row.get(2).unwrap_or(0);
-            let explanation: Option<String> = row.get(3).ok();
-
-            findings_text.push_str(&format!("- [Severity {}] {}\n", severity, msg));
-            if let Some(e) = explanation {
-                findings_text.push_str(&format!("  Explanation: {}\n", e));
-            }
-            if let Some(s) = suggestion {
-                findings_text.push_str(&format!("  Suggestion: {}\n", s));
-            }
-            findings_count += 1;
         }
-    }
-
-    if findings_count == 0 {
-        findings_text.push_str("(No structured findings recorded in DB)\n");
-    }
-
-    // 4. Evaluate with Gemini
-    let review_summary = format!(
-        "{}\n{}",
-        summary.unwrap_or_default(),
-        result_desc.unwrap_or_default()
-    );
-
-    let prompt = format!(
-        "I am benchmarking an automated code review tool.\n\n\
-        The known issue (ground truth) is:\n\
-        {}\n\n\
-        The tool produced the following findings:\n\
-        {}\n\n\
-        The review summary was:\n\
-        {}\n\n\
-        Task:\n\
-        Determine if ANY of the findings or the review summary EXACTLY describes the known issue.\n\
-        - The description must match the specific problem (e.g., 'memory leak in function X', 'double free', 'missing lock').\n\
-        - General warnings about code style, complexity, or unrelated bugs do NOT count.\n\
-        - If a finding describes the problem but with slight inaccuracy (e.g. wrong variable name but correct logic), it is PARTIALLY_DETECTED.\n\
-        - If no finding matches the problem, it is MISSED.\n\n\
-        Respond with EXACTLY one of: [DETECTED, PARTIALLY_DETECTED, MISSED].\n\
-        Then provide a short one-sentence explanation referencing the specific finding that matches (if any).",
-        problem_description, findings_text, review_summary
-    );
-
-    let req = GenerateContentRequest {
-        contents: vec![Content {
-            role: "user".to_string(),
-            parts: vec![Part::Text {
-                text: prompt,
-                thought_signature: None,
-                thought: false,
-            }],
-        }],
-        tools: None,
-        system_instruction: None,
-        generation_config: None,
-    };
-
-    info!("Evaluating commit {} with Gemini...", entry.commit);
-    let resp = client.generate_content(req).await;
-
-    let (status, explanation) = match resp {
-        Ok(r) => {
-            let text = r
-                .candidates
-                .as_ref()
-                .and_then(|c| c.first())
-                .and_then(|c| c.content.parts.first())
-                .map(|p| {
-                    if let Part::Text { text, .. } = p {
-                        text.clone()
-                    } else {
-                        "Unknown".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            let re_status = Regex::new(r"(?i)\b(DETECTED|PARTIALLY_DETECTED|MISSED)\b").unwrap();
-            let (status_raw, expl_raw) = if let Some(cap) = re_status.captures(&text) {
-                let s = cap[1].to_uppercase();
-                let remaining = re_status.replace(&text, "").to_string();
-                (s, remaining)
-            } else {
-                ("UNKNOWN".to_string(), text.clone())
-            };
-
-            let expl = expl_raw
-                .trim()
-                .trim_start_matches([':', '-', ' ', '\n'])
-                .to_string();
-            (status_raw, expl)
-        }
-        Err(e) => {
-            error!("Error calling Gemini for commit {}: {}", entry.commit, e);
-            ("ERROR".to_string(), e.to_string())
-        }
-    };
-
-    let found = status == "DETECTED" || status == "PARTIALLY_DETECTED";
-    info!("Commit {}: {} ({})", entry.commit, status, explanation);
-
-    BenchmarkResult {
-        commit: entry.commit,
-        problem_description,
-        found,
-        status,
-        explanation,
-        findings_count,
     }
 }
