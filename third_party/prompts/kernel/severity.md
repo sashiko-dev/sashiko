@@ -1,49 +1,52 @@
-# Severity Levels
+# Kernel Severity Assessment: The Escalation Protocol
 
-When identifying issues, you must assign a severity level to each finding.
-Treat this task seriously, it's very important. Don't unnecessarily raise the priority,
-critical issues must be critical, high issues must be very damaging.
-Use Medium as default and lower/raise depending on the "Question to ask" answer and examples.
-Use the following definitions and examples:
+You must classify every identified regression using this gated protocol. Your goal is to maintain a professional distribution of findings: the vast majority (>75%) should be Low, and <1% should be Critical.
 
-## Critical
-- **Definition**: Issues that cause data loss, memory corruptions or security vulnerabilities.
-- **Question to ask**: Is it actually better for system to crash rather then keep working? If yes, it's a critical issue.
-- **Examples**:
-    - Security vulnerability.
-    - Data corruption.
-    - Memory corruption (e.g., buffer overflow, use-after-free).
-    - Kernel panic or oops on hot path or which can be triggered by a userspace program or remotely.
-    - ABI breakage without proper deprecation.
+### THE RULE OF DEFAULT LOW
+Every bug, logic error, or violation is **Low Severity** by default. You may only escalate if you can provide technical proof that it meets the specific gates below. If you are unsure or cannot prove a higher impact, it **MUST** remain Low.
 
-## High
-- **Definition**: Serious issues that can bring the system down or make it fully unusable.
-- **Question to ask**: Can the system go down or become totally unusable with a non-trivial probability? If yes, it's a high issue.
-- **Examples**:
-    - Kernel panic or oops.
-    - Logic errors leading to incorrect functional behavior.
-    - Resource leaks (memory, locks).
-    - Significant performance regression.
-    - Violation of core kernel locking rules.
+---
 
-## Medium
-- **Definition**: Recoverable issues or non-critical performance regressions.
-- **Examples**:
-    - Memory or resource leaks on cold paths.
-    - Inefficient locking.
-    - Incorrect statistics.
-    - Meaningful code and commit message mismatch.
-    - Non-critical performance regressions.
-	- Issues in kselftests, perf and other userspace applications.
+### STEP 1: Path Classification
+Before assigning severity, identify the "hotness" of the code path:
+- **HOT**: Per-packet, per-syscall, scheduler loop, interrupt context, high-frequency locks, or any code that runs millions of times.
+- **COLD**: Rare error paths, ioctl setup, slow-path configuration, or code that runs only on specific user triggers.
+- **INIT**: Boot-time only, module load/unload, one-time hardware probe, or setup code that runs exactly once.
 
-## Low
-- **Definition**: Naming, style and coding style issues.
-- **Question to ask**: Is there any visible real life effect? If no, it's a low issue. Otherwise it's a medium issue.
-- **Examples**:
-    - Typos in comments.
-    - Formatting issues.
-    - Potential build failures.
-    - Confusing variable naming or comments.
-    - Negligible performance regressions.
-    - Unnecessary code complexity.
-    - Missing documentation or comments.
+### STEP 2: The Escalation Gates
+
+#### GATE 1: Escalate to MEDIUM?
+**Criteria (Must meet ONE):**
+- **Functional Deviation**: The code does something objectively wrong (e.g., returns the wrong error code) and it has a measurable impact on system behavior, even if small.
+- **Maintainability**: The change makes future maintenance significantly riskier (e.g., severe anti-patterns or extremely confusing logic).
+- **Silent Failure**: An error occurs but is swallowed, making debugging significantly harder.
+
+#### GATE 2: Escalate to HIGH?
+**Criteria (Must meet ONE):**
+- **System Stability**: The bug causes a kernel Oops/Panic, but it requires `root` privileges or very specific/rare hardware state to trigger.
+- **Functional Loss**: A core feature (e.g., a specific filesystem mount, a networking protocol, or a driver) stops working entirely.
+- **Resource Leak**: A memory or lock leak in a **HOT** or **COLD** path (but NOT an **INIT** path).
+- **Race Condition**: A demonstrable race that can cause data corruption or deadlocks under load.
+
+#### GATE 3: Escalate to CRITICAL?
+**Criteria (Must meet ONE):**
+- **Unprivileged/Remote Crash**: Any user on the system (or network) can crash the kernel without special permissions.
+- **Security Breach**: Local Privilege Escalation (LPE) or Remote Code Execution (RCE).
+- **Silent Data Corruption**: The system silently writes the wrong data to disk or memory (e.g., a bug in the block layer, filesystem, or page cache).
+- **Memory Corruption**: Use-After-Free, Double-Free, or OOB-Write in a **HOT** path.
+
+---
+
+### STEP 3: Mandatory Justification
+For every finding, you must include a "Severity Justification" section in your internal notes before generating the report:
+
+1. **Path**: [Hot/Cold/Init]
+2. **Trigger**: [Remote / Unprivileged Local / Root-only / Rare Hardware]
+3. **Escalation Proof**: "This is not [Level Below] because..."
+   - *Example: "This is not Medium because the leak happens in the per-packet path (HOT), meaning it will OOM the server in minutes, which constitutes a High stability issue."*
+
+### Final Check: The "So What?" Test
+- If it's a bug but the system keeps running fine and most users won't notice: **LOW**.
+- If it's a bug that requires a developer to spend 2 days debugging a weird edge case: **MEDIUM**.
+- If it's a bug that makes a server stop serving traffic or requires a reboot: **HIGH**.
+- If it's a bug that gets you a CVE or loses user data: **CRITICAL**.
