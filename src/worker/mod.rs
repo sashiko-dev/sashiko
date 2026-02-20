@@ -419,32 +419,27 @@ impl Worker {
                                         .as_array()
                                         .map(|a| a.len())
                                         .unwrap_or(0);
-                                    if hypotheses_len == 0 {
-                                        info!("No hypotheses submitted. Skipping to Reporting.");
-                                        current_stage = ReviewStage::Reporting;
-                                        self.history.push(AiMessage {
-                                            role: AiRole::User,
-                                            content: Some(
-                                                self.prompts.get_reporting_instructions().await?,
-                                            ),
-                                            thought: None,
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                        });
+
+                                    current_stage = ReviewStage::Verification;
+                                    let content = if hypotheses_len == 0 {
+                                        info!("No hypotheses submitted. Proceeding to Verification with default patterns.");
+                                        self.prompts
+                                            .get_verification_instructions_no_hypotheses()
+                                            .await?
                                     } else {
-                                        current_stage = ReviewStage::Verification;
-                                        self.history.push(AiMessage {
-                                            role: AiRole::User,
-                                            content: Some(
-                                                self.prompts
-                                                    .get_verification_instructions()
-                                                    .await?,
-                                            ),
-                                            thought: None,
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                        });
-                                    }
+                                        self.prompts
+                                            .get_verification_instructions()
+                                            .await?
+                                    };
+
+                                    self.history.push(AiMessage {
+                                        role: AiRole::User,
+                                        content: Some(content),
+                                        thought: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                    });
+
                                     tool_responses.push(AiMessage {
                                         role: AiRole::Tool,
                                         content: Some(

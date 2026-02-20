@@ -135,8 +135,9 @@ impl PromptRegistry {
 
     So, I would like you to:
     1. For each hypothesis: Trace the execution flow and provide proof if it is a real regression.
-    2. If you discover new, unexpected issues during research, include them in the `verifications` list.
-    3. Once research is exhausted, set `verification_complete` to true and submit via `cmd_submit_results` (expected structure below).
+    2. Systematically verify the code against the provided technical patterns.
+    3. If you discover new, unexpected issues during research, include them in the `verifications` list.
+    4. Once research is exhausted, submit via `cmd_submit_results` with `verification_complete` set to true (expected structure below).
 
     USE THESE PATTERNS FOR VERIFICATION:\n".to_string();
 
@@ -160,6 +161,36 @@ impl PromptRegistry {
         Ok(content)
     }
 
+    pub async fn get_verification_instructions_no_hypotheses(&self) -> Result<String> {
+        let mut content = "That is great.
+    You didn't find any potential issues during brainstorming. However, I'd like you to double check the code by systematically applying the technical patterns listed below. Build your context, read the appropriate files, and look for any subtle regressions.
+
+    So, I would like you to:
+    1. Systematically verify the code against the provided technical patterns.
+    2. If you discover any issues during this deeper research, include them in the `verifications` list.
+    3. Once research is exhausted, submit via `cmd_submit_results` with `verification_complete` set to true (expected structure below).
+
+    USE THESE PATTERNS FOR VERIFICATION:\n".to_string();
+
+        self.append_file(&mut content, "technical-patterns.md")
+            .await?;
+
+        content.push_str(
+            "\n\nExpected JSON Structure:
+    {
+    \"verifications\": [
+    {
+      \"evidence\": \"Detailed code proof or execution trace...\",
+      \"suggestion\": \"The potential fix...\",
+      \"is_confirmed\": true
+    }
+    ],
+    \"verification_complete\": true
+    }",
+        );
+        Ok(content)
+    }
+
     pub async fn get_reporting_instructions(&self) -> Result<String> {
         let mut content = "Excellent! Finally, consolidate your confirmed findings into a final report. 
 
@@ -168,7 +199,7 @@ impl PromptRegistry {
     2. Use BOTTOM-UP REASONING: For each finding, document the technical problem and suggestion BEFORE assigning the severity label.
     3. Generate the final summary AFTER you have processed all findings.
     4. Provide the `review_inline` text following the `inline-template.md` guidelines.
-    5. Submit the final result via `cmd_submit_results`.
+    5. Submit your review via `cmd_submit_results`.
 
     REPORTING GUIDELINES:\n".to_string();
 

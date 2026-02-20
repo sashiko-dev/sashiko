@@ -121,6 +121,16 @@ mod tests {
                     }).to_string()
                 }),
             ),
+            // Verification (Mandatory)
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "verifications": [],
+                        "verification_complete": true
+                    }).to_string()
+                }),
+            ),
             // Reporting
             create_tool_call_response(
                 "cmd_submit_results",
@@ -181,7 +191,17 @@ mod tests {
                     }).to_string()
                 }),
             ),
-            // Turn 3: Final Report
+            // Turn 3: Verification (Mandatory)
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "verifications": [],
+                        "verification_complete": true
+                    }).to_string()
+                }),
+            ),
+            // Turn 4: Final Report
             create_tool_call_response(
                 "cmd_submit_results",
                 json!({
@@ -281,6 +301,16 @@ mod tests {
                     }).to_string()
                 }),
             ),
+            // Verification (Mandatory)
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "verifications": [],
+                        "verification_complete": true
+                    }).to_string()
+                }),
+            ),
             // Reporting
             create_tool_call_response(
                 "cmd_submit_results",
@@ -335,6 +365,15 @@ mod tests {
                     "json_text": json!({
                         "hypotheses": [],
                         "exploration_complete": true
+                    }).to_string()
+                }),
+            ),
+            create_tool_call_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "verifications": [],
+                        "verification_complete": true
                     }).to_string()
                 }),
             ),

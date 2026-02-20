@@ -168,7 +168,17 @@ Fix it"
                     }).to_string()
                 }),
             ),
-            // 2. Reporting Stage - Generates report directly
+            // 2. Verification Stage - Now mandatory
+            create_tool_response(
+                "cmd_submit_results",
+                json!({
+                    "json_text": json!({
+                        "verifications": [],
+                        "verification_complete": true
+                    }).to_string()
+                }),
+            ),
+            // 3. Reporting Stage - Generates report
             create_tool_response(
                 "cmd_submit_results",
                 json!({
