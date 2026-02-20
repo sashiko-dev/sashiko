@@ -13,7 +13,7 @@ Use the following definitions and examples:
     - Security vulnerability.
     - Data corruption.
     - Memory corruption (e.g., buffer overflow, use-after-free).
-    - Kernel panic or oops which can be triggered externally.
+    - Kernel panic or oops on hot path or which can be triggered by a userspace program or remotely.
     - ABI breakage without proper deprecation.
 
 ## High
