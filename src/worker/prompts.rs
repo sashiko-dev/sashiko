@@ -38,6 +38,16 @@ When you are completely finished with your investigation and have no more tools 
 }
 ```"#;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStage {
+    /// Stage 1: Hypothesis Generation. Brainstorm potential failure modes.
+    Exploration,
+    /// Stage 2: Research & Verification. Prove or disprove hypotheses.
+    Verification,
+    /// Stage 3: Severity & Final Report. Consolidate and grade findings.
+    Reporting,
+}
+
 pub struct PromptRegistry {
     base_dir: PathBuf,
 }
@@ -122,12 +132,22 @@ impl PromptRegistry {
         series_range: Option<String>,
     ) -> Result<String> {
         let trigger = if use_cache {
-            "Refer to the `# review-core.md` section in the pre-loaded context and run a deep dive regression analysis as described in the protocol of the top commit in the Linux source tree. Do NOT attempt to load any additional prompts."
+            "Refer to the `# review-core.md` section in the pre-loaded context and run a deep dive regression analysis as described in the protocol of the top commit in the Linux source tree. Do NOT attempt to load any additional prompts.
+
+STAGE 1: EXPLORATION.
+Brainstorm every possible way this code could fail. Focus on edge cases, race conditions, and boundary violations. 
+Output your findings in JSON format according to the provided schema. 
+If you suspect no regressions, return an empty `hypotheses` array and set `exploration_complete` to true."
         } else {
-            "Load the protocol from `review-core.md` and run a deep dive regression analysis as described in the protocol of the top commit in the Linux source tree. You also must load the `inline-template.md` and `severity.md` prompts."
+            "Load the protocol from `review-core.md` and run a deep dive regression analysis as described in the protocol of the top commit in the Linux source tree. You also must load the `inline-template.md` and `severity.md` prompts.
+
+STAGE 1: EXPLORATION.
+Brainstorm every possible way this code could fail. Focus on edge cases, race conditions, and boundary violations. 
+Output your findings in JSON format according to the provided schema. 
+If you suspect no regressions, return an empty `hypotheses` array and set `exploration_complete` to true."
         };
 
-        let mut prompt = format!("{}\n\n{}", trigger, OUTPUT_FORMAT_INSTRUCTION);
+        let mut prompt = trigger.to_string();
 
         if let Some(range) = series_range {
             prompt.push_str(&format!(
@@ -137,6 +157,28 @@ impl PromptRegistry {
         }
 
         Ok(prompt)
+    }
+
+    pub fn get_stage_verification_prompt(&self) -> String {
+        "STAGE 2: VERIFICATION.
+Now, using your available tools, systematically verify each hypothesis from the brainstorming phase. 
+For each: 
+1. Trace the execution flow. 
+2. Provide proof if it is a real regression. 
+3. If it is impossible, explain why.
+
+Important: If you discover new, unexpected issues during your research, you MUST include them as additional findings in the `verifications` list.
+Once you have exhausted your research, set `verification_complete` to true.".to_string()
+    }
+
+    pub fn get_stage_reporting_prompt(&self) -> String {
+        format!("STAGE 3: REPORTING.
+Review your confirmed findings from the verification stage. 
+Apply the `severity.md` escalation protocol to each confirmed regression. 
+Provide the mandatory justification for the assigned severity. 
+Finally, generate the final JSON output following the provided schema.
+
+{}", OUTPUT_FORMAT_INSTRUCTION)
     }
 
     async fn append_file(&self, buffer: &mut String, filename: &str) -> Result<()> {
