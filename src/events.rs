@@ -41,6 +41,8 @@ pub enum Event {
         raw: String,
         group: String,
         baseline: Option<String>,
+        skip_subjects: Option<Vec<String>>,
+        only_subjects: Option<Vec<String>>,
     },
     IngestionFailed {
         article_id: String,
@@ -56,4 +58,6 @@ pub struct ParsedArticle {
     pub patch: Option<Patch>,
     pub baseline: Option<String>,
     pub failed_error: Option<String>,
+    pub skip_filters: Option<Vec<String>>,
+    pub only_filters: Option<Vec<String>>,
 }

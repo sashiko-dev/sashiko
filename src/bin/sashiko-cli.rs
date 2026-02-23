@@ -66,6 +66,14 @@ enum Commands {
         /// Baseline commit (for mbox injection only)
         #[arg(long)]
         baseline: Option<String>,
+
+        /// Skip review for patches matching subject pattern (with wildcards, e.g. mm:*)
+        #[arg(long, value_name = "PATTERN")]
+        skip_subject: Option<Vec<String>>,
+
+        /// Only review patches matching subject pattern (with wildcards, e.g. *PRODKERNEL*)
+        #[arg(long, value_name = "PATTERN")]
+        only_subject: Option<Vec<String>>,
     },
     /// Show server status and statistics
     Status,
@@ -150,7 +158,22 @@ async fn run_command(
             r#type,
             repo,
             baseline,
-        } => handle_submit(client, base_url, input, r#type, repo, baseline, format).await,
+            skip_subject,
+            only_subject,
+        } => {
+            handle_submit(
+                client,
+                base_url,
+                input,
+                r#type,
+                repo,
+                baseline,
+                skip_subject,
+                only_subject,
+                format,
+            )
+            .await
+        }
         Commands::Status => handle_status(client, base_url, format).await,
         Commands::List {
             filter,
@@ -161,6 +184,7 @@ async fn run_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_submit(
     client: &Client,
     base_url: &str,
@@ -168,6 +192,8 @@ async fn handle_submit(
     explicit_type: Option<SubmitType>,
     repo: Option<PathBuf>,
     baseline: Option<String>,
+    skip_subjects: Option<Vec<String>>,
+    only_subjects: Option<Vec<String>>,
     format: OutputFormat,
 ) -> Result<()> {
     let url = format!("{}/api/submit", base_url);
@@ -225,6 +251,8 @@ async fn handle_submit(
             SubmitRequest::Inject {
                 raw: content,
                 base_commit: baseline,
+                skip_subjects: skip_subjects.clone(),
+                only_subjects: only_subjects.clone(),
             }
         }
         SubmitType::Remote => {
@@ -233,6 +261,8 @@ async fn handle_submit(
             SubmitRequest::Remote {
                 sha: target,
                 repo: repo_path,
+                skip_subjects: skip_subjects.clone(),
+                only_subjects: only_subjects.clone(),
             }
         }
         SubmitType::Range => {
@@ -241,6 +271,8 @@ async fn handle_submit(
             SubmitRequest::RemoteRange {
                 sha: target,
                 repo: repo_path,
+                skip_subjects: skip_subjects.clone(),
+                only_subjects: only_subjects.clone(),
             }
         }
     };

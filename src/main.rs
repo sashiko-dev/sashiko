@@ -213,6 +213,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 patch: None,
                                 baseline: None,
                                 failed_error: Some(error),
+                                skip_filters: None,
+                                only_filters: None,
                             })
                             .await
                         {
@@ -273,6 +275,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 patch,
                                 baseline: base_commit,
                                 failed_error: None,
+                                skip_filters: None,
+                                only_filters: None,
                             })
                             .await
                         {
@@ -283,6 +287,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         raw,
                         group,
                         baseline,
+                        skip_subjects,
+                        only_subjects,
                     } => {
                         let messages = sashiko::ingestor::split_mbox(raw.as_bytes());
                         let count = messages.len();
@@ -302,6 +308,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let group_clone = group.clone();
                             let tx_clone = tx.clone();
                             let baseline_clone = baseline.clone();
+                            let skip_subjects_clone = skip_subjects.clone();
+                            let only_subjects_clone = only_subjects.clone();
 
                             // Offload parsing
                             let parse_result = tokio::task::spawn_blocking(move || {
@@ -326,6 +334,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             patch: patch_opt,
                                             baseline: baseline_clone,
                                             failed_error: None,
+                                            skip_filters: skip_subjects_clone,
+                                            only_filters: only_subjects_clone,
                                         })
                                         .await
                                     {
@@ -378,6 +388,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         patch: patch_opt,
                                         baseline,
                                         failed_error: None,
+                                        skip_filters: None,
+                                        only_filters: None,
                                     })
                                     .await
                                 {
@@ -506,6 +518,8 @@ async fn process_parsed_article(worker_db: &Database, article: ParsedArticle) ->
         patch,
         baseline,
         failed_error,
+        skip_filters,
+        only_filters,
     } = article;
 
     // Handle ingestion failure
@@ -768,6 +782,8 @@ async fn process_parsed_article(worker_db: &Database, article: ParsedArticle) ->
                 metadata.index,
                 baseline_id,
                 strict_author,
+                skip_filters.as_ref(),
+                only_filters.as_ref(),
             )
             .await
         {

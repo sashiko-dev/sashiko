@@ -49,6 +49,8 @@ pub struct PatchsetRow {
     pub findings_critical: Option<i64>,
     pub baseline_id: Option<i64>,
     pub failed_reason: Option<String>,
+    pub skip_filters: Option<String>,
+    pub only_filters: Option<String>,
     pub target_review_count: Option<u32>,
     pub model_name: Option<String>,
     pub prompts_git_hash: Option<String>,
@@ -388,6 +390,12 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("patchsets", "failed_reason", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "skip_filters", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "only_filters", "TEXT")
             .await;
         let _ = self
             .try_add_column("patchsets", "target_review_count", "INTEGER DEFAULT 1")
@@ -1522,7 +1530,11 @@ impl Database {
         part_index: u32,
         baseline_id: Option<i64>,
         strict_author: bool,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
     ) -> Result<Option<i64>> {
+        let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
+        let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
@@ -1806,6 +1818,13 @@ impl Database {
                 libsql::params![author, total_parts, parser_version, to, cc, target_id],
             ).await?;
 
+            if skip_filters_json.is_some() || only_filters_json.is_some() {
+                self.conn.execute(
+                    "UPDATE patchsets SET skip_filters = COALESCE(?, skip_filters), only_filters = COALESCE(?, only_filters) WHERE id = ?",
+                    libsql::params![skip_filters_json.clone(), only_filters_json.clone(), target_id],
+                ).await?;
+            }
+
             if let Some(bid) = baseline_id {
                 self.conn
                     .execute(
@@ -1860,9 +1879,9 @@ impl Database {
         // No match found, create new patchset
         self.conn
             .execute(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id) 
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?)",
-                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, skip_filters, only_filters) 
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, skip_filters_json.clone(), only_filters_json.clone()],
             )
             .await?;
 
@@ -2048,7 +2067,7 @@ impl Database {
 
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
-             COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count
+             COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters
              FROM patchsets p
              LEFT JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
              LEFT JOIN subsystems s ON ps.subsystem_id = s.id
@@ -2116,6 +2135,8 @@ impl Database {
                 baseline_id: row.get(14).ok(),
                 failed_reason: row.get(15).ok(),
                 target_review_count: row.get(16).ok(),
+                skip_filters: row.get(17).ok(),
+                only_filters: row.get(18).ok(),
                 model_name: None,
                 prompts_git_hash: None,
                 baseline_logs: None,
@@ -2490,7 +2511,7 @@ impl Database {
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count
+            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters
              FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
@@ -2515,6 +2536,8 @@ impl Database {
                 baseline_id: row.get(9).ok(),
                 failed_reason: row.get(10).ok(),
                 target_review_count: row.get(11).ok(),
+                skip_filters: row.get(12).ok(),
+                only_filters: row.get(13).ok(),
                 model_name: None,
                 prompts_git_hash: None,
                 baseline_logs: None,
@@ -2529,6 +2552,16 @@ impl Database {
             .execute(
                 "UPDATE patchsets SET status = ? WHERE id = ?",
                 libsql::params![status, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_patch_status(&self, patch_id: i64, status: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patches SET status = ? WHERE id = ?",
+                libsql::params![status, patch_id],
             )
             .await?;
         Ok(())
@@ -2569,7 +2602,13 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
-    pub async fn create_fetching_patchset(&self, article_id: &str, subject: &str) -> Result<i64> {
+    pub async fn create_fetching_patchset(
+        &self,
+        article_id: &str,
+        subject: &str,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+    ) -> Result<i64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
@@ -2577,6 +2616,9 @@ impl Database {
         let root_msg_id = format!("{}@sashiko.local", article_id);
 
         let clid_candidates = vec![article_id.to_string(), root_msg_id.clone()];
+
+        let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
+        let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
 
         // 1. Check if it already exists
         for clid in clid_candidates {
@@ -2596,8 +2638,8 @@ impl Database {
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
                 if status == "Failed" || status == "Fetching" {
                     self.conn.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL WHERE id = ?",
-                        libsql::params![id]
+                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ? WHERE id = ?",
+                        libsql::params![skip_filters_json.clone(), only_filters_json.clone(), id]
                     ).await?;
                 }
                 return Ok(id);
@@ -2610,9 +2652,9 @@ impl Database {
         // 3. Create the fetching patchset
         self.conn
             .execute(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date) 
-                     VALUES (?, ?, ?, 'Fetching', ?)",
-                libsql::params![thread_id, root_msg_id, subject, now],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters) 
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?)",
+                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json],
             )
             .await?;
 
@@ -2763,7 +2805,7 @@ mod tests {
                 Some(1),
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap();
@@ -2801,7 +2843,7 @@ mod tests {
                 Some(1),
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap();
@@ -2831,7 +2873,7 @@ mod tests {
             Some(1),
             2,
             None,
-            true,
+            true, None, None,
         )
         .await
         .unwrap();
@@ -2856,7 +2898,7 @@ mod tests {
                 Some(1),
                 1,
                 None,
-                false,
+                false, None, None,
             )
             .await
             .unwrap();
@@ -2880,7 +2922,7 @@ mod tests {
                 Some(2),
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap();
@@ -2916,7 +2958,7 @@ mod tests {
                 Some(1),
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -2943,7 +2985,7 @@ mod tests {
                 Some(1),
                 3,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -2985,7 +3027,7 @@ mod tests {
                 Some(1),
                 3,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3015,7 +3057,7 @@ mod tests {
                 Some(1),
                 2,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3062,7 +3104,7 @@ mod tests {
                     None,
                     idx as u32,
                     None,
-                    true,
+                    true, None, None,
                 )
                 .await
                 .unwrap()
@@ -3115,7 +3157,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3190,7 +3232,7 @@ mod tests {
                 Some(6),
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3227,7 +3269,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3280,7 +3322,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3317,7 +3359,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3369,7 +3411,7 @@ mod tests {
                 None,
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3406,7 +3448,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3458,7 +3500,7 @@ mod tests {
                 Some(5),
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3498,7 +3540,7 @@ mod tests {
                 Some(6),
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3550,7 +3592,7 @@ mod tests {
                 Some(3),
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3587,7 +3629,7 @@ mod tests {
                 Some(3),
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3624,7 +3666,7 @@ mod tests {
                 Some(3),
                 2,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3674,7 +3716,7 @@ mod tests {
                 Some(3),
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3719,7 +3761,7 @@ mod tests {
                 parsed_ver, // Pass the result of the potentially buggy parser
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3771,7 +3813,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3821,7 +3863,7 @@ mod tests {
                 None,
                 2,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -3920,7 +3962,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -4030,7 +4072,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -4072,7 +4114,7 @@ mod tests {
                 None,
                 2,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -4132,7 +4174,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -4165,7 +4207,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -4211,7 +4253,7 @@ mod tests {
                 None,
                 1,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -4304,7 +4346,7 @@ mod tests {
                 None,
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()
@@ -4326,7 +4368,7 @@ mod tests {
                 None,
                 0,
                 None,
-                true,
+                true, None, None,
             )
             .await
             .unwrap()

@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS patchsets (
     prompts_git_hash TEXT,
     baseline_logs TEXT,
     failed_reason TEXT,
+    skip_filters TEXT,
+    only_filters TEXT,
     target_review_count INTEGER DEFAULT 1,
     provider TEXT,
     FOREIGN KEY(thread_id) REFERENCES threads(id),

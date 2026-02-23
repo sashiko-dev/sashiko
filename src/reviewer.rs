@@ -389,11 +389,66 @@ impl Reviewer {
                 "patches": patches_json
             });
 
+            let skip_filters: Vec<String> = patchset
+                .skip_filters
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let only_filters: Vec<String> = patchset
+                .only_filters
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            let compile_glob = |pattern: &str| -> regex::Regex {
+                let mut re = String::from("^");
+                for c in pattern.chars() {
+                    match c {
+                        '*' => re.push_str(".*"),
+                        '?' => re.push('.'),
+                        '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
+                            re.push('\\');
+                            re.push(c);
+                        }
+                        _ => re.push(c),
+                    }
+                }
+                re.push('$');
+                regex::Regex::new(&re).unwrap_or_else(|_| regex::Regex::new("a^").unwrap())
+            };
+
+            let skip_regexes: Vec<_> = skip_filters.iter().map(|f| compile_glob(f)).collect();
+            let only_regexes: Vec<_> = only_filters.iter().map(|f| compile_glob(f)).collect();
+
             // 2. Run Reviews
             let mut review_success = true; // Optimistic
             let mut failed_patches = 0;
 
             for (patch_id, index, diff, _subj, _auth, _date, _msg_id) in &diffs {
+                let mut should_skip = false;
+
+                // Opt-out logic
+                if skip_regexes.iter().any(|re| re.is_match(_subj)) {
+                    info!("Skipping patch {} (subject matches skip filter)", patch_id);
+                    should_skip = true;
+                }
+
+                // Opt-in logic (if only_filters is not empty, subject MUST match at least one)
+                if !should_skip
+                    && !only_regexes.is_empty()
+                    && !only_regexes.iter().any(|re| re.is_match(_subj))
+                {
+                    info!(
+                        "Skipping patch {} (subject does not match any only filter)",
+                        patch_id
+                    );
+                    should_skip = true;
+                }
+
+                if should_skip {
+                    let _ = ctx.db.update_patch_status(*patch_id, "Skipped").await;
+                    continue;
+                }
                 let commit_sha = patch_commits.get(index).cloned();
                 let baseline_ref = resolution.as_str();
 
@@ -2031,7 +2086,7 @@ echo '{"patchset_id": 1, "patches": []}'
         let ps_id = db
             .create_patchset(
                 thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
-                None, false,
+                None, false, None, None,
             )
             .await?
             .expect("Failed to create patchset");

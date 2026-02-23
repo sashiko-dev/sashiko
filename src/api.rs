@@ -96,15 +96,21 @@ pub enum SubmitRequest {
     Inject {
         raw: String,
         base_commit: Option<String>,
+        skip_subjects: Option<Vec<String>>,
+        only_subjects: Option<Vec<String>>,
     },
     Remote {
         sha: String,
         repo: Option<String>,
+        skip_subjects: Option<Vec<String>>,
+        only_subjects: Option<Vec<String>>,
     },
     #[serde(rename = "remote-range")]
     RemoteRange {
         sha: String,
         repo: Option<String>,
+        skip_subjects: Option<Vec<String>>,
+        only_subjects: Option<Vec<String>>,
     },
 }
 
@@ -188,7 +194,12 @@ async fn submit_patch(
     }
 
     match payload {
-        SubmitRequest::Inject { raw, base_commit } => {
+        SubmitRequest::Inject {
+            raw,
+            base_commit,
+            skip_subjects,
+            only_subjects,
+        } => {
             if raw.trim().is_empty() {
                 return Err(StatusCode::BAD_REQUEST);
             }
@@ -204,6 +215,8 @@ async fn submit_patch(
                 raw,
                 group: "api-submit".to_string(),
                 baseline: base_commit,
+                skip_subjects,
+                only_subjects,
             };
 
             if let Err(e) = state.sender.send(event).await {
@@ -216,7 +229,18 @@ async fn submit_patch(
                 id,
             }))
         }
-        SubmitRequest::Remote { sha, repo } | SubmitRequest::RemoteRange { sha, repo } => {
+        SubmitRequest::Remote {
+            sha,
+            repo,
+            skip_subjects,
+            only_subjects,
+        }
+        | SubmitRequest::RemoteRange {
+            sha,
+            repo,
+            skip_subjects,
+            only_subjects,
+        } => {
             let id = sha.clone();
             let repo_display = repo.as_deref().unwrap_or("local");
             info!(
@@ -230,6 +254,8 @@ async fn submit_patch(
                 .create_fetching_patchset(
                     &id,
                     &format!("Fetching {} from {}...", &sha, repo_display),
+                    skip_subjects.as_ref(),
+                    only_subjects.as_ref(),
                 )
                 .await
             {
