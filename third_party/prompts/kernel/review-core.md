@@ -146,22 +146,6 @@ This deep dive analysis will take a long time, don't skip steps.
 2. Using the context loaded, and any additional context you need, analyze
 the change for regressions.
 
-3. Check for email discussion about this patch (if available)
-  - Load `lore-thread.md` for detailed instructions on processing lore threads
-  - Search archives for threads with the same subject as this patch, assume
-    the patch you're reviewing is the latest version.
-  - Consider any unaddressed comments as potential regressions
-    - Add each unaddressed comment to your notes
-    - Verify each unaddressed comment as a valid complaint before reporting
-  - Output: subject lines and dates of past versions of the patch
-    ```
-    FINAL UNADDRESSED COMMENTS: NUMBER
-    Found older version: <date> <version> <subject>
-    Found older version: <date> <version2> <subject>
-    ```
-  - When the regression report mentions unaddressed review comments, provide
-    a link to the thread in review-inline.
-
 ### TASK 2.1 Commit tag verification
 
 1. Consider all of the CHANGE CATEGORIES identified in review-core.md, determine
@@ -203,7 +187,7 @@ Fixes tag check for <subsystem>
     create review-inline, even if no other regressions were found.
   - There's no need to run the false-positive-guide.md if the only regression
     found was the missing Fixes: tag
-  - Fixes: tag present in lore searches doesn't count if it isn't in
+  - Fixes: tag present in other sources doesn't count if it isn't in
     the commit being reviewed.
   - Output: Fixes: tag missing yes/no
 

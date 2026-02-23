@@ -22,7 +22,7 @@ archaeology
 
 ## Finding the Fixed Commit
 
-If this is a bug fix, search git history, either with semcode or git log, find
+If this is a bug fix, search git history, using `git_log` or `git_blame`, find
 the commit being fixed.
 
 If you're able to identify a commit being fixed, create a suggested Fixes:

@@ -39,7 +39,7 @@ the author.
   - There's no need to include the diff hunks if the only issue is in the commit message.
 
 - The issue description may include extra details such as later commits that fix 
-  the bug, or lore discussions upstream.  These MUST be included in the summary,
+  the bug, or prior discussions upstream.  These MUST be included in the summary,
   but should be reworded to fit the template requirements.
 
 - You MUST include every issue sent, even if the additional details explain the

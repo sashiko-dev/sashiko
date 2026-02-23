@@ -40,23 +40,19 @@ memory pressure, or concurrent operations.
 
 ---
 
-## CRITICAL: Batch All Semcode Calls
+## CRITICAL: Batch All File Search Calls
 
 **Each API turn re-sends conversation history. Batch all lookups.**
 
 ```
-❌ find_function(A) → wait → find_function(B) → wait → find_function(C)
-✅ find_function(A) + find_function(B) + find_function(C) in ONE message
-
-❌ find_callers(A) → wait → find_callers(B)
-✅ find_callers(A) + find_callers(B) in ONE message
+❌ search_file_content(A) → wait → search_file_content(B) → wait → search_file_content(C)
+✅ search_file_content(A) + search_file_content(B) + search_file_content(C) in ONE message
 ```
 
 Before starting Tasks 1-2:
 1. Identify ALL callees you need to load
 2. Identify ALL callers you need to load
-3. Call find_function for ALL of them in ONE message
-4. Call find_callers for ALL of them in ONE message
+3. Call search_file_content or read_files for ALL of them in ONE message
 
 ---
 
@@ -89,23 +85,22 @@ load them.
 
 ## Task 1: **Callee traversal process**:
 
-**BATCH ALL find_calls AND find_function CALLS IN ONE MESSAGE**
+**BATCH ALL search_file_content AND read_files CALLS IN ONE MESSAGE**
 
 - Step callee.1: Identify all direct callees in modified functions
   - We gather the callees because even small changes in functions can
     cause bugs in the functions they call.  The only way to know is to
     actually read the functions in the callstack.
-  - Use semcode `find_calls` (not "find_callees") on each modified function
-    to get the complete callee list.  Batch these calls together.
+  - Use `search_file_content` to find definitions of the callees. Batch these calls together.
   - Record both the callees and the arguments used
   - **List ALL callees first before loading any**
   - Output: names of callees
 - Step callee.2: For each callee, load entire function definition
-  - **Call find_function for ALL callees in ONE parallel message**
+  - **Call search_file_content or read_files for ALL callees in ONE parallel message**
   - Output: The callee function names, and a random line from anywhere in each definition
     - you must prove you read the callee
 - Step callee.3: Trace 2-3 levels deep as needed
-  - **Batch additional find_function calls together**
+  - **Batch additional file search calls together**
   - Again, small changes higher up in the stack can introduce bugs lower
     down.  You cannot analyze code effectively without looking at the call stack,
     even for changes that you think you understand.
@@ -117,17 +112,17 @@ complete caller analysis.
 
 ## Task 2: **Caller traversal process:**
 
-**BATCH ALL find_callers CALLS IN ONE MESSAGE**
+**BATCH ALL search_file_content CALLS IN ONE MESSAGE**
 
 - For every step, consider both the callers and the arguments used
 - step caller.1: identify all direct callers
   - We gather the callers because even small changes can introduce bugs
     in the functions that call them.  The only way to know is to actually
     read the functions in the callstack.
-  - **Call find_callers for ALL modified functions in ONE parallel message**
+  - **Call search_file_content to find callers for ALL modified functions in ONE parallel message**
   - Output: names of callers
 - step caller.2: for each caller, load function definition
-  - **Call find_function for ALL callers in ONE parallel message**
+  - **Call search_file_content or read_files for ALL callers in ONE parallel message**
   - Output: caller name, size in lines
   - Output: The caller function names, and a random line from anywhere in each definition
     - you must prove you read the callers
@@ -310,7 +305,7 @@ Even if you've already used a lot of tokens, go back and check the
 skipped steps now that you know these potential regressions were safe.
 
 - Did you fully analyze and complete Tasks 1-8 for every category? y/n
-- Did you batch all semcode calls to minimize API turns? y/n
+- Did you batch all file search calls to minimize API turns? y/n
 
 If the answer to either question was no, do not complete callstack.md.  Go back and
 finish analysis as instructed.
