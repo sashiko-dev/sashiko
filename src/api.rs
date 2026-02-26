@@ -126,6 +126,7 @@ pub struct AppState {
     pub sender: mpsc::Sender<Event>,
     pub fetch_sender: mpsc::Sender<FetchRequest>,
     pub read_only: bool,
+    pub allow_all_submit: bool,
     stats_cache: AsyncCache<serde_json::Value>,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
@@ -226,12 +227,14 @@ pub async fn run_server(
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
+    allow_all_submit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         db,
         sender,
         fetch_sender,
         read_only: settings.read_only,
+        allow_all_submit,
         stats_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -297,7 +300,7 @@ async fn submit_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !addr.ip().is_loopback() {
+    if !state.allow_all_submit && !addr.ip().is_loopback() {
         info!("Refused patch submission from non-localhost: {}", addr);
         return Err(StatusCode::FORBIDDEN);
     }
@@ -763,7 +766,7 @@ async fn rerun_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !addr.ip().is_loopback() {
+    if !state.allow_all_submit && !addr.ip().is_loopback() {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -789,7 +792,7 @@ async fn rerun_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !addr.ip().is_loopback() {
+    if !state.allow_all_submit && !addr.ip().is_loopback() {
         return Err(StatusCode::FORBIDDEN);
     }
 

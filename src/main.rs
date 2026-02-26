@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long)]
     debug: bool,
 
+    /// Allow non-localhost POST requests (unsafe)
+    #[arg(long)]
+    enable_unsafe_all_submit: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -485,8 +489,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
+    let allow_all_submit = cli.enable_unsafe_all_submit;
     tokio::spawn(async move {
-        if let Err(e) = sashiko::api::run_server(api_settings, api_db, api_tx, api_fetch_tx).await {
+        if let Err(e) =
+            sashiko::api::run_server(api_settings, api_db, api_tx, api_fetch_tx, allow_all_submit)
+                .await
+        {
             error!("Web API fatal error: {}", e);
         }
     });
