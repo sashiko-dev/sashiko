@@ -43,7 +43,7 @@ regexes
 | Open Firmware (DT) | drivers/of/, of_node, of_find_, of_get_, of_parse_, for_each_child_of_node, for_each_available_child_of_node, of_node_put, of_node_get | of.md |
 | Perf Tools | tools/perf/, openat, fdopendir, closedir | perf.md |
 | MIPS | arch/mips/, tlb_probe, tlb_read, tlb_write_indexed, write_c0_entryhi, read_c0_index, TLBP, TLBR, TLBWI | mips.md |
-| hwmon | drivers/hwmon/, asus-ec-sensors, ec_board_info | hwmon.md |
+| hwmon | drivers/hwmon/, hwmon_*, asus-ec-sensors, ec_board_info | hwmon.md |
 | Media/Video | drivers/media/, v4l2_, V4L2_PIX_FMT_, iris_, video_device | media.md |
 | Wireless/mac80211 | drivers/net/wireless/, net/mac80211/, BSS_CHANGED_, vif_cfg_changed, link_info_changed, bss_info_changed | wireless.md |
 | Selftests | tools/testing/selftests/, TEST_PROGS, TEST_FILES, TEST_GEN_FILES | selftests.md |
@@ -59,6 +59,7 @@ regexes
 | Input | drivers/input/, edt-ft5x06, touchscreen@, report-rate-hz | input.md |
 | Objtool | tools/objtool/, INSN_BUG, INSN_TRAP, decode.c | objtool.md |
 | KHO (Kexec Handover) | lib/test_kho.c, kho_, kho_is_enabled, kho_retrieve_subtree, kho_preserve_folio, kho_add_subtree, register_kho_notifier | kho.md |
+| I2C | drivers/i2c/, i2c_*, | i2c.md |
 
 ## Optional Patterns
 
