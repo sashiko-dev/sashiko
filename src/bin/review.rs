@@ -146,6 +146,7 @@ async fn main() -> Result<()> {
             let mut patch_results = Vec::new();
             let mut patch_shas = std::collections::HashMap::new();
             let mut patch_shows = std::collections::HashMap::new();
+            let mut patch_messages = std::collections::HashMap::new();
 
             let all_applied;
 
@@ -202,6 +203,7 @@ async fn main() -> Result<()> {
                         p,
                         &mut patch_shas,
                         &mut patch_shows,
+                        &mut patch_messages,
                         &mut patch_results,
                     )
                     .await;
@@ -263,6 +265,8 @@ async fn main() -> Result<()> {
                         let mut dummy_shas = std::collections::HashMap::new();
                         let mut dummy_shows = std::collections::HashMap::new();
 
+                        let mut dummy_msgs = std::collections::HashMap::new();
+
                         let patches_subset: Vec<&PatchInput> =
                             patches.iter().filter(|p| p.index <= target_idx).collect();
                         for p in patches_subset {
@@ -271,6 +275,7 @@ async fn main() -> Result<()> {
                                 p,
                                 &mut dummy_shas,
                                 &mut dummy_shows,
+                                &mut dummy_msgs,
                                 &mut dummy_results,
                             )
                             .await;
@@ -339,7 +344,8 @@ async fn main() -> Result<()> {
                                 "date_string": date_str,
                                 "diff": p.diff,
                                 "commit_id": patch_shas.get(&p.index).cloned(),
-                                "git_show": patch_shows.get(&p.index).cloned()
+                                "git_show": patch_shows.get(&p.index).cloned(),
+                                "commit_message_full": patch_messages.get(&p.index).cloned()
                             })
                         })
                         .collect();
@@ -502,6 +508,7 @@ async fn apply_single_patch(
     p: &PatchInput,
     patch_shas: &mut std::collections::HashMap<i64, String>,
     patch_shows: &mut std::collections::HashMap<i64, String>,
+    patch_messages: &mut std::collections::HashMap<i64, String>,
     patch_results: &mut Vec<serde_json::Value>,
 ) -> bool {
     // Check if commit_id is present (preferred over message_id guessing)
@@ -514,6 +521,9 @@ async fn apply_single_patch(
             Ok(_) => {
                 if let Ok(show) = worktree.get_commit_show(sha).await {
                     patch_shows.insert(p.index, show);
+                }
+                if let Ok(msg) = worktree.get_commit_message(sha).await {
+                    patch_messages.insert(p.index, msg);
                 }
                 patch_shas.insert(p.index, sha.clone());
                 patch_results.push(json!({
@@ -549,6 +559,9 @@ async fn apply_single_patch(
             Ok(_) => {
                 if let Ok(show) = worktree.get_commit_show(sha).await {
                     patch_shows.insert(p.index, show);
+                }
+                if let Ok(msg) = worktree.get_commit_message(sha).await {
+                    patch_messages.insert(p.index, msg);
                 }
                 patch_shas.insert(p.index, sha.clone());
                 patch_results.push(json!({
@@ -607,6 +620,9 @@ async fn apply_single_patch(
                     patch_shas.insert(p.index, sha.clone());
                     if let Ok(show) = worktree.get_commit_show(&sha).await {
                         patch_shows.insert(p.index, show);
+                    }
+                    if let Ok(msg) = worktree.get_commit_message(&sha).await {
+                        patch_messages.insert(p.index, msg);
                     }
                 }
                 patch_results.push(json!({
@@ -737,6 +753,7 @@ mod tests {
 
         let mut patch_shas = std::collections::HashMap::new();
         let mut patch_shows = std::collections::HashMap::new();
+        let mut patch_messages = std::collections::HashMap::new();
         let mut patch_results = Vec::new();
 
         // 4. Run apply_single_patch
@@ -745,6 +762,7 @@ mod tests {
             &patch,
             &mut patch_shas,
             &mut patch_shows,
+            &mut patch_messages,
             &mut patch_results,
         )
         .await;
@@ -816,6 +834,7 @@ mod tests {
 
         let mut patch_shas = std::collections::HashMap::new();
         let mut patch_shows = std::collections::HashMap::new();
+        let mut patch_messages = std::collections::HashMap::new();
         let mut patch_results = Vec::new();
 
         // 4. Run apply_single_patch
@@ -824,6 +843,7 @@ mod tests {
             &patch,
             &mut patch_shas,
             &mut patch_shows,
+            &mut patch_messages,
             &mut patch_results,
         )
         .await;
@@ -896,6 +916,7 @@ mod tests {
 
         let mut patch_shas = std::collections::HashMap::new();
         let mut patch_shows = std::collections::HashMap::new();
+        let mut patch_messages = std::collections::HashMap::new();
         let mut patch_results = Vec::new();
 
         let success = apply_single_patch(
@@ -903,6 +924,7 @@ mod tests {
             &patch,
             &mut patch_shas,
             &mut patch_shows,
+            &mut patch_messages,
             &mut patch_results,
         )
         .await;

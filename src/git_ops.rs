@@ -166,7 +166,7 @@ impl GitWorktree {
     pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
         let output = Command::new("git")
             .current_dir(&self.path)
-            .args(["show", hash])
+            .args(["show", "--patch", hash])
             .output()
             .await?;
 
@@ -175,6 +175,23 @@ impl GitWorktree {
         } else {
             Err(anyhow!(
                 "git show failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    pub async fn get_commit_message(&self, hash: &str) -> Result<String> {
+        let output = Command::new("git")
+            .current_dir(&self.path)
+            .args(["show", "--no-patch", hash])
+            .output()
+            .await?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(anyhow!(
+                "git show --no-patch failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             ))
         }
