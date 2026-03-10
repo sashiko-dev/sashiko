@@ -14,6 +14,7 @@
 
 use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
 use crate::settings::InlineReviewStyle;
+use crate::worker::review_validator::{RawIssue, resolve_and_validate_snippets};
 use crate::worker::tools::ToolBox;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -649,9 +650,13 @@ Example:
 
         if all_concerns.is_empty() {
             tracing::info!("No concerns from stages 1-7, skipping stages 8 and 9");
+            let review_inline = match self.inline_review_style {
+                InlineReviewStyle::Text => serde_json::json!("No issues found."),
+                InlineReviewStyle::Structured => serde_json::json!([]),
+            };
             let final_output = serde_json::json!({
                 "findings": [],
-                "review_inline": "No issues found.",
+                "review_inline": review_inline,
                 "fixes": ""
             });
             return Ok(WorkerResult {
@@ -742,9 +747,13 @@ Example:
             && f.is_empty()
         {
             tracing::info!("No findings from Stage 8, skipping Stage 9");
+            let review_inline = match self.inline_review_style {
+                InlineReviewStyle::Text => serde_json::json!("No issues found."),
+                InlineReviewStyle::Structured => serde_json::json!([]),
+            };
             let final_output = serde_json::json!({
                 "findings": findings_json,
-                "review_inline": "No issues found.",
+                "review_inline": review_inline,
                 "fixes": ""
             });
             return Ok(WorkerResult {
@@ -762,7 +771,7 @@ Example:
 
         // Stage 9
         info!("Running Stage 9");
-        let mut review_inline_text = String::new();
+        let mut review_inline_value = Value::Null;
         {
             let stage = 9;
             let (stage_prompt, clean_stage_prompt) =
@@ -771,35 +780,146 @@ Example:
             let clean_system_prompt = clean_shared_context.clone();
             let findings_str = serde_json::to_string_pretty(&findings_json).unwrap_or_default();
             let user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
+                "{}\n\nFindings:\n{}",
                 stage_prompt, findings_str
             );
             let clean_user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
+                "{}\n\nFindings:\n{}",
                 clean_stage_prompt, findings_str
             );
+
+            let diff_ranges = crate::worker::prefetch::parse_diff_ranges(&target_commit_diff);
+
+            let mut local_history = Vec::new();
+            let sys_msg = AiMessage {
+                role: AiRole::System,
+                content: Some(system_prompt),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: None,
+            };
+
+            if self.global_history.is_empty() {
+                self.global_history.push(AiMessage {
+                    role: AiRole::System,
+                    content: Some(clean_system_prompt),
+                    thought: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+
+            local_history.push(AiMessage {
+                role: AiRole::User,
+                content: Some(user_prompt),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            self.global_history.push(AiMessage {
+                role: AiRole::User,
+                content: Some(clean_user_prompt),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+
             let mut retries = 0;
             while retries < 3 {
-                if let Ok((result_text, t_in, t_out, t_cached)) = self
-                    .run_ai_stage_raw(
-                        stage,
-                        system_prompt.clone(),
-                        clean_system_prompt.clone(),
-                        user_prompt.clone(),
-                        clean_user_prompt.clone(),
-                    )
-                    .await
-                {
-                    total_tokens_in += t_in;
-                    total_tokens_out += t_out;
-                    total_tokens_cached += t_cached;
+                match self.run_ai_turn(&sys_msg, &mut local_history).await {
+                    Ok((content, t_in, t_out, t_cached)) => {
+                        total_tokens_in += t_in;
+                        total_tokens_out += t_out;
+                        total_tokens_cached += t_cached;
 
-                    review_inline_text = result_text.clone();
-                    match validate_inline_format(&result_text) {
-                        Ok(_) => break,
-                        Err(e) => {
-                            tracing::warn!("Stage 9 output validation failed: {}. Retrying...", e);
+                        match self.inline_review_style {
+                            InlineReviewStyle::Text => {
+                                match validate_inline_format(&content) {
+                                    Ok(_) => {
+                                        review_inline_value = Value::String(content);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        let feedback = format!("Validation failed: {}. Please fix your report.", e);
+                                        tracing::warn!("Stage 9 validation failed. Retrying...");
+                                        local_history.push(AiMessage {
+                                            role: AiRole::User,
+                                            content: Some(feedback.clone()),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        });
+                                        self.global_history.push(AiMessage {
+                                            role: AiRole::User,
+                                            content: Some(feedback),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        });
+                                    }
+                                }
+                            }
+                            InlineReviewStyle::Structured => {
+                                let cleaned = crate::utils::clean_json_string(&content);
+                                let parsed_res: Result<Vec<RawIssue>, _> = serde_json::from_str(&cleaned);
+
+                                match parsed_res {
+                                    Ok(raw_issues) => {
+                                        let (resolved, errors) = resolve_and_validate_snippets(
+                                            raw_issues,
+                                            self.tools.get_worktree_path(),
+                                            &diff_ranges
+                                        ).await;
+
+                                        if errors.is_empty() {
+                                            review_inline_value = serde_json::to_value(resolved).unwrap_or(Value::Null);
+                                            break;
+                                        } else {
+                                            let feedback = format!(
+                                                "The following issues in your JSON response failed validation:\n{}\nPlease correct these issues. Ensure snippets match the file content exactly and only refer to lines modified in the diff.",
+                                                errors.join("\n")
+                                            );
+                                            tracing::warn!("Stage 9 structured validation failed. Retrying...");
+                                            local_history.push(AiMessage {
+                                                role: AiRole::User,
+                                                content: Some(feedback.clone()),
+                                                thought: None,
+                                                tool_calls: None,
+                                                tool_call_id: None,
+                                            });
+                                            self.global_history.push(AiMessage {
+                                                role: AiRole::User,
+                                                content: Some(feedback),
+                                                thought: None,
+                                                tool_calls: None,
+                                                tool_call_id: None,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let feedback = format!("Failed to parse JSON: {}. Please ensure you return a valid JSON array.", e);
+                                        tracing::warn!("Stage 9 JSON parsing failed. Retrying...");
+                                        local_history.push(AiMessage {
+                                            role: AiRole::User,
+                                            content: Some(feedback.clone()),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        });
+                                        self.global_history.push(AiMessage {
+                                            role: AiRole::User,
+                                            content: Some(feedback),
+                                            thought: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        });
+                                    }
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        warn!("Stage 9 turn failed: {}", e);
                     }
                 }
                 retries += 1;
@@ -837,7 +957,7 @@ Example:
 
         let final_output = json!({
             "findings": findings_json,
-            "review_inline": review_inline_text,
+            "review_inline": review_inline_value,
             "fixes": fixes_text
         });
 
@@ -879,45 +999,11 @@ Example:
         Ok((parsed, t_in, t_out, t_cached))
     }
 
-    async fn run_ai_stage_raw(
+    async fn run_ai_turn(
         &mut self,
-        _stage: u8,
-        system_prompt: String,
-        clean_system_prompt: String,
-        user_prompt: String,
-        clean_user_prompt: String,
+        sys_msg: &AiMessage,
+        local_history: &mut Vec<AiMessage>,
     ) -> Result<(String, u32, u32, u32)> {
-        let mut local_history = Vec::new();
-
-        let user_msg = AiMessage {
-            role: AiRole::User,
-            content: Some(user_prompt.clone()),
-            thought: None,
-            tool_calls: None,
-            tool_call_id: None,
-        };
-        local_history.push(user_msg.clone());
-
-        if self.global_history.is_empty() {
-            // Keep a clean version for testing/history, we can just push the user prompt.
-            // But we don't have a clean sys_msg anymore as an AiMessage.
-            // Let's create an informational System message in global history just to record the context.
-            self.global_history.push(AiMessage {
-                role: AiRole::System,
-                content: Some(clean_system_prompt.clone()),
-                thought: None,
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        self.global_history.push(AiMessage {
-            role: AiRole::User,
-            content: Some(clean_user_prompt),
-            thought: None,
-            tool_calls: None,
-            tool_call_id: None,
-        });
-
         let mut turns = 0;
         let mut t_in = 0;
         let mut t_out = 0;
@@ -930,11 +1016,10 @@ Example:
             }
 
             let request = crate::ai::AiRequest {
-                system: Some(system_prompt.clone()),
+                system: sys_msg.content.clone(),
                 messages: local_history.clone(),
                 tools: Some(self.tools.get_declarations_generic()),
                 temperature: Some(self.temperature),
-
                 response_format: None,
                 context_tag: self.context_tag.as_ref().map(|prefix| {
                     format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)
@@ -988,6 +1073,54 @@ Example:
         }
 
         Err(anyhow::anyhow!("Max interactions exceeded"))
+    }
+
+    async fn run_ai_stage_raw(
+        &mut self,
+        _stage: u8,
+        system_prompt: String,
+        clean_system_prompt: String,
+        user_prompt: String,
+        clean_user_prompt: String,
+    ) -> Result<(String, u32, u32, u32)> {
+        let mut local_history = Vec::new();
+
+        let sys_msg = AiMessage {
+            role: AiRole::System,
+            content: Some(system_prompt.clone()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let clean_sys_msg = AiMessage {
+            role: AiRole::System,
+            content: Some(clean_system_prompt),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        let user_msg = AiMessage {
+            role: AiRole::User,
+            content: Some(user_prompt.clone()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        local_history.push(user_msg.clone());
+
+        if self.global_history.is_empty() {
+            self.global_history.push(clean_sys_msg);
+        }
+        self.global_history.push(AiMessage {
+            role: AiRole::User,
+            content: Some(clean_user_prompt),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        self.run_ai_turn(&sys_msg, &mut local_history).await
     }
 }
 

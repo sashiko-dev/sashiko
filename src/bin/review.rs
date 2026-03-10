@@ -398,10 +398,19 @@ async fn main() -> Result<()> {
 
                                 // Extract review_inline from JSON
                                 let mut inline_content = None;
-                                if let Some(output) = &result.output
-                                    && let Some(content) = output.get("review_inline").and_then(|v| v.as_str()) {
+                                let mut inline_structured = None;
+
+                                if let Some(output) = &result.output {
+                                    if let Some(content) =
+                                        output.get("review_inline").and_then(|v| v.as_str())
+                                    {
                                         inline_content = Some(content.to_string());
+                                    } else if let Some(structured) =
+                                        output.get("review_inline").and_then(|v| v.as_array())
+                                    {
+                                        inline_structured = Some(structured.clone());
                                     }
+                                }
 
                                 // Check for missing inline review with findings
                                 let mut has_findings = false;
@@ -411,7 +420,10 @@ async fn main() -> Result<()> {
                                             has_findings = true;
                                         }
 
-                                if has_findings && inline_content.is_none() {
+                                if has_findings
+                                    && inline_content.is_none()
+                                    && inline_structured.is_none()
+                                {
                                     error!("Review failure: Findings detected but review_inline field was missing or empty.");
                                     if attempt < 3 {
                                         continue;
@@ -425,6 +437,7 @@ async fn main() -> Result<()> {
                                     "review": result.output,
                                     "error": result.error,
                                     "inline_review": inline_content,
+                                    "inline_review_structured": inline_structured,
                                     "input_context": result.input_context,
                                     "history": result.history,
                                     "tokens_in": result.tokens_in,
