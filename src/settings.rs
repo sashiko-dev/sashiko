@@ -98,6 +98,19 @@ pub struct GitSettings {
     pub repository_path: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InlineReviewStyle {
+    Text,
+    Structured,
+}
+
+impl Default for InlineReviewStyle {
+    fn default() -> Self {
+        InlineReviewStyle::Text
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct ReviewSettings {
@@ -113,6 +126,8 @@ pub struct ReviewSettings {
     pub max_files_touched: usize,
     #[serde(default)]
     pub ignore_files: Vec<String>,
+    #[serde(default)]
+    pub inline_review_style: InlineReviewStyle,
 }
 
 fn default_max_lines_changed() -> usize {
