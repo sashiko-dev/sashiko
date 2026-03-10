@@ -14,6 +14,7 @@
 
 pub mod prefetch;
 pub mod prompts;
+pub mod review_validator;
 pub mod tools;
 #[cfg(test)]
 mod tools_test;

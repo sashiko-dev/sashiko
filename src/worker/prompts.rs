@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
+use crate::settings::InlineReviewStyle;
 use crate::worker::tools::ToolBox;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,7 @@ pub struct WorkerConfig {
     pub temperature: f32,
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
+    pub inline_review_style: InlineReviewStyle,
 }
 
 pub struct WorkerResult {
@@ -175,7 +177,11 @@ impl PromptRegistry {
     }
 
     /// Returns the prompt for a specific stage, including any corresponding guidance files.
-    pub async fn get_stage_prompt(&self, stage: u8) -> Result<(String, String)> {
+    pub async fn get_stage_prompt(
+        &self,
+        stage: u8,
+        style: InlineReviewStyle,
+    ) -> Result<(String, String)> {
         let mut clean = String::with_capacity(10_000);
         let mut clean_files = Vec::new();
         let mut content = String::with_capacity(10_000);
@@ -263,8 +269,20 @@ You are an expert kernel developer writing patches to fix bugs found during revi
                     .await?;
             }
             9 => {
-                self.append_file(&mut content, &mut clean_files, "inline-template.md")
-                    .await?;
+                match style {
+                    InlineReviewStyle::Text => {
+                        self.append_file(&mut content, &mut clean_files, "inline-template.md")
+                            .await?;
+                    }
+                    InlineReviewStyle::Structured => {
+                        self.append_file(
+                            &mut content,
+                            &mut clean_files,
+                            "inline-template-structured.md",
+                        )
+                        .await?;
+                    }
+                }
             }
             _ => {}
         }
@@ -362,6 +380,7 @@ pub struct Worker {
     temperature: f32,
     series_range: Option<String>,
     context_tag: Option<String>,
+    inline_review_style: InlineReviewStyle,
 }
 
 impl Worker {
@@ -380,6 +399,7 @@ impl Worker {
             temperature: config.temperature,
             series_range: config.series_range,
             context_tag: None,
+            inline_review_style: config.inline_review_style,
         }
     }
 
@@ -548,7 +568,8 @@ impl Worker {
         // Stages 1-7
         for stage in 1..=7 {
             info!("Running Stage {}", stage);
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
+            let (stage_prompt, clean_stage_prompt) =
+                self.prompts.get_stage_prompt(stage, self.inline_review_style).await?;
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
 
@@ -651,7 +672,8 @@ Example:
         let mut findings_json = Value::Array(Vec::new());
         {
             let stage = 8;
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
+            let (stage_prompt, clean_stage_prompt) =
+                self.prompts.get_stage_prompt(stage, self.inline_review_style).await?;
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
 
@@ -743,7 +765,8 @@ Example:
         let mut review_inline_text = String::new();
         {
             let stage = 9;
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
+            let (stage_prompt, clean_stage_prompt) =
+                self.prompts.get_stage_prompt(stage, self.inline_review_style).await?;
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
             let findings_str = serde_json::to_string_pretty(&findings_json).unwrap_or_default();

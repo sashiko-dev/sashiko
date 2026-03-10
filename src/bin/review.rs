@@ -388,6 +388,7 @@ async fn main() -> Result<()> {
                                 temperature: settings.ai.temperature,
                                                                 custom_prompt: args.custom_prompt.clone(),
                                 series_range,
+                                inline_review_style: settings.review.inline_review_style,
                             },
                         );
 
