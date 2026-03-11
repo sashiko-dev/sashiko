@@ -77,7 +77,10 @@ async fn resolve_single_issue(
         .collect();
 
     if snippet_lines.is_empty() {
-        anyhow::bail!("The provided code snippet for file '{}' is empty.", raw.file);
+        anyhow::bail!(
+            "The provided code snippet for file '{}' is empty.",
+            raw.file
+        );
     }
 
     // 1. Fuzzy match snippet to find line numbers
@@ -139,7 +142,9 @@ async fn resolve_single_issue(
 fn normalize_line(line: &str) -> String {
     // Aggressive normalization: remove all whitespace and leading +/- diff markers
     let mut s = line.trim();
-    if (s.starts_with('+') || s.starts_with('-')) && (s.len() == 1 || s.chars().nth(1).unwrap().is_whitespace()) {
+    if (s.starts_with('+') || s.starts_with('-'))
+        && (s.len() == 1 || s.chars().nth(1).unwrap().is_whitespace())
+    {
         s = s[1..].trim();
     }
     s.chars().filter(|c| !c.is_whitespace()).collect()
@@ -147,13 +152,13 @@ fn normalize_line(line: &str) -> String {
 
 fn match_at(lines: &[&str], start_idx: usize, snippet_lines: &[String]) -> Option<usize> {
     let mut file_idx = start_idx;
-    
+
     for snippet_line in snippet_lines {
         // Skip empty lines in the source file
         while file_idx < lines.len() && normalize_line(lines[file_idx]).is_empty() {
             file_idx += 1;
         }
-        
+
         if file_idx >= lines.len() {
             return None;
         }
@@ -170,14 +175,18 @@ fn match_at(lines: &[&str], start_idx: usize, snippet_lines: &[String]) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_resolve_and_validate() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.c");
-        fs::write(&file_path, "int main() {\n    int x = 1;\n    return 0;\n}\n").unwrap();
+        fs::write(
+            &file_path,
+            "int main() {\n    int x = 1;\n    return 0;\n}\n",
+        )
+        .unwrap();
 
         let mut diff_ranges = HashMap::new();
         diff_ranges.insert("test.c".to_string(), vec![(1, 1)]); // Only line 2 (0-indexed 1) modified
@@ -194,10 +203,11 @@ mod tests {
                 compromised_line: "return 0;".to_string(),
                 approx_line: Some(3),
                 issue: "This should fail because not in diff".to_string(),
-            }
+            },
         ];
 
-        let (resolved, errors) = resolve_and_validate_snippets(issues, dir.path(), &diff_ranges).await;
+        let (resolved, errors) =
+            resolve_and_validate_snippets(issues, dir.path(), &diff_ranges).await;
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].start_line, 2);

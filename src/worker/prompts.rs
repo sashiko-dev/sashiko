@@ -269,22 +269,20 @@ You are an expert kernel developer writing patches to fix bugs found during revi
                 self.append_file(&mut content, &mut clean_files, "severity.md")
                     .await?;
             }
-            9 => {
-                match style {
-                    InlineReviewStyle::Text => {
-                        self.append_file(&mut content, &mut clean_files, "inline-template.md")
-                            .await?;
-                    }
-                    InlineReviewStyle::Structured => {
-                        self.append_file(
-                            &mut content,
-                            &mut clean_files,
-                            "inline-template-structured.md",
-                        )
+            9 => match style {
+                InlineReviewStyle::Text => {
+                    self.append_file(&mut content, &mut clean_files, "inline-template.md")
                         .await?;
-                    }
                 }
-            }
+                InlineReviewStyle::Structured => {
+                    self.append_file(
+                        &mut content,
+                        &mut clean_files,
+                        "inline-template-structured.md",
+                    )
+                    .await?;
+                }
+            },
             _ => {}
         }
         if !clean_files.is_empty() {
@@ -569,8 +567,10 @@ impl Worker {
         // Stages 1-7
         for stage in 1..=7 {
             info!("Running Stage {}", stage);
-            let (stage_prompt, clean_stage_prompt) =
-                self.prompts.get_stage_prompt(stage, self.inline_review_style).await?;
+            let (stage_prompt, clean_stage_prompt) = self
+                .prompts
+                .get_stage_prompt(stage, self.inline_review_style)
+                .await?;
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
 
@@ -677,8 +677,10 @@ Example:
         let mut findings_json = Value::Array(Vec::new());
         {
             let stage = 8;
-            let (stage_prompt, clean_stage_prompt) =
-                self.prompts.get_stage_prompt(stage, self.inline_review_style).await?;
+            let (stage_prompt, clean_stage_prompt) = self
+                .prompts
+                .get_stage_prompt(stage, self.inline_review_style)
+                .await?;
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
 
@@ -774,19 +776,16 @@ Example:
         let mut review_inline_value = Value::Null;
         {
             let stage = 9;
-            let (stage_prompt, clean_stage_prompt) =
-                self.prompts.get_stage_prompt(stage, self.inline_review_style).await?;
+            let (stage_prompt, clean_stage_prompt) = self
+                .prompts
+                .get_stage_prompt(stage, self.inline_review_style)
+                .await?;
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
             let findings_str = serde_json::to_string_pretty(&findings_json).unwrap_or_default();
-            let user_prompt = format!(
-                "{}\n\nFindings:\n{}",
-                stage_prompt, findings_str
-            );
-            let clean_user_prompt = format!(
-                "{}\n\nFindings:\n{}",
-                clean_stage_prompt, findings_str
-            );
+            let user_prompt = format!("{}\n\nFindings:\n{}", stage_prompt, findings_str);
+            let clean_user_prompt =
+                format!("{}\n\nFindings:\n{}", clean_stage_prompt, findings_str);
 
             let diff_ranges = crate::worker::prefetch::parse_diff_ranges(&target_commit_diff);
 
@@ -833,59 +832,69 @@ Example:
                         total_tokens_cached += t_cached;
 
                         match self.inline_review_style {
-                            InlineReviewStyle::Text => {
-                                match validate_inline_format(&content) {
-                                    Ok(_) => {
-                                        review_inline_value = Value::String(content);
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        let feedback = format!("Validation failed: {}. Please fix your report.", e);
-                                        tracing::warn!("Stage 9 validation failed. Retrying...");
-                                        local_history.push(AiMessage {
-                                            role: AiRole::User,
-                                            content: Some(feedback.clone()),
-                                            thought: None,
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                        });
-                                        self.global_history.push(AiMessage {
-                                            role: AiRole::User,
-                                            content: Some(feedback),
-                                            thought: None,
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                        });
-                                    }
+                            InlineReviewStyle::Text => match validate_inline_format(&content) {
+                                Ok(_) => {
+                                    review_inline_value = Value::String(content);
+                                    break;
                                 }
-                            }
+                                Err(e) => {
+                                    let feedback = format!(
+                                        "Validation failed: {}. Please fix your report.",
+                                        e
+                                    );
+                                    tracing::warn!("Stage 9 validation failed. Retrying...");
+                                    local_history.push(AiMessage {
+                                        role: AiRole::User,
+                                        content: Some(feedback.clone()),
+                                        thought: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                    });
+                                    self.global_history.push(AiMessage {
+                                        role: AiRole::User,
+                                        content: Some(feedback),
+                                        thought: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                    });
+                                }
+                            },
                             InlineReviewStyle::Structured => {
                                 let cleaned = crate::utils::clean_json_string(&content);
-                                let parsed_res: Result<Vec<RawIssue>, _> = serde_json::from_str(&cleaned).or_else(|_| {
-                                    let cands = find_json_array_candidates(&content);
-                                    cands.into_iter()
-                                        .last()
-                                        .and_then(|v| serde_json::from_value(v).ok())
-                                        .ok_or_else(|| anyhow::anyhow!("No valid JSON array found"))
-                                });
+                                let parsed_res: Result<Vec<RawIssue>, _> =
+                                    serde_json::from_str(&cleaned).or_else(|_| {
+                                        let cands = find_json_array_candidates(&content);
+                                        cands
+                                            .into_iter()
+                                            .last()
+                                            .and_then(|v| serde_json::from_value(v).ok())
+                                            .ok_or_else(|| {
+                                                anyhow::anyhow!("No valid JSON array found")
+                                            })
+                                    });
 
                                 match parsed_res {
                                     Ok(raw_issues) => {
                                         let (resolved, errors) = resolve_and_validate_snippets(
                                             raw_issues,
                                             self.tools.get_worktree_path(),
-                                            &diff_ranges
-                                        ).await;
+                                            &diff_ranges,
+                                        )
+                                        .await;
 
                                         if errors.is_empty() {
-                                            review_inline_value = serde_json::to_value(resolved).unwrap_or(Value::Null);
+                                            review_inline_value = serde_json::to_value(resolved)
+                                                .unwrap_or(Value::Null);
                                             break;
                                         } else {
                                             let feedback = format!(
                                                 "The following issues in your JSON response failed validation:\n{}\nPlease correct these issues. Ensure snippets match the file content exactly and only refer to lines modified in the diff.",
                                                 errors.join("\n")
                                             );
-                                            tracing::warn!("Stage 9 structured validation failed:\n{}", errors.join("\n"));
+                                            tracing::warn!(
+                                                "Stage 9 structured validation failed:\n{}",
+                                                errors.join("\n")
+                                            );
                                             local_history.push(AiMessage {
                                                 role: AiRole::User,
                                                 content: Some(feedback.clone()),
@@ -903,8 +912,15 @@ Example:
                                         }
                                     }
                                     Err(e) => {
-                                        let feedback = format!("Failed to parse JSON: {}. Please ensure you return a valid JSON array.", e);
-                                        tracing::warn!("Stage 9 JSON parsing failed. Error: {}\nRaw content:\n{}", e, content);
+                                        let feedback = format!(
+                                            "Failed to parse JSON: {}. Please ensure you return a valid JSON array.",
+                                            e
+                                        );
+                                        tracing::warn!(
+                                            "Stage 9 JSON parsing failed. Error: {}\nRaw content:\n{}",
+                                            e,
+                                            content
+                                        );
                                         local_history.push(AiMessage {
                                             role: AiRole::User,
                                             content: Some(feedback.clone()),
