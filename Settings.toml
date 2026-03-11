@@ -33,5 +33,5 @@ concurrency = 24
 worktree_dir = "review_trees"
 timeout_seconds = 3600
 max_retries = 3
-inline_review_style = "text"
+inline_review_style = "structured"
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]

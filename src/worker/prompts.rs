@@ -825,7 +825,7 @@ Example:
 
             let mut retries = 0;
             while retries < 3 {
-                match self.run_ai_turn(&sys_msg, &mut local_history).await {
+                match self.run_ai_turn(stage, &sys_msg, &mut local_history).await {
                     Ok((content, t_in, t_out, t_cached)) => {
                         total_tokens_in += t_in;
                         total_tokens_out += t_out;
@@ -1023,6 +1023,7 @@ Example:
 
     async fn run_ai_turn(
         &mut self,
+        _stage: u8,
         sys_msg: &AiMessage,
         local_history: &mut Vec<AiMessage>,
     ) -> Result<(String, u32, u32, u32)> {
@@ -1099,7 +1100,7 @@ Example:
 
     async fn run_ai_stage_raw(
         &mut self,
-        _stage: u8,
+        stage: u8,
         system_prompt: String,
         clean_system_prompt: String,
         user_prompt: String,
@@ -1142,7 +1143,7 @@ Example:
             tool_call_id: None,
         });
 
-        self.run_ai_turn(&sys_msg, &mut local_history).await
+        self.run_ai_turn(stage, &sys_msg, &mut local_history).await
     }
 }
 
