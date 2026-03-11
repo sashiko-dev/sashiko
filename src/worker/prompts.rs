@@ -861,7 +861,13 @@ Example:
                             }
                             InlineReviewStyle::Structured => {
                                 let cleaned = crate::utils::clean_json_string(&content);
-                                let parsed_res: Result<Vec<RawIssue>, _> = serde_json::from_str(&cleaned);
+                                let parsed_res: Result<Vec<RawIssue>, _> = serde_json::from_str(&cleaned).or_else(|_| {
+                                    let cands = find_json_array_candidates(&content);
+                                    cands.into_iter()
+                                        .last()
+                                        .and_then(|v| serde_json::from_value(v).ok())
+                                        .ok_or_else(|| anyhow::anyhow!("No valid JSON array found"))
+                                });
 
                                 match parsed_res {
                                     Ok(raw_issues) => {
@@ -879,7 +885,7 @@ Example:
                                                 "The following issues in your JSON response failed validation:\n{}\nPlease correct these issues. Ensure snippets match the file content exactly and only refer to lines modified in the diff.",
                                                 errors.join("\n")
                                             );
-                                            tracing::warn!("Stage 9 structured validation failed. Retrying...");
+                                            tracing::warn!("Stage 9 structured validation failed:\n{}", errors.join("\n"));
                                             local_history.push(AiMessage {
                                                 role: AiRole::User,
                                                 content: Some(feedback.clone()),
@@ -898,7 +904,7 @@ Example:
                                     }
                                     Err(e) => {
                                         let feedback = format!("Failed to parse JSON: {}. Please ensure you return a valid JSON array.", e);
-                                        tracing::warn!("Stage 9 JSON parsing failed. Retrying...");
+                                        tracing::warn!("Stage 9 JSON parsing failed. Error: {}\nRaw content:\n{}", e, content);
                                         local_history.push(AiMessage {
                                             role: AiRole::User,
                                             content: Some(feedback.clone()),
@@ -1199,6 +1205,58 @@ fn find_matching_brace(chars: &[char], start: usize) -> Option<usize> {
         } else if *c == '{' {
             depth += 1;
         } else if *c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn find_json_array_candidates(text: &str) -> Vec<Value> {
+    let mut candidates = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '['
+            && let Some(end) = find_matching_bracket(&chars, i)
+        {
+            let candidate: String = chars[i..=end].iter().collect();
+            let clean_candidate = crate::utils::clean_json_string(&candidate);
+            if let Ok(v) =
+                serde_json::from_str(&clean_candidate).or_else(|_| serde_json::from_str(&candidate))
+            {
+                candidates.push(v);
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    candidates
+}
+
+fn find_matching_bracket(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, c) in chars.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if *c == '\\' {
+                escape = true;
+            } else if *c == '"' {
+                in_string = false;
+            }
+        } else if *c == '"' {
+            in_string = true;
+        } else if *c == '[' {
+            depth += 1;
+        } else if *c == ']' {
             depth -= 1;
             if depth == 0 {
                 return Some(i);
