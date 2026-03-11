@@ -91,8 +91,8 @@ async fn resolve_single_issue(
     }
 
     for &i in &indices {
-        if match_at(&lines, i, &snippet_lines) {
-            found_range = Some((i, i + snippet_lines.len() - 1));
+        if let Some(end_idx) = match_at(&lines, i, &snippet_lines) {
+            found_range = Some((i, end_idx));
             break;
         }
     }
@@ -145,18 +145,26 @@ fn normalize_line(line: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn match_at(lines: &[&str], start_idx: usize, snippet_lines: &[String]) -> bool {
-    if start_idx + snippet_lines.len() > lines.len() {
-        return false;
-    }
-
-    for (i, snippet_line) in snippet_lines.iter().enumerate() {
-        if normalize_line(lines[start_idx + i]) != *snippet_line {
-            return false;
+fn match_at(lines: &[&str], start_idx: usize, snippet_lines: &[String]) -> Option<usize> {
+    let mut file_idx = start_idx;
+    
+    for snippet_line in snippet_lines {
+        // Skip empty lines in the source file
+        while file_idx < lines.len() && normalize_line(lines[file_idx]).is_empty() {
+            file_idx += 1;
         }
+        
+        if file_idx >= lines.len() {
+            return None;
+        }
+
+        if normalize_line(lines[file_idx]) != *snippet_line {
+            return None;
+        }
+        file_idx += 1;
     }
 
-    true
+    Some(file_idx.saturating_sub(1))
 }
 
 #[cfg(test)]
