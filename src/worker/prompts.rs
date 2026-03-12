@@ -187,43 +187,43 @@ impl PromptRegistry {
         let mut clean_files = Vec::new();
         let mut content = String::with_capacity(10_000);
 
-        let stage_instruction = match stage {
-            1 => {
+        let stage_instruction = match (stage, style) {
+            (1, _) => {
                 "# Stage 1. Analyze commit main goal
 
 You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally flawed concepts? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."
             }
-            2 => {
+            (2, _) => {
                 "# Stage 2. High-level implementation verification
 
 You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."
             }
-            3 => {
+            (3, _) => {
                 "# Stage 3. Execution flow verification
 
 You are a static analysis engine tracing execution flow in C code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (`goto cleanup;`) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring `CONFIG_` prefixes are used where expected instead of `HAVE_`). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."
             }
-            4 => {
+            (4, _) => {
                 "# Stage 4. Resource management
 
 You are an expert in C resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure `list_add` and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (`kref_get`/`kref_put`) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., `cancel_work_sync`, `del_timer_sync`) and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."
             }
-            5 => {
+            (5, _) => {
                 "# Stage 5. Locking and synchronization
 
 You are a concurrency expert reviewing Linux kernel locking mechanisms. Look for deadlocks, missed unlocks in error paths, sleeping in atomic context (e.g., calling sleeping functions while holding spinlocks, inside RCU read-side critical sections, or with interrupts disabled), and incorrect RCU usage. Investigate race conditions, lock ordering violations (AB-BA deadlocks), and thread-safety issues. Check for mutex lifecycle issues (e.g., double initialization, destroying a locked mutex, or failing to release/destroy on probe failure). Check if shared data is adequately protected across different contexts (process, softirq, hardirq). CRITICAL RCU RULE: Objects must be removed from data structures BEFORE calling `call_rcu()`, `synchronize_rcu()`, or `kfree_rcu()`. Flag any violations as a UAF. Ensure memory barriers are used correctly when lockless concurrency is involved."
             }
-            6 => {
+            (6, _) => {
                 "# Stage 6. Security audit
 
 You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via `copy_to_user`). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."
             }
-            7 => {
+            (7, _) => {
                 "# Stage 7. Hardware engineer's review
 
 You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing `dma_wmb()`/`dma_rmb()` barriers, incorrect endianness conversions (`cpu_to_le32`), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), output an empty concerns list."
             }
-            8 => {
+            (8, _) => {
                 "# Stage 8. Verification and severity estimation
 
 You are the lead reviewer consolidating feedback from multiple specialized analysts. You will be given a list of concerns generated by different review stages.
@@ -234,12 +234,17 @@ You are the lead reviewer consolidating feedback from multiple specialized analy
 5. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit \"mm: fix allocation\"'). Existing historical commits in the tree should still be referenced by their standard hash.
 6. Assign a severity (low, medium, high, critical) to each remaining valid finding and explain the reasoning. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases."
             }
-            9 => {
+            (9, InlineReviewStyle::Text) => {
                 "# Stage 9. LKML-friendly report generation
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply. Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions."
             }
-            10 => {
+            (9, InlineReviewStyle::Structured) => {
+                "# Stage 9. Structured report generation
+
+You are an automated review bot generating a structured report. Convert the provided findings into a JSON array of issues. Each issue must include the file path, the exact line(s) from the source code where the issue is present (compromised_line), an approximate line number (approx_line), and a description of the issue (issue). Output ONLY the JSON array, without any markdown formatting or extra text."
+            }
+            (10, _) => {
                 "# Stage 10. Fix generation
 
 You are an expert kernel developer writing patches to fix bugs found during review. Generate git-formatted patches to address the provided findings. Ensure the code conforms to kernel style guidelines and compiles cleanly mentally. Double-check that your fixes do not introduce new regressions."
