@@ -1,4 +1,3 @@
-use crate::db::Database;
 use crate::settings::SmtpSettings;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
