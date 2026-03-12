@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 pub fn global_registry() -> Arc<StatsRegistry> {
     static REGISTRY: OnceLock<Arc<StatsRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| StatsRegistry::new()).clone()
+    REGISTRY.get_or_init(StatsRegistry::new).clone()
 }
 
 #[derive(Default)]
