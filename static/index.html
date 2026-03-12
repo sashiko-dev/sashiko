@@ -2264,236 +2264,133 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             `;
 
             try {
-                const [timeline, reviews, tools] = await Promise.all([
+                const [timelineRes, reviewsRes, toolsRes, statusRes] = await Promise.all([
                     fetch('/api/stats/timeline').then(r => r.json()),
                     fetch('/api/stats/reviews').then(r => r.json()),
-                    fetch('/api/stats/tools').then(r => r.json())
+                    fetch('/api/stats/tools').then(r => r.json()),
+                    fetch('/api/stats').then(r => r.json())
                 ]);
+                
+                const timeline = timelineRes.timeline || [];
+                const findings = reviewsRes.findings || [];
+                const tokens = reviewsRes.tokens || [];
+                const tools = toolsRes || [];
+                const b = statusRes.breakdown || {};
 
-                // Colors
                 const colors = {
                     primary: '#5470c6',
                     secondary: '#91cc75',
                     patchset: '#fac858',
-                    individual_patches: '#5ab1ef', // Light Blue/Teal
+                    individual_patches: '#5ab1ef',
                     failure: '#ee6666',
                     text: '#666'
                 };
 
-                // HTML Structure
-                let html = '<h2>Activity Timeline</h2><div class="chart-section"><div id="chart-timeline" style="width:100%; height:300px;"></div></div>';
-
-                // Summary Cards
-                html += '<h2>AI Reviews</h2>';
+                let html = '<h2>System Overview</h2>';
                 html += '<div class="stat-card-grid">';
-
-                // Filter for Total Reviews and Success Rate: Exclude in-progress reviews
-                const completedReviews = reviews.filter(r => !['Pending', 'In Review'].includes(r.status));
-                const totalReviews = completedReviews.reduce((acc, r) => acc + r.count, 0);
-                const successful = completedReviews.filter(r => r.status === 'Reviewed').reduce((acc, r) => acc + r.count, 0);
-                // Failures in completed reviews (includes Failed and FailedToApply)
-                const failed = completedReviews.filter(r => r.status.toLowerCase().includes('failed') || r.status.toLowerCase().includes('error')).reduce((acc, r) => acc + r.count, 0);
-                
-                html += renderStatCard('Total Reviews', totalReviews);
-                html += renderStatCard('Success Rate', totalReviews ? Math.round(successful / totalReviews * 100) + '%' : '-');
-                html += renderStatCard('Failures', failed);
+                html += renderStatCard('Pending Queue', b.pending || 0);
+                html += renderStatCard('In Progress', b.reviewing || 0);
+                html += renderStatCard('Ingested (24h)', b.ingested24h || 0);
+                html += renderStatCard('Reviewed (24h)', b.reviewed24h || 0);
+                html += renderStatCard('Avg TTR (24h)', (b.avg_ttr_24h || 0) + 's');
                 html += '</div>';
+
+                html += '<h2>Throughput & Queue Health</h2>';
+                html += '<div class="chart-section"><div id="chart-throughput" style="width:100%; height:300px;"></div></div>';
                 
-                html += '<h3>Review Outcomes</h3><div class="chart-section"><div id="chart-review-outcomes" style="width:100%; height:300px;"></div></div>';
+                html += '<h2>Review Outcomes & Latency</h2>';
+                html += '<div class="chart-section"><div id="chart-outcomes" style="width:100%; height:300px;"></div></div>';
+                html += '<div class="chart-section"><div id="chart-latency" style="width:100%; height:300px;"></div></div>';
 
-                html += '<h3>Findings Severity</h3><div class="chart-section"><div id="chart-findings" style="width:100%; height:300px;"></div></div>';
-
-                // Calculate total tokens
-                // Exclude In Review (Pending/In Review) AND Failed To Apply
-                const tokenReviews = reviews.filter(r => {
-                    const s = r.status.toLowerCase().replace(/ /g, ''); // Normalize "Failed To Apply" -> "failedtoapply"
-                    return !['pending', 'inreview'].includes(s) && !s.includes('failedtoapply');
-                });
-
-                const totalTokensIn = tokenReviews.reduce((acc, r) => acc + (r.tokens_in || 0), 0);
-                const totalTokensOut = tokenReviews.reduce((acc, r) => acc + (r.tokens_out || 0), 0);
-                const totalTokensCached = tokenReviews.reduce((acc, r) => acc + (r.tokens_cached || 0), 0);
-                
-                const tokenReviewCount = tokenReviews.reduce((acc, r) => acc + r.count, 0);
-
-                // Average per patch (review)
-                const avgTokensIn = tokenReviewCount ? Math.round(totalTokensIn / tokenReviewCount) : 0;
-                const avgTokensOut = tokenReviewCount ? Math.round(totalTokensOut / tokenReviewCount) : 0;
-                const avgTokensCached = tokenReviewCount ? Math.round(totalTokensCached / tokenReviewCount) : 0;
-
-                html += '<h3>Token Usage</h3><div class="stat-card-grid">';
-                html += renderStatCard('Input tokens/patch', avgTokensIn);
-                html += renderStatCard('Cached tokens/patch', avgTokensCached);
-                html += renderStatCard('Out tokens/patch', avgTokensOut);
-                html += '</div>';
-                
-                html += '<h2>Tool Usage</h2><div class="chart-section"><div id="chart-tools" style="width:100%; height:500px;"></div></div>';
+                html += '<h2>AI Resource Usage</h2>';
+                html += '<div class="chart-section"><div id="chart-tokens" style="width:100%; height:300px;"></div></div>';
+                html += '<div class="chart-section"><div id="chart-tools" style="width:100%; height:300px;"></div></div>';
 
                 const container = document.getElementById('stats-content');
                 container.innerHTML = html;
                 container.classList.remove('loading');
 
-                // --- 1. Timeline Chart ---
-                if (timeline.messages && timeline.messages.length) {
-                    const chart = echarts.init(document.getElementById('chart-timeline'));
-                    const dates = [...new Set([
-                        ...timeline.messages.map(m => m.day),
-                        ...timeline.patchsets.map(p => p.day),
-                        ...(timeline.patches || []).map(p => p.day)
-                    ])].sort();
-
-                    const msgData = dates.map(d => timeline.messages.find(m => m.day === d)?.count || 0);
-                    const patchsetData = dates.map(d => timeline.patchsets.filter(p => p.day === d).reduce((a, b) => a + b.count, 0));
-                    const patchesData = dates.map(d => timeline.patches?.find(p => p.day === d)?.count || 0);
-
-                    const option = {
-                        color: [colors.primary, colors.individual_patches, colors.patchset],
-                        tooltip: { trigger: 'axis', backgroundColor: 'rgba(255, 255, 255, 0.9)', borderColor: '#eee', borderWidth: 1, textStyle: { color: '#333' } },
-                        legend: { data: ['Messages', 'Patches', 'Patchsets'], bottom: 0 },
-                        grid: { left: '3%', right: '4%', bottom: '10%', top: '10%', containLabel: true, show: true, borderColor: '#eee' },
-                        xAxis: { type: 'category', data: dates, splitLine: { show: false }, axisLine: { lineStyle: { color: '#ccc' } } },
-                        yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        series: [
-                            { name: 'Messages', type: 'line', smooth: true, showSymbol: false, lineStyle: { width: 3 }, data: msgData, itemStyle: { color: colors.primary } },
-                            { name: 'Patches', type: 'line', smooth: true, showSymbol: false, lineStyle: { width: 3 }, data: patchesData, itemStyle: { color: colors.individual_patches } },
-                            { name: 'Patchsets', type: 'line', smooth: true, showSymbol: false, lineStyle: { width: 3 }, data: patchsetData, itemStyle: { color: colors.patchset } }
-                        ]
-                    };
-                    chart.setOption(option);
-                    window.addEventListener('resize', () => chart.resize());
-                } else {
-                    document.getElementById('chart-timeline').innerHTML = '<p class="loading">No timeline data available.</p>';
-                }
-
-                // --- 1.5. Review Outcomes Timeline ---
-                if (timeline.reviews && timeline.reviews.length) {
-                    const chart = echarts.init(document.getElementById('chart-review-outcomes'));
-                    const dates = [...new Set(timeline.reviews.map(r => r.day))].sort();
+                // Draw Charts if data exists
+                if (timeline.length) {
+                    const dates = timeline.map(t => t.day);
+                    const ingested = timeline.map(t => t.ingested);
+                    const reviewed = timeline.map(t => t.reviewed);
+                    const failures = timeline.map(t => t.failures);
+                    const avgTtr = timeline.map(t => t.ttr_count ? Math.round(t.ttr_sum / t.ttr_count) : 0);
                     
-                    const statuses = [...new Set(timeline.reviews.map(r => r.status))];
-                    
-                    // Custom colors for known statuses
-                    const getColor = (s) => {
-                         if (s === 'Reviewed') return colors.secondary;
-                         if (s === 'Pending') return colors.primary;
-                         if (s === 'In Review') return '#d67f05';
-                         if (s.toLowerCase().includes('failed')) return colors.failure;
-                         return null;
-                    };
-
-                    const series = statuses.map(s => {
-                        const style = {};
-                        const c = getColor(s);
-                        if (c) style.color = c;
-                        
-                        return {
-                            name: s,
-                            type: 'line',
-                            smooth: true,
-                            showSymbol: false,
-                            itemStyle: style,
-                            data: dates.map(d => timeline.reviews.find(r => r.day === d && r.status === s)?.count || 0)
-                        };
-                    });
-
-                    const option = {
+                    // Throughput Chart (Ingested vs Reviewed)
+                    const tpChart = echarts.init(document.getElementById('chart-throughput'));
+                    tpChart.setOption({
+                        color: [colors.primary, colors.secondary],
                         tooltip: { trigger: 'axis' },
-                        legend: { data: statuses, bottom: 0 },
-                        grid: { left: '3%', right: '4%', bottom: '10%', top: '10%', containLabel: true },
-                        xAxis: { type: 'category', data: dates, splitLine: { show: false }, axisLine: { lineStyle: { color: '#ccc' } } },
-                        yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        series: series
-                    };
-                    chart.setOption(option);
-                    window.addEventListener('resize', () => chart.resize());
-                } else {
-                     document.getElementById('chart-review-outcomes').innerHTML = '<p class="loading">No review history available.</p>';
-                }
-
-                // --- 3. Tool Usage Chart ---
-                if (tools && tools.length) {
-                    const chart = echarts.init(document.getElementById('chart-tools'));
-                    // Group by tool name
-                    const toolStats = {};
-                    tools.forEach(t => {
-                        if (!toolStats[t.tool]) toolStats[t.tool] = 0;
-                        toolStats[t.tool] += t.count;
-                    });
-
-                    const toolNames = Object.keys(toolStats).sort((a, b) => toolStats[a] - toolStats[b]); // Sort ascending for bar chart
-                    const values = toolNames.map(t => toolStats[t]);
-
-                    const option = {
-                        tooltip: { trigger: 'axis' },
-                        grid: { left: '3%', right: '4%', bottom: '5%', top: '5%', containLabel: true },
-                        xAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        yAxis: { type: 'category', data: toolNames, axisLabel: { color: colors.text } },
+                        legend: { data: ['Ingested', 'Reviewed'] },
+                        xAxis: { type: 'category', data: dates },
+                        yAxis: { type: 'value' },
                         series: [
-                            {
-                                name: 'Count',
-                                type: 'bar',
-                                data: values,
-                                itemStyle: {
-                                    color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [
-                                        { offset: 0, color: '#83bff6' },
-                                        { offset: 0.5, color: '#188df0' },
-                                        { offset: 1, color: '#188df0' }
-                                    ]),
-                                    borderRadius: [0, 4, 4, 0]
-                                }
-                            }
+                            { name: 'Ingested', type: 'line', data: ingested },
+                            { name: 'Reviewed', type: 'line', data: reviewed }
                         ]
-                    };
-                    chart.setOption(option);
-                    window.addEventListener('resize', () => chart.resize());
-                } else {
-                    document.getElementById('chart-tools').innerHTML = '<p class="loading">No tool usage data available.</p>';
-                }
-
-                // --- 4. Findings Chart ---
-                if (timeline.findings && timeline.findings.length) {
-                    const chart = echarts.init(document.getElementById('chart-findings'));
-                    const dates = [...new Set(timeline.findings.map(f => f.day))].sort();
-                    const severities = ['low', 'medium', 'high', 'critical'];
-                    const severityColors = {
-                        'low': '#FBC02D',
-                        'medium': '#FF9800',
-                        'high': '#FF5722',
-                        'critical': '#B71C1C'
-                    };
-
-                    const series = severities.map(sev => {
-                        return {
-                            name: sev.charAt(0).toUpperCase() + sev.slice(1),
-                            type: 'line',
-                            smooth: true,
-                            showSymbol: false,
-                            itemStyle: { color: severityColors[sev] },
-                            data: dates.map(d => {
-                                const entry = timeline.findings.find(f => f.day === d && f.severity === sev);
-                                return entry ? entry.count : 0;
-                            })
-                        };
                     });
 
-                    const option = {
+                    // Latency Chart
+                    const latChart = echarts.init(document.getElementById('chart-latency'));
+                    latChart.setOption({
+                        color: [colors.failure],
                         tooltip: { trigger: 'axis' },
-                        legend: { data: severities.map(s => s.charAt(0).toUpperCase() + s.slice(1)), bottom: 0 },
-                        grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
-                        xAxis: { type: 'category', data: dates, splitLine: { show: false }, axisLine: { lineStyle: { color: '#ccc' } } },
-                        yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-                        series: series
-                    };
-                    chart.setOption(option);
-                    window.addEventListener('resize', () => chart.resize());
-                } else {
-                    document.getElementById('chart-findings').innerHTML = '<p class="loading">No findings data available.</p>';
+                        legend: { data: ['Avg TTR (s)'] },
+                        xAxis: { type: 'category', data: dates },
+                        yAxis: { type: 'value' },
+                        series: [
+                            { name: 'Avg TTR (s)', type: 'line', smooth: true, data: avgTtr }
+                        ]
+                    });
                 }
 
+                if (findings.length) {
+                    const outChart = echarts.init(document.getElementById('chart-outcomes'));
+                    outChart.setOption({
+                        tooltip: { trigger: 'item' },
+                        series: [{
+                            name: 'Findings by Severity',
+                            type: 'pie',
+                            radius: '50%',
+                            data: findings.map(f => ({ name: f.severity, value: f.count }))
+                        }]
+                    });
+                }
+                
+                if (tokens.length) {
+                    const tokChart = echarts.init(document.getElementById('chart-tokens'));
+                    tokChart.setOption({
+                        tooltip: { trigger: 'item' },
+                        series: [{
+                            name: 'Tokens by Type',
+                            type: 'pie',
+                            radius: '50%',
+                            data: tokens.map(f => ({ name: f.label, value: f.count }))
+                        }]
+                    });
+                }
 
-            } catch (e) {
-                console.error(e);
-                document.getElementById('stats-content').innerHTML = `<div class="error">Error loading stats: ${escapeHtml(e.message)}</div>`;
+                if (tools.length) {
+                    const toolChart = echarts.init(document.getElementById('chart-tools'));
+                    toolChart.setOption({
+                        color: [colors.primary],
+                        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                        grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                        xAxis: { type: 'value' },
+                        yAxis: { type: 'category', data: tools.map(t => t.tool_name).reverse() },
+                        series: [{
+                            type: 'bar',
+                            data: tools.map(t => t.count).reverse(),
+                            itemStyle: { color: colors.secondary }
+                        }]
+                    });
+                }
+
+            } catch (err) {
+                console.error("Failed to load stats:", err);
+                document.getElementById('stats-content').innerHTML = '<div class="alert alert-danger">Failed to load statistics.</div>';
             }
         }
 

@@ -678,13 +678,12 @@ async fn get_stats(
                 .unwrap_or_default();
 
             let pending = *counts.get("Pending").unwrap_or(&0);
-            let reviewing =
-                *counts.get("In Review").unwrap_or(&0) + *counts.get("Applying").unwrap_or(&0);
-            let reviewed = *counts.get("Reviewed").unwrap_or(&0);
-            let failed = *counts.get("Failed").unwrap_or(&0);
-            let failed_to_apply = *counts.get("Failed To Apply").unwrap_or(&0);
-            let incomplete = *counts.get("Incomplete").unwrap_or(&0);
-            let cancelled = *counts.get("Cancelled").unwrap_or(&0);
+            let reviewing = *counts.get("In Review").unwrap_or(&0);
+            let ingested24h = *counts.get("Ingested24h").unwrap_or(&0);
+            let reviewed24h = *counts.get("Reviewed24h").unwrap_or(&0);
+            let ttr_sum = *counts.get("TTRSum").unwrap_or(&0);
+            let ttr_count = *counts.get("TTRCount").unwrap_or(&0);
+            let avg_ttr = if ttr_count > 0 { ttr_sum / ttr_count } else { 0 };
 
             Ok::<serde_json::Value, StatusCode>(serde_json::json!({
                 "status": "ok",
@@ -694,11 +693,9 @@ async fn get_stats(
                 "breakdown": {
                     "pending": pending,
                     "reviewing": reviewing,
-                    "reviewed": reviewed,
-                    "failed": failed,
-                    "failed_to_apply": failed_to_apply,
-                    "incomplete": incomplete,
-                    "cancelled": cancelled
+                    "ingested24h": ingested24h,
+                    "reviewed24h": reviewed24h,
+                    "avg_ttr_24h": avg_ttr
                 }
             }))
         })

@@ -17,7 +17,7 @@ use crate::settings::DatabaseSettings;
 use anyhow::Result;
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+
 use tracing::info;
 
 pub struct Database {
@@ -865,249 +865,93 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_timeline_stats(&self, subsystem_id: Option<i64>) -> Result<serde_json::Value> {
-        let mut messages_data = Vec::new();
+        pub async fn get_timeline_stats(&self, _subsystem_id: Option<i64>) -> Result<serde_json::Value> {
+        // Query daily aggregations from hourly table
+        let sql = "SELECT date(bucket_time) as day, metric_name, sum(value) FROM stats_timeseries_hourly GROUP BY day, metric_name ORDER BY day";
+        let mut rows = self.conn.query(sql, ()).await?;
+        
+        let mut ingested_by_day = std::collections::HashMap::new();
+        let mut reviewed_by_day = std::collections::HashMap::new();
+        let mut failures_by_day = std::collections::HashMap::new();
+        let mut ttr_sum_by_day = std::collections::HashMap::new();
+        let mut ttr_count_by_day = std::collections::HashMap::new();
 
-        if let Some(sid) = subsystem_id {
-            let sql_msgs =
-                "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, count(*) FROM messages m
-             JOIN messages_subsystems ms ON m.id = ms.message_id
-             WHERE ms.subsystem_id = ?
-             GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql_msgs, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    messages_data.push(json!({"day": day, "count": count}));
-                }
-            }
-        } else {
-            let sql_msgs = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, count(*) FROM messages GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql_msgs, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    messages_data.push(json!({"day": day, "count": count}));
-                }
+        while let Ok(Some(row)) = rows.next().await {
+            let day: String = row.get(0)?;
+            let metric: String = row.get(1)?;
+            let value: i64 = row.get(2)?;
+            
+            match metric.as_str() {
+                "sashiko_patches_ingested_total" => { ingested_by_day.insert(day, value); }
+                "sashiko_patches_reviewed_total" => { reviewed_by_day.insert(day, value); }
+                "sashiko_review_failures_total" => { failures_by_day.insert(day, value); }
+                "sashiko_time_to_review_sum_seconds" => { ttr_sum_by_day.insert(day, value); }
+                "sashiko_time_to_review_count" => { ttr_count_by_day.insert(day, value); }
+                _ => {}
             }
         }
+        
+        let mut dates: Vec<String> = ingested_by_day.keys().chain(reviewed_by_day.keys()).cloned().collect();
+        dates.sort();
+        dates.dedup();
+        
+        let timeline = dates.iter().map(|d| {
+            serde_json::json!({
+                "day": d,
+                "ingested": ingested_by_day.get(d).unwrap_or(&0),
+                "reviewed": reviewed_by_day.get(d).unwrap_or(&0),
+                "failures": failures_by_day.get(d).unwrap_or(&0),
+                "ttr_sum": ttr_sum_by_day.get(d).unwrap_or(&0),
+                "ttr_count": ttr_count_by_day.get(d).unwrap_or(&0),
+            })
+        }).collect::<Vec<_>>();
 
-        let mut patchsets_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, status, count(*) FROM patchsets p
-             JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
-             WHERE ps.subsystem_id = ?
-             GROUP BY day, status ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: Option<String> = row.get(1).ok();
-                    let count: i64 = row.get(2)?;
-                    patchsets_data.push(
-                        json!({"day": day, "status": status.unwrap_or_default(), "count": count}),
-                    );
-                }
-            }
-        } else {
-            let sql = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, status, count(*) FROM patchsets GROUP BY day, status ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: Option<String> = row.get(1).ok();
-                    let count: i64 = row.get(2)?;
-                    patchsets_data.push(
-                        json!({"day": day, "status": status.unwrap_or_default(), "count": count}),
-                    );
-                }
-            }
-        }
-
-        // Patches stats (individual patches)
-        let mut patches_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql =
-                "SELECT strftime('%Y-%m-%d', m.date, 'unixepoch') as day, count(*) FROM patches p
-              JOIN messages m ON p.message_id = m.message_id
-              JOIN patches_subsystems ps ON p.id = ps.patch_id
-              WHERE ps.subsystem_id = ?
-              GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    patches_data.push(json!({"day": day, "count": count}));
-                }
-            }
-        } else {
-            let sql =
-                "SELECT strftime('%Y-%m-%d', m.date, 'unixepoch') as day, count(*) FROM patches p
-              JOIN messages m ON p.message_id = m.message_id
-              GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    patches_data.push(json!({"day": day, "count": count}));
-                }
-            }
-        }
-
-        // Reviews stats (outcomes over time)
-        let mut reviews_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                r.status,
-                COUNT(*) as count
-            FROM reviews r
-            JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id
-            WHERE ps.subsystem_id = ?
-            GROUP BY day, status
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    reviews_data.push(json!({"day": day, "status": status, "count": count}));
-                }
-            }
-        } else {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                r.status,
-                COUNT(*) as count
-            FROM reviews r
-            GROUP BY day, status
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    reviews_data.push(json!({"day": day, "status": status, "count": count}));
-                }
-            }
-        }
-
-        // Findings stats
-        let mut findings_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                CASE f.severity 
-                    WHEN 1 THEN 'low' 
-                    WHEN 2 THEN 'medium' 
-                    WHEN 3 THEN 'high' 
-                    WHEN 4 THEN 'critical' 
-                    ELSE 'unknown' 
-                END as severity,
-                COUNT(*) as count
-            FROM findings f
-            JOIN reviews r ON f.review_id = r.id
-            JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id
-            WHERE ps.subsystem_id = ?
-            GROUP BY day, severity
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let severity: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    findings_data.push(json!({"day": day, "severity": severity, "count": count}));
-                }
-            }
-        } else {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                CASE f.severity 
-                    WHEN 1 THEN 'low' 
-                    WHEN 2 THEN 'medium' 
-                    WHEN 3 THEN 'high' 
-                    WHEN 4 THEN 'critical' 
-                    ELSE 'unknown' 
-                END as severity,
-                COUNT(*) as count
-            FROM findings f
-            JOIN reviews r ON f.review_id = r.id
-            GROUP BY day, severity
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let severity: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    findings_data.push(json!({"day": day, "severity": severity, "count": count}));
-                }
-            }
-        }
-
-        Ok(json!({
-            "messages": messages_data,
-            "patchsets": patchsets_data,
-            "patches": patches_data,
-            "reviews": reviews_data,
-            "findings": findings_data
+        Ok(serde_json::json!({
+            "timeline": timeline
         }))
     }
 
-    pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
-        let sql = "SELECT 
-            r.provider, 
-            r.model, 
-            r.status, 
-            count(*),
-            sum(COALESCE(ai.tokens_in, 0)),
-            sum(COALESCE(ai.tokens_out, 0)),
-            sum(COALESCE(ai.tokens_cached, 0))
-        FROM reviews r
-        LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-        GROUP BY r.provider, r.model, r.status";
+    
 
+        pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
+        let mut findings = Vec::new();
+        let sql = "SELECT label, sum(value) FROM stats_timeseries_hourly WHERE metric_name = 'sashiko_findings_total' GROUP BY label";
         let mut rows = self.conn.query(sql, ()).await?;
-        let mut stats = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            let provider: Option<String> = row.get(0).ok();
-            let model: Option<String> = row.get(1).ok();
-            let status: Option<String> = row.get(2).ok();
-            let count: i64 = row.get(3)?;
-            let tokens_in: i64 = row.get(4).unwrap_or(0);
-            let tokens_out: i64 = row.get(5).unwrap_or(0);
-            let tokens_cached: i64 = row.get(6).unwrap_or(0);
-
-            stats.push(json!({
-                "provider": provider.unwrap_or_default(),
-                "model": model.unwrap_or_default(),
-                "status": status.unwrap_or_default(),
-                "count": count,
-                "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "tokens_cached": tokens_cached
-            }));
+            let label: String = row.get(0)?;
+            let value: i64 = row.get(1)?;
+            findings.push(serde_json::json!({"severity": label, "count": value}));
         }
-        Ok(json!(stats))
+        
+        let mut tokens = Vec::new();
+        let sql = "SELECT label, sum(value) FROM stats_timeseries_hourly WHERE metric_name = 'sashiko_tokens_total' GROUP BY label";
+        let mut rows = self.conn.query(sql, ()).await?;
+        while let Ok(Some(row)) = rows.next().await {
+            let label: String = row.get(0)?;
+            let value: i64 = row.get(1)?;
+            tokens.push(serde_json::json!({"label": label, "count": value}));
+        }
+
+        Ok(serde_json::json!({
+            "findings": findings,
+            "tokens": tokens
+        }))
     }
 
-    pub async fn get_tool_usage_stats(&self) -> Result<serde_json::Value> {
-        let sql = "SELECT provider, model, tool_name, count(*), avg(output_length) FROM tool_usages GROUP BY provider, model, tool_name";
+    
+
+        pub async fn get_tool_usage_stats(&self) -> Result<serde_json::Value> {
+        let mut tools = Vec::new();
+        let sql = "SELECT label, sum(value) FROM stats_timeseries_hourly WHERE metric_name = 'sashiko_tool_usage_total' GROUP BY label ORDER BY sum(value) DESC";
         let mut rows = self.conn.query(sql, ()).await?;
-        let mut stats = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            let provider: Option<String> = row.get(0).ok();
-            let model: Option<String> = row.get(1).ok();
-            let tool_name: Option<String> = row.get(2).ok();
-            let count: i64 = row.get(3)?;
-            let avg_len: f64 = row.get(4).unwrap_or(0.0);
-            stats.push(json!({
-                "provider": provider.unwrap_or_default(),
-                "model": model.unwrap_or_default(),
-                "tool": tool_name.unwrap_or_default(),
-                "count": count,
-                "avg_output_length": avg_len
-            }));
+            let label: String = row.get(0)?;
+            let value: i64 = row.get(1)?;
+            tools.push(serde_json::json!({"tool_name": label, "count": value}));
         }
-        Ok(json!(stats))
+        Ok(serde_json::json!(tools))
     }
+
 
     pub async fn begin_transaction(&self) -> Result<()> {
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
@@ -2785,23 +2629,40 @@ impl Database {
         Ok(count_ps + count_rev)
     }
 
-    pub async fn get_patchset_counts_by_status(
-        &self,
-    ) -> Result<std::collections::HashMap<String, usize>> {
-        let mut rows = self
-            .conn
-            .query("SELECT status, COUNT(*) FROM patchsets GROUP BY status", ())
-            .await?;
-
-        let mut counts = std::collections::HashMap::new();
+        pub async fn get_patchset_counts_by_status(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let mut map = std::collections::HashMap::new();
+        let mut rows = self.conn.query("SELECT metric_name, value FROM stats_gauges WHERE metric_name IN ('sashiko_queue_pending_patches', 'sashiko_queue_in_progress_patches')", ()).await?;
         while let Ok(Some(row)) = rows.next().await {
-            let status: Option<String> = row.get(0).ok();
-            let count: i64 = row.get(1)?;
-            let status_key = status.unwrap_or_else(|| "Unknown".to_string());
-            counts.insert(status_key, count as usize);
+            let metric: String = row.get(0)?;
+            let value: i64 = row.get(1)?;
+            if metric == "sashiko_queue_pending_patches" {
+                map.insert("Pending".to_string(), value);
+            } else if metric == "sashiko_queue_in_progress_patches" {
+                map.insert("In Review".to_string(), value);
+            }
         }
-        Ok(counts)
+        
+        // Let's also fetch sum of last 24h for Ingested, Reviewed from timeseries
+        // So the frontend can show it in Status Bar.
+        let sql = "SELECT metric_name, sum(value) FROM stats_timeseries_hourly WHERE bucket_time >= datetime('now', '-24 hours') GROUP BY metric_name";
+        let mut rows = self.conn.query(sql, ()).await?;
+        while let Ok(Some(row)) = rows.next().await {
+            let metric: String = row.get(0)?;
+            let value: i64 = row.get(1)?;
+            if metric == "sashiko_patches_ingested_total" {
+                map.insert("Ingested24h".to_string(), value);
+            } else if metric == "sashiko_patches_reviewed_total" {
+                map.insert("Reviewed24h".to_string(), value);
+            } else if metric == "sashiko_time_to_review_sum_seconds" {
+                map.insert("TTRSum".to_string(), value);
+            } else if metric == "sashiko_time_to_review_count" {
+                map.insert("TTRCount".to_string(), value);
+            }
+        }
+        Ok(map)
     }
+
+    
 }
 
 #[cfg(test)]
