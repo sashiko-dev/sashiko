@@ -16,6 +16,7 @@ pub mod ai;
 pub mod api;
 pub mod baseline;
 pub mod db;
+pub mod email_policy;
 pub mod events;
 pub mod fetcher;
 pub mod git_ops;
