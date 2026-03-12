@@ -61,3 +61,12 @@ pub struct ParsedArticle {
     pub skip_filters: Option<Vec<String>>,
     pub only_filters: Option<Vec<String>>,
 }
+
+#[derive(Debug, Clone)]
+pub enum StatEvent {
+    PatchIngested,
+    PatchReviewed { success: bool, latency_secs: u64 },
+    ReviewFinding { severity: String },
+    AiTokens { model: String, token_type: String, amount: u64 },
+    ToolUsage { tool: String },
+}

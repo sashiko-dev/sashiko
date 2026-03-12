@@ -131,6 +131,24 @@ pub struct Finding {
 }
 
 impl Database {
+
+    pub async fn upsert_stat_gauge(&self, metric_name: &str, value: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO stats_gauges (metric_name, value) VALUES (?1, ?2) 
+             ON CONFLICT(metric_name) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+            (metric_name, value)
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn inc_stat_timeseries(&self, bucket_time: &str, metric_name: &str, label: &str, value: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO stats_timeseries_hourly (bucket_time, metric_name, label, value) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(bucket_time, metric_name, label) DO UPDATE SET value = value + excluded.value",
+            (bucket_time, metric_name, label, value)
+        ).await?;
+        Ok(())
+    }
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
             .conn

@@ -133,6 +133,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
 
+    let stats_registry = sashiko::stats::global_registry();
+    let flusher_db = db.clone();
+    tokio::spawn(async move {
+        sashiko::stats::start_flusher(stats_registry, flusher_db).await;
+    });
+
+
     if let Some(Commands::Inspect) = cli.command {
         return sashiko::inspector::run_inspection(db)
             .await

@@ -215,3 +215,20 @@ CREATE TABLE IF NOT EXISTS tool_usages (
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_tool_usages_review ON tool_usages(review_id);
+
+-- Survives restarts, holds absolute instantaneous values.
+CREATE TABLE IF NOT EXISTS stats_gauges (
+    metric_name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Stores hourly aggregations for counters and averages.
+-- The composite primary key acts as a covering index for fast range queries.
+CREATE TABLE IF NOT EXISTS stats_timeseries_hourly (
+    bucket_time TIMESTAMP NOT NULL,  -- e.g., '2026-03-12 10:00:00'
+    metric_name TEXT NOT NULL,       -- e.g., 'patches_ingested_total'
+    label       TEXT NOT NULL,       -- e.g., 'gpt4o' or 'warning' (or 'none' if N/A)
+    value       INTEGER NOT NULL,
+    PRIMARY KEY (bucket_time, metric_name, label)
+);

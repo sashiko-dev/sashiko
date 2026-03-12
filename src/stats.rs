@@ -2,6 +2,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use std::sync::OnceLock;
+
+pub fn global_registry() -> Arc<StatsRegistry> {
+    static REGISTRY: OnceLock<Arc<StatsRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| StatsRegistry::new()).clone()
+}
+
+
 #[derive(Default)]
 pub struct StatsRegistry {
     // Gauges (absolute values)
@@ -102,4 +110,46 @@ pub struct RegistrySnapshot {
     pub gauges: HashMap<String, i64>,
     pub counters: HashMap<String, u64>,
     pub labeled_counters: HashMap<String, HashMap<String, u64>>,
+}
+
+use crate::db::Database;
+use chrono::{DateTime, Utc, Timelike};
+use std::time::SystemTime;
+
+pub async fn start_flusher(registry: Arc<StatsRegistry>, db: Arc<Database>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        flush_to_db(&registry, &db).await;
+    }
+}
+
+pub async fn flush_to_db(registry: &StatsRegistry, db: &Database) {
+    let snapshot = registry.flush();
+    let now: DateTime<Utc> = SystemTime::now().into();
+    
+    // For gauges, we just upsert the current value.
+    for (metric, value) in snapshot.gauges {
+        let _ = db.upsert_stat_gauge(&metric, value).await;
+    }
+
+    // For timeseries, we floor the current time to the hour.
+    let bucket_time = now.with_minute(0).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let bucket_str = bucket_time.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // Insert counters into timeseries
+    for (metric, value) in snapshot.counters {
+        if value > 0 {
+            let _ = db.inc_stat_timeseries(&bucket_str, &metric, "none", value).await;
+        }
+    }
+
+    // Insert labeled counters
+    for (metric, labels) in snapshot.labeled_counters {
+        for (label, value) in labels {
+            if value > 0 {
+                let _ = db.inc_stat_timeseries(&bucket_str, &metric, &label, value).await;
+            }
+        }
+    }
 }
