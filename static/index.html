@@ -1180,15 +1180,17 @@
                         ? `${p.total_parts}`
                         : `${p.received_parts || 0}/${p.total_parts || 0}`;
 
-                    row.onclick = (e) => {
+                    const clickHandler = (e) => {
                         if (e.target.closest('.copy-btn')) return;
                         const target = `#/patchset/${encodeURIComponent(p.message_id || p.id)}`;
-                        if (e.ctrlKey || e.metaKey) {
+                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
                             window.open(target, '_blank');
-                        } else {
+                        } else if (e.button === 0) {
                             navigate(target);
                         }
                     };
+                    row.onclick = clickHandler;
+                    row.onauxclick = clickHandler;
 
                     let tagsHtml = '';
                     if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
@@ -1215,15 +1217,17 @@
                         <td>${findingsHtml}</td>
                     `;
                 } else {
-                    row.onclick = (e) => {
+                    const clickHandler = (e) => {
                         if (e.target.closest('.copy-btn')) return;
                         const target = `#/message/${encodeURIComponent(p.message_id)}`;
-                        if (e.ctrlKey || e.metaKey) {
+                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
                             window.open(target, '_blank');
-                        } else {
+                        } else if (e.button === 0) {
                             navigate(target);
                         }
                     };
+                    row.onclick = clickHandler;
+                    row.onauxclick = clickHandler;
 
                     row.innerHTML = `
                         <td>${escapeHtml(p.subject) || '(no subject)'}</td>
