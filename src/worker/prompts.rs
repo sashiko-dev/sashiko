@@ -450,9 +450,10 @@ impl Worker {
                         response_format: Some(AiResponseFormat::Json {
                             schema: Some(schema),
                         }),
-                        context_tag: self.context_tag.as_ref().map(|prefix| {
-                            format!("{}s:0] ", &prefix[..prefix.len() - 2])
-                        }),
+                        context_tag: self
+                            .context_tag
+                            .as_ref()
+                            .map(|prefix| format!("{}s:0] ", &prefix[..prefix.len() - 2])),
                     };
 
                     match self.provider.generate_content(req).await {
@@ -913,9 +914,10 @@ Example:
                 temperature: Some(self.temperature),
 
                 response_format: None,
-                context_tag: self.context_tag.as_ref().map(|prefix| {
-                    format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)
-                }),
+                context_tag: self
+                    .context_tag
+                    .as_ref()
+                    .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)),
             };
 
             let resp = self.provider.generate_content(request).await?;

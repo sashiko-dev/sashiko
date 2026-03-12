@@ -198,6 +198,7 @@ impl GeminiClient {
         }
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 

@@ -1442,7 +1442,25 @@ async fn run_review_tool(
                                 }).await;
 
                                     let reply = match resp_payload {
-                                        Ok(p) => json!({ "type": "ai_response", "payload": p }),
+                                        Ok(p) => {
+                                            if let Some(tool_calls) = &p.tool_calls {
+                                                for call in tool_calls {
+                                                    let _ = db
+                                                        .create_tool_usage(crate::db::ToolUsage {
+                                                            review_id,
+                                                            provider: settings.ai.provider.clone(),
+                                                            model: settings.ai.model.clone(),
+                                                            tool_name: call.function_name.clone(),
+                                                            arguments: Some(
+                                                                call.arguments.to_string(),
+                                                            ),
+                                                            output_length: 0,
+                                                        })
+                                                        .await;
+                                                }
+                                            }
+                                            json!({ "type": "ai_response", "payload": p })
+                                        }
                                         Err(e) => {
                                             json!({ "type": "error", "payload": e.to_string() })
                                         }
