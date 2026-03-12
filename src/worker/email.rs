@@ -8,12 +8,12 @@ use tokio::time::sleep;
 use tracing::{error, info};
 
 pub struct EmailWorker {
-    db: Database,
+    db: std::sync::Arc<crate::db::Database>,
     settings: SmtpSettings,
 }
 
 impl EmailWorker {
-    pub fn new(db: Database, settings: SmtpSettings) -> Self {
+    pub fn new(db: std::sync::Arc<crate::db::Database>, settings: SmtpSettings) -> Self {
         Self { db, settings }
     }
 
