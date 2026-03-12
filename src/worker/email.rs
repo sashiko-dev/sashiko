@@ -61,6 +61,12 @@ impl EmailWorker {
     }
 
     async fn send_email(&self, email_row: &crate::db::EmailOutboxRow) -> anyhow::Result<()> {
+        if self.settings.dry_run {
+            info!("DRY RUN: Would have sent email to {}, cc {}, subject '{}'", email_row.to_addresses, email_row.cc_addresses, email_row.subject);
+            info!("DRY RUN Body:\n{}", email_row.body);
+            return Ok(());
+        }
+
         let mut builder = Message::builder()
             .from(self.settings.sender_address.parse()?)
             .subject(&email_row.subject);
