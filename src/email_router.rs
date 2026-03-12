@@ -1,4 +1,4 @@
-use crate::email_policy::{EmailPolicyConfig, SubsystemPolicy};
+use crate::email_policy::EmailPolicyConfig;
 use std::collections::HashSet;
 
 pub enum Action {
@@ -27,7 +27,7 @@ impl EmailRouter {
         let mut active_policies = Vec::new();
         let mut known_mailing_lists = HashSet::new();
 
-        for (name, sub_policy) in &policy.subsystems {
+        for sub_policy in policy.subsystems.values() {
             let mut matched = false;
             for list in &sub_policy.lists {
                 known_mailing_lists.insert(list.to_lowercase());
@@ -121,6 +121,7 @@ impl EmailRouter {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use crate::email_policy::SubsystemPolicy;
 
     fn build_test_policy() -> EmailPolicyConfig {
         let mut subsystems = HashMap::new();

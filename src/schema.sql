@@ -215,3 +215,21 @@ CREATE TABLE IF NOT EXISTS tool_usages (
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_tool_usages_review ON tool_usages(review_id);
+
+CREATE TABLE IF NOT EXISTS email_outbox (
+    id INTEGER PRIMARY KEY,
+    patch_id INTEGER,
+    status TEXT DEFAULT 'Pending',
+    to_addresses TEXT,
+    cc_addresses TEXT,
+    subject TEXT,
+    in_reply_to TEXT,
+    references_hdr TEXT,
+    body TEXT,
+    locked_at INTEGER,
+    error_log TEXT,
+    created_at INTEGER,
+    FOREIGN KEY(patch_id) REFERENCES patches(id)
+);
+CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status);
+
