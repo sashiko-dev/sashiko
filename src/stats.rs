@@ -153,3 +153,35 @@ pub async fn flush_to_db(registry: &StatsRegistry, db: &Database) {
         }
     }
 }
+
+use crate::events::{stat_events, StatEvent};
+
+pub async fn start_stat_listener(registry: Arc<StatsRegistry>) {
+    let mut rx = stat_events().subscribe();
+    while let Ok(event) = rx.recv().await {
+        match event {
+            StatEvent::PatchIngested => {
+                registry.inc_counter("sashiko_patches_ingested_total");
+            }
+            StatEvent::PatchReviewed { success, latency_secs } => {
+                if success {
+                    registry.inc_counter("sashiko_patches_reviewed_total");
+                    registry.record_latency("sashiko_time_to_review_seconds", latency_secs);
+                } else {
+                    registry.inc_counter("sashiko_review_failures_total");
+                }
+            }
+            StatEvent::ReviewFinding { severity } => {
+                registry.inc_labeled_counter("sashiko_findings_total", &severity, 1);
+            }
+            StatEvent::AiTokens { model, token_type, amount } => {
+                // Not the most robust serialization, but it fits the schema "label" column.
+                let label = format!("model={},type={}", model, token_type);
+                registry.inc_labeled_counter("sashiko_tokens_total", &label, amount);
+            }
+            StatEvent::ToolUsage { tool } => {
+                registry.inc_labeled_counter("sashiko_tool_usage_total", &tool, 1);
+            }
+        }
+    }
+}

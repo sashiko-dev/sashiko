@@ -70,3 +70,11 @@ pub enum StatEvent {
     AiTokens { model: String, token_type: String, amount: u64 },
     ToolUsage { tool: String },
 }
+
+use std::sync::OnceLock;
+use tokio::sync::broadcast;
+
+pub fn stat_events() -> broadcast::Sender<StatEvent> {
+    static SENDER: OnceLock<broadcast::Sender<StatEvent>> = OnceLock::new();
+    SENDER.get_or_init(|| broadcast::channel(1024).0).clone()
+}

@@ -1,3 +1,4 @@
+use crate::events::{stat_events, StatEvent};
 // Copyright 2026 The Sashiko Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -488,6 +489,7 @@ impl Reviewer {
                                 q.pop()
                             };
                             if let Some(job) = job {
+                                let start_t = std::time::SystemTime::now();
                                 match Self::process_patch_review(
                                     &ctx_clone,
                                     patchset_id,
@@ -503,8 +505,15 @@ impl Reviewer {
                                 )
                                 .await
                                 {
-                                    Ok(PatchResult::Success) => {}
-                                    _ => failed += 1,
+                                    Ok(PatchResult::Success) => {
+                                        let latency = start_t.elapsed().unwrap_or_default().as_secs();
+                                        let _ = stat_events().send(StatEvent::PatchReviewed { success: true, latency_secs: latency });
+                                    }
+                                    _ => {
+                                        let latency = start_t.elapsed().unwrap_or_default().as_secs();
+                                        let _ = stat_events().send(StatEvent::PatchReviewed { success: false, latency_secs: latency });
+                                        failed += 1;
+                                    }
                                 }
                             } else {
                                 break;
@@ -534,6 +543,7 @@ impl Reviewer {
                     q.pop()
                 };
                 if let Some(job) = job {
+                    let start_t = std::time::SystemTime::now();
                     match Self::process_patch_review(
                         &ctx,
                         patchset_id,
@@ -549,8 +559,15 @@ impl Reviewer {
                     )
                     .await
                     {
-                        Ok(PatchResult::Success) => {}
-                        _ => main_failed += 1,
+                        Ok(PatchResult::Success) => {
+                            let latency = start_t.elapsed().unwrap_or_default().as_secs();
+                            let _ = stat_events().send(StatEvent::PatchReviewed { success: true, latency_secs: latency });
+                        }
+                        _ => {
+                            let latency = start_t.elapsed().unwrap_or_default().as_secs();
+                            let _ = stat_events().send(StatEvent::PatchReviewed { success: false, latency_secs: latency });
+                            main_failed += 1;
+                        }
                     }
                 } else {
                     break;
@@ -1002,6 +1019,7 @@ impl Reviewer {
                                 for call in calls {
                                     let name = call["function_name"].as_str().unwrap_or("unknown");
                                     let args = call["arguments"].to_string();
+                                    let _ = stat_events().send(StatEvent::ToolUsage { tool: name.to_string() });
                                     let _ = ctx
                                         .db
                                         .create_tool_usage(ToolUsage {
@@ -1020,6 +1038,18 @@ impl Reviewer {
 
                     let interaction_id = if let Some(tokens_in) = json_output["tokens_in"].as_u64()
                     {
+                        let tokens_out = json_output["tokens_out"].as_u64().unwrap_or(0);
+                        let model_name = ctx.settings.ai.model.clone();
+                        let _ = stat_events().send(StatEvent::AiTokens {
+                            model: model_name.clone(),
+                            token_type: "prompt".to_string(),
+                            amount: tokens_in,
+                        });
+                        let _ = stat_events().send(StatEvent::AiTokens {
+                            model: model_name,
+                            token_type: "completion".to_string(),
+                            amount: tokens_out,
+                        });
                         let i_id = generate_id();
                         let input_ctx = json_output["input_context"].as_str().unwrap_or("");
                         let output_raw = if let Some(r) = json_output.get("review") {
@@ -1104,6 +1134,7 @@ impl Reviewer {
                                     for f in findings_arr {
                                         let severity_str = f["severity"].as_str().unwrap_or("Low");
                                         let severity = Severity::from_str(severity_str);
+                                        let _ = stat_events().send(StatEvent::ReviewFinding { severity: severity_str.to_lowercase() });
 
                                         let problem =
                                             f["problem"].as_str().unwrap_or("").to_string();
@@ -1445,6 +1476,7 @@ async fn run_review_tool(
                                         Ok(p) => {
                                             if let Some(tool_calls) = &p.tool_calls {
                                                 for call in tool_calls {
+                                                    let _ = stat_events().send(StatEvent::ToolUsage { tool: call.function_name.clone() });
                                                     let _ = db
                                                         .create_tool_usage(crate::db::ToolUsage {
                                                             review_id,

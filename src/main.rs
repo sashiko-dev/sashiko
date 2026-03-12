@@ -136,7 +136,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_registry = sashiko::stats::global_registry();
     let flusher_db = db.clone();
     tokio::spawn(async move {
-        sashiko::stats::start_flusher(stats_registry, flusher_db).await;
+        sashiko::stats::start_flusher(stats_registry.clone(), flusher_db).await;
+    });
+
+    let listener_registry = sashiko::stats::global_registry();
+    tokio::spawn(async move {
+        sashiko::stats::start_stat_listener(listener_registry).await;
+    
     });
 
 
