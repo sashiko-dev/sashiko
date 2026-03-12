@@ -27,6 +27,7 @@ pub mod reviewer;
 pub mod settings;
 pub mod utils;
 pub mod worker;
+pub mod stats;
 
 use std::fmt;
 use std::str::FromStr;
