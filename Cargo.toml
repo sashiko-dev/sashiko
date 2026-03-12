@@ -18,6 +18,7 @@ grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.25"
+lettre = { version = "0.11.7", features = ["tokio1", "tokio1-native-tls"] }
 libsql = "0.9.29"
 mail-parser = "0.11.1"
 regex = "1.12.2"

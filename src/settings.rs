@@ -31,6 +31,16 @@ pub struct NntpSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct SmtpSettings {
+    pub server: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub sender_address: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct MailingListsSettings {
     pub track: Vec<String>,
 }
@@ -142,6 +152,7 @@ pub struct Settings {
     pub log_level: String,
     pub database: DatabaseSettings,
     pub nntp: NntpSettings,
+    pub smtp: Option<SmtpSettings>,
     pub mailing_lists: MailingListsSettings,
     pub ai: AiSettings,
     pub server: ServerSettings,
