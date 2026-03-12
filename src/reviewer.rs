@@ -1,4 +1,4 @@
-use crate::events::{stat_events, StatEvent};
+use crate::events::{StatEvent, stat_events};
 // Copyright 2026 The Sashiko Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -506,12 +506,20 @@ impl Reviewer {
                                 .await
                                 {
                                     Ok(PatchResult::Success) => {
-                                        let latency = start_t.elapsed().unwrap_or_default().as_secs();
-                                        let _ = stat_events().send(StatEvent::PatchReviewed { success: true, latency_secs: latency });
+                                        let latency =
+                                            start_t.elapsed().unwrap_or_default().as_secs();
+                                        let _ = stat_events().send(StatEvent::PatchReviewed {
+                                            success: true,
+                                            latency_secs: latency,
+                                        });
                                     }
                                     _ => {
-                                        let latency = start_t.elapsed().unwrap_or_default().as_secs();
-                                        let _ = stat_events().send(StatEvent::PatchReviewed { success: false, latency_secs: latency });
+                                        let latency =
+                                            start_t.elapsed().unwrap_or_default().as_secs();
+                                        let _ = stat_events().send(StatEvent::PatchReviewed {
+                                            success: false,
+                                            latency_secs: latency,
+                                        });
                                         failed += 1;
                                     }
                                 }
@@ -561,11 +569,17 @@ impl Reviewer {
                     {
                         Ok(PatchResult::Success) => {
                             let latency = start_t.elapsed().unwrap_or_default().as_secs();
-                            let _ = stat_events().send(StatEvent::PatchReviewed { success: true, latency_secs: latency });
+                            let _ = stat_events().send(StatEvent::PatchReviewed {
+                                success: true,
+                                latency_secs: latency,
+                            });
                         }
                         _ => {
                             let latency = start_t.elapsed().unwrap_or_default().as_secs();
-                            let _ = stat_events().send(StatEvent::PatchReviewed { success: false, latency_secs: latency });
+                            let _ = stat_events().send(StatEvent::PatchReviewed {
+                                success: false,
+                                latency_secs: latency,
+                            });
                             main_failed += 1;
                         }
                     }
@@ -1019,7 +1033,9 @@ impl Reviewer {
                                 for call in calls {
                                     let name = call["function_name"].as_str().unwrap_or("unknown");
                                     let args = call["arguments"].to_string();
-                                    let _ = stat_events().send(StatEvent::ToolUsage { tool: name.to_string() });
+                                    let _ = stat_events().send(StatEvent::ToolUsage {
+                                        tool: name.to_string(),
+                                    });
                                     let _ = ctx
                                         .db
                                         .create_tool_usage(ToolUsage {
@@ -1134,7 +1150,9 @@ impl Reviewer {
                                     for f in findings_arr {
                                         let severity_str = f["severity"].as_str().unwrap_or("Low");
                                         let severity = Severity::from_str(severity_str);
-                                        let _ = stat_events().send(StatEvent::ReviewFinding { severity: severity_str.to_lowercase() });
+                                        let _ = stat_events().send(StatEvent::ReviewFinding {
+                                            severity: severity_str.to_lowercase(),
+                                        });
 
                                         let problem =
                                             f["problem"].as_str().unwrap_or("").to_string();
@@ -1476,7 +1494,10 @@ async fn run_review_tool(
                                         Ok(p) => {
                                             if let Some(tool_calls) = &p.tool_calls {
                                                 for call in tool_calls {
-                                                    let _ = stat_events().send(StatEvent::ToolUsage { tool: call.function_name.clone() });
+                                                    let _ =
+                                                        stat_events().send(StatEvent::ToolUsage {
+                                                            tool: call.function_name.clone(),
+                                                        });
                                                     let _ = db
                                                         .create_tool_usage(crate::db::ToolUsage {
                                                             review_id,

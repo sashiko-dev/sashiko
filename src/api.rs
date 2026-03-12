@@ -683,7 +683,11 @@ async fn get_stats(
             let reviewed24h = *counts.get("Reviewed24h").unwrap_or(&0);
             let ttr_sum = *counts.get("TTRSum").unwrap_or(&0);
             let ttr_count = *counts.get("TTRCount").unwrap_or(&0);
-            let avg_ttr = if ttr_count > 0 { ttr_sum / ttr_count } else { 0 };
+            let avg_ttr = if ttr_count > 0 {
+                ttr_sum / ttr_count
+            } else {
+                0
+            };
 
             Ok::<serde_json::Value, StatusCode>(serde_json::json!({
                 "status": "ok",

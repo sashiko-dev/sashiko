@@ -131,7 +131,6 @@ pub struct Finding {
 }
 
 impl Database {
-
     pub async fn upsert_stat_gauge(&self, metric_name: &str, value: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO stats_gauges (metric_name, value) VALUES (?1, ?2) 
@@ -141,7 +140,13 @@ impl Database {
         Ok(())
     }
 
-    pub async fn inc_stat_timeseries(&self, bucket_time: &str, metric_name: &str, label: &str, value: u64) -> Result<()> {
+    pub async fn inc_stat_timeseries(
+        &self,
+        bucket_time: &str,
+        metric_name: &str,
+        label: &str,
+        value: u64,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO stats_timeseries_hourly (bucket_time, metric_name, label, value) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(bucket_time, metric_name, label) DO UPDATE SET value = value + excluded.value",
@@ -865,11 +870,14 @@ impl Database {
         Ok(())
     }
 
-        pub async fn get_timeline_stats(&self, _subsystem_id: Option<i64>) -> Result<serde_json::Value> {
+    pub async fn get_timeline_stats(
+        &self,
+        _subsystem_id: Option<i64>,
+    ) -> Result<serde_json::Value> {
         // Query daily aggregations from hourly table
         let sql = "SELECT date(bucket_time) as day, metric_name, sum(value) FROM stats_timeseries_hourly GROUP BY day, metric_name ORDER BY day";
         let mut rows = self.conn.query(sql, ()).await?;
-        
+
         let mut ingested_by_day = std::collections::HashMap::new();
         let mut reviewed_by_day = std::collections::HashMap::new();
         let mut failures_by_day = std::collections::HashMap::new();
@@ -880,40 +888,55 @@ impl Database {
             let day: String = row.get(0)?;
             let metric: String = row.get(1)?;
             let value: i64 = row.get(2)?;
-            
+
             match metric.as_str() {
-                "sashiko_patches_ingested_total" => { ingested_by_day.insert(day, value); }
-                "sashiko_patches_reviewed_total" => { reviewed_by_day.insert(day, value); }
-                "sashiko_review_failures_total" => { failures_by_day.insert(day, value); }
-                "sashiko_time_to_review_sum_seconds" => { ttr_sum_by_day.insert(day, value); }
-                "sashiko_time_to_review_count" => { ttr_count_by_day.insert(day, value); }
+                "sashiko_patches_ingested_total" => {
+                    ingested_by_day.insert(day, value);
+                }
+                "sashiko_patches_reviewed_total" => {
+                    reviewed_by_day.insert(day, value);
+                }
+                "sashiko_review_failures_total" => {
+                    failures_by_day.insert(day, value);
+                }
+                "sashiko_time_to_review_sum_seconds" => {
+                    ttr_sum_by_day.insert(day, value);
+                }
+                "sashiko_time_to_review_count" => {
+                    ttr_count_by_day.insert(day, value);
+                }
                 _ => {}
             }
         }
-        
-        let mut dates: Vec<String> = ingested_by_day.keys().chain(reviewed_by_day.keys()).cloned().collect();
+
+        let mut dates: Vec<String> = ingested_by_day
+            .keys()
+            .chain(reviewed_by_day.keys())
+            .cloned()
+            .collect();
         dates.sort();
         dates.dedup();
-        
-        let timeline = dates.iter().map(|d| {
-            serde_json::json!({
-                "day": d,
-                "ingested": ingested_by_day.get(d).unwrap_or(&0),
-                "reviewed": reviewed_by_day.get(d).unwrap_or(&0),
-                "failures": failures_by_day.get(d).unwrap_or(&0),
-                "ttr_sum": ttr_sum_by_day.get(d).unwrap_or(&0),
-                "ttr_count": ttr_count_by_day.get(d).unwrap_or(&0),
+
+        let timeline = dates
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "day": d,
+                    "ingested": ingested_by_day.get(d).unwrap_or(&0),
+                    "reviewed": reviewed_by_day.get(d).unwrap_or(&0),
+                    "failures": failures_by_day.get(d).unwrap_or(&0),
+                    "ttr_sum": ttr_sum_by_day.get(d).unwrap_or(&0),
+                    "ttr_count": ttr_count_by_day.get(d).unwrap_or(&0),
+                })
             })
-        }).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
         Ok(serde_json::json!({
             "timeline": timeline
         }))
     }
 
-    
-
-        pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
+    pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
         let mut findings = Vec::new();
         let sql = "SELECT label, sum(value) FROM stats_timeseries_hourly WHERE metric_name = 'sashiko_findings_total' GROUP BY label";
         let mut rows = self.conn.query(sql, ()).await?;
@@ -922,7 +945,7 @@ impl Database {
             let value: i64 = row.get(1)?;
             findings.push(serde_json::json!({"severity": label, "count": value}));
         }
-        
+
         let mut tokens = Vec::new();
         let sql = "SELECT label, sum(value) FROM stats_timeseries_hourly WHERE metric_name = 'sashiko_tokens_total' GROUP BY label";
         let mut rows = self.conn.query(sql, ()).await?;
@@ -938,9 +961,7 @@ impl Database {
         }))
     }
 
-    
-
-        pub async fn get_tool_usage_stats(&self) -> Result<serde_json::Value> {
+    pub async fn get_tool_usage_stats(&self) -> Result<serde_json::Value> {
         let mut tools = Vec::new();
         let sql = "SELECT label, sum(value) FROM stats_timeseries_hourly WHERE metric_name = 'sashiko_tool_usage_total' GROUP BY label ORDER BY sum(value) DESC";
         let mut rows = self.conn.query(sql, ()).await?;
@@ -951,7 +972,6 @@ impl Database {
         }
         Ok(serde_json::json!(tools))
     }
-
 
     pub async fn begin_transaction(&self) -> Result<()> {
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
@@ -2629,7 +2649,9 @@ impl Database {
         Ok(count_ps + count_rev)
     }
 
-        pub async fn get_patchset_counts_by_status(&self) -> Result<std::collections::HashMap<String, i64>> {
+    pub async fn get_patchset_counts_by_status(
+        &self,
+    ) -> Result<std::collections::HashMap<String, i64>> {
         let mut map = std::collections::HashMap::new();
         let mut rows = self.conn.query("SELECT metric_name, value FROM stats_gauges WHERE metric_name IN ('sashiko_queue_pending_patches', 'sashiko_queue_in_progress_patches')", ()).await?;
         while let Ok(Some(row)) = rows.next().await {
@@ -2641,7 +2663,7 @@ impl Database {
                 map.insert("In Review".to_string(), value);
             }
         }
-        
+
         // Let's also fetch sum of last 24h for Ingested, Reviewed from timeseries
         // So the frontend can show it in Status Bar.
         let sql = "SELECT metric_name, sum(value) FROM stats_timeseries_hourly WHERE bucket_time >= datetime('now', '-24 hours') GROUP BY metric_name";
@@ -2661,8 +2683,6 @@ impl Database {
         }
         Ok(map)
     }
-
-    
 }
 
 #[cfg(test)]

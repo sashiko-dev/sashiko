@@ -25,9 +25,9 @@ pub mod nntp;
 pub mod patch;
 pub mod reviewer;
 pub mod settings;
+pub mod stats;
 pub mod utils;
 pub mod worker;
-pub mod stats;
 
 use std::fmt;
 use std::str::FromStr;

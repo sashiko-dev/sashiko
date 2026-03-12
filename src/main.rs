@@ -142,9 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener_registry = sashiko::stats::global_registry();
     tokio::spawn(async move {
         sashiko::stats::start_stat_listener(listener_registry).await;
-    
     });
-
 
     if let Some(Commands::Inspect) = cli.command {
         return sashiko::inspector::run_inspection(db)

@@ -65,10 +65,21 @@ pub struct ParsedArticle {
 #[derive(Debug, Clone)]
 pub enum StatEvent {
     PatchIngested,
-    PatchReviewed { success: bool, latency_secs: u64 },
-    ReviewFinding { severity: String },
-    AiTokens { model: String, token_type: String, amount: u64 },
-    ToolUsage { tool: String },
+    PatchReviewed {
+        success: bool,
+        latency_secs: u64,
+    },
+    ReviewFinding {
+        severity: String,
+    },
+    AiTokens {
+        model: String,
+        token_type: String,
+        amount: u64,
+    },
+    ToolUsage {
+        tool: String,
+    },
 }
 
 use std::sync::OnceLock;
