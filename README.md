@@ -9,7 +9,7 @@ Sashiko is an agentic Linux kernel code review system. It uses a set Linux kerne
 ## Quality of reviews
 
 Sashiko is not perfect, but in our measurements the quality of reviews is high:
-in our tests sashiko was able to find 52.1% (with Gemini 3.1 Pro) of bugs based on unfiltered last 1000 upstream commits with Fixed: tags.
+in our tests sashiko was able to find 53.6% (with Gemini 3.1 Pro) of bugs based on unfiltered last 1000 upstream commits with Fixed: tags.
 In some sense, it's already above the human level given that 100% of these bugs made it through human-driven code reviews and were accepted to the main tree.
 The rate of false positives is harder to measure, but based on limited manual reviews it's well within 20% range and the majority of it is a gray zone.
 
