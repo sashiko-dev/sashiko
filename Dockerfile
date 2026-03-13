@@ -23,6 +23,7 @@ FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
+    procps \
     git \
     libssl3 \
     ca-certificates \
