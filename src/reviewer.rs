@@ -1425,6 +1425,7 @@ async fn run_review_tool(
             let mut ai_started = false;
             let mut total_tokens_used: usize = 0;
             let mut total_output_tokens_used: usize = 0;
+            let mut turn_count = 0u32;
 
             loop {
                 let line_result = match timeout_at(deadline, lines.next_line()).await {
@@ -1463,6 +1464,21 @@ async fn run_review_tool(
                                     && let Ok(req) =
                                         serde_json::from_value::<AiRequest>(payload_val.clone())
                                 {
+                                    turn_count += 1;
+                                    if settings.ai.log_turns {
+                                        let n_msgs = req.messages.len();
+                                        let last = req.messages.last();
+                                        let role_str = last.map(|m| format!("{:?}", m.role).to_lowercase()).unwrap_or_default();
+                                        let content_preview = last.and_then(|m| m.content.as_deref()).unwrap_or("(no text content)");
+                                        let preview: String = content_preview.chars().take(300).collect();
+                                        let ellipsis = if content_preview.chars().count() > 300 { "…" } else { "" };
+                                        if let Some(tool_calls) = last.and_then(|m| m.tool_calls.as_ref()) {
+                                            let names: Vec<&str> = tool_calls.iter().map(|t| t.function_name.as_str()).collect();
+                                            info!("→ Turn {} ({} msgs): [{role_str}] tool_calls={:?}", turn_count, n_msgs, names);
+                                        } else {
+                                            info!("→ Turn {} ({} msgs): [{role_str}] {}{}", turn_count, n_msgs, preview, ellipsis);
+                                        }
+                                    }
                                     let ctx_tag = req.context_tag.clone().unwrap_or_default();
                                     let resp_payload = crate::ai::LOG_CONTEXT.scope(ctx_tag, async {
                                     loop {
@@ -1531,6 +1547,26 @@ async fn run_review_tool(
                                                         "Output token budget exceeded: {} output tokens used (limit: {})",
                                                         total_output_tokens_used, output_budget
                                                     ));
+                                                }
+                                            }
+                                            if settings.ai.log_turns {
+                                                if let Some(content) = &p.content {
+                                                    let preview: String = content.chars().take(500).collect();
+                                                    let ellipsis = if content.chars().count() > 500 { "…" } else { "" };
+                                                    info!("← Turn {} text: {}{}", turn_count, preview, ellipsis);
+                                                }
+                                                if let Some(tool_calls) = &p.tool_calls {
+                                                    for call in tool_calls {
+                                                        let args_str = call.arguments.to_string();
+                                                        let args_preview: String = args_str.chars().take(200).collect();
+                                                        let ellipsis = if args_str.chars().count() > 200 { "…" } else { "" };
+                                                        info!("← Turn {} tool_call: {}({}{})", turn_count, call.function_name, args_preview, ellipsis);
+                                                    }
+                                                }
+                                                if let Some(usage) = &p.usage {
+                                                    info!("← Turn {} tokens: in={} out={} cached={}",
+                                                        turn_count, usage.prompt_tokens, usage.completion_tokens,
+                                                        usage.cached_tokens.unwrap_or(0));
                                                 }
                                             }
                                             if let Some(tool_calls) = &p.tool_calls {
