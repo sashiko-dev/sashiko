@@ -1259,22 +1259,25 @@ async fn run_review_tool(
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
 ) -> Result<serde_json::Value> {
-    let exe_path = std::env::current_exe()?;
-    let bin_dir = exe_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let review_bin = bin_dir.join("review");
-
-    let mut cmd = if review_bin.exists() {
-        Command::new(review_bin)
+    let mut cmd = if let Some(ref override_bin) = settings.review.review_tool_override {
+        Command::new(override_bin)
     } else {
-        warn!(
-            "Could not find review binary at {:?}, falling back to cargo run",
-            review_bin
-        );
-        let mut c = Command::new("cargo");
-        c.args(["run", "--bin", "review", "--"]);
-        c
+        let exe_path = std::env::current_exe()?;
+        let bin_dir = exe_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let review_bin = bin_dir.join("review");
+        if review_bin.exists() {
+            Command::new(review_bin)
+        } else {
+            warn!(
+                "Could not find review binary at {:?}, falling back to cargo run",
+                review_bin
+            );
+            let mut c = Command::new("cargo");
+            c.args(["run", "--bin", "review", "--"]);
+            c
+        }
     };
 
     cmd.args([
@@ -1359,6 +1362,8 @@ async fn run_review_tool(
             let mut lines = reader.lines();
             let mut final_result: Option<Value> = None;
             let mut ai_started = false;
+            let mut total_tokens_used: usize = 0;
+            let mut total_output_tokens_used: usize = 0;
 
             loop {
                 let line_result = match timeout_at(deadline, lines.next_line()).await {
@@ -1443,6 +1448,30 @@ async fn run_review_tool(
 
                                     let reply = match resp_payload {
                                         Ok(p) => {
+                                            if let Some(usage) = &p.usage {
+                                                let cached = usage.cached_tokens.unwrap_or(0);
+                                                let uncached_input = usage.prompt_tokens.saturating_sub(cached);
+                                                total_tokens_used += uncached_input + usage.completion_tokens;
+                                                total_output_tokens_used += usage.completion_tokens;
+                                                let token_budget = settings.review.max_total_tokens;
+                                                if token_budget > 0 && total_tokens_used > token_budget {
+                                                    error!("Token budget exceeded: {} uncached tokens used > {} limit — aborting review",
+                                                        total_tokens_used, token_budget);
+                                                    return Err(anyhow::anyhow!(
+                                                        "Token budget exceeded: {} uncached tokens used (limit: {})",
+                                                        total_tokens_used, token_budget
+                                                    ));
+                                                }
+                                                let output_budget = settings.review.max_total_output_tokens;
+                                                if output_budget > 0 && total_output_tokens_used > output_budget {
+                                                    error!("Output token budget exceeded: {} output tokens used > {} limit — aborting review",
+                                                        total_output_tokens_used, output_budget);
+                                                    return Err(anyhow::anyhow!(
+                                                        "Output token budget exceeded: {} output tokens used (limit: {})",
+                                                        total_output_tokens_used, output_budget
+                                                    ));
+                                                }
+                                            }
                                             if let Some(tool_calls) = &p.tool_calls {
                                                 for call in tool_calls {
                                                     let _ = db
@@ -1934,6 +1963,126 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             // So we should find at least one review.
         }
 
+        Ok(())
+    }
+
+    struct MockProviderWithUsage {
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_tokens: usize,
+    }
+
+    #[async_trait]
+    impl AiProvider for MockProviderWithUsage {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Ok(AiResponse {
+                content: Some("Mocked AI response".to_string()),
+                thought: None,
+                tool_calls: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: self.prompt_tokens,
+                    completion_tokens: self.completion_tokens,
+                    total_tokens: self.prompt_tokens + self.completion_tokens,
+                    cached_tokens: Some(self.cached_tokens),
+                }),
+            })
+        }
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    async fn run_two_request_mock(
+        mut settings: Settings,
+        provider: Arc<dyn AiProvider>,
+    ) -> Result<()> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
+
+        // Mock binary: sends two consecutive AI requests then a final result.
+        let mock_script = r#"#!/bin/bash
+read -r input
+echo '{"type": "ai_request", "payload": {"messages": [{"role": "user", "content": "first"}], "temperature": 0.5}}'
+read -r ai_response
+echo '{"type": "ai_request", "payload": {"messages": [{"role": "user", "content": "second"}], "temperature": 0.5}}'
+read -r ai_response
+echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
+"#;
+        std::fs::write(&bin_path, mock_script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+        settings.review.review_tool_override = Some(bin_path.clone());
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let quota_manager = Arc::new(QuotaManager::new());
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        db.create_message("msg_id_p1", thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None).await?;
+        let ps_id = db.create_patchset(thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None, false, None, None).await?.unwrap();
+        let p_id = db.create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;").await?;
+        let review_id = db.create_review(ps_id, Some(p_id), "mock", "mock", None, None).await?;
+
+        run_review_tool(
+            ps_id,
+            &json!({}),
+            &settings,
+            db,
+            "HEAD",
+            Some(1),
+            None,
+            quota_manager,
+            review_id,
+            None,
+            provider,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn test_token_budget_aborts_review() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        // Each turn: 800 uncached input + 100 output = 900 uncached total.
+        // Budget of 1000 allows turn 1 (cumulative 900) but aborts on turn 2 (cumulative 1800).
+        settings.review.max_total_tokens = 1000;
+        settings.review.max_total_output_tokens = 0; // disabled
+
+        let provider = Arc::new(MockProviderWithUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            cached_tokens: 200, // uncached input = 800
+        });
+
+        let err = run_two_request_mock(settings, provider).await
+            .expect_err("Expected token budget error");
+        assert!(err.to_string().contains("Token budget exceeded"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_output_token_budget_aborts_review() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.max_total_tokens = 0; // disabled
+        // Each turn produces 300 output tokens. Budget of 500 allows turn 1 but aborts on turn 2.
+        settings.review.max_total_output_tokens = 500;
+
+        let provider = Arc::new(MockProviderWithUsage {
+            prompt_tokens: 100,
+            completion_tokens: 300,
+            cached_tokens: 0,
+        });
+
+        let err = run_two_request_mock(settings, provider).await
+            .expect_err("Expected output token budget error");
+        assert!(err.to_string().contains("Output token budget exceeded"), "unexpected error: {err}");
         Ok(())
     }
 }
