@@ -120,8 +120,8 @@ Running an automated review system like Sashiko can be computationally expensive
     ```toml
     [ai]
     provider = "claude"
-    model = "claude-sonnet-4-5"
-    max_input_tokens = 180000
+    model = "claude-sonnet-4-6"
+    max_input_tokens = 950000
 
     [ai.claude]
     prompt_caching = true
@@ -131,7 +131,7 @@ Running an automated review system like Sashiko can be computationally expensive
     - Automatic prompt caching (5-minute TTL) reduces costs for repeated context
     - Full tool/function calling support for git operations
     - Automatic retry logic for rate limits and API overload
-    - 200K context window for claude-sonnet-4-5 (use max_input_tokens = 180000 for safety margin)
+    - 1M context window for claude-sonnet-4-6 (use max_input_tokens = 950000 for safety margin)
 
 3.  **Build**:
     ```bash
