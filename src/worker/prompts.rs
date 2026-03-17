@@ -624,6 +624,11 @@ Example:
             }
             if !success {
                 warn!("Stage {} failed after {} attempts.", stage, max_attempts);
+                return Err(anyhow::anyhow!(
+                    "Stage {} failed after {} attempts — aborting review",
+                    stage,
+                    max_attempts
+                ));
             }
         }
 
@@ -1169,5 +1174,58 @@ mod tests {
             calculate_series_range(&patches, &patches_to_review, &patch_shas, "base"),
             Some("base..sha2_resolved".to_string())
         );
+    }
+
+    struct MockProviderAlwaysFails;
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for MockProviderAlwaysFails {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            anyhow::bail!("mock: simulated AI failure")
+        }
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            0
+        }
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stage_failure_aborts_review() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = std::sync::Arc::new(MockProviderAlwaysFails);
+        let tools = crate::worker::tools::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let config = WorkerConfig {
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            custom_prompt: None,
+        };
+        let mut worker = Worker::new(provider, tools, prompts, config);
+
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+        });
+
+        match worker.run(patchset).await {
+            Ok(_) => panic!("Expected stage failure error, got Ok"),
+            Err(e) => assert!(
+                e.to_string().contains("failed after"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 }
