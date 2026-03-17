@@ -123,6 +123,17 @@ fn default_prompt_caching() -> bool {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct OpenAiCompatSettings {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub context_window_size: Option<usize>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct AiSettings {
     pub provider: String,
     pub model: String,
@@ -132,12 +143,19 @@ pub struct AiSettings {
     pub max_interactions: usize,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    #[serde(default = "default_api_timeout_secs")]
+    pub api_timeout_secs: u64,
     #[serde(skip, default)]
     pub no_ai: bool,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
     pub bedrock: Option<BedrockSettings>,
+    pub openai_compat: Option<OpenAiCompatSettings>,
+}
+
+fn default_api_timeout_secs() -> u64 {
+    300
 }
 
 fn default_temperature() -> f32 {
