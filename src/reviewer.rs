@@ -22,6 +22,7 @@ use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
+use crate::worker::prompts::ReviewError;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1518,19 +1519,19 @@ async fn run_review_tool(
                                                 if token_budget > 0 && total_tokens_used > token_budget {
                                                     error!("Token budget exceeded: {} uncached input + output tokens used > {} limit — aborting review",
                                                         total_tokens_used, token_budget);
-                                                    return Err(anyhow::anyhow!(
-                                                        "Token budget exceeded: {} uncached input + output tokens used (limit: {})",
-                                                        total_tokens_used, token_budget
-                                                    ));
+                                                    return Err(ReviewError::BudgetExceeded(
+                                                        format!("Token budget exceeded: {} uncached input + output tokens used (limit: {})",
+                                                            total_tokens_used, token_budget)
+                                                    ).into());
                                                 }
                                                 let output_budget = settings.review.max_total_output_tokens;
                                                 if output_budget > 0 && total_output_tokens_used > output_budget {
                                                     error!("Output token budget exceeded: {} output tokens used > {} limit — aborting review",
                                                         total_output_tokens_used, output_budget);
-                                                    return Err(anyhow::anyhow!(
-                                                        "Output token budget exceeded: {} output tokens used (limit: {})",
-                                                        total_output_tokens_used, output_budget
-                                                    ));
+                                                    return Err(ReviewError::BudgetExceeded(
+                                                        format!("Output token budget exceeded: {} output tokens used (limit: {})",
+                                                            total_output_tokens_used, output_budget)
+                                                    ).into());
                                                 }
                                             }
                                             if let Some(tool_calls) = &p.tool_calls {
