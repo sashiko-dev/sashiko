@@ -153,8 +153,11 @@ pub struct ReviewSettings {
     pub max_files_touched: usize,
     #[serde(default)]
     pub ignore_files: Vec<String>,
-    /// Maximum cumulative uncached tokens (input + output) across all turns in a single review.
-    /// Conservative default; set to 0 to disable.
+    /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
+    /// single review. Cached input tokens are excluded because they cost ~10x less and don't
+    /// reflect runaway model behaviour. At Sonnet 4.6 pricing ($3/M uncached input, $15/M
+    /// output) the 5M default costs roughly $15–75 depending on input/output mix; a typical
+    /// 7-stage review uses ~300–500k tokens total. Set to 0 to disable.
     #[serde(default = "default_max_total_tokens")]
     pub max_total_tokens: usize,
     /// Maximum cumulative output tokens across all turns in a single review.

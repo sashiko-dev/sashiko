@@ -1455,10 +1455,10 @@ async fn run_review_tool(
                                                 total_output_tokens_used += usage.completion_tokens;
                                                 let token_budget = settings.review.max_total_tokens;
                                                 if token_budget > 0 && total_tokens_used > token_budget {
-                                                    error!("Token budget exceeded: {} uncached tokens used > {} limit — aborting review",
+                                                    error!("Token budget exceeded: {} uncached input + output tokens used > {} limit — aborting review",
                                                         total_tokens_used, token_budget);
                                                     return Err(anyhow::anyhow!(
-                                                        "Token budget exceeded: {} uncached tokens used (limit: {})",
+                                                        "Token budget exceeded: {} uncached input + output tokens used (limit: {})",
                                                         total_tokens_used, token_budget
                                                     ));
                                                 }
