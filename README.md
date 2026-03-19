@@ -127,13 +127,43 @@ Running an automated review system like Sashiko can be computationally expensive
 
 ## Usage
 
-To start the application:
+Sashiko consists of two main components: the **Daemon** and the **CLI**.
+
+### 1. Daemon
+
+The daemon is responsible for monitoring mailing lists, managing the database, and coordinating the AI review process. It also provides a Web UI and an API for the CLI.
+
+To start the daemon:
 
 ```bash
-cargo run --release
+cargo run
+```
+### 2. CLI
+
+The CLI allows you to interact with the running Sashiko daemon from your terminal.
+
+To run the CLI:
+
+```bash
+cargo run --bin sashiko-cli -- [COMMAND]
 ```
 
-This will start the Sashiko daemon, which will begin ingesting and reviewing patches based on your configuration.
+**Commands:**
+
+- **`submit [INPUT]`**: Submit a patch or range for review.
+  - `INPUT` can be a file path (mbox), a commit SHA, or a range (e.g., `HEAD~3..HEAD`).
+  - If `INPUT` is omitted and stdin is piped, it reads an mbox from stdin.
+  - If `INPUT` is omitted and stdin is a terminal, it defaults to the current `HEAD`.
+- **`status`**: Show the current server status and queue statistics.
+- **`list [FILTER]`**: List recent patchsets.
+  - `FILTER` can be a status (e.g., `pending`, `failed`, `reviewed`) or a search term.
+- **`show [ID]`**: Show detailed information about a patchset and its AI review.
+  - `ID` defaults to `latest`.
+
+### 3. Web Interface
+
+Once the daemon is running, you can access the Web UI, the daemon will print the
+URL to access it from localhost.
 
 ## Contributing
 
