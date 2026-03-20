@@ -937,12 +937,15 @@
             return { view: 'list', query };
         }
 
+        let hasNavigatedInternally = false;
+        
         function navigate(hash) {
+            hasNavigatedInternally = true;
             window.location.hash = hash;
         }
 
         function goBack() {
-            if (window.history.length > 1) {
+            if (hasNavigatedInternally) {
                 window.history.back();
             } else {
                 navigate('#/');
@@ -995,7 +998,10 @@
             }
         }
 
-        window.addEventListener('hashchange', router);
+        window.addEventListener('hashchange', () => {
+            hasNavigatedInternally = true;
+            router();
+        });
 
         // =====================================================================
         // DATA FETCHING
