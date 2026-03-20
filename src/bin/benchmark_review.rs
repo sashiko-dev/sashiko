@@ -16,7 +16,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures::stream::StreamExt;
 use regex::Regex;
-use sashiko::ai::gemini::{Content, GeminiClient, GenAiClient, GenerateContentRequest, Part};
+use sashiko::ai::{AiMessage, AiProvider, AiRequest, AiRole, create_provider};
+use sashiko::ai::gemini::GeminiError;
+use sashiko::ai::claude::ClaudeError;
+use sashiko::ai::openai::OpenAiCompatError;
 use sashiko::db::Database;
 use sashiko::settings::Settings;
 use serde::{Deserialize, Serialize};
@@ -88,10 +91,8 @@ async fn main() -> Result<()> {
     let total_entries = benchmark_entries.len();
     info!("Loaded {} benchmark entries.", total_entries);
 
-    // Initialize Gemini Client for Evaluation
-    // We use the model configured in settings to act as the judge.
-    let eval_model = settings.ai.model.clone();
-    let gemini_client = Arc::new(GeminiClient::new(eval_model));
+    // Initialize AI provider for evaluation based on settings
+    let ai_provider = create_provider(&settings).context("Failed to create AI provider")?;
 
     let processed_count = Arc::new(AtomicUsize::new(0));
 
@@ -102,7 +103,7 @@ async fn main() -> Result<()> {
     let results: Vec<BenchmarkResult> = futures::stream::iter(benchmark_entries)
         .map(|entry| {
             let db = db.clone();
-            let client = gemini_client.clone();
+            let client = ai_provider.clone();
             let processed_count = processed_count.clone();
             async move {
                 let res = process_entry(db, client, entry).await;
@@ -153,7 +154,7 @@ async fn main() -> Result<()> {
 
 async fn process_entry(
     db: Arc<Database>,
-    client: Arc<GeminiClient>,
+    client: Arc<dyn AiProvider>,
     entry: BenchmarkEntry,
 ) -> BenchmarkResult {
     if entry.problem_description.is_none() {
@@ -270,7 +271,7 @@ async fn process_entry(
         findings_text.push_str("(No structured findings recorded in DB)\n");
     }
 
-    // 4. Evaluate with Gemini
+    // 4. Evaluate with AI provider
     let review_summary = format!(
         "{}\n{}",
         summary.unwrap_or_default(),
@@ -296,61 +297,61 @@ async fn process_entry(
         problem_description, findings_text, review_summary
     );
 
-    info!("Evaluating commit {} with Gemini...", entry.commit);
+    info!("Evaluating commit {}...", entry.commit);
 
     let r = loop {
-        let req = GenerateContentRequest {
-            contents: vec![Content {
-                role: "user".to_string(),
-                parts: vec![Part::Text {
-                    text: prompt.clone(),
-                    thought_signature: None,
-                    thought: false,
-                }],
+        let req = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some(prompt.clone()),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: None,
             }],
             tools: None,
-            system_instruction: None,
-            generation_config: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
         };
 
         match client.generate_content(req).await {
             Ok(r) => break r,
             Err(e) => {
-                if let Some(err) = e.downcast_ref::<sashiko::ai::gemini::GeminiError>() {
-                    match err {
-                        sashiko::ai::gemini::GeminiError::QuotaExceeded(duration) => {
-                            warn!("Quota exceeded, pausing for {:?}...", duration);
-                            tokio::time::sleep(*duration).await;
-                            continue;
+                let retry_duration = e
+                    .downcast_ref::<GeminiError>()
+                    .and_then(|err| match err {
+                        GeminiError::QuotaExceeded(d) | GeminiError::TransientError(d, _) => {
+                            Some(*d)
                         }
-                        sashiko::ai::gemini::GeminiError::TransientError(duration, _) => {
-                            warn!("Transient error, pausing for {:?}...", duration);
-                            tokio::time::sleep(*duration).await;
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-                warn!("API error ({}), pausing for 30s before retry...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        e.downcast_ref::<ClaudeError>().and_then(|err| match err {
+                            ClaudeError::RateLimitExceeded(d)
+                            | ClaudeError::OverloadedError(d) => Some(*d),
+                            _ => None,
+                        })
+                    })
+                    .or_else(|| {
+                        e.downcast_ref::<OpenAiCompatError>()
+                            .and_then(|err| match err {
+                                OpenAiCompatError::RateLimitExceeded(d)
+                                | OpenAiCompatError::TransientError(d, _) => Some(*d),
+                                _ => None,
+                            })
+                    });
+
+                let duration =
+                    retry_duration.unwrap_or(std::time::Duration::from_secs(30));
+                warn!("API error ({}), pausing for {:?} before retry...", e, duration);
+                tokio::time::sleep(duration).await;
             }
         }
     };
 
     let (status, explanation) = {
-        let text = r
-            .candidates
-            .as_ref()
-            .and_then(|c| c.first())
-            .and_then(|c| c.content.parts.first())
-            .map(|p| {
-                if let Part::Text { text, .. } = p {
-                    text.clone()
-                } else {
-                    "Unknown".to_string()
-                }
-            })
-            .unwrap_or_else(|| "Unknown".to_string());
+        let text = r.content.unwrap_or_else(|| "Unknown".to_string());
 
         let re_status = Regex::new(r"(?i)\b(DETECTED|PARTIALLY_DETECTED|MISSED)\b").unwrap();
         let (status_raw, expl_raw) = if let Some(cap) = re_status.captures(&text) {
