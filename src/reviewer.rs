@@ -575,10 +575,8 @@ impl Reviewer {
 
             let final_status = if review_success {
                 ReviewStatus::Reviewed.as_str().to_string()
-            } else if failed_patches == diffs.len() {
-                ReviewStatus::Failed.as_str().to_string() // All failed
             } else {
-                ReviewStatus::Reviewed.as_str().to_string() // Partial success
+                ReviewStatus::Failed.as_str().to_string()
             };
 
             let _ = ctx

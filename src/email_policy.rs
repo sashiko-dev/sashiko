@@ -27,7 +27,6 @@ pub struct SubsystemPolicy {
     pub cc: Vec<String>,
 }
 
-
 impl EmailPolicyConfig {
     /// Loads the email policy configuration from a TOML file.
     /// Returns a default configuration if the file does not exist.
