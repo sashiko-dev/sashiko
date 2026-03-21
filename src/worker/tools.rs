@@ -17,7 +17,7 @@ use crate::ai::{
     AiTool,
     gemini::{FunctionDeclaration, Tool},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use grep::printer::StandardBuilder;
 use grep::regex::RegexMatcher;
 use grep::searcher::{BinaryDetection, SearcherBuilder};
@@ -331,8 +331,16 @@ impl ToolBox {
         let path = self.validate_path(path_str, &self.worktree_path)?;
         let content = fs::read_to_string(path).await?;
 
+        if let (Some(s), Some(e)) = (start_line, end_line) {
+            ensure!(s <= e, "Invalid range: start_line ({s}) > end_line ({e})");
+        }
+
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
+
+        let start_line = start_line.map(|s| s.clamp(1, total_lines));
+        // No need to clamp start against end — the earlier validation already guarantees start <= end
+        let end_line = end_line.map(|e| e.clamp(1, total_lines));
 
         if mode == "smart" {
             let focus = match (start_line, end_line) {
