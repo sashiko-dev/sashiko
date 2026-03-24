@@ -1089,6 +1089,10 @@ impl Reviewer {
                                         let severity_explanation = f["severity_explanation"]
                                             .as_str()
                                             .map(|s| s.to_string());
+                                        let file_path = f["file_path"]
+                                            .as_str()
+                                            .map(|s| s.to_string());
+                                        let line_number = f["line_number"].as_i64();
 
                                         let _ = ctx
                                             .db
@@ -1097,6 +1101,8 @@ impl Reviewer {
                                                 severity,
                                                 severity_explanation,
                                                 problem,
+                                                file_path,
+                                                line_number,
                                             })
                                             .await;
                                     }
