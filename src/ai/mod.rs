@@ -191,10 +191,14 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
             Ok(Arc::new(claude::ClaudeClient::new(model, enable_caching)))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient)),
+        "claude-cli" => Ok(Arc::new(claude_cli::ClaudeCliProvider {
+            model: settings.ai.model.clone(),
+        })),
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
 pub mod claude;
+pub mod claude_cli;
 pub mod gemini;
 pub mod proxy;
 pub mod quota;
