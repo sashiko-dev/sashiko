@@ -18,6 +18,7 @@ use sashiko::events::{Event, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
@@ -93,10 +94,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    fmt()
+    // Determine formatting features independently
+    let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
+    let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal();
+
+    let builder = fmt()
         .with_env_filter(env_filter)
         .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stdout))
-        .init();
+        .with_ansi(use_ansi);
+
+    if plain_logs {
+        builder
+            .with_level(false)
+            .with_target(false)
+            .without_time()
+            .init();
+    } else {
+        builder.init();
+    }
 
     if cli.debug {
         info!("Debug logging enabled");

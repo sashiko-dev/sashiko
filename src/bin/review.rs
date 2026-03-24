@@ -24,6 +24,7 @@ use sashiko::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::{error, info};
 
@@ -89,13 +90,18 @@ async fn main() -> Result<()> {
 
     let no_color = std::env::var("NO_COLOR").is_ok();
     let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
+    let use_ansi = !no_color && std::io::stderr().is_terminal();
 
     let builder = tracing_subscriber::fmt()
         .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stderr))
-        .with_ansi(!no_color);
+        .with_ansi(use_ansi);
 
     if plain_logs {
-        builder.without_time().init();
+        builder
+            .with_level(false)
+            .with_target(false)
+            .without_time()
+            .init();
     } else {
         builder.init();
     }
