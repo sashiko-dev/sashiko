@@ -246,12 +246,30 @@ fn default_log_level() -> String {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct GerritSettings {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    /// Restrict to a specific Gerrit project (optional).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Log what would be posted but don't actually post (default: false).
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Include a Code-Review vote based on findings severity (default: false).
+    #[serde(default)]
+    pub vote: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct Settings {
     #[serde(default = "default_log_level")]
     pub log_level: String,
     pub database: DatabaseSettings,
     pub nntp: NntpSettings,
     pub smtp: Option<SmtpSettings>,
+    pub gerrit: Option<GerritSettings>,
     pub mailing_lists: MailingListsSettings,
     pub ai: AiSettings,
     pub server: ServerSettings,

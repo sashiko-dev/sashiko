@@ -107,6 +107,17 @@ pub enum Severity {
     Critical = 4,
 }
 
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Severity::Critical => write!(f, "Critical"),
+            Severity::High => write!(f, "High"),
+            Severity::Medium => write!(f, "Medium"),
+            Severity::Low => write!(f, "Low"),
+        }
+    }
+}
+
 impl Severity {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
@@ -2548,6 +2559,39 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// Fetch structured findings for a review, returned as JSON values.
+    /// Each finding includes severity, problem, severity_explanation, file_path, line_number.
+    pub async fn get_findings_for_review(&self, review_id: i64) -> Result<Vec<serde_json::Value>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, severity, severity_explanation, problem, file_path, line_number
+                 FROM findings WHERE review_id = ? ORDER BY severity DESC, id ASC",
+                libsql::params![review_id],
+            )
+            .await?;
+
+        let mut findings = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let severity_int: i32 = row.get(1)?;
+            let severity_str = match severity_int {
+                4 => "Critical",
+                3 => "High",
+                2 => "Medium",
+                _ => "Low",
+            };
+            findings.push(serde_json::json!({
+                "id": row.get::<i64>(0)?,
+                "severity": severity_str,
+                "severity_explanation": row.get::<Option<String>>(2).ok(),
+                "problem": row.get::<Option<String>>(3).ok(),
+                "file_path": row.get::<Option<String>>(4).ok(),
+                "line_number": row.get::<Option<i64>>(5).ok(),
+            }));
+        }
+        Ok(findings)
     }
 
     pub async fn get_latest_review_for_patchset(

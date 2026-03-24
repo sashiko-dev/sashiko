@@ -20,6 +20,7 @@ pub mod email_policy;
 pub mod email_router;
 pub mod events;
 pub mod fetcher;
+pub mod gerrit;
 pub mod git_ops;
 pub mod ingestor;
 pub mod inspector;
