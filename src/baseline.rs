@@ -297,7 +297,7 @@ impl BaselineRegistry {
         }
 
         let mut candidates: Vec<(&(String, Option<String>), &usize)> = tree_counts.iter().collect();
-        candidates.sort_by(|a, b| b.1.cmp(a.1));
+        candidates.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.0.cmp(&b.0.0)));
 
         // Check for Linux-MM special handling
         // If the top candidate is akpm/mm or linux-mm, OR the subsystem is MEMORY MANAGEMENT
@@ -320,31 +320,84 @@ impl BaselineRegistry {
             ];
         }
 
+        let max_count = *candidates[0].1;
+        let top_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|(_, count)| **count == max_count)
+            .map(|(tree, _)| *tree)
+            .collect();
+
         let subject_lower = subject.to_lowercase();
         let keywords = [
-            "net", "bpf", "drm", "mm", "sched", "x86", "arm", "arm64", "scsi", "usb",
+            "net", "bpf", "drm", "mm", "sched", "x86", "arm", "arm64", "scsi", "usb", "perf",
         ];
         let is_next = subject_lower.contains("next");
 
-        for (tree, _) in &candidates {
+        let mut filtered = Vec::new();
+        for tree in &top_candidates {
             let (url, branch) = tree;
+            let mut matched_kw = false;
             for kw in keywords {
-                if subject_lower.contains(kw) && url.contains(kw) {
-                    if is_next && url.contains("next") {
-                        return vec![self.resolve_url(url, branch.clone())];
-                    }
-                    if !is_next && !url.contains("next") {
-                        // Prefer non-next trees if the subject does not explicitly mention 'next'.
-                    }
+                let url_matches = url.contains(kw);
+                let branch_matches = branch.as_ref().map(|b| b.contains(kw)).unwrap_or(false);
+                let subject_or_subsys_matches = subject_lower.contains(kw)
+                    || matched_subsystem_name
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(kw))
+                        .unwrap_or(false);
+
+                if subject_or_subsys_matches && (url_matches || branch_matches) {
+                    matched_kw = true;
+                    filtered.push(self.resolve_url(url, branch.clone()));
                 }
             }
-            if is_next && url.contains("next") {
-                return vec![self.resolve_url(url, branch.clone())];
+            if !matched_kw
+                && is_next
+                && (url.contains("next")
+                    || branch.as_ref().map(|b| b.contains("next")).unwrap_or(false))
+            {
+                filtered.push(self.resolve_url(url, branch.clone()));
             }
         }
 
-        let (url, branch) = candidates[0].0;
-        vec![self.resolve_url(url, branch.clone())]
+        if !filtered.is_empty() {
+            // If we have keyword matches, and the subject mentions 'next',
+            // we ONLY return the 'next' trees from the keyword-matched set.
+            // This maintains the original prioritization behavior.
+            if is_next {
+                let next_only: Vec<_> = filtered
+                    .iter()
+                    .filter(|c| {
+                        if let BaselineResolution::RemoteTarget { url, branch, .. } = c {
+                            url.contains("next")
+                                || branch.as_ref().map(|b| b.contains("next")).unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                if !next_only.is_empty() {
+                    return next_only;
+                }
+            }
+
+            // Deduplicate filtered results just in case multiple keywords matched the same tree
+            let mut unique_filtered = Vec::new();
+            for f in filtered {
+                if !unique_filtered.contains(&f) {
+                    unique_filtered.push(f);
+                }
+            }
+            return unique_filtered;
+        }
+
+        // If filtering results in nothing (e.g. subject didn't match keywords, or all were 'next' vs non-next mismatch),
+        // return all top candidates.
+        top_candidates
+            .into_iter()
+            .map(|(url, branch)| self.resolve_url(url, branch.clone()))
+            .collect()
     }
 
     fn resolve_url(&self, url: &str, branch: Option<String>) -> BaselineResolution {
@@ -507,5 +560,112 @@ F: patterns/
         } else {
             panic!("Expected linux-next");
         }
+    }
+
+    #[test]
+    fn test_resolve_multiple_trees() {
+        let entries = vec![MaintainersEntry {
+            subsystem: "PERFORMANCE EVENTS SUBSYSTEM".to_string(),
+            trees: vec![
+                (
+                    "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git".to_string(),
+                    Some("perf/core".to_string()),
+                ),
+                (
+                    "git://git.kernel.org/pub/scm/linux/kernel/git/perf/perf-tools.git".to_string(),
+                    Some("perf-tools".to_string()),
+                ),
+                (
+                    "git://git.kernel.org/pub/scm/linux/kernel/git/perf/perf-tools-next.git"
+                        .to_string(),
+                    Some("perf-tools-next".to_string()),
+                ),
+            ],
+            patterns: vec!["tools/perf/".to_string()],
+        }];
+        let mut remote_map = HashMap::new();
+        remote_map.insert(
+            "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git".to_string(),
+            "tip".to_string(),
+        );
+
+        let registry = BaselineRegistry {
+            entries,
+            remote_map,
+        };
+
+        let files = vec!["tools/perf/builtin-report.c".to_string()];
+        let candidates = registry.resolve_candidates(&files, "Subject", None);
+
+        // Current implementation likely only returns ONE of the trees (arbitrarily or first)
+        // plus linux-next and HEAD.
+        // We want ALL three trees to be present.
+
+        let candidate_names: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(candidate_names.iter().any(|n| n.contains("tip.git")));
+        assert!(candidate_names.iter().any(|n| n.contains("perf-tools.git")));
+        assert!(
+            candidate_names
+                .iter()
+                .any(|n| n.contains("perf-tools-next.git"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_next_prioritization() {
+        let entries = vec![MaintainersEntry {
+            subsystem: "NETWORKING".to_string(),
+            trees: vec![
+                ("git://net.git".to_string(), Some("master".to_string())),
+                ("git://net-next.git".to_string(), Some("master".to_string())),
+            ],
+            patterns: vec!["net/".to_string()],
+        }];
+        let mut remote_map = HashMap::new();
+        remote_map.insert("git://net.git".to_string(), "net".to_string());
+        remote_map.insert("git://net-next.git".to_string(), "net-next".to_string());
+
+        let registry = BaselineRegistry {
+            entries,
+            remote_map,
+        };
+
+        let files = vec!["net/core.c".to_string()];
+
+        // With "next" in subject
+        let candidates_next =
+            registry.resolve_candidates(&files, "[PATCH net-next] something", None);
+        let names_next: Vec<String> = candidates_next
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Should only contain net-next (from subsystem heuristic)
+        assert!(names_next.contains(&"net-next".to_string()));
+        assert!(!names_next.contains(&"net".to_string()));
+
+        // Without "next" in subject
+        let candidates_nonext = registry.resolve_candidates(&files, "[PATCH net] something", None);
+        let names_nonext: Vec<String> = candidates_nonext
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Should contain both (inclusive behavior)
+        assert!(names_nonext.contains(&"net".to_string()));
+        assert!(names_nonext.contains(&"net-next".to_string()));
     }
 }
