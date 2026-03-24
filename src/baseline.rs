@@ -85,7 +85,8 @@ impl BaselineRegistry {
             Err(e) => {
                 warn!(
                     "Failed to load MAINTAINERS from git {}: {}. Falling back to local file.",
-                    ref_name, e
+                    ref_name,
+                    e.to_string().trim()
                 );
                 let maintainers_path = repo_path.join("MAINTAINERS");
                 if maintainers_path.exists() {
@@ -119,7 +120,7 @@ impl BaselineRegistry {
         if !output.status.success() {
             return Err(anyhow::anyhow!(
                 "git show failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())

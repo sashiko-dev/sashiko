@@ -293,7 +293,7 @@ impl Ingestor {
             if !output.status.success() {
                 return Err(anyhow!(
                     "Git clone failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    String::from_utf8_lossy(&output.stderr).trim()
                 ));
             }
         } else {
@@ -350,7 +350,7 @@ impl Ingestor {
                 // Warn but continue, maybe we are offline
                 warn!(
                     "Git fetch failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
         }

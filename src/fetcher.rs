@@ -367,7 +367,7 @@ impl FetchAgent {
             if !output.status.success() {
                 return Err(anyhow!(
                     "Failed to add remote: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    String::from_utf8_lossy(&output.stderr).trim()
                 ));
             }
         }
@@ -386,7 +386,7 @@ impl FetchAgent {
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         Ok(())
@@ -402,7 +402,7 @@ impl FetchAgent {
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch all failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         Ok(())
@@ -458,7 +458,7 @@ impl FetchAgent {
             return Err(anyhow!(
                 "Failed to resolve SHA for {}: {}",
                 commit,
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -504,7 +504,7 @@ impl FetchAgent {
         if !output.status.success() {
             return Err(anyhow!(
                 "git show failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 

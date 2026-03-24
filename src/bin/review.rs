@@ -647,7 +647,7 @@ async fn apply_single_patch(
                     "failed"
                 };
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
                 if status == "failed" {
                     info!(

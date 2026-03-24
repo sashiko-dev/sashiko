@@ -406,7 +406,7 @@ impl ToolBox {
         if !output.status.success() {
             return Err(anyhow!(
                 "git blame failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
@@ -429,7 +429,7 @@ impl ToolBox {
             .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let mut error_msg = format!("git diff failed: {}", stderr);
 
             if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
@@ -470,7 +470,7 @@ impl ToolBox {
         };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Ok(json!({ "error": format!("git log failed: {}", stderr) }));
         }
 
@@ -501,7 +501,7 @@ impl ToolBox {
         if !output.status.success() {
             return Err(anyhow!(
                 "git show failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
@@ -695,7 +695,7 @@ impl ToolBox {
         if !output.status.success() {
             return Err(anyhow!(
                 "find failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 

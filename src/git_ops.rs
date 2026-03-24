@@ -82,7 +82,7 @@ impl GitWorktree {
         if !output.status.success() {
             return Err(anyhow!(
                 "Failed to create worktree: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
@@ -129,8 +129,8 @@ impl GitWorktree {
 
             return Err(anyhow!(
                 "git am failed. stdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
@@ -173,7 +173,7 @@ impl GitWorktree {
         } else {
             Err(anyhow!(
                 "git show failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ))
         }
     }
@@ -190,7 +190,7 @@ impl GitWorktree {
         } else {
             Err(anyhow!(
                 "git show --no-patch failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ))
         }
     }
@@ -243,7 +243,7 @@ impl GitWorktree {
         if !output.status.success() {
             return Err(anyhow!(
                 "git reset --hard failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
@@ -283,7 +283,7 @@ impl GitWorktree {
         if !output.status.success() {
             return Err(anyhow!(
                 "Failed to remove worktree: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         self.is_managed = false;
@@ -305,7 +305,7 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
     if !output.status.success() {
         return Err(anyhow!(
             "git cat-file failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(output.stdout)
@@ -325,7 +325,7 @@ pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     if !output.status.success() {
         return Err(anyhow!(
             "git worktree prune failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(())
@@ -340,7 +340,7 @@ pub async fn check_disk_usage(path: &Path) -> Result<String> {
     } else {
         Err(anyhow!(
             "Failed to check disk usage: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
@@ -520,7 +520,7 @@ pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
         Err(anyhow!(
             "Failed to resolve {}: {}",
             ref_name,
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
@@ -616,7 +616,7 @@ pub async fn get_git_log(params: GitLogParams) -> Result<String> {
     } else {
         Err(anyhow!(
             "git log failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
@@ -633,7 +633,7 @@ pub async fn git_status(repo_path: &Path) -> Result<String> {
     } else {
         Err(anyhow!(
             "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
@@ -650,7 +650,7 @@ pub async fn git_checkout(repo_path: &Path, target: &str) -> Result<()> {
     } else {
         Err(anyhow!(
             "git checkout failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
@@ -667,7 +667,7 @@ pub async fn git_branch(repo_path: &Path) -> Result<String> {
     } else {
         Err(anyhow!(
             "git branch failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
@@ -684,7 +684,7 @@ pub async fn git_tag(repo_path: &Path) -> Result<String> {
     } else {
         Err(anyhow!(
             "git tag failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
