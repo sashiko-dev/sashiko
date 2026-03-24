@@ -236,11 +236,15 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 settings.ai.api_timeout_secs,
             )))
         }
+        "claude-cli" => Ok(Arc::new(claude_cli::ClaudeCliProvider {
+            model: settings.ai.model.clone(),
+        })),
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
 pub mod bedrock;
 pub mod claude;
+pub mod claude_cli;
 pub mod gemini;
 pub mod openai;
 pub mod proxy;
