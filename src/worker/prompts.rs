@@ -655,7 +655,7 @@ Example:
 
         // Stage 8
         info!("Running Stage 8");
-        let mut findings_json = Value::Array(Vec::new());
+        let findings_json;
         {
             let stage = 8;
             let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
@@ -703,7 +703,7 @@ Example:
                 "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{{{{series context}}}}\n\nAggregated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof).\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\"\n    }}\n  ]\n}}\n```",
                 clean_stage_prompt, aggregated_concerns_json
             );
-            if let Ok((result_json, t_in, t_out, t_cached)) = self
+            match self
                 .run_ai_stage(
                     stage,
                     system_prompt,
@@ -713,12 +713,27 @@ Example:
                 )
                 .await
             {
-                total_tokens_in += t_in;
-                total_tokens_out += t_out;
-                total_tokens_cached += t_cached;
+                Ok((result_json, t_in, t_out, t_cached)) => {
+                    total_tokens_in += t_in;
+                    total_tokens_out += t_out;
+                    total_tokens_cached += t_cached;
 
-                if let Some(f) = result_json.get("findings") {
-                    findings_json = f.clone();
+                    if let Some(f) = result_json.get("findings") {
+                        if f.is_array() {
+                            findings_json = f.clone();
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Stage 8 output 'findings' is not an array"
+                            ));
+                        }
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "Stage 8 failed to produce a valid 'findings' array in output."
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Stage 8 AI execution failed: {}", e));
                 }
             }
         }
