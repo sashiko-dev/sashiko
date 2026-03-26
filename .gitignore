@@ -5,7 +5,6 @@
 *.db-wal
 .cargo/config.toml
 target/
-Cargo.lock
 archives/
 third_party/linux/
 review_trees/
