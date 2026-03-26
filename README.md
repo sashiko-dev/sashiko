@@ -169,7 +169,7 @@ cargo run --bin sashiko-cli -- [COMMAND]
   - If `INPUT` is omitted and stdin is a terminal, it defaults to the current `HEAD`.
   - `--repo` (or `-r`) specifies an external git repository (URL or local path acting as a git remote).
   - If `--repo` is provided, the CLI resolves references to full 40-character SHAs locally and verifies their existence in the remote before submission.
-  - If `--repo` is omitted, the Sashiko server's local repository is used, and resolution occurs on the server side.
+  - If `--repo` is omitted, references (such as `HEAD`) are resolved on the server side using the local repository configured in the server's `Settings.toml` (`git.repository_path`).
 
 **Examples:**
 
