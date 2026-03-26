@@ -17,7 +17,6 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
-use sashiko::settings::Settings;
 use serde_json::Value;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -32,7 +31,12 @@ struct Cli {
     command: Commands,
 
     /// Override server URL (default: from settings or http://127.0.0.1:8080)
-    #[arg(long, global = true, env = "SASHIKO_SERVER")]
+    #[arg(
+        long,
+        global = true,
+        env = "SASHIKO_SERVER",
+        default_value = "http://127.0.0.1:8080"
+    )]
     server: Option<String>,
 
     /// Output format (text, json)
@@ -112,14 +116,7 @@ enum SubmitType {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    // Load settings, falling back to defaults if file missing/invalid
-    let settings = Settings::new()
-        .unwrap_or_else(|_| Settings::new().expect("Failed to load default settings"));
-
-    let base_url = cli
-        .server
-        .unwrap_or_else(|| format!("http://{}:{}", settings.server.host, settings.server.port));
+    let base_url = cli.server.unwrap();
 
     let client = Client::new();
 
