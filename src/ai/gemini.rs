@@ -228,6 +228,7 @@ impl GeminiClient {
         body: &T,
     ) -> Result<GenerateContentResponse> {
         let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
+
         let res = match self.client.post(url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
@@ -492,7 +493,7 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                 .map(|tool| FunctionDeclaration {
                     name: tool.name,
                     description: tool.description,
-                    parameters: tool.parameters,
+                    parameters: normalize_schema(tool.parameters),
                 })
                 .collect(),
         }]
@@ -508,7 +509,7 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
             }
             crate::ai::AiResponseFormat::Json { schema } => {
                 response_mime_type = Some("application/json".to_string());
-                response_schema = schema;
+                response_schema = schema.map(normalize_schema);
             }
         }
     }
@@ -526,6 +527,28 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
             }),
         }),
     })
+}
+
+fn normalize_schema(mut schema: Value) -> Value {
+    if let Some(obj) = schema.as_object_mut() {
+        if let Some(ty) = obj.get_mut("type")
+            && let Some(s) = ty.as_str()
+        {
+            *ty = Value::String(s.to_uppercase());
+        }
+        for (_, val) in obj.iter_mut() {
+            if val.is_object() || val.is_array() {
+                *val = normalize_schema(val.clone());
+            }
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        for val in arr.iter_mut() {
+            if val.is_object() || val.is_array() {
+                *val = normalize_schema(val.clone());
+            }
+        }
+    }
+    schema
 }
 
 fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
@@ -960,5 +983,41 @@ mod tests {
         // Total should be around 20-40 tokens.
         assert!(tokens > 10);
         assert!(tokens < 200);
+    }
+
+    #[test]
+    fn test_normalize_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "start_line": { "type": "integer" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let normalized = normalize_schema(schema);
+
+        assert_eq!(normalized["type"], "OBJECT");
+        assert_eq!(normalized["properties"]["files"]["type"], "ARRAY");
+        assert_eq!(
+            normalized["properties"]["files"]["items"]["type"],
+            "OBJECT"
+        );
+        assert_eq!(
+            normalized["properties"]["files"]["items"]["properties"]["path"]["type"],
+            "STRING"
+        );
+        assert_eq!(
+            normalized["properties"]["files"]["items"]["properties"]["start_line"]["type"],
+            "INTEGER"
+        );
     }
 }
