@@ -53,10 +53,6 @@ impl FetchAgent {
 
     pub async fn run(mut self) {
         info!("FetchAgent started");
-
-        // Wait for repository readiness if it's being initialized/updated by entrypoint
-        crate::utils::wait_for_repo_readiness(&self.repo_path);
-
         let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
         let mut ticker = interval(Duration::from_secs(10));
 

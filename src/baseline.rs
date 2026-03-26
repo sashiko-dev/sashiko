@@ -59,9 +59,6 @@ pub struct BaselineRegistry {
 
 impl BaselineRegistry {
     pub fn new(repo_path: &Path) -> Result<Self> {
-        // Wait for repository readiness if it's being initialized/updated by entrypoint
-        crate::utils::wait_for_repo_readiness(repo_path);
-
         let remote_map = Self::load_git_remotes(repo_path).unwrap_or_default();
 
         // Identify Linus's tree
