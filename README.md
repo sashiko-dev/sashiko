@@ -173,7 +173,26 @@ cargo run --bin sashiko-cli -- [COMMAND]
 - **`show [ID]`**: Show detailed information about a patchset and its AI review.
   - `ID` defaults to `latest`.
 
-### 3. Web Interface
+### 3. Getting Sashiko to Review Your Kernel Patch Series Locally
+
+Sashiko is highly effective for reviewing your own changes during local kernel
+development. To get the most out of it:
+
+1.  **Configure `Settings.toml`**: Set `git.repository_path` to the absolute
+    path of the repository you are actively developing in.
+    ```toml
+    [git]
+    repository_path = "/home/user/src/linux"
+    ```
+2.  **Submit for Review**: Use the CLI to submit your recent commits. Since
+    the daemon is looking at the same directory, you can use relative references
+    like `HEAD` or ranges.
+    ```bash
+    # Review the latest 3 commits in your local dev tree
+    sashiko-cli submit HEAD~3..HEAD
+    ```
+
+### 4. Web Interface
 
 Once the daemon is running, you can access the Web UI, the daemon will print the
 URL to access it from localhost.
