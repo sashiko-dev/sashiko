@@ -13,33 +13,10 @@
 // limitations under the License.
 
 use regex::Regex;
-use std::path::Path;
 use std::sync::OnceLock;
-use std::thread;
-use std::time::Duration;
-use tracing::{info, warn};
 
 static KEY_REGEX: OnceLock<Regex> = OnceLock::new();
 static URL_CRED_REGEX: OnceLock<Regex> = OnceLock::new();
-
-/// Waits for repository readiness if it's being initialized/updated by entrypoint.
-/// Checks for the presence of a ".ready" file in the repository path.
-pub fn wait_for_repo_readiness(repo_path: &Path) {
-    let ready_file = repo_path.join(".ready");
-    if ready_file.exists() {
-        info!("Waiting for repository readiness (.ready file exists)...");
-        let mut attempts = 0;
-        while ready_file.exists() && attempts < 60 {
-            thread::sleep(Duration::from_secs(10));
-            attempts += 1;
-        }
-        if ready_file.exists() {
-            warn!("Timed out waiting for repository readiness, proceeding anyway.");
-        } else {
-            info!("Repository is now ready.");
-        }
-    }
-}
 
 /// Redacts sensitive information from a string.
 ///
