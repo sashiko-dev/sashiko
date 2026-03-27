@@ -880,7 +880,10 @@ Example:
             }
 
             if review_inline_text.is_empty() {
-                return Err(anyhow::anyhow!("Stage 9 failed to generate a valid LKML report after {} attempts.", max_retries));
+                return Err(anyhow::anyhow!(
+                    "Stage 9 failed to generate a valid LKML report after {} attempts.",
+                    max_retries
+                ));
             }
         }
 

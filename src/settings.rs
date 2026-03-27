@@ -109,6 +109,14 @@ pub struct GeminiSettings {
     pub explicit_prompt_caching: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct BedrockSettings {
+    /// AWS region for Bedrock API calls (e.g. "us-east-1").
+    /// If omitted, uses the standard AWS SDK default chain.
+    pub region: Option<String>,
+}
+
 fn default_prompt_caching() -> bool {
     true
 }
@@ -129,6 +137,7 @@ pub struct AiSettings {
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
+    pub bedrock: Option<BedrockSettings>,
 }
 
 fn default_temperature() -> f32 {

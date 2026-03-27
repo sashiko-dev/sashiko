@@ -133,6 +133,40 @@ Running an automated review system like Sashiko can be computationally expensive
     - Automatic retry logic for rate limits and API overload
     - 1M context window for claude-sonnet-4-6 (use max_input_tokens = 950000 for safety margin)
 
+    ### AWS Bedrock Setup
+
+    Sashiko supports AWS Bedrock via the Converse API, which works with any Bedrock-hosted model (Claude, Llama, Mistral, etc.).
+
+    **Prerequisites**: Enable model access in the [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your desired model and region.
+
+    **Configure AWS credentials** using any standard method:
+    ```bash
+    # Option 1: Environment variables
+    export AWS_ACCESS_KEY_ID="..."
+    export AWS_SECRET_ACCESS_KEY="..."
+    export AWS_REGION="us-east-1"
+
+    # Option 2: AWS CLI profile (~/.aws/credentials)
+    aws configure
+    ```
+
+    **Update Settings.toml**:
+    ```toml
+    [ai]
+    provider = "bedrock"
+    model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
+    max_input_tokens = 950000
+
+    [ai.bedrock]
+    region = "us-east-1"  # Optional, falls back to AWS SDK defaults
+    ```
+
+    **Features**:
+    - Uses the Converse API — works with any Bedrock-hosted model
+    - No API key needed — uses standard AWS IAM authentication
+    - Supports cross-region inference profiles (e.g., `us.anthropic.claude-*`)
+    - Full tool/function calling support for git operations
+
 3.  **Build**:
     ```bash
     cargo build --release

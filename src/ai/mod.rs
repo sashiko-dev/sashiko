@@ -191,9 +191,15 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
             Ok(Arc::new(claude::ClaudeClient::new(model, enable_caching)))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient)),
+        "bedrock" => {
+            let model = settings.ai.model.clone();
+            let region = settings.ai.bedrock.as_ref().and_then(|b| b.region.clone());
+            Ok(Arc::new(bedrock::BedrockClient::new(model, region)))
+        }
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
+pub mod bedrock;
 pub mod claude;
 pub mod gemini;
 pub mod proxy;

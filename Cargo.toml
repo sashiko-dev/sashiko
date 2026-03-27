@@ -7,6 +7,9 @@ default-run = "sashiko"
 [dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
 axum = "0.8.8"
 chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive", "env"] }
