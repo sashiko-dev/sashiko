@@ -107,6 +107,8 @@ enum SubmitType {
     Remote,
     /// Submit a range of remote commits
     Range,
+    /// Fetch a thread from lore.kernel.org by message ID
+    Thread,
 }
 
 #[tokio::main]
@@ -208,6 +210,9 @@ async fn handle_submit(
                 (SubmitType::Mbox, s)
             } else if s.contains("..") {
                 (SubmitType::Range, s)
+            } else if s.contains('@') && !s.contains('/') && !s.contains('\\') {
+                // If it looks like an email address/msgid and doesn't look like a path, assume Thread
+                (SubmitType::Thread, s)
             } else if PathBuf::from(&s).exists() {
                 // If it's a file, assume mbox. If it's a dir, maybe repo?
                 // For safety, if it looks like a commit (hex), prefer Remote unless file exists.
@@ -275,6 +280,7 @@ async fn handle_submit(
                 only_subjects: only_subjects.clone(),
             }
         }
+        SubmitType::Thread => SubmitRequest::Thread { msgid: target },
     };
 
     let resp = client.post(&url).json(&payload).send().await?;

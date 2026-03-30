@@ -216,6 +216,9 @@ pub enum SubmitRequest {
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
     },
+    Thread {
+        msgid: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -396,7 +399,80 @@ async fn submit_patch(
                 id,
             }))
         }
+        SubmitRequest::Thread { msgid } => {
+            let id = generate_synthetic_id("thread");
+            info!("Received thread fetch request: {} (msgid: {})", id, msgid);
+
+            // Create a placeholder record in the DB so the user can track status
+            if let Err(e) = state
+                .db
+                .create_fetching_patchset(
+                    &msgid, // Or &id? msgid is cleaner for display
+                    &format!("Fetching thread {}...", msgid),
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::error!("Failed to create placeholder patchset: {}", e);
+                // Non-fatal, just continue
+            }
+
+            let msgid_clone = msgid.clone();
+            let sender = state.sender.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = fetch_and_inject_thread(&msgid_clone, sender).await {
+                    tracing::error!("Failed to fetch thread {}: {}", msgid_clone, e);
+                }
+            });
+
+            Ok(Json(SubmitResponse {
+                status: "accepted".to_string(),
+                id, // The client might expect this ID
+            }))
+        }
     }
+}
+
+async fn fetch_and_inject_thread(
+    msgid: &str,
+    sender: tokio::sync::mpsc::Sender<Event>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("https://lore.kernel.org/all/{}/t.mbox.gz", msgid);
+    let response = reqwest::get(&url).await?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to fetch thread {}: HTTP {}",
+            msgid,
+            response.status()
+        )
+        .into());
+    }
+
+    let bytes = response.bytes().await?;
+
+    // Decompress the gzip data using a blocking task to avoid blocking the async runtime
+    let raw = tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut raw = String::new();
+        decoder.read_to_string(&mut raw)?;
+        Ok(raw)
+    })
+    .await??;
+
+    let event = Event::RawMboxSubmitted {
+        raw,
+        group: "api-submit".to_string(),
+        baseline: None,
+        skip_subjects: None,
+        only_subjects: None,
+    };
+
+    sender.send(event).await?;
+    Ok(())
 }
 
 async fn list_mailing_lists(

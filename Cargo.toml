@@ -15,6 +15,7 @@ chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 config = "0.15.19"
 fastrand = "2.3.0"
+flate2 = "1.1.9"
 futures = "0.3.31"
 grep = "0.4.1"
 grep-matcher = "0.1.8"
