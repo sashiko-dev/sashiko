@@ -1,0 +1,6 @@
+spec:
+  defaultBackend:
+    service:
+      name: sashiko-maintenance-service
+      port:
+        number: 80

@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sashiko-maintenance-html
+  namespace: sashiko
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Sashiko Maintenance</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                background-color: #f7f9fc;
+                color: #333;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+            }
+            .container {
+                text-align: center;
+                padding: 2.5rem;
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 10px 25px rgba(0,0,0,0.05);
+                max-width: 450px;
+            }
+            .maintenance-img {
+                width: 100%;
+                max-width: 200px;
+                height: auto;
+                margin-bottom: 1.5rem;
+                border-radius: 4px;
+            }
+            h1 { color: #1a73e8; margin-top: 0; font-size: 1.5rem; }
+            small { color: #777; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <!-- Embedded Tux Image -->
+            <img src="data:image/png;base64,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" alt="Tux mending with Sashiko" class="maintenance-img">
+
+            <h1>Sashiko is mending...</h1>
+            <p>We're currently performing maintenance to keep our kernel analysis sharp. We'll be back online in just a moment.</p>
+
+            <p><small>Thank you for your patience!</small></p>
+        </div>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sashiko-maintenance
+  namespace: sashiko
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sashiko-maintenance
+  template:
+    metadata:
+      labels:
+        app: sashiko-maintenance
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: html
+        configMap:
+          name: sashiko-maintenance-html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sashiko-maintenance-service
+  namespace: sashiko
+spec:
+  type: NodePort
+  selector:
+    app: sashiko-maintenance
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80

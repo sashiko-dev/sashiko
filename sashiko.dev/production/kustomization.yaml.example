@@ -1,0 +1,59 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# ENVIRONMENT-SPECIFIC CONFIGURATION EXAMPLE
+# Copy this to 'kustomization.yaml' and modify IDs.
+# This file is ignored by git.
+
+patches:
+  # 1. Deployment: Update image
+  - target:
+      kind: Deployment
+      name: sashiko-deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: us-docker.pkg.dev/gcp-project-xxxxx/sashiko-repository/sashiko:next
+
+  # 2. ServiceAccount: Link to real GCP Service Account
+  - target:
+      kind: ServiceAccount
+      name: sashiko-ksa
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/iam.gke.io~1gcp-service-account
+        value: a-service-account@gcp-project-xxxxx.iam.gserviceaccount.com
+
+  # 3. Data Manager: Inject Bucket ID
+  - target:
+      kind: Deployment
+      name: data-manager
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: BACKUP_BUCKET
+            value: gs://bucket-xxxxx
+
+  # 4. CronJob: Inject Bucket ID
+  - target:
+      kind: CronJob
+      name: sashiko-nightly-backup
+    patch: |-
+      - op: add
+        path: /spec/jobTemplate/spec/template/spec/containers/0/env
+        value:
+          - name: BACKUP_BUCKET
+            value: gs://bucket-xxxxx
+
+  # 5. Ingress: Real IP and Certificate names
+  - target:
+      kind: Ingress
+      name: sashiko-ingress
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/kubernetes.io~1ingress.global-static-ip-name
+        value: "load-balancer"
+      - op: replace
+        path: /metadata/annotations/networking.gke.io~1managed-certificates
+        value: "certificate"

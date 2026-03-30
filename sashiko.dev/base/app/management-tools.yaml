@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sashiko-management-scripts
+  namespace: sashiko
+data:
+  setup-env.sh: |
+    #!/bin/sh
+    set -e
+    echo "--- Setting up environment at $(date) ---"
+    apk add --no-cache sqlite bash
+    echo "--- Environment setup complete ---"
+  backup-db.sh: |
+    #!/bin/bash
+    set -e
+    DB_PATH="/data/db/sashiko.db"
+    BUCKET="${BACKUP_BUCKET:-gs://BACKUP_BUCKET}"
+    TIMESTAMP=$(date '+%Y-%m-%d_%Hh-%Mm-%Ss-%Z')
+    TEMP_BACKUP="/tmp/sashiko_backup.db"
+
+    echo "--- Starting Backup at $(date) ---"
+
+    if [ ! -f "$DB_PATH" ]; then
+        echo "Error: Database not found at $DB_PATH"
+        exit 1
+    fi
+
+    echo "Creating consistent SQLite snapshot..."
+    sqlite3 "$DB_PATH" ".backup '$TEMP_BACKUP'"
+
+    echo "Uploading to Cloud Storage..."
+    gsutil cp "$TEMP_BACKUP" "${BUCKET}/sashiko_${TIMESTAMP}.db"
+
+    echo "Cleaning up..."
+    rm "$TEMP_BACKUP"
+
+    echo "--- Backup Complete: sashiko_${TIMESTAMP}.db ---"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-manager
+  namespace: sashiko
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-manager
+  template:
+    metadata:
+      labels:
+        app: data-manager
+    spec:
+      serviceAccountName: sashiko-ksa
+      nodeSelector:
+        cloud.google.com/gke-nodepool: big-pool
+      containers:
+      - name: main
+        image: google/cloud-sdk:alpine
+        command: ["/bin/sh", "-c"]
+        args: 
+          - |
+            /usr/local/bin/setup-env.sh;
+            echo "Management Service Live. Waiting for commands...";
+            sleep infinity;
+        volumeMounts:
+        - name: sashiko-storage
+          mountPath: /data
+          subPath: data-dir
+        - name: sashiko-storage
+          mountPath: /app/third_party/linux
+          subPath: linux-repo
+        - name: scripts
+          mountPath: /usr/local/bin/backup-db.sh
+          subPath: backup-db.sh
+        - name: scripts
+          mountPath: /usr/local/bin/setup-env.sh
+          subPath: setup-env.sh
+      volumes:
+      - name: sashiko-storage
+        persistentVolumeClaim:
+          claimName: sashiko-data-pvc
+      - name: scripts
+        configMap:
+          name: sashiko-management-scripts
+          defaultMode: 0755
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sashiko-nightly-backup
+  namespace: sashiko
+spec:
+  schedule: "0 2 * * *" # Every day at 2:00 AM
+  timeZone: "America/Los_Angeles"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: sashiko-ksa
+          nodeSelector:
+            cloud.google.com/gke-nodepool: big-pool
+          containers:
+          - name: backup-worker
+            image: google/cloud-sdk:alpine
+            command: ["/bin/sh", "-c", "/usr/local/bin/setup-env.sh && /usr/local/bin/backup-db.sh"]
+            volumeMounts:
+            - name: sashiko-storage
+              mountPath: /data
+              subPath: data-dir
+            - name: scripts
+              mountPath: /usr/local/bin/backup-db.sh
+              subPath: backup-db.sh
+            - name: scripts
+              mountPath: /usr/local/bin/setup-env.sh
+              subPath: setup-env.sh
+          restartPolicy: OnFailure
+          volumes:
+          - name: sashiko-storage
+            persistentVolumeClaim:
+              claimName: sashiko-data-pvc
+          - name: scripts
+            configMap:
+              name: sashiko-management-scripts
+              defaultMode: 0755
