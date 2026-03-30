@@ -20,8 +20,9 @@ use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
 use sashiko::settings::Settings;
 use serde_json::Value;
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::Path;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use tokio::process::Command;
 
 #[derive(Parser)]
 #[command(name = "sashiko-cli")]
@@ -59,9 +60,9 @@ enum Commands {
         #[arg(long, value_enum)]
         r#type: Option<SubmitType>,
 
-        /// Override repository path (defaults to settings)
+        /// Override repository path (defaults to settings, can be a local path, URL, or remote name)
         #[arg(long, short = 'r')]
-        repo: Option<PathBuf>,
+        repo: Option<String>,
 
         /// Baseline commit (for mbox injection only)
         #[arg(long)]
@@ -190,16 +191,20 @@ async fn handle_submit(
     base_url: &str,
     input: Option<String>,
     explicit_type: Option<SubmitType>,
-    repo: Option<PathBuf>,
+    repo: Option<String>,
     baseline: Option<String>,
     skip_subjects: Option<Vec<String>>,
     only_subjects: Option<Vec<String>>,
     format: OutputFormat,
 ) -> Result<()> {
+    if let Some(r) = &repo {
+        validate_remote(r).await?;
+    }
+
     let url = format!("{}/api/submit", base_url);
 
     // DWIM Detection Logic
-    let (submission_type, target) = if let Some(t) = explicit_type {
+    let (submission_type, mut target) = if let Some(t) = explicit_type {
         (t, input.unwrap_or_else(|| "HEAD".to_string()))
     } else {
         // Auto-detect based on input
@@ -208,12 +213,12 @@ async fn handle_submit(
                 (SubmitType::Mbox, s)
             } else if s.contains("..") {
                 (SubmitType::Range, s)
-            } else if PathBuf::from(&s).exists() {
+            } else if Path::new(&s).exists() {
                 // If it's a file, assume mbox. If it's a dir, maybe repo?
                 // For safety, if it looks like a commit (hex), prefer Remote unless file exists.
                 // But filenames can look like anything.
                 // Sashiko deals with mbox files primarily.
-                let p = PathBuf::from(&s);
+                let p = Path::new(&s);
                 if p.is_file() {
                     (SubmitType::Mbox, s)
                 } else {
@@ -236,6 +241,42 @@ async fn handle_submit(
         }
     };
 
+    // Resolve SHAs if --repo is provided
+    if let Some(r) = &repo
+        && (submission_type == SubmitType::Remote || submission_type == SubmitType::Range)
+    {
+        let context = if Path::new(r).is_dir() {
+            Some(r.as_str())
+        } else {
+            None
+        };
+
+        if target.contains("..") {
+            let parts: Vec<&str> = target.split("..").collect();
+            if parts.len() == 2 {
+                let start = resolve_ref(context, parts[0]).await?;
+                let end = resolve_ref(context, parts[1]).await?;
+
+                // Check if SHAs exist in the remote (if remote is not the context)
+                if context.is_none() || context != Some(r) {
+                    verify_sha_exists_in_remote(r, &start).await?;
+                    verify_sha_exists_in_remote(r, &end).await?;
+                }
+
+                target = format!("{}..{}", start, end);
+            }
+        } else {
+            let sha = resolve_ref(context, &target).await?;
+
+            // Check if SHA exists in the remote (if remote is not the context)
+            if context.is_none() || context != Some(r) {
+                verify_sha_exists_in_remote(r, &sha).await?;
+            }
+
+            target = sha;
+        }
+    }
+
     let payload = match submission_type {
         SubmitType::Mbox => {
             let content = if target == "-" {
@@ -255,26 +296,18 @@ async fn handle_submit(
                 only_subjects: only_subjects.clone(),
             }
         }
-        SubmitType::Remote => {
-            let repo_path = repo.map(|p| p.to_string_lossy().to_string());
-
-            SubmitRequest::Remote {
-                sha: target,
-                repo: repo_path,
-                skip_subjects: skip_subjects.clone(),
-                only_subjects: only_subjects.clone(),
-            }
-        }
-        SubmitType::Range => {
-            let repo_path = repo.map(|p| p.to_string_lossy().to_string());
-
-            SubmitRequest::RemoteRange {
-                sha: target,
-                repo: repo_path,
-                skip_subjects: skip_subjects.clone(),
-                only_subjects: only_subjects.clone(),
-            }
-        }
+        SubmitType::Remote => SubmitRequest::Remote {
+            sha: target,
+            repo: repo.clone(),
+            skip_subjects: skip_subjects.clone(),
+            only_subjects: only_subjects.clone(),
+        },
+        SubmitType::Range => SubmitRequest::RemoteRange {
+            sha: target,
+            repo: repo.clone(),
+            skip_subjects: skip_subjects.clone(),
+            only_subjects: only_subjects.clone(),
+        },
     };
 
     let resp = client.post(&url).json(&payload).send().await?;
@@ -577,4 +610,69 @@ fn format_timestamp(ts: i64) -> String {
         }
         _ => ts.to_string(),
     }
+}
+
+async fn validate_remote(repo: &str) -> Result<()> {
+    // Run git ls-remote HEAD to see if it's reachable and a valid repo
+    let status = Command::new("git")
+        .args(["ls-remote", repo, "HEAD"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .context("Failed to run git command")?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Could not reach or validate git remote: {}",
+            repo
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_ref(context: Option<&str>, reference: &str) -> Result<String> {
+    let mut cmd = Command::new("git");
+    if let Some(c) = context {
+        cmd.arg("-C").arg(c);
+    }
+    let output = cmd
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", reference),
+        ])
+        .output()
+        .await
+        .context("Failed to run git rev-parse")?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "Failed to resolve '{}' to a commit SHA: {}",
+            reference,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn verify_sha_exists_in_remote(repo: &str, sha: &str) -> Result<()> {
+    // Try git fetch --dry-run <repo> <sha>
+    // This is the most reliable check for a remote SHA existence
+    let status = Command::new("git")
+        .args(["fetch", "--dry-run", repo, sha])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .context("Failed to run git fetch")?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Commit {} was not found in remote repository {}",
+            sha,
+            repo
+        ));
+    }
+    Ok(())
 }

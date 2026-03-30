@@ -203,10 +203,26 @@ then run `sashiko-cli [COMMAND]`)
 
 **Commands:**
 
-- **`submit [INPUT]`**: Submit a patch or range for review.
+- **`submit [INPUT] [--repo REPO]`**: Submit a patch or range for review.
   - `INPUT` can be a file path (mbox), a commit SHA, or a range (e.g., `HEAD~3..HEAD`).
   - If `INPUT` is omitted and stdin is piped, it reads an mbox from stdin.
   - If `INPUT` is omitted and stdin is a terminal, it defaults to the current `HEAD`.
+  - `--repo` (or `-r`) specifies an external git repository (URL or local path acting as a git remote).
+  - If `--repo` is provided, the CLI resolves references to full 40-character SHAs locally and verifies their existence in the remote before submission.
+  - If `--repo` is omitted, references (such as `HEAD`) are resolved on the server side using the local repository configured in the server's `Settings.toml` (`git.repository_path`).
+
+**Examples:**
+
+```bash
+# Submit a range of commits (resolved on the server side)
+sashiko-cli submit HEAD~3..HEAD
+
+# Submit a range from a remote URL (resolved on the client side)
+sashiko-cli submit v6.1..v6.2 --repo https://github.com/torvalds/linux.git
+
+# Submit using a local path acting as a git remote (e.g. bare repo)
+sashiko-cli submit main --repo /path/to/linux.git
+```
 - **`status`**: Show the current server status and queue statistics.
 - **`list [FILTER]`**: List recent patchsets.
   - `FILTER` can be a status (e.g., `pending`, `failed`, `reviewed`) or a search term.
