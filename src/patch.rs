@@ -134,8 +134,14 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         || subject_clean.starts_with("fwd:")
         || subject_clean.starts_with("forwarded:")
         || subject_clean.starts_with("aw:") // German 'Antwort'
+        || subject_clean.starts_with("wg:") // German 'Weitergeleitet'
         || subject_clean.starts_with("回复:") // Chinese 'Re'
-        || subject_clean.starts_with("回复："); // Chinese 'Re' with full-width colon
+        || subject_clean.starts_with("回复：") // Chinese 'Re' with full-width colon
+        || subject_clean.starts_with("答复:") // Chinese 'Reply'
+        || subject_clean.starts_with("答复：") // Chinese 'Reply'
+        || subject_clean.starts_with("[reproducer]") // Reproducers
+        || subject_lower.contains("(was ")
+        || subject_lower.contains("(was:");
     let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
     let has_diff = !diff.is_empty();
 
@@ -179,8 +185,10 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
 
 fn parse_subject_index(subject: &str) -> (u32, u32) {
     static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
-    // Match [ ... M/N ... ]
-    let re_brackets = RE_BRACKETS.get_or_init(|| Regex::new(r"\[.*?(\d+)/(\d+).*?\]").unwrap());
+    // Match [ ... M/N ... ] but strictly require PATCH, RFC, RESEND or vN before the M/N
+    let re_brackets = RE_BRACKETS.get_or_init(|| {
+        Regex::new(r"(?i)\[.*?\b(?:PATCH|RFC|RESEND|v\d+)\b.*?(\d+)/(\d+).*?\]").unwrap()
+    });
 
     if let Some(caps) = re_brackets.captures(subject)
         && let (Some(i), Some(t)) = (caps.get(1), caps.get(2))
