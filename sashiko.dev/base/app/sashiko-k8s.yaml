@@ -76,7 +76,7 @@ spec:
         - name: SASHIKO__AI__MODEL
           value: "gemini-3.1-pro-preview"
         - name: SASHIKO__MAILING_LISTS__TRACK
-          value: "bpf,cgroups,dmaengine,driver-core,dwarves,kvm,linux-bluetooth,linux-cifs,linux-ext4,linux-hwmon,linux-kernel,linux-mm,linux-pci,linux-perf-users,linux-phy,linux-rdma,linux-trace-kernel,linux-watchdog,mptcp,netdev,rust-for-linux,kvmarm,linux-arm-kernel,linux-block,linux-scsi,linux-crypto,linux-riscv,intel-gfx,intel-xe"
+          value: "bpf,cgroups,dmaengine,driver-core,dwarves,kvm,linux-bluetooth,linux-cifs,linux-ext4,linux-hwmon,linux-kernel,linux-mm,linux-pci,linux-perf-users,linux-phy,linux-rdma,linux-trace-kernel,linux-watchdog,mptcp,netdev,rust-for-linux,kvmarm,linux-arm-kernel,linux-block,linux-scsi,linux-crypto,linux-riscv,intel-gfx,intel-xe,linux-kselftest"
         - name: SASHIKO__REVIEW__CONCURRENCY
           value: "36"
         - name: LLM_API_KEY
