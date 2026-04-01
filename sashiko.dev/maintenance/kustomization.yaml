@@ -8,7 +8,5 @@ components:
   - ../production
 
 patches:
-  - target:
-      kind: Ingress
-      name: sashiko-ingress
-    path: ../base/routing/maintenance-on.yaml
+  - path: maintenance-on.yaml
+  - path: maintenance-on-ipv6.yaml

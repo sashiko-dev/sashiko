@@ -1,0 +1,11 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sashiko-ingress-ipv6
+  namespace: sashiko
+spec:
+  defaultBackend:
+    service:
+      name: sashiko-maintenance-service
+      port:
+        number: 80
