@@ -242,7 +242,7 @@ URL to access it from localhost.
 We welcome contributions and feedback through two main channels:
 
 *   **GitHub:** Feel free to use GitHub issues for bug reports and feature requests, and submit Pull Requests for code changes.
-*   **Mailing List:** Join us at `sashiko@lore.kernel.org` for Sashiko-related announcements and broader AI-review discussions, including general feedback, architectural ideas, and specific prompt discussions.
+*   **Mailing List:** Join us at `sashiko@lists.linux.dev` (archived at [lore.kernel.org](https://lore.kernel.org/sashiko)) for Sashiko-related announcements and broader AI-review discussions, including general feedback, architectural ideas, and specific prompt discussions.
 
 ## Contributing
 
