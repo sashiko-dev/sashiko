@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
 use sashiko::settings::Settings;
-use serde_json::Value;
+use serde_json::{Value, from_str};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
@@ -503,6 +503,24 @@ async fn handle_show(
                         let idx = patch["part_index"].as_i64().unwrap_or(0);
                         let status = patch["status"].as_str().unwrap_or("");
                         let apply_err = patch["apply_error"].as_str();
+                        let p_id = patch["id"].as_i64().unwrap_or(0);
+
+                        let mut patch_review_status = None;
+                        let mut has_issues = false;
+                        if let Some(reviews) = details.get("reviews").and_then(|r| r.as_array()) {
+                            for r in reviews {
+                                if r.get("patch_id").and_then(|id| id.as_i64()) == Some(p_id) {
+                                    patch_review_status = r.get("status").and_then(|s| s.as_str());
+                                    if let Some(inline) =
+                                        r.get("inline_review").and_then(|s| s.as_str())
+                                        && inline != "No issues found."
+                                        && !inline.is_empty()
+                                    {
+                                        has_issues = true;
+                                    }
+                                }
+                            }
+                        }
 
                         print!("  [{}] {}", idx, patch["subject"].as_str().unwrap_or(""));
                         if !status.is_empty() && status != "Pending" {
@@ -514,6 +532,24 @@ async fn handle_show(
                             };
                             print_colored(color, status);
                             print!(")");
+                        }
+
+                        if let Some(rev_status) = patch_review_status {
+                            print!(" [");
+                            let color = if has_issues {
+                                Color::Yellow
+                            } else if rev_status == "Failed" {
+                                Color::Red
+                            } else {
+                                Color::Green
+                            };
+                            let label = if has_issues {
+                                "Issues Found"
+                            } else {
+                                rev_status
+                            };
+                            print_colored(color, label);
+                            print!("]");
                         }
                         println!();
 
@@ -541,12 +577,69 @@ async fn handle_show(
                         println!("  Model:   {}", model);
                     }
 
-                    if let Some(summary) = review.get("summary").and_then(|s| s.as_str()) {
-                        println!("\n{}", summary);
+                    if let Some(summary) = review.get("summary").and_then(|s| s.as_str())
+                        && summary != "No summary available."
+                        && !summary.is_empty()
+                    {
+                        println!("\n{}", summary.trim());
                     }
 
-                    if let Some(logs) = review.get("logs").and_then(|l| l.as_str()) {
-                        println!("\nLogs:\n{}", logs);
+                    if let Some(patches) = details.get("patches").and_then(|p| p.as_array()) {
+                        println!();
+                        for patch in patches {
+                            let idx = patch["part_index"].as_i64().unwrap_or(0);
+                            let subject = patch["subject"].as_str().unwrap_or("");
+                            let p_id = patch["id"].as_i64().unwrap_or(0);
+
+                            let mut patch_review = None;
+                            if let Some(reviews) = details.get("reviews").and_then(|r| r.as_array())
+                            {
+                                for r in reviews {
+                                    if r.get("patch_id").and_then(|id| id.as_i64()) == Some(p_id) {
+                                        patch_review = Some(r);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(r) = patch_review {
+                                let mut counts = std::collections::HashMap::new();
+                                if let Some(output_str) = r.get("output").and_then(|o| o.as_str())
+                                    && let Ok(output_json) = from_str::<Value>(output_str)
+                                    && let Some(findings) =
+                                        output_json.get("findings").and_then(|f| f.as_array())
+                                {
+                                    for f in findings {
+                                        if let Some(sev) =
+                                            f.get("severity").and_then(|s| s.as_str())
+                                        {
+                                            *counts.entry(sev.to_lowercase()).or_insert(0) += 1;
+                                        }
+                                    }
+                                }
+
+                                let c = counts.get("critical").copied().unwrap_or(0);
+                                let h = counts.get("high").copied().unwrap_or(0);
+                                let m = counts.get("medium").copied().unwrap_or(0);
+                                let l = counts.get("low").copied().unwrap_or(0);
+                                let has_findings = c > 0 || h > 0 || m > 0 || l > 0;
+                                if has_findings {
+                                    println!("Patch {}: {}", idx, subject);
+                                    println!(
+                                        "Critical: {} · High: {} · Medium: {} · Low: {}\n",
+                                        c, h, m, l
+                                    );
+                                    if let Some(inline) =
+                                        r.get("inline_review").and_then(|s| s.as_str())
+                                        && !inline.is_empty()
+                                        && inline != "No issues found."
+                                    {
+                                        println!("{}", inline.trim());
+                                    }
+                                    println!();
+                                }
+                            }
+                        }
                     }
                 } else if let Some(logs) = details.get("baseline_logs").and_then(|l| l.as_str()) {
                     // Fallback to baseline logs if review is missing (e.g. Failed To Apply during baseline prep)
