@@ -116,12 +116,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load settings, falling back to defaults if file missing/invalid
-    let settings = Settings::new()
-        .unwrap_or_else(|_| Settings::new().expect("Failed to load default settings"));
-
-    let base_url = cli
-        .server
-        .unwrap_or_else(|| format!("http://{}:{}", settings.server.host, settings.server.port));
+    let base_url = cli.server.unwrap_or_else(|| {
+        Settings::new()
+            .map(|s| format!("http://{}:{}", s.server.host, s.server.port))
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+    });
 
     let client = Client::new();
 
