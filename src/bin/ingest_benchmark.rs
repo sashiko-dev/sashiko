@@ -29,6 +29,10 @@ struct Args {
     /// Override the default port (reads from settings by default)
     #[arg(short, long)]
     port: Option<u16>,
+
+    /// Override the default repo URL (default: kernel.org linux.git)
+    #[arg(short, long)]
+    repo: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -56,7 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entries: Vec<BenchmarkEntry> = serde_json::from_reader(reader)?;
 
     let client = Client::new();
-    let repo_url = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git";
+    let repo_url = args.repo.as_deref()
+        .unwrap_or("https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git");
 
     println!("Found {} entries to process", entries.len());
 

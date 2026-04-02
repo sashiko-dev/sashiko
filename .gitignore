@@ -8,6 +8,7 @@ target/
 Cargo.lock
 archives/
 third_party/linux/
+benchmarks/smoke-repo/
 review_trees/
 sashiko.log
 Settings.toml

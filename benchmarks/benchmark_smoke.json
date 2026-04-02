@@ -1,0 +1,20 @@
+[
+  {
+    "Commit": "a3f3d6c7843f3021b648623d13bc4fbca0084838",
+    "Fixed-by": "b2890c8a61e34d5a9e7e290c14d5b4a0dd10aab1",
+    "subsystem": "cJSON",
+    "problem_description": "NULL pointer dereference in cJSON_SetNumberHelper when called with NULL object parameter."
+  },
+  {
+    "Commit": "a29814f285cc531c00223743ad3c55cd38c0dc56",
+    "Fixed-by": "5cc0e3988b2de0e1d81cba06b35f7fb85cb7bc0e",
+    "subsystem": "cJSON",
+    "problem_description": "Stack overflow in cJSON_Print due to missing depth check in print_array and print_object for deeply nested structures."
+  },
+  {
+    "Commit": "826cd6f842ae7e46ee38bbc097f9a34f2947388d",
+    "Fixed-by": "3ef4e4e6a18bcab10e3556b98e95b25f6c549e3e",
+    "subsystem": "cJSON",
+    "problem_description": "Heap buffer overflow in parse_object when input ends with a comma but no subsequent key-value pair."
+  }
+]
