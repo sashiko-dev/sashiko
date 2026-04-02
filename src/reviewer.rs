@@ -1307,6 +1307,15 @@ async fn run_review_tool(
     cmd.env("NO_COLOR", "1");
     cmd.env("SASHIKO_LOG_PLAIN", "1");
 
+    // Forward SASHIKO_* env vars to the child so that env-var overrides
+    // (e.g. SASHIKO_AI__MODEL, SASHIKO_GIT__REPOSITORY_PATH) are visible
+    // to the review binary's config loading.
+    for (key, value) in std::env::vars() {
+        if key.starts_with("SASHIKO_") {
+            cmd.env(&key, &value);
+        }
+    }
+
     if let Some(idx) = review_index {
         cmd.arg("--review-patch-index").arg(idx.to_string());
     }
