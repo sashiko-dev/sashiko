@@ -125,7 +125,8 @@ impl AiProvider for ClaudeCliProvider {
 
 /// Build the full text prompt from the AiRequest.
 /// Embeds system prompt, conversation history, tool definitions, and instructions.
-fn build_prompt(request: &AiRequest) -> String {
+/// Public so other CLI providers (codex-cli, gemini-cli) can reuse the same prompt format.
+pub fn build_prompt(request: &AiRequest) -> String {
     let mut out = String::new();
 
     // System prompt
@@ -214,7 +215,7 @@ fn parse_usage(outer: &Value) -> Option<AiUsage> {
     })
 }
 
-fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResponse> {
+pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResponse> {
     // Try extracting JSON (might be in a markdown code block)
     let json_str = extract_json(text);
 
