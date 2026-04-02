@@ -14,6 +14,14 @@
 
 //! AI provider that shells out to the `claude` CLI instead of calling the API directly.
 //! This uses the local Claude Code installation (subscription auth) rather than API credits.
+//!
+//! ## Safety
+//!
+//! The `claude --print` flag runs in text-completion mode: no tools, no file
+//! access, no session persistence, no network calls. The CLI reads a prompt
+//! from stdin and writes a response to stdout — it cannot modify the
+//! filesystem or execute commands. This makes it inherently safe for use as
+//! a completion backend without any additional sandboxing.
 
 use anyhow::Result;
 use async_trait::async_trait;
