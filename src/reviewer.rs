@@ -1340,7 +1340,7 @@ async fn run_review_tool(
         &settings.review.worktree_dir,
         "--ai-provider",
         match settings.ai.provider.as_str() {
-            "claude" | "stdio-claude" | "claude-cli" => "stdio-claude",
+            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" => "stdio-claude",
             _ => "stdio-gemini",
         },
     ]);
