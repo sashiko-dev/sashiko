@@ -1298,7 +1298,10 @@ async fn run_review_tool(
         "--worktree-dir",
         &settings.review.worktree_dir,
         "--ai-provider",
-        "stdio-gemini",
+        match settings.ai.provider.as_str() {
+            "claude" | "stdio-claude" | "claude-cli" => "stdio-claude",
+            _ => "stdio-gemini",
+        },
     ]);
 
     cmd.env("NO_COLOR", "1");
