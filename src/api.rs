@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Central API surface for the Sashiko project.
+//!
+//! This module implements the REST API and static file serving using `axum`.
+//! It acts as the primary interface for users to submit patches for review,
+//! track ingestion progress, and view AI-generated findings.
+//!
+//! # Concurrency & Performance
+//! To maintain high responsiveness under load, the API employs a multi-layered
+//! caching strategy (`AsyncCache` and `AsyncMapCache`) for expensive database
+//! aggregations. It uses an event-driven architecture via `tokio::sync::mpsc`
+//! to decouple request handling from long-running background tasks like
+//! git operations and AI reviews.
+
 use crate::db::Database;
 use crate::events::Event;
 use crate::fetcher::FetchRequest;
@@ -33,17 +46,24 @@ use tracing::{error, info};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+/// Internal container for cached data with a TTL tracker.
 struct CachedValue<T> {
     value: T,
     timestamp: Instant,
 }
 
+/// A thread-safe, asynchronous cache for single values with Time-To-Live (TTL).
+///
+/// This cache is designed to prevent "thundering herd" problems by using
+/// double-checked locking with an `RwLock`. It is primarily used for expensive
+/// homepage stats and counters that do not need millisecond-level freshness.
 struct AsyncCache<T> {
     inner: RwLock<Option<CachedValue<T>>>,
     ttl: Duration,
 }
 
 impl<T: Clone> AsyncCache<T> {
+    /// Creates a new cache instance with the specified expiration duration.
     fn new(ttl: Duration) -> Self {
         Self {
             inner: RwLock::new(None),
@@ -51,18 +71,27 @@ impl<T: Clone> AsyncCache<T> {
         }
     }
 
+    /// Retrieves the cached value or executes the provided future to refresh it.
+    ///
+    /// Uses double-checked locking to ensure that only one concurrent caller
+    /// triggers a refresh when the cache expires, while others wait for the
+    /// new value.
     async fn get_or_fetch<F, Fut, E>(&self, fetch: F) -> Result<T, E>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
+        // First check with a read lock for maximum concurrency
         if let Some(cached) = self.inner.read().await.as_ref()
             && cached.timestamp.elapsed() < self.ttl
         {
             return Ok(cached.value.clone());
         }
 
+        // Potential miss or expiration: acquire write lock
         let mut write_guard = self.inner.write().await;
+
+        // Double-check: another thread might have updated while we were waiting for the write lock
         if let Some(cached) = write_guard.as_ref()
             && cached.timestamp.elapsed() < self.ttl
         {
@@ -78,12 +107,17 @@ impl<T: Clone> AsyncCache<T> {
     }
 }
 
+/// A thread-safe, asynchronous map-based cache with per-key TTL.
+///
+/// Similar to `AsyncCache`, but manages multiple independent values indexed by keys.
+/// Used for stats that are partitioned by subsystems or mailing lists.
 struct AsyncMapCache<K, V> {
     inner: RwLock<std::collections::HashMap<K, CachedValue<V>>>,
     ttl: Duration,
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
+    /// Creates a new map cache with a global TTL applied to all entries.
     fn new(ttl: Duration) -> Self {
         Self {
             inner: RwLock::new(std::collections::HashMap::new()),
@@ -91,6 +125,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
         }
     }
 
+    /// Retrieves a value for a specific key, fetching it if missing or expired.
     async fn get_or_fetch<F, Fut, E>(&self, key: K, fetch: F) -> Result<V, E>
     where
         F: FnOnce() -> Fut,
@@ -111,7 +146,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
 
         let value = fetch().await?;
         write_guard.insert(
-            key,
+            key.clone(),
             CachedValue {
                 value: value.clone(),
                 timestamp: Instant::now(),
@@ -121,14 +156,36 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
     }
 }
 
+/// Shared state for the Axum API server.
+///
+/// This struct holds references to the database, event channels, and configuration
+/// flags. It is wrapped in an `Arc` to be shared across all request handlers.
 pub struct AppState {
+    /// Connection to the primary SQLite database.
     pub db: Arc<Database>,
+
+    /// Channel for sending high-level system events.
+    /// Used for ingestion requests, reruns, and status updates.
     pub sender: mpsc::Sender<Event>,
+
+    /// Specialized channel for remote git fetch requests.
+    /// Decoupled from `sender` to allow independent throttling and prioritization
+    /// of network-heavy git operations.
     pub fetch_sender: mpsc::Sender<FetchRequest>,
+
+    /// When true, mutation endpoints (submit, rerun) are disabled.
     pub read_only: bool,
+
+    /// When true, allows patch submission from any IP (default is localhost only).
     pub allow_all_submit: bool,
+
+    /// Indicates if SMTP is configured for sending review results via email.
     pub smtp_enabled: bool,
+
+    /// When true, review results are generated but not sent to mailing lists.
     pub dry_run: bool,
+
+    // Internal caches for expensive API responses
     stats_cache: AsyncCache<serde_json::Value>,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
@@ -194,21 +251,30 @@ pub struct InjectRequest {
     pub baseline: Option<String>,
 }
 
+/// Request payload for submitting content for review.
+///
+/// Supports multiple ingestion methods, from raw mbox files to remote git commits.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SubmitRequest {
+    /// Injects raw mbox content directly into the processing pipeline.
+    /// Used for manual submissions or local testing.
     Inject {
         raw: String,
         base_commit: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
     },
+    /// Triggers a remote git fetch for a single commit.
+    /// Recommended for quick reviews of existing branches.
     Remote {
         sha: String,
         repo: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
     },
+    /// Similar to `Remote`, but fetches a range of commits.
+    /// Useful for reviewing multi-patch series stored in a remote repository.
     #[serde(rename = "remote-range")]
     RemoteRange {
         sha: String,
@@ -216,9 +282,9 @@ pub enum SubmitRequest {
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
     },
-    Thread {
-        msgid: String,
-    },
+    /// Fetches an entire mailing list thread via lore.kernel.org.
+    /// The canonical way to review patches that have already been posted.
+    Thread { msgid: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -227,6 +293,10 @@ pub struct SubmitResponse {
     pub id: String,
 }
 
+/// Initializes and runs the Axum web server.
+///
+/// Sets up the API routes, static file serving, and shared application state.
+/// This function blocks until the server is shut down.
 pub async fn run_server(
     settings: ServerSettings,
     db: Arc<Database>,
@@ -300,6 +370,11 @@ fn generate_synthetic_id(prefix: &str) -> String {
     )
 }
 
+/// Handles submission of new content for review.
+///
+/// Enforces security policies (read-only mode and localhost restrictions) before
+/// dispatching the request to the appropriate processing channel. Returns a
+/// tracking ID that can be used to poll for status.
 async fn submit_patch(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -309,6 +384,7 @@ async fn submit_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // Default policy: only allow submissions from the local host unless explicitly opened.
     if !state.allow_all_submit && !addr.ip().is_loopback() {
         info!("Refused patch submission from non-localhost: {}", addr);
         return Err(StatusCode::FORBIDDEN);
@@ -506,6 +582,10 @@ async fn list_mailing_lists(
     Ok(Json(result))
 }
 
+/// Retrieves a paginated list of patchsets.
+///
+/// Employs a homepage cache for the first page of results to handle high traffic
+/// to the landing page efficiently.
 async fn list_patchsets(
     State(state): State<Arc<AppState>>,
     Query(pagination): Query<Pagination>,
@@ -514,6 +594,7 @@ async fn list_patchsets(
     let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
+    // Use cached response only for the default homepage view (no query, page 1)
     let items = if pagination.q.is_none()
         && pagination.mailing_list.is_none()
         && page == 1
@@ -700,6 +781,12 @@ async fn get_review(
     }
 }
 
+/// Retrieves a specific message by its database ID or `Message-ID`.
+///
+/// # Git Fallback
+/// If the message body is not stored in the database (to save space), this handler
+/// will automatically attempt to locate and read the original message from the
+/// git-based mailing list archives by searching through the latest 'epochs'.
 async fn get_message(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
@@ -714,12 +801,14 @@ async fn get_message(
 
     match result {
         Ok(Some(mut details)) => {
+            // Lazy-load message body from git archives if database record is empty.
             if (details.body.is_none() || details.body.as_deref() == Some(""))
                 && let (Some(hash), Some(group)) = (&details.git_blob_hash, &details.mailing_list)
             {
                 let repo_root = std::path::PathBuf::from("archives").join(group);
 
-                // 1. Find all potential repo paths (root + epochs)
+                // 1. Find all potential repo paths (root + epochs).
+                // Lore archives often partition messages into numbered directories (epochs).
                 let mut candidate_paths = Vec::new();
 
                 // Check epochs first (most likely for recent messages)
