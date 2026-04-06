@@ -8,5 +8,4 @@ components:
   - ../production
 
 patches:
-  - path: maintenance-on.yaml
-  - path: maintenance-on-ipv6.yaml
+  - path: instant-maintenance.yaml

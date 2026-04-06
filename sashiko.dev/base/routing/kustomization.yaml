@@ -3,4 +3,5 @@ kind: Kustomization
 
 resources:
   - sashiko-ingress.yaml
+  - sashiko-service.yaml
   - maintenance-setup.yaml

@@ -51,6 +51,15 @@ data:
         </div>
     </body>
     </html>
+  default.conf: |
+    server {
+        listen 8080;
+        server_name localhost;
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -71,12 +80,18 @@ spec:
       - name: nginx
         image: nginx:alpine
         ports:
-        - containerPort: 80
+        - containerPort: 8080
         volumeMounts:
         - name: html
           mountPath: /usr/share/nginx/html
+        - name: config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: default.conf
       volumes:
       - name: html
+        configMap:
+          name: sashiko-maintenance-html
+      - name: config
         configMap:
           name: sashiko-maintenance-html
 ---
@@ -92,4 +107,4 @@ spec:
   ports:
   - protocol: TCP
     port: 80
-    targetPort: 80
+    targetPort: 8080
