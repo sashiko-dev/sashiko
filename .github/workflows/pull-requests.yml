@@ -1,0 +1,35 @@
+name: Pull Request Workflow
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-sob:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check Developer Certificate of Origin (S-O-B)
+        run: |
+          TARGET_BRANCH=${GITHUB_BASE_REF:-main}
+          for commit in $(git rev-list \
+          origin/$TARGET_BRANCH..HEAD --no-merges); do
+            AUTHOR_NAME=$(git log -1 --format='%an' $commit)
+            AUTHOR_EMAIL=$(git log -1 --format='%ae' $commit)
+            EXPECTED_SOB="Signed-off-by: $AUTHOR_NAME <$AUTHOR_EMAIL>"
+            if ! git log -1 --format='%b' $commit | \
+            grep -q "^$EXPECTED_SOB"; then
+              echo "ERROR: DCO mismatch in commit $commit"
+              echo "Expected: $EXPECTED_SOB"
+              exit 1
+            fi
+          done
+          echo "All commits have valid matching sign-offs!"
+  lint:
+    needs: check-sob
+    uses: ./.github/workflows/linting.yml
+  run-tests:
+    needs: [check-sob, lint]
+    uses: ./.github/workflows/test-prs.yml

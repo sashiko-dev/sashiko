@@ -1,0 +1,31 @@
+name: Linting Workflow
+# Lint Rust source code, yaml, and toml files
+on:
+  workflow_call
+
+jobs:
+  yamllint:
+    name: Yaml File Linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Python Toolchain
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14.3'
+      - name: Run yamllint
+        run: |
+          pip install yamllint
+          yamllint .
+
+  clippy_check:
+    name: Rust Code Formatting and Linting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo-clippy && cargo-fmt
+        run: |
+          cargo clippy --all-targets --all-features --  -D warnings
+          cargo fmt --all --quiet -- --check

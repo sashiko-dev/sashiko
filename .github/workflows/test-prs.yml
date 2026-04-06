@@ -1,0 +1,16 @@
+name: Testing Workflow
+# Test Rust Source Code
+on:
+  workflow_call
+
+jobs:
+  cargo_test:
+    name: Rust Code Unit Testing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo-test
+        run: |
+          cargo test
