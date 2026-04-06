@@ -42,6 +42,7 @@ COPY --from=builder /usr/src/sashiko/target/release/review /usr/local/bin/review
 
 # Copy default settings and assets
 COPY Settings.toml /app/Settings.toml
+COPY sashiko.dev/email_policy.toml /app/email_policy.toml
 COPY third_party/prompts /app/third_party/prompts
 COPY static /app/static
 
