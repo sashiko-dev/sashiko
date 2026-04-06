@@ -43,12 +43,15 @@ setup_kernel() {
     else
         echo "Linux kernel tree already initialized. Updating and maintaining..."
         cd "$KERNEL_DIR"
-        # Prune unreachable objects and run gc to keep the repo healthy
-        echo "Pruning and garbage collecting..."
-        git prune
         # Ensure remote origin is set correctly and not pointing to a temporary bundle
         git remote set-url origin https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git 2>/dev/null || \
         git remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+        # Prune unreachable objects and run gc to keep the repo healthy
+        echo "Pruning and garbage collecting..."
+        git remote prune origin || true
+        git reflog expire --all --expire=now
+        git gc --auto
+        git prune
         # Ensure we are on master and it's clean
         git pull origin master || echo "Warning: Failed to update kernel tree, continuing with existing version."
     fi
@@ -84,7 +87,8 @@ if [ -n "$PORT" ]; then
 fi
 
 # Start background tasks
-setup_kernel
+setup_kernel &
+sleep 1
 delayed_test_query &
 mkdir -p /data/db/
 
