@@ -4,7 +4,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct EmailWorker {
     db: std::sync::Arc<crate::db::Database>,
@@ -75,17 +75,26 @@ impl EmailWorker {
             .subject(&email_row.subject);
 
         if let Some(reply_to) = &self.settings.reply_to {
-            builder = builder.reply_to(reply_to.parse()?);
+            match reply_to.parse() {
+                Ok(addr) => builder = builder.reply_to(addr),
+                Err(e) => warn!("Failed to parse reply_to address '{}': {}", reply_to, e),
+            }
         }
 
         let to_addresses: Vec<String> = serde_json::from_str(&email_row.to_addresses)?;
         for to in to_addresses {
-            builder = builder.to(to.parse()?);
+            match to.parse() {
+                Ok(addr) => builder = builder.to(addr),
+                Err(e) => warn!("Failed to parse 'to' address '{}': {}", to, e),
+            }
         }
 
         let cc_addresses: Vec<String> = serde_json::from_str(&email_row.cc_addresses)?;
         for cc in cc_addresses {
-            builder = builder.cc(cc.parse()?);
+            match cc.parse() {
+                Ok(addr) => builder = builder.cc(addr),
+                Err(e) => warn!("Failed to parse 'cc' address '{}': {}", cc, e),
+            }
         }
 
         if !email_row.in_reply_to.is_empty() {

@@ -63,7 +63,7 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
             let name = a.name().unwrap_or_default().trim();
             let address = a.address().unwrap_or("unknown@localhost").trim();
             let n = if name.is_empty() { "Unknown" } else { name };
-            let addr = if address.is_empty() {
+            let addr = if address.is_empty() || !address.contains('@') {
                 "unknown@localhost"
             } else {
                 address
@@ -78,7 +78,19 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         .to()
         .map(|addr| {
             addr.iter()
-                .map(|a| a.address().unwrap_or("").to_string())
+                .filter_map(|a| {
+                    let address = a.address().unwrap_or("").trim();
+                    if address.is_empty() || !address.contains('@') {
+                        None
+                    } else {
+                        let name = a.name().unwrap_or_default().trim();
+                        if name.is_empty() {
+                            Some(address.to_string())
+                        } else {
+                            Some(format!("\"{}\" <{}>", name.replace("\"", "\\\""), address))
+                        }
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         })
@@ -88,7 +100,19 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         .cc()
         .map(|addr| {
             addr.iter()
-                .map(|a| a.address().unwrap_or("").to_string())
+                .filter_map(|a| {
+                    let address = a.address().unwrap_or("").trim();
+                    if address.is_empty() || !address.contains('@') {
+                        None
+                    } else {
+                        let name = a.name().unwrap_or_default().trim();
+                        if name.is_empty() {
+                            Some(address.to_string())
+                        } else {
+                            Some(format!("\"{}\" <{}>", name.replace("\"", "\\\""), address))
+                        }
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         })
@@ -393,6 +417,19 @@ mod tests {
             b"Message-ID: <456>\r\nFrom: test2@example.com\r\nSubject: Test\r\n\r\nBody";
         let (meta2, _) = parse_email(raw_no_name).unwrap();
         assert_eq!(meta2.author, "\"Unknown\" <test2@example.com>");
+
+        let raw_malformed =
+            b"Message-ID: <789>\r\nFrom: \"fqr\" <user.email>\r\nSubject: Test\r\n\r\nBody";
+        let (meta3, _) = parse_email(raw_malformed).unwrap();
+        assert_eq!(meta3.author, "\"fqr\" <unknown@localhost>");
+    }
+
+    #[test]
+    fn test_recipient_parsing() {
+        let raw = b"Message-ID: <1>\r\nFrom: a@b.com\r\nTo: \"Valid User\" <valid@example.com>, invalid_no_at, <another@test.com>\r\nCc: Bad <bad>, \"Good\" <good@example.com>\r\nSubject: Test\r\n\r\nBody";
+        let (meta, _) = parse_email(raw).unwrap();
+        assert_eq!(meta.to, "\"Valid User\" <valid@example.com>, another@test.com");
+        assert_eq!(meta.cc, "\"Good\" <good@example.com>");
     }
 
     #[test]
