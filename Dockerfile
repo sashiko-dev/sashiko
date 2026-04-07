@@ -36,6 +36,7 @@ WORKDIR /app
 # Copy binaries from builder
 COPY --from=builder /usr/src/sashiko/target/release/sashiko /usr/local/bin/sashiko
 COPY --from=builder /usr/src/sashiko/target/release/review /usr/local/bin/review
+COPY --from=builder /usr/src/sashiko/target/release/sashiko-cli /usr/local/bin/sashiko-cli
 
 ## Copy the pre-downloaded kernel bundle
 #COPY --from=builder /usr/src/sashiko/linux-kernel.bundle /opt/linux-kernel.bundle
