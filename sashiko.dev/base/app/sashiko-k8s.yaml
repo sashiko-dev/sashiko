@@ -85,6 +85,20 @@ spec:
                 linux-crypto,linux-riscv,intel-gfx,intel-xe,linux-kselftest
             - name: SASHIKO__REVIEW__CONCURRENCY
               value: "36"
+            - name: SASHIKO__SMTP__SENDER_ADDRESS
+              value: "sashiko-bot@kernel.org"
+            - name: SASHIKO__SMTP__SERVER
+              value: "mail.kernel.org"
+            - name: SASHIKO__SMTP__PORT
+              value: "465"
+            - name: SASHIKO__SMTP__USERNAME
+              value: "sashiko-bot@kernel.org"
+            - name: SASHIKO__SMTP__REPLY_TO
+              value: "sashiko@lists.linux.dev"
+            - name: SASHIKO__SMTP__DRY_RUN
+              value: "false"
+            - name: SASHIKO__REVIEW__EMAIL_POLICY_PATH
+              value: "/app/email_policy.toml"
             - name: LLM_API_KEY
               valueFrom:
                 secretKeyRef:
