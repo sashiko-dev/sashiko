@@ -97,21 +97,12 @@ To evaluate the AI's review performance against a set of known issues, follow th
     mv sashiko.db sashiko.db.bak
     ```
 
-2.  **Run benchmark ingestion:**
-    Ingest the benchmark patches using the `ingest_benchmark` tool and a benchmark JSON file (e.g., `benchmark_small.json`). This will download the patches and submit them for review.
+2.  **Run the benchmark tool:**
+    Use the unified `benchmark` tool with a benchmark JSON file (e.g., `benchmark_small.json`). This tool will automatically ingest the patches, wait for all AI review processes to complete in the background, and then dynamically evaluate the generated findings against ground-truth descriptions.
     ```bash
-    cargo run --bin ingest_benchmark -- --file benchmarks/benchmark_small.json
+    cargo run --bin benchmark -- --file benchmarks/benchmark_small.json
     ```
 
-3.  **Wait for reviews to finish:**
-    Wait for the ingestion and the subsequent AI review processes to fully complete in the background worker.
-
-4.  **Analyze the results:**
-    Once all reviews are finished, run the `benchmark_review` tool with the same benchmark file to dynamically evaluate the generated findings against ground-truth descriptions using the AI.
-    ```bash
-    cargo run --bin benchmark_review -- --file benchmarks/benchmark_small.json
-    ```
-
-    *   A summary of detection rates (Detected, Missed, Partially Detected) will be printed to the console upon completion.
+    *   A summary of detection rates (Detected, Missed, Partially Detected) along with performance metrics (Average Tokens In/Out, Average Turns, Average Time) and counts of total concerns and findings will be printed to the console upon completion.
     *   Detailed evaluation results are written to `benchmark_results.json` in the current working directory, which contains explanations from the AI judge for each finding.
 

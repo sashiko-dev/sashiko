@@ -237,6 +237,25 @@ development. To get the most out of it:
 Once the daemon is running, you can access the Web UI, the daemon will print the
 URL to access it from localhost.
 
+## Benchmarking
+
+To evaluate the AI's review performance against a set of known issues, follow this workflow:
+
+1.  **Prepare the environment:**
+    Move or drop the existing database to start with a clean state.
+    ```bash
+    mv sashiko.db sashiko.db.bak
+    ```
+
+2.  **Run the benchmark tool:**
+    Use the unified `benchmark` tool with a benchmark JSON file (e.g., `benchmark_small.json`). This tool will automatically ingest the patches, wait for all AI review processes to complete in the background, and then dynamically evaluate the generated findings against ground-truth descriptions.
+    ```bash
+    cargo run --bin benchmark -- --file benchmarks/benchmark_small.json
+    ```
+
+    *   A summary of detection rates (Detected, Missed, Partially Detected) along with performance metrics (Average Tokens In/Out, Average Turns, Average Time) and counts of total concerns and findings will be printed to the console upon completion.
+    *   Detailed evaluation results are written to `benchmark_results.json` in the current working directory, which contains explanations from the AI judge for each finding.
+
 ## Communication
 
 We welcome contributions and feedback through two main channels:
