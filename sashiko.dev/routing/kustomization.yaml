@@ -6,3 +6,13 @@ resources:
 
 components:
   - ../production
+
+patches:
+  - target:
+      kind: Service
+      name: sashiko-service
+    patch: |-
+      - op: add
+        path: /spec/selector
+        value:
+          app: sashiko

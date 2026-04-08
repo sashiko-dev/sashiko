@@ -8,4 +8,11 @@ components:
   - ../production
 
 patches:
-  - path: instant-maintenance.yaml
+  - target:
+      kind: Service
+      name: sashiko-service
+    patch: |-
+      - op: add
+        path: /spec/selector
+        value:
+          app: sashiko-maintenance
