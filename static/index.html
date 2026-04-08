@@ -1073,6 +1073,15 @@
             return { name: authorStr, email: '' };
         }
 
+        function formatAuthorList(str) {
+            if (!str) return '-';
+            const parts = str.split(',');
+            return parts.map(p => {
+                const a = parseAuthor(p.trim());
+                return a.name ? `${a.name} <${a.email}>` : a.email;
+            }).join(', ');
+        }
+
         document.addEventListener('keydown', e => {
             if (e.key === 'Escape') closeAbout();
         });
@@ -2187,8 +2196,8 @@
                         const a = parseAuthor(data.author);
                         return escapeHtml(a.name ? `${a.name} <${a.email}>` : a.email);
                     })()}</div>
-                    <div><span class="label">To:</span> ${escapeHtml(data.to) || '-'}</div>
-                    <div><span class="label">Cc:</span> ${escapeHtml(data.cc) || '-'}</div>
+                    <div><span class="label">To:</span> ${escapeHtml(formatAuthorList(data.to))}</div>
+                    <div><span class="label">Cc:</span> ${escapeHtml(formatAuthorList(data.cc))}</div>
                     <div><span class="label">Date:</span> ${date}</div>
                     <div><span class="label">ID:</span> ${escapeHtml(data.message_id)} <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(data.message_id)}')">Copy</button></div>
                 </div>
