@@ -822,7 +822,8 @@ Example:
             let final_output = serde_json::json!({
                 "findings": [],
                 "review_inline": "No issues found.",
-                "fixes": ""
+                "fixes": "",
+                "concerns_count": 0
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -929,7 +930,8 @@ Example:
             let final_output = serde_json::json!({
                 "findings": findings_json,
                 "review_inline": "No issues found.",
-                "fixes": ""
+                "fixes": "",
+                "concerns_count": all_concerns.len()
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1076,7 +1078,8 @@ Example:
         let final_output = json!({
             "findings": findings_json,
             "review_inline": review_inline_text,
-            "fixes": fixes_text
+            "fixes": fixes_text,
+            "concerns_count": all_concerns.len()
         });
 
         Ok(WorkerResult {

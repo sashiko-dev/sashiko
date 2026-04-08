@@ -75,6 +75,7 @@ struct BenchmarkResult {
     status: String, // "DETECTED", "PARTIALLY_DETECTED", "MISSED", "UNKNOWN", "NOT_REVIEWED", "SKIPPED", "NOT_FOUND_IN_DB"
     explanation: String,
     findings_count: usize,
+    concerns_count: usize,
     tokens_in: u32,
     tokens_out: u32,
     turns: u32,
@@ -248,6 +249,8 @@ async fn main() -> Result<()> {
     let mut total_turns: u64 = 0;
     let mut total_duration: u64 = 0;
     let mut valid_metric_count: u64 = 0;
+    let mut total_findings: u64 = 0;
+    let mut total_concerns: u64 = 0;
 
     for res in &results {
         match res.status.as_str() {
@@ -264,6 +267,8 @@ async fn main() -> Result<()> {
             total_tokens_out += res.tokens_out as u64;
             total_turns += res.turns as u64;
             total_duration += res.duration_secs;
+            total_findings += res.findings_count as u64;
+            total_concerns += res.concerns_count as u64;
             valid_metric_count += 1;
         }
     }
@@ -279,6 +284,8 @@ async fn main() -> Result<()> {
     info!("Missed: {}", missed_count);
     info!("Not Reviewed/Found: {}", not_reviewed_count);
     info!("Skipped (No Description): {}", skipped_count);
+    info!("Total Concerns (Before Stage 8): {}", total_concerns);
+    info!("Total Findings (Final Report): {}", total_findings);
 
     if valid_metric_count > 0 {
         info!("--- Performance Metrics (averages per reviewed patch) ---");
@@ -309,6 +316,7 @@ async fn process_entry(
             status: "SKIPPED".to_string(),
             explanation: "No problem description provided".to_string(),
             findings_count: 0,
+            concerns_count: 0,
             tokens_in: 0,
             tokens_out: 0,
             turns: 0,
@@ -349,6 +357,7 @@ async fn process_entry(
             status: "NOT_FOUND_IN_DB".to_string(),
             explanation: "Patch not found in database.".to_string(),
             findings_count: 0,
+            concerns_count: 0,
             tokens_in: 0,
             tokens_out: 0,
             turns: 0,
@@ -391,6 +400,7 @@ async fn process_entry(
             status: "NOT_REVIEWED".to_string(),
             explanation: "Patch found but no review exists.".to_string(),
             findings_count: 0,
+            concerns_count: 0,
             tokens_in: 0,
             tokens_out: 0,
             turns: 0,
@@ -404,12 +414,13 @@ async fn process_entry(
     let mut tokens_out = 0;
     let mut duration_secs = 0;
     let mut turns = 1; // Minimum 1 turn for the initial prompt
+    let mut concerns_count = 0;
 
     if let Some(iid) = interaction_id {
         let int_rows = db
             .conn
             .query(
-                "SELECT tokens_in, tokens_out, created_at FROM ai_interactions WHERE id = ?",
+                "SELECT tokens_in, tokens_out, created_at, output_raw FROM ai_interactions WHERE id = ?",
                 libsql::params![iid],
             )
             .await;
@@ -420,6 +431,13 @@ async fn process_entry(
             tokens_in = row.get::<i64>(0).unwrap_or(0) as u32;
             tokens_out = row.get::<i64>(1).unwrap_or(0) as u32;
             let int_created_at = row.get::<i64>(2).unwrap_or(0);
+
+            if let Ok(Some(output_raw)) = row.get::<Option<String>>(3)
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output_raw)
+                && let Some(count) = parsed.get("concerns_count").and_then(|v| v.as_u64())
+            {
+                concerns_count = count as usize;
+            }
 
             if let Some(start_time) = review_created_at
                 && int_created_at >= start_time
@@ -585,6 +603,7 @@ async fn process_entry(
         status,
         explanation,
         findings_count,
+        concerns_count,
         tokens_in,
         tokens_out,
         turns,
