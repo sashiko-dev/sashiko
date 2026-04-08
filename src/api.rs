@@ -842,12 +842,16 @@ async fn get_stats(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let pending = crate::metrics::get_pending_patches();
     let reviewing = crate::metrics::get_reviewing_patches();
+    let messages = crate::metrics::get_messages();
+    let patchsets = crate::metrics::get_patchsets();
 
     Ok(Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "pending": pending,
-        "reviewing": reviewing
+        "reviewing": reviewing,
+        "messages": messages,
+        "patchsets": patchsets
     })))
 }
 

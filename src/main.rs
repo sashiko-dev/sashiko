@@ -555,6 +555,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(reviewing) = metrics_db.count_reviewing_patches().await {
                 sashiko::metrics::set_reviewing_patches(reviewing);
             }
+            if let Ok(messages) = metrics_db.count_messages(None, None).await {
+                sashiko::metrics::set_messages(messages);
+            }
+            if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
+                sashiko::metrics::set_patchsets(patchsets);
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
