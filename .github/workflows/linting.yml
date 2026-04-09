@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Run cargo-clippy && cargo-fmt
-        run: |
-          cargo clippy --all-targets --all-features --  -D warnings
-          cargo fmt --all --quiet -- --check
+      - name: Run cargo-clippy
+        run: cargo clippy --all-targets --all-features --  -D warnings
+      - name: Run cargo-fmt
+        run: cargo fmt --all -- --check
