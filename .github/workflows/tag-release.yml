@@ -1,0 +1,53 @@
+name: Tag Release Workflow
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  check-sob:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check Developer Certificate of Origin (S-O-B)
+        run: |
+          commit=${{ github.sha }}
+          AUTHOR_NAME=$(git log -1 --format='%an' $commit)
+          AUTHOR_EMAIL=$(git log -1 --format='%ae' $commit)
+          EXPECTED_SOB="Signed-off-by: $AUTHOR_NAME <$AUTHOR_EMAIL>"
+          if ! git log -1 --format='%b' $commit | grep -q "^$EXPECTED_SOB"; then
+            echo "ERROR: DCO mismatch in commit $commit"
+            echo "Expected: $EXPECTED_SOB"
+            exit 1
+          fi
+          echo "Tag commit has valid matching sign-off!"
+
+  lint:
+    needs: check-sob
+    uses: ./.github/workflows/linting.yml
+
+  run-tests:
+    needs: [check-sob, lint]
+    uses: ./.github/workflows/test-prs.yml
+
+  integration-tests:
+    needs: [check-sob, lint, run-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Setup Smoke Test Environment
+        run: |
+          chmod +x ./benchmarks/setup_smoke.sh
+          ./benchmarks/setup_smoke.sh
+      - name: Run Smoke Tests (Benchmark Mock Environment)
+        run: |
+          cargo run --release --bin benchmark -- \
+            --file ./benchmarks/benchmark_smoke.json
