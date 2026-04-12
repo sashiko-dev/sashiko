@@ -566,10 +566,11 @@ impl Database {
         baseline_id: Option<i64>,
         prompts_hash: Option<&str>,
     ) -> Result<i64> {
-        self.conn
-            .execute(
+        let mut rows = self
+            .conn
+            .query(
                 "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
-             VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?)",
+             VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?) RETURNING id",
                 libsql::params![
                     patchset_id,
                     patch_id,
@@ -584,10 +585,6 @@ impl Database {
             )
             .await?;
 
-        let mut rows = self
-            .conn
-            .query("SELECT last_insert_rowid()", libsql::params![])
-            .await?;
         if let Ok(Some(row)) = rows.next().await {
             Ok(row.get(0)?)
         } else {
@@ -1349,14 +1346,13 @@ impl Database {
         subject: &str,
         date: i64,
     ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO threads (root_message_id, subject, last_updated) VALUES (?, ?, ?)",
+        let mut rows = self.conn
+            .query(
+                "INSERT INTO threads (root_message_id, subject, last_updated) VALUES (?, ?, ?) RETURNING id",
                 libsql::params![root_message_id, subject, date],
             )
             .await?;
 
-        let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
         if let Ok(Some(row)) = rows.next().await {
             Ok(row.get(0)?)
         } else {
@@ -1516,17 +1512,13 @@ impl Database {
             return Ok(row.get(0)?);
         }
 
-        self.conn
-            .execute(
-                "INSERT INTO baselines (repo_url, branch, last_known_commit) VALUES (?, ?, ?)",
+        let mut rows = self.conn
+            .query(
+                "INSERT INTO baselines (repo_url, branch, last_known_commit) VALUES (?, ?, ?) RETURNING id",
                 libsql::params![repo_url, branch, commit],
             )
             .await?;
 
-        let mut rows = self
-            .conn
-            .query("SELECT last_insert_rowid()", libsql::params![])
-            .await?;
         if let Ok(Some(row)) = rows.next().await {
             Ok(row.get(0)?)
         } else {
@@ -1940,18 +1932,14 @@ impl Database {
         }
 
         // No match found, create new patchset
-        self.conn
-            .execute(
+        let mut rows = self.conn
+            .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, skip_filters, only_filters) 
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, skip_filters_json.clone(), only_filters_json.clone()],
             )
             .await?;
 
-        let mut rows = self
-            .conn
-            .query("SELECT last_insert_rowid()", libsql::params![])
-            .await?;
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             Ok(Some(id))
@@ -3019,18 +3007,14 @@ impl Database {
         let thread_id = self.ensure_thread_for_message(&root_msg_id, now).await?;
 
         // 3. Create the fetching patchset
-        self.conn
-            .execute(
+        let mut rows = self.conn
+            .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters) 
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?)",
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?) RETURNING id",
                 libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json],
             )
             .await?;
 
-        let mut rows = self
-            .conn
-            .query("SELECT last_insert_rowid()", libsql::params![])
-            .await?;
         if let Ok(Some(row)) = rows.next().await {
             Ok(row.get(0)?)
         } else {
