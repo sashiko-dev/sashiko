@@ -624,12 +624,12 @@ async fn process_parsed_article(
 
     let author_email = sashiko::patch::extract_email(&metadata.author);
 
-    if sashiko::email_router::EmailRouter::is_ignored_author(
-        policy,
-        &author_email,
-    ) {
+    if sashiko::email_router::EmailRouter::is_ignored_author(policy, &author_email) {
         if metadata.is_patch_or_cover {
-            info!("Ignoring patch/cover from {} according to email policy", author_email);
+            info!(
+                "Ignoring patch/cover from {} according to email policy",
+                author_email
+            );
         }
         metadata.is_patch_or_cover = false;
         patch_opt = None;

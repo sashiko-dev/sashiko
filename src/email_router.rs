@@ -161,10 +161,7 @@ impl EmailRouter {
         }
     }
 
-    pub fn is_ignored_author(
-        policy: &EmailPolicyConfig,
-        author_email: &str,
-    ) -> bool {
+    pub fn is_ignored_author(policy: &EmailPolicyConfig, author_email: &str) -> bool {
         let author_lower = author_email.to_lowercase();
 
         if policy
@@ -184,7 +181,7 @@ impl EmailRouter {
                 return true;
             }
         }
-        
+
         false
     }
 }
