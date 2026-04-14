@@ -19,26 +19,6 @@ jobs:
           AFTER="${{ github.event.after }}"
           ZERO="0000000000000000000000000000000000000000"
           if [ "$BEFORE" = "$ZERO" ] || [ -z "$BEFORE" ]; then
-            echo "New branch or invalid before sha, checking latest commit."
-            COMMIT_RANGE="$AFTER~1..$AFTER"
-          else
-            COMMIT_RANGE="$BEFORE..$AFTER"
-          fi
-
-          echo "Checking commits in range: $COMMIT_RANGE"
-          for commit in $(git rev-list $COMMIT_RANGE --no-merges); do
-            AUTHOR_NAME=$(git log -1 --format='%an' $commit)
-            AUTHOR_EMAIL=$(git log -1 --format='%ae' $commit)
-            EXPECTED_SOB="Signed-off-by: $AUTHOR_NAME <$AUTHOR_EMAIL>"
-            if ! git log -1 --format='%b' $commit | \
-              grep -q "^$EXPECTED_SOB"; then
-              echo "ERROR: DCO mismatch in commit $commit"
-              echo "Expected: $EXPECTED_SOB"
-              exit 1
-            fi
-          done
-
-          echo "All commits have valid matching sign-offs!"
             RANGE="$AFTER~1..$AFTER"
           else
             RANGE="$BEFORE..$AFTER"

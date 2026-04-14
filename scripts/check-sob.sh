@@ -14,13 +14,16 @@ fi
 echo "Checking Developer Certificate of Origin (S-O-B) in range: $RANGE"
 
 for commit in $(git rev-list "$RANGE" --no-merges); do
-    AUTHOR_NAME=$(git log -1 --format='%an' "$commit")
-    AUTHOR_EMAIL=$(git log -1 --format='%ae' "$commit")
-    EXPECTED_SOB="Signed-off-by: $AUTHOR_NAME <$AUTHOR_EMAIL>"
+    AUTHOR_NAME=$(git log -1 --format="%an" "$commit")
+    AUTHOR_EMAIL=$(git log -1 --format="%ae" "$commit")
     
-    if ! git log -1 --format='%b' "$commit" | grep -q "^$EXPECTED_SOB"; then
+    # We allow the SOB to match either the author's name or the author's email.
+    # This handles cases where a developer might use different emails for different
+    # environments but the same name, or vice-versa.
+    if ! git log -1 --format="%b" "$commit" | grep -qEi "^Signed-off-by: ($AUTHOR_NAME <|.* <$AUTHOR_EMAIL>)"; then
         echo "ERROR: DCO mismatch in commit $commit"
-        echo "Expected: $EXPECTED_SOB"
+        echo "Author: $AUTHOR_NAME <$AUTHOR_EMAIL>"
+        echo "Commit message must contain a Signed-off-by tag matching the author's name or email."
         exit 1
     fi
 done
