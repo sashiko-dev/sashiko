@@ -180,6 +180,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
 
+CREATE INDEX IF NOT EXISTS idx_messages_day ON messages(strftime('%Y-%m-%d', date, 'unixepoch'));
+CREATE INDEX IF NOT EXISTS idx_patchsets_day ON patchsets(strftime('%Y-%m-%d', date, 'unixepoch'));
+CREATE INDEX IF NOT EXISTS idx_messages_subsystems_sid ON messages_subsystems(subsystem_id);
+CREATE INDEX IF NOT EXISTS idx_patchsets_subsystems_sid ON patchsets_subsystems(subsystem_id);
+
 CREATE TABLE IF NOT EXISTS people (
     id INTEGER PRIMARY KEY,
     name TEXT,
