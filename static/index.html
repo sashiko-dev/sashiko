@@ -1604,7 +1604,7 @@
         async function renderPatchsetView(id, query = {}) {
             const page = parseInt(query.page) || 1;
             const limit = parseInt(query.limit) || 50;
-            const res = await fetch(`/api/patch?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
+            const res = await fetch(`/api/patchset?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
             const data = await res.json();
             
