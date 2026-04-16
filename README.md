@@ -62,6 +62,18 @@ Running an automated review system like Sashiko can be computationally expensive
 - **Rust**: Version 1.86 or later.
 - **Git**: For managing the repository and kernel tree.
 - **LLM Provider API Key**: Access to an LLM provider (e.g., Google's Gemini or Anthropic's Claude).
+- **System packages** (Debian/Ubuntu):
+    ```bash
+    sudo apt install pkg-config libssl-dev build-essential yamllint
+    ```
+    - `pkg-config`, `libssl-dev` — required by OpenSSL (used by reqwest and lettre for TLS)
+    - `build-essential` — C compiler needed by tree-sitter
+    - `yamllint` — required by `just lint`
+
+    On Fedora/RHEL:
+    ```bash
+    sudo dnf install pkg-config openssl-devel gcc yamllint
+    ```
 
 ## Setup
 
