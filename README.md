@@ -275,6 +275,25 @@ git commit -s
 
 ## Development
 
+This project uses [just](https://github.com/casey/just) as a task runner. Install it and run targets from the repo root:
+
+```bash
+# Install just (pick one)
+cargo install just          # via cargo
+sudo apt install just       # Debian/Ubuntu
+
+# See all available targets
+just
+
+# Common usage
+just lint                   # clippy + fmt + yamllint
+just test                   # cargo test --release
+just check-pr               # sob + lint + test (full PR suite)
+just check-all              # PR suite + integration tests
+just sob                    # check Signed-off-by tags
+just sob "HEAD~5..HEAD"     # check SOB for a custom range
+```
+
 This project was built using Gemini CLI. If you're using other development agents, make sure they follow the guidance in GEMINI.md.
 Please, make sure your code is working before sending PR. Make sure it can be built without warnings, all tests pass, run cargo fmt and clippy.
 If you're changing AI-related parts, please, run at least several code reviews.
