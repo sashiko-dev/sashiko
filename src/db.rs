@@ -748,30 +748,23 @@ impl Database {
     pub async fn migrate_tool_usages(&self) -> Result<()> {
         // 1. Check if we have logs to parse
         info!("Migration: Checking for tool usages to backfill...");
-        let mut rows = self.conn.query("SELECT id, logs, provider, model FROM reviews WHERE status IN ('Reviewed', 'Failed') AND logs IS NOT NULL", ()).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT r.id, r.logs, r.provider, r.model 
+             FROM reviews r 
+             LEFT JOIN tool_usages t ON r.id = t.review_id 
+             WHERE r.status IN ('Reviewed', 'Failed') AND r.logs IS NOT NULL AND t.id IS NULL
+             GROUP BY r.id",
+                (),
+            )
+            .await?;
 
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let logs: String = row.get(1)?;
             let provider: String = row.get(2).unwrap_or_else(|_| "unknown".to_string());
             let model: String = row.get(3).unwrap_or_else(|_| "unknown".to_string());
-
-            // Check if already populated
-            let count_rows = self
-                .conn
-                .query(
-                    "SELECT count(*) FROM tool_usages WHERE review_id = ?",
-                    libsql::params![review_id],
-                )
-                .await;
-            if let Ok(mut c_rows) = count_rows
-                && let Ok(Some(c_row)) = c_rows.next().await
-            {
-                let count: i64 = c_row.get(0)?;
-                if count > 0 {
-                    continue;
-                }
-            }
 
             // Parse logs (simple JSON array parsing)
             if let Ok(history) = serde_json::from_str::<Vec<serde_json::Value>>(&logs) {
@@ -836,33 +829,18 @@ impl Database {
     pub async fn migrate_findings(&self) -> Result<()> {
         info!("Migration: Checking for findings to backfill...");
         // Select reviews that have AI output but maybe no findings in the new table
-        let sql = "SELECT r.id, ai.output_raw 
-                   FROM reviews r 
+        let sql = "SELECT r.id, ai.output_raw
+                   FROM reviews r
                    JOIN ai_interactions ai ON r.interaction_id = ai.id
-                   WHERE r.status = 'Reviewed'";
+                   LEFT JOIN findings f ON r.id = f.review_id
+                   WHERE r.status = 'Reviewed' AND f.id IS NULL
+                   GROUP BY r.id";
 
         let mut rows = self.conn.query(sql, ()).await?;
 
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let output_raw: String = row.get(1)?;
-
-            // Check if we already have findings for this review
-            let count_check = self
-                .conn
-                .query(
-                    "SELECT count(*) FROM findings WHERE review_id = ?",
-                    libsql::params![review_id],
-                )
-                .await;
-            if let Ok(mut c_rows) = count_check
-                && let Ok(Some(c_row)) = c_rows.next().await
-            {
-                let count: i64 = c_row.get(0)?;
-                if count > 0 {
-                    continue;
-                }
-            }
 
             // Parse JSON and insert findings
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&output_raw)
