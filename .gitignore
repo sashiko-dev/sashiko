@@ -11,5 +11,5 @@ third_party/linux/
 benchmarks/smoke-repo/
 review_trees/
 sashiko.log
-Settings.toml
+Settings.local.toml
 email_policy.toml
