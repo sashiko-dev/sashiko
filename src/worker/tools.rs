@@ -13,10 +13,7 @@
 // limitations under the License.
 
 use crate::ai::truncator::Truncator;
-use crate::ai::{
-    AiTool,
-    gemini::{FunctionDeclaration, Tool},
-};
+use crate::ai::AiTool;
 use anyhow::{Result, anyhow, ensure};
 use grep::printer::StandardBuilder;
 use grep::regex::RegexMatcher;
@@ -45,22 +42,6 @@ impl ToolBox {
         &self.worktree_path
     }
 
-    /// Returns Gemini-specific tool declarations.
-    /// TODO: Deprecate after migration.
-    pub fn get_declarations(&self) -> Tool {
-        let decls = self.get_declarations_generic();
-        Tool {
-            function_declarations: decls
-                .into_iter()
-                .map(|t| FunctionDeclaration {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.parameters,
-                })
-                .collect(),
-        }
-    }
-
     /// Returns generic tool declarations.
     pub fn get_declarations_generic(&self) -> Vec<AiTool> {
         let mut decls = vec![
@@ -69,22 +50,22 @@ impl ToolBox {
                 description: "Read the content of one or more files. In 'smart' mode, it collapses irrelevant code around the focus lines."
                     .to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "files": {
-                            "type": "ARRAY",
+                            "type": "array",
                             "description": "List of files to read.",
                             "items": {
-                                "type": "OBJECT",
+                                "type": "object",
                                 "properties": {
-                                    "path": { "type": "STRING", "description": "Relative path to the file." },
-                                    "start_line": { "type": "INTEGER", "description": "1-based start line (optional). In smart mode, this is the start of the focus area." },
-                                    "end_line": { "type": "INTEGER", "description": "1-based end line (optional). In smart mode, this is the end of the focus area." }
+                                    "path": { "type": "string", "description": "Relative path to the file." },
+                                    "start_line": { "type": "integer", "description": "1-based start line (optional). In smart mode, this is the start of the focus area." },
+                                    "end_line": { "type": "integer", "description": "1-based end line (optional). In smart mode, this is the end of the focus area." }
                                 },
                                 "required": ["path"]
                             }
                         },
-                        "mode": { "type": "STRING", "enum": ["raw", "smart"], "description": "Read mode. Defaults to 'raw'." }
+                        "mode": { "type": "string", "enum": ["raw", "smart"], "description": "Read mode. Defaults to 'raw'." }
                     },
                     "required": ["files"]
                 }),
@@ -94,11 +75,11 @@ impl ToolBox {
                 description: "Show what revision and author last modified each line of a file."
                     .to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "path": { "type": "STRING", "description": "Relative path to the file." },
-                        "start_line": { "type": "INTEGER", "description": "1-based start line (optional)." },
-                        "end_line": { "type": "INTEGER", "description": "1-based end line (optional)." }
+                        "path": { "type": "string", "description": "Relative path to the file." },
+                        "start_line": { "type": "integer", "description": "1-based start line (optional)." },
+                        "end_line": { "type": "integer", "description": "1-based end line (optional)." }
                     },
                     "required": ["path"]
                 }),
@@ -108,9 +89,9 @@ impl ToolBox {
                 description: "Show changes between commits, commit and working tree, etc."
                     .to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "args": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "Arguments for git diff (e.g., ['HEAD^', 'HEAD'])." }
+                        "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for git diff (e.g., ['HEAD^', 'HEAD'])." }
                     },
                     "required": ["args"]
                 }),
@@ -120,12 +101,12 @@ impl ToolBox {
                 description: "Show various types of objects (blobs, trees, tags and commits). Supports line filtering for blobs and diff suppression for commits."
                     .to_string(),
                 parameters: json!({
-                        "type": "OBJECT",
+                        "type": "object",
                         "properties": {
-                            "object": { "type": "STRING", "description": "The object to show (e.g. 'HEAD:README.md' or 'HEAD')." },
-                            "suppress_diff": { "type": "BOOLEAN", "description": "If true, suppresses the diff output for commits (shows only metadata). Useful for checking commit details cheaply." },
-                            "start_line": { "type": "INTEGER", "description": "1-based start line (optional). Useful for reading specific parts of a file (blob)." },
-                            "end_line": { "type": "INTEGER", "description": "1-based end line (optional)." }
+                            "object": { "type": "string", "description": "The object to show (e.g. 'HEAD:README.md' or 'HEAD')." },
+                            "suppress_diff": { "type": "boolean", "description": "If true, suppresses the diff output for commits (shows only metadata). Useful for checking commit details cheaply." },
+                            "start_line": { "type": "integer", "description": "1-based start line (optional). Useful for reading specific parts of a file (blob)." },
+                            "end_line": { "type": "integer", "description": "1-based end line (optional)." }
                         },
                         "required": ["object"]
                 }),
@@ -134,9 +115,9 @@ impl ToolBox {
                 name: "git_log".to_string(),
                 description: "Show commit logs. IMPORTANT: When using expensive search flags like -S or -G, you MUST limit the search range using --since (e.g., '--since=1.year.ago') or specific commit ranges to avoid timeouts on large repositories.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "args": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "Arguments for git log (e.g., ['-n', '3', '--oneline']). Bounded to 100 commits by default unless overridden. For -S/-G searches, always include a time limit like '--since=1.year.ago'." }
+                        "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for git log (e.g., ['-n', '3', '--oneline']). Bounded to 100 commits by default unless overridden. For -S/-G searches, always include a time limit like '--since=1.year.ago'." }
                     },
                 }),
             },
@@ -144,7 +125,7 @@ impl ToolBox {
                 name: "git_status".to_string(),
                 description: "Show the working tree status.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {},
                 }),
             },
@@ -152,9 +133,9 @@ impl ToolBox {
                 name: "git_checkout".to_string(),
                 description: "Switch branches or restore working tree files.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "target": { "type": "STRING", "description": "The branch or commit to checkout." }
+                        "target": { "type": "string", "description": "The branch or commit to checkout." }
                     },
                     "required": ["target"]
                 }),
@@ -163,7 +144,7 @@ impl ToolBox {
                 name: "git_branch".to_string(),
                 description: "List both remote-tracking branches and local branches.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {},
                 }),
             },
@@ -171,7 +152,7 @@ impl ToolBox {
                 name: "git_tag".to_string(),
                 description: "List tags.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {},
                 }),
             },
@@ -179,9 +160,9 @@ impl ToolBox {
                 name: "list_dir".to_string(),
                 description: "List files in a directory.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "path": { "type": "STRING", "description": "Directory path." }
+                        "path": { "type": "string", "description": "Directory path." }
                     },
                     "required": ["path"]
                 }),
@@ -190,11 +171,11 @@ impl ToolBox {
                 name: "search_file_content".to_string(),
                 description: "Search for a pattern in files using grep. Returns matching lines with context.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "pattern": { "type": "STRING", "description": "Regex pattern to search for." },
-                        "path": { "type": "STRING", "description": "Directory to search in (defaults to root)." },
-                        "context_lines": { "type": "INTEGER", "description": "Number of context lines to show (default 0)." }
+                        "pattern": { "type": "string", "description": "Regex pattern to search for." },
+                        "path": { "type": "string", "description": "Directory to search in (defaults to root)." },
+                        "context_lines": { "type": "integer", "description": "Number of context lines to show (default 0)." }
                     },
                     "required": ["pattern"]
                 }),
@@ -203,10 +184,10 @@ impl ToolBox {
                 name: "find_files".to_string(),
                 description: "Find files matching a glob pattern (e.g., '*.rs', 'src/**/mod.rs').".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "pattern": { "type": "STRING", "description": "Glob pattern to match." },
-                        "path": { "type": "STRING", "description": "Directory to search in (defaults to root)." }
+                        "pattern": { "type": "string", "description": "Glob pattern to match." },
+                        "path": { "type": "string", "description": "Directory to search in (defaults to root)." }
                     },
                     "required": ["pattern"]
                 }),
@@ -215,9 +196,9 @@ impl ToolBox {
                 name: "TodoWrite".to_string(),
                 description: "Add a new TODO item to the TODO.md file.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "content": { "type": "STRING", "description": "The TODO item content." }
+                        "content": { "type": "string", "description": "The TODO item content." }
                     },
                     "required": ["content"]
                 }),
@@ -229,9 +210,9 @@ impl ToolBox {
                 name: "read_prompt".to_string(),
                 description: "Read a specific prompt file from the prompt registry (e.g., 'mm.md', 'locking.md').".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "name": { "type": "STRING", "description": "Name of the prompt file (e.g., 'patterns/BPF-001.md')." }
+                        "name": { "type": "string", "description": "Name of the prompt file (e.g., 'patterns/BPF-001.md')." }
                     },
                     "required": ["name"]
                 }),
