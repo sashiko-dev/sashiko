@@ -275,28 +275,6 @@ impl OpenAiCompatClient {
     }
 }
 
-fn normalize_schema(mut schema: Value) -> Value {
-    if let Some(obj) = schema.as_object_mut() {
-        if let Some(ty) = obj.get_mut("type")
-            && let Some(s) = ty.as_str()
-        {
-            *ty = Value::String(s.to_lowercase());
-        }
-        for (_, val) in obj.iter_mut() {
-            if val.is_object() || val.is_array() {
-                *val = normalize_schema(val.clone());
-            }
-        }
-    } else if let Some(arr) = schema.as_array_mut() {
-        for val in arr.iter_mut() {
-            if val.is_object() || val.is_array() {
-                *val = normalize_schema(val.clone());
-            }
-        }
-    }
-    schema
-}
-
 fn translate_ai_request(
     request: AiRequest,
     max_tokens: u32,
@@ -372,7 +350,7 @@ fn translate_ai_request(
                         function: OpenAiFunction {
                             name: tool.name,
                             description: tool.description,
-                            parameters: normalize_schema(tool.parameters),
+                            parameters: tool.parameters,
                         },
                     })
                     .collect(),
@@ -1057,51 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_schema_lowercases_types() {
-        let schema = json!({
-            "type": "OBJECT",
-            "properties": {
-                "files": {
-                    "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "path": { "type": "STRING" },
-                            "start_line": { "type": "INTEGER" }
-                        }
-                    }
-                },
-                "mode": { "type": "STRING", "enum": ["raw", "smart"] },
-                "flag": { "type": "BOOLEAN" }
-            }
-        });
-
-        let normalized = normalize_schema(schema);
-
-        assert_eq!(normalized["type"], "object");
-        assert_eq!(normalized["properties"]["files"]["type"], "array");
-        assert_eq!(normalized["properties"]["files"]["items"]["type"], "object");
-        assert_eq!(
-            normalized["properties"]["files"]["items"]["properties"]["path"]["type"],
-            "string"
-        );
-        assert_eq!(
-            normalized["properties"]["files"]["items"]["properties"]["start_line"]["type"],
-            "integer"
-        );
-        assert_eq!(normalized["properties"]["mode"]["type"], "string");
-        assert_eq!(normalized["properties"]["flag"]["type"], "boolean");
-    }
-
-    #[test]
-    fn test_normalize_schema_already_lowercase() {
-        let schema = json!({"type": "object", "properties": {"x": {"type": "string"}}});
-        let normalized = normalize_schema(schema.clone());
-        assert_eq!(normalized, schema);
-    }
-
-    #[test]
-    fn test_translate_request_normalizes_tool_schemas() -> Result<()> {
+    fn test_translate_request_preserves_tool_schemas() -> Result<()> {
         let request = AiRequest {
             system: None,
             messages: vec![],
@@ -1109,9 +1043,9 @@ mod tests {
                 name: "my_tool".to_string(),
                 description: "Does something.".to_string(),
                 parameters: json!({
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
-                        "mode": { "type": "STRING" }
+                        "mode": { "type": "string" }
                     }
                 }),
             }]),
