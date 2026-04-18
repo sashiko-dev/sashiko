@@ -54,7 +54,7 @@ async fn test_get_completed_reviews_for_release() {
     db.conn
         .execute(
             "INSERT INTO findings (review_id, severity, problem, severity_explanation)
-         VALUES (1, 'High', 'Problem 1', 'Explanation 1')",
+         VALUES (1, 3, 'Problem 1', 'Explanation 1')",
             (),
         )
         .await

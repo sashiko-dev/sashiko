@@ -1122,16 +1122,16 @@ impl Database {
     }
 
     pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
-        let sql = "SELECT 
-            r.provider, 
-            r.model, 
-            r.status, 
+        let sql = "SELECT
+            r.provider,
+            r.model,
+            r.status,
             count(*),
             sum(COALESCE(ai.tokens_in, 0)),
             sum(COALESCE(ai.tokens_out, 0)),
             sum(COALESCE(ai.tokens_cached, 0))
         FROM reviews r
-        LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
+        LEFT JOIN ai_interactions ai INDEXED BY idx_ai_interactions_tokens ON r.interaction_id = ai.id
         GROUP BY r.provider, r.model, r.status";
 
         let mut rows = self.conn.query(sql, ()).await?;
@@ -3161,7 +3161,8 @@ impl Database {
                     3 => "High",
                     2 => "Medium",
                     _ => "Low",
-                }.to_string();
+                }
+                .to_string();
                 let problem: String = f_row.get(1).unwrap_or_default();
                 let severity_explanation: Option<String> = f_row.get(2).ok();
 
