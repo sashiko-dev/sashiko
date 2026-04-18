@@ -3155,7 +3155,13 @@ impl Database {
 
             let mut findings = Vec::new();
             while let Ok(Some(f_row)) = findings_rows.next().await {
-                let severity: String = f_row.get(0).unwrap_or_default();
+                let severity_int: i64 = f_row.get(0).unwrap_or(1);
+                let severity = match severity_int {
+                    4 => "Critical",
+                    3 => "High",
+                    2 => "Medium",
+                    _ => "Low",
+                }.to_string();
                 let problem: String = f_row.get(1).unwrap_or_default();
                 let severity_explanation: Option<String> = f_row.get(2).ok();
 
