@@ -83,7 +83,7 @@ spec:
                 linux-rdma,linux-trace-kernel,linux-watchdog,mptcp,netdev,
                 rust-for-linux,kvmarm,linux-arm-kernel,linux-block,linux-scsi,
                 linux-crypto,linux-riscv,intel-gfx,intel-xe,linux-kselftest,
-                kexec,linux-iio,netfilter-devel
+                kexec,linux-iio,netfilter-devel,linux-omap
             - name: SASHIKO__REVIEW__CONCURRENCY
               value: "36"
             - name: SASHIKO__SMTP__SENDER_ADDRESS
