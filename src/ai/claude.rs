@@ -248,11 +248,38 @@ fn translate_ai_request(request: &AiRequest, enable_caching: bool) -> Result<Cla
     let mut system_blocks = Vec::new();
 
     // Extract system prompt from the explicit system field
+    let json_instruction_owned: Option<String> =
+        if let Some(crate::ai::AiResponseFormat::Json { schema }) = &request.response_format {
+            // Claude has no native JSON mode; enforce it via instruction.
+            if let Some(schema) = schema {
+                Some(format!(
+                    "\n\nYou MUST respond with valid JSON only matching this schema: {}. Do not include any explanation, markdown, or code fences — output raw JSON.",
+                    serde_json::to_string(schema).unwrap_or_default()
+                ))
+            } else {
+                Some("\n\nYou MUST respond with valid JSON only. Do not include any explanation, markdown, or code fences — output raw JSON.".to_string())
+            }
+        } else {
+            None
+        };
+    let json_instruction = json_instruction_owned.as_deref();
+
     if let Some(system_text) = &request.system {
+        let mut text = system_text.clone();
+        if let Some(instr) = json_instruction {
+            text.push_str(instr);
+        }
         system_blocks.push(SystemBlock {
             block_type: "text".to_string(),
-            text: system_text.clone(),
+            text,
             cache_control: None, // Will be set later if caching is enabled
+        });
+    } else if let Some(instr) = json_instruction {
+        // No system prompt but JSON format required — create a minimal system block.
+        system_blocks.push(SystemBlock {
+            block_type: "text".to_string(),
+            text: instr.trim_start_matches('\n').to_string(),
+            cache_control: None,
         });
     }
 

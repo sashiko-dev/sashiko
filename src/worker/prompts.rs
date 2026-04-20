@@ -472,11 +472,11 @@ impl Worker {
                         subsystem_md, target_commit_diff
                     );
                     let schema = json!({
-                        "type": "OBJECT",
+                        "type": "object",
                         "properties": {
                             "selected_prompts": {
-                                "type": "ARRAY",
-                                "items": { "type": "STRING" }
+                                "type": "array",
+                                "items": { "type": "string" }
                             }
                         },
                         "required": ["selected_prompts"]
@@ -619,11 +619,11 @@ impl Worker {
         let mut planning_selected_stages: Option<Vec<u8>> = None;
         if self.stages.is_none() {
             let schema = serde_json::json!({
-                "type": "OBJECT",
+                "type": "object",
                 "properties": {
                     "relevant_stages": {
-                        "type": "ARRAY",
-                        "items": { "type": "INTEGER" },
+                        "type": "array",
+                        "items": { "type": "integer" },
                         "description": "Array of stage numbers from 4, 5, 6, 7 that are relevant to this patch. Err on the side of inclusion if unsure."
                     }
                 },
@@ -636,7 +636,7 @@ impl Worker {
 - Stage 6: Security audit
 - Stage 7: Hardware engineer's review
 
-Return ONLY a JSON object containing an array of integers representing the relevant stages (e.g., [4, 5, 6, 7]).
+Return ONLY a JSON object with a "relevant_stages" key containing an array of integers (e.g., {"relevant_stages": [4, 5, 6, 7]}).
 CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer."#;
 
             let req = AiRequest {
