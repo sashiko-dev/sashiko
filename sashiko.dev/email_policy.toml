@@ -47,3 +47,7 @@ cc = ["tytso@mit.edu"]
 [subsystems.net]
 lists = ["netdev@vger.kernel.org"]
 embargo_hours = 24
+
+[subsystems.renesas-soc]
+lists = ["linux-renesas-soc@vger.kernel.org"]
+cc = ["wsa+renesas@sang-engineering.com"]
