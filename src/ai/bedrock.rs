@@ -87,10 +87,19 @@ pub struct BedrockClient {
     region: Option<String>,
     model_id: String,
     context_window_size: usize,
+    max_tokens: u32,
+    thinking: Option<String>,
+    effort: Option<String>,
 }
 
 impl BedrockClient {
-    pub fn new(model_id: String, region: Option<String>) -> Self {
+    pub fn new(
+        model_id: String,
+        region: Option<String>,
+        max_tokens: u32,
+        thinking: Option<String>,
+        effort: Option<String>,
+    ) -> Self {
         let context_window_size = if model_id.contains("claude") {
             200_000
         } else {
@@ -102,6 +111,9 @@ impl BedrockClient {
             region,
             model_id,
             context_window_size,
+            max_tokens,
+            thinking,
+            effort,
         }
     }
 
@@ -126,10 +138,38 @@ struct ConverseParams {
     system: Option<Vec<SystemContentBlock>>,
     tool_config: Option<ToolConfiguration>,
     inference_config: Option<InferenceConfiguration>,
+    additional_model_request_fields: Option<Document>,
+}
+
+fn build_additional_fields(thinking: Option<&str>, effort: Option<&str>) -> Option<Document> {
+    let mut map: HashMap<String, Document> = HashMap::new();
+
+    if let Some(t) = thinking {
+        let mut thinking_obj: HashMap<String, Document> = HashMap::new();
+        thinking_obj.insert("type".to_string(), Document::String(t.to_string()));
+        map.insert("thinking".to_string(), Document::Object(thinking_obj));
+    }
+
+    if let Some(e) = effort {
+        let mut output_cfg: HashMap<String, Document> = HashMap::new();
+        output_cfg.insert("effort".to_string(), Document::String(e.to_string()));
+        map.insert("output_config".to_string(), Document::Object(output_cfg));
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(Document::Object(map))
+    }
 }
 
 /// Translate Sashiko's generic AiRequest into Bedrock Converse API parameters.
-fn translate_request(request: &AiRequest) -> Result<ConverseParams> {
+fn translate_request(
+    request: &AiRequest,
+    max_tokens: u32,
+    thinking: Option<&str>,
+    effort: Option<&str>,
+) -> Result<ConverseParams> {
     let system = request
         .system
         .as_ref()
@@ -240,18 +280,23 @@ fn translate_request(request: &AiRequest) -> Result<ConverseParams> {
     });
 
     let inference_config = {
-        let mut builder = InferenceConfiguration::builder().max_tokens(4096);
-        if let Some(temp) = request.temperature {
-            builder = builder.temperature(temp);
+        let mut builder = InferenceConfiguration::builder().max_tokens(max_tokens as i32);
+        if thinking.is_none() {
+            if let Some(temp) = request.temperature {
+                builder = builder.temperature(temp);
+            }
         }
         Some(builder.build())
     };
+
+    let additional_model_request_fields = build_additional_fields(thinking, effort);
 
     Ok(ConverseParams {
         messages,
         system,
         tool_config,
         inference_config,
+        additional_model_request_fields,
     })
 }
 
@@ -332,7 +377,12 @@ fn estimate_tokens_generic(request: &AiRequest) -> usize {
 #[async_trait]
 impl AiProvider for BedrockClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let params = translate_request(&request)?;
+        let params = translate_request(
+            &request,
+            self.max_tokens,
+            self.thinking.as_deref(),
+            self.effort.as_deref(),
+        )?;
 
         let resp = self
             .get_client()
@@ -343,6 +393,7 @@ impl AiProvider for BedrockClient {
             .set_system(params.system)
             .set_tool_config(params.tool_config)
             .set_inference_config(params.inference_config)
+            .set_additional_model_request_fields(params.additional_model_request_fields)
             .send()
             .await;
 
@@ -427,7 +478,7 @@ mod tests {
         req.system = Some("You are helpful.".to_string());
         req.temperature = Some(0.5);
 
-        let params = translate_request(&req)?;
+        let params = translate_request(&req, 4096, None, None)?;
 
         let sys = params.system.unwrap();
         assert_eq!(sys.len(), 1);
@@ -466,7 +517,7 @@ mod tests {
             tool_call_id: None,
         }]);
 
-        let params = translate_request(&req)?;
+        let params = translate_request(&req, 4096, None, None)?;
         let content = params.messages[0].content();
         assert_eq!(content.len(), 2);
 
@@ -497,7 +548,7 @@ mod tests {
             tool_call_id: Some("call_1".to_string()),
         }]);
 
-        let params = translate_request(&req)?;
+        let params = translate_request(&req, 4096, None, None)?;
         assert_eq!(params.messages.len(), 1);
         assert_eq!(params.messages[0].role(), &ConversationRole::User);
 
@@ -528,7 +579,7 @@ mod tests {
             }),
         }]);
 
-        let params = translate_request(&req)?;
+        let params = translate_request(&req, 4096, None, None)?;
         let tools = params.tool_config.unwrap().tools().to_vec();
         assert_eq!(tools.len(), 1);
 
@@ -553,9 +604,60 @@ mod tests {
         }]);
         req.tools = Some(vec![]);
 
-        let params = translate_request(&req)?;
+        let params = translate_request(&req, 4096, None, None)?;
         assert!(params.tool_config.is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_additional_fields_none_when_unset() {
+        assert!(build_additional_fields(None, None).is_none());
+    }
+
+    #[test]
+    fn test_additional_fields_thinking_and_effort() {
+        let doc = build_additional_fields(Some("adaptive"), Some("xhigh")).unwrap();
+        let json = document_to_json(&doc);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "xhigh"}
+            })
+        );
+    }
+
+    #[test]
+    fn test_max_tokens_propagates_to_inference_config() -> Result<()> {
+        let req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+
+        let params = translate_request(&req, 8192, None, None)?;
+        assert_eq!(params.inference_config.unwrap().max_tokens(), Some(8192));
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_request_wires_additional_fields() -> Result<()> {
+        let req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+
+        let params = translate_request(&req, 8192, Some("adaptive"), Some("high"))?;
+        let extra = params.additional_model_request_fields.unwrap();
+        let json = document_to_json(&extra);
+        assert_eq!(json["thinking"]["type"], "adaptive");
+        assert_eq!(json["output_config"]["effort"], "high");
         Ok(())
     }
 }

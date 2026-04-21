@@ -193,8 +193,18 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient)),
         "bedrock" => {
             let model = settings.ai.model.clone();
-            let region = settings.ai.bedrock.as_ref().and_then(|b| b.region.clone());
-            Ok(Arc::new(bedrock::BedrockClient::new(model, region)))
+            let bedrock = settings.ai.bedrock.as_ref();
+            let region = bedrock.and_then(|b| b.region.clone());
+            let max_tokens = bedrock.map(|b| b.max_tokens).unwrap_or(8192);
+            let thinking = bedrock.and_then(|b| b.thinking.clone());
+            let effort = bedrock.and_then(|b| b.effort.clone());
+            Ok(Arc::new(bedrock::BedrockClient::new(
+                model,
+                region,
+                max_tokens,
+                thinking,
+                effort,
+            )))
         }
         "openai" | "openai-compatible" => {
             let provider_type = match settings.ai.provider.to_lowercase().as_str() {
