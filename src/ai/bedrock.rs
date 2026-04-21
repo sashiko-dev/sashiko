@@ -363,14 +363,19 @@ fn translate_response(
         }
     }
 
+    // Bedrock splits input into uncached + cache_read + cache_write; sum all
+    // three for the true total.  cache_write isn't in AiUsage because Gemini
+    // has no equivalent — the Bedrock log line still prints it for cost analysis.
     let usage = output.usage.as_ref().map(|u| {
-        let cached = u.cache_read_input_tokens().unwrap_or(0);
+        let cache_read = u.cache_read_input_tokens().unwrap_or(0);
+        let cache_write = u.cache_write_input_tokens().unwrap_or(0);
+        let total_input = u.input_tokens() + cache_read + cache_write;
         AiUsage {
-            prompt_tokens: u.input_tokens() as usize,
+            prompt_tokens: total_input as usize,
             completion_tokens: u.output_tokens() as usize,
-            total_tokens: (u.input_tokens() + u.output_tokens()) as usize,
-            cached_tokens: if cached > 0 {
-                Some(cached as usize)
+            total_tokens: (total_input + u.output_tokens()) as usize,
+            cached_tokens: if cache_read > 0 {
+                Some(cache_read as usize)
             } else {
                 None
             },
@@ -460,10 +465,11 @@ impl AiProvider for BedrockClient {
             .as_ref()
             .map(|u| {
                 format!(
-                    "in={}, out={}, cached={}",
+                    "in={}, out={}, cache_read={}, cache_write={}",
                     u.input_tokens(),
                     u.output_tokens(),
-                    u.cache_read_input_tokens().unwrap_or(0)
+                    u.cache_read_input_tokens().unwrap_or(0),
+                    u.cache_write_input_tokens().unwrap_or(0),
                 )
             })
             .unwrap_or_else(|| "unknown".to_string());
