@@ -1,9 +1,9 @@
 use anyhow::Result;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
-use tree_sitter::{Parser, Point};
+use tree_sitter::{Node, Parser, Point};
 
 /// Parses a unified diff and returns a map of filename -> list of modified line ranges.
 /// Line numbers are 0-based to align with Tree-sitter's Point API.
@@ -89,7 +89,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                 if let Some(block) = extract_enclosing_block(&content, start, end) {
                     extracted_blocks.insert(block);
                 }
-                let ids = extract_identifiers(&content, start, end);
+                let ids = extract_type_names(&content, start, end);
                 symbols_to_lookup.extend(ids);
             }
             for block in extracted_blocks {
@@ -120,8 +120,10 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     };
 
     let search_path = worktree_path.to_path_buf();
-    let definitions = Arc::new(Mutex::new(HashMap::new()));
-    let definitions_clone = Arc::clone(&definitions);
+    // Map of symbol -> list of (path, line_num) candidate hits.
+    let candidates: Arc<Mutex<HashMap<String, Vec<(PathBuf, u64)>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let candidates_clone = Arc::clone(&candidates);
 
     let _ = tokio::task::spawn_blocking(move || {
         let walker = WalkBuilder::new(&search_path)
@@ -132,7 +134,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
 
         walker.run(|| {
             let matcher = matcher.clone();
-            let definitions = Arc::clone(&definitions_clone);
+            let candidates = Arc::clone(&candidates_clone);
 
             let symbols = symbols.clone();
             Box::new(move |result| {
@@ -142,9 +144,11 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                     }
 
                     let path = entry.path().to_path_buf();
-                    if !path.to_string_lossy().ends_with(".h")
-                        && !path.to_string_lossy().ends_with(".c")
-                    {
+                    let path_str = path.to_string_lossy();
+                    if !path_str.ends_with(".h") && !path_str.ends_with(".c") {
+                        return ignore::WalkState::Continue;
+                    }
+                    if is_noisy_tree(&path_str) {
                         return ignore::WalkState::Continue;
                     }
 
@@ -158,12 +162,11 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                         &path,
                         grep_searcher::sinks::UTF8(|line_num, line| {
                             for sym in &symbols {
-                                // Simple heuristic: does the line contain the symbol?
-                                // A more accurate way would be to run the specific symbol regex again, but this is fast.
-                                if line.contains(sym) {
-                                    let mut defs = definitions.lock().unwrap();
-                                    if !defs.contains_key(sym) {
-                                        defs.insert(sym.clone(), (path.clone(), line_num));
+                                if line_matches_symbol(line, sym) {
+                                    let mut defs = candidates.lock().unwrap();
+                                    let entry = defs.entry(sym.clone()).or_default();
+                                    if entry.len() < 32 {
+                                        entry.push((path.clone(), line_num));
                                     }
                                 }
                             }
@@ -177,36 +180,219 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     })
     .await;
 
-    let mut defs_vec = Vec::new();
-    {
-        let mut defs = definitions.lock().unwrap();
-        defs_vec.extend(defs.drain());
-    }
-    for (sym, (path, line_num)) in defs_vec {
-        if let Ok(content) = fs::read_to_string(&path).await {
-            let line_idx = line_num.saturating_sub(1) as usize;
-            if let Some(block) = extract_enclosing_block(&content, line_idx, line_idx) {
-                let filename = path
-                    .strip_prefix(worktree_path)
-                    .unwrap_or(&path)
-                    .to_string_lossy();
-                let def_str = format!(
-                    "--- Extracted Definition of {} from {} ---\n{}\n",
-                    sym, filename, block
-                );
+    let candidates_vec: Vec<(String, Vec<(PathBuf, u64)>)> = {
+        let mut defs = candidates.lock().unwrap();
+        defs.drain().collect()
+    };
 
-                if current_chars + def_str.len() > MAX_PREFETCH_CHARS {
-                    context_blocks
-                        .push("\n... (Definitions prefetch limits reached)\n".to_string());
-                    break;
-                }
-                current_chars += def_str.len();
-                context_blocks.push(def_str);
+    for (sym, hits) in candidates_vec {
+        if let Some((path, block)) = best_definition_block(&sym, &hits).await {
+            let filename = path
+                .strip_prefix(worktree_path)
+                .unwrap_or(&path)
+                .to_string_lossy();
+            let def_str = format!(
+                "--- Extracted Definition of {} from {} ---\n{}\n",
+                sym, filename, block
+            );
+
+            if current_chars + def_str.len() > MAX_PREFETCH_CHARS {
+                context_blocks
+                    .push("\n... (Definitions prefetch limits reached)\n".to_string());
+                break;
             }
+            current_chars += def_str.len();
+            context_blocks.push(def_str);
         }
     }
 
     Ok(context_blocks.join("\n"))
+}
+
+/// Paths under these roots are test/sample/tools code that shadows real kernel
+/// definitions (e.g. `tools/virtio/ringtest/` hosts a toy `spin_lock`). They
+/// dominate first-match-wins lookups and contribute no signal for patch review.
+fn is_noisy_tree(path_str: &str) -> bool {
+    const NOISY_PREFIXES: &[&str] = &[
+        "/tools/",
+        "/samples/",
+        "/Documentation/",
+        "/scripts/",
+        "/LICENSES/",
+    ];
+    NOISY_PREFIXES.iter().any(|p| path_str.contains(p))
+}
+
+/// Require the match to be a word-boundary hit against the symbol, not just a
+/// substring occurrence. The regex matcher already filtered to definition-shaped
+/// lines; this is the per-symbol disambiguation.
+fn line_matches_symbol(line: &str, sym: &str) -> bool {
+    let bytes = line.as_bytes();
+    let sym_bytes = sym.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = line[i..].find(sym) {
+        let start = i + pos;
+        let end = start + sym_bytes.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Score a candidate definition block from tree-sitter. Higher is better.
+/// 0 means "not actually a definition" (forward decl, parameter name, etc.) —
+/// the caller rejects those.
+fn score_definition_node(node: Node<'_>, sym: &str, source: &[u8]) -> i32 {
+    let kind = node.kind();
+    let names_symbol = |field: &str| {
+        node.child_by_field_name(field)
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|t| t == sym)
+            .unwrap_or(false)
+    };
+    let has_body = node.child_by_field_name("body").is_some();
+
+    match kind {
+        "struct_specifier" | "union_specifier" | "enum_specifier" => {
+            if !names_symbol("name") {
+                return 0;
+            }
+            if has_body { 100 } else { 0 }
+        }
+        "function_definition" => {
+            // declarator is nested; find the function_declarator's identifier.
+            let declared = function_name(node, source);
+            if declared.as_deref() != Some(sym) {
+                return 0;
+            }
+            if has_body { 90 } else { 0 }
+        }
+        "preproc_def" | "preproc_function_def" => {
+            if names_symbol("name") { 70 } else { 0 }
+        }
+        "type_definition" => {
+            // typedef struct foo { ... } sym; — score if the typedef name matches.
+            if typedef_names_match(node, sym, source) {
+                80
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+    // Note: we deliberately do not score plain `declaration` nodes. They match
+    // variable decls like `struct dentry *dentry;` and prototypes without
+    // bodies — neither conveys the actual definition. If a symbol has only
+    // declaration-form hits we'd rather omit it than pollute the prompt.
+}
+
+fn function_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cur = node.child_by_field_name("declarator")?;
+    loop {
+        match cur.kind() {
+            "identifier" => return cur.utf8_text(source).ok().map(str::to_string),
+            "function_declarator" | "pointer_declarator" | "parenthesized_declarator" => {
+                cur = cur.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn typedef_names_match(node: Node<'_>, sym: &str, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "type_identifier"
+            && child.utf8_text(source).ok() == Some(sym)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pick the highest-scoring definition across all ripgrep candidates for `sym`.
+/// Returns (path, rendered block text).
+async fn best_definition_block(
+    sym: &str,
+    hits: &[(PathBuf, u64)],
+) -> Option<(PathBuf, String)> {
+    // Deduplicate paths — many hits may live in the same file.
+    let mut seen = HashSet::new();
+    let mut best: Option<(i32, PathBuf, String)> = None;
+
+    for (path, _line) in hits {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(path).await else {
+            continue;
+        };
+        let Some((score, block)) = score_best_in_file(&content, sym) else {
+            continue;
+        };
+        if score == 0 {
+            continue;
+        }
+        match &best {
+            Some((best_score, _, _)) if *best_score >= score => {}
+            _ => best = Some((score, path.clone(), block)),
+        }
+    }
+    best.map(|(_, p, b)| (p, b))
+}
+
+/// Parse `content` once and find the highest-scoring definition of `sym`.
+fn score_best_in_file(content: &str, sym: &str) -> Option<(i32, String)> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(content, None)?;
+    let source = content.as_bytes();
+
+    let mut best: Option<(i32, Node)> = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let score = score_definition_node(node, sym, source);
+        if score > 0 {
+            match &best {
+                Some((b, _)) if *b >= score => {}
+                _ => best = Some((score, node)),
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    let (score, node) = best?;
+    let start = node.start_byte();
+    let end = node.end_byte();
+    if end > content.len() {
+        return None;
+    }
+    let lines_count = node
+        .end_position()
+        .row
+        .saturating_sub(node.start_position().row);
+    let block = if lines_count > 200 {
+        format!(
+            "// Block is too large ({} lines), truncated...\n{}",
+            lines_count,
+            truncate_to_window(content, node.start_position().row, node.end_position().row)
+        )
+    } else {
+        content[start..end].to_string()
+    };
+    Some((score, block))
 }
 pub fn extract_enclosing_block(
     source_code: &str,
@@ -294,48 +480,71 @@ fn is_common_c_word(word: &str) -> bool {
     common.contains(&word)
 }
 
-pub fn extract_identifiers(
+/// Extracts C type names referenced within (and around) the modified line range.
+///
+/// Uses tree-sitter's `type_identifier` node-kind — which is semantically distinct
+/// from `identifier` — so we pick up `fbnic_dev`, `fbnic_net`, `seq_file` and
+/// skip variable/field/function names like `fbd`, `fbn`, `ret`.
+///
+/// Scopes collection to the **enclosing function/struct/typedef**, not just the
+/// exact modified lines, so types declared in a function signature (`struct
+/// fbnic_dev *fbd`) are captured even when the diff only touches the body.
+pub fn extract_type_names(
     source_code: &str,
     start_line: usize,
     end_line: usize,
 ) -> HashSet<String> {
-    let mut ids = HashSet::new();
+    let mut types = HashSet::new();
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_c::LANGUAGE.into())
         .is_err()
     {
-        return ids;
+        return types;
     }
 
-    let tree = if let Some(t) = parser.parse(source_code, None) {
-        t
-    } else {
-        return ids;
+    let Some(tree) = parser.parse(source_code, None) else {
+        return types;
     };
     let root_node = tree.root_node();
     let start_point = Point::new(start_line, 0);
     let end_point = Point::new(end_line, usize::MAX);
 
-    if let Some(node) = root_node.descendant_for_point_range(start_point, end_point) {
-        fn walk<'a>(n: tree_sitter::Node<'a>, src: &[u8], out: &mut HashSet<String>) {
-            let kind = n.kind();
-            if (kind == "identifier" || kind == "type_identifier")
-                && let Ok(text) = n.utf8_text(src)
-            {
-                let s = text.to_string();
-                if s.len() >= 3 && !is_common_c_word(&s) {
-                    out.insert(s);
-                }
-            }
-            let mut cursor = n.walk();
-            for child in n.children(&mut cursor) {
-                walk(child, src, out);
+    let Some(mut scope) = root_node.descendant_for_point_range(start_point, end_point) else {
+        return types;
+    };
+
+    // Widen to the enclosing function/struct/typedef so signature types are in scope.
+    let target_kinds = [
+        "function_definition",
+        "struct_specifier",
+        "union_specifier",
+        "enum_specifier",
+        "type_definition",
+    ];
+    while !target_kinds.contains(&scope.kind()) {
+        match scope.parent() {
+            Some(p) => scope = p,
+            None => break,
+        }
+    }
+
+    fn walk(n: Node<'_>, src: &[u8], out: &mut HashSet<String>) {
+        if n.kind() == "type_identifier"
+            && let Ok(text) = n.utf8_text(src)
+        {
+            let s = text.to_string();
+            if s.len() >= 3 && !is_common_c_word(&s) {
+                out.insert(s);
             }
         }
-        walk(node, source_code.as_bytes(), &mut ids);
+        let mut cursor = n.walk();
+        for child in n.children(&mut cursor) {
+            walk(child, src, out);
+        }
     }
-    ids
+    walk(scope, source_code.as_bytes(), &mut types);
+    types
 }
 
 #[cfg(test)]
