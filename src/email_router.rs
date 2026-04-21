@@ -85,7 +85,7 @@ impl EmailRouter {
         let mut mute_all = false;
         let mut is_private = false;
         let mut reply_to_author = false;
-        let mut cc_maintainers = false;
+        let mut cc_individuals = false;
         let mut cc = Vec::new();
 
         for p in active_policies {
@@ -98,8 +98,8 @@ impl EmailRouter {
             if p.reply_to_author {
                 reply_to_author = true;
             }
-            if p.cc_maintainers {
-                cc_maintainers = true;
+            if p.cc_individuals {
+                cc_individuals = true;
             }
             for cr in &p.cc {
                 cc.push(cr.clone());
@@ -126,13 +126,13 @@ impl EmailRouter {
             final_cc.insert(cr);
         }
 
-        // Add original non-mailing-list recipients if cc_maintainers is true
+        // Add original non-mailing-list recipients if cc_individuals is true
         // Or if it's public, add everyone (mailing lists included, unless it's private)
         for addr in incoming_to {
             let addr_lower = addr.to_lowercase();
             let is_mailing_list = known_mailing_lists.iter().any(|ml| addr_lower.contains(ml));
 
-            if (!is_private) || (cc_maintainers && !is_mailing_list) {
+            if (!is_private) || (cc_individuals && !is_mailing_list) {
                 final_to.insert(addr.to_string());
             }
         }
@@ -141,7 +141,7 @@ impl EmailRouter {
             let addr_lower = addr.to_lowercase();
             let is_mailing_list = known_mailing_lists.iter().any(|ml| addr_lower.contains(ml));
 
-            if (!is_private) || (cc_maintainers && !is_mailing_list) {
+            if (!is_private) || (cc_individuals && !is_mailing_list) {
                 final_cc.insert(addr.to_string());
             }
         }
@@ -200,7 +200,7 @@ mod tests {
                 lists: vec!["linux-mm@kvack.org".to_string()],
                 reply_all: true,
                 reply_to_author: true,
-                cc_maintainers: true,
+                cc_individuals: true,
                 mute_all: false,
                 cc: vec!["mm-bot@test.com".to_string()],
                 ignored_emails: vec![],
@@ -214,7 +214,7 @@ mod tests {
                 lists: vec!["bpf@vger.kernel.org".to_string()],
                 reply_all: false,
                 reply_to_author: true,
-                cc_maintainers: false,
+                cc_individuals: false,
                 mute_all: false,
                 cc: vec![],
                 ignored_emails: vec![],
@@ -228,7 +228,7 @@ mod tests {
                 lists: vec!["netdev@vger.kernel.org".to_string()],
                 reply_all: true,
                 reply_to_author: true,
-                cc_maintainers: true,
+                cc_individuals: true,
                 mute_all: true,
                 cc: vec![],
                 ignored_emails: vec![],
@@ -241,7 +241,7 @@ mod tests {
                 lists: vec![],
                 reply_all: false,
                 reply_to_author: true,
-                cc_maintainers: true,
+                cc_individuals: true,
                 mute_all: false,
                 cc: vec![],
                 ignored_emails: vec![],
@@ -325,7 +325,7 @@ mod tests {
                 // Mailing lists should be stripped
                 assert!(!to.contains(&"linux-mm@kvack.org".to_string()));
                 assert!(!to.contains(&"bpf@vger.kernel.org".to_string()));
-                // Maintainer kept because cc_maintainers was true in mm policy (union rules)
+                // Maintainer kept because cc_individuals was true in mm policy (union rules)
                 assert!(cc.contains(&"maintainer@test.com".to_string()));
                 assert!(cc.contains(&"mm-bot@test.com".to_string()));
             }
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn test_defaults() {
         let policy = build_test_policy();
-        // Unknown list -> defaults apply (private, reply_to_author=true, cc_maintainers=true)
+        // Unknown list -> defaults apply (private, reply_to_author=true, cc_individuals=true)
         let action = EmailRouter::resolve_recipients(
             &policy,
             &["unknown-list@vger.kernel.org".to_string()],

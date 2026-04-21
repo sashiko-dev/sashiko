@@ -11,7 +11,7 @@ To guarantee reliability and prevent duplicate emails during crashes, the system
 [defaults]
 reply_all = false
 reply_to_author = true
-cc_maintainers = true
+cc_individuals = true
 mute_all = false
 cc = []
 
@@ -19,13 +19,13 @@ cc = []
 lists = ["linux-mm@kvack.org", "linux-mm@vger.kernel.org"]
 reply_all = true
 reply_to_author = true
-cc_maintainers = true
+cc_individuals = true
 
 [subsystems.bpf]
 lists = ["bpf@vger.kernel.org"]
 reply_all = false
 reply_to_author = true
-cc_maintainers = false
+cc_individuals = false
 
 [subsystems.net]
 lists = ["netdev@vger.kernel.org"]
@@ -40,7 +40,7 @@ mute_all = true
 3.  **Resolve Conflicts (Safety First):**
     *   **Mute:** If *any* matched policy has `mute_all = true`, abort the email process completely.
     *   **Downgrade:** If *any* matched policy has `reply_all = false`, remove *all* configured mailing list addresses from the outgoing recipients. (Forces a private thread).
-4.  **Build List:** Add author (`reply_to_author`), maintainers/individuals (`cc_maintainers`), and `cc`.
+4.  **Build List:** Add author (`reply_to_author`), maintainers/individuals (`cc_individuals`), and `cc`.
 5.  **Sanitize:** Deduplicate (case-insensitive) and remove Sashiko's own email address.
 
 ## 4. Database Schema (The Outbox)

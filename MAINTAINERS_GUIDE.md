@@ -32,7 +32,7 @@ Sashiko provides flexible delivery mechanisms that can be configured per mailing
 
 *   **`reply_all`:** Controls whether Sashiko can reply directly to the public mailing list. If set to `false`, reviews are restricted to private recipients (the author and/or maintainers).
 *   **`reply_to_author`:** Determines whether the review email should be sent directly to the author of the patch.
-*   **`cc_maintainers`:** Controls whether other maintainers and users in the CC list of the patch should be included in the review email.
+*   **`cc_individuals`:** Controls whether other maintainers and users in the CC list of the patch should be included in the review email.
 *   **`mute_all`:** Completely mutes Sashiko for the given scope, preventing any review emails from being sent.
 *   **`cc`:** A static list of email addresses that should always receive a copy of the review.
 *   **`ignored_emails`:** A list of author email addresses whose submissions will never be reviewed by the system.
