@@ -56,3 +56,8 @@ cc = ["tj@kernel.org", "hannes@cmpxchg.org", "mkoutny@suse.com"]
 [subsystems.renesas-soc]
 lists = ["linux-renesas-soc@vger.kernel.org"]
 cc = ["wsa+renesas@sang-engineering.com"]
+
+[subsystems.rust-for-linux]
+lists = ["rust-for-linux@vger.kernel.org"]
+reply_to_author = true
+cc = ["ojeda@kernel.org"]
