@@ -20,9 +20,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ConversationRole, InferenceConfiguration, Message, SystemContentBlock, Tool,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
-    ToolUseBlock,
+    CachePointBlock, CachePointType, ContentBlock, ConversationRole, InferenceConfiguration,
+    Message, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+    ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::{Document, Number};
 use std::collections::HashMap;
@@ -87,6 +87,7 @@ pub struct BedrockClient {
     region: Option<String>,
     model_id: String,
     context_window_size: usize,
+    enable_caching: bool,
     max_tokens: u32,
     thinking: Option<String>,
     effort: Option<String>,
@@ -96,6 +97,7 @@ impl BedrockClient {
     pub fn new(
         model_id: String,
         region: Option<String>,
+        enable_caching: bool,
         max_tokens: u32,
         thinking: Option<String>,
         effort: Option<String>,
@@ -111,6 +113,7 @@ impl BedrockClient {
             region,
             model_id,
             context_window_size,
+            enable_caching,
             max_tokens,
             thinking,
             effort,
@@ -166,14 +169,23 @@ fn build_additional_fields(thinking: Option<&str>, effort: Option<&str>) -> Opti
 /// Translate Sashiko's generic AiRequest into Bedrock Converse API parameters.
 fn translate_request(
     request: &AiRequest,
+    enable_caching: bool,
     max_tokens: u32,
     thinking: Option<&str>,
     effort: Option<&str>,
 ) -> Result<ConverseParams> {
-    let system = request
-        .system
-        .as_ref()
-        .map(|s| vec![SystemContentBlock::Text(s.clone())]);
+    let system = request.system.as_ref().map(|s| {
+        let mut blocks = vec![SystemContentBlock::Text(s.clone())];
+        if enable_caching {
+            blocks.push(SystemContentBlock::CachePoint(
+                CachePointBlock::builder()
+                    .r#type(CachePointType::Default)
+                    .build()
+                    .expect("CachePointBlock build"),
+            ));
+        }
+        blocks
+    });
 
     let mut messages: Vec<Message> = Vec::new();
 
@@ -255,11 +267,30 @@ fn translate_request(
     }
     flush_tool_results(&mut pending_tool_results, &mut messages)?;
 
+    if enable_caching
+        && let Some(last) = messages.last_mut()
+    {
+        let role = last.role().clone();
+        let mut builder = Message::builder().role(role);
+        for block in last.content().iter().cloned() {
+            builder = builder.content(block);
+        }
+        builder = builder.content(ContentBlock::CachePoint(
+            CachePointBlock::builder()
+                .r#type(CachePointType::Default)
+                .build()
+                .expect("CachePointBlock build"),
+        ));
+        *last = builder
+            .build()
+            .context("Failed to rebuild last message with cachePoint")?;
+    }
+
     let tool_config = request.tools.as_ref().and_then(|tools| {
         if tools.is_empty() {
             return None;
         }
-        let bedrock_tools: Vec<Tool> = tools
+        let mut bedrock_tools: Vec<Tool> = tools
             .iter()
             .filter_map(|t| {
                 let schema_doc = json_to_document(&t.parameters);
@@ -273,6 +304,14 @@ fn translate_request(
                 ))
             })
             .collect();
+        if enable_caching && !bedrock_tools.is_empty() {
+            bedrock_tools.push(Tool::CachePoint(
+                CachePointBlock::builder()
+                    .r#type(CachePointType::Default)
+                    .build()
+                    .expect("CachePointBlock build"),
+            ));
+        }
         ToolConfiguration::builder()
             .set_tools(Some(bedrock_tools))
             .build()
@@ -325,11 +364,18 @@ fn translate_response(
         }
     }
 
-    let usage = output.usage.as_ref().map(|u| AiUsage {
-        prompt_tokens: u.input_tokens() as usize,
-        completion_tokens: u.output_tokens() as usize,
-        total_tokens: (u.input_tokens() + u.output_tokens()) as usize,
-        cached_tokens: None,
+    let usage = output.usage.as_ref().map(|u| {
+        let cached = u.cache_read_input_tokens().unwrap_or(0);
+        AiUsage {
+            prompt_tokens: u.input_tokens() as usize,
+            completion_tokens: u.output_tokens() as usize,
+            total_tokens: (u.input_tokens() + u.output_tokens()) as usize,
+            cached_tokens: if cached > 0 {
+                Some(cached as usize)
+            } else {
+                None
+            },
+        }
     });
 
     Ok(AiResponse {
@@ -379,6 +425,7 @@ impl AiProvider for BedrockClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let params = translate_request(
             &request,
+            self.enable_caching,
             self.max_tokens,
             self.thinking.as_deref(),
             self.effort.as_deref(),
@@ -412,7 +459,14 @@ impl AiProvider for BedrockClient {
         let usage_str = resp
             .usage
             .as_ref()
-            .map(|u| format!("in={}, out={}", u.input_tokens(), u.output_tokens()))
+            .map(|u| {
+                format!(
+                    "in={}, out={}, cached={}",
+                    u.input_tokens(),
+                    u.output_tokens(),
+                    u.cache_read_input_tokens().unwrap_or(0)
+                )
+            })
             .unwrap_or_else(|| "unknown".to_string());
         info!("Bedrock response received. Tokens: {}", usage_str);
 
@@ -478,7 +532,7 @@ mod tests {
         req.system = Some("You are helpful.".to_string());
         req.temperature = Some(0.5);
 
-        let params = translate_request(&req, 4096, None, None)?;
+        let params = translate_request(&req, false, 4096, None, None)?;
 
         let sys = params.system.unwrap();
         assert_eq!(sys.len(), 1);
@@ -517,7 +571,7 @@ mod tests {
             tool_call_id: None,
         }]);
 
-        let params = translate_request(&req, 4096, None, None)?;
+        let params = translate_request(&req, false, 4096, None, None)?;
         let content = params.messages[0].content();
         assert_eq!(content.len(), 2);
 
@@ -548,7 +602,7 @@ mod tests {
             tool_call_id: Some("call_1".to_string()),
         }]);
 
-        let params = translate_request(&req, 4096, None, None)?;
+        let params = translate_request(&req, false, 4096, None, None)?;
         assert_eq!(params.messages.len(), 1);
         assert_eq!(params.messages[0].role(), &ConversationRole::User);
 
@@ -579,7 +633,7 @@ mod tests {
             }),
         }]);
 
-        let params = translate_request(&req, 4096, None, None)?;
+        let params = translate_request(&req, false, 4096, None, None)?;
         let tools = params.tool_config.unwrap().tools().to_vec();
         assert_eq!(tools.len(), 1);
 
@@ -604,7 +658,7 @@ mod tests {
         }]);
         req.tools = Some(vec![]);
 
-        let params = translate_request(&req, 4096, None, None)?;
+        let params = translate_request(&req, false, 4096, None, None)?;
         assert!(params.tool_config.is_none());
 
         Ok(())
@@ -638,7 +692,7 @@ mod tests {
             tool_call_id: None,
         }]);
 
-        let params = translate_request(&req, 8192, None, None)?;
+        let params = translate_request(&req, false, 8192, None, None)?;
         assert_eq!(params.inference_config.unwrap().max_tokens(), Some(8192));
         Ok(())
     }
@@ -653,11 +707,159 @@ mod tests {
             tool_call_id: None,
         }]);
 
-        let params = translate_request(&req, 8192, Some("adaptive"), Some("high"))?;
+        let params = translate_request(&req, false, 8192, Some("adaptive"), Some("high"))?;
         let extra = params.additional_model_request_fields.unwrap();
         let json = document_to_json(&extra);
         assert_eq!(json["thinking"]["type"], "adaptive");
         assert_eq!(json["output_config"]["effort"], "high");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_point_inserted_when_enabled() -> Result<()> {
+        let mut req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("Hello!".to_string()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        req.system = Some("System prompt.".to_string());
+
+        let params = translate_request(&req, true, 4096, None, None)?;
+        let sys = params.system.unwrap();
+        assert_eq!(sys.len(), 2);
+        assert!(matches!(&sys[0], SystemContentBlock::Text(_)));
+        assert!(sys[1].is_cache_point());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rolling_cache_point_on_last_message_when_enabled() -> Result<()> {
+        let req = make_request(vec![
+            AiMessage {
+                role: AiRole::User,
+                content: Some("first".to_string()),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            AiMessage {
+                role: AiRole::Assistant,
+                content: Some("second".to_string()),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+
+        let params = translate_request(&req, true, 4096, None, None)?;
+        assert_eq!(params.messages.len(), 2);
+
+        let first_content = params.messages[0].content();
+        assert_eq!(first_content.len(), 1);
+        assert!(!first_content[0].is_cache_point());
+
+        let last_content = params.messages[1].content();
+        assert_eq!(last_content.len(), 2);
+        assert!(!last_content[0].is_cache_point());
+        assert!(last_content[1].is_cache_point());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rolling_cache_point_preserves_tool_result_blocks() -> Result<()> {
+        let req = make_request(vec![
+            AiMessage {
+                role: AiRole::Tool,
+                content: Some("result A".to_string()),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: Some("call_a".to_string()),
+            },
+            AiMessage {
+                role: AiRole::Tool,
+                content: Some("result B".to_string()),
+                thought: None,
+                tool_calls: None,
+                tool_call_id: Some("call_b".to_string()),
+            },
+        ]);
+
+        let params = translate_request(&req, true, 4096, None, None)?;
+        assert_eq!(params.messages.len(), 1);
+        let content = params.messages[0].content();
+        assert_eq!(content.len(), 3);
+        assert!(matches!(&content[0], ContentBlock::ToolResult(_)));
+        assert!(matches!(&content[1], ContentBlock::ToolResult(_)));
+        assert!(content[2].is_cache_point());
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_rolling_cache_point_when_disabled() -> Result<()> {
+        let req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+
+        let params = translate_request(&req, false, 4096, None, None)?;
+        let content = params.messages[0].content();
+        assert_eq!(content.len(), 1);
+        assert!(!content[0].is_cache_point());
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_cache_point_appended_when_enabled() -> Result<()> {
+        let mut req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        req.tools = Some(vec![AiTool {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}}
+            }),
+        }]);
+
+        let params = translate_request(&req, true, 4096, None, None)?;
+        let tools = params.tool_config.unwrap().tools().to_vec();
+        assert_eq!(tools.len(), 2);
+        assert!(matches!(&tools[0], Tool::ToolSpec(_)));
+        assert!(tools[1].is_cache_point());
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_cache_point_absent_when_disabled() -> Result<()> {
+        let mut req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        req.tools = Some(vec![AiTool {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({"type": "object"}),
+        }]);
+
+        let params = translate_request(&req, false, 4096, None, None)?;
+        let tools = params.tool_config.unwrap().tools().to_vec();
+        assert_eq!(tools.len(), 1);
+        assert!(matches!(&tools[0], Tool::ToolSpec(_)));
         Ok(())
     }
 }

@@ -116,6 +116,8 @@ pub struct BedrockSettings {
     /// AWS region for Bedrock API calls (e.g. "us-east-1").
     /// If omitted, uses the standard AWS SDK default chain.
     pub region: Option<String>,
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
     /// Max output tokens per Converse call.
     #[serde(default = "default_bedrock_max_tokens")]
     pub max_tokens: u32,

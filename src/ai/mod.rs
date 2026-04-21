@@ -195,12 +195,14 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
             let model = settings.ai.model.clone();
             let bedrock = settings.ai.bedrock.as_ref();
             let region = bedrock.and_then(|b| b.region.clone());
+            let enable_caching = bedrock.map(|b| b.prompt_caching).unwrap_or(true);
             let max_tokens = bedrock.map(|b| b.max_tokens).unwrap_or(8192);
             let thinking = bedrock.and_then(|b| b.thinking.clone());
             let effort = bedrock.and_then(|b| b.effort.clone());
             Ok(Arc::new(bedrock::BedrockClient::new(
                 model,
                 region,
+                enable_caching,
                 max_tokens,
                 thinking,
                 effort,
