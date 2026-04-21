@@ -466,7 +466,7 @@ impl Worker {
             match tokio::fs::read_to_string(&subsystem_md_path).await {
                 Ok(subsystem_md) => {
                     info!("Executing Phase 0: Pre-screening relevant subsystem guides.");
-                    let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.";
+                    let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```";
                     let phase0_prompt = format!(
                         "<subsystem_guide_index>\n{}\n</subsystem_guide_index>\n\n<patch>\n{}\n</patch>",
                         subsystem_md, target_commit_diff
@@ -636,8 +636,12 @@ impl Worker {
 - Stage 6: Security audit
 - Stage 7: Hardware engineer's review
 
-Return ONLY a JSON object containing an array of integers representing the relevant stages (e.g., [4, 5, 6, 7]).
-CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer."#;
+CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer.
+
+You MUST respond with ONLY a JSON object, no other text. Example:
+```json
+{"relevant_stages": [4, 5, 6, 7]}
+```"#;
 
             let req = AiRequest {
                 system: None,
