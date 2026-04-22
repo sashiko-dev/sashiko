@@ -101,6 +101,18 @@ fn default_max_input_tokens() -> usize {
 pub struct ClaudeSettings {
     #[serde(default = "default_prompt_caching")]
     pub prompt_caching: bool,
+    #[serde(default = "default_claude_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+fn default_claude_max_tokens() -> u32 {
+    4096
 }
 
 #[derive(Debug, Deserialize, Clone)]
