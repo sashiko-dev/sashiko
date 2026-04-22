@@ -70,6 +70,7 @@ impl QuotaManager {
         let mut count = self.consecutive_transient_errors.lock().await;
         if *count > 0 {
             *count = 0;
+            *self.blocked_until.lock().await = None;
             info!("AI request succeeded, resetting transient error backoff.");
         }
     }
