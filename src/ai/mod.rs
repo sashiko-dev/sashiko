@@ -191,6 +191,7 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
             Ok(Arc::new(claude::ClaudeClient::new(model, enable_caching)))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient)),
+        #[cfg(feature = "bedrock")]
         "bedrock" => {
             let model = settings.ai.model.clone();
             let bedrock = settings.ai.bedrock.as_ref();
@@ -208,6 +209,8 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 effort,
             )))
         }
+        #[cfg(not(feature = "bedrock"))]
+        "bedrock" => bail!("bedrock provider requires the 'bedrock' feature"),
         "openai" | "openai-compatible" => {
             let provider_type = match settings.ai.provider.to_lowercase().as_str() {
                 "openai" => openai::OpenAiProviderType::OpenAi,
@@ -257,6 +260,7 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
+#[cfg(feature = "bedrock")]
 pub mod bedrock;
 pub mod claude;
 pub mod claude_cli;

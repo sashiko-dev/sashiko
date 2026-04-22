@@ -110,6 +110,7 @@ pub struct GeminiSettings {
     pub explicit_prompt_caching: bool,
 }
 
+#[cfg(feature = "bedrock")]
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct BedrockSettings {
@@ -131,6 +132,7 @@ pub struct BedrockSettings {
     pub effort: Option<String>,
 }
 
+#[cfg(feature = "bedrock")]
 fn default_bedrock_max_tokens() -> u32 {
     8192
 }
@@ -172,6 +174,7 @@ pub struct AiSettings {
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
+    #[cfg(feature = "bedrock")]
     pub bedrock: Option<BedrockSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
 }
