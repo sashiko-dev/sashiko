@@ -87,6 +87,10 @@ pub struct ClaudeRequest {
     pub tools: Option<Vec<ClaudeTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,10 +148,20 @@ pub struct ClaudeClient {
     model: String,
     client: Client,
     enable_caching: bool,
+    max_tokens: u32,
+    base_url: String,
+    thinking: Option<String>,
+    effort: Option<String>,
 }
 
 impl ClaudeClient {
-    pub fn new(model: String, enable_caching: bool) -> Self {
+    pub fn new(model: String,
+               enable_caching: bool,
+               max_tokens: u32,
+               base_url: String,
+               thinking: Option<String>,
+               effort: Option<String>,
+    ) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default();
@@ -157,12 +171,18 @@ impl ClaudeClient {
             model,
             client: Client::new(),
             enable_caching,
+            max_tokens,
+            base_url,
+            thinking,
+            effort,
         }
     }
 
-    async fn post_request(&self, body: &ClaudeRequest) -> Result<ClaudeResponse> {
-        let url = "https://api.anthropic.com/v1/messages";
+    pub fn default_base_url() -> String {
+        "https://api.anthropic.com/v1/messages".to_string()
+    }
 
+    async fn post_request(&self, body: &ClaudeRequest) -> Result<ClaudeResponse> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "x-api-key",
@@ -183,7 +203,7 @@ impl ClaudeClient {
 
         let res = self
             .client
-            .post(url)
+            .post(&self.base_url)
             .headers(headers)
             .json(body)
             .send()
@@ -243,7 +263,11 @@ impl ClaudeClient {
 
 // --- Translation Functions ---
 
-fn translate_ai_request(request: &AiRequest, enable_caching: bool) -> Result<ClaudeRequest> {
+fn translate_ai_request(request: &AiRequest,
+                        enable_caching: bool,
+                        max_tokens: u32,
+                        thinking: Option<String>,
+                        effort: Option<String>) -> Result<ClaudeRequest> {
     let mut messages = Vec::new();
     let mut system_blocks = Vec::new();
 
@@ -340,18 +364,26 @@ fn translate_ai_request(request: &AiRequest, enable_caching: bool) -> Result<Cla
             .collect()
     });
 
+    // With thinking enabled or adaptive temperature have to be set to 1.0
+    let normalize_temperature: Option<f32> = match thinking.as_deref() {
+        Some("disabled") => request.temperature,
+        Some(_) | None => Some(1.0),
+    };
+
     // Build the request
     let mut claude_request = ClaudeRequest {
         model: String::new(), // Will be set by the client
         messages,
-        max_tokens: 4096, // Hard-coded as per plan
+        max_tokens: max_tokens,
+        thinking: thinking,
+        effort: effort,
         system: if system_blocks.is_empty() {
             None
         } else {
             Some(system_blocks)
         },
         tools,
-        temperature: request.temperature,
+        temperature: normalize_temperature,
     };
 
     // Apply cache control if enabled
@@ -469,7 +501,11 @@ fn estimate_tokens_generic(request: &AiRequest) -> usize {
 impl AiProvider for ClaudeClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         // 1. Translate generic request to Claude format
-        let mut claude_req = translate_ai_request(&request, self.enable_caching)?;
+        let mut claude_req = translate_ai_request(&request,
+                                                  self.enable_caching,
+                                                  self.max_tokens,
+                                                  self.thinking.clone(),
+                                                  self.effort.clone())?;
 
         // 2. Set the model
         claude_req.model = self.model.clone();
