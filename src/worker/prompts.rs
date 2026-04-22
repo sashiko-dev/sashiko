@@ -43,6 +43,10 @@ use tracing::{info, warn};
 /// System identity prompt - used across all AI interactions
 pub const SYSTEM_IDENTITY: &str = "";
 
+/// Subsystem guides that are loaded per-stage in get_stage_prompt() and should
+/// be excluded from Phase 0's shared context to avoid double-counting.
+const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct PatchInput {
     pub index: i64,
@@ -519,6 +523,7 @@ impl Worker {
                         let prompts: Vec<String> = arr
                             .iter()
                             .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .filter(|name| !STAGE_EXCLUSIVE_GUIDES.contains(&name.as_str()))
                             .collect();
                         info!("Phase 0 selected prompts: {:?}", prompts);
                         Some(prompts)
