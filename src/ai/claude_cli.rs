@@ -34,7 +34,8 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
+    AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
+    ToolCall,
 };
 
 pub struct ClaudeCliProvider {
@@ -87,7 +88,17 @@ impl AiProvider for ClaudeCliProvider {
             }
         }
 
+        let raw = String::from_utf8_lossy(&output.stdout);
+
         if !output.status.success() {
+            // Try to extract the actual error message from the JSON output before giving up.
+            // The CLI emits a JSON object with is_error=true and the reason in the "result"
+            // field even when it exits non-zero (e.g. unknown model, quota exceeded).
+            if let Ok(outer) = serde_json::from_str::<Value>(&raw) {
+                if let Some(msg) = outer["result"].as_str() {
+                    anyhow::bail!("claude CLI error: {}", msg);
+                }
+            }
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
                 "claude CLI exited with {}: {}",
@@ -95,8 +106,6 @@ impl AiProvider for ClaudeCliProvider {
                 stderr.trim()
             );
         }
-
-        let raw = String::from_utf8_lossy(&output.stdout);
         let outer: Value = serde_json::from_str(&raw).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse claude CLI JSON output: {}\nRaw: {}",
@@ -209,6 +218,18 @@ pub fn build_prompt(request: &AiRequest) -> String {
              For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
              Do not mix both. Output exactly one JSON object.\n",
         );
+    } else if let Some(AiResponseFormat::Json { schema }) = &request.response_format {
+        // No tools but JSON format required (e.g. Phase 0, Planning).
+        if let Some(schema) = schema {
+            out.push_str(&format!(
+                "RESPONSE FORMAT: You MUST respond with valid JSON only matching this schema: {}. Do not include any explanation, markdown, or code fences — output raw JSON.\n",
+                serde_json::to_string(schema).unwrap_or_default()
+            ));
+        } else {
+            out.push_str(
+                "RESPONSE FORMAT: You MUST respond with valid JSON only. Do not include any explanation, markdown, or code fences — output raw JSON.\n",
+            );
+        }
     }
 
     out
