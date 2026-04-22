@@ -122,8 +122,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     let search_path = worktree_path.to_path_buf();
     // Map of symbol -> list of (path, line_num) candidate hits.
     type CandidatesMap = HashMap<String, Vec<(PathBuf, u64)>>;
-    let candidates: Arc<Mutex<CandidatesMap>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let candidates: Arc<Mutex<CandidatesMap>> = Arc::new(Mutex::new(HashMap::new()));
     let candidates_clone = Arc::clone(&candidates);
 
     let _ = tokio::task::spawn_blocking(move || {

@@ -503,11 +503,14 @@ impl Worker {
                     };
 
                     let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
-                    let val = self.json_request("s0", req, &mut tokens, |v| {
-                        v.get("selected_prompts").and_then(|v| v.as_array())
-                            .ok_or_else(|| "missing 'selected_prompts' array".to_string())
-                            .map(|_| ())
-                    }).await;
+                    let val = self
+                        .json_request("s0", req, &mut tokens, |v| {
+                            v.get("selected_prompts")
+                                .and_then(|v| v.as_array())
+                                .ok_or_else(|| "missing 'selected_prompts' array".to_string())
+                                .map(|_| ())
+                        })
+                        .await;
                     total_tokens_in = tokens.0;
                     total_tokens_out = tokens.1;
                     total_tokens_cached = tokens.2;
@@ -642,11 +645,14 @@ You MUST respond with ONLY a JSON object, no other text. Example:
 
             info!("Running planning pre-phase");
             let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
-            let val = self.json_request("sp", req, &mut tokens, |v| {
-                v.get("relevant_stages").and_then(|v| v.as_array())
-                    .ok_or_else(|| "missing 'relevant_stages' array".to_string())
-                    .map(|_| ())
-            }).await;
+            let val = self
+                .json_request("sp", req, &mut tokens, |v| {
+                    v.get("relevant_stages")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| "missing 'relevant_stages' array".to_string())
+                        .map(|_| ())
+                })
+                .await;
             total_tokens_in = tokens.0;
             total_tokens_out = tokens.1;
             total_tokens_cached = tokens.2;
@@ -1239,12 +1245,18 @@ Example:
             tokens.2 += usage.cached_tokens.unwrap_or(0) as u32;
         }
 
-        fn try_parse(content: &str, validate: &impl Fn(&Value) -> Result<(), String>) -> Result<Value, String> {
+        fn try_parse(
+            content: &str,
+            validate: &impl Fn(&Value) -> Result<(), String>,
+        ) -> Result<Value, String> {
             let stripped = content.trim();
-            let stripped = stripped.strip_prefix("```json").or_else(|| stripped.strip_prefix("```"))
+            let stripped = stripped
+                .strip_prefix("```json")
+                .or_else(|| stripped.strip_prefix("```"))
                 .map(|s| s.strip_suffix("```").unwrap_or(s).trim())
                 .unwrap_or(stripped);
-            let v = serde_json::from_str::<Value>(stripped).map_err(|e| format!("JSON parse error: {}", e))?;
+            let v = serde_json::from_str::<Value>(stripped)
+                .map_err(|e| format!("JSON parse error: {}", e))?;
             validate(&v)?;
             Ok(v)
         }

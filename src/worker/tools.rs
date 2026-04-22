@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::truncator::Truncator;
 use crate::ai::AiTool;
+use crate::ai::truncator::Truncator;
 use anyhow::{Result, anyhow, ensure};
 use grep::printer::StandardBuilder;
 use grep::regex::RegexMatcher;

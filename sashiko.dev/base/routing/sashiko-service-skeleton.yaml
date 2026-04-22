@@ -7,7 +7,7 @@ metadata:
   namespace: sashiko
   annotations:
     cloud.google.com/neg: '{"ingress": true}'
-    beta.cloud.google.com/backend-config: '{"default": "sashiko-backend-config"}'
+    beta.cloud.google.com/backend-config: '{"default": "sashiko-backend"}'
 spec:
   type: NodePort
   ports:
