@@ -77,6 +77,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     let mut range_map: LineRangeMap = BTreeMap::new();
     let mut symbols_to_lookup = HashSet::new();
     let mut already_extracted = HashSet::new();
+    let mut called_functions = HashSet::new();
 
     // Phase 1: modified code — find enclosing blocks, types, and called functions.
     for (file, ranges) in &file_ranges {
@@ -96,12 +97,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                 already_extracted.extend(extract_defined_names(&content, start, end));
                 symbols_to_lookup.extend(extract_type_names(&content, start, end));
             }
-            let called = extract_called_functions(&content, ranges);
-            for f in called {
-                if !already_extracted.contains(&f) {
-                    symbols_to_lookup.insert(f);
-                }
-            }
+            called_functions.extend(extract_called_functions(&content, ranges));
         }
     }
 
@@ -109,6 +105,16 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     for sym in &already_extracted {
         symbols_to_lookup.remove(sym);
     }
+
+    // Drop opaque container types.
+    let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, worktree_path).await;
+    for sym in &opaque {
+        symbols_to_lookup.remove(sym);
+    }
+
+    // Merge called functions into the lookup set.
+    called_functions.retain(|f| !already_extracted.contains(f));
+    symbols_to_lookup.extend(called_functions);
 
     let symbols: Vec<String> = symbols_to_lookup.into_iter().take(50).collect();
 
@@ -548,6 +554,60 @@ fn is_common_c_word(word: &str) -> bool {
         "off_t", "ret", "err", "len", "size", "res", "tmp", "val", "ptr", "idx", "out",
     ];
     COMMON.contains(&word)
+}
+
+/// Identifies types that are only used as opaque containers in the modified files.
+///
+/// A type is "opaque" if, across all modified files:
+///   - no variable of that type is ever dereferenced (`var->member`), OR
+///   - every dereferenced member name contains "priv"
+async fn find_opaque_types(
+    types: &HashSet<String>,
+    file_ranges: &HashMap<String, Vec<(usize, usize)>>,
+    worktree_path: &Path,
+) -> HashSet<String> {
+    if types.is_empty() {
+        return HashSet::new();
+    }
+
+    let mut type_members: HashMap<&str, HashSet<String>> = HashMap::new();
+    for t in types {
+        type_members.insert(t, HashSet::new());
+    }
+
+    let decl_re = Regex::new(r"struct\s+(\w+)\s+\*(\w+)").unwrap();
+
+    for file in file_ranges.keys() {
+        let file_path = worktree_path.join(file);
+        let Ok(content) = fs::read_to_string(&file_path).await else {
+            continue;
+        };
+
+        let mut var_to_type: Vec<(String, String)> = Vec::new();
+        for cap in decl_re.captures_iter(&content) {
+            let type_name = cap[1].to_string();
+            let var_name = cap[2].to_string();
+            if type_members.contains_key(type_name.as_str()) {
+                var_to_type.push((var_name, type_name));
+            }
+        }
+
+        for (var, typ) in &var_to_type {
+            let pattern = format!(r"{}\s*->\s*(\w+)", regex::escape(var));
+            if let Ok(re) = Regex::new(&pattern) {
+                for cap in re.captures_iter(&content) {
+                    let member = cap[1].to_string();
+                    type_members.get_mut(typ.as_str()).unwrap().insert(member);
+                }
+            }
+        }
+    }
+
+    type_members
+        .into_iter()
+        .filter(|(_, members)| members.is_empty() || members.iter().all(|m| m.contains("priv")))
+        .map(|(t, _)| t.to_string())
+        .collect()
 }
 
 /// Collects the names of all function/struct/enum/union definitions that overlap
