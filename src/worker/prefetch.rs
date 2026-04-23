@@ -112,11 +112,13 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
         symbols_to_lookup.remove(sym);
     }
 
-    // Merge called functions into the lookup set.
+    // Merge called functions *after* opaque filtering — find_opaque_types looks
+    // for `struct X *var` declarations, so non-struct names (function calls) would
+    // all be falsely classified as opaque and dropped.
     called_functions.retain(|f| !already_extracted.contains(f));
     symbols_to_lookup.extend(called_functions);
 
-    // Drop _ops structs — these are vtables, not data structures.
+    // _ops structs are large vtables (e.g. net_device_ops) — not useful for review.
     symbols_to_lookup.retain(|s| !s.ends_with("_ops"));
 
     let symbols: Vec<String> = symbols_to_lookup.into_iter().take(50).collect();
@@ -323,6 +325,9 @@ fn overlapping_definitions(
         "preproc_function_def",
     ];
 
+    // Iterate root children (top-down) rather than walking up from the diff point.
+    // Walking up finds only one enclosing block and misses sibling definitions
+    // that also overlap the diff range.
     let root = tree.root_node();
     let mut cursor = root.walk();
     let mut ranges = Vec::new();
@@ -378,6 +383,9 @@ pub fn extract_enclosing_block(
 // Ripgrep + tree-sitter symbol lookup
 // ---------------------------------------------------------------------------
 
+// These directories contain userspace reimplementations of kernel primitives
+// (e.g. tools/virtio/ringtest/ has a toy spin_lock) that shadow the real
+// definitions and provide no signal for patch review.
 fn is_noisy_tree(path_str: &str) -> bool {
     const NOISY_PREFIXES: &[&str] = &[
         "/tools/",
@@ -675,6 +683,7 @@ fn extract_called_functions(source_code: &str, diff_ranges: &[(usize, usize)]) -
             let in_diff = diff_ranges.iter().any(|&(s, e)| row >= s && row <= e);
             if in_diff {
                 if let Some(func) = node.child_by_field_name("function") {
+                    // Skip field_expression (e.g. obj->method) — only direct calls.
                     if func.kind() == "identifier" {
                         if let Ok(name) = func.utf8_text(source) {
                             if name.len() >= 3 && !is_common_c_word(name) {
@@ -728,6 +737,9 @@ pub fn extract_type_names(
         "enum_specifier",
         "type_definition",
     ];
+    // Walk up from the diff range to find the enclosing definition. If we hit
+    // root (file-scope code), we restrict type extraction to just the diff lines
+    // to avoid pulling types from unrelated functions in the same file.
     let hit_root = loop {
         if target_kinds.contains(&scope.kind()) {
             break false;
@@ -757,6 +769,8 @@ pub fn extract_type_names(
             walk(child, src, out, bounds);
         }
     }
+    // Also restrict for struct/union scopes (huge headers like netdevice.h) and
+    // when the parse tree has errors (scope is unreliable, fall back to range).
     let bounds = if hit_root
         || scope.kind() == "struct_specifier"
         || scope.kind() == "union_specifier"
