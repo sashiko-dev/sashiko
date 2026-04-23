@@ -78,7 +78,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     let mut symbols_to_lookup = HashSet::new();
     let mut already_extracted = HashSet::new();
 
-    // Phase 1: modified code — find enclosing blocks, types.
+    // Phase 1: modified code — find enclosing blocks, types, and called functions.
     for (file, ranges) in &file_ranges {
         if !file.ends_with(".c") && !file.ends_with(".h") {
             continue;
@@ -95,6 +95,12 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                 }
                 already_extracted.extend(extract_defined_names(&content, start, end));
                 symbols_to_lookup.extend(extract_type_names(&content, start, end));
+            }
+            let called = extract_called_functions(&content, ranges);
+            for f in called {
+                if !already_extracted.contains(&f) {
+                    symbols_to_lookup.insert(f);
+                }
             }
         }
     }
@@ -578,6 +584,52 @@ fn extract_defined_names(source_code: &str, start_line: usize, end_line: usize) 
         }
     }
     names
+}
+
+/// Extracts function call names from modified lines using tree-sitter.
+fn extract_called_functions(source_code: &str, diff_ranges: &[(usize, usize)]) -> HashSet<String> {
+    let mut funcs = HashSet::new();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return funcs;
+    }
+    let Some(tree) = parser.parse(source_code, None) else {
+        return funcs;
+    };
+    let source = source_code.as_bytes();
+
+    fn collect_calls(
+        node: Node<'_>,
+        source: &[u8],
+        diff_ranges: &[(usize, usize)],
+        out: &mut HashSet<String>,
+    ) {
+        if node.kind() == "call_expression" {
+            let row = node.start_position().row;
+            let in_diff = diff_ranges.iter().any(|&(s, e)| row >= s && row <= e);
+            if in_diff {
+                if let Some(func) = node.child_by_field_name("function") {
+                    if func.kind() == "identifier" {
+                        if let Ok(name) = func.utf8_text(source) {
+                            if name.len() >= 3 && !is_common_c_word(name) {
+                                out.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_calls(child, source, diff_ranges, out);
+        }
+    }
+
+    collect_calls(tree.root_node(), source, diff_ranges, &mut funcs);
+    funcs
 }
 
 /// Extracts C type names referenced within (and around) the modified line range.
