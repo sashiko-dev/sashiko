@@ -1,6 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tree_sitter::{Node, Parser, Point};
@@ -59,8 +59,6 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
     files
 }
 
-/// Uses Tree-sitter to extract the highest-level meaningful enclosing block (like a function or struct)
-/// for a given line range. Returns the source code of that block.
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
 use ignore::WalkBuilder;
@@ -68,149 +66,303 @@ use std::sync::{Arc, Mutex};
 
 const MAX_PREFETCH_CHARS: usize = 200000;
 
-pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String> {
-    let mut context_blocks = Vec::new();
-    let mut current_chars = 0;
-    let file_ranges = parse_diff_ranges(diff);
-    let mut symbols_to_lookup = HashSet::new();
+type LineRangeMap = BTreeMap<PathBuf, BTreeSet<(usize, usize)>>;
 
-    for (file, ranges) in file_ranges {
+fn add_range(map: &mut LineRangeMap, path: PathBuf, start: usize, end: usize) {
+    map.entry(path).or_default().insert((start, end));
+}
+
+pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String> {
+    let file_ranges = parse_diff_ranges(diff);
+    let mut range_map: LineRangeMap = BTreeMap::new();
+    let mut symbols_to_lookup = HashSet::new();
+    let mut already_extracted = HashSet::new();
+
+    // Phase 1: modified code — find enclosing blocks, types.
+    for (file, ranges) in &file_ranges {
         if !file.ends_with(".c") && !file.ends_with(".h") {
             continue;
         }
-        let file_path = worktree_path.join(&file);
+        let file_path = worktree_path.join(file);
         if !file_path.exists() {
             continue;
         }
 
         if let Ok(content) = fs::read_to_string(&file_path).await {
-            let mut extracted_blocks = HashSet::new();
-            for (start, end) in ranges {
-                if let Some(block) = extract_enclosing_block(&content, start, end) {
-                    extracted_blocks.insert(block);
+            for &(start, end) in ranges {
+                for (blk_start, blk_end) in overlapping_definitions(&content, start, end) {
+                    add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
                 }
-                let ids = extract_type_names(&content, start, end);
-                symbols_to_lookup.extend(ids);
-            }
-            for block in extracted_blocks {
-                let block_str = format!("--- Extracted Context from {} ---\n{}\n", file, block);
-                if current_chars + block_str.len() > MAX_PREFETCH_CHARS {
-                    context_blocks.push("\n... (Context prefetch limits reached)\n".to_string());
-                    return Ok(context_blocks.join("\n"));
-                }
-                current_chars += block_str.len();
-                context_blocks.push(block_str);
+                already_extracted.extend(extract_defined_names(&content, start, end));
+                symbols_to_lookup.extend(extract_type_names(&content, start, end));
             }
         }
+    }
+
+    // Remove symbols whose definitions are already in context.
+    for sym in &already_extracted {
+        symbols_to_lookup.remove(sym);
     }
 
     let symbols: Vec<String> = symbols_to_lookup.into_iter().take(50).collect();
-    if symbols.is_empty() {
-        return Ok(context_blocks.join("\n"));
-    }
 
-    let regex_pattern = format!(
-        "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
-        symbols.join("|")
-    );
+    // Phase 2: look up referenced symbol definitions via ripgrep + tree-sitter.
+    if !symbols.is_empty() {
+        let regex_pattern = format!(
+            "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
+            symbols.join("|")
+        );
 
-    let matcher = match RegexMatcher::new(&regex_pattern) {
-        Ok(m) => m,
-        Err(_) => return Ok(context_blocks.join("\n")),
-    };
+        let matcher = match RegexMatcher::new(&regex_pattern) {
+            Ok(m) => m,
+            Err(_) => return render_range_map(&range_map, worktree_path, &file_ranges).await,
+        };
 
-    let search_path = worktree_path.to_path_buf();
-    // Map of symbol -> list of (path, line_num) candidate hits.
-    type CandidatesMap = HashMap<String, Vec<(PathBuf, u64)>>;
-    let candidates: Arc<Mutex<CandidatesMap>> = Arc::new(Mutex::new(HashMap::new()));
-    let candidates_clone = Arc::clone(&candidates);
+        let search_path = worktree_path.to_path_buf();
+        let candidates: Arc<Mutex<HashMap<String, Vec<(PathBuf, u64)>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let candidates_clone = Arc::clone(&candidates);
 
-    let _ = tokio::task::spawn_blocking(move || {
-        let walker = WalkBuilder::new(&search_path)
-            .hidden(false)
-            .ignore(true)
-            .git_ignore(true)
-            .build_parallel();
+        let _ = tokio::task::spawn_blocking(move || {
+            let walker = WalkBuilder::new(&search_path)
+                .hidden(false)
+                .ignore(true)
+                .git_ignore(true)
+                .build_parallel();
 
-        walker.run(|| {
-            let matcher = matcher.clone();
-            let candidates = Arc::clone(&candidates_clone);
+            walker.run(|| {
+                let matcher = matcher.clone();
+                let candidates = Arc::clone(&candidates_clone);
+                let symbols = symbols.clone();
+                Box::new(move |result| {
+                    if let Ok(entry) = result {
+                        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                            return ignore::WalkState::Continue;
+                        }
 
-            let symbols = symbols.clone();
-            Box::new(move |result| {
-                if let Ok(entry) = result {
-                    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                        return ignore::WalkState::Continue;
-                    }
+                        let path = entry.path().to_path_buf();
+                        let path_str = path.to_string_lossy();
+                        if !path_str.ends_with(".h") && !path_str.ends_with(".c") {
+                            return ignore::WalkState::Continue;
+                        }
+                        if is_noisy_tree(&path_str) {
+                            return ignore::WalkState::Continue;
+                        }
 
-                    let path = entry.path().to_path_buf();
-                    let path_str = path.to_string_lossy();
-                    if !path_str.ends_with(".h") && !path_str.ends_with(".c") {
-                        return ignore::WalkState::Continue;
-                    }
-                    if is_noisy_tree(&path_str) {
-                        return ignore::WalkState::Continue;
-                    }
+                        let mut searcher = SearcherBuilder::new()
+                            .binary_detection(BinaryDetection::quit(b'\x00'))
+                            .line_number(true)
+                            .build();
 
-                    let mut searcher = SearcherBuilder::new()
-                        .binary_detection(BinaryDetection::quit(b'\x00'))
-                        .line_number(true)
-                        .build();
-
-                    let _ = searcher.search_path(
-                        &matcher,
-                        &path,
-                        grep_searcher::sinks::UTF8(|line_num, line| {
-                            for sym in &symbols {
-                                if line_matches_symbol(line, sym) {
-                                    let mut defs = candidates.lock().unwrap();
-                                    let entry = defs.entry(sym.clone()).or_default();
-                                    if entry.len() < 32 {
-                                        entry.push((path.clone(), line_num));
+                        let _ = searcher.search_path(
+                            &matcher,
+                            &path,
+                            grep_searcher::sinks::UTF8(|line_num, line| {
+                                for sym in &symbols {
+                                    if line_matches_symbol(line, sym) {
+                                        let mut defs = candidates.lock().unwrap();
+                                        let entry = defs.entry(sym.clone()).or_default();
+                                        if entry.len() < 32 {
+                                            entry.push((path.clone(), line_num));
+                                        }
                                     }
                                 }
-                            }
-                            Ok(true)
-                        }),
-                    );
-                }
-                ignore::WalkState::Continue
-            })
-        });
-    })
-    .await;
+                                Ok(true)
+                            }),
+                        );
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+        })
+        .await;
 
-    let candidates_vec: Vec<(String, Vec<(PathBuf, u64)>)> = {
-        let mut defs = candidates.lock().unwrap();
-        defs.drain().collect()
-    };
+        let candidates_vec: Vec<(String, Vec<(PathBuf, u64)>)> = {
+            let mut defs = candidates.lock().unwrap();
+            defs.drain().collect()
+        };
 
-    for (sym, hits) in candidates_vec {
-        if let Some((path, block)) = best_definition_block(&sym, &hits).await {
-            let filename = path
-                .strip_prefix(worktree_path)
-                .unwrap_or(&path)
-                .to_string_lossy();
-            let def_str = format!(
-                "--- Extracted Definition of {} from {} ---\n{}\n",
-                sym, filename, block
-            );
-
-            if current_chars + def_str.len() > MAX_PREFETCH_CHARS {
-                context_blocks.push("\n... (Definitions prefetch limits reached)\n".to_string());
-                break;
+        for (sym, hits) in candidates_vec {
+            if let Some((path, start, end)) = best_definition_range(&sym, &hits).await {
+                add_range(&mut range_map, path, start, end);
             }
-            current_chars += def_str.len();
-            context_blocks.push(def_str);
         }
     }
 
-    Ok(context_blocks.join("\n"))
+    render_range_map(&range_map, worktree_path, &file_ranges).await
 }
 
-/// Paths under these roots are test/sample/tools code that shadows real kernel
-/// definitions (e.g. `tools/virtio/ringtest/` hosts a toy `spin_lock`). They
-/// dominate first-match-wins lookups and contribute no signal for patch review.
+/// Merge overlapping or adjacent ranges (within `gap` lines).
+fn merge_ranges(ranges: &BTreeSet<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for &(start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 + gap + 1 {
+                last.1 = std::cmp::max(last.1, end);
+            } else {
+                merged.push((start, end));
+            }
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+/// Render the collected line ranges into the final prefetch context string.
+/// Modified files are rendered first (higher priority when nearing budget).
+async fn render_range_map(
+    range_map: &LineRangeMap,
+    worktree_path: &Path,
+    modified_files: &HashMap<String, Vec<(usize, usize)>>,
+) -> Result<String> {
+    let mut output = String::new();
+    let mut current_chars = 0;
+
+    let modified_paths: HashSet<PathBuf> = modified_files
+        .keys()
+        .map(|f| worktree_path.join(f))
+        .collect();
+
+    // Render modified files first, then definition-only files.
+    let mut ordered_files: Vec<&PathBuf> = range_map.keys().collect();
+    ordered_files.sort_by_key(|p| if modified_paths.contains(*p) { 0 } else { 1 });
+
+    for file_path in ordered_files {
+        let Some(ranges) = range_map.get(file_path) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(file_path).await else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let relative = file_path
+            .strip_prefix(worktree_path)
+            .unwrap_or(file_path)
+            .to_string_lossy();
+
+        let merged = merge_ranges(ranges, 3);
+
+        for &(start, end) in &merged {
+            let clamped_end = std::cmp::min(end, lines.len().saturating_sub(1));
+
+            let names = extract_defined_names(&content, start, clamped_end);
+            let header = if names.len() == 1 {
+                let name = names.into_iter().next().unwrap();
+                format!("--- {}:{} ({}) ---\n", relative, start + 1, name)
+            } else {
+                format!("--- {}:{} ---\n", relative, start + 1)
+            };
+
+            let block: String = if clamped_end >= start && start < lines.len() {
+                lines[start..=clamped_end].join("\n")
+            } else {
+                String::new()
+            };
+
+            if current_chars + header.len() + block.len() + 1 > MAX_PREFETCH_CHARS {
+                output.push_str("\n... (Context prefetch limits reached)\n");
+                return Ok(output);
+            }
+
+            output.push_str(&header);
+            output.push_str(&block);
+            output.push('\n');
+            current_chars += header.len() + block.len() + 1;
+        }
+    }
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Tree-sitter helpers
+// ---------------------------------------------------------------------------
+
+/// Collect line ranges of all top-level definitions that overlap a diff range.
+/// Returns complete, parseable definitions (functions, structs, enums, etc.)
+/// rather than walking up to a single enclosing block.
+fn overlapping_definitions(
+    source_code: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Vec<(usize, usize)> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return vec![];
+    }
+    let Some(tree) = parser.parse(source_code, None) else {
+        return vec![];
+    };
+
+    let target_kinds = [
+        "function_definition",
+        "struct_specifier",
+        "enum_specifier",
+        "union_specifier",
+        "declaration",
+        "type_definition",
+        "preproc_def",
+        "preproc_function_def",
+    ];
+
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut ranges = Vec::new();
+    for child in root.children(&mut cursor) {
+        if child.end_position().row < start_line || child.start_position().row > end_line {
+            continue;
+        }
+        if !target_kinds.contains(&child.kind()) {
+            continue;
+        }
+        let blk_start = child.start_position().row;
+        let blk_end = child.end_position().row;
+        let line_count = blk_end.saturating_sub(blk_start);
+        if line_count > 200 {
+            let center = (start_line + end_line) / 2;
+            ranges.push((
+                center.saturating_sub(100),
+                std::cmp::min(center + 100, blk_end),
+            ));
+        } else {
+            ranges.push((blk_start, blk_end));
+        }
+    }
+    ranges
+}
+
+/// Returns (block_text, symbol_name) for the first overlapping definition.
+pub fn extract_enclosing_block(
+    source_code: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Option<(String, Option<String>)> {
+    let defs = overlapping_definitions(source_code, start_line, end_line);
+    let &(blk_start, blk_end) = defs.first()?;
+    let lines: Vec<&str> = source_code.lines().collect();
+    let clamped_end = std::cmp::min(blk_end, lines.len().saturating_sub(1));
+    let text = if clamped_end >= blk_start && blk_start < lines.len() {
+        lines[blk_start..=clamped_end].join("\n")
+    } else {
+        return None;
+    };
+
+    let names = extract_defined_names(source_code, blk_start, clamped_end);
+    let name = if names.len() == 1 {
+        names.into_iter().next()
+    } else {
+        None
+    };
+    Some((text, name))
+}
+
+// ---------------------------------------------------------------------------
+// Ripgrep + tree-sitter symbol lookup
+// ---------------------------------------------------------------------------
+
 fn is_noisy_tree(path_str: &str) -> bool {
     const NOISY_PREFIXES: &[&str] = &[
         "/tools/",
@@ -222,9 +374,6 @@ fn is_noisy_tree(path_str: &str) -> bool {
     NOISY_PREFIXES.iter().any(|p| path_str.contains(p))
 }
 
-/// Require the match to be a word-boundary hit against the symbol, not just a
-/// substring occurrence. The regex matcher already filtered to definition-shaped
-/// lines; this is the per-symbol disambiguation.
 fn line_matches_symbol(line: &str, sym: &str) -> bool {
     let bytes = line.as_bytes();
     let sym_bytes = sym.as_bytes();
@@ -247,8 +396,7 @@ fn is_ident_byte(b: u8) -> bool {
 }
 
 /// Score a candidate definition block from tree-sitter. Higher is better.
-/// 0 means "not actually a definition" (forward decl, parameter name, etc.) —
-/// the caller rejects those.
+/// 0 means "not actually a definition" (forward decl, parameter name, etc.).
 fn score_definition_node(node: Node<'_>, sym: &str, source: &[u8]) -> i32 {
     let kind = node.kind();
     let names_symbol = |field: &str| {
@@ -267,7 +415,6 @@ fn score_definition_node(node: Node<'_>, sym: &str, source: &[u8]) -> i32 {
             if has_body { 100 } else { 0 }
         }
         "function_definition" => {
-            // declarator is nested; find the function_declarator's identifier.
             let declared = function_name(node, source);
             if declared.as_deref() != Some(sym) {
                 return 0;
@@ -282,7 +429,6 @@ fn score_definition_node(node: Node<'_>, sym: &str, source: &[u8]) -> i32 {
             }
         }
         "type_definition" => {
-            // typedef struct foo { ... } sym; — score if the typedef name matches.
             if typedef_names_match(node, sym, source) {
                 80
             } else {
@@ -291,10 +437,6 @@ fn score_definition_node(node: Node<'_>, sym: &str, source: &[u8]) -> i32 {
         }
         _ => 0,
     }
-    // Note: we deliberately do not score plain `declaration` nodes. They match
-    // variable decls like `struct dentry *dentry;` and prototypes without
-    // bodies — neither conveys the actual definition. If a symbol has only
-    // declaration-form hits we'd rather omit it than pollute the prompt.
 }
 
 fn function_name(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -321,11 +463,13 @@ fn typedef_names_match(node: Node<'_>, sym: &str, source: &[u8]) -> bool {
 }
 
 /// Pick the highest-scoring definition across all ripgrep candidates for `sym`.
-/// Returns (path, rendered block text).
-async fn best_definition_block(sym: &str, hits: &[(PathBuf, u64)]) -> Option<(PathBuf, String)> {
-    // Deduplicate paths — many hits may live in the same file.
+/// Returns (path, start_line, end_line).
+async fn best_definition_range(
+    sym: &str,
+    hits: &[(PathBuf, u64)],
+) -> Option<(PathBuf, usize, usize)> {
     let mut seen = HashSet::new();
-    let mut best: Option<(i32, PathBuf, String)> = None;
+    let mut best: Option<(i32, PathBuf, usize, usize)> = None;
 
     for (path, _line) in hits {
         if !seen.insert(path.clone()) {
@@ -334,22 +478,23 @@ async fn best_definition_block(sym: &str, hits: &[(PathBuf, u64)]) -> Option<(Pa
         let Ok(content) = fs::read_to_string(path).await else {
             continue;
         };
-        let Some((score, block)) = score_best_in_file(&content, sym) else {
+        let Some((score, start, end)) = score_best_in_file_for_sym(&content, sym) else {
             continue;
         };
         if score == 0 {
             continue;
         }
         match &best {
-            Some((best_score, _, _)) if *best_score >= score => {}
-            _ => best = Some((score, path.clone(), block)),
+            Some((best_score, _, _, _)) if *best_score >= score => {}
+            _ => best = Some((score, path.clone(), start, end)),
         }
     }
-    best.map(|(_, p, b)| (p, b))
+    best.map(|(_, p, s, e)| (p, s, e))
 }
 
-/// Parse `content` once and find the highest-scoring definition of `sym`.
-fn score_best_in_file(content: &str, sym: &str) -> Option<(i32, String)> {
+/// Parse `content` and find the highest-scoring definition of `sym`.
+/// Returns (score, start_line, end_line).
+fn score_best_in_file_for_sym(content: &str, sym: &str) -> Option<(i32, usize, usize)> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
     let tree = parser.parse(content, None)?;
@@ -372,101 +517,22 @@ fn score_best_in_file(content: &str, sym: &str) -> Option<(i32, String)> {
     }
 
     let (score, node) = best?;
-    let start = node.start_byte();
-    let end = node.end_byte();
-    if end > content.len() {
-        return None;
-    }
-    let lines_count = node
-        .end_position()
-        .row
-        .saturating_sub(node.start_position().row);
-    let block = if lines_count > 200 {
-        format!(
-            "// Block is too large ({} lines), truncated...\n{}",
-            lines_count,
-            truncate_to_window(content, node.start_position().row, node.end_position().row)
-        )
+    let start = node.start_position().row;
+    let end = node.end_position().row;
+    let line_count = end.saturating_sub(start);
+    if line_count > 200 {
+        Some((score, start, std::cmp::min(start + 200, end)))
     } else {
-        content[start..end].to_string()
-    };
-    Some((score, block))
-}
-pub fn extract_enclosing_block(
-    source_code: &str,
-    start_line: usize,
-    end_line: usize,
-) -> Option<String> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
-
-    let tree = parser.parse(source_code, None)?;
-    let root_node = tree.root_node();
-
-    let start_point = Point::new(start_line, 0);
-    let end_point = Point::new(end_line, usize::MAX);
-
-    let mut current_node = root_node.descendant_for_point_range(start_point, end_point)?;
-
-    let target_kinds = [
-        "function_definition",
-        "struct_specifier",
-        "enum_specifier",
-        "union_specifier",
-        "declaration",
-        "type_definition",
-    ];
-
-    let mut found_block = None;
-
-    loop {
-        if target_kinds.contains(&current_node.kind()) {
-            found_block = Some(current_node);
-            break;
-        }
-        if let Some(parent) = current_node.parent() {
-            current_node = parent;
-        } else {
-            break;
-        }
-    }
-
-    if let Some(node) = found_block {
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let lines_count = node
-            .end_position()
-            .row
-            .saturating_sub(node.start_position().row);
-
-        if start_byte < source_code.len() && end_byte <= source_code.len() {
-            if lines_count > 200 {
-                return Some(format!(
-                    "// Block is too large ({} lines), truncated to 200 lines around the change...\n{}",
-                    lines_count,
-                    truncate_to_window(source_code, start_line, end_line)
-                ));
-            }
-            return Some(source_code[start_byte..end_byte].to_string());
-        }
-    }
-
-    Some(truncate_to_window(source_code, start_line, end_line))
-}
-
-fn truncate_to_window(source_code: &str, start_line: usize, end_line: usize) -> String {
-    let lines: Vec<&str> = source_code.lines().collect();
-    let start = start_line.saturating_sub(20);
-    let end = std::cmp::min(lines.len().saturating_sub(1), end_line + 20);
-    if start <= end && start < lines.len() {
-        lines[start..=end].join("\n")
-    } else {
-        String::new()
+        Some((score, start, end))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Symbol extraction helpers
+// ---------------------------------------------------------------------------
 
 fn is_common_c_word(word: &str) -> bool {
-    let common = [
+    const COMMON: &[&str] = &[
         "int", "char", "void", "long", "short", "unsigned", "signed", "struct", "union", "enum",
         "typedef", "static", "const", "volatile", "if", "else", "for", "while", "do", "switch",
         "case", "default", "return", "break", "continue", "goto", "sizeof", "true", "false",
@@ -475,18 +541,46 @@ fn is_common_c_word(word: &str) -> bool {
         "int16_t", "int32_t", "int64_t", "bool", "size_t", "ssize_t", "pid_t", "uid_t", "gid_t",
         "off_t", "ret", "err", "len", "size", "res", "tmp", "val", "ptr", "idx", "out",
     ];
-    common.contains(&word)
+    COMMON.contains(&word)
+}
+
+/// Collects the names of all function/struct/enum/union definitions that overlap
+/// the given line range.
+fn extract_defined_names(source_code: &str, start_line: usize, end_line: usize) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .is_err()
+    {
+        return names;
+    }
+    let Some(tree) = parser.parse(source_code, None) else {
+        return names;
+    };
+    let source = source_code.as_bytes();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.end_position().row < start_line || child.start_position().row > end_line {
+            continue;
+        }
+        let name = match child.kind() {
+            "function_definition" => function_name(child, source),
+            "struct_specifier" | "enum_specifier" | "union_specifier" => child
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(str::to_string),
+            _ => None,
+        };
+        if let Some(n) = name {
+            names.insert(n);
+        }
+    }
+    names
 }
 
 /// Extracts C type names referenced within (and around) the modified line range.
-///
-/// Uses tree-sitter's `type_identifier` node-kind — which is semantically distinct
-/// from `identifier` — so we pick up `fbnic_dev`, `fbnic_net`, `seq_file` and
-/// skip variable/field/function names like `fbd`, `fbn`, `ret`.
-///
-/// Scopes collection to the **enclosing function/struct/typedef**, not just the
-/// exact modified lines, so types declared in a function signature (`struct
-/// fbnic_dev *fbd`) are captured even when the diff only touches the body.
 pub fn extract_type_names(
     source_code: &str,
     start_line: usize,
@@ -512,7 +606,6 @@ pub fn extract_type_names(
         return types;
     };
 
-    // Widen to the enclosing function/struct/typedef so signature types are in scope.
     let target_kinds = [
         "function_definition",
         "struct_specifier",
@@ -520,14 +613,22 @@ pub fn extract_type_names(
         "enum_specifier",
         "type_definition",
     ];
-    while !target_kinds.contains(&scope.kind()) {
+    let hit_root = loop {
+        if target_kinds.contains(&scope.kind()) {
+            break false;
+        }
         match scope.parent() {
             Some(p) => scope = p,
-            None => break,
+            None => break true,
         }
-    }
+    };
 
-    fn walk(n: Node<'_>, src: &[u8], out: &mut HashSet<String>) {
+    fn walk(n: Node<'_>, src: &[u8], out: &mut HashSet<String>, bounds: Option<(usize, usize)>) {
+        if let Some((lo, hi)) = bounds {
+            if n.end_position().row < lo || n.start_position().row > hi {
+                return;
+            }
+        }
         if n.kind() == "type_identifier"
             && let Ok(text) = n.utf8_text(src)
         {
@@ -538,10 +639,15 @@ pub fn extract_type_names(
         }
         let mut cursor = n.walk();
         for child in n.children(&mut cursor) {
-            walk(child, src, out);
+            walk(child, src, out, bounds);
         }
     }
-    walk(scope, source_code.as_bytes(), &mut types);
+    let bounds = if hit_root {
+        Some((start_line, end_line))
+    } else {
+        None
+    };
+    walk(scope, source_code.as_bytes(), &mut types, bounds);
     types
 }
 
@@ -585,11 +691,23 @@ struct MyStruct {
     int x;
 };
 "#;
-        let block_main = extract_enclosing_block(source_code, 4, 4).unwrap();
+        let (block_main, name_main) = extract_enclosing_block(source_code, 4, 4).unwrap();
         assert!(block_main.starts_with("int main() {"));
         assert!(block_main.ends_with("return 0;\n}"));
+        assert_eq!(name_main.as_deref(), Some("main"));
 
-        let block_struct = extract_enclosing_block(source_code, 10, 10).unwrap();
+        let (block_struct, name_struct) = extract_enclosing_block(source_code, 10, 10).unwrap();
         assert!(block_struct.starts_with("struct MyStruct"));
+        assert_eq!(name_struct.as_deref(), Some("MyStruct"));
+    }
+
+    #[test]
+    fn test_merge_ranges() {
+        let mut ranges = BTreeSet::new();
+        ranges.insert((10, 20));
+        ranges.insert((22, 30)); // gap of 1 — merges with gap=3
+        ranges.insert((50, 60)); // gap of 19 — does not merge
+        let merged = merge_ranges(&ranges, 3);
+        assert_eq!(merged, vec![(10, 30), (50, 60)]);
     }
 }
