@@ -757,7 +757,11 @@ pub fn extract_type_names(
             walk(child, src, out, bounds);
         }
     }
-    let bounds = if hit_root {
+    let bounds = if hit_root
+        || scope.kind() == "struct_specifier"
+        || scope.kind() == "union_specifier"
+        || scope.has_error()
+    {
         Some((start_line, end_line))
     } else {
         None
