@@ -116,6 +116,9 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     called_functions.retain(|f| !already_extracted.contains(f));
     symbols_to_lookup.extend(called_functions);
 
+    // Drop _ops structs — these are vtables, not data structures.
+    symbols_to_lookup.retain(|s| !s.ends_with("_ops"));
+
     let symbols: Vec<String> = symbols_to_lookup.into_iter().take(50).collect();
 
     // Phase 2: look up referenced symbol definitions via ripgrep + tree-sitter.
