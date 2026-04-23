@@ -136,10 +136,19 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
         };
 
         let search_path = worktree_path.to_path_buf();
-        let candidates: Arc<Mutex<HashMap<String, Vec<(PathBuf, u64)>>>> =
+        let caller_dirs: HashSet<&str> = file_ranges
+            .keys()
+            .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+            .collect();
+        // Two buckets per symbol: (general, priority). Priority = include/ or
+        // caller directories. Separate caps prevent the parallel walker from
+        // filling up with random .c files before it reaches include/ headers.
+        let candidates: Arc<Mutex<HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let candidates_clone = Arc::clone(&candidates);
 
+        let caller_dirs_arc: Arc<Vec<String>> =
+            Arc::new(caller_dirs.iter().map(|s| s.to_string()).collect());
         let _ = tokio::task::spawn_blocking(move || {
             let walker = WalkBuilder::new(&search_path)
                 .hidden(false)
@@ -151,6 +160,8 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                 let matcher = matcher.clone();
                 let candidates = Arc::clone(&candidates_clone);
                 let symbols = symbols.clone();
+                let caller_dirs_for_walk = Arc::clone(&caller_dirs_arc);
+                let search_path = search_path.clone();
                 Box::new(move |result| {
                     if let Ok(entry) = result {
                         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -171,6 +182,15 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                             .line_number(true)
                             .build();
 
+                        let rel = path
+                            .strip_prefix(&search_path)
+                            .map(|p| p.to_string_lossy())
+                            .unwrap_or_default();
+                        let is_priority = rel.starts_with("include/")
+                            || caller_dirs_for_walk.iter().any(|d| {
+                                rel.starts_with(d.as_str())
+                                    && rel.as_bytes().get(d.len()) == Some(&b'/')
+                            });
                         let _ = searcher.search_path(
                             &matcher,
                             &path,
@@ -178,9 +198,15 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
                                 for sym in &symbols {
                                     if line_matches_symbol(line, sym) {
                                         let mut defs = candidates.lock().unwrap();
-                                        let entry = defs.entry(sym.clone()).or_default();
-                                        if entry.len() < 32 {
-                                            entry.push((path.clone(), line_num));
+                                        let (general, priority) = defs
+                                            .entry(sym.clone())
+                                            .or_insert_with(|| (Vec::new(), Vec::new()));
+                                        if is_priority {
+                                            if priority.len() < 32 {
+                                                priority.push((path.clone(), line_num));
+                                            }
+                                        } else if general.len() < 32 {
+                                            general.push((path.clone(), line_num));
                                         }
                                     }
                                 }
@@ -194,13 +220,17 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
         })
         .await;
 
-        let candidates_vec: Vec<(String, Vec<(PathBuf, u64)>)> = {
+        let candidates_vec: Vec<(String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>))> = {
             let mut defs = candidates.lock().unwrap();
             defs.drain().collect()
         };
 
-        for (sym, hits) in candidates_vec {
-            if let Some((path, start, end)) = best_definition_range(&sym, &hits).await {
+        for (sym, (general, priority)) in candidates_vec {
+            let mut hits = priority;
+            hits.extend(general);
+            if let Some((path, start, end)) =
+                best_definition_range(&sym, &hits, worktree_path, &caller_dirs).await
+            {
                 add_range(&mut range_map, path, start, end);
             }
         }
@@ -486,10 +516,12 @@ fn typedef_names_match(node: Node<'_>, sym: &str, source: &[u8]) -> bool {
 }
 
 /// Pick the highest-scoring definition across all ripgrep candidates for `sym`.
-/// Returns (path, start_line, end_line).
+/// Total score = definition kind score + proximity score.
 async fn best_definition_range(
     sym: &str,
     hits: &[(PathBuf, u64)],
+    worktree_path: &Path,
+    caller_dirs: &HashSet<&str>,
 ) -> Option<(PathBuf, usize, usize)> {
     let mut seen = HashSet::new();
     let mut best: Option<(i32, PathBuf, usize, usize)> = None;
@@ -501,12 +533,18 @@ async fn best_definition_range(
         let Ok(content) = fs::read_to_string(path).await else {
             continue;
         };
-        let Some((score, start, end)) = score_best_in_file_for_sym(&content, sym) else {
+        let Some((def_score, is_static, start, end)) = score_best_in_file_for_sym(&content, sym)
+        else {
             continue;
         };
-        if score == 0 {
+        if def_score == 0 {
             continue;
         }
+        let rel_path = path
+            .strip_prefix(worktree_path)
+            .unwrap_or(path)
+            .to_string_lossy();
+        let score = def_score + proximity_score(&rel_path, is_static, caller_dirs);
         match &best {
             Some((best_score, _, _, _)) if *best_score >= score => {}
             _ => best = Some((score, path.clone(), start, end)),
@@ -515,9 +553,46 @@ async fn best_definition_range(
     best.map(|(_, p, s, e)| (p, s, e))
 }
 
+fn proximity_score(def_path: &str, is_static: bool, caller_dirs: &HashSet<&str>) -> i32 {
+    // Static .c definitions outside caller directories are almost certainly
+    // wrong-file matches (e.g. mkregtable.c reimplements list_add_tail).
+    if is_static && def_path.ends_with(".c") {
+        let def_dir = def_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if !caller_dirs.contains(def_dir) {
+            return -200;
+        }
+    }
+
+    let def_dir = def_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+
+    if caller_dirs.contains(def_dir) {
+        return 50;
+    }
+
+    if def_path.starts_with("include/") {
+        return 40;
+    }
+
+    // Fall back to longest common path prefix with any caller directory.
+    let best_common = caller_dirs
+        .iter()
+        .map(|cd| common_prefix_len(def_dir, cd))
+        .max()
+        .unwrap_or(0);
+
+    best_common as i32
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.split('/')
+        .zip(b.split('/'))
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
 /// Parse `content` and find the highest-scoring definition of `sym`.
-/// Returns (score, start_line, end_line).
-fn score_best_in_file_for_sym(content: &str, sym: &str) -> Option<(i32, usize, usize)> {
+/// Returns (score, is_static, start_line, end_line).
+fn score_best_in_file_for_sym(content: &str, sym: &str) -> Option<(i32, bool, usize, usize)> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_c::LANGUAGE.into()).ok()?;
     let tree = parser.parse(content, None)?;
@@ -540,14 +615,27 @@ fn score_best_in_file_for_sym(content: &str, sym: &str) -> Option<(i32, usize, u
     }
 
     let (score, node) = best?;
+    let is_static = has_static_storage(node, source);
     let start = node.start_position().row;
     let end = node.end_position().row;
     let line_count = end.saturating_sub(start);
     if line_count > 200 {
-        Some((score, start, std::cmp::min(start + 200, end)))
+        Some((score, is_static, start, std::cmp::min(start + 200, end)))
     } else {
-        Some((score, start, end))
+        Some((score, is_static, start, end))
     }
+}
+
+fn has_static_storage(node: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "storage_class_specifier"
+            && child.utf8_text(source).ok() == Some("static")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
