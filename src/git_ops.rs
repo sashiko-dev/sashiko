@@ -462,11 +462,41 @@ pub async fn ensure_remote(
     // 4. Fetch
     if should_fetch {
         info!("Fetching remote {}", name);
-        let fetch = Command::new("git")
+        let mut fetch = Command::new("git")
             .current_dir(repo_path)
             .args(["fetch", "--prune", name])
             .output()
             .await?;
+
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+
+            // Auto-recover from bad tags
+            if stderr.contains("fatal: bad object refs/tags/")
+                && let Some(start) = stderr.find("refs/tags/")
+            {
+                let tag_path = &stderr[start..];
+                let tag_path = tag_path.split_whitespace().next().unwrap_or("");
+                if !tag_path.is_empty() {
+                    warn!(
+                        "Detected bad tag '{}'. Attempting to delete and retry fetch.",
+                        tag_path
+                    );
+                    let _ = Command::new("git")
+                        .current_dir(repo_path)
+                        .args(["update-ref", "-d", tag_path])
+                        .output()
+                        .await;
+
+                    // Retry the fetch once
+                    fetch = Command::new("git")
+                        .current_dir(repo_path)
+                        .args(["fetch", "--prune", name])
+                        .output()
+                        .await?;
+                }
+            }
+        }
 
         if !fetch.status.success() {
             warn!(
