@@ -18,17 +18,17 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 
 ## 1. Prerequisites
 Install the following tools to manage the development lifecycle:
-- **just:** Command runner for project tasks. [Installation Guide](https://github.com/casey/just#installation)
+- **make:** Command runner for project tasks. (Usually pre-installed or available via `build-essential` on Debian/Ubuntu).
 - **yamllint:** Linter for YAML files. [Installation Guide](https://github.com/adrienverge/yamllint#installation)
 
 ## 2. Common Commands
-Use `just` to run common development tasks:
-- `just lint`: Run all linters (clippy, fmt, yamllint).
-- `just test`: Run unit tests.
-- `just integration-test`: Run the full integration smoke tests (starts server, runs benchmark, cleans up).
-- `just sob <range>`: Validate Signed-off-by tags for a commit range (default: `HEAD~1..HEAD`).
-- `just check-pr`: Run all checks required for a Pull Request (`sob`, `lint`, `test`).
-- `just check-all`: Run the complete suite including integration tests.
+Use `make` to run common development tasks:
+- `make lint`: Run all linters (clippy, fmt, yamllint).
+- `make test`: Run unit tests.
+- `make integration-test`: Run the full integration smoke tests (starts server, runs benchmark, cleans up).
+- `make sob`: Validate Signed-off-by tags for a commit range.
+- `make check-pr`: Run all checks required for a Pull Request (`sob`, `lint`, `test`).
+- `make check-all`: Run the complete suite including integration tests.
 
 # Rust Coding Standards
 
