@@ -999,7 +999,14 @@
                         <div style="display: flex; align-items: center; justify-content: space-between;">
                             <span>Colorblind Mode</span>
                             <label class="switch">
-                                <input type="checkbox" id="colorblindToggle" onchange="setColorblind(this.checked)" style="opacity: 0; width: 0; height: 0;">
+                                <input type="checkbox" id="colorblindToggle" onchange="setColorblind(this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div style="display: flex; align-items: center; justify-content: space-between;">
+                            <span>Show Patchset Summary</span>
+                            <label class="switch">
+                                <input type="checkbox" id="summaryToggle" onchange="setSummaryEnabled(this.checked)">
                                 <span class="slider"></span>
                             </label>
                         </div>
@@ -1020,6 +1027,11 @@
             display: inline-block;
             width: 40px;
             height: 20px;
+        }
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
         }
         .slider {
             position: absolute;
@@ -1110,7 +1122,8 @@
             patchsetLimit: 50,
             settings: {
                 theme: 'auto',
-                colorblind: false
+                colorblind: false,
+                patchsetSummary: true
             }
         };
 
@@ -1146,25 +1159,30 @@
             if (themeSelect) themeSelect.value = state.settings.theme;
             const cbToggle = document.getElementById('colorblindToggle');
             if (cbToggle) cbToggle.checked = state.settings.colorblind;
+            const summaryToggle = document.getElementById('summaryToggle');
+            if (summaryToggle) summaryToggle.checked = state.settings.patchsetSummary;
         }
 
-        function setTheme(val) {
-            state.settings.theme = val;
-            setCookie('sashiko_theme', val);
+        function updateSetting(key, cookieName, val, reloadOnPatchset = false) {
+            state.settings[key] = val;
+            setCookie(cookieName, typeof val === 'boolean' ? (val ? '1' : '0') : val);
             applySettings();
+            if (reloadOnPatchset && state.view === 'patchset' && state.patchsetId) {
+                router();
+            }
         }
 
-        function setColorblind(val) {
-            state.settings.colorblind = !!val;
-            setCookie('sashiko_colorblind', state.settings.colorblind ? '1' : '0');
-            applySettings();
-        }
+        function setTheme(val) { updateSetting('theme', 'sashiko_theme', val); }
+        function setColorblind(val) { updateSetting('colorblind', 'sashiko_colorblind', !!val); }
+        function setSummaryEnabled(val) { updateSetting('patchsetSummary', 'sashiko_summary', !!val, true); }
 
         function loadSettings() {
             const theme = getCookie('sashiko_theme');
             if (theme) state.settings.theme = theme;
             const cb = getCookie('sashiko_colorblind');
             if (cb) state.settings.colorblind = cb === '1';
+            const sum = getCookie('sashiko_summary');
+            if (sum) state.settings.patchsetSummary = sum === '1';
             applySettings();
         }
 
@@ -2206,15 +2224,26 @@
 
             let currentStatus = data.status || 'Pending';
 
+            let seriesSummaryHtml = '';
+            if (data.summary && state.settings.patchsetSummary) {
+                seriesSummaryHtml = `
+                    <div class="section" style="background: var(--btn-bg); border: 1px solid var(--border-light); padding: 12px; border-radius: 4px; margin-bottom: 20px;">
+                        <h2 style="margin-top: 0; font-size: 1em; color: var(--text-muted);">Series Summary</h2>
+                        <div style="font-size: 0.95em; line-height: 1.5; white-space: pre-wrap;">${escapeHtml(data.summary)}</div>
+                    </div>
+                `;
+            }
+
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
                 <h1>
                     <span>${escapeHtml(data.subject) || '(no subject)'}</span>
                     <span class="status-badge status-${currentStatus.replace(/ /g, '')}">${currentStatus}</span>
                 </h1>
-                
-                ${failureHtml}
 
+                ${seriesSummaryHtml}
+
+                ${failureHtml}
                 <div class="section">
                     <div class="kv"><div class="label">Author:</div><div>${(() => {
                         const a = parseAuthor(data.author);

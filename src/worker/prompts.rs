@@ -460,6 +460,7 @@ impl Worker {
         }
 
         let mut all_concerns = Vec::new();
+        let mut series_summary = String::new();
         let mut total_tokens_in = 0;
         let mut total_tokens_out = 0;
         let mut total_tokens_cached = 0;
@@ -758,6 +759,12 @@ Example:
                             if let Some(concerns) =
                                 result_json.get("concerns").and_then(|c| c.as_array())
                             {
+                                if stage == 1
+                                    && let Some(summary) =
+                                        result_json.get("series_summary").and_then(|s| s.as_str())
+                                {
+                                    series_summary = summary.to_string();
+                                }
                                 for c in concerns {
                                     if c.is_object() {
                                         all_concerns.push(c.clone());
@@ -1084,6 +1091,7 @@ Example:
             "findings": findings_json,
             "review_inline": review_inline_text,
             "fixes": fixes_text,
+            "summary": series_summary,
             "concerns_count": all_concerns.len()
         });
 

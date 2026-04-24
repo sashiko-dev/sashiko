@@ -1212,6 +1212,11 @@ impl Reviewer {
                                     review_content["summary"].as_str().unwrap_or("").to_string();
                                 let result_desc = "Review completed successfully.";
 
+                                if !summary.is_empty() {
+                                    let _ =
+                                        ctx.db.update_patchset_summary(patchset_id, &summary).await;
+                                }
+
                                 let inline_review = json_output["inline_review"].as_str();
 
                                 let mut db_success = true;
