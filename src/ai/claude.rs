@@ -88,6 +88,13 @@ pub struct ClaudeRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type")]
     pub thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -378,8 +385,6 @@ fn translate_ai_request(
         model: String::new(), // Will be set by the client
         messages,
         max_tokens,
-        thinking,
-        effort,
         system: if system_blocks.is_empty() {
             None
         } else {
@@ -387,6 +392,10 @@ fn translate_ai_request(
         },
         tools,
         temperature: normalize_temperature,
+        thinking: Some(ThinkingConfig {
+            thinking,
+            effort,
+        }),
     };
 
     // Apply cache control if enabled
