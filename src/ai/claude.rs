@@ -86,8 +86,6 @@ pub struct ClaudeRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ClaudeTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
 }
 
@@ -374,12 +372,6 @@ fn translate_ai_request(
             .collect()
     });
 
-    // With thinking enabled or adaptive temperature have to be set to 1.0
-    let normalize_temperature: Option<f32> = match thinking.as_deref() {
-        Some("disabled") => request.temperature,
-        Some(_) | None => Some(1.0),
-    };
-
     // Build the request
     let mut claude_request = ClaudeRequest {
         model: String::new(), // Will be set by the client
@@ -391,7 +383,6 @@ fn translate_ai_request(
             Some(system_blocks)
         },
         tools,
-        temperature: normalize_temperature,
         thinking: Some(ThinkingConfig {
             thinking,
             effort,
