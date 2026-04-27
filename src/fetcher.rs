@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::events::Event;
+use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
@@ -134,6 +134,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: commit.clone(),
                                     error: format!("Failed to set up remote {}: {}", url, e),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                         }
@@ -155,6 +156,7 @@ impl FetchAgent {
                                     .send(Event::IngestionFailed {
                                         article_id: commit.clone(),
                                         error: format!("Failed to fetch from {}: {}", url, e),
+                                        source: MessageSource::GitFetch,
                                     })
                                     .await;
                             }
@@ -197,6 +199,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: range.clone(),
                                     error: "Failed to resolve git range count".to_string(),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                             continue;
@@ -209,6 +212,7 @@ impl FetchAgent {
                             .send(Event::IngestionFailed {
                                 article_id: range.clone(),
                                 error: "Git range is empty".to_string(),
+                                source: MessageSource::GitFetch,
                             })
                             .await;
                         continue;
@@ -235,6 +239,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: range.clone(),
                                     error: "Failed to resolve git range SHAs".to_string(),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                             continue;
@@ -274,6 +279,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: commit_or_range.clone(),
                                     error: format!("Failed to resolve SHA: {}", e),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                             continue;
@@ -301,6 +307,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: commit_or_range,
                                     error: format!("Failed to extract patch: {}", e),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                         }

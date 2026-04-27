@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::db::Database;
-use crate::events::Event;
+use crate::events::{Event, MessageSource};
 use crate::fetcher::FetchRequest;
 use crate::settings::ServerSettings;
 use axum::{
@@ -293,7 +293,7 @@ fn generate_synthetic_id(prefix: &str) -> String {
         .expect("Time went backwards");
     // e.g. sashiko-local-1715890000-12345
     format!(
-        "sashiko-{}-{}-{}",
+        "sashiko-{}-{}-{}@sashiko.local",
         prefix,
         since_the_epoch.as_secs(),
         fastrand::u32(..)
@@ -334,6 +334,8 @@ async fn submit_patch(
 
             let event = Event::RawMboxSubmitted {
                 raw,
+                submission_id: id.clone(),
+                source: MessageSource::ApiInject,
                 group: "api-submit".to_string(),
                 baseline: base_commit,
                 skip_subjects,
@@ -373,7 +375,7 @@ async fn submit_patch(
             if let Err(e) = state
                 .db
                 .create_fetching_patchset(
-                    &id,
+                    &format!("{}@sashiko.local", id),
                     &format!("Fetching {} from {}...", &sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
@@ -432,6 +434,7 @@ async fn submit_patch(
                         .send(Event::IngestionFailed {
                             article_id: msgid_clone.clone(),
                             error: format!("Failed to fetch thread: {}", e),
+                            source: MessageSource::ApiFetchThread,
                         })
                         .await;
                 }
@@ -475,6 +478,8 @@ async fn fetch_and_inject_thread(
 
     let event = Event::RawMboxSubmitted {
         raw,
+        submission_id: msgid.to_string(),
+        source: MessageSource::ApiFetchThread,
         group: "api-submit".to_string(),
         baseline: None,
         skip_subjects: None,
@@ -957,4 +962,16 @@ async fn rerun_patch(
         })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_synthetic_id_format() {
+        let id = generate_synthetic_id("test");
+        assert!(id.starts_with("sashiko-test-"));
+        assert!(id.ends_with("@sashiko.local"));
+    }
 }
