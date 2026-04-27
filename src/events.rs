@@ -14,6 +14,16 @@
 
 use crate::patch::{Patch, PatchsetMetadata};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageSource {
+    Nntp,
+    ApiInject,
+    ApiFetchThread,
+    GitFetch,
+    GitImport,
+    GitArchive,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum Event {
@@ -42,6 +52,8 @@ pub enum Event {
     },
     RawMboxSubmitted {
         raw: String,
+        submission_id: String,
+        source: MessageSource,
         group: String,
         baseline: Option<String>,
         skip_subjects: Option<Vec<String>>,
@@ -50,6 +62,7 @@ pub enum Event {
     IngestionFailed {
         article_id: String,
         error: String,
+        source: MessageSource,
     },
 }
 
@@ -57,6 +70,7 @@ pub enum Event {
 pub struct ParsedArticle {
     pub group: String,
     pub article_id: String,
+    pub source: MessageSource,
     pub metadata: Option<PatchsetMetadata>,
     pub patch: Option<Patch>,
     pub baseline: Option<String>,
