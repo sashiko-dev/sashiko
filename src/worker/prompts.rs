@@ -118,12 +118,18 @@ pub struct WorkerResult {
     pub tokens_cached: u32,
 }
 
+#[derive(rust_embed::RustEmbed)]
+#[folder = "third_party/prompts/kernel/"]
+struct EmbeddedPrompts;
+
 pub struct PromptRegistry {
-    base_dir: PathBuf,
+    base_dir: Option<PathBuf>,
 }
 
 impl PromptRegistry {
-    pub fn new(base_dir: PathBuf) -> Self {
+    pub fn new(base_dir: Option<PathBuf>) -> Self {
+        let base_dir =
+            base_dir.or_else(|| std::env::var("SASHIKO_PROMPTS_DIR").ok().map(PathBuf::from));
         Self { base_dir }
     }
 
@@ -162,35 +168,26 @@ impl PromptRegistry {
         clean.push_str("The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.\n\n");
 
         // Subsystem Guidelines
-        let subsystem_dir = self.base_dir.join("subsystem");
-
-        if subsystem_dir.exists() {
-            self.append_directory(&mut content, &mut clean_files, &subsystem_dir, |name| {
-                if matches!(name, "README.md" | "subsystem-template.md" | "subsystem.md") {
-                    return false;
-                }
-                if let Some(selected) = selected_prompts {
-                    selected.iter().any(|s| name == s)
-                } else {
-                    true
-                }
-            })
-            .await?;
-        }
+        self.append_directory(&mut content, &mut clean_files, "subsystem", |name| {
+            if matches!(name, "README.md" | "subsystem-template.md" | "subsystem.md") {
+                return false;
+            }
+            if let Some(selected) = selected_prompts {
+                selected.iter().any(|s| name == s)
+            } else {
+                true
+            }
+        })
+        .await?;
 
         // Specific Pattern Directories
-        self.append_directory(
-            &mut content,
-            &mut clean_files,
-            &self.base_dir.join("patterns"),
-            |name| {
-                if let Some(selected) = selected_prompts {
-                    selected.iter().any(|s| name == s)
-                } else {
-                    true
-                }
-            },
-        )
+        self.append_directory(&mut content, &mut clean_files, "patterns", |name| {
+            if let Some(selected) = selected_prompts {
+                selected.iter().any(|s| name == s)
+            } else {
+                true
+            }
+        })
         .await?;
 
         content.push_str("</global_review_guidelines>\n");
@@ -202,7 +199,6 @@ impl PromptRegistry {
         Ok((content, clean))
     }
 
-    /// Returns the prompt for a specific stage, including any corresponding guidance files.
     pub async fn get_stage_prompt(&self, stage: u8) -> Result<(String, String)> {
         let mut clean = String::with_capacity(10_000);
         let mut clean_files = Vec::new();
@@ -253,7 +249,7 @@ You are a Red Team security researcher auditing a Linux kernel patch. Look for s
             7 => {
                 "# Stage 7. Hardware engineer's review
 
-You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), output an empty concerns list."
+You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), output an empty concerns list."
             }
             8 => {
                 "# Stage 8. Verification and severity estimation
@@ -323,16 +319,23 @@ You are an expert kernel developer writing patches to fix bugs found during revi
         clean: &mut Vec<String>,
         filename: &str,
     ) -> Result<()> {
-        let path = self.base_dir.join(filename);
-        if path.exists() {
+        if let Some(ref base_dir) = self.base_dir {
+            let path = base_dir.join(filename);
+            if path.exists() {
+                buffer.push_str(&format!("# {}\n", filename));
+                buffer.push_str(
+                    &fs::read_to_string(&path)
+                        .await
+                        .with_context(|| format!("Failed to read {}", filename))?,
+                );
+                buffer.push_str("\n\n");
+                clean.push(format!("@{}", filename));
+            }
+        } else if let Some(embedded) = EmbeddedPrompts::get(filename) {
+            let text = std::str::from_utf8(embedded.data.as_ref())?;
             buffer.push_str(&format!("# {}\n", filename));
-            buffer.push_str(
-                &fs::read_to_string(&path)
-                    .await
-                    .with_context(|| format!("Failed to read {}", filename))?,
-            );
+            buffer.push_str(text);
             buffer.push_str("\n\n");
-
             clean.push(format!("@{}", filename));
         }
         Ok(())
@@ -342,39 +345,58 @@ You are an expert kernel developer writing patches to fix bugs found during revi
         &self,
         buffer: &mut String,
         clean: &mut Vec<String>,
-        dir: &Path,
+        dir_name: &str,
         filter: F,
     ) -> Result<()>
     where
         F: Fn(&str) -> bool,
     {
-        if !dir.exists() {
-            return Ok(());
-        }
-        let mut entries = fs::read_dir(dir).await?;
-        let mut paths = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "md")
-                && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && filter(name)
-            {
-                paths.push(path);
+        if let Some(ref base_dir) = self.base_dir {
+            let dir = base_dir.join(dir_name);
+            if !dir.exists() {
+                return Ok(());
             }
-        }
-        paths.sort();
-        for path in paths {
-            let name = path.file_name().unwrap().to_string_lossy();
-            let header = if let Ok(rel) = path.strip_prefix(&self.base_dir) {
-                rel.to_string_lossy().to_string()
-            } else {
-                name.to_string()
-            };
-            buffer.push_str(&format!("## {}\n", header));
-            buffer.push_str(&fs::read_to_string(&path).await?);
-            buffer.push_str("\n\n");
-
-            clean.push(format!("@{}", name));
+            let mut entries = fs::read_dir(dir).await?;
+            let mut paths = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "md")
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && filter(name)
+                {
+                    paths.push(path);
+                }
+            }
+            paths.sort();
+            for path in paths {
+                let name = path.file_name().unwrap().to_string_lossy();
+                let header = format!("{dir_name}/{}", name);
+                buffer.push_str(&format!("## {}\n", header));
+                buffer.push_str(&fs::read_to_string(&path).await?);
+                buffer.push_str("\n\n");
+                clean.push(format!("@{}", name));
+            }
+        } else {
+            let mut files = Vec::new();
+            for file in EmbeddedPrompts::iter() {
+                let path_str = file.as_ref();
+                if let Some(relative) = path_str.strip_prefix(&(format!("{}/", dir_name)))
+                    && relative.ends_with(".md")
+                    && filter(relative)
+                {
+                    files.push(path_str.to_string());
+                }
+            }
+            files.sort();
+            for file in files {
+                let embedded = EmbeddedPrompts::get(&file).unwrap();
+                let text = std::str::from_utf8(embedded.data.as_ref())?;
+                let name = Path::new(&file).file_name().unwrap().to_string_lossy();
+                buffer.push_str(&format!("## {}\n", file));
+                buffer.push_str(text);
+                buffer.push_str("\n\n");
+                clean.push(format!("@{}", name));
+            }
         }
         Ok(())
     }
@@ -465,80 +487,89 @@ impl Worker {
         let mut total_tokens_cached = 0;
 
         // Phase 0: Pre-screen relevant prompts
-        let subsystem_md_path = self.prompts.base_dir.join("subsystem/subsystem.md");
-        let selected_prompts = if subsystem_md_path.exists() {
-            match tokio::fs::read_to_string(&subsystem_md_path).await {
-                Ok(subsystem_md) => {
-                    info!("Executing Phase 0: Pre-screening relevant subsystem guides.");
-                    let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```";
-                    let phase0_prompt = format!(
-                        "<subsystem_guide_index>\n{}\n</subsystem_guide_index>\n\n<patch>\n{}\n</patch>",
-                        subsystem_md, target_commit_diff
-                    );
-                    let schema = json!({
-                        "type": "OBJECT",
-                        "properties": {
-                            "selected_prompts": {
-                                "type": "ARRAY",
-                                "items": { "type": "STRING" }
-                            }
-                        },
-                        "required": ["selected_prompts"]
-                    });
-
-                    let req = AiRequest {
-                        system: Some(phase0_system.to_string()),
-                        messages: vec![AiMessage {
-                            role: AiRole::User,
-                            content: Some(phase0_prompt),
-                            thought: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                        }],
-                        tools: None,
-                        temperature: Some(0.0),
-                        response_format: Some(AiResponseFormat::Json {
-                            schema: Some(schema),
-                        }),
-                        context_tag: self
-                            .context_tag
-                            .as_ref()
-                            .map(|prefix| format!("{}s:0] ", &prefix[..prefix.len() - 2])),
-                    };
-
-                    let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
-                    let val = self
-                        .json_request("s0", req, &mut tokens, |v| {
-                            v.get("selected_prompts")
-                                .and_then(|v| v.as_array())
-                                .ok_or_else(|| "missing 'selected_prompts' array".to_string())
-                                .map(|_| ())
-                        })
-                        .await;
-                    total_tokens_in = tokens.0;
-                    total_tokens_out = tokens.1;
-                    total_tokens_cached = tokens.2;
-                    val.and_then(|val| {
-                        let arr = val.get("selected_prompts")?.as_array()?;
-                        let prompts: Vec<String> = arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .filter(|name| !STAGE_EXCLUSIVE_GUIDES.contains(&name.as_str()))
-                            .collect();
-                        info!("Phase 0 selected prompts: {:?}", prompts);
-                        Some(prompts)
-                    })
+        let subsystem_md = if let Some(ref base_dir) = self.prompts.base_dir {
+            let path = base_dir.join("subsystem/subsystem.md");
+            if path.exists() {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!("Failed to read subsystem.md for Phase 0: {}", e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to read subsystem.md for Phase 0: {}", e);
-                    None
-                }
+            } else {
+                None
             }
+        } else if let Some(embedded) = EmbeddedPrompts::get("subsystem/subsystem.md") {
+            std::str::from_utf8(embedded.data.as_ref())
+                .ok()
+                .map(|s| s.to_string())
         } else {
-            warn!(
-                "subsystem.md not found for Phase 0 at {:?}",
-                subsystem_md_path
+            None
+        };
+
+        let selected_prompts = if let Some(subsystem_md) = subsystem_md {
+            info!("Executing Phase 0: Pre-screening relevant subsystem guides.");
+            let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```";
+            let phase0_prompt = format!(
+                "<subsystem_guide_index>\n{}\n</subsystem_guide_index>\n\n<patch>\n{}\n</patch>",
+                subsystem_md, target_commit_diff
             );
+            let schema = json!({
+                "type": "OBJECT",
+                "properties": {
+                    "selected_prompts": {
+                        "type": "ARRAY",
+                        "items": { "type": "STRING" }
+                    }
+                },
+                "required": ["selected_prompts"]
+            });
+
+            let req = AiRequest {
+                system: Some(phase0_system.to_string()),
+                messages: vec![AiMessage {
+                    role: AiRole::User,
+                    content: Some(phase0_prompt),
+                    thought: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                tools: None,
+                temperature: Some(0.0),
+                response_format: Some(AiResponseFormat::Json {
+                    schema: Some(schema),
+                }),
+                context_tag: self
+                    .context_tag
+                    .as_ref()
+                    .map(|prefix| format!("{}s:0] ", &prefix[..prefix.len() - 2])),
+            };
+
+            let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
+            let val = self
+                .json_request("s0", req, &mut tokens, |v| {
+                    v.get("selected_prompts")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| "missing 'selected_prompts' array".to_string())
+                        .map(|_| ())
+                })
+                .await;
+            total_tokens_in = tokens.0;
+            total_tokens_out = tokens.1;
+            total_tokens_cached = tokens.2;
+            val.and_then(|val| {
+                let arr = val.get("selected_prompts")?.as_array()?;
+                let prompts: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|name| !STAGE_EXCLUSIVE_GUIDES.contains(&name.as_str()))
+                    .collect();
+                info!("Phase 0 selected prompts: {:?}", prompts);
+                Some(prompts)
+            })
+        } else {
+            warn!("subsystem.md not found for Phase 0");
             None
         };
 
@@ -1188,6 +1219,10 @@ Example:
                     .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)),
             };
 
+            info!(
+                "→ Requesting AI generation for Stage {} (Turn {})",
+                _stage, turns
+            );
             let resp = self.provider.generate_content(request).await?;
 
             if let Some(usage) = &resp.usage {
@@ -1209,6 +1244,10 @@ Example:
             if let Some(tool_calls) = resp.tool_calls {
                 let mut tool_responses = Vec::new();
                 for call in tool_calls {
+                    info!(
+                        "← Turn {} (Stage {}) calls tool: {}",
+                        turns, _stage, call.function_name
+                    );
                     let result = match self
                         .tools
                         .call(&call.function_name, call.arguments.clone())
@@ -1217,6 +1256,16 @@ Example:
                         Ok(v) => v.to_string(),
                         Err(e) => json!({"error": e.to_string()}).to_string(),
                     };
+                    let preview: String = result.chars().take(100).collect();
+                    let ellipsis = if result.chars().count() > 100 {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    info!(
+                        "→ Tool {} returned: {}{}",
+                        call.function_name, preview, ellipsis
+                    );
                     tool_responses.push(AiMessage {
                         role: AiRole::Tool,
                         content: Some(result),
@@ -1555,7 +1604,7 @@ mod tests {
 
         let provider = std::sync::Arc::new(MockProviderAlwaysFails);
         let tools = crate::worker::tools::ToolBox::new(temp_dir.path().to_path_buf(), None);
-        let prompts = PromptRegistry::new(prompts_dir);
+        let prompts = PromptRegistry::new(Some(prompts_dir));
         let config = WorkerConfig {
             max_input_tokens: 10000,
             max_interactions: 3,
