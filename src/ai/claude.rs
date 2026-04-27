@@ -39,6 +39,11 @@ pub enum ClaudeContent {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -323,6 +328,14 @@ fn translate_ai_request(
                     });
                 }
 
+                // Add thinking content if present
+                if let Some(thinking) = &msg.thought {
+                    content.push(ClaudeContent::Thinking {
+                        thinking: thinking.clone(),
+                        signature: None,
+                    });
+                }
+
                 // Add tool calls as tool_use blocks
                 if let Some(tool_calls) = &msg.tool_calls {
                     for call in tool_calls {
@@ -383,10 +396,7 @@ fn translate_ai_request(
             Some(system_blocks)
         },
         tools,
-        thinking: Some(ThinkingConfig {
-            thinking,
-            effort,
-        }),
+        thinking: Some(ThinkingConfig { thinking, effort }),
     };
 
     // Apply cache control if enabled
@@ -419,6 +429,7 @@ fn apply_cache_control(request: &mut ClaudeRequest) {
 
 fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
     let mut content = String::new();
+    let mut thought = String::new();
     let mut tool_calls = Vec::new();
 
     for block in &resp.content {
@@ -426,12 +437,15 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
             ClaudeContent::Text { text, .. } => {
                 content.push_str(text);
             }
+            ClaudeContent::Thinking { thinking, .. } => {
+                thought.push_str(thinking);
+            }
             ClaudeContent::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     function_name: name.clone(),
                     arguments: input.clone(),
-                    thought_signature: None, // Claude doesn't expose thought signatures
+                    thought_signature: None,
                 });
             }
             ClaudeContent::ToolResult { .. } => {
@@ -453,7 +467,11 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         } else {
             Some(content)
         },
-        thought: None,
+        thought: if thought.is_empty() {
+            None
+        } else {
+            Some(thought)
+        },
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
