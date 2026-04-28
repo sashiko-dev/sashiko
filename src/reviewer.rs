@@ -94,18 +94,22 @@ impl Reviewer {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
-        let baseline_registry = match BaselineRegistry::new(&repo_path) {
-            Ok(r) => Arc::new(r),
-            Err(e) => {
-                error!(
-                    "Failed to initialize BaselineRegistry: {}. Using empty registry.",
-                    e
-                );
-                Arc::new(BaselineRegistry::new(&repo_path).unwrap_or_else(|_| {
-                    panic!("Critical error initializing BaselineRegistry: {}", e)
-                }))
-            }
-        };
+        let baseline_registry =
+            match BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone()) {
+                Ok(r) => Arc::new(r),
+                Err(e) => {
+                    error!(
+                        "Failed to initialize BaselineRegistry: {}. Using empty registry.",
+                        e
+                    );
+                    Arc::new(
+                        BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone())
+                            .unwrap_or_else(|_| {
+                                panic!("Critical error initializing BaselineRegistry: {}", e)
+                            }),
+                    )
+                }
+            };
 
         // Initialize Provider
         let provider = create_provider(&settings).expect("Failed to create AI provider");
@@ -358,10 +362,12 @@ impl Reviewer {
             } else {
                 ctx.baseline_registry
                     .resolve_candidates(&all_files, &subject, body.as_deref())
+                    .await
             }
         } else {
             ctx.baseline_registry
                 .resolve_candidates(&all_files, &subject, body.as_deref())
+                .await
         };
 
         // 1. Find a working baseline (apply series)
@@ -2200,7 +2206,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings: settings.clone(),
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new(".")).unwrap()),
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
             quota_manager,
             target_review_count: 1,
             provider,
