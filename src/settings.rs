@@ -214,8 +214,18 @@ pub struct ServerSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct CustomRemoteSettings {
+    pub name: String,
+    pub url: String,
+    pub check_all_branches: bool,
+    pub only_branches: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct GitSettings {
     pub repository_path: String,
+    pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

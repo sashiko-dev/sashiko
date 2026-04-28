@@ -46,6 +46,13 @@ port = 8080
 [git]
 repository_path = "third_party/linux"
 
+# Track custom remotes and attempt to apply patches on their branches
+# [[git.custom_remotes]]
+# name = "remote-name"
+# url = "git://my-custom.com/remote"
+# check_all_branches = true
+# only_branches = []
+
 [review]
 concurrency = 20
 worktree_dir = "review_trees"
