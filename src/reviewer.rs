@@ -694,6 +694,7 @@ impl Reviewer {
     ) {
         let mut attempts: Vec<BaselineAttempt> = Vec::new();
         let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
+        let mut tested_shas = std::collections::HashSet::new();
 
         for candidate in candidates {
             let baseline_ref = candidate.as_str();
@@ -729,6 +730,11 @@ impl Reviewer {
                     continue;
                 }
             };
+
+            if !tested_shas.insert(baseline_sha.clone()) {
+                info!("Skipping duplicate baseline SHA {}", baseline_sha);
+                continue;
+            }
 
             let baseline_display = format!("{} ({})", baseline_ref, baseline_sha);
             current_log = format!("Trying baseline: {}\n", baseline_display);

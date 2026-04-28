@@ -268,6 +268,53 @@ impl BaselineRegistry {
         // For simplicity: HEAD.
         candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
 
+        // 5. Custom Remotes
+        if let Some(custom_remotes) = &self.custom_remotes {
+            for remote in custom_remotes {
+                // Fetch to ensure we have the latest branches (Issue 1)
+                if let Err(e) =
+                    crate::git_ops::ensure_remote(&self.repo_path, &remote.name, &remote.url, false)
+                        .await
+                {
+                    warn!(
+                        "Failed to ensure custom remote {}: {}. Using local branches.",
+                        remote.name, e
+                    );
+                }
+
+                if remote.check_all_branches {
+                    match crate::git_ops::get_remote_branches(&self.repo_path, &remote.name).await {
+                        Ok(branches) => {
+                            for branch in branches {
+                                candidates.push(BaselineResolution::RemoteTarget {
+                                    url: remote.url.clone(),
+                                    name: remote.name.clone(),
+                                    branch: Some(branch),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get remote branches for {}: {}. Continuing.",
+                                remote.name, e
+                            );
+                        }
+                    }
+                }
+
+                // Change else if to if (Issue 3)
+                if let Some(branches) = &remote.only_branches {
+                    for branch in branches {
+                        candidates.push(BaselineResolution::RemoteTarget {
+                            url: remote.url.clone(),
+                            name: remote.name.clone(),
+                            branch: Some(branch.clone()),
+                        });
+                    }
+                }
+            }
+        }
+
         // Deduplicate
         // Simple deduplication based on string representation or enum equality
         // Since we implement PartialEq, dedup works if consecutive. We need unique.
@@ -740,5 +787,50 @@ F: patterns/
         let pos_net_nonext = names_nonext.iter().position(|x| x == "net").unwrap();
         let pos_net_next_nonext = names_nonext.iter().position(|x| x == "net-next").unwrap();
         assert!(pos_net_nonext < pos_net_next_nonext);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_custom_remotes() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        // Init git repo to avoid ensure_remote failing too hard
+        std::process::Command::new("git")
+            .current_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+
+        let mut remote_map = HashMap::new();
+        let dummy_url = repo_path.join("dummy_remote").to_str().unwrap().to_string();
+        remote_map.insert(
+            dummy_url.clone(),
+            "dummy-repo".to_string(),
+        );
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "dummy-repo".to_string(),
+                url: dummy_url,
+                check_all_branches: false,
+                only_branches: Some(vec!["master".to_string()]),
+            }]),
+            repo_path: repo_path.to_path_buf(),
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+
+        let candidate_names: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(candidate_names.contains(&"dummy-repo".to_string()));
     }
 }
