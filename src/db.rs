@@ -1637,10 +1637,33 @@ impl Database {
                 )
                 .await?;
             if let Ok(Some(row)) = rows.next().await {
-                // Found it! Use this ID. We'll update its fields below.
                 let id: i64 = row.get(0)?;
+                let existing_subject: String = row.get(3)?;
                 let subject_index: u32 = row.get(4).unwrap_or(9999);
                 let existing_total: u32 = row.get(5).unwrap_or(1);
+
+                let v_new = version.unwrap_or(1);
+                let v_old = crate::patch::parse_subject_version(&existing_subject).unwrap_or(1);
+
+                // Check for index collision
+                let index_collision = if part_index == 0 {
+                    subject_index == 0
+                } else {
+                    let mut p_rows = self
+                        .conn
+                        .query(
+                            "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
+                            libsql::params![id, part_index, message_id],
+                        )
+                        .await?;
+                    p_rows.next().await.ok().flatten().is_some()
+                };
+
+                if index_collision || v_new != v_old {
+                    continue;
+                }
+
+                // Found it! Use this ID. We'll update its fields below.
 
                 // Prevent downgrading a series to a singleton if we already have multiple parts.
                 // This handles cases where a singleton root (1/1) overwrites a series (N/N) inferred from replies.
