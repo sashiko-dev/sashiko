@@ -99,7 +99,7 @@ async fn test_merge_prefixes_mismatch_should_split() {
 }
 
 #[tokio::test]
-async fn test_merge_prefixes_match_should_not_merge() {
+async fn test_merge_prefixes_match_should_merge_if_complementary() {
     let db = setup_db().await;
 
     let t1 = db
@@ -161,8 +161,8 @@ async fn test_merge_prefixes_match_should_not_merge() {
         .unwrap()
         .unwrap();
 
-    assert_ne!(
+    assert_eq!(
         ps1, ps2,
-        "Matching prefixes (net-next) should NOT merge across threads"
+        "Matching prefixes (net-next) SHOULD merge across threads when they are complementary"
     );
 }
