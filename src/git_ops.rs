@@ -685,6 +685,77 @@ pub async fn git_checkout(repo_path: &Path, target: &str) -> Result<()> {
     }
 }
 
+pub async fn git_create_squashed_branch(
+    repo_path: &Path,
+    range: &str,
+    branch_name: &str,
+) -> Result<String> {
+    let output = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-parse", "--verify", "--quiet", branch_name])
+        .output()
+        .await?;
+
+    if output.status.success() {
+        tokio::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["branch", "-D", branch_name])
+            .output()
+            .await?;
+    }
+
+    let output = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("{}^1", range.split("..").next().unwrap_or("")),
+        ])
+        .output()
+        .await;
+
+    let base = match output {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                range.split("..").next().unwrap_or("HEAD~1").to_string()
+            } else {
+                s
+            }
+        }
+        _ => range.split("..").next().unwrap_or("HEAD~1").to_string(),
+    };
+
+    tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["checkout", "-b", branch_name, &base])
+        .output()
+        .await?;
+
+    let output = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args([
+            "merge",
+            "--squash",
+            range.split("..").nth(1).unwrap_or("HEAD"),
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!("git merge --squash failed");
+    }
+
+    tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["commit", "-m", "Squashed commits"])
+        .output()
+        .await?;
+
+    let sha = get_commit_hash(repo_path, branch_name).await?;
+    Ok(sha)
+}
+
 pub async fn git_branch(repo_path: &Path) -> Result<String> {
     let output = Command::new("git")
         .current_dir(repo_path)
@@ -1079,6 +1150,90 @@ mod tests {
             !worktree.is_empty_commit(&initial_hash).await?,
             "Initial should not be empty"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_git_create_squashed_branch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        // Init git repo
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+        let _ = Command::new("git")
+            .current_dir(&repo_path)
+            .args(["branch", "-m", "master"])
+            .output()
+            .await;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+
+        // 1. Initial commit
+        let file_path = repo_path.join("test.txt");
+        {
+            let mut file = File::create(&file_path)?;
+            writeln!(file, "Initial content")?;
+        }
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "-m", "Initial commit"])
+            .output()
+            .await?;
+
+        let base_hash = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // 2. Add commit 1
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
+            writeln!(file, "Commit 1 content")?;
+        }
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "-am", "Commit 1"])
+            .output()
+            .await?;
+
+        // 3. Add commit 2
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
+            writeln!(file, "Commit 2 content")?;
+        }
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "-am", "Commit 2"])
+            .output()
+            .await?;
+
+        let head_hash = get_commit_hash(&repo_path, "HEAD").await?;
+        let range = format!("{}..{}", base_hash, head_hash);
+
+        // Create uncommitted changes in repo
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
+            writeln!(file, "Uncommitted changes")?;
+        }
+
+        // Test create branch should fail when there are uncommitted changes
+        let result = git_create_squashed_branch(&repo_path, &range, "temp-test-review-2").await;
+        assert!(result.is_err());
 
         Ok(())
     }
