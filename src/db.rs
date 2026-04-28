@@ -1637,10 +1637,33 @@ impl Database {
                 )
                 .await?;
             if let Ok(Some(row)) = rows.next().await {
-                // Found it! Use this ID. We'll update its fields below.
                 let id: i64 = row.get(0)?;
+                let existing_subject: String = row.get(3)?;
                 let subject_index: u32 = row.get(4).unwrap_or(9999);
                 let existing_total: u32 = row.get(5).unwrap_or(1);
+
+                let v_new = version.unwrap_or(1);
+                let v_old = crate::patch::parse_subject_version(&existing_subject).unwrap_or(1);
+
+                // Check for index collision
+                let index_collision = if part_index == 0 {
+                    subject_index == 0
+                } else {
+                    let mut p_rows = self
+                        .conn
+                        .query(
+                            "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
+                            libsql::params![id, part_index, message_id],
+                        )
+                        .await?;
+                    p_rows.next().await.ok().flatten().is_some()
+                };
+
+                if index_collision || v_new != v_old {
+                    continue;
+                }
+
+                // Found it! Use this ID. We'll update its fields below.
 
                 // Prevent downgrading a series to a singleton if we already have multiple parts.
                 // This handles cases where a singleton root (1/1) overwrites a series (N/N) inferred from replies.
@@ -1839,8 +1862,10 @@ impl Database {
             };
 
             // Thread Enforcement: To prevent cross-thread "stealing" of patches for resends of the same series,
-            // we strictly require multi-part series patches to belong to the same thread.
-            let thread_compatible = same_thread || is_singleton;
+            // we strictly require multi-part series patches to belong to the same thread, UNLESS
+            // the candidate series is incomplete, in which case we allow merging complementary parts.
+            let thread_compatible =
+                same_thread || is_singleton || (existing_received < existing_total);
 
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
@@ -1851,20 +1876,28 @@ impl Database {
                 && thread_compatible
                 && !index_collision
             {
-                matches.push((id, existing_subject_index));
+                matches.push((id, existing_subject_index, existing_thread_id));
             }
         }
 
         if !matches.is_empty() {
-            // Sort matches to pick the "best" one to keep (e.g. oldest ID or one with lowest subject index)
-            // Let's keep the one with the lowest ID (created first)
-            matches.sort_by_key(|k| k.0);
+            // Sort matches: Prioritize matches in the same thread over cross-thread matches, then pick by oldest ID.
+            matches.sort_by_key(|k| {
+                let same = k.2 == Some(thread_id);
+                (!same, k.0)
+            });
 
             let target_id = matches[0].0;
+            let target_thread_id = matches[0].2;
             let mut current_subject_index = matches[0].1;
 
-            // If we have multiple matches, merge others into target_id
-            for (merge_from_id, merge_subject_index) in matches.iter().skip(1) {
+            // If we have multiple matches, merge others into target_id.
+            // Cross-thread merging of existing distinct patchsets is prevented to avoid accidental stealing.
+            for (merge_from_id, merge_subject_index, merge_from_thread_id) in matches.iter().skip(1)
+            {
+                if *merge_from_thread_id != target_thread_id {
+                    continue;
+                }
                 let merge_from_id = *merge_from_id;
                 info!("Merging patchset {} into {}", merge_from_id, target_id);
 
@@ -4955,7 +4988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cross_thread_no_merge() {
+    async fn test_cross_thread_complementary_merge_in_db() {
         let db = setup_db().await;
 
         // 1. Create Thread A and Patchset A (1/2)
@@ -5045,10 +5078,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // 3. Assert they DID NOT merge (ps2 should NOT equal ps1)
-        assert_ne!(
+        // 3. Assert they DID merge (ps2 should equal ps1)
+        assert_eq!(
             ps1, ps2,
-            "Patchsets from different threads should NOT merge even if author/time match"
+            "Patchsets from different threads SHOULD merge when they are complementary and incomplete"
         );
 
         // 4. Verify total patches count or received parts
@@ -5060,13 +5093,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(details1["received_parts"], 1);
+        assert_eq!(details1["received_parts"], 2);
         let details2 = db
             .get_patchset_details(ps2, None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(details2["received_parts"], 1);
+        assert_eq!(details2["received_parts"], 2);
     }
 
     #[tokio::test]
