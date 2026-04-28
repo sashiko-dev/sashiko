@@ -1984,7 +1984,7 @@ impl Reviewer {
                     && !findings_arr.is_empty()
                 {
                     header.push_str(&format!(
-                        "Sashiko AI review found {} potential issue(s):\n",
+                        "Thank you for your contribution! Sashiko AI review found {} potential issue(s) to consider:\n",
                         findings_arr.len()
                     ));
 
