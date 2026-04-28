@@ -14,7 +14,7 @@
 
 use clap::{Parser, Subcommand};
 use sashiko::db::Database;
-use sashiko::events::{Event, ParsedArticle, MessageSource};
+use sashiko::events::{Event, MessageSource, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
@@ -235,7 +235,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _permit = permit; // Hold permit until task completion
 
                 match event {
-                    Event::IngestionFailed { article_id, error, source } => {
+                    Event::IngestionFailed {
+                        article_id,
+                        error,
+                        source,
+                    } => {
                         if let Err(e) = tx
                             .send(ParsedArticle {
                                 group: "error".to_string(),
@@ -825,7 +829,6 @@ async fn process_parsed_article(
     );
     */
 
-
     let cover_letter_id = if group == "git-fetch" || group == "api-submit" {
         if metadata.total == 1 {
             Some(metadata.message_id.as_str())
@@ -1038,9 +1041,10 @@ fn calculate_embargo_hours(
 
 fn resolve_root_msg_id(source: MessageSource, article_id: &str) -> String {
     match source {
-        MessageSource::Nntp | MessageSource::ApiFetchThread | MessageSource::GitArchive | MessageSource::ApiInject => {
-            article_id.to_string()
-        }
+        MessageSource::Nntp
+        | MessageSource::ApiFetchThread
+        | MessageSource::GitArchive
+        | MessageSource::ApiInject => article_id.to_string(),
         MessageSource::GitFetch | MessageSource::GitImport => {
             format!("{}@sashiko.local", article_id)
         }
@@ -1235,12 +1239,30 @@ mod tests {
 
     #[test]
     fn test_resolve_root_msg_id() {
-        assert_eq!(resolve_root_msg_id(MessageSource::Nntp, "foo@bar.com"), "foo@bar.com");
-        assert_eq!(resolve_root_msg_id(MessageSource::ApiFetchThread, "foo@bar.com"), "foo@bar.com");
-        assert_eq!(resolve_root_msg_id(MessageSource::GitArchive, "foo@bar.com"), "foo@bar.com");
-        assert_eq!(resolve_root_msg_id(MessageSource::ApiInject, "sashiko-123"), "sashiko-123");
-        assert_eq!(resolve_root_msg_id(MessageSource::GitFetch, "abc123_sha"), "abc123_sha@sashiko.local");
-        assert_eq!(resolve_root_msg_id(MessageSource::GitImport, "range_a_b"), "range_a_b@sashiko.local");
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::Nntp, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::ApiFetchThread, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitArchive, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::ApiInject, "sashiko-123"),
+            "sashiko-123"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitFetch, "abc123_sha"),
+            "abc123_sha@sashiko.local"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitImport, "range_a_b"),
+            "range_a_b@sashiko.local"
+        );
     }
 
     #[test]

@@ -3312,7 +3312,7 @@ impl Database {
         }
 
         // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
-        let thread_id = self.ensure_thread_for_message(&root_msg_id, now).await?;
+        let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
 
         // 3. Create the fetching patchset
         let mut rows = self.conn
