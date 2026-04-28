@@ -24,6 +24,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -219,7 +220,8 @@ impl std::error::Error for GeminiError {}
 pub struct GeminiClient {
     model: String,
     base_url: String,
-    client: Client,
+    api_key: String,
+    client: RwLock<Client>,
 }
 
 impl GeminiClient {
@@ -231,23 +233,42 @@ impl GeminiClient {
             .or_else(|_| std::env::var("GEMINI_BASE_URL"))
             .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
 
-        let mut headers = reqwest::header::HeaderMap::new();
-        if !api_key.is_empty()
-            && let Ok(value) = reqwest::header::HeaderValue::from_str(&api_key)
-        {
-            headers.insert("x-goog-api-key", value);
-        }
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(600))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = Self::create_http_client(&api_key);
 
         Self {
             model,
             base_url,
-            client,
+            api_key,
+            client: RwLock::new(client),
         }
+    }
+
+    fn create_http_client(api_key: &str) -> Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !api_key.is_empty()
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(api_key)
+        {
+            headers.insert("x-goog-api-key", value);
+        }
+
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(600))
+            // Reliability Tuning: Prune stale connections proactively
+            .tcp_keepalive(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(5)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// Replaces the internal HTTP client with a fresh one.
+    /// This is used to recover from degraded connection pools without restarting the service.
+    async fn refresh_client(&self) {
+        tracing::warn!("Refreshing Gemini HTTP client due to transport errors...");
+        let new_client = Self::create_http_client(&self.api_key);
+        let mut guard = self.client.write().await;
+        *guard = new_client;
     }
 
     pub async fn generate_content_single(
@@ -270,11 +291,16 @@ impl GeminiClient {
     ) -> Result<GenerateContentResponse> {
         let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
 
-        let res = match self.client.post(url).json(body).send().await {
+        let client = self.client.read().await.clone();
+        let res = match client.post(url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
                 let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
                 tracing::error!("Gemini request failed (transport): {}", err_str);
+
+                // Trigger self-healing: Refresh the client for the next attempt
+                self.refresh_client().await;
+
                 return Err(GeminiError::TransientError(Duration::from_secs(30), err_str).into());
             }
         };
