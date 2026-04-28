@@ -537,6 +537,31 @@ pub async fn ensure_remote(
     Ok(())
 }
 
+pub async fn get_remote_branches(repo_path: &Path, remote_name: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["branch", "-r", "--list", &format!("{}/*", remote_name)])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to list remote branches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let branches = stdout
+        .lines()
+        .map(|line| line.trim())
+        .filter_map(|line| line.strip_prefix(&format!("{}/", remote_name)))
+        .filter(|s| !s.contains("->")) // Filter out symbolic references like HEAD -> origin/main
+        .map(|s| s.to_string())
+        .collect();
+    Ok(branches)
+}
+
 pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
     let output = Command::new("git")
         .current_dir(path)
