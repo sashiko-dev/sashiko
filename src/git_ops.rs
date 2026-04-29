@@ -68,20 +68,42 @@ impl GitWorktree {
 
         info!("Creating worktree at {:?}", path);
 
+        // Split worktree creation into two phases:
+        // 1) metadata update (under lock, fast)
+        // 2) file checkout (no lock, parallelizable)
+        let output = {
+            let lock = get_worktree_lock();
+            let _guard = lock.lock().await;
+            Command::new("git")
+                .current_dir(repo_path)
+                .args(["-c", "safe.bareRepository=all"])
+                .arg("worktree")
+                .arg("add")
+                .arg("--detach")
+                .arg("--no-checkout")
+                .arg(&path)
+                .arg(commit_hash)
+                .output()
+                .await?
+        };
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Failed to create worktree: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
         let output = Command::new("git")
-            .current_dir(repo_path)
+            .current_dir(&path)
             .args(["-c", "safe.bareRepository=all"])
-            .arg("worktree")
-            .arg("add")
-            .arg("--detach")
-            .arg(&path)
-            .arg(commit_hash)
+            .args(["reset", "--hard", commit_hash])
             .output()
             .await?;
 
         if !output.status.success() {
             return Err(anyhow!(
-                "Failed to create worktree: {}",
+                "Failed to populate worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
@@ -270,15 +292,27 @@ impl GitWorktree {
             return Ok(());
         }
         info!("Removing worktree at {:?}", self.path);
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(["-c", "safe.bareRepository=all"])
-            .arg("worktree")
-            .arg("remove")
-            .arg("-f")
-            .arg(&self.path)
-            .output()
-            .await?;
+
+        // Split worktree removal into two phases:
+        // 1) directory cleanup (no lock, parallelizable)
+        // 2) metadata removal (under lock, fast)
+        if self.path.exists() {
+            std::fs::remove_dir_all(&self.path)?;
+        }
+
+        let output = {
+            let lock = get_worktree_lock();
+            let _guard = lock.lock().await;
+            Command::new("git")
+                .current_dir(&self.repo_path)
+                .args(["-c", "safe.bareRepository=all"])
+                .arg("worktree")
+                .arg("remove")
+                .arg("-f")
+                .arg(&self.path)
+                .output()
+                .await?
+        };
 
         if !output.status.success() {
             return Err(anyhow!(
@@ -314,13 +348,17 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
 #[allow(dead_code)]
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     info!("Pruning git worktrees in {:?}", repo_path);
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["-c", "safe.bareRepository=all"])
-        .arg("worktree")
-        .arg("prune")
-        .output()
-        .await?;
+    let output = {
+        let lock = get_worktree_lock();
+        let _guard = lock.lock().await;
+        Command::new("git")
+            .current_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .arg("worktree")
+            .arg("prune")
+            .output()
+            .await?
+    };
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -368,6 +406,13 @@ fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
 fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
     static GLOBAL_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
     GLOBAL_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
+    static WORKTREE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    WORKTREE_LOCK
         .get_or_init(|| Arc::new(AsyncMutex::new(())))
         .clone()
 }
