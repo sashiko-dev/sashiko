@@ -42,6 +42,8 @@ pub enum ClaudeContent {
     Thinking {
         thinking: String,
         signature: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
@@ -53,6 +55,8 @@ pub enum ClaudeContent {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -228,10 +232,11 @@ impl ClaudeClient {
                 serde_json::from_str(&body_text).context("Failed to parse Claude API response")?;
 
             info!(
-                "Claude response received. Tokens: in={}, out={}, cached={}",
+                "Claude response received. Tokens: in={}, out={}, cache_read={} cache_write={}",
                 response.usage.input_tokens,
                 response.usage.output_tokens,
-                response.usage.cache_read_input_tokens.unwrap_or(0)
+                response.usage.cache_read_input_tokens.unwrap_or(0),
+                response.usage.cache_creation_input_tokens.unwrap_or(0),
             );
 
             Ok(response)
@@ -332,6 +337,7 @@ fn translate_ai_request(
                     content.push(ClaudeContent::Thinking {
                         thinking: thinking.clone(),
                         signature: signature.clone(),
+                        cache_control: None,
                     });
                 }
 
@@ -362,6 +368,7 @@ fn translate_ai_request(
                     tool_use_id: tool_call_id.clone(),
                     content: msg.content.clone().unwrap_or_else(|| "{}".to_string()),
                     is_error: None,
+                    cache_control: None,
                 }];
 
                 messages.push(ClaudeMessage {
@@ -424,6 +431,18 @@ fn apply_cache_control(request: &mut ClaudeRequest) {
             cache_type: "ephemeral".to_string(),
         });
     }
+
+    // Mark last content for caching
+    if let Some(message) = request.messages.last_mut()
+        && let Some(content) = message.content.last_mut()
+        && let ClaudeContent::Text { cache_control, .. }
+        | ClaudeContent::Thinking { cache_control, .. }
+        | ClaudeContent::ToolResult { cache_control, .. } = content
+    {
+        *cache_control = Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+        });
+    }
 }
 
 fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
@@ -439,7 +458,8 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
             }
             ClaudeContent::Thinking {
                 thinking,
-                signature
+                signature,
+                ..
             } => {
                 thought.push_str(thinking);
                 thought_signature.push_str(signature);
@@ -458,11 +478,18 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         }
     }
 
+    let cache_read = resp.usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = resp.usage.cache_creation_input_tokens.unwrap_or(0);
+    let total_input = resp.usage.input_tokens + cache_read + cache_write;
     let usage = AiUsage {
-        prompt_tokens: resp.usage.input_tokens as usize,
+        prompt_tokens: total_input as usize,
         completion_tokens: resp.usage.output_tokens as usize,
-        total_tokens: (resp.usage.input_tokens + resp.usage.output_tokens) as usize,
-        cached_tokens: resp.usage.cache_read_input_tokens.map(|c| c as usize),
+        total_tokens: (total_input + resp.usage.output_tokens) as usize,
+        cached_tokens: if cache_read > 0 {
+            Some(cache_read as usize)
+        } else {
+            None
+        },
     };
 
     Ok(AiResponse {
