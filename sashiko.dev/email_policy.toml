@@ -61,3 +61,8 @@ cc = ["wsa+renesas@sang-engineering.com"]
 lists = ["rust-for-linux@vger.kernel.org"]
 reply_to_author = true
 cc = ["ojeda@kernel.org"]
+
+[subsystems.sched-ext]
+lists = ["sched-ext@lists.linux.dev"]
+reply_to_author = true
+cc = ["sched-ext@lists.linux.dev"]
