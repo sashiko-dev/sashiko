@@ -492,6 +492,7 @@ impl Worker {
                             role: AiRole::User,
                             content: Some(phase0_prompt),
                             thought: None,
+                            thought_signature: None,
                             tool_calls: None,
                             tool_call_id: None,
                         }],
@@ -634,6 +635,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                     role: crate::ai::AiRole::User,
                     content: Some(format!("{}\n\n{}", shared_context, planning_prompt)),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 }],
@@ -1139,6 +1141,7 @@ Example:
             role: AiRole::User,
             content: Some(user_prompt.clone()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         };
@@ -1152,6 +1155,7 @@ Example:
                 role: AiRole::System,
                 content: Some(clean_system_prompt.clone()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1160,6 +1164,7 @@ Example:
             role: AiRole::User,
             content: Some(clean_user_prompt),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         });
@@ -1200,6 +1205,7 @@ Example:
                 role: AiRole::Assistant,
                 content: resp.content.clone(),
                 thought: resp.thought.clone(),
+                thought_signature: resp.thought_signature.clone(),
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
             };
@@ -1221,6 +1227,7 @@ Example:
                         role: AiRole::Tool,
                         content: Some(result),
                         thought: None,
+                        thought_signature: None,
                         tool_calls: None,
                         tool_call_id: Some(call.id.clone()),
                     });
@@ -1287,6 +1294,7 @@ Example:
                     role: AiRole::Assistant,
                     content: Some(content.to_string()),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -1297,6 +1305,7 @@ Example:
                         e
                     )),
                     thought: None,
+                    thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });

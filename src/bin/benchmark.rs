@@ -528,6 +528,7 @@ async fn process_entry(
                 role: AiRole::User,
                 content: Some(prompt.clone()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],

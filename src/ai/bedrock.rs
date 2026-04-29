@@ -389,6 +389,7 @@ fn translate_response(
             Some(text_parts.join(""))
         },
         thought: None,
+        thought_signature: None,
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
@@ -531,6 +532,7 @@ mod tests {
             role: AiRole::User,
             content: Some("Hello!".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -567,6 +569,7 @@ mod tests {
             role: AiRole::Assistant,
             content: Some("Let me check.".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
                 function_name: "git_log".to_string(),
@@ -603,6 +606,7 @@ mod tests {
             role: AiRole::Tool,
             content: Some("commit abc123".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
         }]);
@@ -626,6 +630,7 @@ mod tests {
             role: AiRole::User,
             content: Some("hi".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -658,6 +663,7 @@ mod tests {
             role: AiRole::User,
             content: Some("hi".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -693,6 +699,7 @@ mod tests {
             role: AiRole::User,
             content: Some("hi".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -708,6 +715,7 @@ mod tests {
             role: AiRole::User,
             content: Some("hi".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -726,6 +734,7 @@ mod tests {
             role: AiRole::User,
             content: Some("Hello!".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -747,6 +756,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("first".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -754,6 +764,7 @@ mod tests {
                 role: AiRole::Assistant,
                 content: Some("second".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -781,6 +792,7 @@ mod tests {
                 role: AiRole::Tool,
                 content: Some("result A".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_a".to_string()),
             },
@@ -788,6 +800,7 @@ mod tests {
                 role: AiRole::Tool,
                 content: Some("result B".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_b".to_string()),
             },
@@ -809,6 +822,7 @@ mod tests {
             role: AiRole::User,
             content: Some("hi".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -826,6 +840,7 @@ mod tests {
             role: AiRole::User,
             content: Some("hi".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -852,6 +867,7 @@ mod tests {
             role: AiRole::User,
             content: Some("hi".to_string()),
             thought: None,
+            thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
         }]);

@@ -43,6 +43,9 @@ pub struct AiMessage {
     /// Optional thoughts of the AI model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
+    /// Optional thoughts signature of the AI model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
     /// Optional tool calls requested by the AI (usually only for Assistant role).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -129,6 +132,9 @@ pub struct AiResponse {
     /// Optional thought content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
+    /// Optional thought signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
     /// Tool calls requested by the AI, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -318,6 +324,7 @@ mod tests {
                 role: AiRole::User,
                 content: Some("Hello".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],

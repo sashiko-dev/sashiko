@@ -2068,6 +2068,7 @@ mod tests {
             Ok(AiResponse {
                 content: Some("Mocked AI response".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 usage: None,
             })
@@ -2398,6 +2399,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             Ok(AiResponse {
                 content: Some("Mocked AI response".to_string()),
                 thought: None,
+                thought_signature: None,
                 tool_calls: None,
                 usage: Some(crate::ai::AiUsage {
                     prompt_tokens: self.prompt_tokens,

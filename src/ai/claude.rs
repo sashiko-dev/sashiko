@@ -41,8 +41,7 @@ pub enum ClaudeContent {
     },
     Thinking {
         thinking: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
+        signature: String,
     },
     ToolUse {
         id: String,
@@ -329,10 +328,10 @@ fn translate_ai_request(
                 }
 
                 // Add thinking content if present
-                if let Some(thinking) = &msg.thought {
+                if let (Some(thinking), Some(signature)) = (&msg.thought, &msg.thought_signature) {
                     content.push(ClaudeContent::Thinking {
                         thinking: thinking.clone(),
-                        signature: None,
+                        signature: signature.clone(),
                     });
                 }
 
@@ -428,6 +427,7 @@ fn apply_cache_control(request: &mut ClaudeRequest) {
 }
 
 fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
+    let mut thought_signature = String::new();
     let mut content = String::new();
     let mut thought = String::new();
     let mut tool_calls = Vec::new();
@@ -437,8 +437,12 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
             ClaudeContent::Text { text, .. } => {
                 content.push_str(text);
             }
-            ClaudeContent::Thinking { thinking, .. } => {
+            ClaudeContent::Thinking {
+                thinking,
+                signature
+            } => {
                 thought.push_str(thinking);
+                thought_signature.push_str(signature);
             }
             ClaudeContent::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall {
@@ -471,6 +475,11 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
             None
         } else {
             Some(thought)
+        },
+        thought_signature: if thought_signature.is_empty() {
+            None
+        } else {
+            Some(thought_signature)
         },
         tool_calls: if tool_calls.is_empty() {
             None
