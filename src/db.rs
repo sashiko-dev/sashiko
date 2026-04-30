@@ -3271,7 +3271,7 @@ impl Database {
 
     pub async fn create_fetching_patchset(
         &self,
-        article_id: &str,
+        root_msg_id: &str,
         subject: &str,
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
@@ -3280,13 +3280,7 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        let root_msg_id = if article_id.contains('@') {
-            article_id.to_string()
-        } else {
-            format!("{}@sashiko.local", article_id)
-        };
-
-        let clid_candidates = vec![article_id.to_string(), root_msg_id.clone()];
+        let clid_candidates = vec![root_msg_id.to_string()];
 
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
@@ -3318,7 +3312,7 @@ impl Database {
         }
 
         // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
-        let thread_id = self.ensure_thread_for_message(&root_msg_id, now).await?;
+        let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
 
         // 3. Create the fetching patchset
         let mut rows = self.conn
@@ -3335,12 +3329,7 @@ impl Database {
             Err(anyhow::anyhow!("Failed to get patchset ID"))
         }
     }
-    pub async fn update_patchset_error(&self, article_id: &str, error: &str) -> Result<()> {
-        let root_msg_id = if article_id.contains('@') {
-            article_id.to_string()
-        } else {
-            format!("{}@sashiko.local", article_id)
-        };
+    pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         self.conn
             .execute(
                 "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
