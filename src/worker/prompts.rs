@@ -149,15 +149,12 @@ impl PromptRegistry {
             current_date
         );
 
-        content.push_str(&date_fact);
-        content.push_str("You are an expert Linux kernel maintainer. Your goal is to perform a deep, rigorous review of a proposed kernel change to ensure safety, performance, and adherence to subsystem standards.\n\n");
-        content.push_str("TOOL USAGE: When you need to gather information using tools, actively batch parallel or independent tool calls into a single response to minimize the number of conversation turns.\n\n");
+        let preamble = format!("{}You are an expert Linux kernel maintainer. You are ONE AGENT in a multi-stage automated review pipeline. Other specialized agents handle different aspects of this patch in parallel — you must focus strictly on YOUR stage's scope and not duplicate their work. A later consolidation stage (Stage 8) will merge all findings, so do not attempt a comprehensive review yourself.\n\nTOOL USAGE: Use tools only to verify concerns within your stage's scope. Do not broadly explore the codebase or trace execution paths outside your assigned focus area. When you do use tools, batch parallel or independent calls into a single response to minimize turns.\n\n", date_fact);
+        content.push_str(&preamble);
         content.push_str("<global_review_guidelines>\n");
         content.push_str("The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.\n\n");
 
-        clean.push_str(&date_fact);
-        clean.push_str("You are an expert Linux kernel maintainer. Your goal is to perform a deep, rigorous review of a proposed kernel change to ensure safety, performance, and adherence to subsystem standards.\n\n");
-        clean.push_str("TOOL USAGE: When you need to gather information using tools, actively batch parallel or independent tool calls into a single response to minimize the number of conversation turns.\n\n");
+        clean.push_str(&preamble);
         clean.push_str("<global_review_guidelines>\n");
         clean.push_str("The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.\n\n");
 
@@ -212,25 +209,35 @@ impl PromptRegistry {
             1 => {
                 "# Stage 1. Analyze commit main goal
 
-You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally flawed concepts? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."
+SCOPE: You review ONLY high-level intent and design — the \"what\" and \"why\", not the \"how\". Other pipeline agents cover: implementation completeness (Stage 2), control flow bugs (Stage 3), resource leaks/UAF (Stage 4), locking/concurrency (Stage 5), security vulnerabilities (Stage 6), and hardware correctness (Stage 7). Do NOT analyze locking correctness, sleeping-in-atomic-context, lock ordering, race conditions, or any concurrency concern — Stage 5 handles all of that. Do not read source code to trace lock/context interactions.
+
+You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally wrong approaches? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."
             }
             2 => {
                 "# Stage 2. High-level implementation verification
+
+SCOPE: You verify ONLY that the code matches what the commit message claims. Other pipeline agents cover: high-level design (Stage 1), control flow tracing (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), security (Stage 6), and hardware (Stage 7). Do not trace execution paths, check locking, or audit for security issues.
 
 You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."
             }
             3 => {
                 "# Stage 3. Execution flow verification
 
+SCOPE: You trace ONLY control flow and logic errors within the changed code. Other pipeline agents cover: high-level design (Stage 1), commit message vs code (Stage 2), resource lifecycle (Stage 4), locking/concurrency (Stage 5), security (Stage 6), and hardware (Stage 7). Do not audit locking correctness, memory management, or security attack surfaces.
+
 You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."
             }
             4 => {
                 "# Stage 4. Resource management
 
+SCOPE: You audit ONLY resource lifecycle: allocations, frees, refcounts, and teardown symmetry. Other pipeline agents cover: high-level design (Stage 1), implementation completeness (Stage 2), control flow (Stage 3), locking/concurrency (Stage 5), security (Stage 6), and hardware (Stage 7). Do not analyze lock correctness or security attack surfaces.
+
 You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."
             }
             5 => {
                 "# Stage 5. Locking and synchronization
+
+SCOPE: You audit ONLY locking, concurrency, and synchronization. Other pipeline agents cover: high-level design (Stage 1), implementation completeness (Stage 2), control flow (Stage 3), resource lifecycle (Stage 4), security (Stage 6), and hardware (Stage 7). Do not investigate general logic errors, missing API callbacks, or buffer overflow attack surfaces.
 
 You are a world-class concurrency and locking expert auditing a Linux kernel patch.
 Carefully review the proposed patch for ANY locking, concurrency, or synchronization bugs.
@@ -248,10 +255,14 @@ You MUST consider the following categories of issues and report any violations:
             6 => {
                 "# Stage 6. Security audit
 
+SCOPE: You audit ONLY security vulnerabilities and attack surfaces. Other pipeline agents cover: high-level design (Stage 1), implementation completeness (Stage 2), control flow (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), and hardware (Stage 7). Do not report general logic errors or resource leaks unless they have a direct security impact.
+
 You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."
             }
             7 => {
                 "# Stage 7. Hardware engineer's review
+
+SCOPE: You review ONLY hardware/driver-specific concerns. Other pipeline agents cover: high-level design (Stage 1), implementation completeness (Stage 2), control flow (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), and security (Stage 6). Do not report general software logic issues that aren't hardware-related.
 
 You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), output an empty concerns list."
             }
@@ -704,7 +715,9 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 clean_shared_context.clone()
             };
 
-            let format_guidance = r#"Once you have gathered sufficient information, return ONLY a JSON object with a "concerns" array.
+            let format_guidance = r#"EFFICIENCY: You are one stage in a pipeline — stay focused on your stage's scope. Use tools sparingly and only to verify specific concerns you've identified from reading the diff. Do not explore broadly. Aim to complete in 3-5 tool calls or fewer. If the diff is clear enough to identify a concern without tools, just report it.
+
+Return ONLY a JSON object with a "concerns" array.
 If you find no concerns, return `{"concerns": []}`.
 If you find concerns, each must be an object with:
 - "type": A short category string.
