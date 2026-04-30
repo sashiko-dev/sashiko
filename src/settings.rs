@@ -300,6 +300,7 @@ impl Settings {
         let s = Config::builder()
             // Start with default settings
             .add_source(File::with_name("Settings"))
+            .add_source(File::with_name("Settings.local").required(false))
             // Add settings from environment variables (with a prefix of SASHIKO)
             // e.g. SASHIKO_SERVER__PORT=8081 would set the server port
             .add_source(Environment::with_prefix("SASHIKO").separator("__"))
