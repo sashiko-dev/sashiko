@@ -140,6 +140,8 @@ pub struct Finding {
     pub severity: Severity,
     pub severity_explanation: Option<String>,
     pub problem: String,
+    pub file_path: Option<String>,
+    pub line_number: Option<i64>,
 }
 
 pub struct EmailOutboxRow {
@@ -561,13 +563,13 @@ impl Database {
             .conn
             .execute("ALTER TABLE findings RENAME COLUMN message TO problem", ())
             .await;
+        // Re-add file_path and line_number for structured finding locations
+        // (needed by API consumers like Gerrit for inline comments)
         let _ = self
-            .conn
-            .execute("ALTER TABLE findings DROP COLUMN file_path", ())
+            .try_add_column("findings", "file_path", "TEXT")
             .await;
         let _ = self
-            .conn
-            .execute("ALTER TABLE findings DROP COLUMN line_number", ())
+            .try_add_column("findings", "line_number", "INTEGER")
             .await;
 
         let _ = self.migrate_tool_usages().await;
@@ -869,13 +871,15 @@ impl Database {
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem)
-             VALUES (?, ?, ?, ?)",
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, file_path, line_number)
+             VALUES (?, ?, ?, ?, ?, ?)",
                 libsql::params![
                     finding.review_id,
                     finding.severity as i32,
                     finding.severity_explanation,
                     finding.problem,
+                    finding.file_path,
+                    finding.line_number,
                 ],
             )
             .await?;
@@ -920,12 +924,20 @@ impl Database {
 
                     let severity = Severity::from_str(severity_str);
 
+                    let file_path = f
+                        .get("file_path")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string());
+                    let line_number = f.get("line_number").and_then(|n| n.as_i64());
+
                     let _ = self
                         .create_finding(Finding {
                             review_id,
                             severity,
                             severity_explanation,
                             problem,
+                            file_path,
+                            line_number,
                         })
                         .await;
                 }
@@ -2958,6 +2970,9 @@ impl Database {
             .await?;
 
         if let Ok(Some(r)) = rows.next().await {
+            // Fetch structured findings for this review
+            let findings = self.get_findings_for_review(id).await.unwrap_or_default();
+
             Ok(Some(serde_json::json!({
                 "id": r.get::<i64>(0)?,
                 "model": r.get::<Option<String>>(1).ok(),
@@ -2980,10 +2995,42 @@ impl Database {
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                "findings": findings,
             })))
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn get_findings_for_review(&self, review_id: i64) -> Result<Vec<serde_json::Value>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, severity, severity_explanation, problem, file_path, line_number
+                 FROM findings WHERE review_id = ? ORDER BY severity DESC, id ASC",
+                libsql::params![review_id],
+            )
+            .await?;
+
+        let mut findings = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let severity_int: i32 = row.get(1)?;
+            let severity_str = match severity_int {
+                4 => "Critical",
+                3 => "High",
+                2 => "Medium",
+                _ => "Low",
+            };
+            findings.push(serde_json::json!({
+                "id": row.get::<i64>(0)?,
+                "severity": severity_str,
+                "severity_explanation": row.get::<Option<String>>(2).ok(),
+                "problem": row.get::<Option<String>>(3).ok(),
+                "file_path": row.get::<Option<String>>(4).ok(),
+                "line_number": row.get::<Option<i64>>(5).ok(),
+            }));
+        }
+        Ok(findings)
     }
 
     pub async fn get_latest_review_for_patchset(
