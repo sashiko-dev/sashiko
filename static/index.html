@@ -58,7 +58,13 @@
             --role-tool: #3f51b5;
             --fn-name: #6f42c1;
 
+            /* Severity Colors */
+            --sev-critical: #B71C1C;
+            --sev-high: #FF5722;
+            --sev-medium: #FF9800;
+            --sev-low: #FBC02D;
         }
+
         @media (prefers-color-scheme: dark) {
             :root {
                 --bg: #0d1117;
@@ -101,7 +107,124 @@
                 --role-user: #79c0ff;
                 --role-tool: #82aaff;
                 --fn-name: #d2a8ff;
+
+                /* Severity Colors - Dark Mode */
+                --sev-critical: #ff8b8b;
+                --sev-high: #ff9d7e;
+                --sev-medium: #ffc260;
+                --sev-low: #ffea7f;
             }
+        }
+
+        /* Colorblind Mode Overrides (Okabe-Ito inspired palette) */
+        body.colorblind-mode {
+            --status-pending: #56B4E9;   /* Sky Blue */
+            --status-inreview: #E69F00;  /* Orange */
+            --status-reviewed: #0072B2;  /* Blue */
+            --status-failed: #D55E00;    /* Vermilion */
+            --status-embargoed: #CC79A7; /* Reddish Purple */
+
+            --sev-critical: #D55E00;     /* Vermilion */
+            --sev-high: #E69F00;         /* Orange */
+            --sev-medium: #F0E442;       /* Yellow */
+            --sev-low: #56B4E9;          /* Sky Blue */
+        }
+
+        /* Explicit Theme Overrides */
+        body.theme-light {
+            color-scheme: light;
+            --bg: #f5f5f5;
+            --border: #ccc;
+            --border-light: #eee;
+            --text: #24292f;
+            --text-muted: #666;
+            --text-dim: #999;
+            --link: #007bff;
+            --hover: #e0e0e0;
+            --selected: #d0d0d0;
+            --code-bg: #f6f8fa;
+            --code-border: #d0d7de;
+            --btn-bg: #fff;
+            --input-bg: #fff;
+            --card-bg: #fff;
+            --ai-bg: #ffffff;
+            --ai-border: #283593;
+            --warn-bg: #fff3cd;
+            --warn-border: #ffeeba;
+            --warn-text: #856404;
+            --error-bg: #fff0f0;
+            --error-border: #ffcdd2;
+            --error-text: #d73a49;
+            --error-title: #b71c1c;
+            --thought-color: #6a737d;
+            --thought-border: #d0d7de;
+            --log-color: #000;
+            --th-bg: #fafafa;
+            --status-pending: #0366d6;
+            --status-inreview: #d67f05;
+            --status-reviewed: #22863a;
+            --status-failed: #d73a49;
+            --status-embargoed: #6f42c1;
+            --tag-bg: #e0f7fa;
+            --tag-text: #006064;
+            --diff-add-bg: #e6ffec;
+            --diff-rm-bg: #ffebe9;
+            --diff-header: #005cc5;
+            --role-user: #005cc5;
+            --role-tool: #3f51b5;
+            --fn-name: #6f42c1;
+            --sev-critical: #B71C1C;
+            --sev-high: #FF5722;
+            --sev-medium: #FF9800;
+            --sev-low: #FBC02D;
+        }
+
+        body.theme-dark {
+            color-scheme: dark;
+            --bg: #0d1117;
+            --border: #30363d;
+            --border-light: #21262d;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --text-dim: #6e7681;
+            --link: #58a6ff;
+            --hover: #21262d;
+            --selected: #21262d;
+            --code-bg: #161b22;
+            --code-border: #30363d;
+            --btn-bg: #21262d;
+            --input-bg: #0d1117;
+            --card-bg: #161b22;
+            --ai-bg: #161b22;
+            --ai-border: #58a6ff;
+            --warn-bg: #3a2a00;
+            --warn-border: #755200;
+            --warn-text: #e5b300;
+            --error-bg: #3a0000;
+            --error-border: #750000;
+            --error-text: #ff6b6b;
+            --error-title: #ff8b8b;
+            --thought-color: #8b949e;
+            --thought-border: #30363d;
+            --log-color: #c9d1d9;
+            --th-bg: #161b22;
+            --status-pending: #58a6ff;
+            --status-inreview: #d29922;
+            --status-reviewed: #3fb950;
+            --status-failed: #f85149;
+            --status-embargoed: #d2a8ff;
+            --tag-bg: #032f62;
+            --tag-text: #79c0ff;
+            --diff-add-bg: rgba(46, 160, 67, 0.15);
+            --diff-rm-bg: rgba(248, 81, 73, 0.15);
+            --diff-header: #79c0ff;
+            --role-user: #79c0ff;
+            --role-tool: #82aaff;
+            --fn-name: #d2a8ff;
+            --sev-critical: #ff8b8b;
+            --sev-high: #ff9d7e;
+            --sev-medium: #ffc260;
+            --sev-low: #ffea7f;
         }
 
 
@@ -183,23 +306,27 @@
         }
 
         .controls button,
-        button {
+        button,
+        select {
             padding: 4px 10px;
             font-family: inherit;
             font-size: inherit;
             border: 1px solid var(--border);
             background: var(--btn-bg);
+            color: var(--text);
             border-radius: 3px;
             cursor: pointer;
         }
 
         .controls button:hover,
-        button:hover {
+        button:hover,
+        select:hover {
             background: var(--hover);
         }
 
         .controls button:disabled,
-        button:disabled {
+        button:disabled,
+        select:disabled {
             opacity: 0.5;
             cursor: default;
         }
@@ -850,6 +977,70 @@
         <kbd>q</kbd> back
     </div>
 
+    <div id="settingsModal" class="modal-overlay" onclick="if(event.target===this) closeSettings()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeSettings()">&times;</span>
+            <div class="about-logo">
+                <svg style="height: 1em; margin-right: 12px;" viewBox="0 0 16 16" width="24" height="24" fill="currentColor"><path d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 10.196.256 10.92.507c.052.018.103.037.154.057l.01.004c.431.166.844.387 1.236.657.352.243.68.522.98.833.3.311.57.652.804 1.018.234.367.43.76.585 1.177.025.066.048.133.07.2.145.43.25.874.316 1.332.03.207.045.418.045.629 0 .211-.015.422-.045.629a8.225 8.225 0 0 1-.316 1.332c-.022.067-.045.134-.07.2-.154.416-.351.81-.585 1.177-.234.366-.504.707-.804 1.018-.3.311-.628.59-0.98.833a8.163 8.163 0 0 1-1.236.657l-.01.004c-.051.02-.102.039-.154.057a8.217 8.217 0 0 1-2.219.538c-.23.015-.461.023-.692.023-.23 0-.461-.008-.692-.023a8.217 8.217 0 0 1-2.219-.538c-.052-.018-.103-.037-.154-.057l-.01-.004a8.163 8.163 0 0 1-1.236-.657c-.352-.243-.68-.522-.98-.833a8.14 8.14 0 0 1-.804-1.018 8.12 8.12 0 0 1-.585-1.177c-.025-.066-.048-.133-.07-.2a8.225 8.225 0 0 1-.316-1.332A8.156 8.156 0 0 1 0 8c0-.211.015-.422.045-.629a8.225 8.225 0 0 1 .316-1.332c.022-.067.045-.134.07-.2a8.12 8.12 0 0 1 .585-1.177c.234-.366.504-.707.804-1.018.3-.311.628-.59.98-.833a8.163 8.163 0 0 1 1.236-.657l.01-.004c.051-.02.102-.039.154-.057a8.217 8.217 0 0 1 2.219-.538C7.539.008 7.769 0 8 0Zm0 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11Zm0 2a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7Z"></path></svg>
+                Settings
+            </div>
+            <div class="about-text">
+                <div style="margin-bottom: 24px;">
+                    <h3 style="margin-top: 0;">Appearance</h3>
+                    <div style="display: flex; flex-direction: column; gap: 12px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between;">
+                            <span>Theme</span>
+                            <select id="themeSelect" onchange="setTheme(this.value)">
+                                <option value="auto">System Default</option>
+                                <option value="light">Light</option>
+                                <option value="dark">Dark</option>
+                            </select>
+                        </div>
+                        <div style="display: flex; align-items: center; justify-content: space-between;">
+                            <span>Colorblind Mode</span>
+                            <label class="switch">
+                                <input type="checkbox" id="colorblindToggle" onchange="setColorblind(this.checked)" style="opacity: 0; width: 0; height: 0;">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="disclaimer" style="margin-top: 24px; font-size: 0.9em;">
+                    Settings are saved in your browser's cookies and will persist across sessions.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        /* Toggle Switch Styling */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 40px;
+            height: 20px;
+        }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: var(--border);
+            transition: .4s;
+            border-radius: 20px;
+        }
+        .switch input:checked + .slider { background-color: var(--status-reviewed); }
+        .switch input:focus + .slider { box-shadow: 0 0 1px var(--status-reviewed); }
+        .switch input:checked + .slider:before { transform: translateX(20px); }
+        .slider:before {
+            position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px;
+            background-color: white; transition: .4s; border-radius: 50%;
+        }
+    </style>
+
     <div id="aboutModal" class="modal-overlay" onclick="if(event.target===this) closeAbout()">
         <div class="modal-content">
             <span class="modal-close" onclick="closeAbout()">&times;</span>
@@ -916,8 +1107,74 @@
             patchsetId: null,
             patchsetPage: 1,
             patchsetTotalPages: 1,
-            patchsetLimit: 50
+            patchsetLimit: 50,
+            settings: {
+                theme: 'auto',
+                colorblind: false
+            }
         };
+
+        // =====================================================================
+        // SETTINGS & COOKIES
+        // =====================================================================
+        function setCookie(name, value, days = 365) {
+            const d = new Date();
+            d.setTime(d.getTime() + (days * 24 * 60 * 60 * 1000));
+            document.cookie = `${name}=${value};expires=${d.toUTCString()};path=/`;
+        }
+
+        function getCookie(name) {
+            const value = `; ${document.cookie}`;
+            const parts = value.split(`; ${name}=`);
+            if (parts.length === 2) return parts.pop().split(';').shift();
+        }
+
+        function applySettings() {
+            const body = document.body;
+            
+            // Apply Theme
+            body.classList.remove('theme-light', 'theme-dark');
+            if (state.settings.theme === 'light') body.classList.add('theme-light');
+            else if (state.settings.theme === 'dark') body.classList.add('theme-dark');
+            
+            // Apply Colorblind Mode
+            if (state.settings.colorblind) body.classList.add('colorblind-mode');
+            else body.classList.remove('colorblind-mode');
+
+            // Sync UI
+            const themeSelect = document.getElementById('themeSelect');
+            if (themeSelect) themeSelect.value = state.settings.theme;
+            const cbToggle = document.getElementById('colorblindToggle');
+            if (cbToggle) cbToggle.checked = state.settings.colorblind;
+        }
+
+        function setTheme(val) {
+            state.settings.theme = val;
+            setCookie('sashiko_theme', val);
+            applySettings();
+        }
+
+        function setColorblind(val) {
+            state.settings.colorblind = !!val;
+            setCookie('sashiko_colorblind', state.settings.colorblind ? '1' : '0');
+            applySettings();
+        }
+
+        function loadSettings() {
+            const theme = getCookie('sashiko_theme');
+            if (theme) state.settings.theme = theme;
+            const cb = getCookie('sashiko_colorblind');
+            if (cb) state.settings.colorblind = cb === '1';
+            applySettings();
+        }
+
+        function openSettings() {
+            document.getElementById('settingsModal').classList.add('open');
+        }
+
+        function closeSettings() {
+            document.getElementById('settingsModal').classList.remove('open');
+        }
 
         // =====================================================================
         // ROUTER
@@ -1290,10 +1547,10 @@
             }
             return `
                 <div style="display:inline-flex; gap:6px; font-weight:bold; font-size:0.9em; vertical-align:middle;">
-                    <span style="color:${critical > 0 ? '#B71C1C' : 'var(--text-dim)'}" title="Critical">${critical}</span>
-                    <span style="color:${high > 0 ? '#FF5722' : 'var(--text-dim)'}" title="High">${high}</span>
-                    <span style="color:${medium > 0 ? '#FF9800' : 'var(--text-dim)'}" title="Medium">${medium}</span>
-                    <span style="color:${low > 0 ? '#FBC02D' : 'var(--text-dim)'}" title="Low">${low}</span>
+                    <span style="color:var(--sev-critical)" title="Critical">${critical}</span>
+                    <span style="color:var(--sev-high)" title="High">${high}</span>
+                    <span style="color:var(--sev-medium)" title="Medium">${medium}</span>
+                    <span style="color:var(--sev-low)" title="Low">${low}</span>
                 </div>
             `;
         }
@@ -1382,7 +1639,7 @@
                     </span>
                 </h1>
                 <div class="controls">
-                    <select id="listSelector" onchange="setMailingList(this.value)" style="padding: 4px 8px; border: 1px solid var(--border); border-radius: 3px;">
+                    <select id="listSelector" onchange="setMailingList(this.value)">
                         <option value="">All Lists</option>
                         ${listOptions}
                     </select>
@@ -1556,6 +1813,8 @@
                             <span class="stats-label">Sashiko</span> v${data.version}
                             <span class="stats-sep"></span>
                             <a href="#" onclick="event.preventDefault(); openAbout();" style="font-weight:500;">About</a>
+                            <span class="stats-sep"></span>
+                            <a href="#" onclick="event.preventDefault(); openSettings();" style="font-weight:500;">Settings</a>
                             <span class="stats-sep"></span>
                             <a href="#/stats" style="font-weight:500;">Stats</a>
                         </div>
@@ -2075,10 +2334,10 @@
                             displayResult = '<span style="color:#2e7d32;font-weight:bold;">No regressions</span>';
                         } else {
                             const parts = [];
-                            parts.push(`Critical: <span style="${counts.critical > 0 ? 'color:#B71C1C;font-weight:bold' : 'color:var(--text-dim)'}">${counts.critical}</span>`);
-                            parts.push(`High: <span style="${counts.high > 0 ? 'color:#FF5722;font-weight:bold' : 'color:var(--text-dim)'}">${counts.high}</span>`);
-                            parts.push(`Medium: <span style="${counts.medium > 0 ? 'color:#FF9800;font-weight:bold' : 'color:var(--text-dim)'}">${counts.medium}</span>`);
-                            parts.push(`Low: <span style="${counts.low > 0 ? 'color:#FBC02D;font-weight:bold' : 'color:var(--text-dim)'}">${counts.low}</span>`);
+                            parts.push(`Critical: <span style="${counts.critical > 0 ? 'color:var(--sev-critical);font-weight:bold' : 'color:var(--text-dim)'}">${counts.critical}</span>`);
+                            parts.push(`High: <span style="${counts.high > 0 ? 'color:var(--sev-high);font-weight:bold' : 'color:var(--text-dim)'}">${counts.high}</span>`);
+                            parts.push(`Medium: <span style="${counts.medium > 0 ? 'color:var(--sev-medium);font-weight:bold' : 'color:var(--text-dim)'}">${counts.medium}</span>`);
+                            parts.push(`Low: <span style="${counts.low > 0 ? 'color:var(--sev-low);font-weight:bold' : 'color:var(--text-dim)'}">${counts.low}</span>`);
                             displayResult = parts.join(' · ');
                         }
                         parsedFindings = true;
@@ -2812,11 +3071,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     const chart = echarts.init(document.getElementById('chart-findings'), isDark ? 'dark' : null);
                     const dates = [...new Set(timeline.findings.map(f => f.day))].sort();
                     const severities = ['low', 'medium', 'high', 'critical'];
+                    
+                    const computedStyle = getComputedStyle(document.body);
                     const severityColors = {
-                        'low': '#FBC02D',
-                        'medium': '#FF9800',
-                        'high': '#FF5722',
-                        'critical': '#B71C1C'
+                        'low': computedStyle.getPropertyValue('--sev-low').trim() || '#FBC02D',
+                        'medium': computedStyle.getPropertyValue('--sev-medium').trim() || '#FF9800',
+                        'high': computedStyle.getPropertyValue('--sev-high').trim() || '#FF5722',
+                        'critical': computedStyle.getPropertyValue('--sev-critical').trim() || '#B71C1C'
                     };
 
                     const series = severities.map(sev => {
@@ -2855,6 +3116,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             }
         }
 
+        loadSettings();
         router();
     </script>
 </body>
