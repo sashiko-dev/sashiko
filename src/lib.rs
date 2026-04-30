@@ -21,6 +21,7 @@ pub mod email_policy;
 pub mod email_router;
 pub mod events;
 pub mod fetcher;
+pub mod forge;
 pub mod git_ops;
 pub mod ingestor;
 pub mod inspector;
@@ -104,3 +105,21 @@ impl ReviewStatus {
     }
 }
 pub mod logging;
+
+/// Extract repository name from GitLab MR URL
+/// Example: https://gitlab.com/org/group/project/-/merge_requests/123
+/// Returns: Some("project")
+pub fn extract_repo_name_from_url(url: &str) -> Option<String> {
+    // Parse the URL and extract the path
+    let url_path = url.split("://").nth(1)?; // Remove protocol
+    let path = url_path.split('/').collect::<Vec<_>>();
+
+    // Look for "/-/merge_requests/" pattern and get the component before it
+    for (i, segment) in path.iter().enumerate() {
+        if *segment == "-" && i > 0 && i + 1 < path.len() && path[i + 1] == "merge_requests" {
+            return Some(path[i - 1].to_string());
+        }
+    }
+
+    None
+}

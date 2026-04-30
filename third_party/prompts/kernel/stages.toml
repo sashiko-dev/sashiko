@@ -1,0 +1,78 @@
+# Sashiko Review Stages Configuration
+# Customize which stages run and their prompts
+
+[[stages]]
+number = 1
+name = "Analyze commit main goal"
+instruction_file = "stages/01-analyze-goal.md"
+supporting_files = []
+enabled = true
+
+[[stages]]
+number = 2
+name = "Implementation verification"
+instruction_file = "stages/02-implementation.md"
+supporting_files = ["technical-patterns.md", "coding-style.md"]
+enabled = true
+
+[[stages]]
+number = 3
+name = "Control flow analysis"
+instruction_file = "stages/03-control-flow.md"
+supporting_files = ["callstack.md", "technical-patterns.md"]
+enabled = true
+
+[[stages]]
+number = 4
+name = "Resource management"
+instruction_file = "stages/04-resource-mgmt.md"
+supporting_files = []
+enabled = true
+
+[[stages]]
+number = 5
+name = "Locking and synchronization"
+instruction_file = "stages/05-locking.md"
+supporting_files = ["subsystem/locking.md"]
+enabled = true
+
+[[stages]]
+number = 6
+name = "Security audit"
+instruction_file = "stages/06-security.md"
+supporting_files = []
+enabled = true
+
+[[stages]]
+number = 7
+name = "Hardware review"
+instruction_file = "stages/07-hardware.md"
+supporting_files = ["hwmon.md"]
+enabled = true
+
+[[stages]]
+number = 8
+name = "Verification and severity"
+instruction_file = "stages/08-verification.md"
+supporting_files = ["false-positive-guide.md", "severity.md"]
+enabled = true
+
+[[stages]]
+number = 9
+name = "Report generation"
+instruction_file = "stages/09-report.md"
+supporting_files = ["inline-template.md"]
+enabled = true
+
+# Example: Custom stage
+# [[stages]]
+# number = 11
+# name = "Performance analysis"
+# instruction_file = "custom/performance.md"
+# supporting_files = ["custom/perf-patterns.md"]
+# enabled = true
+
+# Example: Disable a stage
+# [[stages]]
+# number = 7
+# enabled = false

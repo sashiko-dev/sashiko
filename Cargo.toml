@@ -15,6 +15,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 aws-sdk-bedrockruntime = { version = "1", optional = true }
 aws-smithy-types = { version = "1", optional = true }
 axum = "0.8.8"
+bytes = "1.9"
 chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 config = "0.15.19"
@@ -29,6 +30,7 @@ ignore = "0.4.25"
 lettre = { version = "0.11.7", features = ["tokio1", "tokio1-native-tls"] }
 libsql = "0.9.29"
 mail-parser = "0.11.1"
+md5 = "0.7.0"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }

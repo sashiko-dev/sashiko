@@ -19,10 +19,11 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 
 ## Features
 
-- **Automated Ingestion**: Monitors mailing lists (using `lore.kernel.org`) for new patch submissions.
-- **Manual Ingestion**: Can ingest patches from a local git repository.
-- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini and Claude are currently supported).
-- **Web interface and CLI**: Provides a web interface and a CLI tool. Email support will be added soon.
+- **Automated Ingestion**: Monitors mailing lists (`lore.kernel.org`), GitHub PRs, and GitLab MRs for new patch submissions.
+- **Manual Ingestion**: Can ingest patches from local git repositories or specific PRs/MRs.
+- **Forge Integration**: Automatic PR/MR review via GitHub and GitLab webhooks.
+- **Self-contained**: Doesn't depend on 3rd-party tools and works with multiple LLM providers (Gemini and Claude currently supported).
+- **Web interface and CLI**: Provides a web interface for monitoring and a CLI tool for local development.
 
 ## Prompts
 
@@ -82,6 +83,10 @@ Running an automated review system like Sashiko can be computationally expensive
     *   **Server**: API server host and port.
     *   **Git**: Path to the reference kernel repository.
     *   **Review**: Concurrency and worktree settings.
+    *   **Tools**: Configure which AI tools are enabled (optional). See [docs/TOOLS.md](docs/TOOLS.md) for details.
+    *   **Forge**: GitHub/GitLab webhook integration (optional). See forge setup guides below.
+    *   **Prompts**: Customize review stages and prompts (optional). See [docs/PROMPTS.md](docs/PROMPTS.md) for details.
+    *   **Subsystems**: Map file patterns to subsystems for targeted reviews (optional).
 
     ### Configuring the LLM Provider
 
@@ -185,7 +190,7 @@ The daemon is responsible for monitoring mailing lists, managing the database, a
 To start the daemon:
 
 ```bash
-cargo run
+cargo run --release
 ```
 
 (Or via Nix: `nix run github:sashiko-dev/sashiko`)
@@ -238,6 +243,28 @@ development. To get the most out of it:
 
 Once the daemon is running, you can access the Web UI, the daemon will print the
 URL to access it from localhost.
+
+## Customization
+
+Sashiko is highly configurable:
+
+- **AI Tools** - Configure which tools are available ([docs/TOOLS.md](docs/TOOLS.md))
+- **Review Prompts** - Customize stage instructions and guidance ([docs/PROMPTS.md](docs/PROMPTS.md))
+- **Forge Integration** - GitHub and GitLab support (see setup guides below)
+
+### Forge Integration
+
+Sashiko can automatically review Pull Requests (GitHub) and Merge Requests (GitLab) via webhooks:
+
+- **Overview**: See [docs/FORGE_SETUP.md](docs/FORGE_SETUP.md) for general requirements and forge compatibility
+- **GitHub**: See [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) for GitHub-specific setup
+- **GitLab**: See [docs/GITLAB_SETUP.md](docs/GITLAB_SETUP.md) for GitLab-specific setup
+
+All integrations support:
+- Automatic review triggering on PR/MR open or update
+- Inline comments with findings (when implemented)
+- Manual testing via scripts in `scripts/` directory
+- Custom subsystem mapping for targeted reviews
 
 ## Benchmarking
 

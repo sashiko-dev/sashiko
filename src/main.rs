@@ -176,7 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize FetchAgent
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-    let (fetch_agent, fetch_tx) = sashiko::fetcher::FetchAgent::new(repo_path, raw_tx.clone());
+    let (fetch_agent, fetch_tx) = sashiko::fetcher::FetchAgent::new(
+        repo_path,
+        raw_tx.clone(),
+        settings.forge.api_token.clone(),
+    );
 
     // Spawn FetchAgent
     tokio::spawn(async move {
@@ -246,6 +250,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 failed_error: Some(error),
                                 skip_filters: None,
                                 only_filters: None,
+                                mr_url: None,
+                                mr_title: None,
+                                mr_number: None,
                             })
                             .await
                         {
@@ -264,6 +271,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         timestamp,
                         index,
                         total,
+                        mr_url,
+                        mr_title,
+                        mr_number,
                     } => {
                         let root_msg_id = format!("{}@sashiko.local", article_id);
 
@@ -308,6 +318,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 failed_error: None,
                                 skip_filters: None,
                                 only_filters: None,
+                                mr_url,
+                                mr_title,
+                                mr_number,
                             })
                             .await
                         {
@@ -367,6 +380,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             failed_error: None,
                                             skip_filters: skip_subjects_clone,
                                             only_filters: only_subjects_clone,
+                                            mr_url: None,
+                                            mr_title: None,
+                                            mr_number: None,
                                         })
                                         .await
                                     {
@@ -421,6 +437,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         failed_error: None,
                                         skip_filters: None,
                                         only_filters: None,
+                                        mr_url: None,
+                                        mr_title: None,
+                                        mr_number: None,
                                     })
                                     .await
                                 {
@@ -443,6 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // DB Worker (Transactional Batching)
     let worker_db = db.clone();
+    let mapping = settings.subsystems.mapping.clone();
     let _db_worker_handle = tokio::spawn(async move {
         info!("DB Worker started");
 
@@ -450,6 +470,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total_processed = 0;
         let mut total_ingested = 0;
         let mut total_errors = 0;
+
+        let policy =
+            sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml").unwrap_or_default();
 
         loop {
             let count = parsed_rx.recv_many(&mut buffer, 100).await;
@@ -459,11 +482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // info!("Processing batch of {} parsed articles", count); // Too verbose
 
-            let policy = sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml")
-                .unwrap_or_default();
-
             for article in buffer.drain(..) {
-                match process_parsed_article(&worker_db, article, &policy).await {
+                match process_parsed_article(&worker_db, article, &policy, &mapping).await {
                     ProcessStatus::Ingested => total_ingested += 1,
                     ProcessStatus::Error => total_errors += 1,
                 }
@@ -486,21 +506,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start Ingestor (feeds raw_tx)
-    let ingestor = Ingestor::new(
-        settings.clone(),
-        db.clone(),
-        raw_tx.clone(),
-        cli.download,
-        cli.track,
-    );
-    let ingestor_handle = tokio::spawn(async move {
-        if let Err(e) = ingestor.run().await {
-            error!("Ingestor fatal error: {}", e);
-        }
-    });
+    let ingestor_handle = if !settings.forge.enabled {
+        let ingestor = Ingestor::new(
+            settings.clone(),
+            db.clone(),
+            raw_tx.clone(),
+            cli.download,
+            cli.track,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = ingestor.run().await {
+                error!("Ingestor fatal error: {}", e);
+            }
+        })
+    } else {
+        info!("Forge integration is enabled. Lore/NNTP ingestor is disabled.");
+        tokio::spawn(async move {
+            // Keep the process alive
+            std::future::pending::<()>().await;
+        })
+    };
 
     // Start Web API
-    let api_settings = settings.server.clone();
+    let api_settings = Arc::new(settings.clone());
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
@@ -545,10 +573,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start Reviewer Service
-    let reviewer = Reviewer::new(db.clone(), settings.clone());
-    tokio::spawn(async move {
-        reviewer.start().await;
-    });
+    match Reviewer::new(db.clone(), settings.clone()) {
+        Ok(reviewer) => {
+            tokio::spawn(async move {
+                reviewer.start().await;
+            });
+        }
+        Err(e) => {
+            error!("Failed to initialize Reviewer service: {}", e);
+        }
+    }
 
     let metrics_db = db.clone();
     tokio::spawn(async move {
@@ -589,6 +623,7 @@ async fn process_parsed_article(
     worker_db: &Database,
     article: ParsedArticle,
     policy: &sashiko::email_policy::EmailPolicyConfig,
+    subsystem_mapping: &[sashiko::settings::SubsystemMapping],
 ) -> ProcessStatus {
     let ParsedArticle {
         group,
@@ -599,6 +634,9 @@ async fn process_parsed_article(
         failed_error,
         skip_filters,
         only_filters,
+        mr_url,
+        mr_title,
+        mr_number,
     } = article;
 
     // Handle ingestion failure
@@ -748,10 +786,39 @@ async fn process_parsed_article(
     }
 
     // Subsystem Identification and Linking
-    let mut subsystems = identify_subsystems(&metadata.to, &metadata.cc);
-    if group.starts_with("git-import") {
-        subsystems.push(("from git".to_string(), "git-import".to_string()));
+    let mut subsystems = identify_subsystems(&metadata.to, &metadata.cc, subsystem_mapping);
+
+    // Check paths for forge/git integrations
+    if let Some(p) = patch_opt.as_ref() {
+        let files = sashiko::baseline::extract_files_from_diff(&p.diff);
+        let path_subsystems = identify_subsystems_from_paths(&files, subsystem_mapping);
+        subsystems.extend(path_subsystems);
     }
+
+    if group.starts_with("git-import") || group == "git-fetch" {
+        // Extract repository name from MR URL if available
+        let (label, email) = if let Some(url) = &mr_url {
+            // Parse repo name from GitLab URL
+            // Example: https://gitlab.com/org/group/project/-/merge_requests/123
+            // Extract: project
+            info!("Extracting repo name from MR URL: {}", url);
+            if let Some(repo_name) = sashiko::extract_repo_name_from_url(url) {
+                info!("Extracted repo name: {}", repo_name);
+                // Use repo-specific email to avoid UNIQUE constraint conflicts
+                let email = format!("git-import-{}", repo_name);
+                (repo_name, email)
+            } else {
+                warn!("Failed to extract repo name from URL: {}", url);
+                ("from git".to_string(), "git-import".to_string())
+            }
+        } else {
+            info!("No MR URL available for article {}", article_id);
+            ("from git".to_string(), "git-import".to_string())
+        };
+        subsystems.push((label, email));
+    }
+    subsystems.sort();
+    subsystems.dedup();
 
     let mut subsystem_ids = Vec::new();
     for (name, email) in &subsystems {
@@ -821,7 +888,11 @@ async fn process_parsed_article(
     */
 
     let root_msg_id = format!("{}@sashiko.local", article_id);
-    let cover_letter_id = if group == "git-fetch" || group == "api-submit" {
+    let cover_letter_id = if group == "git-fetch" {
+        // Always use root_msg_id for git-fetch to match the placeholder ID.
+        // article_id now includes MR number (mr-{number}-{range}) so no collision.
+        Some(root_msg_id.as_str())
+    } else if group == "api-submit" {
         if metadata.total == 1 {
             Some(metadata.message_id.as_str())
         } else {
@@ -849,6 +920,26 @@ async fn process_parsed_article(
                 },
                 false,
             )
+        } else if group == "git-fetch" && mr_title.is_some() && mr_number.is_some() {
+            // For git-fetch MRs (both single and multi-patch), use MR title for patchset subject
+            // Only applies when this is the first/only patch (which creates the patchset)
+            if metadata.total == 1 || metadata.index == 1 {
+                let title = mr_title.as_ref().unwrap();
+                let number = mr_number.unwrap();
+                (
+                    format!("!{}: {}", number, title),
+                    metadata.author.clone(),
+                    metadata.total,
+                    true,
+                )
+            } else {
+                (
+                    metadata.subject.clone(),
+                    metadata.author.clone(),
+                    metadata.total,
+                    !group.starts_with("git-import"),
+                )
+            }
         } else {
             (
                 metadata.subject.clone(),
@@ -1031,7 +1122,12 @@ fn calculate_embargo_hours(
     max_embargo_hours
 }
 
-fn identify_subsystems(to: &str, cc: &str) -> Vec<(String, String)> {
+// Helper function to map To/Cc to Subsystems based on config
+fn identify_subsystems(
+    to: &str,
+    cc: &str,
+    mapping: &[sashiko::settings::SubsystemMapping],
+) -> Vec<(String, String)> {
     let mut subsystems = Vec::new();
     let mut all_recipients = String::new();
     all_recipients.push_str(to);
@@ -1045,33 +1141,53 @@ fn identify_subsystems(to: &str, cc: &str) -> Vec<(String, String)> {
         }
 
         let lower_email = email.to_lowercase();
+        let mut matched = false;
 
-        // 1. Static Map (Mimic MAINTAINERS)
-        if lower_email.contains("linux-kernel@vger.kernel.org") {
-            subsystems.push((
-                "LKML".to_string(),
-                "linux-kernel@vger.kernel.org".to_string(),
-            ));
-        } else if lower_email.contains("netdev@vger.kernel.org") {
-            subsystems.push(("netdev".to_string(), "netdev@vger.kernel.org".to_string()));
-        } else if lower_email.contains("bpf@vger.kernel.org") {
-            subsystems.push(("bpf".to_string(), "bpf@vger.kernel.org".to_string()));
-        } else if lower_email.contains("linux-usb@vger.kernel.org") {
-            subsystems.push(("usb".to_string(), "linux-usb@vger.kernel.org".to_string()));
-        } else if lower_email.contains("linux-fsdevel@vger.kernel.org") {
-            subsystems.push((
-                "fsdevel".to_string(),
-                "linux-fsdevel@vger.kernel.org".to_string(),
-            ));
-        } else if lower_email.contains("linux-mm@kvack.org") {
-            subsystems.push(("linux-mm".to_string(), "linux-mm@kvack.org".to_string()));
-        } else if lower_email.ends_with("@vger.kernel.org")
-            || lower_email.ends_with("@lists.linux.dev")
-            || lower_email.ends_with("@lists.infradead.org")
-        {
-            // Fallback: derive name from email user part
-            if let Some(name) = lower_email.split('@').next() {
+        for rule in mapping {
+            if let Ok(re) = regex::Regex::new(&rule.pattern)
+                && re.is_match(&lower_email)
+            {
+                subsystems.push((rule.name.clone(), lower_email.clone()));
+                matched = true;
+            }
+        }
+
+        // Fallback for known kernel lists if no mapping is provided, to remain compatible
+        if !matched && mapping.is_empty() {
+            if lower_email.contains("linux-kernel@vger.kernel.org") {
+                subsystems.push(("LKML".to_string(), lower_email));
+            } else if lower_email.contains("netdev@vger.kernel.org") {
+                subsystems.push(("netdev".to_string(), lower_email));
+            } else if (lower_email.ends_with("@vger.kernel.org")
+                || lower_email.ends_with("@lists.linux.dev")
+                || lower_email.ends_with("@lists.infradead.org")
+                || lower_email.ends_with("@kvack.org"))
+                && let Some(name) = lower_email.split('@').next()
+            {
                 subsystems.push((name.to_string(), lower_email));
+            }
+        }
+    }
+
+    subsystems.sort();
+    subsystems.dedup();
+    subsystems
+}
+
+// Helper function to map touched file paths to Subsystems based on config
+fn identify_subsystems_from_paths(
+    paths: &[String],
+    mapping: &[sashiko::settings::SubsystemMapping],
+) -> Vec<(String, String)> {
+    let mut subsystems = Vec::new();
+
+    for path in paths {
+        let lower_path = path.to_lowercase();
+        for rule in mapping {
+            if let Ok(re) = regex::Regex::new(&rule.pattern)
+                && re.is_match(&lower_path)
+            {
+                subsystems.push((rule.name.clone(), rule.name.clone() + "@forge.local"));
             }
         }
     }
@@ -1084,6 +1200,7 @@ fn identify_subsystems(to: &str, cc: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sashiko::extract_repo_name_from_url;
 
     #[test]
     fn test_cli_parsing() {
@@ -1127,7 +1244,7 @@ mod tests {
         // Test known subsystem
         let to = "linux-kernel@vger.kernel.org";
         let cc = "netdev@vger.kernel.org";
-        let subsystems = identify_subsystems(to, cc);
+        let subsystems = identify_subsystems(to, cc, &[]);
         assert!(subsystems.contains(&(
             "LKML".to_string(),
             "linux-kernel@vger.kernel.org".to_string()
@@ -1137,7 +1254,7 @@ mod tests {
         // Test fallback
         let to = "unknown-list@vger.kernel.org";
         let cc = "";
-        let subsystems = identify_subsystems(to, cc);
+        let subsystems = identify_subsystems(to, cc, &[]);
         assert!(subsystems.contains(&(
             "unknown-list".to_string(),
             "unknown-list@vger.kernel.org".to_string()
@@ -1146,15 +1263,18 @@ mod tests {
         // Test mixed
         let to = "linux-usb@vger.kernel.org, random-user@example.com";
         let cc = "bpf@vger.kernel.org";
-        let subsystems = identify_subsystems(to, cc);
-        assert!(subsystems.contains(&("usb".to_string(), "linux-usb@vger.kernel.org".to_string())));
+        let subsystems = identify_subsystems(to, cc, &[]);
+        assert!(subsystems.contains(&(
+            "linux-usb".to_string(),
+            "linux-usb@vger.kernel.org".to_string()
+        )));
         assert!(subsystems.contains(&("bpf".to_string(), "bpf@vger.kernel.org".to_string())));
         // random-user should be ignored as it doesn't match list patterns
         assert_eq!(subsystems.len(), 2);
 
         // Test linux-mm
         let to = "linux-mm@kvack.org";
-        let subsystems = identify_subsystems(to, "");
+        let subsystems = identify_subsystems(to, "", &[]);
         assert!(subsystems.contains(&("linux-mm".to_string(), "linux-mm@kvack.org".to_string())));
     }
 
@@ -1206,5 +1326,34 @@ mod tests {
             ("usb".to_string(), "linux-usb@vger.kernel.org".to_string()),
         ];
         assert_eq!(calculate_embargo_hours(&subs, &policy), 5);
+    }
+
+    #[test]
+    fn test_extract_repo_name_from_url() {
+        // Test deeply nested project URL
+        let url = "https://gitlab.com/org/group/subgroup/my-project/-/merge_requests/2335";
+        assert_eq!(
+            extract_repo_name_from_url(url),
+            Some("my-project".to_string())
+        );
+
+        // Test simple project URL
+        let url = "https://gitlab.com/org/another-project/-/merge_requests/123";
+        assert_eq!(
+            extract_repo_name_from_url(url),
+            Some("another-project".to_string())
+        );
+
+        // Test different nesting depth
+        let url = "https://gitlab.com/company/team/repo/-/merge_requests/456";
+        assert_eq!(extract_repo_name_from_url(url), Some("repo".to_string()));
+
+        // Test invalid URL (no merge request pattern)
+        let url = "https://gitlab.com/org/group/subgroup/my-project";
+        assert_eq!(extract_repo_name_from_url(url), None);
+
+        // Test malformed URL
+        let url = "not a url";
+        assert_eq!(extract_repo_name_from_url(url), None);
     }
 }

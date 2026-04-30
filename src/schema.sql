@@ -79,12 +79,14 @@ CREATE TABLE IF NOT EXISTS patchsets (
     target_review_count INTEGER DEFAULT 1,
     provider TEXT,
     embargo_until INTEGER,
+    slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL;
 
 
 CREATE TABLE IF NOT EXISTS patches (
