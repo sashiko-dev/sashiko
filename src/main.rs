@@ -18,7 +18,7 @@ use sashiko::events::{Event, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
@@ -68,6 +68,8 @@ enum Commands {
     Inspect,
     /// Restart failed reviews
     RestartFailed,
+    /// Check runtime environment and configuration
+    Doctor,
 }
 
 const PARSER_VERSION: i32 = 2;
@@ -151,6 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(stages) = cli.stages {
         settings.review.stages = Some(stages.clone());
         info!("Selected stages via --stages flag: {:?}", stages);
+    }
+
+    if let Some(Commands::Doctor) = cli.command {
+        return run_doctor(&settings).await;
     }
 
     // Initialize Database
@@ -1066,6 +1072,168 @@ fn identify_subsystems(to: &str, cc: &str) -> Vec<(String, String)> {
     subsystems.sort();
     subsystems.dedup();
     subsystems
+}
+
+async fn run_doctor(settings: &Settings) -> Result<(), Box<dyn std::error::Error>> {
+    use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+
+    struct DoctorReport {
+        stdout: StandardStream,
+        ok: u32,
+        warnings: u32,
+        failures: u32,
+    }
+
+    impl DoctorReport {
+        fn new() -> Self {
+            Self {
+                stdout: StandardStream::stdout(ColorChoice::Auto),
+                ok: 0,
+                warnings: 0,
+                failures: 0,
+            }
+        }
+
+        fn print_check(&mut self, color: Color, symbol: &str, msg: &str) {
+            let _ = self.stdout.set_color(ColorSpec::new().set_fg(Some(color)));
+            let _ = write!(self.stdout, "  {} ", symbol);
+            let _ = self.stdout.reset();
+            println!("{}", msg);
+        }
+
+        fn pass(&mut self, msg: &str) {
+            self.ok += 1;
+            self.print_check(Color::Green, "OK", msg);
+        }
+
+        fn skip(&mut self, msg: &str) {
+            self.warnings += 1;
+            self.print_check(Color::Yellow, "!!", msg);
+        }
+
+        fn fail(&mut self, msg: &str) {
+            self.failures += 1;
+            self.print_check(Color::Red, "XX", msg);
+        }
+    }
+
+    let mut r = DoctorReport::new();
+
+    println!("Checking runtime environment...\n");
+
+    // --- Configuration ---
+    println!("Configuration");
+    r.pass(&format!(
+        "AI provider: {} (model: {})",
+        settings.ai.provider, settings.ai.model
+    ));
+    r.pass(&format!(
+        "Server: {}:{}",
+        settings.server.host, settings.server.port
+    ));
+    if settings.smtp.is_some() {
+        let dry = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(true);
+        if dry {
+            r.skip("SMTP configured with dry_run=true (no emails sent)");
+        } else {
+            r.skip("SMTP configured with dry_run=false — emails WILL be sent");
+        }
+    } else {
+        r.pass("SMTP not configured (no emails will be sent)");
+    }
+
+    let policy =
+        sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml").unwrap_or_default();
+    if policy.defaults.mute_all {
+        r.pass("Email policy: mute_all=true (safe)");
+    } else if settings.smtp.is_none() {
+        r.pass("Email policy: mute_all=false, but SMTP is disabled");
+    } else {
+        r.skip("Email policy: mute_all=false and SMTP is configured — review carefully");
+    }
+    println!();
+
+    println!();
+
+    // --- Database ---
+    println!("Database");
+    match Database::new(&settings.database).await {
+        Ok(db) => {
+            r.pass(&format!("Connected to {}", settings.database.url));
+            match db.migrate().await {
+                Ok(_) => r.pass("Schema migrations OK"),
+                Err(e) => r.fail(&format!("Migration failed: {}", e)),
+            }
+        }
+        Err(e) => r.fail(&format!(
+            "Cannot connect to {}: {}",
+            settings.database.url, e
+        )),
+    }
+    println!();
+
+    // --- LLM provider ---
+    println!("LLM provider");
+    let provider = settings.ai.provider.to_lowercase();
+    let needs_key = !matches!(provider.as_str(), "claude-cli" | "codex-cli" | "bedrock");
+
+    if needs_key {
+        let key_vars: &[(&str, &str)] = &[
+            ("ANTHROPIC_API_KEY", "claude"),
+            ("GEMINI_API_KEY", "gemini"),
+            ("OPENAI_API_KEY", "openai"),
+            ("LLM_API_KEY", ""),
+        ];
+
+        let mut found = false;
+        for (var, prov) in key_vars {
+            if std::env::var(var).is_ok() {
+                if prov.is_empty() || provider.contains(prov) {
+                    r.pass(&format!("{} is set", var));
+                }
+                found = true;
+            }
+        }
+        if !found {
+            r.fail("No API key found (set LLM_API_KEY or a provider-specific key)");
+        }
+    } else {
+        r.pass(&format!(
+            "Provider {} does not require an API key",
+            provider
+        ));
+    }
+
+    match sashiko::ai::create_provider(settings) {
+        Ok(p) => {
+            let caps = p.get_capabilities();
+            r.pass(&format!(
+                "Provider initialized (context window: {} tokens)",
+                caps.context_window_size
+            ));
+        }
+        Err(e) => r.fail(&format!("Provider initialization failed: {}", e)),
+    }
+    println!();
+
+    // --- Summary ---
+    print!("{} checks passed", r.ok);
+    if r.warnings > 0 {
+        print!(", {} warnings", r.warnings);
+    }
+    if r.failures > 0 {
+        let _ = r
+            .stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Red)));
+        print!(", {} failed", r.failures);
+        let _ = r.stdout.reset();
+    }
+    println!();
+
+    if r.failures > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
