@@ -136,6 +136,7 @@ pub struct AppState {
     patchsets_count_cache: AsyncCache<usize>,
     patchsets_homepage_cache: AsyncCache<Vec<crate::db::PatchsetRow>>,
     messages_homepage_cache: AsyncCache<Vec<crate::db::MessageRow>>,
+    gerrit_client: Option<Arc<crate::gerrit::GerritClient>>,
 }
 
 #[derive(Deserialize)]
@@ -218,6 +219,24 @@ pub enum SubmitRequest {
     Thread {
         msgid: String,
     },
+    /// Submit a Gerrit change for review. Sashiko fetches the change,
+    /// reviews it, and (if [gerrit] is configured) posts findings back.
+    Gerrit {
+        /// Gerrit change number (e.g. 64591).
+        change_number: u64,
+        /// Override the Gerrit URL from settings.
+        #[serde(default)]
+        gerrit_url: Option<String>,
+        /// Override the local git repo path for fetching.
+        #[serde(default)]
+        repo: Option<String>,
+        /// Post findings back to Gerrit after review (default: true if [gerrit] configured).
+        #[serde(default)]
+        post_back: Option<bool>,
+        /// Include a Code-Review vote when posting back.
+        #[serde(default)]
+        vote: Option<bool>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +253,7 @@ pub async fn run_server(
     allow_all_submit: bool,
     smtp_enabled: bool,
     dry_run: bool,
+    gerrit_client: Option<Arc<crate::gerrit::GerritClient>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         db,
@@ -250,6 +270,7 @@ pub async fn run_server(
         patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
         messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+        gerrit_client,
     });
 
     let app = Router::new()
@@ -268,6 +289,7 @@ pub async fn run_server(
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
+        .route("/api/gerrit/post", post(post_to_gerrit))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state);
@@ -439,7 +461,80 @@ async fn submit_patch(
 
             Ok(Json(SubmitResponse {
                 status: "accepted".to_string(),
-                id, // The client might expect this ID
+                id,
+            }))
+        }
+        SubmitRequest::Gerrit {
+            change_number,
+            gerrit_url: _,
+            repo,
+            post_back: _,
+            vote: _,
+        } => {
+            let gerrit = state.gerrit_client.as_ref().ok_or_else(|| {
+                error!("Gerrit submit requires [gerrit] configuration in Settings.toml");
+                StatusCode::SERVICE_UNAVAILABLE
+            })?;
+
+            // 1. Fetch change details from Gerrit
+            let change = gerrit.get_change_detail(change_number).await.map_err(|e| {
+                error!("Failed to fetch Gerrit change {}: {}", change_number, e);
+                StatusCode::BAD_GATEWAY
+            })?;
+
+            let (fetch_url, fetch_ref, _ps_number, _commit_sha) =
+                gerrit.extract_fetch_info(&change, change_number).map_err(|e| {
+                    error!("Failed to extract fetch info for change {}: {}", change_number, e);
+                    StatusCode::BAD_GATEWAY
+                })?;
+
+            // 2. Fetch into local repo
+            let repo_path = repo.as_deref().unwrap_or("third_party/linux");
+            let sha = gerrit
+                .fetch_into_repo(repo_path, &fetch_url, &fetch_ref)
+                .await
+                .map_err(|e| {
+                    error!("Failed to git fetch Gerrit change {}: {}", change_number, e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            let id = sha.clone();
+            info!(
+                "Gerrit change {} fetched as {}, submitting for review",
+                change_number, &sha[..12.min(sha.len())]
+            );
+
+            // 3. Create placeholder and submit for review (same as Remote flow)
+            if let Err(e) = state
+                .db
+                .create_fetching_patchset(
+                    &id,
+                    &format!(
+                        "Gerrit change {} ({}): {}",
+                        change_number, change.project, change.subject
+                    ),
+                    None,
+                    None,
+                )
+                .await
+            {
+                error!("Failed to create placeholder patchset: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+
+            let req = FetchRequest {
+                repo_url: None,
+                commit_hash: sha,
+            };
+
+            if let Err(e) = state.fetch_sender.send(req).await {
+                error!("Failed to send fetch request to queue: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+
+            Ok(Json(SubmitResponse {
+                status: "accepted".to_string(),
+                id,
             }))
         }
     }
@@ -957,4 +1052,83 @@ async fn rerun_patch(
         })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+// --- Gerrit backend ---
+
+#[derive(Deserialize)]
+struct GerritPostRequest {
+    /// Sashiko review ID to post findings from.
+    review_id: i64,
+    /// Gerrit change identifier (number, Change-Id, or project~branch~Change-Id).
+    change_id: String,
+    /// Gerrit revision (patchset SHA or number).
+    revision_id: String,
+    /// Include a Code-Review vote based on severity (overrides settings).
+    #[serde(default)]
+    vote: Option<bool>,
+}
+
+async fn post_to_gerrit(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GerritPostRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let gerrit = state.gerrit_client.as_ref().ok_or_else(|| {
+        tracing::error!("Gerrit backend not configured (add [gerrit] to Settings.toml)");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let findings = state
+        .db
+        .get_findings_for_review(req.review_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to fetch findings for review {}: {}", req.review_id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let gerrit_findings: Vec<crate::gerrit::GerritFinding> = findings
+        .iter()
+        .map(|f| crate::gerrit::GerritFinding {
+            severity: crate::db::Severity::from_str(
+                f.get("severity").and_then(|v| v.as_str()).unwrap_or("Low"),
+            ),
+            problem: f
+                .get("problem")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            severity_explanation: f
+                .get("severity_explanation")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            file_path: f
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            line_number: f.get("line_number").and_then(|v| v.as_i64()),
+        })
+        .collect();
+
+    let include_vote = req.vote.unwrap_or(false);
+
+    gerrit
+        .post_review(&req.change_id, &req.revision_id, &gerrit_findings, include_vote)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to post to Gerrit: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let located = gerrit_findings
+        .iter()
+        .filter(|f| f.file_path.is_some() && f.line_number.is_some())
+        .count();
+
+    Ok(Json(serde_json::json!({
+        "status": "posted",
+        "findings": gerrit_findings.len(),
+        "inline_comments": located,
+        "change_id": req.change_id,
+    })))
 }

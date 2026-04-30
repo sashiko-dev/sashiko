@@ -507,6 +507,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allow_all_submit = cli.enable_unsafe_all_submit;
     let smtp_enabled = settings.smtp.is_some();
     let dry_run = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false);
+
+    // Initialize review backend clients (Gerrit)
+    let gerrit_client = settings
+        .gerrit
+        .as_ref()
+        .and_then(|gs| {
+            sashiko::gerrit::GerritClient::new(gs.clone())
+                .map(|c| std::sync::Arc::new(c))
+                .map_err(|e| error!("Failed to initialize Gerrit client: {}", e))
+                .ok()
+        });
+
     tokio::spawn(async move {
         if let Err(e) = sashiko::api::run_server(
             api_settings,
@@ -516,6 +528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_all_submit,
             smtp_enabled,
             dry_run,
+            gerrit_client,
         )
         .await
         {
