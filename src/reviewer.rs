@@ -61,9 +61,7 @@ struct BaselineAttempt {
 fn generate_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let start = SystemTime::now();
-    let since_the_epoch = start
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
+    let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap_or_default();
     format!("{:x}-{:x}", since_the_epoch.as_micros(), std::process::id())
 }
 
@@ -90,7 +88,7 @@ impl Reviewer {
     ///
     /// * `db` - The database connection.
     /// * `settings` - Application settings.
-    pub fn new(db: Arc<Database>, settings: Settings) -> Self {
+    pub fn new(db: Arc<Database>, settings: Settings) -> Result<Self> {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
@@ -112,18 +110,18 @@ impl Reviewer {
             };
 
         // Initialize Provider
-        let provider = create_provider(&settings).expect("Failed to create AI provider");
+        let provider = create_provider(&settings)?;
 
         // Initialize CacheManager
         // Assuming prompts are in "third_party/prompts/kernel" in CWD.
-        Self {
+        Ok(Self {
             db,
             settings,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             baseline_registry,
             quota_manager: Arc::new(QuotaManager::new()),
             provider,
-        }
+        })
     }
 
     /// Starts the reviewer service loop.
@@ -1478,6 +1476,8 @@ async fn run_review_tool(
         baseline,
         "--worktree-dir",
         &settings.review.worktree_dir,
+        "--prompts",
+        &settings.get_prompts_dir(),
         "--ai-provider",
         match settings.ai.provider.as_str() {
             "claude" | "stdio-claude" | "claude-cli" | "codex-cli" => "stdio-claude",

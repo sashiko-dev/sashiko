@@ -28,6 +28,8 @@ use tokio::process::Command;
 pub struct ToolBox {
     worktree_path: PathBuf,
     prompts_path: Option<PathBuf>,
+    enabled_tools: Option<Vec<String>>,
+    custom_tools: Vec<(AiTool, crate::settings::CustomToolDefinition)>,
 }
 
 impl ToolBox {
@@ -35,11 +37,223 @@ impl ToolBox {
         Self {
             worktree_path,
             prompts_path,
+            enabled_tools: None,
+            custom_tools: Vec::new(),
         }
+    }
+
+    /// Create a new ToolBox with tool filtering configuration.
+    pub fn with_config(
+        worktree_path: PathBuf,
+        prompts_path: Option<PathBuf>,
+        tools_config: Option<&crate::settings::ToolsSettings>,
+    ) -> Self {
+        let enabled_tools = tools_config.map(|config| {
+            // If enabled list is specified (allowlist mode), use it
+            if !config.enabled.is_empty() {
+                // Filter out disabled tools
+                config
+                    .enabled
+                    .iter()
+                    .filter(|name| !config.disabled.contains(name))
+                    .cloned()
+                    .collect()
+            } else {
+                // If no enabled list, get all built-in tools and filter disabled
+                let all_tools = vec![
+                    "read_files",
+                    "git_blame",
+                    "git_diff",
+                    "git_show",
+                    "git_log",
+                    "git_status",
+                    "git_checkout",
+                    "git_branch",
+                    "git_tag",
+                    "list_dir",
+                    "search_file_content",
+                    "find_files",
+                    "TodoWrite",
+                    "read_prompt",
+                ];
+                all_tools
+                    .into_iter()
+                    .filter(|name| !config.disabled.contains(&name.to_string()))
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+        });
+
+        let mut toolbox = Self {
+            worktree_path,
+            prompts_path,
+            enabled_tools,
+            custom_tools: Vec::new(),
+        };
+
+        // Register custom tools if provided
+        if let Some(config) = tools_config
+            && let Err(e) = toolbox.register_custom_tools(&config.custom)
+        {
+            tracing::warn!("Failed to register custom tools: {}", e);
+        }
+
+        toolbox
     }
 
     pub fn get_worktree_path(&self) -> &Path {
         &self.worktree_path
+    }
+
+    /// Check if a tool is enabled based on configuration.
+    fn is_tool_enabled(&self, tool_name: &str) -> bool {
+        match &self.enabled_tools {
+            Some(enabled) => enabled.contains(&tool_name.to_string()),
+            None => true, // All tools enabled by default
+        }
+    }
+
+    /// Register custom tools from configuration
+    fn register_custom_tools(
+        &mut self,
+        custom_tool_defs: &[crate::settings::CustomToolDefinition],
+    ) -> Result<()> {
+        for tool_def in custom_tool_defs {
+            // Validate command security
+            self.validate_tool_security(tool_def)?;
+
+            // Parse parameter schema
+            let schema: serde_json::Value =
+                serde_json::from_str(&tool_def.parameters).map_err(|e| {
+                    anyhow!(
+                        "Invalid parameter schema for tool '{}': {}",
+                        tool_def.name,
+                        e
+                    )
+                })?;
+
+            // Create AiTool definition
+            let ai_tool = AiTool {
+                name: tool_def.name.clone(),
+                description: tool_def.description.clone(),
+                parameters: schema,
+            };
+
+            // Store for later execution
+            self.custom_tools.push((ai_tool, tool_def.clone()));
+        }
+
+        Ok(())
+    }
+
+    /// Validate custom tool security
+    fn validate_tool_security(
+        &self,
+        tool_def: &crate::settings::CustomToolDefinition,
+    ) -> Result<()> {
+        // Check for dangerous patterns
+        let dangerous_patterns = ["rm -rf", "sudo", "curl", "wget", "dd ", "mkfs"];
+        for pattern in &dangerous_patterns {
+            if tool_def.command.contains(pattern) {
+                anyhow::bail!(
+                    "Potentially dangerous command in custom tool '{}': contains '{}'",
+                    tool_def.name,
+                    pattern
+                );
+            }
+        }
+
+        // Validate allowed_paths if specified
+        if !tool_def.allowed_paths.is_empty() {
+            for path in &tool_def.allowed_paths {
+                let full_path = self.worktree_path.join(path);
+                if !full_path.starts_with(&self.worktree_path) {
+                    anyhow::bail!(
+                        "Custom tool '{}' path escapes worktree: {}",
+                        tool_def.name,
+                        path
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute custom tool
+    async fn execute_custom_tool(
+        &self,
+        tool_def: &crate::settings::CustomToolDefinition,
+        args: &serde_json::Value,
+    ) -> Result<String> {
+        // Build command with parameter substitution
+        let mut command = tool_def.command.clone();
+
+        // Simple parameter substitution: {param_name}
+        if let Some(obj) = args.as_object() {
+            for (key, value) in obj {
+                let placeholder = format!("{{{}}}", key);
+                let value_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(arr) => {
+                        // Join array elements with spaces
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
+                    _ => value.to_string(),
+                };
+                command = command.replace(&placeholder, &value_str);
+            }
+        }
+
+        // Validate path parameters against allowlist if specified
+        if !tool_def.allowed_paths.is_empty() {
+            // Extract potential file paths from args and validate
+            if let Some(obj) = args.as_object() {
+                for (key, value) in obj {
+                    if key.contains("path") || key.contains("file") {
+                        let path_str = match value {
+                            serde_json::Value::String(s) => s.as_str(),
+                            _ => continue,
+                        };
+
+                        let is_allowed = tool_def
+                            .allowed_paths
+                            .iter()
+                            .any(|allowed| path_str.starts_with(allowed));
+
+                        if !is_allowed {
+                            anyhow::bail!(
+                                "Path '{}' not allowed for custom tool '{}'. Allowed paths: {:?}",
+                                path_str,
+                                tool_def.name,
+                                tool_def.allowed_paths
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Execute command in worktree
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&self.worktree_path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Custom tool '{}' failed: {}",
+                tool_def.name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Returns generic tool declarations.
@@ -205,7 +419,7 @@ impl ToolBox {
             },
         ];
 
-        if self.prompts_path.is_some() {
+        if self.prompts_path.is_some() && self.is_tool_enabled("read_prompt") {
             decls.push(AiTool {
                 name: "read_prompt".to_string(),
                 description: "Read a specific prompt file from the prompt registry (e.g., 'mm.md', 'locking.md').".to_string(),
@@ -219,11 +433,36 @@ impl ToolBox {
             });
         }
 
+        // Add custom tools
+        for (ai_tool, _) in &self.custom_tools {
+            decls.push(ai_tool.clone());
+        }
+
+        // Filter declarations based on enabled_tools configuration
         decls
+            .into_iter()
+            .filter(|tool| self.is_tool_enabled(&tool.name))
+            .collect()
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let name_normalized = name.trim().to_lowercase();
+
+        // Check if it's a custom tool first
+        if let Some((_, tool_def)) = self
+            .custom_tools
+            .iter()
+            .find(|(ai_tool, _)| ai_tool.name.to_lowercase() == name_normalized)
+        {
+            let result = self.execute_custom_tool(tool_def, &args).await?;
+            return Ok(Value::String(result));
+        }
+
+        // Check if tool is enabled
+        if !self.is_tool_enabled(&name_normalized) {
+            return Err(anyhow!("Tool '{}' is not enabled", name));
+        }
+
         match name_normalized.as_str() {
             "read_files" => self.read_files(args).await,
             "git_blame" => self.git_blame(args).await,
@@ -891,6 +1130,163 @@ mod tests {
         let result = toolbox.call("git_tag", json!({})).await?;
         let content = result["content"].as_str().unwrap();
         assert!(content.contains("v1.0"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_allowlist() -> Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec!["read_files".to_string(), "git_diff".to_string()],
+            disabled: vec![],
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls = toolbox.get_declarations_generic();
+
+        // Should only have 2 tools
+        assert_eq!(decls.len(), 2);
+        assert!(decls.iter().any(|t| t.name == "read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+
+        // Other tools should not be present
+        assert!(!decls.iter().any(|t| t.name == "git_log"));
+        assert!(!decls.iter().any(|t| t.name == "TodoWrite"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_denylist() -> Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec![],
+            disabled: vec!["git_checkout".to_string(), "TodoWrite".to_string()],
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls = toolbox.get_declarations_generic();
+
+        // Should have all tools except the disabled ones
+        assert!(decls.len() > 10); // Should have most tools
+        assert!(!decls.iter().any(|t| t.name == "git_checkout"));
+        assert!(!decls.iter().any(|t| t.name == "TodoWrite"));
+
+        // Other tools should be present
+        assert!(decls.iter().any(|t| t.name == "read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+        assert!(decls.iter().any(|t| t.name == "git_log"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_combined() -> Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec![
+                "read_files".to_string(),
+                "git_diff".to_string(),
+                "git_checkout".to_string(),
+            ],
+            disabled: vec!["git_checkout".to_string()], // Takes precedence
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls = toolbox.get_declarations_generic();
+
+        // Should only have 2 tools (git_checkout filtered by disabled)
+        assert_eq!(decls.len(), 2);
+        assert!(decls.iter().any(|t| t.name == "read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+        assert!(!decls.iter().any(|t| t.name == "git_checkout"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_call_disabled() -> Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec!["read_files".to_string()],
+            disabled: vec![],
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+
+        // Calling a disabled tool should fail
+        let args = json!({
+            "args": ["--oneline"]
+        });
+        let result = toolbox.call("git_log", args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not enabled"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_default_all_enabled() -> Result<()> {
+        let dir = tempdir()?;
+        // No config means all tools enabled
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, None);
+        let decls = toolbox.get_declarations_generic();
+
+        // Should have all built-in tools (13 tools, read_prompt excluded without prompts_path)
+        assert_eq!(decls.len(), 13);
+        assert!(decls.iter().any(|t| t.name == "read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+        assert!(decls.iter().any(|t| t.name == "git_log"));
+        assert!(decls.iter().any(|t| t.name == "TodoWrite"));
+        assert!(decls.iter().any(|t| t.name == "git_checkout"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_read_prompt_conditional() -> Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempdir()?;
+        let prompts_dir = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir)?;
+
+        // Allowlist including read_prompt
+        let config = ToolsSettings {
+            enabled: vec!["read_files".to_string(), "read_prompt".to_string()],
+            disabled: vec![],
+            custom: vec![],
+        };
+
+        // With prompts_path, read_prompt should be available
+        let toolbox = ToolBox::with_config(
+            dir.path().to_path_buf(),
+            Some(prompts_dir.clone()),
+            Some(&config),
+        );
+        let decls = toolbox.get_declarations_generic();
+        assert_eq!(decls.len(), 2);
+        assert!(decls.iter().any(|t| t.name == "read_prompt"));
+
+        // Without prompts_path, read_prompt should not be available even if enabled
+        let toolbox_no_prompts =
+            ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls_no_prompts = toolbox_no_prompts.get_declarations_generic();
+        assert_eq!(decls_no_prompts.len(), 1);
+        assert!(!decls_no_prompts.iter().any(|t| t.name == "read_prompt"));
 
         Ok(())
     }

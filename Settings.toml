@@ -1,27 +1,40 @@
+# Sashiko Configuration
+# Terse comments only. See docs/SETTINGS.md for full details.
+
 log_level = "info"
+
+[project]
+name = "Sashiko (Linux Kernel)"
+description = "Agentic review system for Linux kernel mailing lists."
+
+[forge]
+enabled = false
+# provider = "github"
+# webhook_secret = "secret"
+# api_token = "token"
+
+[subsystems]
+# Regex map email -> subsystem name
+mapping = [
+    { pattern = ".*linux-kernel@vger.kernel.org.*", name = "LKML" },
+    { pattern = ".*netdev@vger.kernel.org.*", name = "netdev" },
+    { pattern = ".*bpf@vger.kernel.org.*", name = "bpf" },
+    { pattern = ".*linux-usb@vger.kernel.org.*", name = "usb" },
+    { pattern = ".*linux-fsdevel@vger.kernel.org.*", name = "fsdevel" },
+    { pattern = ".*linux-mm@kvack.org.*", name = "linux-mm" }
+]
 
 [database]
 url = "sashiko.db"
 token = ""
 
 [mailing_lists]
+# Lore list names to watch
 track = ["linux-kernel"]
 
 [nntp]
 server = "nntp.lore.kernel.org"
 port = 119
-
-# [smtp]
-# **WARNING: BE VERY CAREFUL WHEN ENABLING EMAIL SENDING.**
-# Sashiko can easily generate and send a large volume of automated emails to
-# public mailing lists, potentially causing disruption or being marked as spam.
-# Ensure your filters and dry_run settings are correctly configured before use.
-# server = "smtp.example.com"
-# port = 587
-# username = "user@example.com"
-# password = "your_password"
-# sender_address = "sashiko@example.com"
-# dry_run = true
 
 [ai]
 provider = "gemini"
@@ -29,12 +42,6 @@ model = "gemini-3.1-pro-preview"
 max_input_tokens = 900000
 max_interactions = 50
 temperature = 1.0
-
-# To use Claude Code CLI (fixed-cost subscription, no API key needed):
-# provider = "claude-cli"
-# model = "claude-sonnet-4-6"
-# max_input_tokens = 180000
-# max_interactions = 150
 
 [ai.claude]
 prompt_caching = true
@@ -44,6 +51,7 @@ host = "127.0.0.1"
 port = 8080
 
 [git]
+# Local path to target repository
 repository_path = "third_party/linux"
 
 # Track custom remotes and attempt to apply patches on their branches
@@ -59,3 +67,15 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+
+[tools]
+# enabled = ["read_files", "git_diff"]
+# disabled = ["TodoWrite"]
+
+[prompts]
+# directory = "third_party/prompts/kernel"
+# directory = "git://github.com/user/prompts.git"
+# stages_config = "stages.toml"
+
+[prompts.variables]
+# project_name = "Sashiko"

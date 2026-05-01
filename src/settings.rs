@@ -14,6 +14,38 @@
 
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
+use std::path::PathBuf;
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct SubsystemMapping {
+    pub pattern: String,
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct SubsystemsSettings {
+    #[serde(default)]
+    pub mapping: Vec<SubsystemMapping>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct ProjectSettings {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct ForgeSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    pub provider: Option<String>,
+    pub webhook_secret: Option<String>,
+    pub api_token: Option<String>,
+}
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
@@ -291,10 +323,58 @@ fn default_log_level() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct CustomToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: String, // JSON schema as string
+    pub command: String,    // Shell command template
+    #[serde(default)]
+    pub allowed_paths: Vec<String>, // Security: allowlist
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct ToolsSettings {
+    /// List of tools to enable (allowlist mode).
+    /// If empty, all tools are enabled by default.
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    /// List of tools to disable (denylist mode).
+    /// Takes precedence over enabled list.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    /// Custom tool definitions
+    #[serde(default)]
+    pub custom: Vec<CustomToolDefinition>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct PromptsSettings {
+    /// Override prompts directory (local path or remote URL)
+    /// Local: "/custom/prompts" or "./my-prompts"
+    /// Remote: "https://example.com/prompts" or "git://github.com/user/prompts.git"
+    pub directory: Option<String>,
+
+    /// Path to stages.toml configuration
+    /// Can be absolute or relative to prompts directory
+    pub stages_config: Option<PathBuf>,
+
+    /// Template variables for prompt substitution
+    #[serde(default)]
+    pub variables: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct Settings {
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    pub project: ProjectSettings,
+    #[serde(default = "default_subsystems")]
+    pub subsystems: SubsystemsSettings,
+    #[serde(default = "default_forge")]
+    pub forge: ForgeSettings,
     pub database: DatabaseSettings,
     pub nntp: NntpSettings,
     pub smtp: Option<SmtpSettings>,
@@ -303,6 +383,25 @@ pub struct Settings {
     pub server: ServerSettings,
     pub git: GitSettings,
     pub review: ReviewSettings,
+    /// Optional tools configuration.
+    /// If omitted, all tools are enabled (default behavior).
+    pub tools: Option<ToolsSettings>,
+    /// Optional prompts configuration.
+    /// If omitted, default prompts from third_party/prompts/kernel are used.
+    pub prompts: Option<PromptsSettings>,
+}
+
+fn default_subsystems() -> SubsystemsSettings {
+    SubsystemsSettings { mapping: vec![] }
+}
+
+fn default_forge() -> ForgeSettings {
+    ForgeSettings {
+        enabled: false,
+        provider: None,
+        webhook_secret: None,
+        api_token: None,
+    }
 }
 
 impl Settings {
@@ -316,5 +415,12 @@ impl Settings {
             .build()?;
 
         s.try_deserialize()
+    }
+
+    pub fn get_prompts_dir(&self) -> String {
+        self.prompts
+            .as_ref()
+            .and_then(|p| p.directory.clone())
+            .unwrap_or_else(|| "third_party/prompts/kernel".to_string())
     }
 }

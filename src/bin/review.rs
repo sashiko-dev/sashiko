@@ -44,8 +44,8 @@ struct Args {
     #[arg(long)]
     worktree_dir: Option<PathBuf>,
 
-    #[arg(long, default_value = "third_party/prompts/kernel")]
-    prompts: PathBuf,
+    #[arg(long)]
+    prompts: Option<PathBuf>,
 
     /// If set, only review the patch with this index (1-based usually).
     /// Previous patches (with lower index) will be applied but not reviewed.
@@ -374,11 +374,26 @@ async fn main() -> Result<()> {
                         let provider = sashiko::ai::create_provider(&settings).expect("Failed to create AI provider");
 
                         // Enable read_prompt tool only if explicit caching is NOT used.
-                        let prompts_dir = PathBuf::from("third_party/prompts/kernel");
+                        let prompts_dir = args
+                            .prompts
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from(settings.get_prompts_dir()));
                         let prompts_tool_path = Some(prompts_dir.join("tool.md"));
 
-                        let tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
-                        let prompts = PromptRegistry::new(args.prompts.clone());
+                        let tools = ToolBox::with_config(
+                            worktree.path.clone(),
+                            prompts_tool_path,
+                            settings.tools.as_ref(),
+                        );
+
+                        // Use settings if available, otherwise fall back to args.prompts
+                        let prompts = if settings.prompts.is_some() {
+                            PromptRegistry::with_settings(settings.prompts.as_ref())
+                                .await
+                                .expect("Failed to load prompts with settings")
+                        } else {
+                            PromptRegistry::new(prompts_dir)
+                        };
 
                         // Calculate series range (baseline..last_patch)
                         let series_range = calculate_series_range(

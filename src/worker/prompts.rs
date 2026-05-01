@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
+use crate::settings::PromptsSettings;
 use crate::worker::tools::ToolBox;
 use anyhow::{Context, Result};
 
@@ -35,6 +36,7 @@ pub enum ReviewError {
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -97,6 +99,27 @@ fn validate_inline_format(content: &str) -> std::result::Result<(), String> {
     }
     Ok(())
 }
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct StagesConfig {
+    pub stages: Vec<StageDefinition>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct StageDefinition {
+    pub number: u8,
+    pub name: Option<String>,
+    pub instruction_file: Option<PathBuf>,
+    #[serde(default)]
+    pub supporting_files: Vec<String>,
+    #[serde(default = "default_stage_enabled")]
+    pub enabled: bool,
+}
+
+fn default_stage_enabled() -> bool {
+    true
+}
+
 pub struct WorkerConfig {
     pub max_input_tokens: usize,
     pub max_interactions: usize,
@@ -120,11 +143,180 @@ pub struct WorkerResult {
 
 pub struct PromptRegistry {
     base_dir: PathBuf,
+    stages_config: Option<StagesConfig>,
+    variables: Option<HashMap<String, String>>,
 }
 
 impl PromptRegistry {
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            stages_config: None,
+            variables: None,
+        }
+    }
+
+    /// Create a new PromptRegistry with PromptsSettings support
+    pub async fn with_settings(settings: Option<&PromptsSettings>) -> Result<Self> {
+        // Resolve directory (supports local/remote)
+        let resolved_dir = if let Some(prompts_settings) = settings
+            && let Some(directory) = &prompts_settings.directory
+        {
+            Self::resolve_prompts_directory(directory).await?
+        } else {
+            PathBuf::from("third_party/prompts/kernel")
+        };
+
+        // Load stages config if specified
+        let stages_config = if let Some(prompts_settings) = settings {
+            Self::load_stages_config(&resolved_dir, prompts_settings.stages_config.as_ref()).await?
+        } else {
+            Self::load_stages_config(&resolved_dir, None).await?
+        };
+
+        // Copy variables if provided
+        let variables = settings.and_then(|s| {
+            if s.variables.is_empty() {
+                None
+            } else {
+                Some(s.variables.clone())
+            }
+        });
+
+        Ok(Self {
+            base_dir: resolved_dir,
+            stages_config,
+            variables,
+        })
+    }
+
+    /// Resolve prompts directory from settings
+    /// Supports local paths and remote URLs
+    async fn resolve_prompts_directory(directory: &str) -> Result<PathBuf> {
+        if directory.starts_with("http://") || directory.starts_with("https://") {
+            // Remote URL: download and cache
+            return Self::download_remote_prompts(directory).await;
+        } else if directory.starts_with("git://") || directory.ends_with(".git") {
+            // Git repository: clone and cache
+            return Self::clone_git_prompts(directory).await;
+        } else {
+            // Local path: resolve relative to cwd
+            let path = PathBuf::from(directory);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Ok(std::env::current_dir()?.join(path))
+            }
+        }
+    }
+
+    /// Download remote prompts via HTTP(S)
+    async fn download_remote_prompts(url: &str) -> Result<PathBuf> {
+        use std::fs;
+
+        // Create cache directory
+        let cache_dir = PathBuf::from(".sashiko-cache/prompts");
+        fs::create_dir_all(&cache_dir)?;
+
+        // Hash URL for cache key
+        let hash = format!("{:x}", md5::compute(url));
+        let cache_path = cache_dir.join(&hash);
+
+        // Check if already cached
+        if cache_path.exists() {
+            info!("Using cached prompts from {}", url);
+            return Ok(cache_path);
+        }
+
+        info!("Downloading prompts from {}", url);
+
+        // Download as tarball or zip
+        let response = reqwest::get(url).await?;
+        let _bytes = response.bytes().await?;
+
+        // For simplicity, assume the URL points to a directory structure
+        // In a production implementation, we would detect and extract archives
+        // For now, just create a marker directory
+        fs::create_dir_all(&cache_path)?;
+
+        // Save the downloaded content (simplified - would need proper archive handling)
+        warn!("Remote HTTP prompts download is not fully implemented - using local fallback");
+
+        // Fallback to default directory
+        Ok(PathBuf::from("third_party/prompts/kernel"))
+    }
+
+    /// Clone Git repository for prompts
+    async fn clone_git_prompts(repo_url: &str) -> Result<PathBuf> {
+        use std::fs;
+        use std::process::Command;
+
+        let cache_dir = PathBuf::from(".sashiko-cache/prompts");
+        fs::create_dir_all(&cache_dir)?;
+
+        let hash = format!("{:x}", md5::compute(repo_url));
+        let cache_path = cache_dir.join(&hash);
+
+        if cache_path.exists() {
+            info!("Using cached git prompts from {}", repo_url);
+            // TODO: git pull to update
+            return Ok(cache_path);
+        }
+
+        info!("Cloning prompts repository from {}", repo_url);
+
+        let output = Command::new("git")
+            .args(["clone", repo_url, cache_path.to_str().unwrap()])
+            .output()?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to clone git repository: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(cache_path)
+    }
+
+    /// Load stages.toml configuration
+    async fn load_stages_config(
+        base_dir: &Path,
+        config_path: Option<&PathBuf>,
+    ) -> Result<Option<StagesConfig>> {
+        let stages_file = if let Some(path) = config_path {
+            base_dir.join(path)
+        } else {
+            base_dir.join("stages.toml")
+        };
+
+        if !stages_file.exists() {
+            return Ok(None);
+        }
+
+        info!("Loading stages configuration from {:?}", stages_file);
+        let contents = fs::read_to_string(&stages_file).await?;
+        let config: StagesConfig = toml::from_str(&contents)?;
+
+        Ok(Some(config))
+    }
+
+    /// Substitute template variables in prompt content
+    /// Supports {{variable_name}} syntax
+    fn substitute_variables(content: &str, variables: &HashMap<String, String>) -> String {
+        let mut result = content.to_string();
+
+        for (key, value) in variables {
+            let placeholder = format!("{{{{{}}}}}", key);
+            result = result.replace(&placeholder, value);
+        }
+
+        // Add built-in variables
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        result = result.replace("{{date}}", &timestamp);
+        result = result.replace("{{year}}", &chrono::Utc::now().format("%Y").to_string());
+
+        result
     }
 
     pub fn get_system_identity() -> &'static str {
@@ -208,7 +400,134 @@ impl PromptRegistry {
         let mut clean_files = Vec::new();
         let mut content = String::with_capacity(10_000);
 
-        let stage_instruction = match stage {
+        // Check if custom stage config exists
+        let mut custom_supporting_files = Vec::new();
+        if let Some(ref config) = self.stages_config
+            && let Some(stage_def) = config.stages.iter().find(|s| s.number == stage)
+        {
+            if !stage_def.enabled {
+                // Stage disabled in config
+                anyhow::bail!("Stage {} is disabled in configuration", stage);
+            }
+
+            // Load instruction from custom file if specified
+            if let Some(ref file) = stage_def.instruction_file {
+                let instruction_path = self.base_dir.join(file);
+                if let Ok(raw_content) = fs::read_to_string(&instruction_path).await {
+                    // Apply variable substitution
+                    let instruction = if let Some(ref vars) = self.variables {
+                        Self::substitute_variables(&raw_content, vars)
+                    } else {
+                        raw_content
+                    };
+
+                    content.push_str(&instruction);
+                    clean.push_str(&instruction);
+                    content.push_str("\n\n");
+                    clean.push_str("\n\n");
+
+                    // Use custom supporting files
+                    custom_supporting_files = stage_def.supporting_files.clone();
+                }
+            }
+        }
+
+        // If no custom instruction was loaded, use default behavior
+        if content.is_empty() {
+            let stage_instruction = self
+                .load_stage_instruction_from_file(stage)
+                .await
+                .or_else(|| self.get_hardcoded_stage_instruction(stage));
+
+            if let Some(raw_instruction) = stage_instruction {
+                // Apply variable substitution
+                let instruction = if let Some(ref vars) = self.variables {
+                    Self::substitute_variables(&raw_instruction, vars)
+                } else {
+                    raw_instruction
+                };
+
+                content.push_str(&instruction);
+                clean.push_str(&instruction);
+                content.push_str("\n\n");
+                clean.push_str("\n\n");
+            }
+        }
+
+        // Load supporting files (custom or default)
+        if !custom_supporting_files.is_empty() {
+            // Use custom supporting files from stages.toml
+            for file in &custom_supporting_files {
+                self.append_file(&mut content, &mut clean_files, file)
+                    .await?;
+            }
+        } else {
+            // Use default supporting files
+            match stage {
+                3 => {
+                    self.append_file(&mut content, &mut clean_files, "callstack.md")
+                        .await?;
+                    self.append_file(&mut content, &mut clean_files, "technical-patterns.md")
+                        .await?;
+                }
+                5 => {
+                    self.append_file(&mut content, &mut clean_files, "subsystem/locking.md")
+                        .await?;
+                }
+                8 => {
+                    self.append_file(&mut content, &mut clean_files, "false-positive-guide.md")
+                        .await?;
+                    self.append_file(&mut content, &mut clean_files, "severity.md")
+                        .await?;
+                }
+                9 => {
+                    self.append_file(&mut content, &mut clean_files, "inline-template.md")
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+
+        if !clean_files.is_empty() {
+            clean.push_str(&clean_files.join(", "));
+            clean.push_str("\n\n");
+        }
+        Ok((content, clean))
+    }
+
+    /// Load stage instruction from file (e.g., stages/01-analyze-goal.md)
+    async fn load_stage_instruction_from_file(&self, stage: u8) -> Option<String> {
+        let stage_dir = self.base_dir.join("stages");
+        if !stage_dir.exists() {
+            return None;
+        }
+
+        // Try to find a file matching the pattern: {stage:02}-*.md
+        let stage_prefix = format!("{:02}-", stage);
+
+        match std::fs::read_dir(&stage_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                        && filename.starts_with(&stage_prefix)
+                        && filename.ends_with(".md")
+                    {
+                        // Found matching stage file, read it
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            return Some(content);
+                        }
+                    }
+                }
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Get hardcoded stage instruction (fallback)
+    fn get_hardcoded_stage_instruction(&self, stage: u8) -> Option<String> {
+        let instruction = match stage {
             1 => {
                 "# Stage 1. Analyze commit main goal
 
@@ -280,41 +599,11 @@ You are an expert kernel developer writing patches to fix bugs found during revi
             _ => "",
         };
 
-        if !stage_instruction.is_empty() {
-            content.push_str(stage_instruction);
-            clean.push_str(stage_instruction);
-            content.push_str("\n\n");
-            clean.push_str("\n\n");
+        if instruction.is_empty() {
+            None
+        } else {
+            Some(instruction.to_string())
         }
-
-        match stage {
-            3 => {
-                self.append_file(&mut content, &mut clean_files, "callstack.md")
-                    .await?;
-                self.append_file(&mut content, &mut clean_files, "technical-patterns.md")
-                    .await?;
-            }
-            5 => {
-                self.append_file(&mut content, &mut clean_files, "subsystem/locking.md")
-                    .await?;
-            }
-            8 => {
-                self.append_file(&mut content, &mut clean_files, "false-positive-guide.md")
-                    .await?;
-                self.append_file(&mut content, &mut clean_files, "severity.md")
-                    .await?;
-            }
-            9 => {
-                self.append_file(&mut content, &mut clean_files, "inline-template.md")
-                    .await?;
-            }
-            _ => {}
-        }
-        if !clean_files.is_empty() {
-            clean.push_str(&clean_files.join(", "));
-            clean.push_str("\n\n");
-        }
-        Ok((content, clean))
     }
 
     async fn append_file(
@@ -673,6 +962,19 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                         stages.push(n as u8);
                     }
                 }
+
+                // Filter out disabled stages from configuration
+                if let Some(ref config) = self.prompts.stages_config {
+                    stages.retain(|&stage| {
+                        config
+                            .stages
+                            .iter()
+                            .find(|s| s.number == stage)
+                            .map(|s| s.enabled)
+                            .unwrap_or(true) // Default to enabled if not in config
+                    });
+                }
+
                 info!("Planning phase selected stages: {:?}", stages);
                 planning_selected_stages = Some(stages);
             }

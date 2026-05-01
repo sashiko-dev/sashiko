@@ -15,10 +15,9 @@
 use crate::db::Database;
 use crate::events::Event;
 use crate::fetcher::FetchRequest;
-use crate::settings::ServerSettings;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     routing::{get, get_service, post},
 };
@@ -28,7 +27,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -122,9 +121,11 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
 }
 
 pub struct AppState {
+    pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
     pub sender: mpsc::Sender<Event>,
     pub fetch_sender: mpsc::Sender<FetchRequest>,
+    pub forge_registry: Arc<crate::forge::ForgeRegistry>,
     pub read_only: bool,
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
@@ -227,7 +228,7 @@ pub struct SubmitResponse {
 }
 
 pub async fn run_server(
-    settings: ServerSettings,
+    settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
@@ -235,11 +236,15 @@ pub async fn run_server(
     smtp_enabled: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let forge_registry = Arc::new(crate::forge::ForgeRegistry::new());
+
     let state = Arc::new(AppState {
+        read_only: settings.server.read_only,
+        settings: settings.clone(),
         db,
         sender,
         fetch_sender,
-        read_only: settings.read_only,
+        forge_registry,
         allow_all_submit,
         smtp_enabled,
         dry_run,
@@ -253,6 +258,7 @@ pub async fn run_server(
     });
 
     let app = Router::new()
+        .route("/api/config", get(get_config))
         .route("/api/lists", get(list_mailing_lists))
         .route("/api/patchsets", get(list_patchsets))
         .route("/api/messages", get(list_messages))
@@ -268,11 +274,12 @@ pub async fn run_server(
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
+        .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], settings.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], settings.server.port));
     info!("Web API listening on {}", addr);
 
     let listener = TcpListener::bind(addr).await?;
@@ -288,9 +295,7 @@ pub async fn run_server(
 fn generate_synthetic_id(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let start = SystemTime::now();
-    let since_the_epoch = start
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
+    let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap_or_default();
     // e.g. sashiko-local-1715890000-12345
     format!(
         "sashiko-{}-{}-{}",
@@ -377,6 +382,10 @@ async fn submit_patch(
                     &format!("Fetching {} from {}...", &sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
+                    None,
+                    None,
+                    None,
+                    None, // slug
                 )
                 .await
             {
@@ -387,6 +396,9 @@ async fn submit_patch(
             let req = FetchRequest {
                 repo_url: repo,
                 commit_hash: sha,
+                mr_url: None,
+                mr_title: None,
+                mr_number: None,
             };
 
             if let Err(e) = state.fetch_sender.send(req).await {
@@ -415,6 +427,10 @@ async fn submit_patch(
                     &format!("Fetching thread {}...", clean_msgid),
                     None,
                     None,
+                    None,
+                    None,
+                    None,
+                    None, // slug
                 )
                 .await
             {
@@ -639,6 +655,13 @@ async fn get_patchset(
         state
             .db
             .get_patchset_details(id_val, query.page, query.per_page)
+            .await
+    } else if query.id.contains('-') && !query.id.contains('@') {
+        // Likely a slug (format: repo-mrnum, e.g., "my-project-2007")
+        info!("Fetching details for patchset slug: {}", query.id);
+        state
+            .db
+            .get_patchset_details_by_slug(&query.id, query.page, query.per_page)
             .await
     } else {
         info!("Fetching details for patchset msgid: {}", query.id);
@@ -957,4 +980,105 @@ async fn rerun_patch(
         })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+async fn get_config(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({
+        "project_name": state.settings.project.name,
+        "project_description": state.settings.project.description,
+        "forge_enabled": state.settings.forge.enabled,
+    })))
+}
+
+/// Generic webhook handler for all forge providers
+async fn forge_webhook(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // 1. Security checks (unified)
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !state.allow_all_submit && !addr.ip().is_loopback() {
+        info!("Refused {} webhook from non-localhost: {}", provider, addr);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // 2. Get provider from registry
+    let forge = state.forge_registry.get(&provider).ok_or_else(|| {
+        warn!("Unknown forge provider: {}", provider);
+        StatusCode::NOT_FOUND
+    })?;
+
+    // 3. Validate event (uses trait!)
+    forge.validate_event(&headers)?;
+
+    // 4. Parse payload (uses trait!)
+    let (action, metadata) = forge.parse_payload(&body)?;
+
+    info!(
+        "{} {}: {} - {}",
+        forge.name(),
+        action,
+        metadata.pr_title.as_deref().unwrap_or("(no title)"),
+        metadata.pr_url.as_deref().unwrap_or("(no url)")
+    );
+
+    // 5. Create placeholder (unified)
+    let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
+    let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
+
+    // 6. Queue request (unified)
+    // Create a range (base..head) so FetchAgent processes all commits in the PR/MR
+    let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
+
+    // Use a unique placeholder ID per MR to avoid collisions when different MRs
+    // have overlapping commit ranges. The actual patchset will use this same ID.
+    let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
+
+    // Generate URL slug: {repo}-{mr_number}
+    let slug = metadata.pr_url.as_ref().and_then(|url| {
+        crate::extract_repo_name_from_url(url)
+            .map(|repo| format!("{}-{}", repo, metadata.pr_number))
+    });
+
+    state
+        .db
+        .create_fetching_patchset(
+            &placeholder_id,
+            &format!("Fetching {} PR/MR: {}", forge.name(), subject),
+            None,
+            None,
+            metadata.pr_url.as_deref(),
+            Some(subject),
+            Some(metadata.pr_number),
+            slug.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to create placeholder patchset: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let req = FetchRequest {
+        repo_url: metadata.repo_url,
+        commit_hash: commit_range,
+        mr_url: metadata.pr_url,
+        mr_title: metadata.pr_title,
+        mr_number: Some(metadata.pr_number),
+    };
+
+    state.fetch_sender.send(req).await.map_err(|e| {
+        error!("Failed to send fetch request to queue: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "accepted",
+        "message": format!("{} {} queued for review", forge.name(), action)
+    })))
 }
