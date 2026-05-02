@@ -66,3 +66,8 @@ cc = ["ojeda@kernel.org"]
 lists = ["sched-ext@lists.linux.dev"]
 reply_to_author = true
 cc = ["sched-ext@lists.linux.dev"]
+
+[subsystems.pci]
+lists = ["linux-pci@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-pci@vger.kernel.org"]
