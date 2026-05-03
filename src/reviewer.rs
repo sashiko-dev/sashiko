@@ -1509,7 +1509,7 @@ async fn run_review_tool(
         &settings.review.worktree_dir,
         "--ai-provider",
         match settings.ai.provider.as_str() {
-            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" => {
+            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli" => {
                 "stdio-claude"
             }
             _ => "stdio-gemini",

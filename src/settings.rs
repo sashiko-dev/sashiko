@@ -191,6 +191,25 @@ pub struct OpenAiCompatSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct KiroCliSettings {
+    #[serde(default = "default_kiro_cli_binary")]
+    pub binary: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default = "default_kiro_cli_context_window")]
+    pub context_window_size: usize,
+}
+
+fn default_kiro_cli_binary() -> String {
+    "kiro-cli".to_string()
+}
+
+fn default_kiro_cli_context_window() -> usize {
+    200_000
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct AiSettings {
     pub provider: String,
     pub model: String,
@@ -220,6 +239,7 @@ pub struct AiSettings {
     #[cfg(feature = "vertex")]
     pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
+    pub kiro_cli: Option<KiroCliSettings>,
 }
 
 fn default_response_cache_ttl_days() -> u64 {

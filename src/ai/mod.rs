@@ -317,6 +317,18 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
             model: settings.ai.model.clone(),
         })),
+        "kiro-cli" => {
+            let cfg = settings.ai.kiro_cli.as_ref();
+            Ok(Arc::new(kiro_cli::KiroCliProvider {
+                model: settings.ai.model.clone(),
+                binary: cfg
+                    .map(|c| c.binary.clone())
+                    .unwrap_or_else(|| "kiro-cli".to_string()),
+                agent: cfg.and_then(|c| c.agent.clone()),
+                context_window_size: cfg.map(|c| c.context_window_size).unwrap_or(200_000),
+                timeout_secs: settings.ai.api_timeout_secs,
+            }))
+        }
         #[cfg(feature = "vertex")]
         "vertex" => {
             let model = settings.ai.model.clone();
@@ -359,6 +371,7 @@ pub mod claude_cli;
 pub mod codex_cli;
 pub mod copilot_cli;
 pub mod gemini;
+pub mod kiro_cli;
 pub mod openai;
 pub mod proxy;
 pub mod quota;

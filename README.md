@@ -236,6 +236,28 @@ prompt_caching = true
 - 1M context window for Claude Opus 4.7/4.6 and Sonnet 4.6 on Vertex
 - Full tool/function calling and prompt caching support
 
+    ### Kiro CLI Setup
+
+    Sashiko supports using the local `kiro-cli` as a completion backend.
+
+    **Prerequisites**: Install `kiro-cli` and authenticate with `KIRO_API_KEY` or a browser login.
+
+    **Update Settings.toml**:
+    ```toml
+    [ai]
+    provider = "kiro-cli"
+    model = "claude-opus-4.6"
+
+    [ai.kiro_cli]
+    binary = "kiro-cli"
+    context_window_size = 200000
+    ```
+
+    **Features**:
+    - Runs `kiro-cli acp` as a stateless completion backend
+    - Kiro native tools are disabled by default; Sashiko's own tool protocol is used instead
+    - An isolated temporary agent with a deny-all hook prevents accidental tool execution
+
 3.  **Build**:
     ```bash
     cargo build --release
