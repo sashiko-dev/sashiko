@@ -29,6 +29,10 @@ lists = ["linux-perf-users@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-perf-users@vger.kernel.org"]
 
+[subsystems.batman]
+lists = ["b.a.t.m.a.n@lists.open-mesh.org"]
+cc = ["marek.lindner@mailbox.org", "sw@simonwunderlich.de", "antonio@mandelbit.com", "sven@narfation.org"]
+
 [subsystems.bpf]
 lists = ["bpf@vger.kernel.org"]
 reply_to_author = true
