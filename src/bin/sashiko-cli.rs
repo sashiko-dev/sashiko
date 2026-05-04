@@ -609,8 +609,11 @@ async fn handle_show(
                             {
                                 for r in reviews {
                                     if r.get("patch_id").and_then(|id| id.as_i64()) == Some(p_id) {
-                                        patch_review = Some(r);
-                                        break;
+                                        if let Some(inline) = r.get("inline_review").and_then(|s| s.as_str())
+                                            && !inline.is_empty() {
+                                                patch_review = Some(r);
+                                                break;
+                                        }
                                     }
                                 }
                             }
