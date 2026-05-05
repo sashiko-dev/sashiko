@@ -79,6 +79,9 @@ lists = ["sched-ext@lists.linux.dev"]
 reply_to_author = true
 cc = ["sched-ext@lists.linux.dev"]
 
+[subsystems.openvpn-devel]
+lists = ["openvpn-devel@lists.sourceforge.net"]
+cc = ["antonio@mandelbit.com", "ralf@mandelbit.com", "sd@queasysnail.net"]
 
 [subsystems.pci]
 lists = ["linux-pci@vger.kernel.org"]
