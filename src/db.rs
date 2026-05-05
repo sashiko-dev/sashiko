@@ -3305,7 +3305,10 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        let clid_candidates = vec![root_msg_id.to_string()];
+        let mut clid_candidates = vec![root_msg_id.to_string()];
+        if let Some(sha) = root_msg_id.strip_suffix("@sashiko.local") {
+            clid_candidates.push(sha.to_string());
+        }
 
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
@@ -3326,7 +3329,7 @@ impl Database {
 
                 // Only reset to Fetching if it failed or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
-                if status == "Failed" || status == "Fetching" {
+                if status == "Failed" || status == "Fetching" || status == "Cancelled" {
                     self.conn.execute(
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ? WHERE id = ?",
                         libsql::params![skip_filters_json.clone(), only_filters_json.clone(), id]
