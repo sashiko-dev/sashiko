@@ -86,6 +86,12 @@ if [ -n "$PORT" ]; then
     export SASHIKO__SERVER__PORT="$PORT"
 fi
 
+# Prune stale git worktrees synchronously to prevent fetch errors at startup
+if [ -d "$KERNEL_DIR/.git" ]; then
+    echo "Pruning stale git worktrees..."
+    git -C "$KERNEL_DIR" worktree prune || true
+fi
+
 # Start background tasks
 setup_kernel &
 sleep 1
