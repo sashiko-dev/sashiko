@@ -15,6 +15,7 @@
 use clap::{Parser, Subcommand};
 use sashiko::db::Database;
 use sashiko::events::{Event, MessageSource, ParsedArticle};
+use sashiko::fetcher::FetchRequest;
 use sashiko::ingestor::Ingestor;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
@@ -179,8 +180,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (fetch_agent, fetch_tx) = sashiko::fetcher::FetchAgent::new(repo_path, raw_tx.clone());
 
     // Spawn FetchAgent
-    tokio::spawn(async move {
+    let fetch_handle = tokio::spawn(async move {
         fetch_agent.run().await;
+    });
+
+    // Resume stuck fetches in the background
+    let db_resumption = db.clone();
+    let tx_resumption = fetch_tx.clone();
+    tokio::spawn(async move {
+        match db_resumption.get_stuck_fetches().await {
+            Ok(stuck) => {
+                if !stuck.is_empty() {
+                    info!("Resuming {} stuck fetches", stuck.len());
+                    for (msgid, repo_url) in stuck {
+                        // Extract actual SHA from synthetic message ID
+                        // Format: sashiko-<sha>-<ts>@sashiko.local
+                        // Or just <sha>
+                        let mut commit_hash = msgid.clone();
+                        if commit_hash.starts_with("sashiko-") {
+                            commit_hash = commit_hash
+                                .strip_prefix("sashiko-")
+                                .and_then(|s| s.split('-').next())
+                                .map(|s| s.to_string())
+                                .unwrap_or(commit_hash);
+                        }
+
+                        // Remove domain suffix if present (e.g. @sashiko.local)
+                        if let Some(pos) = commit_hash.find('@') {
+                            commit_hash.truncate(pos);
+                        }
+
+                        if let Err(e) = tx_resumption
+                            .send(FetchRequest {
+                                repo_url,
+                                commit_hash,
+                            })
+                            .await
+                        {
+                            error!("Failed to re-queue stuck fetch: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => error!("Failed to query stuck fetches: {}", e),
+        }
     });
 
     // Parser Dispatcher
@@ -588,6 +631,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Abort handles
     ingestor_handle.abort();
     parser_handle.abort();
+    fetch_handle.abort();
 
     Ok(())
 }

@@ -3427,6 +3427,37 @@ impl Database {
         Ok(count_ps + count_rev)
     }
 
+    pub async fn get_stuck_fetches(&self) -> Result<Vec<(String, Option<String>)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.cover_letter_message_id, b.repo_url
+                 FROM patchsets p 
+                 LEFT JOIN baselines b ON p.baseline_id = b.id 
+                 WHERE p.status = 'Fetching'",
+                (),
+            )
+            .await?;
+
+        let mut stuck = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let msgid: String = row.get(0)?;
+            let repo: Option<String> = row.get(1).ok().flatten();
+            stuck.push((msgid, repo));
+        }
+        Ok(stuck)
+    }
+
+    pub async fn reset_stuck_fetches(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Stuck after reboot' WHERE status = 'Fetching'",
+                (),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_patchset_counts_by_status(
         &self,
     ) -> Result<std::collections::HashMap<String, usize>> {
