@@ -1743,20 +1743,36 @@ impl Database {
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
-            clid_candidates.push(clid.to_string());
+            clid_candidates.push((clid.to_string(), false));
         }
-        // Fallback for single-patch git imports where placeholder is sha@sashiko.local
-        // but the actual cover letter becomes the sha itself.
-        clid_candidates.push(format!("{}@sashiko.local", message_id));
+        // Fallback for single-patch git imports where placeholder is
+        // sha@sashiko.local but the actual cover letter becomes the sha
+        // itself.  Only add the fallback when no explicit cover letter
+        // was provided AND the patch is a singleton (total == 1).
+        // Multi-part ranges always have an explicit cover letter ID,
+        // and the fallback would incorrectly match patchsets from
+        // unrelated submissions that happen to share a commit SHA.
+        if cover_letter_message_id.is_none() || total_parts == 1 {
+            clid_candidates.push((format!("{}@sashiko.local", message_id), true));
+        }
 
-        for clid in clid_candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
+        for (clid, scope_to_thread) in clid_candidates {
+            // When using the @sashiko.local fallback, scope the query
+            // to the same thread to avoid cross-patchset contamination.
+            let query = if scope_to_thread {
+                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ? AND thread_id = ?"
+            } else {
+                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?"
+            };
+            let mut rows = if scope_to_thread {
+                self.conn
+                    .query(query, libsql::params![clid.clone(), thread_id])
+                    .await?
+            } else {
+                self.conn
+                    .query(query, libsql::params![clid.clone()])
+                    .await?
+            };
             while let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
                 let existing_subject: String = row.get(3)?;
@@ -3716,7 +3732,10 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        let clid_candidates = vec![root_msg_id.to_string()];
+        let mut clid_candidates = vec![root_msg_id.to_string()];
+        if let Some(sha) = root_msg_id.strip_suffix("@sashiko.local") {
+            clid_candidates.push(sha.to_string());
+        }
 
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
@@ -3737,7 +3756,7 @@ impl Database {
 
                 // Only reset to Fetching if it failed or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
-                if status == "Failed" || status == "Fetching" {
+                if status == "Failed" || status == "Fetching" || status == "Cancelled" {
                     self.conn.execute(
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
                         libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
@@ -6642,6 +6661,266 @@ mod tests {
         assert_eq!(
             ps1, ps2,
             "Patchset from B4 Relay devnull alias and real author email MUST merge"
+        );
+    }
+    /// Verify that a commit SHA submitted as a singleton does NOT steal
+    /// a patch from a range patchset in a different thread.
+    ///
+    /// Regression test for the clid_candidates fallback that matched
+    /// across unrelated patchsets via the @sashiko.local suffix.
+    #[tokio::test]
+    async fn test_range_patch_not_stolen_by_singleton() {
+        let db = setup_db().await;
+        let author = "Akhil R <akhilrajeev@nvidia.com>";
+
+        // Thread 1: single commit submission (sha_D).
+        // For singletons, cover_letter_message_id = message_id.
+        let t1 = db
+            .create_thread("sha_D", "Single commit", 90000)
+            .await
+            .unwrap();
+        db.create_message(
+            "sha_D",
+            t1,
+            None,
+            author,
+            "i2c: tegra: Update timing",
+            90000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some("sha_D"),
+                "sha_D",
+                "i2c: tegra: Update timing",
+                author,
+                90000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, "sha_D", 1, "diff-single")
+            .await
+            .unwrap();
+
+        // Verify single patchset is full (1/1)
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1);
+        assert_eq!(det["total_parts"], 1);
+
+        // Thread 2: range submission (A..D) with 4 commits.
+        // The root message_id is the range itself.
+        let t2 = db
+            .create_thread("range_root", "Range submission", 90010)
+            .await
+            .unwrap();
+
+        // Create the root/cover message for the range
+        db.create_message(
+            "range_root",
+            t2,
+            None,
+            author,
+            "Range A..D",
+            90010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // First patch establishes the range patchset
+        db.create_message(
+            "sha_A",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 1/4] Patch sha_A",
+            90011,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_A",
+                "[PATCH 1/4] Patch sha_A",
+                author,
+                90011,
+                4,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "sha_A", 1, "diff-sha_A")
+            .await
+            .unwrap();
+
+        // Patches 2-3 merge into the range patchset
+        for (i, sha) in ["sha_B", "sha_C"].iter().enumerate() {
+            let idx = (i + 2) as u32;
+            db.create_message(
+                sha,
+                t2,
+                Some("range_root"),
+                author,
+                &format!("[PATCH {}/4] Patch {}", idx, sha),
+                90010 + idx as i64,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let ps = db
+                .create_patchset(
+                    t2,
+                    Some("range_root"),
+                    sha,
+                    &format!("[PATCH {}/4] Patch {}", idx, sha),
+                    author,
+                    90010 + idx as i64,
+                    4,
+                    0,
+                    "",
+                    "",
+                    None,
+                    idx,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(ps, ps_range, "Patch {}/4 should merge into range", idx);
+            db.create_patch(ps, sha, idx, &format!("diff-{}", sha))
+                .await
+                .unwrap();
+        }
+
+        // Now patch 4/4: its message_id "sha_D_range" differs from
+        // the singleton's "sha_D", but the @sashiko.local fallback
+        // used to construct "sha_D_range@sashiko.local" which is
+        // different enough. The real issue was when message_id was
+        // literally the same SHA. Simulate that: message_id = "sha_D"
+        // but in thread t2.
+        db.create_message(
+            "sha_D_in_range",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 4/4] i2c: tegra: Update timing",
+            90014,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_4 = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_D_in_range",
+                "[PATCH 4/4] i2c: tegra: Update timing",
+                author,
+                90014,
+                4,
+                0,
+                "",
+                "",
+                None,
+                4,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("Patch 4/4 should merge into range, not be dropped");
+
+        assert_eq!(
+            ps_4, ps_range,
+            "Patch 4/4 must merge into the range patchset, not the singleton"
+        );
+
+        db.create_patch(ps_4, "sha_D_in_range", 4, "diff-sha_D")
+            .await
+            .unwrap();
+
+        // Range patchset should have all 4 patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 4,
+            "Range patchset should have all 4 patches"
+        );
+
+        // Singleton should still be untouched (1/1)
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton patchset should still have exactly 1 patch"
         );
     }
 }
