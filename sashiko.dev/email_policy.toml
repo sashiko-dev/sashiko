@@ -45,6 +45,11 @@ lists = ["damon@lists.linux.dev"]
 reply_to_author = true
 cc = ["damon@lists.linux.dev"]
 
+[subsystems.devicetree]
+lists = ["devicetree@vger.kernel.org"]
+reply_to_author = true
+cc = ["robh@kernel.org", "krzk+dt@kernel.org", "conor+dt@kernel.org", "devicetree@vger.kernel.org"]
+
 [subsystems.ext4]
 lists = ["linux-ext4@vger.kernel.org"]
 reply_to_author = true
