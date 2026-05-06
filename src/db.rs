@@ -3294,6 +3294,17 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? OR cover_letter_message_id = ?",
+                libsql::params![msgid, format!("<{}>", msgid)],
+            )
+            .await?;
+        Ok(rows.next().await.ok().flatten().is_some())
+    }
+
     pub async fn create_fetching_patchset(
         &self,
         root_msg_id: &str,
