@@ -89,3 +89,8 @@ cc = ["linux-pci@vger.kernel.org"]
 lists = ["linux-watchdog@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-watchdog@vger.kernel.org"]
+
+[subsystems.linux-input]
+lists = ["linux-input@vger.kernel.org"]
+reply_to_author = true
+cc = ["dmitry.torokhov@gmail.com", "linux-input@vger.kernel.org"]
