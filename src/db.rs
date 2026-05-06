@@ -3818,6 +3818,34 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
+        let candidates = Self::get_msgid_candidates(msgid);
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if rows.next().await.ok().flatten().is_some() {
+                return Ok(true);
+            }
+
+            let mut p_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if p_rows.next().await.ok().flatten().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_fetching_patchset(
         &self,
@@ -3855,7 +3883,12 @@ impl Database {
 
                 // Only reset to Fetching if it failed or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
-                if status == "Failed" || status == "Fetching" || status == "Cancelled" {
+                if status == "Failed"
+                    || status == "Fetching"
+                    || status == "Cancelled"
+                    || status == "Failed To Apply"
+                    || status == "FailedToApply"
+                {
                     self.conn.execute(
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
                         libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
@@ -8236,6 +8269,517 @@ mod tests {
             .unwrap();
         assert_eq!(updated["status"], "Failed");
         assert_eq!(updated["failed_reason"], "Fetch failed: timeout");
+    }
+
+    /// Verify that has_patchset_by_msgid detects patchsets by bare SHA
+    /// for synthetic @sashiko.local cover letters and for patches in the patches table.
+    #[tokio::test]
+    async fn test_has_patchset_by_msgid_synthetic_and_patch_sha() {
+        let db = setup_db().await;
+        let sha_fetching = "deadbeef1234567890abcdef1234567890abcdef";
+        let synthetic_id = format!("{}@sashiko.local", sha_fetching);
+
+        // 1. Placeholder patchset in Fetching state with @sashiko.local cover letter
+        db.create_fetching_patchset(
+            &synthetic_id,
+            "Fetching placeholder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Must return true when queried by bare SHA
+        assert!(
+            db.has_patchset_by_msgid(sha_fetching).await.unwrap(),
+            "has_patchset_by_msgid should return true for bare SHA matching @sashiko.local cover letter"
+        );
+
+        // 2. Patchset with physical patch row
+        let sha_patch = "c0ffee1234567890abcdef1234567890abcdef";
+        let t = db
+            .create_thread("t_thread", "Test Thread", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_letter@example.com",
+            t,
+            None,
+            "Author <a@example.com>",
+            "Cover Subject",
+            999,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_patch,
+            t,
+            Some("cover_letter@example.com"),
+            "Author <a@example.com>",
+            "Patch Subject",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                t,
+                Some("cover_letter@example.com"),
+                sha_patch,
+                "Patch Subject",
+                "Author <a@example.com>",
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps, sha_patch, 1, "diff-patch")
+            .await
+            .unwrap();
+
+        // Must return true when queried by the patch's SHA even if cover letter is different
+        assert!(
+            db.has_patchset_by_msgid(sha_patch).await.unwrap(),
+            "has_patchset_by_msgid should return true for SHA existing in patches table"
+        );
+    }
+
+    /// Verify that has_patchset_by_msgid returns false for Failed and Cancelled
+    /// patchsets so that retry submissions can be re-fetched.
+    #[tokio::test]
+    async fn test_has_patchset_by_msgid_excludes_failed_and_cancelled() {
+        let db = setup_db().await;
+        let sha_failed = "f00f00f001234567890abcdef1234567890abcdef";
+        let synthetic_failed = format!("{}@sashiko.local", sha_failed);
+
+        // 1. Create a patchset and mark it Failed
+        let _ps_failed = db
+            .create_fetching_patchset(
+                &synthetic_failed,
+                "Fetching failed placeholder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_patchset_error(sha_failed, "Remote host unreachable")
+            .await
+            .unwrap();
+
+        // Must return false for Failed patchset to allow retry
+        assert!(
+            !db.has_patchset_by_msgid(sha_failed).await.unwrap(),
+            "has_patchset_by_msgid should return false for Failed patchset to allow retry"
+        );
+
+        // 2. Create a patchset and mark it Cancelled
+        let sha_cancelled = "c00c00c001234567890abcdef1234567890abcdef";
+        let synthetic_cancelled = format!("{}@sashiko.local", sha_cancelled);
+        let ps_cancelled = db
+            .create_fetching_patchset(
+                &synthetic_cancelled,
+                "Fetching cancelled placeholder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_cancelled, "Cancelled")
+            .await
+            .unwrap();
+
+        // Must return false for Cancelled patchset to allow retry
+        assert!(
+            !db.has_patchset_by_msgid(sha_cancelled).await.unwrap(),
+            "has_patchset_by_msgid should return false for Cancelled patchset to allow retry"
+        );
+
+        // 3. Create a patchset with a physical patch row, then mark patchset Failed
+        let sha_failed_patch = "a11a11a111234567890abcdef1234567890abcdef";
+        let t_failed = db
+            .create_thread("t_f", "Failed thread", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_failed@example.com",
+            t_failed,
+            None,
+            "Author <a@example.com>",
+            "Failed Subject",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_failed_patch,
+            t_failed,
+            Some("cover_failed@example.com"),
+            "Author <a@example.com>",
+            "Failed Patch Subject",
+            2001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_f = db
+            .create_patchset(
+                t_failed,
+                Some("cover_failed@example.com"),
+                sha_failed_patch,
+                "Failed Patch Subject",
+                "Author <a@example.com>",
+                2001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_f, sha_failed_patch, 1, "diff-fail")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_f, "Failed").await.unwrap();
+
+        // Must return false when queried by the patch's SHA because its patchset is Failed
+        assert!(
+            !db.has_patchset_by_msgid(sha_failed_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Failed patchset"
+        );
+
+        // 4. Create a patchset with a physical patch row, then mark patchset Cancelled
+        let sha_cancelled_patch = "b22b22b221234567890abcdef1234567890abcdef";
+        let t_cancelled = db
+            .create_thread("t_c", "Cancelled thread", 3000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_cancelled@example.com",
+            t_cancelled,
+            None,
+            "Author <a@example.com>",
+            "Cancelled Subject",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_cancelled_patch,
+            t_cancelled,
+            Some("cover_cancelled@example.com"),
+            "Author <a@example.com>",
+            "Cancelled Patch Subject",
+            3001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_c = db
+            .create_patchset(
+                t_cancelled,
+                Some("cover_cancelled@example.com"),
+                sha_cancelled_patch,
+                "Cancelled Patch Subject",
+                "Author <a@example.com>",
+                3001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_c, sha_cancelled_patch, 1, "diff-cancel")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_c, "Cancelled").await.unwrap();
+
+        // Must return false when queried by the patch's SHA because its patchset is Cancelled
+        assert!(
+            !db.has_patchset_by_msgid(sha_cancelled_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Cancelled patchset"
+        );
+
+        // 5. Create a patchset with a physical patch row, then mark patchset Failed To Apply
+        let sha_fta_patch = "c33c33c331234567890abcdef1234567890abcdef";
+        let t_fta = db
+            .create_thread("t_fta", "Failed to apply thread", 4000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_fta@example.com",
+            t_fta,
+            None,
+            "Author <a@example.com>",
+            "FTA Subject",
+            4000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_fta_patch,
+            t_fta,
+            Some("cover_fta@example.com"),
+            "Author <a@example.com>",
+            "FTA Patch Subject",
+            4001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_fta = db
+            .create_patchset(
+                t_fta,
+                Some("cover_fta@example.com"),
+                sha_fta_patch,
+                "FTA Patch Subject",
+                "Author <a@example.com>",
+                4001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_fta, sha_fta_patch, 1, "diff-fta")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_fta, "Failed To Apply")
+            .await
+            .unwrap();
+
+        // Must return false when queried by cover letter and by patch SHA
+        assert!(
+            !db.has_patchset_by_msgid("cover_fta@example.com")
+                .await
+                .unwrap(),
+            "has_patchset_by_msgid should return false for cover letter of Failed To Apply patchset"
+        );
+        assert!(
+            !db.has_patchset_by_msgid(sha_fta_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Failed To Apply patchset"
+        );
+    }
+
+    /// Verify that create_fetching_patchset resets patchsets in 'Failed To Apply'
+    /// status to 'Fetching' so that re-submitted patches can transition to 'Pending'.
+    #[tokio::test]
+    async fn test_failed_to_apply_patchset_resettable_and_reingestible() {
+        let db = setup_db().await;
+        let sha = "d44d44d441234567890abcdef1234567890abcdef";
+        let synthetic_cover = format!("{}@sashiko.local", sha);
+
+        // 1. Create a placeholder and ingest the patch
+        let ps_id = db
+            .create_fetching_patchset(
+                &synthetic_cover,
+                "Fetching initial",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let t = db
+            .create_thread("t_reingest", "Thread", 5000)
+            .await
+            .unwrap();
+        db.create_message(
+            sha,
+            t,
+            Some(&synthetic_cover),
+            "Author <a@example.com>",
+            "Patch Subject",
+            5000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_created = db
+            .create_patchset(
+                t,
+                Some(&synthetic_cover),
+                sha,
+                "Patch Subject",
+                "Author <a@example.com>",
+                5000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id, ps_created);
+
+        db.create_patch(ps_id, sha, 1, "diff-v1").await.unwrap();
+
+        // 2. Mark patchset Failed To Apply during review
+        db.update_patchset_status(ps_id, "Failed To Apply")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["status"], "Failed To Apply");
+
+        // 3. User re-submits: create_fetching_patchset must reset status to Fetching
+        let ps_re_id = db
+            .create_fetching_patchset(
+                &synthetic_cover,
+                "Fetching retry",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ps_re_id, ps_id);
+
+        let det_after_fetch = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_after_fetch["status"], "Fetching");
+
+        // 4. Ingestion re-runs create_patchset and create_patch
+        let ps_reingested = db
+            .create_patchset(
+                t,
+                Some(&synthetic_cover),
+                sha,
+                "Patch Subject Retry",
+                "Author <a@example.com>",
+                5010,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_reingested, ps_id);
+
+        db.create_patch(ps_id, sha, 1, "diff-v2").await.unwrap();
+
+        // Patchset must now successfully be in Pending status (ready for review)
+        let det_final = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_final["status"], "Pending");
     }
 
     /// Verify that an existing database at user_version = 1 with the legacy

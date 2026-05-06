@@ -436,6 +436,25 @@ async fn submit_patch(
                 sha, repo_display
             );
 
+            // Optimistic check: If we already have this patchset in the DB,
+            // skip creating placeholder and skip fetch queue entirely.
+            match state.db.has_patchset_by_msgid(&id).await {
+                Ok(true) => {
+                    info!(
+                        "Remote fetch request for already ingested SHA {}, skipping placeholder and fetch",
+                        id
+                    );
+                    return Ok(Json(SubmitResponse {
+                        status: "accepted".to_string(),
+                        id,
+                    }));
+                }
+                Err(e) => {
+                    error!("Failed to check if patchset exists: {}", e);
+                }
+                _ => {}
+            }
+
             // Create a placeholder record in the DB so the user can track status
             if let Err(e) = state
                 .db
