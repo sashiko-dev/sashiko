@@ -1651,7 +1651,9 @@
                 if (!reviews || reviews.length === 0) {
                     const statusToCheck = patchStatus || data.status;
                     if (statusToCheck === 'Embargoed' && data.embargo_until) {
-                        return `<p style="font-style:italic; color:var(--status-embargoed);">Embargoed until ${formatDate(data.embargo_until, true)}</p>`;
+                        const hours = data.date ? Math.round((data.embargo_until - data.date) / 3600) : null;
+                        const hoursText = hours !== null ? `${hours} hours` : 'some time';
+                        return `<p style="font-style:italic; font-size:1.2em; color:var(--status-embargoed);">Embargoed by mailing list policy to ${hoursText} after posting. Public at ${formatDate(data.embargo_until, true)}</p>`;
                     }
                     return `<p style="font-style:italic; color:#888;">No reviews yet.</p>`;
                 }
