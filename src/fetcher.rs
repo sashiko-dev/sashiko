@@ -29,10 +29,19 @@ pub struct FetchRequest {
     pub commit_hash: String,
 }
 
+#[derive(Clone)]
+struct DelayedRequest {
+    repo_url: Option<String>,
+    commit_hash: String,
+    run_at: std::time::Instant,
+}
+
 pub struct FetchAgent {
     repo_path: PathBuf,
     rx: mpsc::Receiver<FetchRequest>,
     main_tx: mpsc::Sender<Event>,
+    tick_interval: Duration,
+    backoff_base: Duration,
 }
 
 impl FetchAgent {
@@ -46,15 +55,25 @@ impl FetchAgent {
                 repo_path,
                 rx,
                 main_tx,
+                tick_interval: Duration::from_secs(10),
+                backoff_base: Duration::from_secs(10),
             },
             tx,
         )
     }
 
+    pub fn with_intervals(mut self, tick_interval: Duration, backoff_base: Duration) -> Self {
+        self.tick_interval = tick_interval;
+        self.backoff_base = backoff_base;
+        self
+    }
+
     pub async fn run(mut self) {
         info!("FetchAgent started");
         let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
-        let mut ticker = interval(Duration::from_secs(10));
+        let mut delayed_retries: Vec<DelayedRequest> = Vec::new(); // In-memory delay vector
+        let mut attempts_tracker: HashMap<String, u32> = HashMap::new(); // Local attempt tracker
+        let mut ticker = interval(self.tick_interval); // Configurable batch timer
 
         loop {
             tokio::select! {
@@ -64,15 +83,41 @@ impl FetchAgent {
                         .insert(req.commit_hash);
                 }
                 _ = ticker.tick() => {
+                    let now = std::time::Instant::now();
+                    let mut expired_retries = Vec::new();
+
+                    // Filter out expired retries
+                    delayed_retries.retain(|item| {
+                        if now >= item.run_at {
+                            expired_retries.push(item.clone());
+                            false // Remove from delayed list (promoted)
+                        } else {
+                            true // Keep in delayed list
+                        }
+                    });
+
+                    // Promote expired retries into the active batch queue
+                    for retry in expired_retries {
+                        queue.entry(retry.repo_url)
+                            .or_default()
+                            .insert(retry.commit_hash);
+                    }
+
+                    // Process active batch queue
                     if !queue.is_empty() {
-                        self.process_queue(&mut queue).await;
+                        self.process_queue(&mut queue, &mut delayed_retries, &mut attempts_tracker).await;
                     }
                 }
             }
         }
     }
 
-    async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
+    async fn process_queue(
+        &self,
+        queue: &mut HashMap<Option<String>, HashSet<String>>,
+        delayed_retries: &mut Vec<DelayedRequest>,
+        attempts_tracker: &mut HashMap<String, u32>,
+    ) {
         info!("Processing fetch queue with {} repos", queue.len());
 
         for (url_opt, commits) in queue.drain() {
@@ -102,9 +147,9 @@ impl FetchAgent {
                     "All commits present locally, skipping fetch for {}",
                     url_display
                 );
-            } else if let Some(url) = url_opt {
+            } else if let Some(ref url) = url_opt {
                 // Remote fetch logic
-                let remote_name = self.get_remote_name(&url);
+                let remote_name = self.get_remote_name(url);
 
                 // Check if repo is local (same as self.repo_path)
                 let is_local = {
@@ -126,17 +171,17 @@ impl FetchAgent {
                     );
                     // Do not continue here; let it fall through to Step 3 where it will fail individually
                 } else {
-                    if let Err(e) = self.ensure_remote(&remote_name, &url).await {
+                    if let Err(e) = self.ensure_remote(&remote_name, url).await {
                         error!("Failed to ensure remote {}: {}", url, e);
                         for commit in &missing_commits {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit.clone(),
-                                    error: format!("Failed to set up remote {}: {}", url, e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
+                            self.handle_fetch_failure(
+                                &url_opt,
+                                commit,
+                                &format!("Failed to set up remote {}: {}", url, e),
+                                delayed_retries,
+                                attempts_tracker,
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -151,14 +196,14 @@ impl FetchAgent {
                         if let Err(e) = self.fetch_all(&remote_name).await {
                             error!("Full fetch failed for {}: {}", url, e);
                             for commit in &missing_commits {
-                                let _ = self
-                                    .main_tx
-                                    .send(Event::IngestionFailed {
-                                        article_id: commit.clone(),
-                                        error: format!("Failed to fetch from {}: {}", url, e),
-                                        source: MessageSource::GitFetch,
-                                    })
-                                    .await;
+                                self.handle_fetch_failure(
+                                    &url_opt,
+                                    commit,
+                                    &format!("Failed to fetch from {}: {}", url, e),
+                                    delayed_retries,
+                                    attempts_tracker,
+                                )
+                                .await;
                             }
                             continue;
                         }
@@ -182,14 +227,14 @@ impl FetchAgent {
                     {
                         Ok(shas) => shas,
                         Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: range.clone(),
-                                    error: format!("Failed to resolve git range: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
+                            self.handle_fetch_failure(
+                                &url_opt,
+                                &commit_or_range,
+                                &format!("Failed to resolve git range: {}", e),
+                                delayed_retries,
+                                attempts_tracker,
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -217,26 +262,33 @@ impl FetchAgent {
                             }
                         }
                     }
+                    // Range Success! Clean up attempts tracker and delay queue for the range key
+                    attempts_tracker.remove(&commit_or_range);
+                    delayed_retries.retain(|item| item.commit_hash != commit_or_range);
                     info!("Successfully submitted remote range {}", range);
                 } else {
                     // Single commit
                     let full_sha = match self.resolve_sha(&commit_or_range).await {
                         Ok(sha) => sha,
                         Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range.clone(),
-                                    error: format!("Failed to resolve SHA: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
+                            self.handle_fetch_failure(
+                                &url_opt,
+                                &commit_or_range,
+                                &format!("Failed to resolve SHA: {}", e),
+                                delayed_retries,
+                                attempts_tracker,
+                            )
+                            .await;
                             continue;
                         }
                     };
 
                     match self.extract_patch(&full_sha, &commit_or_range, 1, 1).await {
                         Ok(mut event) => {
+                            // Success! Clean up attempts tracker and the parked delay queue
+                            attempts_tracker.remove(&commit_or_range);
+                            delayed_retries.retain(|item| item.commit_hash != commit_or_range);
+
                             if let Event::PatchSubmitted {
                                 ref mut message_id, ..
                             } = event
@@ -251,14 +303,14 @@ impl FetchAgent {
                         }
                         Err(e) => {
                             error!("Failed to extract patch {}: {}", commit_or_range, e);
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range,
-                                    error: format!("Failed to extract patch: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
+                            self.handle_fetch_failure(
+                                &url_opt,
+                                &commit_or_range,
+                                &format!("Failed to extract patch: {}", e),
+                                delayed_retries,
+                                attempts_tracker,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -439,6 +491,61 @@ impl FetchAgent {
             total,
         })
     }
+
+    async fn handle_fetch_failure(
+        &self,
+        url_opt: &Option<String>,
+        commit: &str,
+        error_msg: &str,
+        delayed_retries: &mut Vec<DelayedRequest>,
+        attempts_tracker: &mut HashMap<String, u32>,
+    ) {
+        let attempts = attempts_tracker.get(commit).cloned().unwrap_or(0);
+        let max_retries = 3;
+
+        if attempts < max_retries {
+            let next_attempt = attempts + 1;
+            attempts_tracker.insert(commit.to_string(), next_attempt);
+
+            // Exponential backoff using configurable base: base * (2 ^ attempts)
+            let delay = self.backoff_base * (2u32.pow(next_attempt));
+            let run_at = std::time::Instant::now() + delay;
+
+            warn!(
+                "Fetch/extract failed for {} (attempts: {}/{}). Parking in delay queue for {}s.",
+                commit,
+                next_attempt,
+                max_retries,
+                delay.as_secs()
+            );
+
+            // Deduplicate inside delayed_retries first to prevent duplicate parked entries!
+            delayed_retries.retain(|item| item.commit_hash != commit);
+
+            delayed_retries.push(DelayedRequest {
+                repo_url: url_opt.clone(),
+                commit_hash: commit.to_string(),
+                run_at,
+            });
+        } else {
+            // Retries exhausted, clean up attempts tracker and the parked delay queue
+            attempts_tracker.remove(commit);
+            delayed_retries.retain(|item| item.commit_hash != commit);
+            error!(
+                "Fetch/extract failed for {} after {} retries. Marking as Failed. Error: {}",
+                commit, max_retries, error_msg
+            );
+
+            let _ = self
+                .main_tx
+                .send(Event::IngestionFailed {
+                    article_id: commit.to_string(),
+                    error: error_msg.to_string(),
+                    source: MessageSource::GitFetch,
+                })
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +694,81 @@ mod tests {
             agent.is_present(&commit_sha).await,
             "Commit SHA should be considered present"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_agent_delay_queue_retry() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        // Setup empty dummy repo
+        Command::new("git")
+            .current_dir(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+
+        let (event_tx, mut event_rx) = mpsc::channel(10);
+
+        // Create agent with tiny sub-second intervals for fast real-time testing!
+        let (agent, fetch_tx) = {
+            let (a, tx) = FetchAgent::new(repo_path.clone(), event_tx);
+            (
+                a.with_intervals(Duration::from_millis(50), Duration::from_millis(50)),
+                tx,
+            )
+        };
+
+        // Spawn the agent in the background
+        let agent_handle = tokio::spawn(agent.run());
+
+        // Enqueue a FetchRequest for a missing commit (which will fail resolve_sha!)
+        let req = FetchRequest {
+            repo_url: None,
+            commit_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        };
+        fetch_tx.send(req).await?;
+
+        // Let the first tick (50ms) process. Wait 100ms to be safe.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The first tick ran process_queue, failed, and parked it in delayed_retries (Attempts = 1, delay = 100ms)
+        // Verify no event is received yet.
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                panic!("Received unexpected event: {:?}", event);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                // Expected: no event sent!
+            }
+        }
+
+        // Wait for retries to exhaust:
+        // Attempt 1: delay 100ms.
+        // Attempt 2: delay 200ms.
+        // Attempt 3: delay 400ms.
+        // Total delay is 700ms. Plus ticks processing time, we sleep 1.2 seconds to be completely safe.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Verify that Event::IngestionFailed is finally received!
+        tokio::select! {
+            Some(Event::IngestionFailed { article_id, error, .. }) = event_rx.recv() => {
+                assert_eq!(article_id, "0123456789abcdef0123456789abcdef01234567");
+                assert!(
+                    error.contains("Failed to resolve SHA") || error.contains("Failed to extract patch"),
+                    "Actual error was: {}",
+                    error
+                );
+            }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                panic!("Timed out waiting for IngestionFailed event after retries!");
+            }
+        }
+
+        // Clean up the agent
+        agent_handle.abort();
 
         Ok(())
     }
