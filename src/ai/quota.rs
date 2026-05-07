@@ -12,9 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffType {
+    Exponential,
+    Flat,
+}
 
 pub struct QuotaManager {
     // Stores the time when we can resume making requests.
@@ -22,6 +29,8 @@ pub struct QuotaManager {
     blocked_until: Mutex<Option<Instant>>,
     // Track consecutive transient errors for exponential backoff.
     consecutive_transient_errors: Mutex<u32>,
+    transient_backoff_type: BackoffType,
+    transient_flat_delay: Duration,
 }
 
 impl Default for QuotaManager {
@@ -32,9 +41,18 @@ impl Default for QuotaManager {
 
 impl QuotaManager {
     pub fn new() -> Self {
+        Self::new_with_settings(BackoffType::Exponential, Duration::from_secs(30))
+    }
+
+    pub fn new_with_settings(
+        transient_backoff_type: BackoffType,
+        transient_flat_delay: Duration,
+    ) -> Self {
         Self {
             blocked_until: Mutex::new(None),
             consecutive_transient_errors: Mutex::new(0),
+            transient_backoff_type,
+            transient_flat_delay: transient_flat_delay.max(Duration::from_secs(1)),
         }
     }
 
@@ -76,8 +94,9 @@ impl QuotaManager {
     }
 
     pub async fn report_quota_error(&self, retry_after: Duration) {
+        let delay = retry_after.max(Duration::from_secs(1));
         let mut guard = self.blocked_until.lock().await;
-        let resume_time = Instant::now() + retry_after;
+        let resume_time = Instant::now() + delay;
 
         if let Some(current) = *guard {
             if resume_time > current {
@@ -89,7 +108,7 @@ impl QuotaManager {
 
         warn!(
             "Quota exhausted! Blocking all LLM requests for {:.2}s",
-            retry_after.as_secs_f64()
+            delay.as_secs_f64()
         );
     }
 
@@ -98,9 +117,13 @@ impl QuotaManager {
         *count_guard += 1;
         let count = *count_guard;
 
-        // Exponential backoff: 1s, 2s, 4s, 8s... capped at 60s
-        let backoff_secs = (1.0 * (2.0_f64.powi((count - 1) as i32))).min(60.0);
-        let backoff = Duration::from_secs_f64(backoff_secs);
+        let backoff = match self.transient_backoff_type {
+            BackoffType::Exponential => {
+                let backoff_secs = (1.0 * (2.0_f64.powi((count - 1) as i32))).min(60.0);
+                Duration::from_secs_f64(backoff_secs).max(Duration::from_secs(1))
+            }
+            BackoffType::Flat => self.transient_flat_delay,
+        };
 
         let mut block_guard = self.blocked_until.lock().await;
         let resume_time = Instant::now() + backoff;
@@ -115,7 +138,122 @@ impl QuotaManager {
 
         warn!(
             "AI provider transient error (streak: {}). Globally backing off for {:.2}s",
-            count, backoff_secs
+            count,
+            backoff.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_quota_manager_flat_backoff() {
+        tokio::time::pause(); // Pause the real clock
+        let manager = Arc::new(QuotaManager::new_with_settings(
+            BackoffType::Flat,
+            Duration::from_secs(5),
+        ));
+
+        // First transient error -> triggers 5s flat delay
+        manager.report_transient_error().await;
+
+        let manager_clone = manager.clone();
+        let handle = tokio::spawn(async move { manager_clone.wait_for_access().await });
+
+        // Yield execution to let the spawned task run and hit the sleep
+        tokio::task::yield_now().await;
+        // Sleep a tiny virtual duration to ensure the task has transitioned to sleeping
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // Fast-forward 5s instantly
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let slept = handle.await.unwrap();
+
+        // It should have slept for at least 5s (capped at the total advanced time)
+        assert!(slept >= Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_quota_manager_exponential_backoff() {
+        tokio::time::pause();
+        let manager = Arc::new(QuotaManager::new_with_settings(
+            BackoffType::Exponential,
+            Duration::from_secs(30),
+        ));
+
+        // Attempt 1 -> 1s delay
+        manager.report_transient_error().await;
+        let manager_clone = manager.clone();
+        let handle1 = tokio::spawn(async move { manager_clone.wait_for_access().await });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(handle1.await.unwrap() >= Duration::from_secs(1));
+
+        // Attempt 2 -> 2s delay
+        manager.report_transient_error().await;
+        let manager_clone = manager.clone();
+        let handle2 = tokio::spawn(async move { manager_clone.wait_for_access().await });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(handle2.await.unwrap() >= Duration::from_secs(2));
+
+        // Attempt 3 -> 4s delay
+        manager.report_transient_error().await;
+        let manager_clone = manager.clone();
+        let handle3 = tokio::spawn(async move { manager_clone.wait_for_access().await });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(handle3.await.unwrap() >= Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn test_quota_manager_min_delay_cap() {
+        tokio::time::pause();
+        // Configure with 0s flat delay (invalid, should be capped at 1s)
+        let manager = Arc::new(QuotaManager::new_with_settings(
+            BackoffType::Flat,
+            Duration::from_secs(0),
+        ));
+
+        manager.report_transient_error().await;
+
+        let manager_clone = manager.clone();
+        let handle = tokio::spawn(async move { manager_clone.wait_for_access().await });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let slept = handle.await.unwrap();
+
+        assert!(slept >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_quota_manager_report_success_resets() {
+        tokio::time::pause();
+        let manager = Arc::new(QuotaManager::new_with_settings(
+            BackoffType::Exponential,
+            Duration::from_secs(30),
+        ));
+
+        // Attempt 1 -> 1s delay
+        manager.report_transient_error().await;
+
+        // Report success -> resets
+        manager.report_success().await;
+
+        // Attempt 1 (after reset) -> should be 1s again (not 2s)
+        manager.report_transient_error().await;
+        let manager_clone = manager.clone();
+        let handle = tokio::spawn(async move { manager_clone.wait_for_access().await });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(handle.await.unwrap() >= Duration::from_secs(1));
     }
 }

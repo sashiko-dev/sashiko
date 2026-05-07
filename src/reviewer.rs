@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::ReviewStatus;
-use crate::ai::quota::QuotaManager;
-use crate::ai::{AiProvider, AiRequest, create_provider_cached};
+use crate::ai::quota::{BackoffType, QuotaManager};
+use crate::ai::{AiError, AiProvider, AiRequest, create_provider_cached};
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, ToolUsage};
 use crate::email_policy::EmailPolicyConfig;
@@ -119,12 +119,18 @@ impl Reviewer {
         .await
         .expect("Failed to create AI provider");
 
+        let transient_type = match settings.ai.transient_backoff_type.as_str() {
+            "flat" => BackoffType::Flat,
+            _ => BackoffType::Exponential,
+        };
+        let flat_delay = std::time::Duration::from_secs(settings.ai.transient_flat_backoff_secs);
+        let quota_manager = Arc::new(QuotaManager::new_with_settings(transient_type, flat_delay));
         Self {
             db,
             settings,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             baseline_registry,
-            quota_manager: Arc::new(QuotaManager::new()),
+            quota_manager,
             provider,
         }
     }
@@ -1480,6 +1486,17 @@ async fn run_review_tool(
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
 ) -> Result<serde_json::Value> {
+    let quota_manager = if settings.ai.global_backoff {
+        quota_manager
+    } else {
+        let transient_type = match settings.ai.transient_backoff_type.as_str() {
+            "flat" => BackoffType::Flat,
+            _ => BackoffType::Exponential,
+        };
+        let flat_delay = std::time::Duration::from_secs(settings.ai.transient_flat_backoff_secs);
+        Arc::new(QuotaManager::new_with_settings(transient_type, flat_delay))
+    };
+
     let mut cmd = if let Some(ref override_bin) = settings.review.review_tool_override {
         Command::new(override_bin)
     } else {
@@ -1678,22 +1695,26 @@ async fn run_review_tool(
                                                 break Ok(resp);
                                             }
                                             Err(e) => {
-                                                let err_str = e.to_string();
+                                                let (is_quota, is_transient, server_delay) = if let Some(ai_err) = e.downcast_ref::<AiError>() {
+                                                    match ai_err {
+                                                        AiError::QuotaExceeded(d) => (true, false, Some(*d)),
+                                                        AiError::Transient(d, _) => (false, true, Some(*d)),
+                                                        AiError::Fatal(_) => (false, false, None),
+                                                    }
+                                                } else {
+                                                    // Fallback string matching
+                                                    let err_str = e.to_string();
+                                                    let q = err_str.contains("Quota exceeded") || err_str.contains("429");
+                                                    let t = err_str.contains("Transient error") || err_str.contains("503") || err_str.contains("529") || err_str.contains("overloaded");
+                                                    (q, t, None)
+                                                };
 
-                                                // Categorize and report errors to QuotaManager
-                                                if err_str.contains("Quota exceeded")
-                                                    || err_str.contains("429")
-                                                {
-                                                    quota_manager
-                                                        .report_quota_error(Duration::from_secs(60))
-                                                        .await;
+                                                if is_quota {
+                                                    let delay = server_delay.unwrap_or(Duration::from_secs(settings.ai.quota_backoff_secs));
+                                                    quota_manager.report_quota_error(delay).await;
                                                     continue;
                                                 }
-                                                if err_str.contains("Transient error")
-                                                    || err_str.contains("503")
-                                                    || err_str.contains("529")
-                                                    || err_str.contains("overloaded")
-                                                {
+                                                if is_transient {
                                                     quota_manager.report_transient_error().await;
                                                     continue;
                                                 }
@@ -2510,7 +2531,12 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
-        let quota_manager = Arc::new(QuotaManager::new());
+        let transient_type = match settings.ai.transient_backoff_type.as_str() {
+            "flat" => BackoffType::Flat,
+            _ => BackoffType::Exponential,
+        };
+        let flat_delay = std::time::Duration::from_secs(settings.ai.transient_flat_backoff_secs);
+        let quota_manager = Arc::new(QuotaManager::new_with_settings(transient_type, flat_delay));
 
         let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
         db.create_message(
@@ -2604,6 +2630,235 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             err.to_string().contains("Output token budget exceeded"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    struct MockTransientThenSuccessProvider {
+        attempts: Arc<tokio::sync::Mutex<u32>>,
+    }
+    #[async_trait]
+    impl AiProvider for MockTransientThenSuccessProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let mut att = self.attempts.lock().await;
+            *att += 1;
+            if *att == 1 {
+                return Err(AiError::Transient(
+                    std::time::Duration::from_secs(5),
+                    "Simulated transient".to_string(),
+                )
+                .into());
+            }
+            Ok(AiResponse {
+                content: Some("Mocked AI response after transient".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+            })
+        }
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    struct MockQuotaProvider {
+        attempts: Arc<tokio::sync::Mutex<u32>>,
+    }
+    #[async_trait]
+    impl AiProvider for MockQuotaProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let mut att = self.attempts.lock().await;
+            *att += 1;
+            if *att == 1 {
+                return Err(AiError::QuotaExceeded(std::time::Duration::from_secs(5)).into());
+            }
+            Ok(AiResponse {
+                content: Some("Mocked AI response after quota".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+            })
+        }
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    async fn run_one_request_mock(
+        mut settings: Settings,
+        provider: Arc<dyn AiProvider>,
+    ) -> Result<()> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
+
+        // Mock binary: sends one AI request then a final result.
+        let mock_script = r#"#!/bin/bash
+read -r input
+echo '{"type": "ai_request", "payload": {"messages": [{"role": "user", "content": "hello"}], "temperature": 0.5}}'
+read -r ai_response
+echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
+"#;
+        std::fs::write(&bin_path, mock_script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+        settings.review.review_tool_override = Some(bin_path.clone());
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let transient_type = match settings.ai.transient_backoff_type.as_str() {
+            "flat" => BackoffType::Flat,
+            _ => BackoffType::Exponential,
+        };
+        let flat_delay = std::time::Duration::from_secs(settings.ai.transient_flat_backoff_secs);
+        let quota_manager = Arc::new(QuotaManager::new_with_settings(transient_type, flat_delay));
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .unwrap();
+        let p_id = db
+            .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;")
+            .await?;
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await?;
+
+        run_review_tool(
+            ps_id,
+            &json!({}),
+            &settings,
+            db,
+            "HEAD",
+            Some(1),
+            None,
+            quota_manager,
+            review_id,
+            None,
+            provider,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn test_review_timeout_exemption() -> Result<()> {
+        // Run in real-time because child process spawning is asynchronous to tokio virtual clock.
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.timeout_seconds = 1; // 1s active timeout
+        settings.ai.transient_backoff_type = "flat".to_string();
+        settings.ai.transient_flat_backoff_secs = 2; // 2s transient backoff (longer than timeout)
+
+        let provider = Arc::new(MockTransientThenSuccessProvider {
+            attempts: Arc::new(tokio::sync::Mutex::new(0)),
+        });
+
+        let start = std::time::Instant::now();
+        let res = run_one_request_mock(settings, provider).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            res.is_ok(),
+            "Expected review to succeed despite sleeping longer than timeout. Error: {:?}",
+            res.err()
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "Review finished too quickly, expected to sleep for backoff: {:?}",
+            elapsed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_review_local_backoff_isolation() -> Result<()> {
+        // Run in real-time because child process spawning is asynchronous to tokio virtual clock.
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.ai.global_backoff = false; // LOCAL backoff!
+        settings.ai.quota_backoff_secs = 3; // 3s quota delay
+
+        let provider_quota = Arc::new(MockQuotaProvider {
+            attempts: Arc::new(tokio::sync::Mutex::new(0)),
+        });
+        let provider_success = Arc::new(MockProvider); // succeeds instantly
+
+        let start = std::time::Instant::now();
+
+        let settings_quota = settings.clone();
+        let handle_quota =
+            tokio::spawn(async move { run_one_request_mock(settings_quota, provider_quota).await });
+
+        let settings_success = settings.clone();
+        let handle_success =
+            tokio::spawn(
+                async move { run_one_request_mock(settings_success, provider_success).await },
+            );
+
+        // Wait for handle_success to finish (should finish very quickly, way before 3s quota backoff)
+        let res_success = handle_success.await.unwrap();
+        assert!(
+            res_success.is_ok(),
+            "Success task failed: {:?}",
+            res_success.err()
+        );
+        let success_elapsed = start.elapsed();
+        assert!(
+            success_elapsed < std::time::Duration::from_secs(2),
+            "Success task took too long, was likely blocked by quota: {:?}",
+            success_elapsed
+        );
+
+        // Quota task should still be running (sleeping for 3s)
+        assert!(
+            !handle_quota.is_finished(),
+            "Quota task finished too early (should be sleeping)"
+        );
+
+        // Wait for handle_quota to finish
+        let res_quota = handle_quota.await.unwrap();
+        assert!(
+            res_quota.is_ok(),
+            "Quota task failed: {:?}",
+            res_quota.err()
+        );
+        let quota_elapsed = start.elapsed();
+        assert!(
+            quota_elapsed >= std::time::Duration::from_secs(3),
+            "Quota task finished too quickly: {:?}",
+            quota_elapsed
+        );
+
         Ok(())
     }
 }
