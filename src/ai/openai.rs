@@ -482,7 +482,18 @@ impl AiProvider for OpenAiCompatClient {
         openai_req.model = self.model.clone();
 
         let resp_body = serde_json::to_value(&openai_req)?;
-        let resp = self.post_request(&resp_body).await?;
+        let resp = match self.post_request(&resp_body).await {
+            Ok(resp) => resp,
+            Err(e) => match e {
+                OpenAiCompatError::RateLimitExceeded(d) => {
+                    return Err(crate::ai::AiError::QuotaExceeded(d).into());
+                }
+                OpenAiCompatError::TransientError(d, msg) => {
+                    return Err(crate::ai::AiError::Transient(d, msg).into());
+                }
+                _ => return Err(e.into()),
+            },
+        };
         translate_ai_response(resp)
     }
 

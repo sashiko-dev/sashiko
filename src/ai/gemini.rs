@@ -756,7 +756,39 @@ fn estimate_tokens_generic(request: &AiRequest) -> usize {
 impl AiProvider for GeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let gen_req = translate_ai_request(request)?;
-        let resp = GenAiClient::generate_content(self, gen_req).await?;
+        let resp = match GenAiClient::generate_content(self, gen_req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if let Some(gemini_err) = e.downcast_ref::<GeminiError>() {
+                    match gemini_err {
+                        GeminiError::QuotaExceeded(d) => {
+                            return Err(crate::ai::AiError::QuotaExceeded(*d).into());
+                        }
+                        GeminiError::TransientError(d, msg) => {
+                            return Err(crate::ai::AiError::Transient(*d, msg.clone()).into());
+                        }
+                        GeminiError::PermissionDenied(msg) => {
+                            return Err(crate::ai::AiError::Fatal(format!(
+                                "Permission denied: {}",
+                                msg
+                            ))
+                            .into());
+                        }
+                        GeminiError::ApiError(status, msg) => {
+                            return Err(crate::ai::AiError::Fatal(format!(
+                                "API Error ({}): {}",
+                                status, msg
+                            ))
+                            .into());
+                        }
+                        GeminiError::Other(msg) => {
+                            return Err(crate::ai::AiError::Fatal(msg.clone()).into());
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
         translate_ai_response(resp)
     }
 

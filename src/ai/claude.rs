@@ -574,7 +574,27 @@ impl AiProvider for ClaudeClient {
         claude_req.model = self.model.clone();
 
         // 3. Make API call
-        let response = self.post_request(&claude_req).await?;
+        let response = match self.post_request(&claude_req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if let Some(claude_err) = e.downcast_ref::<ClaudeError>() {
+                    match claude_err {
+                        ClaudeError::RateLimitExceeded(d) => {
+                            return Err(crate::ai::AiError::QuotaExceeded(*d).into());
+                        }
+                        ClaudeError::OverloadedError(d) => {
+                            return Err(crate::ai::AiError::Transient(
+                                *d,
+                                "Claude API overloaded".to_string(),
+                            )
+                            .into());
+                        }
+                        _ => {}
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // 4. Translate response back to generic format
         translate_ai_response(&response)
