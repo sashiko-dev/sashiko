@@ -212,6 +212,14 @@ pub struct AiSettings {
     pub response_cache: bool,
     #[serde(default = "default_response_cache_ttl_days")]
     pub response_cache_ttl_days: u64,
+    #[serde(default = "default_global_backoff")]
+    pub global_backoff: bool,
+    #[serde(default = "default_quota_backoff_secs")]
+    pub quota_backoff_secs: u64,
+    #[serde(default = "default_transient_backoff_type")]
+    pub transient_backoff_type: String,
+    #[serde(default = "default_transient_flat_backoff_secs")]
+    pub transient_flat_backoff_secs: u64,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
@@ -224,6 +232,22 @@ pub struct AiSettings {
 
 fn default_response_cache_ttl_days() -> u64 {
     7
+}
+
+fn default_global_backoff() -> bool {
+    true
+}
+
+fn default_quota_backoff_secs() -> u64 {
+    60
+}
+
+fn default_transient_backoff_type() -> String {
+    "exponential".to_string()
+}
+
+fn default_transient_flat_backoff_secs() -> u64 {
+    30
 }
 
 fn default_api_timeout_secs() -> u64 {
