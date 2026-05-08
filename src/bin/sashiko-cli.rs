@@ -21,7 +21,10 @@ use sashiko::settings::Settings;
 use serde_json::{Value, from_str};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+
+static COLOR_CHOICE: OnceLock<ColorChoice> = OnceLock::new();
 
 #[derive(Parser)]
 #[command(name = "sashiko-cli")]
@@ -38,12 +41,32 @@ struct Cli {
     /// Output format (text, json)
     #[arg(long, global = true, default_value = "text")]
     format: OutputFormat,
+
+    /// When to use color: auto (default), always, never
+    #[arg(long, global = true, default_value = "auto")]
+    color: ColorMode,
 }
 
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
     Text,
     Json,
+}
+
+#[derive(Clone, ValueEnum)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+struct ShowOptions {
+    patch: Option<i64>,
+    summary: bool,
+    issues: bool,
+    since: Option<i64>,
+    inline: bool,
+    diff: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -100,6 +123,30 @@ enum Commands {
         /// Stream status updates linearly
         #[arg(long, short = 'w')]
         watch: bool,
+
+        /// Show only a single patch by part index (1-indexed)
+        #[arg(long, conflicts_with = "issues")]
+        patch: Option<i64>,
+
+        /// Show compact progress summary
+        #[arg(long, short = 's')]
+        summary: bool,
+
+        /// Show only patches with issues found
+        #[arg(long, short = 'i', conflicts_with = "patch")]
+        issues: bool,
+
+        /// Show only reviews newer than this review ID
+        #[arg(long)]
+        since: Option<i64>,
+
+        /// Include inline review content in text output
+        #[arg(long)]
+        inline: bool,
+
+        /// Compare with another patchset ID
+        #[arg(long, short = 'd')]
+        diff: Option<String>,
     },
     /// Request a re-review of a completed patchset
     Rerun {
@@ -162,6 +209,14 @@ enum SubmitType {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    COLOR_CHOICE
+        .set(match cli.color {
+            ColorMode::Always => ColorChoice::Always,
+            ColorMode::Never => ColorChoice::Never,
+            ColorMode::Auto => ColorChoice::Auto,
+        })
+        .unwrap();
 
     // Load settings, falling back to defaults if file missing/invalid
     let base_url = cli.server.unwrap_or_else(|| {
@@ -235,7 +290,26 @@ async fn run_command(
             page,
             per_page,
         } => handle_list(client, base_url, page, per_page, filter, format).await,
-        Commands::Show { id, watch } => handle_show(client, base_url, id, watch, format).await,
+        Commands::Show {
+            id,
+            watch,
+            patch,
+            summary,
+            issues,
+            since,
+            inline,
+            diff,
+        } => {
+            let opts = ShowOptions {
+                patch,
+                summary,
+                issues,
+                since,
+                inline,
+                diff,
+            };
+            handle_show(client, base_url, id, watch, format, opts).await
+        }
         Commands::Rerun { id } => handle_rerun(client, base_url, id, format).await,
         Commands::Cancel { id, force } => handle_cancel(client, base_url, id, force, format).await,
         Commands::Local {
@@ -509,15 +583,112 @@ async fn handle_list(
     Ok(())
 }
 
+fn review_has_issues(review: &Value) -> bool {
+    review
+        .get("inline_review")
+        .and_then(|s| s.as_str())
+        .is_some_and(|inline| !inline.is_empty() && inline != "No issues found.")
+}
+
+fn find_best_review_for_patch(patch_id: i64, reviews: &[Value]) -> Option<&Value> {
+    let refs: Vec<&Value> = reviews.iter().collect();
+    find_best_review_for_patch_refs(patch_id, &refs)
+}
+
+fn find_best_review_for_patch_refs<'a>(patch_id: i64, reviews: &[&'a Value]) -> Option<&'a Value> {
+    let mut best: Option<&Value> = None;
+    for r in reviews {
+        if r.get("patch_id").and_then(|id| id.as_i64()) != Some(patch_id) {
+            continue;
+        }
+        let status = r.get("status").and_then(|s| s.as_str());
+        let current_status = best.and_then(|pr| pr.get("status").and_then(|s| s.as_str()));
+        if status == Some("Reviewed") || current_status != Some("Reviewed") {
+            best = Some(r);
+        }
+    }
+    best
+}
+
+fn review_result_label(review: &Value) -> &str {
+    if review_has_issues(review) {
+        "Issues Found"
+    } else {
+        review.get("status").and_then(|s| s.as_str()).unwrap_or("")
+    }
+}
+
+async fn fetch_patchset(client: &Client, base_url: &str, id: &str) -> Result<Value> {
+    let url = format!("{}/api/patch?id={}", base_url, id);
+    let resp = client.get(&url).send().await?;
+    if resp.status().is_success() {
+        Ok(resp.json().await?)
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to fetch patchset: {}",
+            resp.status()
+        ))
+    }
+}
+
+fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
+    let idx = patch["part_index"].as_i64().unwrap_or(0);
+    let status = patch["status"].as_str().unwrap_or("");
+    let apply_err = patch["apply_error"].as_str();
+
+    print!("  [{}] {}", idx, patch["subject"].as_str().unwrap_or(""));
+    if !status.is_empty() && status != "Pending" {
+        print!(" (");
+        let color = match status {
+            "Failed" | "Failed To Apply" | "Error" => Color::Red,
+            "Embargoed" => Color::Magenta,
+            _ => Color::Green,
+        };
+        print_colored(color, status);
+        print!(")");
+    }
+
+    if let Some(rev) = review {
+        let has_issues = review_has_issues(rev);
+        let rev_status = rev.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        print!(" [");
+        let color = if has_issues {
+            Color::Yellow
+        } else if rev_status == "Failed" {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        print_colored(color, review_result_label(rev));
+        print!("]");
+    }
+    println!();
+
+    if let Some(err) = apply_err {
+        print_colored(Color::Red, "      Error: ");
+        println!("{}", err.trim());
+    }
+
+    if show_inline
+        && let Some(rev) = review
+        && let Some(inline) = rev.get("inline_review").and_then(|s| s.as_str())
+        && !inline.is_empty()
+        && inline != "No issues found."
+    {
+        println!("{}", inline.trim());
+        println!();
+    }
+}
+
 async fn handle_show(
     client: &Client,
     base_url: &str,
     mut id: String,
     watch: bool,
     format: OutputFormat,
+    opts: ShowOptions,
 ) -> Result<()> {
     if id == "latest" {
-        // Fetch list to find latest
         let list_url = format!("{}/api/patchsets?page=1&per_page=1", base_url);
         let resp = client.get(&list_url).send().await?;
         if resp.status().is_success() {
@@ -533,6 +704,10 @@ async fn handle_show(
                 resp.status()
             ));
         }
+    }
+
+    if let Some(ref diff_id) = opts.diff {
+        return handle_show_diff(client, base_url, &id, diff_id, &format).await;
     }
 
     let mut last_status = String::new();
@@ -565,10 +740,8 @@ async fn handle_show(
                 continue;
             }
 
-            // Extract the actual numeric ID for subsequent calls
             let numeric_id = details["id"].to_string();
 
-            // Fetch review if available
             let mut review_data = None;
             if status == "Reviewed" || status == "Failed" || status == "Failed To Apply" {
                 let review_url = format!("{}/api/review_log?patchset_id={}", base_url, numeric_id);
@@ -577,6 +750,44 @@ async fn handle_show(
                 if review_resp.status().is_success() {
                     review_data = Some(review_resp.json::<Value>().await?);
                 }
+            }
+
+            let patches = details
+                .get("patches")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let reviews = details
+                .get("reviews")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let reviews_filtered: Vec<&Value> = if let Some(since_id) = opts.since {
+                reviews
+                    .iter()
+                    .filter(|r| r.get("id").and_then(|i| i.as_i64()).unwrap_or(0) > since_id)
+                    .collect()
+            } else {
+                reviews.iter().collect()
+            };
+
+            if opts.summary {
+                return show_summary(&details, &patches, &reviews_filtered, &format, &opts);
+            }
+
+            if let Some(patch_idx) = opts.patch {
+                return show_single_patch(
+                    patch_idx,
+                    &patches,
+                    &reviews_filtered,
+                    &format,
+                    opts.inline,
+                );
+            }
+
+            if opts.issues {
+                return show_issues(&patches, &reviews_filtered, &format, opts.inline);
             }
 
             match format {
@@ -616,69 +827,11 @@ async fn handle_show(
                         println!("{}", reason);
                     }
 
-                    if let Some(patches) = details.get("patches").and_then(|p| p.as_array()) {
-                        println!("\nPatches ({}):", patches.len());
-                        for patch in patches {
-                            let idx = patch["part_index"].as_i64().unwrap_or(0);
-                            let status = patch["status"].as_str().unwrap_or("");
-                            let apply_err = patch["apply_error"].as_str();
-                            let p_id = patch["id"].as_i64().unwrap_or(0);
-
-                            let mut patch_review_status = None;
-                            let mut has_issues = false;
-                            if let Some(reviews) = details.get("reviews").and_then(|r| r.as_array())
-                            {
-                                for r in reviews {
-                                    if r.get("patch_id").and_then(|id| id.as_i64()) == Some(p_id) {
-                                        patch_review_status =
-                                            r.get("status").and_then(|s| s.as_str());
-                                        if let Some(inline) =
-                                            r.get("inline_review").and_then(|s| s.as_str())
-                                            && inline != "No issues found."
-                                            && !inline.is_empty()
-                                        {
-                                            has_issues = true;
-                                        }
-                                    }
-                                }
-                            }
-
-                            print!("  [{}] {}", idx, patch["subject"].as_str().unwrap_or(""));
-                            if !status.is_empty() && status != "Pending" {
-                                print!(" (");
-                                let color = match status {
-                                    "Failed" | "Failed To Apply" | "Error" => Color::Red,
-                                    "Embargoed" => Color::Magenta,
-                                    _ => Color::Green,
-                                };
-                                print_colored(color, status);
-                                print!(")");
-                            }
-
-                            if let Some(rev_status) = patch_review_status {
-                                print!(" [");
-                                let color = if has_issues {
-                                    Color::Yellow
-                                } else if rev_status == "Failed" {
-                                    Color::Red
-                                } else {
-                                    Color::Green
-                                };
-                                let label = if has_issues {
-                                    "Issues Found"
-                                } else {
-                                    rev_status
-                                };
-                                print_colored(color, label);
-                                print!("]");
-                            }
-                            println!();
-
-                            if let Some(err) = apply_err {
-                                print_colored(Color::Red, "      Error: ");
-                                println!("{}", err.trim());
-                            }
-                        }
+                    println!("\nPatches ({}):", patches.len());
+                    for patch in &patches {
+                        let p_id = patch["id"].as_i64().unwrap_or(0);
+                        let review = find_best_review_for_patch(p_id, &reviews);
+                        print_patch_line(patch, review, opts.inline);
                     }
 
                     if let Some(review) = review_data {
@@ -705,57 +858,30 @@ async fn handle_show(
                             println!("\n{}", summary.trim());
                         }
 
-                        if let Some(patches) = details.get("patches").and_then(|p| p.as_array()) {
-                            println!();
-                            for patch in patches {
-                                let idx = patch["part_index"].as_i64().unwrap_or(0);
-                                let subject = patch["subject"].as_str().unwrap_or("");
-                                let p_id = patch["id"].as_i64().unwrap_or(0);
+                        println!();
+                        for patch in &patches {
+                            let idx = patch["part_index"].as_i64().unwrap_or(0);
+                            let subject = patch["subject"].as_str().unwrap_or("");
+                            let p_id = patch["id"].as_i64().unwrap_or(0);
 
-                                let mut patch_review = None;
-                                if let Some(reviews) =
-                                    details.get("reviews").and_then(|r| r.as_array())
-                                {
-                                    for r in reviews {
-                                        if r.get("patch_id").and_then(|id| id.as_i64())
-                                            == Some(p_id)
-                                        {
-                                            let status = r.get("status").and_then(|s| s.as_str());
-                                            let current_status =
-                                                patch_review.and_then(|pr: &serde_json::Value| {
-                                                    pr.get("status").and_then(|s| s.as_str())
-                                                });
-                                            if status == Some("Reviewed")
-                                                || current_status != Some("Reviewed")
-                                            {
-                                                patch_review = Some(r);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Some(r) = patch_review
-                                    && let Some(output_str) =
-                                        r.get("output").and_then(|o| o.as_str())
-                                    && let Ok(output_json) = from_str::<Value>(output_str)
-                                    && let Some(findings) =
-                                        output_json.get("findings").and_then(|f| f.as_array())
-                                {
-                                    let inline = r.get("inline_review").and_then(|s| s.as_str());
-                                    print_findings_summary(
-                                        &format!("Patch {}: {}", idx, subject),
-                                        findings,
-                                        inline,
-                                    );
-                                }
+                            if let Some(r) = find_best_review_for_patch(p_id, &reviews)
+                                && let Some(output_str) = r.get("output").and_then(|o| o.as_str())
+                                && let Ok(output_json) = from_str::<Value>(output_str)
+                                && let Some(findings) =
+                                    output_json.get("findings").and_then(|f| f.as_array())
+                            {
+                                let inline = r.get("inline_review").and_then(|s| s.as_str());
+                                print_findings_summary(
+                                    &format!("Patch {}: {}", idx, subject),
+                                    findings,
+                                    inline,
+                                );
                             }
                         }
                     } else if let Some(logs) = details.get("baseline_logs").and_then(|l| l.as_str())
+                        && status == "Failed To Apply"
                     {
-                        // Fallback to baseline logs if review is missing (e.g. Failed To Apply during baseline prep)
-                        if status == "Failed To Apply" {
-                            println!("\nBaseline Logs:\n{}", logs);
-                        }
+                        println!("\nBaseline Logs:\n{}", logs);
                     }
                 }
             }
@@ -768,6 +894,428 @@ async fn handle_show(
         }
     }
 
+    Ok(())
+}
+
+fn show_summary(
+    details: &Value,
+    patches: &[Value],
+    reviews: &[&Value],
+    format: &OutputFormat,
+    opts: &ShowOptions,
+) -> Result<()> {
+    let ps_id = details["id"].as_i64().unwrap_or(0);
+    let ps_status = details["status"].as_str().unwrap_or("");
+    let total = patches.len();
+
+    let mut reviewed_clean = 0usize;
+    let mut reviewed_issues = 0usize;
+    let mut in_review = 0usize;
+    let mut not_started = 0usize;
+    let mut failed = 0usize;
+    let mut latest_review_id: i64 = 0;
+    let mut issues_list: Vec<(i64, String)> = Vec::new();
+
+    for patch in patches {
+        let p_id = patch["id"].as_i64().unwrap_or(0);
+        let matching: Vec<&&Value> = reviews
+            .iter()
+            .filter(|r| r.get("patch_id").and_then(|id| id.as_i64()) == Some(p_id))
+            .collect();
+
+        if matching.is_empty() {
+            not_started += 1;
+            continue;
+        }
+
+        let best = matching
+            .iter()
+            .filter(|r| r.get("status").and_then(|s| s.as_str()) == Some("Reviewed"))
+            .max_by_key(|r| r.get("id").and_then(|i| i.as_i64()).unwrap_or(0))
+            .or_else(|| matching.last());
+
+        if let Some(rev) = best {
+            let rev_id = rev.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
+            if rev_id > latest_review_id {
+                latest_review_id = rev_id;
+            }
+
+            match rev.get("status").and_then(|s| s.as_str()).unwrap_or("") {
+                "Reviewed" => {
+                    if review_has_issues(rev) {
+                        reviewed_issues += 1;
+                        let idx = patch["part_index"].as_i64().unwrap_or(0);
+                        let subject = patch["subject"].as_str().unwrap_or("").to_string();
+                        issues_list.push((idx, subject));
+                    } else {
+                        reviewed_clean += 1;
+                    }
+                }
+                "Failed" | "Error" => failed += 1,
+                _ => in_review += 1,
+            }
+        }
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let issues_json: Vec<Value> = issues_list
+                .iter()
+                .map(|(idx, subject)| {
+                    serde_json::json!({
+                        "part_index": idx,
+                        "subject": subject,
+                    })
+                })
+                .collect();
+            let summary = serde_json::json!({
+                "patchset_id": ps_id,
+                "total_patches": total,
+                "status": ps_status,
+                "reviewed_clean": reviewed_clean,
+                "reviewed_issues": reviewed_issues,
+                "in_review": in_review,
+                "not_started": not_started,
+                "failed": failed,
+                "latest_review_id": latest_review_id,
+                "issues": issues_json,
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        OutputFormat::Text => {
+            println!("PS {} ({} patches) — Status: {}", ps_id, total, ps_status);
+            println!(
+                "  Reviewed:    {:>3}  (clean: {}, issues: {})",
+                reviewed_clean + reviewed_issues,
+                reviewed_clean,
+                reviewed_issues
+            );
+            println!("  In Review:   {:>3}", in_review);
+            println!("  Not Started: {:>3}", not_started);
+            println!("  Failed:      {:>3}", failed);
+
+            if !issues_list.is_empty() && !opts.issues {
+                println!("\nIssues Found:");
+                for (idx, subject) in &issues_list {
+                    println!("  [{}] {}", idx, subject);
+                }
+            }
+
+            if opts.issues {
+                println!();
+                let all_reviews: Vec<&Value> = reviews.to_vec();
+                for patch in patches {
+                    let p_id = patch["id"].as_i64().unwrap_or(0);
+                    if let Some(rev) = find_best_review_for_patch_refs(p_id, &all_reviews)
+                        && review_has_issues(rev)
+                    {
+                        print_patch_line(patch, Some(rev), opts.inline);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn show_single_patch(
+    patch_idx: i64,
+    patches: &[Value],
+    reviews: &[&Value],
+    format: &OutputFormat,
+    show_inline: bool,
+) -> Result<()> {
+    let patch = patches
+        .iter()
+        .find(|p| p["part_index"].as_i64() == Some(patch_idx));
+
+    let patch = match patch {
+        Some(p) => p,
+        None => return Err(anyhow::anyhow!("Patch {} not found", patch_idx)),
+    };
+
+    let p_id = patch["id"].as_i64().unwrap_or(0);
+    let all_reviews: Vec<&Value> = reviews.to_vec();
+    let review = find_best_review_for_patch_refs(p_id, &all_reviews);
+
+    match format {
+        OutputFormat::Json => {
+            let result_label = review.map(review_result_label).unwrap_or("");
+            let inline = review
+                .and_then(|r| r.get("inline_review").and_then(|s| s.as_str()))
+                .unwrap_or("");
+            let review_id = review
+                .and_then(|r| r.get("id").and_then(|i| i.as_i64()))
+                .unwrap_or(0);
+            let rev_status = review
+                .and_then(|r| r.get("status").and_then(|s| s.as_str()))
+                .unwrap_or("");
+
+            let out = serde_json::json!({
+                "part_index": patch_idx,
+                "subject": patch["subject"].as_str().unwrap_or(""),
+                "status": rev_status,
+                "result": result_label,
+                "inline_review": inline,
+                "review_id": review_id,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        OutputFormat::Text => {
+            print_patch_line(patch, review, show_inline);
+
+            if let Some(rev) = review
+                && let Some(output_str) = rev.get("output").and_then(|o| o.as_str())
+                && let Ok(output_json) = from_str::<Value>(output_str)
+                && let Some(findings) = output_json.get("findings").and_then(|f| f.as_array())
+            {
+                let idx = patch["part_index"].as_i64().unwrap_or(0);
+                let subject = patch["subject"].as_str().unwrap_or("");
+                let inline = rev.get("inline_review").and_then(|s| s.as_str());
+                print_findings_summary(&format!("Patch {}: {}", idx, subject), findings, inline);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn show_issues(
+    patches: &[Value],
+    reviews: &[&Value],
+    format: &OutputFormat,
+    show_inline: bool,
+) -> Result<()> {
+    let all_reviews: Vec<&Value> = reviews.to_vec();
+    let mut issue_patches: Vec<(&Value, &Value)> = Vec::new();
+
+    for patch in patches {
+        let p_id = patch["id"].as_i64().unwrap_or(0);
+        if let Some(rev) = find_best_review_for_patch_refs(p_id, &all_reviews)
+            && review_has_issues(rev)
+        {
+            issue_patches.push((patch, rev));
+        }
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let items: Vec<Value> = issue_patches
+                .iter()
+                .map(|(patch, rev)| {
+                    serde_json::json!({
+                        "part_index": patch["part_index"].as_i64().unwrap_or(0),
+                        "subject": patch["subject"].as_str().unwrap_or(""),
+                        "review_id": rev.get("id").and_then(|i| i.as_i64()).unwrap_or(0),
+                        "inline_review": rev.get("inline_review").and_then(|s| s.as_str()).unwrap_or(""),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&Value::Array(items))?);
+        }
+        OutputFormat::Text => {
+            if issue_patches.is_empty() {
+                println!("No issues found.");
+                return Ok(());
+            }
+            for (patch, rev) in &issue_patches {
+                print_patch_line(patch, Some(rev), show_inline);
+
+                if !show_inline
+                    && let Some(output_str) = rev.get("output").and_then(|o| o.as_str())
+                    && let Ok(output_json) = from_str::<Value>(output_str)
+                    && let Some(findings) = output_json.get("findings").and_then(|f| f.as_array())
+                {
+                    let idx = patch["part_index"].as_i64().unwrap_or(0);
+                    let subject = patch["subject"].as_str().unwrap_or("");
+                    let inline = rev.get("inline_review").and_then(|s| s.as_str());
+                    print_findings_summary(
+                        &format!("Patch {}: {}", idx, subject),
+                        findings,
+                        inline,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_show_diff(
+    client: &Client,
+    base_url: &str,
+    current_id: &str,
+    other_id: &str,
+    format: &OutputFormat,
+) -> Result<()> {
+    let current = fetch_patchset(client, base_url, current_id).await?;
+    let other = fetch_patchset(client, base_url, other_id).await?;
+
+    let current_patches = current
+        .get("patches")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let other_patches = other
+        .get("patches")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let current_reviews = current
+        .get("reviews")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let other_reviews = other
+        .get("reviews")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let current_ps_id = current["id"].as_i64().unwrap_or(0);
+    let other_ps_id = other["id"].as_i64().unwrap_or(0);
+
+    struct PatchDiff {
+        part_index: i64,
+        subject: String,
+        old_result: String,
+        new_result: String,
+        is_new: bool,
+        is_removed: bool,
+    }
+
+    let mut diffs: Vec<PatchDiff> = Vec::new();
+
+    for cp in &current_patches {
+        let idx = cp["part_index"].as_i64().unwrap_or(0);
+        let subject = cp["subject"].as_str().unwrap_or("").to_string();
+        let cp_id = cp["id"].as_i64().unwrap_or(0);
+        let c_rev = find_best_review_for_patch(cp_id, &current_reviews);
+        let new_result = c_rev
+            .map(|r| review_result_label(r).to_string())
+            .unwrap_or_else(|| "Not Started".to_string());
+
+        let matched = other_patches.iter().find(|op| {
+            op["subject"].as_str().unwrap_or("") == subject
+                || op["part_index"].as_i64() == Some(idx)
+        });
+
+        if let Some(op) = matched {
+            let op_id = op["id"].as_i64().unwrap_or(0);
+            let o_rev = find_best_review_for_patch(op_id, &other_reviews);
+            let old_result = o_rev
+                .map(|r| review_result_label(r).to_string())
+                .unwrap_or_else(|| "Not Started".to_string());
+
+            diffs.push(PatchDiff {
+                part_index: idx,
+                subject,
+                old_result,
+                new_result,
+                is_new: false,
+                is_removed: false,
+            });
+        } else {
+            diffs.push(PatchDiff {
+                part_index: idx,
+                subject,
+                old_result: String::new(),
+                new_result,
+                is_new: true,
+                is_removed: false,
+            });
+        }
+    }
+
+    for op in &other_patches {
+        let subject = op["subject"].as_str().unwrap_or("");
+        let idx = op["part_index"].as_i64().unwrap_or(0);
+        let already_matched = current_patches.iter().any(|cp| {
+            cp["subject"].as_str().unwrap_or("") == subject
+                || cp["part_index"].as_i64() == Some(idx)
+        });
+        if !already_matched {
+            let op_id = op["id"].as_i64().unwrap_or(0);
+            let o_rev = find_best_review_for_patch(op_id, &other_reviews);
+            let old_result = o_rev
+                .map(|r| review_result_label(r).to_string())
+                .unwrap_or_else(|| "Not Started".to_string());
+            diffs.push(PatchDiff {
+                part_index: idx,
+                subject: subject.to_string(),
+                old_result,
+                new_result: String::new(),
+                is_new: false,
+                is_removed: true,
+            });
+        }
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let items: Vec<Value> = diffs
+                .iter()
+                .map(|d| {
+                    let mut obj = serde_json::json!({
+                        "part_index": d.part_index,
+                        "subject": d.subject,
+                    });
+                    if d.is_new {
+                        obj["change"] = "added".into();
+                        obj["result"] = d.new_result.as_str().into();
+                    } else if d.is_removed {
+                        obj["change"] = "removed".into();
+                        obj["result"] = d.old_result.as_str().into();
+                    } else if d.old_result != d.new_result {
+                        obj["change"] = "changed".into();
+                        obj["old_result"] = d.old_result.as_str().into();
+                        obj["new_result"] = d.new_result.as_str().into();
+                    } else {
+                        obj["change"] = "unchanged".into();
+                        obj["result"] = d.new_result.as_str().into();
+                    }
+                    obj
+                })
+                .collect();
+            let out = serde_json::json!({
+                "current_patchset": current_ps_id,
+                "compared_with": other_ps_id,
+                "patches": items,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        OutputFormat::Text => {
+            println!("Diff: PS {} vs PS {}\n", current_ps_id, other_ps_id);
+            let changed: Vec<&PatchDiff> = diffs
+                .iter()
+                .filter(|d| d.is_new || d.is_removed || d.old_result != d.new_result)
+                .collect();
+
+            if changed.is_empty() {
+                println!("No changes between patchsets.");
+            } else {
+                for d in &changed {
+                    if d.is_new {
+                        print_colored(Color::Green, "  + ");
+                        println!("[{}] {} ({})", d.part_index, d.subject, d.new_result);
+                    } else if d.is_removed {
+                        print_colored(Color::Red, "  - ");
+                        println!("[{}] {} (was: {})", d.part_index, d.subject, d.old_result);
+                    } else {
+                        print_colored(Color::Yellow, "  ~ ");
+                        println!(
+                            "[{}] {} ({} -> {})",
+                            d.part_index, d.subject, d.old_result, d.new_result
+                        );
+                    }
+                }
+            }
+
+            let unchanged_count = diffs.len() - changed.len();
+            if unchanged_count > 0 {
+                println!("\n  {} patches unchanged", unchanged_count);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1292,7 +1840,8 @@ fn print_findings_summary(label: &str, findings: &[Value], inline_review: Option
 }
 
 fn print_colored(color: Color, text: &str) {
-    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+    let choice = COLOR_CHOICE.get().copied().unwrap_or(ColorChoice::Auto);
+    let mut stdout = StandardStream::stdout(choice);
     stdout
         .set_color(ColorSpec::new().set_fg(Some(color)))
         .unwrap();
