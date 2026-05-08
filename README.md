@@ -98,6 +98,25 @@ Running an automated review system like Sashiko can be computationally expensive
     # temperature = 1.0
     ```
 
+## Gemini CLI Skills
+
+For users of the [Gemini CLI](https://github.com/google/gemini-cli), we provide specialized skills to automate development workflows:
+
+- **`review-pr`**: Performs deep, scrutinizing code reviews against `GEMINI.md` and design documents. Detects relevant design files automatically and generates categorized findings with ready-to-paste diffs.
+- **`sashiko-feature`**: A meta-skill for implementing new features. It handles design document matching, codebase investigation, and ensures adherence to SOLID/DRY principles in Rust, while iteratively running `make` checks.
+
+### Installing Skills
+
+To install these skills in your local workspace:
+
+```bash
+gemini skills install ./skills/review-pr.skill --scope workspace
+gemini skills install ./skills/sashiko-feature.skill --scope workspace
+/skills reload
+```
+
+For users of other agent interfaces (e.g., OpenCode, Claude Code), we recommend following your interface's specific settings to symlink or copy the skill configurations (the `SKILL.md` and `references/` files) into your agent's custom instruction path.
+
     You can also configure settings via environment variables using the `SASHIKO` prefix and double underscores for nesting (e.g., `SASHIKO_AI__PROVIDER=gemini`).
 
     **Important**: You must set the `LLM_API_KEY` environment variable with your provider's API key.
