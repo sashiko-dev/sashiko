@@ -104,3 +104,8 @@ cc = ["vkoul@kernel.org", "Frank.Li@kernel.org", "dmaengine@vger.kernel.org"]
 lists = ["linux-phy@lists.infradead.org"]
 reply_to_author = true
 cc = ["vkoul@kernel.org", "neil.armstrong@linaro.org", "olteanv@gmail.com", "linux-phy@lists.infradead.org"]
+
+[subsystems.imx]
+lists = ["imx@lists.linux.dev"]
+reply_to_author = true
+cc = ["Frank.Li@kernel.org", "imx@lists.linux.dev"]
