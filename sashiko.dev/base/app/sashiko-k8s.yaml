@@ -102,6 +102,17 @@ spec:
               value: "false"
             - name: SASHIKO__REVIEW__EMAIL_POLICY_PATH
               value: "/app/email_policy.toml"
+            # Enable per-worker (local) backoff isolation
+            - name: SASHIKO__AI__GLOBAL_BACKOFF
+              value: "false"
+            # Configure flat backoffs instead of exponential
+            - name: SASHIKO__AI__TRANSIENT_BACKOFF_TYPE
+              value: "flat"
+            - name: SASHIKO__AI__TRANSIENT_FLAT_BACKOFF_SECS
+              value: "30"
+            # Set flat quota retry to 65s too (optional, defaults to 60s if omitted)
+            - name: SASHIKO__AI__QUOTA_BACKOFF_SECS
+              value: "65"
             - name: LLM_API_KEY
               valueFrom:
                 secretKeyRef:
