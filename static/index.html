@@ -2477,10 +2477,17 @@
                     ${threadHtml}
                 </div>` : ''}
 
-                ${baselineLogsHtml}
-                
-                <div class="section">
-                    <h2 id="ai-reviews">AI Reviews</h2>
+                 ${baselineLogsHtml}
+
+                ${data.summary ? `
+                <div class="section" style="border-left: 3px solid var(--link); padding-left: 16px;">
+                    <h2 style="margin-top: 0;">Series Summary</h2>
+                    <p style="margin: 0; line-height: 1.6; color: var(--text);">${escapeHtml(data.summary)}</p>
+                    <div style="margin-top: 8px; font-size: 0.8em; color: var(--text-muted); font-style: italic;">AI-generated summary</div>
+                </div>
+                ` : ''}
+
+                 <div class="section">                    <h2 id="ai-reviews">AI Reviews</h2>
                     ${summaryHtml}
                     ${reviewsHtml}
                     ${paginationHtml}

@@ -228,6 +228,7 @@ pub async fn build_review_input_from_git(
             id: 0,
             subject,
             patches,
+            series_map: None,
         },
         shas,
     ))

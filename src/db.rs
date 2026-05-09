@@ -511,6 +511,7 @@ impl Database {
                 (),
             )
             .await;
+        let _ = self.try_add_column("patchsets", "summary", "TEXT").await;
         let _ = self
             .try_create_index(
                 "idx_patchsets_status_embargo_until",
@@ -2558,7 +2559,7 @@ impl Database {
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
                     p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
+                    p.embargo_until, p.mr_url, p.slug, p.summary
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -2586,6 +2587,7 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            let patchset_summary: Option<String> = row.get(20).ok();
             // Fetch baseline details if needed
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
@@ -2783,7 +2785,8 @@ impl Database {
                 "provider": provider,
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
-                "slug": slug
+                "slug": slug,
+                "summary": patchset_summary
             })))
         } else {
             Ok(None)
@@ -2803,7 +2806,7 @@ impl Database {
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
                     p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
+                    p.embargo_until, p.mr_url, p.slug, p.summary
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -2831,6 +2834,7 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            let patchset_summary: Option<String> = row.get(20).ok();
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
                     .conn
@@ -3022,7 +3026,8 @@ impl Database {
                 "provider": provider,
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
-                "slug": slug
+                "slug": slug,
+                "summary": patchset_summary
             })))
         } else {
             Ok(None)
@@ -3391,6 +3396,16 @@ impl Database {
             .execute(
                 "UPDATE patchsets SET status = ? WHERE id = ?",
                 libsql::params![status, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_patchset_summary(&self, patchset_id: i64, summary: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET summary = ? WHERE id = ?",
+                libsql::params![summary, patchset_id],
             )
             .await?;
         Ok(())

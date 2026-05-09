@@ -1,6 +1,25 @@
-use crate::ai::{AiMessage, AiProvider, AiRequest, AiRole};
+// Copyright 2026 The Sashiko Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
+use crate::db::Database;
 use crate::worker::prompts::SeriesMap;
 use anyhow::{Context, Result};
+use std::sync::Arc;
+use tracing::{info, warn};
+
+const MAX_DIFF_CHARS_PER_PATCH: usize = 4000;
 
 pub async fn generate_series_map(
     provider: &dyn AiProvider,
@@ -22,13 +41,20 @@ pub async fn generate_series_map(
     system_prompt.push_str("  ]\n");
     system_prompt.push_str("}\n");
 
-    let mut user_content = String::new();
+    let mut user_content = String::with_capacity(8192);
     if let Some(cl) = cover_letter {
         user_content.push_str(&format!("COVER LETTER:\n{}\n\n", cl));
     }
 
     for (i, diff) in diffs.iter().enumerate() {
-        user_content.push_str(&format!("--- PATCH {} ---\n{}\n\n", i + 1, diff));
+        user_content.push_str(&format!("--- PATCH {} ---\n", i + 1));
+        if diff.len() > MAX_DIFF_CHARS_PER_PATCH {
+            user_content.push_str(&diff[..MAX_DIFF_CHARS_PER_PATCH]);
+            user_content.push_str("\n... (truncated)\n");
+        } else {
+            user_content.push_str(diff);
+        }
+        user_content.push_str("\n\n");
     }
 
     let request = AiRequest {
@@ -43,7 +69,7 @@ pub async fn generate_series_map(
         }],
         tools: None,
         temperature: Some(0.1),
-        response_format: Some(crate::ai::AiResponseFormat::Json { schema: None }),
+        response_format: Some(AiResponseFormat::Json { schema: None }),
         context_tag: None,
     };
 
@@ -57,8 +83,10 @@ pub async fn generate_series_map(
     Ok(map)
 }
 
-pub async fn generate_user_summary(
+pub async fn generate_patchset_summary(
+    db: &Arc<Database>,
     provider: &dyn AiProvider,
+    patchset_id: i64,
     cover_letter: Option<&str>,
     diffs: &[&str],
 ) -> Result<String> {
@@ -67,13 +95,20 @@ pub async fn generate_user_summary(
     system_prompt.push_str("Provide a concise, high-level summary of what the series achieves, why it is needed, and any notable design choices.\n");
     system_prompt.push_str("Format as a single paragraph or bullet points. Do not mention patch numbers explicitly unless necessary.\n");
 
-    let mut user_content = String::new();
+    let mut user_content = String::with_capacity(8192);
     if let Some(cl) = cover_letter {
         user_content.push_str(&format!("COVER LETTER:\n{}\n\n", cl));
     }
 
     for (i, diff) in diffs.iter().enumerate() {
-        user_content.push_str(&format!("--- PATCH {} ---\n{}\n\n", i + 1, diff));
+        user_content.push_str(&format!("--- PATCH {} ---\n", i + 1));
+        if diff.len() > MAX_DIFF_CHARS_PER_PATCH {
+            user_content.push_str(&diff[..MAX_DIFF_CHARS_PER_PATCH]);
+            user_content.push_str("\n... (truncated)\n");
+        } else {
+            user_content.push_str(diff);
+        }
+        user_content.push_str("\n\n");
     }
 
     let request = AiRequest {
@@ -88,12 +123,32 @@ pub async fn generate_user_summary(
         }],
         tools: None,
         temperature: Some(0.3),
-        response_format: Some(crate::ai::AiResponseFormat::Text),
-        context_tag: None,
+        response_format: Some(AiResponseFormat::Text),
+        context_tag: Some(format!("[ps:{} summary]", patchset_id)),
     };
 
-    let response = provider.generate_content(request).await?;
-    Ok(response
-        .content
-        .unwrap_or_else(|| "No summary generated.".to_string()))
+    match provider.generate_content(request).await {
+        Ok(response) => {
+            if let Some(text) = response.content {
+                let summary = text.trim().to_string();
+                if !summary.is_empty() {
+                    db.set_patchset_summary(patchset_id, &summary).await?;
+                    info!(
+                        "Generated summary for patchset {} ({} chars)",
+                        patchset_id,
+                        summary.len()
+                    );
+                    return Ok(summary);
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Failed to generate summary for patchset {}: {}",
+                patchset_id, e
+            );
+        }
+    }
+
+    Ok("No summary generated.".to_string())
 }

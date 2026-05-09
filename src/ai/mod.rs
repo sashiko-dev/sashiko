@@ -587,7 +587,6 @@ pub mod gemini;
 pub mod kiro_cli;
 pub mod ollama;
 pub mod openai;
-pub mod patchset_summary;
 pub mod proxy;
 pub mod quota;
 pub mod session;

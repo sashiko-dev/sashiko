@@ -31,6 +31,7 @@ pub mod patchwork;
 pub mod prompt_bundle;
 pub mod reviewer;
 pub mod settings;
+pub mod summarizer;
 pub mod toolbox;
 pub mod utils;
 pub mod worker;

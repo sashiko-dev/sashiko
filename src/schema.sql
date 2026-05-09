@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS patchsets (
     provider TEXT,
     embargo_until INTEGER,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
+    summary TEXT,
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)

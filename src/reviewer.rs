@@ -462,7 +462,7 @@ impl Reviewer {
                 .iter()
                 .map(|(_, _, diff, _, _, _, _)| diff.as_str())
                 .collect();
-            let series_map = crate::ai::patchset_summary::generate_series_map(
+            let series_map = crate::summarizer::generate_series_map(
                 ctx.provider.as_ref(),
                 body.as_deref(),
                 &diffs_str,
@@ -470,21 +470,19 @@ impl Reviewer {
             .await
             .ok();
 
-            if let Ok(summary) = crate::ai::patchset_summary::generate_user_summary(
+            if let Err(e) = crate::summarizer::generate_patchset_summary(
+                &ctx.db,
                 ctx.provider.as_ref(),
+                patchset_id,
                 body.as_deref(),
                 &diffs_str,
             )
             .await
             {
-                // Attach the user summary to the patchset. Assuming we can update the review summary or status.
-                // We'll log it for now and it will be presented.
-                info!(
-                    "Generated User Summary for Patchset {}:\n{}",
-                    patchset_id, summary
+                warn!(
+                    "Patchset summary generation failed for {}: {}",
+                    patchset_id, e
                 );
-                // Note: To persist this to DB, we'd need a field in `patchsets` table.
-                // For now, it's just generated and available for future use.
             }
 
             let input_payload = json!({
