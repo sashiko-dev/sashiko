@@ -670,6 +670,25 @@ impl Worker {
 
         // Prefetch AST context based on the diff
         let worktree_path = self.tools.get_worktree_path();
+
+        if let Some(series_map) = patchset.get("series_map").and_then(|v| v.as_object()) {
+            let map_json = serde_json::to_string_pretty(series_map).unwrap_or_default();
+            let map_context = format!(
+                "\n\n<series_map>\n\
+                You are reviewing Patch {p_id}. You have access to the following Series Map which maps symbols introduced across the entire patchset.\n\
+                If you detect an incomplete interface, missing method, or unused struct, consult this map.\n\
+                If the map indicates the symbol is completed or used in Patch M (where M > {p_id}), DO NOT flag it as a concern.\n\
+                {}\n\
+                </series_map>\n",
+                map_json
+            );
+            dynamic_context.push_str(&map_context);
+            clean_dynamic_context.push_str(&map_context);
+
+            dynamic_context_no_log.push_str(&map_context);
+            clean_dynamic_context_no_log.push_str(&map_context);
+        }
+
         if let Ok(prefetched) =
             crate::worker::prefetch::prefetch_context(worktree_path, &target_commit_diff).await
             && !prefetched.is_empty()
