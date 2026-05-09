@@ -457,11 +457,42 @@ impl Reviewer {
                 })
                 .unwrap_or_default();
 
+            // Pre-computation: Generate SeriesMap and User Summary
+            let diffs_str: Vec<&str> = diffs
+                .iter()
+                .map(|(_, _, diff, _, _, _, _)| diff.as_str())
+                .collect();
+            let series_map = crate::ai::patchset_summary::generate_series_map(
+                ctx.provider.as_ref(),
+                body.as_deref(),
+                &diffs_str,
+            )
+            .await
+            .ok();
+
+            if let Ok(summary) = crate::ai::patchset_summary::generate_user_summary(
+                ctx.provider.as_ref(),
+                body.as_deref(),
+                &diffs_str,
+            )
+            .await
+            {
+                // Attach the user summary to the patchset. Assuming we can update the review summary or status.
+                // We'll log it for now and it will be presented.
+                info!(
+                    "Generated User Summary for Patchset {}:\n{}",
+                    patchset_id, summary
+                );
+                // Note: To persist this to DB, we'd need a field in `patchsets` table.
+                // For now, it's just generated and available for future use.
+            }
+
             let input_payload = json!({
                 "id": patchset_id,
                 "message_id": patchset_msg_id,
                 "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
-                "patches": patches_json
+                "patches": patches_json,
+                "series_map": series_map
             });
 
             let skip_filters: Vec<String> = patchset
