@@ -79,11 +79,26 @@ pub struct PatchInput {
     pub commit_id: Option<String>,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SymbolReference {
+    pub name: String,
+    pub defined_in_patch_index: i64,
+    pub completed_in_patch_indices: Vec<i64>,
+    pub description: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SeriesMap {
+    pub introduced_symbols: Vec<SymbolReference>,
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ReviewInput {
     pub id: i64,
     pub subject: String,
     pub patches: Vec<PatchInput>,
+    #[serde(default)]
+    pub series_map: Option<SeriesMap>,
 }
 
 pub struct WorkerConfig {
