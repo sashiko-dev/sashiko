@@ -554,18 +554,31 @@ async fn process_entry(
 
         match client.generate_content(req).await {
             Ok(r) => break r,
-            Err(e) => {
-                let retry_after = match classify_ai_error(&e) {
-                    AiErrorClass::RateLimit { retry_after }
-                    | AiErrorClass::Transient { retry_after } => retry_after,
-                    AiErrorClass::Fatal => std::time::Duration::from_secs(30),
-                };
-                warn!(
-                    "API error ({}), pausing for {:?} before retry...",
-                    e, retry_after
-                );
-                tokio::time::sleep(retry_after).await;
-            }
+            Err(e) => match classify_ai_error(&e) {
+                AiErrorClass::RateLimit { retry_after }
+                | AiErrorClass::Transient { retry_after } => {
+                    warn!(
+                        "API error ({}), pausing for {:?} before retry...",
+                        e, retry_after
+                    );
+                    tokio::time::sleep(retry_after).await;
+                }
+                AiErrorClass::Fatal => {
+                    return BenchmarkResult {
+                        commit: entry.commit,
+                        problem_description,
+                        found: false,
+                        status: "UNKNOWN".to_string(),
+                        explanation: format!("Evaluation failed: {}", e),
+                        findings_count,
+                        concerns_count,
+                        tokens_in,
+                        tokens_out,
+                        turns,
+                        duration_secs,
+                    };
+                }
+            },
         }
     };
 

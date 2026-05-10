@@ -1682,9 +1682,9 @@ async fn run_review_tool(
                                             }
                                             Err(e) => {
                                                 match classify_ai_error(&e) {
-                                                    AiErrorClass::RateLimit { .. } => {
+                                                    AiErrorClass::RateLimit { retry_after } => {
                                                         quota_manager
-                                                            .report_quota_error(Duration::from_secs(60))
+                                                            .report_quota_error(retry_after)
                                                             .await;
                                                         continue;
                                                     }
@@ -2122,7 +2122,10 @@ mod tests {
     use async_trait::async_trait;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tempfile::tempdir;
 
     struct MockProvider;
@@ -2156,6 +2159,41 @@ mod tests {
     impl AiProvider for FailingProvider {
         async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
             Err(anyhow::anyhow!("fatal provider failure"))
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    struct RateLimitThenSuccessProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for RateLimitThenSuccessProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(crate::ai::openai::OpenAiCompatError::RateLimitExceeded(
+                    std::time::Duration::from_millis(1),
+                )
+                .into());
+            }
+
+            Ok(AiResponse {
+                content: Some("Recovered after rate limit".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+            })
         }
 
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
@@ -2352,6 +2390,30 @@ fi
         let result = run_single_ai_request_mock(mock_script, Arc::new(FailingProvider)).await?;
 
         assert_eq!(result["patches"][0]["status"], "typed_fatal");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_review_tool_retries_rate_limits_without_child_error() -> Result<()> {
+        let mock_script = r#"#!/bin/bash
+read -r input
+echo '{"type":"ai_request","payload":{"messages":[{"role":"user","content":"hello"}]}}'
+read -r ai_response
+if [[ "$ai_response" == *'"type":"error"'* ]]; then
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"error_written"}]}'
+else
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"applied"}]}'
+fi
+"#;
+        let provider = Arc::new(RateLimitThenSuccessProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_for_tool: Arc<dyn AiProvider> = provider.clone();
+
+        let result = run_single_ai_request_mock(mock_script, provider_for_tool).await?;
+
+        assert_eq!(result["patches"][0]["status"], "applied");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         Ok(())
     }
 

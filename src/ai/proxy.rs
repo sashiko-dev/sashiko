@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::gemini::{GeminiClient, GeminiError, GenerateContentRequest};
+use crate::ai::gemini::{GeminiClient, GenerateContentRequest};
 use crate::ai::quota::QuotaManager;
+use crate::ai::{AiErrorClass, classify_ai_error};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -42,18 +43,16 @@ pub async fn handle_generate(
                 return (StatusCode::OK, Json(response)).into_response();
             }
             Err(e) => {
-                if let Some(err) = e.downcast_ref::<GeminiError>() {
-                    match err {
-                        GeminiError::QuotaExceeded(duration) => {
-                            state.quota_manager.report_quota_error(*duration).await;
-                            continue;
-                        }
-                        GeminiError::TransientError(_, _) => {
-                            state.quota_manager.report_transient_error().await;
-                            continue;
-                        }
-                        _ => {}
+                match classify_ai_error(&e) {
+                    AiErrorClass::RateLimit { retry_after } => {
+                        state.quota_manager.report_quota_error(retry_after).await;
+                        continue;
                     }
+                    AiErrorClass::Transient { .. } => {
+                        state.quota_manager.report_transient_error().await;
+                        continue;
+                    }
+                    AiErrorClass::Fatal => {}
                 }
 
                 error!("Gemini Proxy Error: {}", e);
