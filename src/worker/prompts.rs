@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::{AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole};
+use crate::ai::{
+    AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole, ClassifyAiError,
+};
 use crate::worker::tools::ToolBox;
 use anyhow::{Context, Result};
 
@@ -32,6 +34,17 @@ pub enum ReviewError {
     #[error("Format validation failed: {0}")]
     FormatRejection(String),
 }
+
+impl ClassifyAiError for ReviewError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            ReviewError::LimitExceeded => AiErrorClass::Fatal,
+            ReviewError::BudgetExceeded(_) => AiErrorClass::Fatal,
+            ReviewError::FormatRejection(_) => AiErrorClass::Fatal,
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1598,6 +1611,27 @@ mod tests {
     }
 
     // ReviewError tests
+
+    #[test]
+    fn test_limit_exceeded_classifies_as_fatal() {
+        let err = ReviewError::LimitExceeded;
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_budget_exceeded_classifies_as_fatal() {
+        let err = ReviewError::BudgetExceeded("1000 tokens used (limit: 500)".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_format_rejection_classifies_as_fatal() {
+        let err = ReviewError::FormatRejection("contains markdown code blocks".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
 
     #[test]
     fn test_limit_exceeded_downcasts_as_review_error() {

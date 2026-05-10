@@ -14,8 +14,8 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
-    decode_stdio_ai_response,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
+    ProviderCapabilities, ToolCall, classify_status_code, decode_stdio_ai_response,
 };
 use crate::utils::redact_secret;
 use anyhow::{Context, Result};
@@ -217,6 +217,24 @@ impl std::fmt::Display for GeminiError {
 }
 
 impl std::error::Error for GeminiError {}
+
+impl ClassifyAiError for GeminiError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            GeminiError::QuotaExceeded(retry_after) => AiErrorClass::RateLimit {
+                retry_after: *retry_after,
+            },
+            GeminiError::TransientError(retry_after, _) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            GeminiError::PermissionDenied(_) => AiErrorClass::Fatal,
+            GeminiError::ApiError(status, _) => {
+                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+            }
+            GeminiError::Other(_) => AiErrorClass::Fatal,
+        }
+    }
+}
 
 pub struct GeminiClient {
     model: String,
@@ -767,8 +785,70 @@ impl AiProvider for GeminiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiMessage, AiResponseFormat, AiRole, AiTool, ToolCall};
+    use crate::ai::{
+        AiErrorClass, AiMessage, AiResponseFormat, AiRole, AiTool, ClassifyAiError,
+        DEFAULT_RETRY_AFTER, ToolCall,
+    };
     use serde_json::json;
+
+    #[test]
+    fn test_quota_exceeded_classifies_as_rate_limit() {
+        let retry_after = Duration::from_secs(7);
+        let err = GeminiError::QuotaExceeded(retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::RateLimit { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_transient_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(11);
+        let err = GeminiError::TransientError(retry_after, "busy".to_string());
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_permission_denied_classifies_as_fatal() {
+        let err = GeminiError::PermissionDenied("forbidden".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_api_error_server_status_classifies_as_transient() {
+        let err = GeminiError::ApiError(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable".to_string(),
+        );
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            }
+        );
+    }
+
+    #[test]
+    fn test_api_error_client_status_classifies_as_fatal() {
+        let err =
+            GeminiError::ApiError(reqwest::StatusCode::BAD_REQUEST, "bad request".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_other_classifies_as_fatal() {
+        let err = GeminiError::Other("unknown".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
 
     #[test]
     fn test_translate_ai_request_system_and_user() -> Result<()> {

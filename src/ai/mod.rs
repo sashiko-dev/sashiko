@@ -207,6 +207,36 @@ pub struct RemoteAiError {
     pub class: AiErrorClass,
 }
 
+pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+pub trait ClassifyAiError {
+    fn ai_error_class(&self) -> AiErrorClass;
+}
+
+impl ClassifyAiError for RemoteAiError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        self.class
+    }
+}
+
+pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErrorClass> {
+    match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {
+            retry_after: DEFAULT_RETRY_AFTER,
+        }),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        | reqwest::StatusCode::BAD_GATEWAY
+        | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        | reqwest::StatusCode::GATEWAY_TIMEOUT => Some(AiErrorClass::Transient {
+            retry_after: DEFAULT_RETRY_AFTER,
+        }),
+        status if status.as_u16() == 529 => Some(AiErrorClass::Transient {
+            retry_after: DEFAULT_RETRY_AFTER,
+        }),
+        _ => None,
+    }
+}
+
 /// Decodes a single line of the stdio AI protocol into an [`AiResponse`].
 ///
 /// Error payloads in the legacy string form surface as
@@ -688,6 +718,53 @@ mod tests {
 
         assert!(err.to_string().contains("retry_after_secs"));
         Ok(())
+    }
+
+    #[test]
+    fn test_remote_ai_error_classifies_from_payload_class() {
+        let retry_after = Duration::from_secs(42);
+        let err = RemoteAiError {
+            message: "remote rate limit".to_string(),
+            class: AiErrorClass::RateLimit { retry_after },
+        };
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::RateLimit { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_rate_limit() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some(AiErrorClass::RateLimit {
+                retry_after: DEFAULT_RETRY_AFTER,
+            })
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_server_error() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            Some(AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            })
+        );
+    }
+
+    #[test]
+    fn test_classify_status_code_other() {
+        assert_eq!(classify_status_code(reqwest::StatusCode::BAD_REQUEST), None);
+    }
+
+    #[test]
+    fn test_classify_status_code_not_implemented_is_fatal() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::NOT_IMPLEMENTED),
+            None
+        );
     }
 
     #[test]

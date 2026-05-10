@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
-    decode_stdio_ai_response,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
+    ProviderCapabilities, ToolCall, classify_status_code, decode_stdio_ai_response,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -153,6 +153,24 @@ pub enum ClaudeError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+}
+
+impl ClassifyAiError for ClaudeError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            ClaudeError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
+                retry_after: *retry_after,
+            },
+            ClaudeError::OverloadedError(retry_after) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            ClaudeError::InvalidRequest(_) => AiErrorClass::Fatal,
+            ClaudeError::AuthenticationError(_) => AiErrorClass::Fatal,
+            ClaudeError::ApiError(status, _) => {
+                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+            }
+        }
+    }
 }
 
 // --- ClaudeClient ---
@@ -654,7 +672,10 @@ impl AiProvider for StdioClaudeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiMessage, AiRequest, AiRole, AiTool, ToolCall};
+    use crate::ai::{
+        AiErrorClass, AiMessage, AiRequest, AiRole, AiTool, ClassifyAiError, DEFAULT_RETRY_AFTER,
+        ToolCall,
+    };
     use serde_json::json;
 
     fn make_request(messages: Vec<AiMessage>) -> AiRequest {
@@ -666,6 +687,65 @@ mod tests {
             response_format: None,
             context_tag: None,
         }
+    }
+
+    #[test]
+    fn test_rate_limit_exceeded_classifies_as_rate_limit() {
+        let retry_after = Duration::from_secs(7);
+        let err = ClaudeError::RateLimitExceeded(retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::RateLimit { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_overloaded_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(11);
+        let err = ClaudeError::OverloadedError(retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_invalid_request_classifies_as_fatal() {
+        let err = ClaudeError::InvalidRequest("bad request".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_authentication_error_classifies_as_fatal() {
+        let err = ClaudeError::AuthenticationError("bad key".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_api_error_server_status_classifies_as_transient() {
+        let err = ClaudeError::ApiError(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable".to_string(),
+        );
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            }
+        );
+    }
+
+    #[test]
+    fn test_api_error_client_status_classifies_as_fatal() {
+        let err =
+            ClaudeError::ApiError(reqwest::StatusCode::BAD_REQUEST, "bad request".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
     }
 
     // --- ThinkingConfig tests (Bug 1 regression) ---

@@ -14,8 +14,8 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
-    ToolCall,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
+    ClassifyAiError, ProviderCapabilities, ToolCall, classify_status_code,
 };
 use crate::utils::redact_secret;
 use anyhow::Result;
@@ -111,6 +111,23 @@ pub enum OpenAiCompatError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+}
+
+impl ClassifyAiError for OpenAiCompatError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            OpenAiCompatError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
+                retry_after: *retry_after,
+            },
+            OpenAiCompatError::TransientError(retry_after, _) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            OpenAiCompatError::AuthenticationError(_) => AiErrorClass::Fatal,
+            OpenAiCompatError::ApiError(status, _) => {
+                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,8 +518,62 @@ impl AiProvider for OpenAiCompatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiMessage, AiTool};
+    use crate::ai::{AiErrorClass, AiMessage, AiTool, ClassifyAiError, DEFAULT_RETRY_AFTER};
     use serde_json::json;
+
+    #[test]
+    fn test_rate_limit_exceeded_classifies_as_rate_limit() {
+        let retry_after = Duration::from_secs(7);
+        let err = OpenAiCompatError::RateLimitExceeded(retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::RateLimit { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_transient_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(11);
+        let err = OpenAiCompatError::TransientError(retry_after, "busy".to_string());
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    #[test]
+    fn test_authentication_error_classifies_as_fatal() {
+        let err = OpenAiCompatError::AuthenticationError("bad key".to_string());
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_api_error_server_status_classifies_as_transient() {
+        let err = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable".to_string(),
+        );
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            }
+        );
+    }
+
+    #[test]
+    fn test_api_error_client_status_classifies_as_fatal() {
+        let err = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::BAD_REQUEST,
+            "bad request".to_string(),
+        );
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
 
     #[test]
     fn test_translate_request_system_and_user() -> Result<()> {
