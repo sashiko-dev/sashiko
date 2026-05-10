@@ -31,7 +31,7 @@ sequenceDiagram
             P->>P: Handle Quota (Wait & Retry)
             P->>C: (Delayed Response)
         else Fatal Error
-            P->>C: {"type": "error", "payload": "Description"}
+            P->>C: {"type": "error", "payload": {"message": "Description", "class": "fatal"}}
         end
     end
 
@@ -106,7 +106,7 @@ The parent processes the request (handling authentication, networking, and quota
 If the parent fails to execute the request (e.g., network failure after retries, invalid request), it returns an error.
 
 *   **Direction**: Parent -> Child
-*   **New Format**:
+*   **Format**:
     ```json
     {
       "type": "error",
@@ -121,15 +121,7 @@ If the parent fails to execute the request (e.g., network failure after retries,
     *   `fatal`: Permanent failure. `retry_after_secs` is omitted.
     *   `rate_limit`: Provider quota or rate-limit failure. `retry_after_secs` is required.
     *   `transient`: Retryable provider or transport failure. `retry_after_secs` is required.
-*   **Receive Semantics**: Object payloads are decoded into a typed `RemoteAiError`, preserving the message and error class for callers that need structured handling.
-*   **Legacy Format**:
-    ```json
-    {
-      "type": "error",
-      "payload": "Detailed error message string"
-    }
-    ```
-    String payloads remain accepted for backward compatibility and surface as a plain `Remote AI Error: ...` error.
+*   **Receive Semantics**: Error payloads are decoded into a typed `RemoteAiError`, preserving the message and error class for callers that need structured handling. String payloads are not accepted.
 
 ### 5. Final Result (Worker -> Parent)
 Upon completion, the worker outputs the final review data. This message **does not** have a `type` wrapper, allowing it to be distinct from protocol messages, or identified by specific fields (e.g., `patchset_id`).

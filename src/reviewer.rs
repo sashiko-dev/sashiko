@@ -14,7 +14,10 @@
 
 use crate::ReviewStatus;
 use crate::ai::quota::QuotaManager;
-use crate::ai::{AiProvider, AiRequest, create_provider_cached};
+use crate::ai::{
+    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
+    create_provider_cached,
+};
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, ToolUsage};
 use crate::email_policy::EmailPolicyConfig;
@@ -1678,27 +1681,19 @@ async fn run_review_tool(
                                                 break Ok(resp);
                                             }
                                             Err(e) => {
-                                                let err_str = e.to_string();
-
-                                                // Categorize and report errors to QuotaManager
-                                                if err_str.contains("Quota exceeded")
-                                                    || err_str.contains("429")
-                                                {
-                                                    quota_manager
-                                                        .report_quota_error(Duration::from_secs(60))
-                                                        .await;
-                                                    continue;
+                                                match classify_ai_error(&e) {
+                                                    AiErrorClass::RateLimit { .. } => {
+                                                        quota_manager
+                                                            .report_quota_error(Duration::from_secs(60))
+                                                            .await;
+                                                        continue;
+                                                    }
+                                                    AiErrorClass::Transient { .. } => {
+                                                        quota_manager.report_transient_error().await;
+                                                        continue;
+                                                    }
+                                                    AiErrorClass::Fatal => break Err(e),
                                                 }
-                                                if err_str.contains("Transient error")
-                                                    || err_str.contains("503")
-                                                    || err_str.contains("529")
-                                                    || err_str.contains("overloaded")
-                                                {
-                                                    quota_manager.report_transient_error().await;
-                                                    continue;
-                                                }
-
-                                                break Err(e);
                                             }
                                         }
                                     }
@@ -1769,7 +1764,10 @@ async fn run_review_tool(
                                             json!({ "type": "ai_response", "payload": p })
                                         }
                                         Err(e) => {
-                                            json!({ "type": "error", "payload": e.to_string() })
+                                            let message = e.to_string();
+                                            let class = classify_ai_error(&e);
+                                            let payload = RemoteAiErrorPayload::new(message, class);
+                                            json!({ "type": "error", "payload": payload })
                                         }
                                     };
                                     let mut reply_str = serde_json::to_string(&reply)?;
@@ -2152,6 +2150,90 @@ mod tests {
         }
     }
 
+    struct FailingProvider;
+
+    #[async_trait]
+    impl AiProvider for FailingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Err(anyhow::anyhow!("fatal provider failure"))
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    async fn run_single_ai_request_mock(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+    ) -> Result<Value> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
+
+        std::fs::write(&bin_path, mock_script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.review_tool_override = Some(bin_path);
+        settings.review.timeout_seconds = 5;
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let quota_manager = Arc::new(QuotaManager::new());
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .expect("Failed to create patchset");
+        let p_id = db
+            .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;")
+            .await?;
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await?;
+
+        run_review_tool(
+            ps_id,
+            &json!({}),
+            &settings,
+            db,
+            "HEAD",
+            Some(1),
+            None,
+            quota_manager,
+            review_id,
+            None,
+            provider,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn test_run_review_tool_concurrency() -> Result<()> {
         let temp_dir = tempdir()?;
@@ -2251,6 +2333,25 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         assert_eq!(result.unwrap()["patchset_id"], 1);
 
         child.wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_review_tool_sends_typed_fatal_error_payload() -> Result<()> {
+        let mock_script = r#"#!/bin/bash
+read -r input
+echo '{"type":"ai_request","payload":{"messages":[{"role":"user","content":"hello"}]}}'
+read -r ai_response
+if [[ "$ai_response" == *'"type":"error"'* && "$ai_response" == *'"message":"fatal provider failure"'* && "$ai_response" == *'"class":"fatal"'* ]]; then
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"typed_fatal"}]}'
+else
+    echo '{"patchset_id":1,"patches":[{"index":1,"status":"unexpected"}]}'
+fi
+"#;
+
+        let result = run_single_ai_request_mock(mock_script, Arc::new(FailingProvider)).await?;
+
+        assert_eq!(result["patches"][0]["status"], "typed_fatal");
         Ok(())
     }
 

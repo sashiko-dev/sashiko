@@ -186,7 +186,6 @@ pub(crate) struct RemoteAiErrorPayload {
 }
 
 impl RemoteAiErrorPayload {
-    #[allow(dead_code)]
     pub fn new(message: String, class: AiErrorClass) -> Self {
         Self { message, class }
     }
@@ -237,23 +236,37 @@ pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErro
     }
 }
 
+/// Classifies AI errors through typed provider and stdio error downcasts.
+pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
+    if let Some(e) = error.downcast_ref::<RemoteAiError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<openai::OpenAiCompatError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<claude::ClaudeError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
+        return e.ai_error_class();
+    }
+    AiErrorClass::Fatal
+}
+
 /// Decodes a single line of the stdio AI protocol into an [`AiResponse`].
 ///
-/// Error payloads in the legacy string form surface as
-/// `Remote AI Error: ...` for backward compatibility with older parents.
-/// Typed object payloads surface as [`RemoteAiError`].
+/// Typed error payloads surface as [`RemoteAiError`].
 pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
     let resp_msg: serde_json::Value = serde_json::from_str(line)?;
     match resp_msg["type"].as_str() {
         Some("ai_response") => Ok(serde_json::from_value(resp_msg["payload"].clone())?),
         Some("error") => {
-            let payload = &resp_msg["payload"];
-            if payload.is_object() {
-                let payload: RemoteAiErrorPayload = serde_json::from_value(payload.clone())?;
-                return Err(payload.into_error().into());
-            }
-            let err_msg = payload.as_str().unwrap_or("Unknown error");
-            bail!("Remote AI Error: {}", err_msg)
+            let payload: RemoteAiErrorPayload =
+                serde_json::from_value(resp_msg["payload"].clone())?;
+            Err(payload.into_error().into())
         }
         _ => bail!("Unexpected response type: {:?}", resp_msg["type"]),
     }
@@ -500,6 +513,8 @@ pub fn scrub_thought_signatures(val: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::prompts::ReviewError;
+    use anyhow::anyhow;
     use serde_json::json;
 
     #[test]
@@ -686,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_stdio_ai_response_legacy_string_error_payload() -> Result<()> {
+    fn test_decode_stdio_ai_response_rejects_non_object_error_payload() -> Result<()> {
         let raw_json = json!({
             "type": "error",
             "payload": "Rate limit exceeded, retry after 60s"
@@ -695,10 +710,7 @@ mod tests {
 
         let err = decode_stdio_ai_response(&serialized).unwrap_err();
 
-        assert_eq!(
-            err.to_string(),
-            "Remote AI Error: Rate limit exceeded, retry after 60s"
-        );
+        assert!(err.to_string().contains("invalid type"));
         assert!(err.downcast_ref::<RemoteAiError>().is_none());
         Ok(())
     }
@@ -757,6 +769,85 @@ mod tests {
     #[test]
     fn test_classify_status_code_other() {
         assert_eq!(classify_status_code(reqwest::StatusCode::BAD_REQUEST), None);
+    }
+
+    fn assert_ai_error_class(error: impl Into<anyhow::Error>, expected: AiErrorClass) {
+        let error = error.into();
+        assert_eq!(classify_ai_error(&error), expected);
+    }
+
+    #[test]
+    fn test_classify_ai_error_remote_rate_limit() {
+        let retry_after = Duration::from_secs(42);
+        assert_ai_error_class(
+            RemoteAiError {
+                message: "remote rate limit".to_string(),
+                class: AiErrorClass::RateLimit { retry_after },
+            },
+            AiErrorClass::RateLimit { retry_after },
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_remote_transient() {
+        let retry_after = Duration::from_secs(15);
+        assert_ai_error_class(
+            RemoteAiError {
+                message: "remote transient".to_string(),
+                class: AiErrorClass::Transient { retry_after },
+            },
+            AiErrorClass::Transient { retry_after },
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_remote_fatal() {
+        assert_ai_error_class(
+            RemoteAiError {
+                message: "remote fatal".to_string(),
+                class: AiErrorClass::Fatal,
+            },
+            AiErrorClass::Fatal,
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_provider_cascade() {
+        assert_ai_error_class(
+            openai::OpenAiCompatError::RateLimitExceeded(Duration::from_secs(7)),
+            AiErrorClass::RateLimit {
+                retry_after: Duration::from_secs(7),
+            },
+        );
+        assert_ai_error_class(
+            claude::ClaudeError::OverloadedError(Duration::from_secs(9)),
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(9),
+            },
+        );
+        assert_ai_error_class(
+            gemini::GeminiError::TransientError(Duration::from_secs(11), "busy".to_string()),
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(11),
+            },
+        );
+        assert_ai_error_class(
+            ReviewError::FormatRejection("bad response".to_string()),
+            AiErrorClass::Fatal,
+        );
+    }
+
+    #[test]
+    fn test_classify_ai_error_unrelated_error_is_fatal() {
+        assert_ai_error_class(anyhow!("totally unrelated error"), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_classify_ai_error_string_shaped_remote_error_is_fatal() {
+        assert_ai_error_class(
+            anyhow!("Remote AI Error: rate limit exceeded"),
+            AiErrorClass::Fatal,
+        );
     }
 
     #[test]

@@ -17,10 +17,9 @@ use clap::Parser;
 use futures::stream::StreamExt;
 use regex::Regex;
 use reqwest::Client;
-use sashiko::ai::claude::ClaudeError;
-use sashiko::ai::gemini::GeminiError;
-use sashiko::ai::openai::OpenAiCompatError;
-use sashiko::ai::{AiMessage, AiProvider, AiRequest, AiRole, create_provider};
+use sashiko::ai::{
+    AiErrorClass, AiMessage, AiProvider, AiRequest, AiRole, classify_ai_error, create_provider,
+};
 use sashiko::db::Database;
 use sashiko::settings::Settings;
 use serde::{Deserialize, Serialize};
@@ -556,36 +555,16 @@ async fn process_entry(
         match client.generate_content(req).await {
             Ok(r) => break r,
             Err(e) => {
-                let retry_duration =
-                    e.downcast_ref::<GeminiError>()
-                        .and_then(|err| match err {
-                            GeminiError::QuotaExceeded(d) | GeminiError::TransientError(d, _) => {
-                                Some(*d)
-                            }
-                            _ => None,
-                        })
-                        .or_else(|| {
-                            e.downcast_ref::<ClaudeError>().and_then(|err| match err {
-                                ClaudeError::RateLimitExceeded(d)
-                                | ClaudeError::OverloadedError(d) => Some(*d),
-                                _ => None,
-                            })
-                        })
-                        .or_else(|| {
-                            e.downcast_ref::<OpenAiCompatError>()
-                                .and_then(|err| match err {
-                                    OpenAiCompatError::RateLimitExceeded(d)
-                                    | OpenAiCompatError::TransientError(d, _) => Some(*d),
-                                    _ => None,
-                                })
-                        });
-
-                let duration = retry_duration.unwrap_or(std::time::Duration::from_secs(30));
+                let retry_after = match classify_ai_error(&e) {
+                    AiErrorClass::RateLimit { retry_after }
+                    | AiErrorClass::Transient { retry_after } => retry_after,
+                    AiErrorClass::Fatal => std::time::Duration::from_secs(30),
+                };
                 warn!(
                     "API error ({}), pausing for {:?} before retry...",
-                    e, duration
+                    e, retry_after
                 );
-                tokio::time::sleep(duration).await;
+                tokio::time::sleep(retry_after).await;
             }
         }
     };
