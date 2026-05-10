@@ -144,6 +144,22 @@ pub struct AiResponse {
     pub usage: Option<AiUsage>,
 }
 
+/// Decodes a single line of the stdio AI protocol into an [`AiResponse`].
+///
+/// Error payloads in the legacy string form surface as
+/// `Remote AI Error: ...` for backward compatibility with older parents.
+pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
+    let resp_msg: serde_json::Value = serde_json::from_str(line)?;
+    match resp_msg["type"].as_str() {
+        Some("ai_response") => Ok(serde_json::from_value(resp_msg["payload"].clone())?),
+        Some("error") => {
+            let err_msg = resp_msg["payload"].as_str().unwrap_or("Unknown error");
+            bail!("Remote AI Error: {}", err_msg)
+        }
+        _ => bail!("Unexpected response type: {:?}", resp_msg["type"]),
+    }
+}
+
 /// Token usage statistics for an AI interaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiUsage {
@@ -464,6 +480,23 @@ mod tests {
         assert_eq!(usage.completion_tokens, 50);
         assert_eq!(usage.total_tokens, 150);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_stdio_ai_response_legacy_string_error_payload() -> Result<()> {
+        let raw_json = json!({
+            "type": "error",
+            "payload": "Rate limit exceeded, retry after 60s"
+        });
+        let serialized = serde_json::to_string(&raw_json)?;
+
+        let err = decode_stdio_ai_response(&serialized).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Remote AI Error: Rate limit exceeded, retry after 60s"
+        );
         Ok(())
     }
 

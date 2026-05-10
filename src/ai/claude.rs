@@ -14,6 +14,7 @@
 
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
+    decode_stdio_ai_response,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -620,16 +621,7 @@ trait GenClaudeClient: Send + Sync {
                 bail!("Unexpected EOF from stdin waiting for AI response");
             }
 
-            let resp_msg: Value = serde_json::from_str(&line)?;
-            if resp_msg["type"] == "ai_response" {
-                let payload = serde_json::from_value(resp_msg["payload"].clone())?;
-                Ok(payload)
-            } else if resp_msg["type"] == "error" {
-                let err_msg = resp_msg["payload"].as_str().unwrap_or("Unknown error");
-                bail!("Remote AI Error: {}", err_msg)
-            } else {
-                bail!("Unexpected response type: {:?}", resp_msg["type"])
-            }
+            decode_stdio_ai_response(&line)
         })
         .await?
     }
