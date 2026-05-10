@@ -1688,8 +1688,10 @@ async fn run_review_tool(
                                                             .await;
                                                         continue;
                                                     }
-                                                    AiErrorClass::Transient { .. } => {
-                                                        quota_manager.report_transient_error().await;
+                                                    AiErrorClass::Transient { retry_after } => {
+                                                        quota_manager
+                                                            .report_transient_error(retry_after)
+                                                            .await;
                                                         continue;
                                                     }
                                                     AiErrorClass::Fatal => break Err(e),

@@ -48,8 +48,11 @@ pub async fn handle_generate(
                         state.quota_manager.report_quota_error(retry_after).await;
                         continue;
                     }
-                    AiErrorClass::Transient { .. } => {
-                        state.quota_manager.report_transient_error().await;
+                    AiErrorClass::Transient { retry_after } => {
+                        state
+                            .quota_manager
+                            .report_transient_error(retry_after)
+                            .await;
                         continue;
                     }
                     AiErrorClass::Fatal => {}

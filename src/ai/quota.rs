@@ -96,14 +96,15 @@ impl QuotaManager {
         );
     }
 
-    pub async fn report_transient_error(&self) {
+    pub async fn report_transient_error(&self, retry_after: Duration) {
+        let retry_after = retry_after.min(MAX_RETRY_AFTER);
         let mut count_guard = self.consecutive_transient_errors.lock().await;
         *count_guard += 1;
         let count = *count_guard;
 
         // Exponential backoff: 1s, 2s, 4s, 8s... capped at 60s
         let backoff_secs = (1.0 * (2.0_f64.powi((count - 1) as i32))).min(60.0);
-        let backoff = Duration::from_secs_f64(backoff_secs);
+        let backoff = Duration::from_secs_f64(backoff_secs).max(retry_after);
 
         let mut block_guard = self.blocked_until.lock().await;
         let resume_time = Instant::now() + backoff;
@@ -118,7 +119,8 @@ impl QuotaManager {
 
         warn!(
             "AI provider transient error (streak: {}). Globally backing off for {:.2}s",
-            count, backoff_secs
+            count,
+            backoff.as_secs_f64()
         );
     }
 }
