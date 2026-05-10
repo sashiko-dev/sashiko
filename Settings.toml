@@ -42,6 +42,12 @@ temperature = 1.0
 # max_input_tokens = 40000
 # max_interactions = 150
 
+# To use GitHub Copilot CLI (subscription auth, no API key needed):
+# provider = "copilot-cli"
+# model = "claude-sonnet-4.5"
+# max_input_tokens = 40000
+# max_interactions = 150
+
 # To use Claude via Google Cloud Vertex AI (requires --features vertex):
 # provider = "vertex"
 # model = "claude-sonnet-4-6"

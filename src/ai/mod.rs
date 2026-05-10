@@ -314,6 +314,9 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: settings.ai.model.clone(),
         })),
+        "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
+            model: settings.ai.model.clone(),
+        })),
         #[cfg(feature = "vertex")]
         "vertex" => {
             let model = settings.ai.model.clone();
@@ -354,6 +357,7 @@ pub mod cache;
 pub mod claude;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod copilot_cli;
 pub mod gemini;
 pub mod openai;
 pub mod proxy;
