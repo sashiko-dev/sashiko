@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
 pub struct QuotaManager {
     // Stores the time when we can resume making requests.
     // If None or in the past, we are free to go.
@@ -76,6 +78,7 @@ impl QuotaManager {
     }
 
     pub async fn report_quota_error(&self, retry_after: Duration) {
+        let retry_after = retry_after.min(MAX_RETRY_AFTER);
         let mut guard = self.blocked_until.lock().await;
         let resume_time = Instant::now() + retry_after;
 
