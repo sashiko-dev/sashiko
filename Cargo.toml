@@ -37,6 +37,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 aws-sdk-bedrockruntime = { version = "1", optional = true }
 aws-smithy-types = { version = "1", optional = true }
 axum = "0.8.9"
+bytes = "1.9"
 chrono = "0.4.43"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 config = "0.15.23"
