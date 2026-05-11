@@ -15,10 +15,9 @@
 use crate::db::Database;
 use crate::events::Event;
 use crate::fetcher::FetchRequest;
-use crate::settings::ServerSettings;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Redirect},
@@ -30,7 +29,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -124,9 +123,11 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
 }
 
 pub struct AppState {
+    pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
     pub sender: mpsc::Sender<Event>,
     pub fetch_sender: mpsc::Sender<FetchRequest>,
+    pub forge_registry: Arc<crate::forge::ForgeRegistry>,
     pub read_only: bool,
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
@@ -256,19 +257,24 @@ async fn redirect_www(req: Request, next: Next) -> impl IntoResponse {
 /// Extracted from [`run_server`] so that integration tests can construct the
 /// router independently (e.g. bind to port 0 for random-port testing).
 pub fn build_router(
+    settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
-    read_only: bool,
     allow_all_submit: bool,
     smtp_enabled: bool,
     dry_run: bool,
 ) -> Router {
+    let forge_registry = Arc::new(crate::forge::ForgeRegistry::new());
+    let read_only = settings.server.read_only;
+
     let state = Arc::new(AppState {
+        settings: settings.clone(),
         db,
         sender,
         fetch_sender,
         read_only,
+        forge_registry,
         allow_all_submit,
         smtp_enabled,
         dry_run,
@@ -282,6 +288,7 @@ pub fn build_router(
     });
 
     Router::new()
+        .route("/api/config", get(get_config))
         .route("/api/lists", get(list_mailing_lists))
         .route("/api/patchsets", get(list_patchsets))
         .route("/api/messages", get(list_messages))
@@ -298,6 +305,7 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
+        .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
         .layer(middleware::from_fn(redirect_www))
@@ -305,7 +313,7 @@ pub fn build_router(
 }
 
 pub async fn run_server(
-    settings: ServerSettings,
+    settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
@@ -314,16 +322,16 @@ pub async fn run_server(
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(
+        settings.clone(),
         db,
         sender,
         fetch_sender,
-        settings.read_only,
         allow_all_submit,
         smtp_enabled,
         dry_run,
     );
 
-    let bind_addr = format!("{}:{}", settings.host, settings.port);
+    let bind_addr = format!("{}:{}", settings.server.host, settings.server.port);
     let addrs: Vec<SocketAddr> = bind_addr
         .to_socket_addrs()
         .map_err(|e| anyhow::anyhow!("invalid bind address '{}': {}", bind_addr, e))?
@@ -446,6 +454,9 @@ async fn submit_patch(
             let req = FetchRequest {
                 repo_url: repo,
                 commit_hash: sha,
+                mr_url: None,
+                mr_title: None,
+                mr_number: None,
             };
 
             if let Err(e) = state.fetch_sender.send(req).await {
@@ -702,6 +713,12 @@ async fn get_patchset(
         state
             .db
             .get_patchset_details(id_val, query.page, query.per_page)
+            .await
+    } else if query.id.contains('-') && !query.id.contains('@') {
+        info!("Fetching details for patchset slug: {}", query.id);
+        state
+            .db
+            .get_patchset_details_by_slug(&query.id, query.page, query.per_page)
             .await
     } else {
         info!("Fetching details for patchset msgid: {}", query.id);
@@ -1058,4 +1075,94 @@ async fn rerun_patch(
         })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+async fn get_config(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({
+        "project_name": state.settings.project.name,
+        "project_description": state.settings.project.description,
+        "forge_enabled": state.settings.forge.enabled,
+    })))
+}
+
+async fn forge_webhook(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+        info!("Refused {} webhook from non-localhost: {}", provider, addr);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let forge = state.forge_registry.get(&provider).ok_or_else(|| {
+        warn!("Unknown forge provider: {}", provider);
+        StatusCode::NOT_FOUND
+    })?;
+
+    forge.validate_event(&headers)?;
+
+    let (action, metadata) = forge.parse_payload(&body)?;
+
+    info!(
+        "{} {}: {} - {}",
+        forge.name(),
+        action,
+        metadata.pr_title.as_deref().unwrap_or("(no title)"),
+        metadata.pr_url.as_deref().unwrap_or("(no url)")
+    );
+
+    let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
+    let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
+
+    let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
+    let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
+
+    let slug = metadata.pr_url.as_ref().map(|url| {
+        let repo = crate::forge::extract_repo_name_from_url(url);
+        format!("{}-{}", repo, metadata.pr_number)
+    });
+
+    state
+        .db
+        .create_fetching_patchset(
+            &placeholder_id,
+            &format!("Fetching {} PR/MR: {}", forge.name(), subject),
+            None,
+            None,
+            metadata.pr_url.as_deref(),
+            Some(subject),
+            Some(metadata.pr_number),
+            slug.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to create placeholder patchset: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let req = FetchRequest {
+        repo_url: metadata.repo_url,
+        commit_hash: commit_range,
+        mr_url: metadata.pr_url,
+        mr_title: metadata.pr_title,
+        mr_number: Some(metadata.pr_number),
+    };
+
+    state.fetch_sender.send(req).await.map_err(|e| {
+        error!("Failed to send fetch request to queue: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "accepted",
+        "message": format!("{} {} queued for review", forge.name(), action)
+    })))
 }

@@ -11,9 +11,53 @@ use sashiko::api::build_router;
 use sashiko::db::Database;
 use sashiko::events::Event;
 use sashiko::fetcher::FetchRequest;
-use sashiko::settings::DatabaseSettings;
+use sashiko::settings::{DatabaseSettings, Settings};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+
+/// Build a minimal [`Settings`] for integration tests.
+///
+/// The `read_only` flag on `server` is set from the parameter; all other
+/// fields use harmless defaults that don't require external resources.
+fn test_settings(read_only: bool) -> Settings {
+    let toml = format!(
+        r#"
+[database]
+url = ":memory:"
+token = ""
+
+[nntp]
+server = "localhost"
+port = 119
+
+[mailing_lists]
+track = []
+
+[ai]
+provider = "gemini"
+model = "test"
+
+[server]
+host = "127.0.0.1"
+port = 0
+read_only = {read_only}
+
+[git]
+repository_path = "."
+
+[review]
+concurrency = 1
+worktree_dir = "/tmp/sashiko-test-trees"
+timeout_seconds = 60
+"#
+    );
+    let cfg = config::Config::builder()
+        .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+        .build()
+        .expect("test settings parse");
+    cfg.try_deserialize::<Settings>()
+        .expect("test settings deserialize")
+}
 
 /// A running test server instance with its base URL and background handles.
 struct TestServer {
@@ -41,11 +85,12 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
     let (event_tx, event_rx) = mpsc::channel::<Event>(100);
     let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(100);
 
+    let settings = Arc::new(test_settings(read_only));
     let app = build_router(
+        settings,
         Arc::clone(&db),
         event_tx,
         fetch_tx,
-        read_only,
         /* allow_all_submit */ true,
         /* smtp_enabled */ false,
         /* dry_run */ true,

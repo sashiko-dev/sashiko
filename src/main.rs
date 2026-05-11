@@ -494,7 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start Web API
-    let api_settings = settings.server.clone();
+    let api_settings = Arc::new(settings.clone());
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
