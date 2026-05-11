@@ -446,6 +446,34 @@ pub fn translate_ai_request(
             .collect()
     });
 
+    // Handle response format by appending instructions to the system prompt
+    // since Claude API doesn't support it natively.
+    if let Some(format) = &request.response_format {
+        match format {
+            crate::ai::AiResponseFormat::Json { schema } => {
+                let instruction = if let Some(schema) = schema {
+                    format!(
+                        "\n\nYou MUST respond with ONLY a JSON object matching this schema: {}\nNo other text before or after the JSON.",
+                        serde_json::to_string(schema).unwrap_or_default()
+                    )
+                } else {
+                    "\n\nYou MUST respond with ONLY a JSON object.\nNo other text before or after the JSON.".to_string()
+                };
+
+                if let Some(last_sys) = system_blocks.last_mut() {
+                    last_sys.text.push_str(&instruction);
+                } else {
+                    system_blocks.push(SystemBlock {
+                        block_type: "text".to_string(),
+                        text: instruction.trim().to_string(),
+                        cache_control: None,
+                    });
+                }
+            }
+            crate::ai::AiResponseFormat::Text => {}
+        }
+    }
+
     // Build the request
     let mut claude_request = ClaudeRequest {
         model: String::new(), // Will be set by the client
@@ -1143,7 +1171,24 @@ mod tests {
         Ok(())
     }
 
-    // --- Cache control tests ---
+    #[test]
+    fn test_translate_request_json_format() -> Result<()> {
+        let mut req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        req.response_format = Some(crate::ai::AiResponseFormat::Json { schema: None });
+
+        let claude_req = translate_ai_request(&req, false, 4096, None, None)?;
+        let sys = claude_req.system.unwrap();
+        assert!(sys[0].text.contains("MUST respond with ONLY a JSON object"));
+
+        Ok(())
+    }
 
     #[test]
     fn test_cache_control_applied() -> Result<()> {

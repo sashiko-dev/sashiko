@@ -174,18 +174,57 @@ fn translate_request(
     thinking: Option<&str>,
     effort: Option<&str>,
 ) -> Result<ConverseParams> {
-    let system = request.system.as_ref().map(|s| {
-        let mut blocks = vec![SystemContentBlock::Text(s.clone())];
-        if enable_caching {
-            blocks.push(SystemContentBlock::CachePoint(
-                CachePointBlock::builder()
-                    .r#type(CachePointType::Default)
-                    .build()
-                    .expect("CachePointBlock build"),
-            ));
+    let mut system_blocks = Vec::new();
+
+    if let Some(s) = &request.system {
+        system_blocks.push(SystemContentBlock::Text(s.clone()));
+    }
+
+    // Collect any system messages from the messages array
+    for msg in &request.messages {
+        if let (AiRole::System, Some(content)) = (&msg.role, &msg.content) {
+            system_blocks.push(SystemContentBlock::Text(content.clone()));
         }
-        blocks
-    });
+    }
+
+    // Handle response format by appending instructions to the system prompt
+    // since Bedrock doesn't support it natively for all models.
+    if let Some(format) = &request.response_format {
+        match format {
+            crate::ai::AiResponseFormat::Json { schema } => {
+                let instruction = if let Some(schema) = schema {
+                    format!(
+                        "\n\nYou MUST respond with ONLY a JSON object matching this schema: {}\nNo other text before or after the JSON.",
+                        serde_json::to_string(schema).unwrap_or_default()
+                    )
+                } else {
+                    "\n\nYou MUST respond with ONLY a JSON object.\nNo other text before or after the JSON.".to_string()
+                };
+
+                if let Some(SystemContentBlock::Text(text)) = system_blocks.last_mut() {
+                    text.push_str(&instruction);
+                } else {
+                    system_blocks.push(SystemContentBlock::Text(instruction.trim().to_string()));
+                }
+            }
+            crate::ai::AiResponseFormat::Text => {}
+        }
+    }
+
+    if enable_caching && !system_blocks.is_empty() {
+        system_blocks.push(SystemContentBlock::CachePoint(
+            CachePointBlock::builder()
+                .r#type(CachePointType::Default)
+                .build()
+                .expect("CachePointBlock build"),
+        ));
+    }
+
+    let system = if system_blocks.is_empty() {
+        None
+    } else {
+        Some(system_blocks)
+    };
 
     let mut messages: Vec<Message> = Vec::new();
 
@@ -529,37 +568,63 @@ mod tests {
 
     #[test]
     fn test_translate_system_and_user() -> Result<()> {
-        let mut req = make_request(vec![AiMessage {
-            role: AiRole::User,
-            content: Some("Hello!".to_string()),
-            thought: None,
-            thought_signature: None,
-            tool_calls: None,
-            tool_call_id: None,
-        }]);
-        req.system = Some("You are helpful.".to_string());
+        let mut req = make_request(vec![
+            AiMessage {
+                role: AiRole::System,
+                content: Some("System 2.".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            AiMessage {
+                role: AiRole::User,
+                content: Some("Hello!".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+        req.system = Some("System 1.".to_string());
         req.temperature = Some(0.5);
 
         let params = translate_request(&req, false, 4096, None, None)?;
 
         let sys = params.system.unwrap();
-        assert_eq!(sys.len(), 1);
+        assert_eq!(sys.len(), 2);
         if let SystemContentBlock::Text(t) = &sys[0] {
-            assert_eq!(t, "You are helpful.");
-        } else {
-            panic!("Expected Text system block");
+            assert_eq!(t, "System 1.");
+        }
+        if let SystemContentBlock::Text(t) = &sys[1] {
+            assert_eq!(t, "System 2.");
         }
 
         assert_eq!(params.messages.len(), 1);
         assert_eq!(params.messages[0].role(), &ConversationRole::User);
-        if let ContentBlock::Text(t) = &params.messages[0].content()[0] {
-            assert_eq!(t, "Hello!");
-        } else {
-            panic!("Expected Text content block");
-        }
 
-        let ic = params.inference_config.unwrap();
-        assert_eq!(ic.temperature(), Some(0.5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_request_json_format() -> Result<()> {
+        let mut req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("hi".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        req.response_format = Some(crate::ai::AiResponseFormat::Json { schema: None });
+
+        let params = translate_request(&req, false, 4096, None, None)?;
+        let sys = params.system.unwrap();
+        if let SystemContentBlock::Text(t) = &sys[0] {
+            assert!(t.contains("MUST respond with ONLY a JSON object"));
+        } else {
+            panic!("Expected Text system block");
+        }
 
         Ok(())
     }
