@@ -432,6 +432,10 @@ async fn submit_patch(
                     &format!("Fetching {} from {}...", &sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .await
             {
@@ -468,6 +472,10 @@ async fn submit_patch(
                 .create_fetching_patchset(
                     &clean_msgid,
                     &format!("Fetching thread {}...", clean_msgid),
+                    None,
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                 )

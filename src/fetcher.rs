@@ -436,6 +436,9 @@ impl FetchAgent {
             timestamp: meta.timestamp,
             index,
             total,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
         })
     }
 }
