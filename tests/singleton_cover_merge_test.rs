@@ -80,7 +80,7 @@ async fn test_cover_letter_merges_into_singleton() {
 
     // Verify state
     let d1 = db
-        .get_patchset_details(ps_id_1, None, None)
+        .get_patchset_details(ps_id_1, None, None, false)
         .await
         .unwrap()
         .unwrap();
@@ -136,7 +136,7 @@ async fn test_cover_letter_merges_into_singleton() {
 
     // Verify state
     let d2 = db
-        .get_patchset_details(ps_id_1, None, None)
+        .get_patchset_details(ps_id_1, None, None, false)
         .await
         .unwrap()
         .unwrap();

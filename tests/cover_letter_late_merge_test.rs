@@ -126,7 +126,7 @@ async fn test_cover_letter_merges_into_full_patchset() {
 
     // Verify it is full
     let details = db
-        .get_patchset_details(ps_id, None, None)
+        .get_patchset_details(ps_id, None, None, false)
         .await
         .unwrap()
         .unwrap();
@@ -183,7 +183,7 @@ async fn test_cover_letter_merges_into_full_patchset() {
 
     // Verify cover letter ID was updated
     let details_updated = db
-        .get_patchset_details(ps_id, None, None)
+        .get_patchset_details(ps_id, None, None, false)
         .await
         .unwrap()
         .unwrap();

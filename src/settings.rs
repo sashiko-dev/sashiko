@@ -245,6 +245,13 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default)]
     pub read_only: bool,
+    /// Static secret tokens that let a client see embargoed patchset
+    /// details immediately. Passed as `Authorization: Bearer <token>` or
+    /// `?token=<token>`. Multiple tokens may be active at once for easy
+    /// rotation. Only use over HTTPS — tokens in query strings leak into
+    /// logs and referrers.
+    #[serde(default)]
+    pub embargo_bypass_tokens: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

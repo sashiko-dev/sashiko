@@ -113,7 +113,7 @@ async fn test_singleton_root_overwrite_prevention() {
 
     // 3. Verify Total Parts
     let details = db
-        .get_patchset_details(ps_id, None, None)
+        .get_patchset_details(ps_id, None, None, false)
         .await
         .unwrap()
         .unwrap();

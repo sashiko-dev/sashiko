@@ -179,7 +179,7 @@ async fn test_findings_sum_across_patches() {
     .unwrap();
 
     // 7. Get patchsets and verify findings counts
-    let patchsets = db.get_patchsets(10, 0, None, None).await.unwrap();
+    let patchsets = db.get_patchsets(10, 0, None, None, false).await.unwrap();
     assert_eq!(patchsets.len(), 1);
 
     let ps = &patchsets[0];
