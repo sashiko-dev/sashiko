@@ -154,7 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize FetchAgent
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-    let (fetch_agent, fetch_tx) = sashiko::fetcher::FetchAgent::new(repo_path, raw_tx.clone());
+    let (fetch_agent, fetch_tx) = sashiko::fetcher::FetchAgent::new(
+        repo_path,
+        raw_tx.clone(),
+        settings.forge.api_token.clone(),
+    );
 
     // Spawn FetchAgent
     tokio::spawn(async move {

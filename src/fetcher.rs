@@ -36,12 +36,16 @@ pub struct FetchAgent {
     repo_path: PathBuf,
     rx: mpsc::Receiver<FetchRequest>,
     main_tx: mpsc::Sender<Event>,
+    #[allow(clippy::type_complexity)]
+    mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
+    gitlab_token: Option<String>,
 }
 
 impl FetchAgent {
     pub fn new(
         repo_path: PathBuf,
         main_tx: mpsc::Sender<Event>,
+        gitlab_token: Option<String>,
     ) -> (Self, mpsc::Sender<FetchRequest>) {
         let (tx, rx) = mpsc::channel(100);
         (
@@ -49,6 +53,8 @@ impl FetchAgent {
                 repo_path,
                 rx,
                 main_tx,
+                mr_metadata: HashMap::new(),
+                gitlab_token,
             },
             tx,
         )
@@ -62,6 +68,12 @@ impl FetchAgent {
         loop {
             tokio::select! {
                 Some(req) = self.rx.recv() => {
+                    if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
+                        self.mr_metadata.insert(
+                            req.commit_hash.clone(),
+                            (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
+                        );
+                    }
                     queue.entry(req.repo_url)
                         .or_default()
                         .insert(req.commit_hash);
@@ -92,9 +104,22 @@ impl FetchAgent {
                 url_display
             );
 
-            // Check existence first
+            // For ranges (base..head), we need to check both endpoints individually
+            let mut commits_to_check = Vec::new();
+            for commit_or_range in &commit_list {
+                if commit_or_range.contains("..") {
+                    let parts: Vec<&str> = commit_or_range.split("..").collect();
+                    if parts.len() == 2 {
+                        commits_to_check.push(parts[0].to_string());
+                        commits_to_check.push(parts[1].to_string());
+                    }
+                } else {
+                    commits_to_check.push(commit_or_range.clone());
+                }
+            }
+
             let mut missing_commits = Vec::new();
-            for commit in &commit_list {
+            for commit in &commits_to_check {
                 if !self.is_present(commit).await {
                     missing_commits.push(commit.clone());
                 }
@@ -196,8 +221,31 @@ impl FetchAgent {
                     let count = shas.len() as u32;
 
                     // Process each SHA
+                    let (mr_url, mr_title, mr_number) = self
+                        .mr_metadata
+                        .get(range)
+                        .cloned()
+                        .unwrap_or((None, None, None));
+
+                    let article_id = if let Some(number) = mr_number {
+                        format!("mr-{}-{}", number, range)
+                    } else {
+                        range.to_string()
+                    };
+
                     for (i, sha) in shas.iter().enumerate() {
-                        match self.extract_patch(sha, range, (i + 1) as u32, count).await {
+                        match self
+                            .extract_patch(
+                                sha,
+                                &article_id,
+                                (i + 1) as u32,
+                                count,
+                                mr_url.as_ref(),
+                                mr_title.as_ref(),
+                                mr_number,
+                            )
+                            .await
+                        {
                             Ok(mut event) => {
                                 if let Event::PatchSubmitted {
                                     ref mut message_id, ..
@@ -234,7 +282,30 @@ impl FetchAgent {
                         }
                     };
 
-                    match self.extract_patch(&full_sha, &commit_or_range, 1, 1).await {
+                    let (mr_url, mr_title, mr_number) = self
+                        .mr_metadata
+                        .get(&commit_or_range)
+                        .cloned()
+                        .unwrap_or((None, None, None));
+
+                    let article_id = if let Some(number) = mr_number {
+                        format!("mr-{}-{}", number, &commit_or_range)
+                    } else {
+                        commit_or_range.clone()
+                    };
+
+                    match self
+                        .extract_patch(
+                            &full_sha,
+                            &article_id,
+                            1,
+                            1,
+                            mr_url.as_ref(),
+                            mr_title.as_ref(),
+                            mr_number,
+                        )
+                        .await
+                    {
                         Ok(mut event) => {
                             if let Event::PatchSubmitted {
                                 ref mut message_id, ..
@@ -275,9 +346,21 @@ impl FetchAgent {
     }
 
     async fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
+        // Inject GitLab token if available
+        let authenticated_url = if let Some(token) = &self.gitlab_token {
+            if url.contains("gitlab.com") && url.starts_with("https://") {
+                url.replace("https://", &format!("https://oauth2:{}@", token))
+            } else {
+                url.to_string()
+            }
+        } else {
+            url.to_string()
+        };
+
         // Check if remote exists
         let status = Command::new("git")
             .current_dir(&self.repo_path)
+            .args(["-c", "safe.bareRepository=all"])
             .args(["remote", "get-url", name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -285,32 +368,38 @@ impl FetchAgent {
             .await?;
 
         if status.success() {
-            // Check if URL matches, if not update it
             let output = Command::new("git")
                 .current_dir(&self.repo_path)
+                .args(["-c", "safe.bareRepository=all"])
                 .args(["remote", "get-url", name])
                 .output()
                 .await?;
             let current_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-            if current_url != url {
+            if current_url != authenticated_url {
                 info!(
                     "Updating remote {} from {} to {}",
                     name,
                     redact_secret(&current_url),
-                    redact_secret(url)
+                    redact_secret(&authenticated_url)
                 );
                 Command::new("git")
                     .current_dir(&self.repo_path)
-                    .args(["remote", "set-url", name, url])
+                    .args(["-c", "safe.bareRepository=all"])
+                    .args(["remote", "set-url", name, &authenticated_url])
                     .output()
                     .await?;
             }
         } else {
-            info!("Adding remote {} -> {}", name, redact_secret(url));
+            info!(
+                "Adding remote {} -> {}",
+                name,
+                redact_secret(&authenticated_url)
+            );
             let output = Command::new("git")
                 .current_dir(&self.repo_path)
-                .args(["remote", "add", name, url])
+                .args(["-c", "safe.bareRepository=all"])
+                .args(["remote", "add", name, &authenticated_url])
                 .output()
                 .await?;
 
@@ -363,15 +452,15 @@ impl FetchAgent {
     }
 
     async fn is_present(&self, commit_or_range: &str) -> bool {
+        let mut args = vec!["-c", "safe.bareRepository=all"];
         let arg_str: String;
-        let args = if let Some((start, end)) = commit_or_range.split_once("..") {
-            // For ranges, ensure both endpoints are commits
+
+        if let Some((start, end)) = commit_or_range.split_once("..") {
             arg_str = format!("{}^{{commit}}..{}^{{commit}}", start, end);
-            vec!["rev-list", "-n", "1", &arg_str]
+            args.extend(["rev-list", "-n", "1", &arg_str]);
         } else {
-            // For single commits, ensure it is a valid commit object
             arg_str = format!("{}^{{commit}}", commit_or_range);
-            vec!["rev-parse", "--verify", &arg_str]
+            args.extend(["rev-parse", "--verify", &arg_str]);
         };
 
         let output = Command::new("git")
@@ -404,6 +493,7 @@ impl FetchAgent {
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
         let output = Command::new("git")
             .current_dir(&self.repo_path)
+            .args(["-c", "safe.bareRepository=all"])
             .args(["rev-parse", "--verify", commit])
             .output()
             .await?;
@@ -418,12 +508,16 @@ impl FetchAgent {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn extract_patch(
         &self,
         commit: &str,
         article_id: &str,
         index: u32,
         total: u32,
+        mr_url: Option<&String>,
+        mr_title: Option<&String>,
+        mr_number: Option<i64>,
     ) -> Result<Event> {
         let meta = crate::git_ops::extract_patch_metadata(&self.repo_path, commit).await?;
 
@@ -439,9 +533,9 @@ impl FetchAgent {
             timestamp: meta.timestamp,
             index,
             total,
-            mr_url: None,
-            mr_title: None,
-            mr_number: None,
+            mr_url: mr_url.cloned(),
+            mr_title: mr_title.cloned(),
+            mr_number,
         })
     }
 }
@@ -456,7 +550,7 @@ mod tests {
     async fn test_fetch_agent_lifecycle() {
         let (tx, _rx) = mpsc::channel(1);
         let repo_path = PathBuf::from("/tmp");
-        let (_agent, _sender) = FetchAgent::new(repo_path, tx);
+        let (_agent, _sender) = FetchAgent::new(repo_path, tx, None);
     }
 
     #[tokio::test]
@@ -497,7 +591,7 @@ mod tests {
             .await?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx);
+        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
 
         let output = Command::new("git")
             .current_dir(&repo_path)
@@ -506,7 +600,9 @@ mod tests {
             .await?;
         let head = String::from_utf8(output.stdout)?.trim().to_string();
 
-        let event = agent.extract_patch(&head, &head, 1, 1).await?;
+        let event = agent
+            .extract_patch(&head, &head, 1, 1, None, None, None)
+            .await?;
 
         match event {
             Event::PatchSubmitted {
@@ -567,7 +663,7 @@ mod tests {
             .await?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx);
+        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
 
         let output = Command::new("git")
             .current_dir(&repo_path)
