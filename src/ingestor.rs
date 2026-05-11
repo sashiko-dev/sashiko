@@ -375,7 +375,13 @@ impl Ingestor {
             let group_name = &group_name;
             self.db.ensure_mailing_list(&name, group_name).await?;
 
-            let info = client.group(group_name).await?;
+            let info = match client.group(group_name).await {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Failed to select group {}: {}", group_name, e);
+                    continue;
+                }
+            };
             let last_known = self.db.get_last_article_num(group_name).await?;
 
             info!(
