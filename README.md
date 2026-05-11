@@ -125,116 +125,116 @@ gemini skills install ./skills/sashiko-feature.skill --scope workspace
 
 For users of other agent interfaces (e.g., OpenCode, Claude Code), we recommend following your interface's specific settings to symlink or copy the skill configurations (the `SKILL.md` and `references/` files) into your agent's custom instruction path.
 
-    You can also configure settings via environment variables using the `SASHIKO` prefix and double underscores for nesting (e.g., `SASHIKO_AI__PROVIDER=gemini`).
+You can also configure settings via environment variables using the `SASHIKO` prefix and double underscores for nesting (e.g., `SASHIKO_AI__PROVIDER=gemini`).
 
-    **Important**: You must set the `LLM_API_KEY` environment variable with your provider's API key.
-    ```bash
-    export LLM_API_KEY="your_api_key_here"
-    ```
+**Important**: You must set the `LLM_API_KEY` environment variable with your provider's API key.
+```bash
+export LLM_API_KEY="your_api_key_here"
+```
 
-    ### Claude Setup
+### Claude Setup
 
-    Sashiko supports Anthropic's Claude models via the Claude API.
+Sashiko supports Anthropic's Claude models via the Claude API.
 
-    **Get an API key**: https://console.anthropic.com/
+**Get an API key**: https://console.anthropic.com/
 
-    **Configure environment**:
-    ```bash
-    export ANTHROPIC_API_KEY="sk-ant-..."
-    # Or use the generic key (LLM_API_KEY serves as fallback):
-    export LLM_API_KEY="sk-ant-..."
-    ```
+**Configure environment**:
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+# Or use the generic key (LLM_API_KEY serves as fallback):
+export LLM_API_KEY="sk-ant-..."
+```
 
-    **Update Settings.toml**:
-    ```toml
-    [ai]
-    provider = "claude"
-    model = "claude-sonnet-4-6"
-    max_input_tokens = 40000
+**Update Settings.toml**:
+```toml
+[ai]
+provider = "claude"
+model = "claude-sonnet-4-6"
+max_input_tokens = 40000
 
-    [ai.claude]
-    prompt_caching = true
-    # thinking = "enabled"    # Optional: enable extended thinking
-    # effort = "high"         # Optional: thinking effort level
-    ```
+[ai.claude]
+prompt_caching = true
+# thinking = "enabled"    # Optional: enable extended thinking
+# effort = "high"         # Optional: thinking effort level
+```
 
-    **Features**:
-    - Automatic prompt caching (5-minute TTL) reduces costs for repeated context
-    - Full tool/function calling support for git operations
-    - Automatic retry logic for rate limits and API overload
-    - 200K context window for Claude models (use max_input_tokens = 40000 for cost-conscious defaults)
-    - Extended thinking support via `thinking` and `effort` settings
+**Features**:
+- Automatic prompt caching (5-minute TTL) reduces costs for repeated context
+- Full tool/function calling support for git operations
+- Automatic retry logic for rate limits and API overload
+- 200K context window for Claude models (use max_input_tokens = 40000 for cost-conscious defaults)
+- Extended thinking support via `thinking` and `effort` settings
 
-    ### AWS Bedrock Setup
+### AWS Bedrock Setup
 
-    Sashiko supports AWS Bedrock via the Converse API, which works with any Bedrock-hosted model (Claude, Llama, Mistral, etc.).
+Sashiko supports AWS Bedrock via the Converse API, which works with any Bedrock-hosted model (Claude, Llama, Mistral, etc.).
 
-    **Prerequisites**: Enable model access in the [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your desired model and region.
+**Prerequisites**: Enable model access in the [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your desired model and region.
 
-    **Configure AWS credentials** using any standard method:
-    ```bash
-    # Option 1: Environment variables
-    export AWS_ACCESS_KEY_ID="..."
-    export AWS_SECRET_ACCESS_KEY="..."
-    export AWS_REGION="us-east-1"
+**Configure AWS credentials** using any standard method:
+```bash
+# Option 1: Environment variables
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-east-1"
 
-    # Option 2: AWS CLI profile (~/.aws/credentials)
-    aws configure
-    ```
+# Option 2: AWS CLI profile (~/.aws/credentials)
+aws configure
+```
 
-    **Update Settings.toml**:
-    ```toml
-    [ai]
-    provider = "bedrock"
-    model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
-    max_input_tokens = 40000
+**Update Settings.toml**:
+```toml
+[ai]
+provider = "bedrock"
+model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
+max_input_tokens = 40000
 
-    [ai.bedrock]
-    region = "us-east-1"  # Optional, falls back to AWS SDK defaults
-    ```
+[ai.bedrock]
+region = "us-east-1"  # Optional, falls back to AWS SDK defaults
+```
 
-    **Features**:
-    - Uses the Converse API — works with any Bedrock-hosted model
-    - No API key needed — uses standard AWS IAM authentication
-    - Supports cross-region inference profiles (e.g., `us.anthropic.claude-*`)
-    - Full tool/function calling support for git operations
+**Features**:
+- Uses the Converse API — works with any Bedrock-hosted model
+- No API key needed — uses standard AWS IAM authentication
+- Supports cross-region inference profiles (e.g., `us.anthropic.claude-*`)
+- Full tool/function calling support for git operations
 
-    ### Google Cloud Vertex AI Setup
+### Google Cloud Vertex AI Setup
 
-    Sashiko supports Google Cloud Vertex AI, which provides access to Claude models (and potentially other model families) via Google Cloud infrastructure. Build with `--features vertex`.
+Sashiko supports Google Cloud Vertex AI, which provides access to Claude models (and potentially other model families) via Google Cloud infrastructure. Build with `--features vertex`.
 
-    **Prerequisites**: Enable the Vertex AI API and model access in the [Vertex AI Model Garden](https://cloud.google.com/model-garden) for your desired model and region.
+**Prerequisites**: Enable the Vertex AI API and model access in the [Vertex AI Model Garden](https://cloud.google.com/model-garden) for your desired model and region.
 
-    **Configure GCP credentials**:
-    ```bash
-    gcloud auth application-default login
-    ```
+**Configure GCP credentials**:
+```bash
+gcloud auth application-default login
+```
 
-    **Configure environment**:
-    ```bash
-    export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"
-    export CLOUD_ML_REGION="us-east5"  # or "global" for global endpoints
-    ```
+**Configure environment**:
+```bash
+export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"
+export CLOUD_ML_REGION="us-east5"  # or "global" for global endpoints
+```
 
-    **Update Settings.toml**:
-    ```toml
-    [ai]
-    provider = "vertex"
-    model = "claude-sonnet-4-6"
-    max_input_tokens = 40000
+**Update Settings.toml**:
+```toml
+[ai]
+provider = "vertex"
+model = "claude-sonnet-4-6"
+max_input_tokens = 40000
 
-    [ai.vertex]
-    prompt_caching = true
-    # project_id = "my-gcp-project"  # Falls back to ANTHROPIC_VERTEX_PROJECT_ID
-    # region = "us-east5"            # Falls back to CLOUD_ML_REGION
-    ```
+[ai.vertex]
+prompt_caching = true
+# project_id = "my-gcp-project"  # Falls back to ANTHROPIC_VERTEX_PROJECT_ID
+# region = "us-east5"            # Falls back to CLOUD_ML_REGION
+```
 
-    **Features**:
-    - Model-agnostic routing layer — currently supports Claude, extensible to other model families
-    - No API key needed — uses Google Cloud Application Default Credentials (ADC)
-    - Supports global, multi-region, and regional endpoints
-    - 1M context window for Claude Opus 4.7/4.6 and Sonnet 4.6 on Vertex
-    - Full tool/function calling and prompt caching support
+**Features**:
+- Model-agnostic routing layer — currently supports Claude, extensible to other model families
+- No API key needed — uses Google Cloud Application Default Credentials (ADC)
+- Supports global, multi-region, and regional endpoints
+- 1M context window for Claude Opus 4.7/4.6 and Sonnet 4.6 on Vertex
+- Full tool/function calling and prompt caching support
 
 3.  **Build**:
     ```bash
