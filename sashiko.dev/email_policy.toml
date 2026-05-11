@@ -90,6 +90,11 @@ lists = ["linux-watchdog@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-watchdog@vger.kernel.org"]
 
+[subsystems.linux-ide]
+lists = ["linux-ide@vger.kernel.org"]
+reply_to_author = true
+cc = ["dlemoal@kernel.org", "cassel@kernel.org", "linux-ide@vger.kernel.org"]
+
 [subsystems.linux-input]
 lists = ["linux-input@vger.kernel.org"]
 reply_to_author = true
