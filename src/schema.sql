@@ -87,7 +87,6 @@ CREATE TABLE IF NOT EXISTS patchsets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL;
 
 
 CREATE TABLE IF NOT EXISTS patches (

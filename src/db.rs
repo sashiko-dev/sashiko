@@ -503,6 +503,14 @@ impl Database {
         let _ = self
             .try_add_column("patchsets", "embargo_until", "INTEGER")
             .await;
+        let _ = self.try_add_column("patchsets", "slug", "TEXT").await;
+        let _ = self
+            .conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL",
+                (),
+            )
+            .await;
         let _ = self
             .try_create_index(
                 "idx_patchsets_status_embargo_until",

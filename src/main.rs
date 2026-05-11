@@ -249,9 +249,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         timestamp,
                         index,
                         total,
-                        mr_url: _,
-                        mr_title: _,
-                        mr_number: _,
+                        mr_url,
+                        mr_title,
+                        mr_number,
                     } => {
                         let root_msg_id = format!("{}@sashiko.local", article_id);
 
@@ -297,9 +297,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 failed_error: None,
                                 skip_filters: None,
                                 only_filters: None,
-                                mr_url: None,
-                                mr_title: None,
-                                mr_number: None,
+                                mr_url,
+                                mr_title,
+                                mr_number,
                             })
                             .await
                         {
@@ -441,6 +441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // DB Worker (Transactional Batching)
     let worker_db = db.clone();
+    let mapping = settings.subsystems.mapping.clone();
     let _db_worker_handle = tokio::spawn(async move {
         info!("DB Worker started");
 
@@ -449,19 +450,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total_ingested = 0;
         let mut total_errors = 0;
 
+        let policy =
+            sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml").unwrap_or_default();
+
         loop {
             let count = parsed_rx.recv_many(&mut buffer, 100).await;
             if count == 0 {
                 break;
             }
 
-            // info!("Processing batch of {} parsed articles", count); // Too verbose
-
-            let policy = sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml")
-                .unwrap_or_default();
-
             for article in buffer.drain(..) {
-                match process_parsed_article(&worker_db, article, &policy).await {
+                match process_parsed_article(&worker_db, article, &policy, &mapping).await {
                     ProcessStatus::Ingested => total_ingested += 1,
                     ProcessStatus::Error => total_errors += 1,
                 }
@@ -484,18 +483,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start Ingestor (feeds raw_tx)
-    let ingestor = Ingestor::new(
-        settings.clone(),
-        db.clone(),
-        raw_tx.clone(),
-        cli.download,
-        cli.track,
-    );
-    let ingestor_handle = tokio::spawn(async move {
-        if let Err(e) = ingestor.run().await {
-            error!("Ingestor fatal error: {}", e);
-        }
-    });
+    let ingestor_handle = if !settings.forge.enabled {
+        let ingestor = Ingestor::new(
+            settings.clone(),
+            db.clone(),
+            raw_tx.clone(),
+            cli.download,
+            cli.track,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = ingestor.run().await {
+                error!("Ingestor fatal error: {}", e);
+            }
+        })
+    } else {
+        info!("Forge integration is enabled. Lore/NNTP ingestor is disabled.");
+        tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        })
+    };
 
     // Start Web API
     let api_settings = Arc::new(settings.clone());
@@ -630,6 +636,7 @@ async fn process_parsed_article(
     worker_db: &Database,
     article: ParsedArticle,
     policy: &sashiko::email_policy::EmailPolicyConfig,
+    subsystem_mapping: &[sashiko::settings::SubsystemMapping],
 ) -> ProcessStatus {
     let ParsedArticle {
         group,
@@ -640,9 +647,9 @@ async fn process_parsed_article(
         failed_error,
         skip_filters,
         only_filters,
-        mr_url: _,
-        mr_title: _,
-        mr_number: _,
+        mr_url,
+        mr_title,
+        mr_number,
     } = article;
 
     // Handle ingestion failure
@@ -804,10 +811,29 @@ async fn process_parsed_article(
     }
 
     // Subsystem Identification and Linking
-    let mut subsystems = identify_subsystems(&metadata.to, &metadata.cc);
-    if group.starts_with("git-import") {
-        subsystems.push(("from git".to_string(), "git-import".to_string()));
+    let mut subsystems = identify_subsystems(&metadata.to, &metadata.cc, subsystem_mapping);
+
+    if let Some(p) = patch_opt.as_ref() {
+        let files = sashiko::baseline::extract_files_from_diff(&p.diff);
+        let path_subsystems = identify_subsystems_from_paths(&files, subsystem_mapping);
+        subsystems.extend(path_subsystems);
     }
+
+    if group.starts_with("git-import") || group == "git-fetch" {
+        let (label, email) = if let Some(url) = &mr_url {
+            if let Some(repo_name) = sashiko::forge::extract_repo_name_from_mr_url(url) {
+                let email = format!("git-import-{}", repo_name);
+                (repo_name, email)
+            } else {
+                ("from git".to_string(), "git-import".to_string())
+            }
+        } else {
+            ("from git".to_string(), "git-import".to_string())
+        };
+        subsystems.push((label, email));
+    }
+    subsystems.sort();
+    subsystems.dedup();
 
     let mut subsystem_ids = Vec::new();
     for (name, email) in &subsystems {
@@ -877,7 +903,10 @@ async fn process_parsed_article(
     */
 
     let root_msg_id = format!("{}@sashiko.local", article_id);
-    let cover_letter_id = if group == "git-fetch" || group == "api-submit" {
+    let cover_letter_id = if group == "git-fetch" {
+        // Always use root_msg_id for git-fetch to match the placeholder ID
+        Some(root_msg_id.as_str())
+    } else if group == "api-submit" {
         if metadata.total == 1 {
             Some(metadata.message_id.as_str())
         } else {
@@ -905,6 +934,22 @@ async fn process_parsed_article(
                 },
                 false,
             )
+        } else if group == "git-fetch" && let (Some(title), Some(number)) = (&mr_title, &mr_number) {
+            if metadata.total == 1 || metadata.index == 1 {
+                (
+                    format!("!{}: {}", number, title),
+                    metadata.author.clone(),
+                    metadata.total,
+                    true,
+                )
+            } else {
+                (
+                    metadata.subject.clone(),
+                    metadata.author.clone(),
+                    metadata.total,
+                    !group.starts_with("git-import"),
+                )
+            }
         } else {
             (
                 metadata.subject.clone(),
@@ -1163,12 +1208,20 @@ fn calculate_embargo_hours(
     }
 }
 
-fn identify_subsystems(to: &str, cc: &str) -> Vec<(String, String)> {
+fn identify_subsystems(
+    to: &str,
+    cc: &str,
+    mapping: &[sashiko::settings::SubsystemMapping],
+) -> Vec<(String, String)> {
     let mut subsystems = Vec::new();
     let mut all_recipients = String::new();
     all_recipients.push_str(to);
     all_recipients.push_str(", ");
     all_recipients.push_str(cc);
+
+    let compiled_rules: Vec<_> = mapping.iter().filter_map(|rule| {
+        regex::Regex::new(&rule.pattern).ok().map(|re| (re, &rule.name))
+    }).collect();
 
     for email in all_recipients.split(',') {
         let email = email.trim();
@@ -1177,33 +1230,53 @@ fn identify_subsystems(to: &str, cc: &str) -> Vec<(String, String)> {
         }
 
         let lower_email = email.to_lowercase();
+        let mut matched = false;
 
-        // 1. Static Map (Mimic MAINTAINERS)
-        if lower_email.contains("linux-kernel@vger.kernel.org") {
-            subsystems.push((
-                "LKML".to_string(),
-                "linux-kernel@vger.kernel.org".to_string(),
-            ));
-        } else if lower_email.contains("netdev@vger.kernel.org") {
-            subsystems.push(("netdev".to_string(), "netdev@vger.kernel.org".to_string()));
-        } else if lower_email.contains("bpf@vger.kernel.org") {
-            subsystems.push(("bpf".to_string(), "bpf@vger.kernel.org".to_string()));
-        } else if lower_email.contains("linux-usb@vger.kernel.org") {
-            subsystems.push(("usb".to_string(), "linux-usb@vger.kernel.org".to_string()));
-        } else if lower_email.contains("linux-fsdevel@vger.kernel.org") {
-            subsystems.push((
-                "fsdevel".to_string(),
-                "linux-fsdevel@vger.kernel.org".to_string(),
-            ));
-        } else if lower_email.contains("linux-mm@kvack.org") {
-            subsystems.push(("linux-mm".to_string(), "linux-mm@kvack.org".to_string()));
-        } else if lower_email.ends_with("@vger.kernel.org")
-            || lower_email.ends_with("@lists.linux.dev")
-            || lower_email.ends_with("@lists.infradead.org")
-        {
-            // Fallback: derive name from email user part
-            if let Some(name) = lower_email.split('@').next() {
+        for (re, name) in &compiled_rules {
+            if re.is_match(&lower_email)
+            {
+                subsystems.push(((*name).clone(), lower_email.clone()));
+                matched = true;
+            }
+        }
+
+        // Fallback for known kernel lists if no mapping is provided
+        if !matched {
+            if lower_email.contains("linux-kernel@vger.kernel.org") {
+                subsystems.push(("LKML".to_string(), lower_email));
+            } else if lower_email.contains("netdev@vger.kernel.org") {
+                subsystems.push(("netdev".to_string(), lower_email));
+            } else if (lower_email.ends_with("@vger.kernel.org")
+                || lower_email.ends_with("@lists.linux.dev")
+                || lower_email.ends_with("@lists.infradead.org")
+                || lower_email.ends_with("@kvack.org"))
+                && let Some(name) = lower_email.split('@').next()
+            {
                 subsystems.push((name.to_string(), lower_email));
+            }
+        }
+    }
+
+    subsystems.sort();
+    subsystems.dedup();
+    subsystems
+}
+
+fn identify_subsystems_from_paths(
+    paths: &[String],
+    mapping: &[sashiko::settings::SubsystemMapping],
+) -> Vec<(String, String)> {
+    let mut subsystems = Vec::new();
+    let compiled_rules: Vec<_> = mapping.iter().filter_map(|rule| {
+        regex::Regex::new(&rule.pattern).ok().map(|re| (re, &rule.name))
+    }).collect();
+
+    for path in paths {
+        let lower_path = path.to_lowercase();
+        for (re, name) in &compiled_rules {
+            if re.is_match(&lower_path)
+            {
+                subsystems.push(((*name).clone(), (*name).clone() + "@forge.local"));
             }
         }
     }
@@ -1259,7 +1332,7 @@ mod tests {
         // Test known subsystem
         let to = "linux-kernel@vger.kernel.org";
         let cc = "netdev@vger.kernel.org";
-        let subsystems = identify_subsystems(to, cc);
+        let subsystems = identify_subsystems(to, cc, &[]);
         assert!(subsystems.contains(&(
             "LKML".to_string(),
             "linux-kernel@vger.kernel.org".to_string()
@@ -1269,7 +1342,7 @@ mod tests {
         // Test fallback
         let to = "unknown-list@vger.kernel.org";
         let cc = "";
-        let subsystems = identify_subsystems(to, cc);
+        let subsystems = identify_subsystems(to, cc, &[]);
         assert!(subsystems.contains(&(
             "unknown-list".to_string(),
             "unknown-list@vger.kernel.org".to_string()
@@ -1278,16 +1351,52 @@ mod tests {
         // Test mixed
         let to = "linux-usb@vger.kernel.org, random-user@example.com";
         let cc = "bpf@vger.kernel.org";
-        let subsystems = identify_subsystems(to, cc);
-        assert!(subsystems.contains(&("usb".to_string(), "linux-usb@vger.kernel.org".to_string())));
+        let subsystems = identify_subsystems(to, cc, &[]);
+        assert!(subsystems.contains(&(
+            "linux-usb".to_string(),
+            "linux-usb@vger.kernel.org".to_string()
+        )));
         assert!(subsystems.contains(&("bpf".to_string(), "bpf@vger.kernel.org".to_string())));
         // random-user should be ignored as it doesn't match list patterns
         assert_eq!(subsystems.len(), 2);
 
         // Test linux-mm
         let to = "linux-mm@kvack.org";
-        let subsystems = identify_subsystems(to, "");
+        let subsystems = identify_subsystems(to, "", &[]);
         assert!(subsystems.contains(&("linux-mm".to_string(), "linux-mm@kvack.org".to_string())));
+    }
+
+    #[test]
+    fn test_identify_subsystems_custom_and_fallback() {
+        let custom_mapping = vec![sashiko::settings::SubsystemMapping {
+            pattern: ".*custom-list@example.com.*".to_string(),
+            name: "Custom".to_string(),
+        }];
+
+        // Test that a known default list is still identified even with custom mappings present.
+        let to = "netdev@vger.kernel.org";
+        let cc = "custom-list@example.com";
+        let subsystems = identify_subsystems(to, cc, &custom_mapping);
+
+        assert_eq!(subsystems.len(), 2); // Both custom and default should be found
+        assert!(subsystems.contains(&("netdev".to_string(), "netdev@vger.kernel.org".to_string())));
+        assert!(
+            subsystems.contains(&("Custom".to_string(), "custom-list@example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_identify_subsystems_from_paths() {
+        let mapping = vec![sashiko::settings::SubsystemMapping {
+            pattern: "^drivers/usb/.*".to_string(),
+            name: "usb".to_string(),
+        }];
+
+        let paths = vec!["drivers/usb/core/devio.c".to_string(), "README.md".to_string()];
+        let subsystems = identify_subsystems_from_paths(&paths, &mapping);
+
+        assert_eq!(subsystems.len(), 1);
+        assert!(subsystems.contains(&("usb".to_string(), "usb@forge.local".to_string())));
     }
 
     #[test]
