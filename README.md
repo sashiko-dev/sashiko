@@ -75,45 +75,45 @@ cargo install sashiko
 
 ### From source
 
-1.  **Clone the repository**:
-    ```bash
-    git clone --recursive https://github.com/sashiko-dev/sashiko.git
-    cd sashiko
-    ```
-    *Note: The `--recursive` flag is important to initialize the `linux` kernel source submodule.*
+#### 1.  **Clone the repository**:
+```bash
+git clone --recursive https://github.com/sashiko-dev/sashiko.git
+cd sashiko
+```
+*Note: The `--recursive` flag is important to initialize the `linux` kernel source submodule.*
 
-2.  **Configuration**:
-    Copy `Settings.toml` to customize your configuration. The default `Settings.toml` includes sections for:
-    *   **Database**: SQLite database path (`sashiko.db`).
-    *   **NNTP**: Server details and groups to monitor.
-    *   **AI**: Provider and model selection.
-    *   **Server**: API server host and port.
-    *   **Git**: Path to the reference kernel repository.
-    *   **Review**: Concurrency and worktree settings.
+#### 2.  **Configuration**:
+Copy `Settings.toml` to customize your configuration. The default `Settings.toml` includes sections for:
+*   **Database**: SQLite database path (`sashiko.db`).
+*   **NNTP**: Server details and groups to monitor.
+*   **AI**: Provider and model selection.
+*   **Server**: API server host and port.
+*   **Git**: Path to the reference kernel repository.
+*   **Review**: Concurrency and worktree settings.
 
-    ### Configuring the LLM Provider
+#### Configuring the LLM Provider
 
-    Sashiko supports multiple LLM providers (e.g. `gemini`). You must configure the provider and model in `Settings.toml`. There are no default values, so please set them explicitly.
+Sashiko supports multiple LLM providers (e.g. `gemini`). You must configure the provider and model in `Settings.toml`. There are no default values, so please set them explicitly.
 
-    Example `Settings.toml` configuration for Gemini:
+Example `Settings.toml` configuration for Gemini:
 
-    ```toml
-    [ai]
-    provider = "gemini"
-    model = "gemini-3.1-pro-preview"
-    # Optional settings
-    # max_input_tokens = 950000
-    # temperature = 1.0
-    ```
+```toml
+[ai]
+provider = "gemini"
+model = "gemini-3.1-pro-preview"
+# Optional settings
+# max_input_tokens = 950000
+# temperature = 1.0
+```
 
-## Gemini CLI Skills
+#### Gemini CLI Skills
 
 For users of the [Gemini CLI](https://github.com/google/gemini-cli), we provide specialized skills to automate development workflows:
 
 - **`review-pr`**: Performs deep, scrutinizing code reviews against `GEMINI.md` and design documents. Detects relevant design files automatically and generates categorized findings with ready-to-paste diffs.
 - **`sashiko-feature`**: A meta-skill for implementing new features. It handles design document matching, codebase investigation, and ensures adherence to SOLID/DRY principles in Rust, while iteratively running `make` checks.
 
-### Installing Skills
+##### Installing Skills
 
 To install these skills in your local workspace:
 
@@ -132,7 +132,7 @@ You can also configure settings via environment variables using the `SASHIKO` pr
 export LLM_API_KEY="your_api_key_here"
 ```
 
-### Claude Setup
+#### Claude Setup
 
 Sashiko supports Anthropic's Claude models via the Claude API.
 
@@ -165,7 +165,7 @@ prompt_caching = true
 - 200K context window for Claude models (use max_input_tokens = 40000 for cost-conscious defaults)
 - Extended thinking support via `thinking` and `effort` settings
 
-### AWS Bedrock Setup
+#### AWS Bedrock Setup
 
 Sashiko supports AWS Bedrock via the Converse API, which works with any Bedrock-hosted model (Claude, Llama, Mistral, etc.).
 
@@ -199,7 +199,7 @@ region = "us-east-1"  # Optional, falls back to AWS SDK defaults
 - Supports cross-region inference profiles (e.g., `us.anthropic.claude-*`)
 - Full tool/function calling support for git operations
 
-### Google Cloud Vertex AI Setup
+#### Google Cloud Vertex AI Setup
 
 Sashiko supports Google Cloud Vertex AI, which provides access to Claude models (and potentially other model families) via Google Cloud infrastructure. Build with `--features vertex`.
 
@@ -236,32 +236,32 @@ prompt_caching = true
 - 1M context window for Claude Opus 4.7/4.6 and Sonnet 4.6 on Vertex
 - Full tool/function calling and prompt caching support
 
-    ### Kiro CLI Setup
+#### Kiro CLI Setup
 
-    Sashiko supports using the local `kiro-cli` as a completion backend.
+Sashiko supports using the local `kiro-cli` as a completion backend.
 
-    **Prerequisites**: Install `kiro-cli` and authenticate with `KIRO_API_KEY` or a browser login.
+**Prerequisites**: Install `kiro-cli` and authenticate with `KIRO_API_KEY` or a browser login.
 
-    **Update Settings.toml**:
-    ```toml
-    [ai]
-    provider = "kiro-cli"
-    model = "claude-opus-4.6"
+**Update Settings.toml**:
+```toml
+[ai]
+provider = "kiro-cli"
+model = "claude-opus-4.6"
 
-    [ai.kiro_cli]
-    binary = "kiro-cli"
-    context_window_size = 200000
-    ```
+[ai.kiro_cli]
+binary = "kiro-cli"
+context_window_size = 200000
+```
 
-    **Features**:
-    - Runs `kiro-cli acp` as a stateless completion backend
-    - Kiro native tools are disabled by default; Sashiko's own tool protocol is used instead
-    - An isolated temporary agent with a deny-all hook prevents accidental tool execution
+**Features**:
+- Runs `kiro-cli acp` as a stateless completion backend
+- Kiro native tools are disabled by default; Sashiko's own tool protocol is used instead
+- An isolated temporary agent with a deny-all hook prevents accidental tool execution
 
-3.  **Build**:
-    ```bash
-    cargo build --release
-    ```
+#### 3.  **Build**:
+```bash
+cargo build --release
+```
 
 ## Usage
 
