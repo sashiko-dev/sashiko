@@ -85,7 +85,7 @@ spec:
                 linux-crypto,linux-riscv,intel-gfx,intel-xe,linux-kselftest,
                 kexec,linux-iio,netfilter-devel,linux-renesas-soc,linux-omap,linux-xfs,
                 linux-cxl,nvdimm,linux-ide,linux-btrfs,rcu,sched-ext,oe-linux-nfc,
-                batman,linux-s390,linux-devicetree,imx,linux-sunxi
+                batman,linux-s390,linux-devicetree,imx,linux-sunxi,linux-amlogic
             - name: SASHIKO__REVIEW__CONCURRENCY
               value: "48"
             - name: SASHIKO__SMTP__SENDER_ADDRESS
