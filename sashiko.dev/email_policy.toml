@@ -119,3 +119,8 @@ cc = ["Frank.Li@kernel.org", "imx@lists.linux.dev"]
 lists = ["linux-sunxi@lists.linux.dev"]
 reply_to_author = true
 cc = ["linux-sunxi@lists.linux.dev"]
+
+[subsystems.linux-amlogic]
+lists = ["linux-amlogic@lists.infradead.org"]
+reply_to_author = true
+cc = ["neil.armstrong@linaro.org", "linux-amlogic@lists.infradead.org"]
