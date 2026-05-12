@@ -65,6 +65,9 @@ prompt_caching = true
 # thinking = "enabled"    # Enable extended thinking (or "adaptive" for Sonnet 4.6+)
 # effort = "high"         # Thinking effort: "low", "medium", "high"
 
+# [ai.claude_cli]
+# effort = "high"   # Thinking effort: "low", "medium", "high", "xhigh", "max"
+
 # [ai.vertex]
 # project_id = "my-gcp-project"  # Or set ANTHROPIC_VERTEX_PROJECT_ID env var
 # region = "us-east5"            # Or set CLOUD_ML_REGION env var (default: "us-east5")
