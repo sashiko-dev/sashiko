@@ -43,9 +43,15 @@ pub struct ProjectSettings {
 pub struct ForgeSettings {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub disable_nntp: bool,
     pub provider: Option<String>,
     pub webhook_secret: Option<String>,
     pub api_token: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -438,6 +444,7 @@ fn default_subsystems() -> SubsystemsSettings {
 fn default_forge() -> ForgeSettings {
     ForgeSettings {
         enabled: false,
+        disable_nntp: true,
         provider: None,
         webhook_secret: None,
         api_token: None,

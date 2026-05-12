@@ -21,10 +21,11 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 
 ## Features
 
-- **Automated Ingestion**: Monitors mailing lists (using `lore.kernel.org`) for new patch submissions.
-- **Manual Ingestion**: Can ingest patches from a local git repository.
-- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini, Claude, GitHub Copilot CLI, and others).
-- **Web interface and CLI**: Provides a web interface and a CLI tool. Email support will be added soon.
+- **Automated Ingestion**: Monitors mailing lists (`lore.kernel.org`), GitHub PRs, and GitLab MRs for new patch submissions.
+- **Manual Ingestion**: Can ingest patches from local git repositories or specific PRs/MRs.
+- **Forge Integration**: Automatic PR/MR review via GitHub and GitLab webhooks.
+- **Self-contained**: Doesn't depend on 3rd-party tools and works with multiple LLM providers (Gemini, Claude, and GitHub Copilot CLI are currently supported).
+- **Web interface and CLI**: Provides a web interface for monitoring and a CLI tool for local development. Email support will be added soon.
 
 ## Prompts
 
@@ -88,8 +89,17 @@ cd sashiko
 *Note: The `--recursive` flag is important to initialize the `linux` kernel source submodule.*
 
 #### 2.  **Configuration**:
-Copy an example config to get started. For a full reference of every
-setting, see the [Configuration Reference](docs/configuration.md).
+Copy `Settings.toml` to customize your configuration. For a full reference of every
+setting, see the [Configuration Reference](docs/configuration.md). The default `Settings.toml` includes sections for:
+*   **Database**: SQLite database path (`sashiko.db`).
+*   **NNTP**: Server details and groups to monitor.
+*   **AI**: Provider and model selection.
+*   **Server**: API server host and port.
+*   **Git**: Path to the reference kernel repository.
+*   **Review**: Concurrency and worktree settings.
+    *   **Forge**: GitHub/GitLab webhook integration (optional). See forge setup guides below.
+        *   When enabling `[forge]`, the NNTP (mailing list) ingestor is disabled by default. If you need to monitor both, set `disable_nntp = false` in the `[forge]` section of your config.
+    *   **Subsystems**: Map file patterns to subsystems for targeted reviews (optional).
 
 #### Configuring the LLM Provider
 

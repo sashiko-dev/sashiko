@@ -1181,7 +1181,7 @@
                 <img src="static/logo.png" style="height: 1.5em; margin-right: 12px;" alt="Sashiko Logo">
                 About Sashiko
             </div>
-            <div class="about-text">
+            <div class="about-text" id="about-text-content">
                 <blockquote>
                     <strong>Sashiko</strong> (刺し子, literally "little stabs") is a form of decorative reinforcement stitching from Japan. Originally used to reinforce points of wear or to repair worn places or tears with patches, here it represents our mission to reinforce the Linux kernel through automated, intelligent patch review.
                 </blockquote>
@@ -1201,15 +1201,8 @@
                 <p>
                     This particular instance of Sashiko is provided as a service and is actively <strong>reviewing all LKML (Linux Kernel Mailing List) submissions</strong>. All compute resources and LLM tokens utilized for these automated reviews are proudly provided and funded by <strong>Google</strong>.
                 </p>
-
-                <p>
-                    <strong>Quality of Reviews:</strong> In our tests using Gemini 3.1 Pro, Sashiko was able to successfully identify <strong>53.6% of bugs</strong> based on an unfiltered selection of the last 1000 upstream commits with <code>Fixed:</code> tags. 100% of these historical bugs had previously made it through human-driven code reviews.
-                </p>
-
-                <div class="disclaimer">
-                    <strong>Note:</strong> As with any Large Language Model-based tool, Sashiko's output is probabilistic. It might find or miss bugs across different runs with the exact same input. It is designed to augment and assist human reviewers, not to replace them.
-                </div>
-
+            </div>
+            <div style="margin-top: 32px; text-align: center;">
                 <div style="margin-top: 32px; text-align: center;">
                     <a href="https://github.com/sashiko-dev/sashiko" target="_blank" rel="noopener noreferrer" style="display: inline-flex; align-items: center; gap: 8px; font-weight: bold; color: var(--text); padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px; background: var(--btn-bg); text-decoration: none; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
                         <svg height="20" aria-hidden="true" viewBox="0 0 16 16" version="1.1" width="20" data-view-component="true" style="fill: currentColor;">
@@ -1386,6 +1379,25 @@
             }
         }
 
+        
+        let config = {};
+        async function fetchConfig() {
+            try {
+                const res = await fetch('/api/config');
+                if (res.ok) {
+                    config = await res.json();
+                    document.title = config.project_name;
+                    document.getElementById('about-text-content').innerHTML = `
+                        <p>${escapeHtml(config.project_description)}</p>
+                    `;
+                    const els = document.querySelectorAll('.header-title, .about-logo');
+                    els.forEach(el => {
+                        el.innerHTML = `<img src="static/logo.png" style="height: 1.5em; margin-right: 12px;" alt="Logo"> ${escapeHtml(config.project_name)}`;
+                    });
+                }
+            } catch(e) { console.error("Failed to load config", e); }
+        }
+
         async function router() {
             const route = parseHash();
             const oldView = state.view;
@@ -1441,7 +1453,7 @@
 
         window.addEventListener('hashchange', () => {
             hasNavigatedInternally = true;
-            router();
+            fetchConfig().then(router);
         });
 
         // =====================================================================
@@ -1940,7 +1952,7 @@
 
                     const clickHandler = (e) => {
                         if (e.target.closest('.copy-btn')) return;
-                        const target = `#/patchset/${encodeURIComponent(p.message_id || p.id)}`;
+                        const target = `#/patchset/${encodeURIComponent(p.slug || p.message_id || p.id)}`;
                         if (e.button === 1 || e.ctrlKey || e.metaKey) {
                             window.open(target, '_blank');
                         } else if (e.button === 0) {
@@ -2121,9 +2133,7 @@
                 if (!reviews || reviews.length === 0) {
                     const statusToCheck = patchStatus || data.status;
                     if (statusToCheck === 'Embargoed' && data.embargo_until) {
-                        const hours = data.date ? Math.round((data.embargo_until - data.date) / 3600) : null;
-                        const hoursText = hours !== null ? `${hours} hours` : 'some time';
-                        return `<p style="font-style:italic; font-size:1.2em; color:var(--status-embargoed);">Embargoed by mailing list policy to ${hoursText} after posting. Public at ${formatDate(data.embargo_until, true)}</p>`;
+                        return `<p style="font-style:italic; color:var(--status-embargoed);">Embargoed until ${formatDate(data.embargo_until, true)}</p>`;
                     }
                     return `<p class="status-placeholder">No reviews yet.</p>`;
                 }
@@ -2301,8 +2311,8 @@
             let paginationHtml = '';
             if (data.total_patches_in_db > data.limit) {
                 const totalPages = Math.ceil(data.total_patches_in_db / data.limit);
-                const basePath = `#/patchset/${encodeURIComponent(data.id || data.message_id)}`;
-                
+                const basePath = `#/patchset/${encodeURIComponent(data.slug || data.id || data.message_id)}`;
+
                 paginationHtml = `
                     <div class="pagination">
                         <button onclick="navigate('${basePath}?page=1&limit=${data.limit}')" ${data.page <= 1 ? 'disabled' : ''}>First</button>
@@ -2441,6 +2451,15 @@
                     <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>
                 </div>
                 
+                ${data.mr_url ? `<div class="section">
+                    <h2>Merge Request</h2>
+                    <div style="padding: 12px; background: var(--card-bg); border-radius: 6px; border: 1px solid var(--border);">
+                        <a href="${escapeHtml(data.mr_url)}" target="_blank" rel="noopener noreferrer" style="color: var(--link); text-decoration: none; font-weight: 500;">
+                            ${escapeHtml(data.mr_url)} ↗
+                        </a>
+                    </div>
+                </div>` : ''}
+
                 ${threadHtml ? `<div class="section">
                     <h2>Thread</h2>
                     ${threadHtml}
@@ -3387,7 +3406,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         loadSettings();
-        router();
+        fetchConfig().then(router);
     </script>
 </body>
 

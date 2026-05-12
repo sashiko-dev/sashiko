@@ -483,7 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start Ingestor (feeds raw_tx)
-    let ingestor_handle = if !settings.forge.enabled {
+    let ingestor_handle = if !(settings.forge.enabled && settings.forge.disable_nntp) {
         let ingestor = Ingestor::new(
             settings.clone(),
             db.clone(),
@@ -934,7 +934,9 @@ async fn process_parsed_article(
                 },
                 false,
             )
-        } else if group == "git-fetch" && let (Some(title), Some(number)) = (&mr_title, &mr_number) {
+        } else if group == "git-fetch"
+            && let (Some(title), Some(number)) = (&mr_title, &mr_number)
+        {
             if metadata.total == 1 || metadata.index == 1 {
                 (
                     format!("!{}: {}", number, title),
@@ -1219,9 +1221,14 @@ fn identify_subsystems(
     all_recipients.push_str(", ");
     all_recipients.push_str(cc);
 
-    let compiled_rules: Vec<_> = mapping.iter().filter_map(|rule| {
-        regex::Regex::new(&rule.pattern).ok().map(|re| (re, &rule.name))
-    }).collect();
+    let compiled_rules: Vec<_> = mapping
+        .iter()
+        .filter_map(|rule| {
+            regex::Regex::new(&rule.pattern)
+                .ok()
+                .map(|re| (re, &rule.name))
+        })
+        .collect();
 
     for email in all_recipients.split(',') {
         let email = email.trim();
@@ -1233,8 +1240,7 @@ fn identify_subsystems(
         let mut matched = false;
 
         for (re, name) in &compiled_rules {
-            if re.is_match(&lower_email)
-            {
+            if re.is_match(&lower_email) {
                 subsystems.push(((*name).clone(), lower_email.clone()));
                 matched = true;
             }
@@ -1267,15 +1273,19 @@ fn identify_subsystems_from_paths(
     mapping: &[sashiko::settings::SubsystemMapping],
 ) -> Vec<(String, String)> {
     let mut subsystems = Vec::new();
-    let compiled_rules: Vec<_> = mapping.iter().filter_map(|rule| {
-        regex::Regex::new(&rule.pattern).ok().map(|re| (re, &rule.name))
-    }).collect();
+    let compiled_rules: Vec<_> = mapping
+        .iter()
+        .filter_map(|rule| {
+            regex::Regex::new(&rule.pattern)
+                .ok()
+                .map(|re| (re, &rule.name))
+        })
+        .collect();
 
     for path in paths {
         let lower_path = path.to_lowercase();
         for (re, name) in &compiled_rules {
-            if re.is_match(&lower_path)
-            {
+            if re.is_match(&lower_path) {
                 subsystems.push(((*name).clone(), (*name).clone() + "@forge.local"));
             }
         }
@@ -1392,7 +1402,10 @@ mod tests {
             name: "usb".to_string(),
         }];
 
-        let paths = vec!["drivers/usb/core/devio.c".to_string(), "README.md".to_string()];
+        let paths = vec![
+            "drivers/usb/core/devio.c".to_string(),
+            "README.md".to_string(),
+        ];
         let subsystems = identify_subsystems_from_paths(&paths, &mapping);
 
         assert_eq!(subsystems.len(), 1);
@@ -1478,5 +1491,23 @@ mod tests {
             calculate_embargo_hours("[RFC PATCH bpf-next] foo", &subs, &policy),
             0
         );
+    }
+
+    #[test]
+    fn test_nntp_ingestor_enabled_with_forge() {
+        let mut settings = Settings::new().unwrap();
+        settings.forge.enabled = true;
+        settings.forge.disable_nntp = false;
+        let should_start_ingestor = !(settings.forge.enabled && settings.forge.disable_nntp);
+        assert!(should_start_ingestor);
+    }
+
+    #[test]
+    fn test_nntp_ingestor_disabled_by_default_with_forge() {
+        let mut settings = Settings::new().unwrap();
+        settings.forge.enabled = true;
+        settings.forge.disable_nntp = true; // This is the default
+        let should_start_ingestor = !(settings.forge.enabled && settings.forge.disable_nntp);
+        assert!(!should_start_ingestor);
     }
 }
