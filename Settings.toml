@@ -54,6 +54,12 @@ temperature = 1.0
 # max_input_tokens = 40000
 # max_interactions = 50
 
+# To use Kiro CLI (fixed-cost subscription, no API key needed):
+# provider = "kiro-cli"
+# model = "claude-opus-4.6"
+# max_input_tokens = 40000
+# max_interactions = 50
+
 [ai.claude]
 prompt_caching = true
 # thinking = "enabled"    # Enable extended thinking (or "adaptive" for Sonnet 4.6+)
@@ -63,6 +69,10 @@ prompt_caching = true
 # project_id = "my-gcp-project"  # Or set ANTHROPIC_VERTEX_PROJECT_ID env var
 # region = "us-east5"            # Or set CLOUD_ML_REGION env var (default: "us-east5")
 # prompt_caching = true
+
+# [ai.kiro_cli]
+# binary = "kiro-cli"
+# context_window_size = 200000
 
 [server]
 host = "::"
