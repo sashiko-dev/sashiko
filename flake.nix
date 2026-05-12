@@ -15,7 +15,10 @@
         naersk' = pkgs.callPackage naersk {};
       in {
         packages.default  = naersk'.buildPackage {
-          src = ./.;
+          src = pkgs.lib.cleanSourceWith {
+            src = pkgs.lib.cleanSource ./.;
+            filter = path: type: baseNameOf path != "Settings.toml";
+          };
         };
         devShell = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [ rustc cargo ];
