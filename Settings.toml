@@ -1,5 +1,22 @@
 log_level = "info"
 
+[project]
+name = "Sashiko"
+description = ""
+
+[forge]
+enabled = false
+# provider = "github"
+# webhook_secret = "your-webhook-secret"
+# api_token = "your-api-token"
+
+[subsystems]
+# Regex map: email address pattern -> subsystem name
+# mapping = [
+#     { pattern = ".*linux-kernel@vger.kernel.org.*", name = "LKML" },
+#     { pattern = ".*netdev@vger.kernel.org.*", name = "netdev" },
+# ]
+
 [database]
 url = "sashiko.db"
 token = ""
