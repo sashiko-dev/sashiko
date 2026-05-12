@@ -40,6 +40,7 @@ use crate::ai::{
 
 pub struct ClaudeCliProvider {
     pub model: String,
+    pub effort: Option<String>,
 }
 
 #[async_trait]
@@ -58,6 +59,11 @@ impl AiProvider for ClaudeCliProvider {
 
         args.push("--model".to_string());
         args.push(self.model.clone());
+
+        if let Some(effort) = &self.effort {
+            args.push("--effort".to_string());
+            args.push(effort.clone());
+        }
 
         let mut child = Command::new("claude")
             .args(&args)
@@ -143,8 +149,22 @@ impl AiProvider for ClaudeCliProvider {
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
-            context_window_size: 200_000,
+            context_window_size: context_window_for_model(&self.model),
         }
+    }
+}
+
+/// Pick the context window to advertise for a given model name. The value is
+/// currently metadata only (no consumer gates on it), so the mapping is coarse.
+/// Opus 4.7 ships with a 1M window by default via Claude Code, and any model
+/// can be selected with the `[1m]` suffix to opt into the 1M variant.
+/// Verified against Claude Code 2.1.132 for opus-4-7, sonnet-4-6, sonnet-4-6[1m],
+/// haiku-4-5.
+fn context_window_for_model(model: &str) -> usize {
+    if model.contains("[1m]") || model.contains("opus-4-7") {
+        1_000_000
+    } else {
+        200_000
     }
 }
 

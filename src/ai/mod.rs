@@ -436,9 +436,13 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 settings.ai.api_timeout_secs,
             )))
         }
-        "claude-cli" => Ok(Arc::new(claude_cli::ClaudeCliProvider {
-            model: settings.ai.model.clone(),
-        })),
+        "claude-cli" => {
+            let cfg = settings.ai.claude_cli.as_ref();
+            Ok(Arc::new(claude_cli::ClaudeCliProvider {
+                model: settings.ai.model.clone(),
+                effort: cfg.and_then(|c| c.effort.clone()),
+            }))
+        }
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: settings.ai.model.clone(),
         })),

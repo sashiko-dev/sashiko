@@ -210,6 +210,15 @@ fn default_kiro_cli_context_window() -> usize {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct ClaudeCliSettings {
+    /// Effort level passed to `claude --effort`. Valid values per Claude Code:
+    /// "low", "medium", "high", "xhigh", "max". Leave unset for the model default.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct AiSettings {
     pub provider: String,
     pub model: String,
@@ -240,6 +249,7 @@ pub struct AiSettings {
     pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
+    pub claude_cli: Option<ClaudeCliSettings>,
 }
 
 fn default_response_cache_ttl_days() -> u64 {

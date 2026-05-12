@@ -165,6 +165,53 @@ prompt_caching = true
 - 200K context window for Claude models (use max_input_tokens = 40000 for cost-conscious defaults)
 - Extended thinking support via `thinking` and `effort` settings
 
+#### Claude Code CLI Setup
+
+Sashiko can use a local [Claude Code](https://claude.com/claude-code) install as
+a completion backend. This path uses your Claude Code subscription, so there is
+no per-token API charge and no API key to configure.
+
+**Prerequisites**: Install Claude Code and sign in. Verify with `claude --version`.
+
+**Update Settings.toml**:
+```toml
+[ai]
+provider = "claude-cli"
+model = "claude-opus-4-7"
+max_input_tokens = 950000
+max_interactions = 150
+
+# [ai.claude_cli]
+# effort = "high"   # Optional: "low", "medium", "high", "xhigh", "max"
+```
+
+`model` accepts any identifier the CLI accepts via `--model`: aliases like
+`opus` or `sonnet`, or full names like `claude-opus-4-7`, `claude-sonnet-4-6`.
+
+Context window notes:
+- `claude-opus-4-7` gives you 1M tokens by default.
+- `claude-sonnet-4-6` and `claude-opus-4-6` have 1M capability per Anthropic's
+  docs, but the CLI defaults them to 200K. Append the `[1m]` suffix
+  (e.g. `claude-sonnet-4-6[1m]`) to opt into the 1M variant.
+- `claude-haiku-4-5` is 200K only; there is no 1M variant.
+- The CLI rejects pre-thinking models (Claude 3.x family) with HTTP 404.
+
+**Features**:
+- No API key needed. Uses Claude Code's subscription auth.
+- Stateless: spawns `claude --print --output-format json --no-session-persistence`
+  per request. No tool access, no file access, no session reuse.
+- Prompt caching is handled by Claude Code automatically.
+- `effort` is forwarded to `claude --effort` and controls the model's thinking
+  budget. The exact mode depends on the model: Opus 4.7 uses adaptive
+  thinking, Sonnet 4.6 and Haiku 4.5 use extended thinking. The CLI exposes
+  one knob (effort) for both; if you need to pick the mode explicitly or
+  disable thinking, use `provider = "claude"` (API) instead.
+- `[ai.claude]` settings (`prompt_caching`, `thinking`, etc.) are read only by
+  the API provider above. They are ignored on this path.
+
+**Notes**: Each review may spawn many CLI processes. Lower `review.concurrency`
+if you hit subscription rate limits.
+
 #### AWS Bedrock Setup
 
 Sashiko supports AWS Bedrock via the Converse API, which works with any Bedrock-hosted model (Claude, Llama, Mistral, etc.).
