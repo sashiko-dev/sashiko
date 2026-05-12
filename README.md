@@ -125,7 +125,7 @@ gemini skills install ./skills/sashiko-feature.skill --scope workspace
 
 For users of other agent interfaces (e.g., OpenCode, Claude Code), we recommend following your interface's specific settings to symlink or copy the skill configurations (the `SKILL.md` and `references/` files) into your agent's custom instruction path.
 
-You can also configure settings via environment variables using the `SASHIKO` prefix and double underscores for nesting (e.g., `SASHIKO_AI__PROVIDER=gemini`).
+You can also configure settings via environment variables using the `SASHIKO` prefix and `__` (double underscore) as the separator between every segment (e.g., `SASHIKO__AI__PROVIDER=gemini`).
 
 **Important**: You must set the `LLM_API_KEY` environment variable with your provider's API key.
 ```bash

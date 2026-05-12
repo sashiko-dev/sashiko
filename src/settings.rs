@@ -366,7 +366,7 @@ impl Settings {
             // Start with default settings
             .add_source(File::with_name("Settings"))
             // Add settings from environment variables (with a prefix of SASHIKO)
-            // e.g. SASHIKO_SERVER__PORT=8081 would set the server port
+            // e.g. SASHIKO__SERVER__PORT=8081 would set the server port
             .add_source(Environment::with_prefix("SASHIKO").separator("__"))
             .build()?;
 
