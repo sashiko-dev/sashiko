@@ -124,3 +124,8 @@ cc = ["linux-sunxi@lists.linux.dev"]
 lists = ["linux-amlogic@lists.infradead.org"]
 reply_to_author = true
 cc = ["neil.armstrong@linaro.org", "linux-amlogic@lists.infradead.org"]
+
+[subsystems.linux-hyperv]
+lists = ["linux-hyperv@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-hyperv@vger.kernel.org"]
