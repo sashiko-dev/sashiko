@@ -34,9 +34,39 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
-    ToolCall,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage,
+    ClassifyAiError, ProviderCapabilities, ToolCall,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClaudeCliError {
+    #[error("Failed to spawn claude CLI: {0}")]
+    Spawn(String),
+    #[error("claude CLI timed out after 10 minutes")]
+    Timeout,
+    #[error("claude CLI wait error: {0}")]
+    Wait(String),
+    #[error("claude CLI error: {0}")]
+    Cli(String),
+    #[error("Failed to parse claude CLI JSON output: {0}")]
+    Parse(String),
+}
+
+impl ClassifyAiError for ClaudeCliError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        match self {
+            ClaudeCliError::Spawn(_) => AiErrorClass::Fatal,
+            ClaudeCliError::Timeout => AiErrorClass::Transient {
+                retry_after: Duration::from_secs(30),
+            },
+            ClaudeCliError::Wait(_) => AiErrorClass::Transient {
+                retry_after: Duration::from_secs(30),
+            },
+            ClaudeCliError::Cli(_) => AiErrorClass::Fatal,
+            ClaudeCliError::Parse(_) => AiErrorClass::Fatal,
+        }
+    }
+}
 
 pub struct ClaudeCliProvider {
     pub model: String,
@@ -72,7 +102,7 @@ impl AiProvider for ClaudeCliProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn claude CLI: {}. Is it installed?", e))?;
+            .map_err(|e| ClaudeCliError::Spawn(e.to_string()))?;
 
         // Write prompt to stdin then close it
         if let Some(mut stdin) = child.stdin.take() {
@@ -83,8 +113,8 @@ impl AiProvider for ClaudeCliProvider {
         // 10-minute timeout per CLI call — a hung claude process won't block forever
         let output = timeout(Duration::from_secs(600), child.wait_with_output())
             .await
-            .map_err(|_| anyhow::anyhow!("claude CLI timed out after 10 minutes"))?
-            .map_err(|e| anyhow::anyhow!("claude CLI wait error: {}", e))?;
+            .map_err(|_| ClaudeCliError::Timeout)?
+            .map_err(|e| ClaudeCliError::Wait(e.to_string()))?;
 
         if !output.stderr.is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -104,28 +134,29 @@ impl AiProvider for ClaudeCliProvider {
             if let Ok(outer) = serde_json::from_str::<Value>(&raw)
                 && let Some(msg) = outer["result"].as_str()
             {
-                anyhow::bail!("claude CLI error: {}", msg);
+                return Err(ClaudeCliError::Cli(msg.to_string()).into());
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "claude CLI exited with {}: {}",
+            return Err(ClaudeCliError::Cli(format!(
+                "exited with {}: {}",
                 output.status,
                 stderr.trim()
-            );
+            ))
+            .into());
         }
         let outer: Value = serde_json::from_str(&raw).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse claude CLI JSON output: {}\nRaw: {}",
+            ClaudeCliError::Parse(format!(
+                "{}\nRaw: {}",
                 e,
                 &raw[..raw.len().min(200)]
-            )
+            ))
         })?;
 
         if outer["is_error"].as_bool().unwrap_or(false) {
-            anyhow::bail!(
-                "claude CLI returned error: {}",
-                outer["result"].as_str().unwrap_or("unknown error")
-            );
+            return Err(ClaudeCliError::Cli(
+                outer["result"].as_str().unwrap_or("unknown error").to_string(),
+            )
+            .into());
         }
 
         let result_text = outer["result"].as_str().unwrap_or("").trim().to_string();
@@ -239,23 +270,13 @@ pub fn build_prompt(request: &AiRequest) -> String {
              For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
              Do not mix both. Output exactly one JSON object.\n",
         );
-    } else if matches!(request.response_format, Some(AiResponseFormat::Json { .. })) {
-        // No tools but JSON format required (e.g. Phase 0, Planning).
-        if let Some(AiResponseFormat::Json {
-            schema: Some(schema),
-        }) = &request.response_format
-        {
-            out.push_str(&format!(
-                "RESPONSE FORMAT: You MUST respond with valid JSON only matching this schema: {}. \
-                 Do not include any explanation, markdown, or code fences — output raw JSON.\n",
-                serde_json::to_string(schema).unwrap_or_default()
-            ));
-        } else {
-            out.push_str(
-                "RESPONSE FORMAT: You MUST respond with valid JSON only. \
-                 Do not include any explanation, markdown, or code fences — output raw JSON.\n",
-            );
-        }
+    } else if let Some(instruction) = request
+        .response_format
+        .as_ref()
+        .and_then(|f| f.format_json_schema_instruction())
+    {
+        out.push_str(&instruction);
+        out.push('\n');
     }
 
     out
@@ -452,7 +473,7 @@ mod tests {
 
         let prompt = build_prompt(&req);
         assert!(prompt.contains("RESPONSE FORMAT"));
-        assert!(prompt.contains("valid JSON only"));
+        assert!(prompt.contains("ONLY a valid JSON object"));
         assert!(!prompt.contains("tool_calls"));
     }
 
