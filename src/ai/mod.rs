@@ -85,6 +85,36 @@ pub enum AiResponseFormat {
     },
 }
 
+impl AiResponseFormat {
+    /// Returns a strict instruction string to enforce JSON output for the given format.
+    pub fn format_json_schema_instruction(&self) -> Option<String> {
+        match self {
+            AiResponseFormat::Json {
+                schema: Some(schema),
+            } => {
+                if let Ok(schema_str) = serde_json::to_string(schema) {
+                    Some(format!(
+                        "RESPONSE FORMAT: You MUST respond with ONLY a valid JSON object matching this schema: {schema_str}. \
+                         Do not include any explanation, markdown, or code fences — output raw JSON."
+                    ))
+                } else {
+                    Some(
+                        "RESPONSE FORMAT: You MUST respond with ONLY a valid JSON object. \
+                         Do not include any explanation, markdown, or code fences — output raw JSON."
+                            .to_string(),
+                    )
+                }
+            }
+            AiResponseFormat::Json { schema: None } => Some(
+                "RESPONSE FORMAT: You MUST respond with ONLY a valid JSON object. \
+                     Do not include any explanation, markdown, or code fences — output raw JSON."
+                    .to_string(),
+            ),
+            AiResponseFormat::Text => None,
+        }
+    }
+}
+
 /// Definition of a tool that can be called by the AI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiTool {
@@ -248,6 +278,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<claude::ClaudeError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<claude_cli::ClaudeCliError>() {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
