@@ -352,6 +352,32 @@ pub fn translate_ai_request(
         });
     }
 
+    // Inject strict JSON formatting instruction if requested
+    if let Some(instruction) = request
+        .response_format
+        .as_ref()
+        .and_then(|f| f.format_json_schema_instruction())
+    {
+        if let Some(last_block) = system_blocks.last_mut() {
+            if last_block.block_type == "text" {
+                last_block.text.push_str("\n\n");
+                last_block.text.push_str(&instruction);
+            } else {
+                system_blocks.push(SystemBlock {
+                    block_type: "text".to_string(),
+                    text: instruction,
+                    cache_control: None,
+                });
+            }
+        } else {
+            system_blocks.push(SystemBlock {
+                block_type: "text".to_string(),
+                text: instruction,
+                cache_control: None,
+            });
+        }
+    }
+
     // Translate messages
     for msg in &request.messages {
         match msg.role {
@@ -445,34 +471,6 @@ pub fn translate_ai_request(
             })
             .collect()
     });
-
-    // Handle response format by appending instructions to the system prompt
-    // since Claude API doesn't support it natively.
-    if let Some(format) = &request.response_format {
-        match format {
-            crate::ai::AiResponseFormat::Json { schema } => {
-                let instruction = if let Some(schema) = schema {
-                    format!(
-                        "\n\nYou MUST respond with ONLY a JSON object matching this schema: {}\nNo other text before or after the JSON.",
-                        serde_json::to_string(schema).unwrap_or_default()
-                    )
-                } else {
-                    "\n\nYou MUST respond with ONLY a JSON object.\nNo other text before or after the JSON.".to_string()
-                };
-
-                if let Some(last_sys) = system_blocks.last_mut() {
-                    last_sys.text.push_str(&instruction);
-                } else {
-                    system_blocks.push(SystemBlock {
-                        block_type: "text".to_string(),
-                        text: instruction.trim().to_string(),
-                        cache_control: None,
-                    });
-                }
-            }
-            crate::ai::AiResponseFormat::Text => {}
-        }
-    }
 
     // Build the request
     let mut claude_request = ClaudeRequest {
@@ -1185,7 +1183,11 @@ mod tests {
 
         let claude_req = translate_ai_request(&req, false, 4096, None, None)?;
         let sys = claude_req.system.unwrap();
-        assert!(sys[0].text.contains("MUST respond with ONLY a JSON object"));
+        assert!(
+            sys[0]
+                .text
+                .contains("MUST respond with ONLY a valid JSON object")
+        );
 
         Ok(())
     }

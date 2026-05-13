@@ -34,8 +34,8 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage,
-    ClassifyAiError, ProviderCapabilities, ToolCall,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
+    ProviderCapabilities, ToolCall,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -145,16 +145,15 @@ impl AiProvider for ClaudeCliProvider {
             .into());
         }
         let outer: Value = serde_json::from_str(&raw).map_err(|e| {
-            ClaudeCliError::Parse(format!(
-                "{}\nRaw: {}",
-                e,
-                &raw[..raw.len().min(200)]
-            ))
+            ClaudeCliError::Parse(format!("{}\nRaw: {}", e, &raw[..raw.len().min(200)]))
         })?;
 
         if outer["is_error"].as_bool().unwrap_or(false) {
             return Err(ClaudeCliError::Cli(
-                outer["result"].as_str().unwrap_or("unknown error").to_string(),
+                outer["result"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string(),
             )
             .into());
         }
