@@ -17,11 +17,10 @@
 //!
 //! ## Safety
 //!
-//! Unlike `claude --print`, the `copilot -p` flag runs in non-interactive
-//! mode but retains tool access. To minimize side effects we pass
-//! `--disable-builtin-mcps` (no MCP servers) and `--no-custom-instructions`
-//! (ignores local AGENTS.md). The provider is used as a text-completion
-//! backend only.
+//! Copilot's non-interactive (stdin) mode retains tool access. To minimize
+//! side effects we pass `--disable-builtin-mcps` (no MCP servers) and
+//! `--no-custom-instructions` (ignores local AGENTS.md). The provider is
+//! used as a text-completion backend only.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -39,6 +38,21 @@ pub struct CopilotCliProvider {
     pub model: String,
 }
 
+/// Returns the argv slice passed to `copilot` (excluding the prompt, which is
+/// sent via stdin). Extracted so tests can assert on the exact flag set.
+pub fn build_copilot_args(model: &str) -> Vec<String> {
+    vec![
+        "--output-format".to_string(),
+        "json".to_string(),
+        "-s".to_string(),
+        "--model".to_string(),
+        model.to_string(),
+        "--disable-builtin-mcps".to_string(),
+        "--no-custom-instructions".to_string(),
+        "--allow-all-tools".to_string(),
+    ]
+}
+
 #[async_trait]
 impl AiProvider for CopilotCliProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -46,25 +60,30 @@ impl AiProvider for CopilotCliProvider {
 
         debug!("copilot-cli prompt length: {} chars", prompt.len());
 
-        let child = Command::new("copilot")
-            .args([
-                "-p",
-                &prompt,
-                "--output-format",
-                "json",
-                "-s",
-                "--model",
-                &self.model,
-                "--disable-builtin-mcps",
-                "--no-custom-instructions",
-                "--allow-all-tools",
-            ])
-            .stdin(Stdio::null())
+        // Pipe the prompt via stdin rather than `-p <prompt>` argv. Linux's
+        // MAX_ARG_STRLEN caps single argv elements at ~128 KB; kernel-review
+        // prompts (subsystem guides + diff + tool definitions) routinely
+        // exceed that and cause spawn() to fail with E2BIG. Stdin has no such
+        // limit and the timing is equivalent in copilot's non-interactive mode.
+        let mut child = Command::new("copilot")
+            .args(build_copilot_args(&self.model))
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn copilot CLI: {}. Is it installed?", e))?;
+
+        // Write the prompt to copilot's stdin and close the pipe so it
+        // proceeds to non-interactive (--print-like) mode.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("copilot CLI stdin write failed: {}", e))?;
+            drop(stdin);
+        }
 
         let output = timeout(Duration::from_secs(600), child.wait_with_output())
             .await
@@ -305,5 +324,61 @@ mod tests {
         assert!(resp.content.is_some());
         let content = resp.content.unwrap();
         assert!(content.contains("Memory leak"));
+    }
+
+    /// Regression guard: the prompt must NOT appear in the copilot argv slice.
+    /// Before this fix, `-p <prompt>` was passed as a single argv element,
+    /// which fails with E2BIG on prompts >~128 KB (Linux MAX_ARG_STRLEN).
+    #[test]
+    fn test_command_does_not_pass_prompt_via_argv() {
+        let args = build_copilot_args("claude-sonnet-4.5");
+        assert!(
+            !args.contains(&"-p".to_string()),
+            "regression: prompt should not be passed via -p argv (E2BIG risk)"
+        );
+        // Verify the expected flags ARE present
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"--disable-builtin-mcps".to_string()));
+        assert!(args.contains(&"--no-custom-instructions".to_string()));
+        assert!(args.contains(&"--allow-all-tools".to_string()));
+        assert!(args.contains(&"-s".to_string()));
+        assert!(args.iter().any(|a| a == "claude-sonnet-4.5"));
+    }
+
+    /// Smoke-test: spawn copilot with a 200 KB prompt via stdin and confirm
+    /// it does NOT immediately fail with E2BIG (os error 7). Requires copilot
+    /// to be installed and authenticated; skipped otherwise.
+    ///
+    /// Manual reproduction without this test:
+    ///   python3 -c "print('x' * 200000)" | timeout 30 \
+    ///     copilot --output-format json -s --no-custom-instructions
+    ///   # Must NOT print: "Argument list too long (os error 7)"
+    #[test]
+    #[ignore = "requires copilot CLI installed and authenticated"]
+    fn test_large_prompt_via_stdin_no_e2big() {
+        use std::io::Write;
+        use std::process::{Command as StdCommand, Stdio as StdStdio};
+
+        let large_prompt = "x".repeat(200_000);
+        let mut child = StdCommand::new("copilot")
+            .args(build_copilot_args("claude-sonnet-4.5"))
+            .stdin(StdStdio::piped())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .spawn()
+            .expect("failed to spawn copilot — is it installed?");
+
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(large_prompt.as_bytes())
+            .expect("stdin write failed");
+
+        // We only care that spawn + write succeeded (no E2BIG). We don't wait
+        // for the full model response in CI — kill the child and reap it so
+        // clippy::zombie_processes is satisfied.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
