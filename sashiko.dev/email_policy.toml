@@ -83,6 +83,10 @@ cc = ["sched-ext@lists.linux.dev"]
 lists = ["openvpn-devel@lists.sourceforge.net"]
 cc = ["antonio@mandelbit.com", "ralf@mandelbit.com", "sd@queasysnail.net"]
 
+[subsystems.live-patching]
+lists = ["live-patching@vger.kernel.org"]
+reply_all = true
+
 [subsystems.pci]
 lists = ["linux-pci@vger.kernel.org"]
 reply_to_author = true
