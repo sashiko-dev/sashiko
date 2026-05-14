@@ -21,7 +21,7 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 
 - **Automated Ingestion**: Monitors mailing lists (using `lore.kernel.org`) for new patch submissions.
 - **Manual Ingestion**: Can ingest patches from a local git repository.
-- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini and Claude are currently supported).
+- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini, Claude, and GitHub Copilot CLI are currently supported).
 - **Web interface and CLI**: Provides a web interface and a CLI tool. Email support will be added soon.
 
 ## Prompts
@@ -211,6 +211,39 @@ Context window notes:
 
 **Notes**: Each review may spawn many CLI processes. Lower `review.concurrency`
 if you hit subscription rate limits.
+
+#### GitHub Copilot CLI Setup
+
+Sashiko can use a local [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli)
+install as a completion backend. This path uses your GitHub Copilot
+subscription, so there is no per-token API charge and no API key to configure.
+
+**Prerequisites**:
+- `copilot` CLI installed and on `$PATH`
+- Authenticated session (run `copilot` once interactively to authenticate)
+
+**Update Settings.toml**:
+```toml
+[ai]
+provider = "copilot-cli"
+model = "claude-sonnet-4.5"
+max_input_tokens = 40000
+max_interactions = 150
+```
+
+**Notes**:
+- `model` follows GitHub Copilot's catalog (e.g. `claude-sonnet-4.5`,
+  `gpt-5.5`); pick a model your subscription has access to.
+- Sashiko invokes `copilot` with `--disable-builtin-mcps`,
+  `--no-custom-instructions`, and `--allow-all-tools` so the provider is used
+  as a text-completion-with-tools backend only — no MCP servers, no
+  `AGENTS.md`.
+- The prompt is sent via stdin (not `-p <argv>`) to avoid Linux's
+  `MAX_ARG_STRLEN` cap (~128 KB per argv element).
+- `max_interactions` controls how many tool-call rounds the provider permits
+  before aborting, the same as `claude-cli`.
+- Each review may spawn many `copilot` processes. Lower `review.concurrency`
+  if you hit subscription rate limits.
 
 #### AWS Bedrock Setup
 
