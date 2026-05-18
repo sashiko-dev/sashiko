@@ -184,6 +184,7 @@ pub struct ClaudeClient {
     base_url: String,
     thinking: Option<String>,
     effort: Option<String>,
+    extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl ClaudeClient {
@@ -196,8 +197,11 @@ impl ClaudeClient {
         effort: Option<String>,
     ) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default();
+
+        let extra_headers = Self::parse_env_headers();
 
         Self {
             api_key,
@@ -208,11 +212,31 @@ impl ClaudeClient {
             base_url,
             thinking,
             effort,
+            extra_headers,
         }
     }
 
     pub fn default_base_url() -> String {
-        "https://api.anthropic.com/v1/messages".to_string()
+        std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .map(|u| format!("{}/v1/messages", u.trim_end_matches('/')))
+            .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string())
+    }
+
+    fn parse_env_headers() -> std::collections::HashMap<String, String> {
+        let mut headers = std::collections::HashMap::new();
+        if let Ok(raw) = std::env::var("ANTHROPIC_CUSTOM_HEADERS") {
+            for line in raw.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    let k = k.trim();
+                    let v = v.trim();
+                    if !k.is_empty() {
+                        headers.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+        }
+        headers
     }
 
     async fn post_request(&self, body: &ClaudeRequest) -> Result<ClaudeResponse> {
@@ -233,6 +257,14 @@ impl ClaudeClient {
                 .parse()
                 .context("Invalid content-type header")?,
         );
+
+        for (name, value) in &self.extra_headers {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .context("Invalid extra header name")?,
+                value.parse().context("Invalid extra header value")?,
+            );
+        }
 
         let res = self
             .client
