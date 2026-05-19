@@ -159,6 +159,13 @@ pub struct EmailOutboxRow {
     pub created_at: i64,
 }
 
+pub struct ReviewCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub tokens_saved: u64,
+    pub tokens_stored: u64,
+}
+
 impl Database {
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
@@ -449,6 +456,18 @@ impl Database {
         let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
         let _ = self
             .try_add_column("reviews", "inline_review", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "cache_hits", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "cache_misses", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "cache_tokens_saved", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "cache_tokens_stored", "INTEGER")
             .await;
         let _ = self
             .try_add_column("patchsets", "baseline_id", "INTEGER")
@@ -776,11 +795,36 @@ impl Database {
         interaction_id: Option<&str>,
         inline_review: Option<&str>,
         logs: Option<&str>,
+        cache_stats: Option<&ReviewCacheStats>,
     ) -> Result<()> {
+        let (c_hits, c_misses, c_saved, c_stored) = match cache_stats {
+            Some(cs) => (
+                Some(cs.hits as i64),
+                Some(cs.misses as i64),
+                Some(cs.tokens_saved as i64),
+                Some(cs.tokens_stored as i64),
+            ),
+            None => (None, None, None, None),
+        };
         self.conn
             .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
+                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, \
+                 interaction_id = ?, inline_review = ?, logs = ?, \
+                 cache_hits = ?, cache_misses = ?, cache_tokens_saved = ?, cache_tokens_stored = ? \
+                 WHERE id = ?",
+                libsql::params![
+                    status,
+                    result,
+                    summary,
+                    interaction_id,
+                    inline_review,
+                    logs,
+                    c_hits,
+                    c_misses,
+                    c_saved,
+                    c_stored,
+                    review_id
+                ],
             )
             .await?;
         Ok(())
@@ -5213,6 +5257,7 @@ mod tests {
             "desc",
             None,
             Some("int_id"),
+            None,
             None,
             None,
         )

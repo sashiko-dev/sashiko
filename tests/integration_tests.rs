@@ -11,6 +11,7 @@ mod integration {
     mod server_tests;
     mod singleton_cover_merge_test;
     mod singleton_root_overwrite;
+    mod test_cache_stats;
     mod test_nested;
     mod test_pending;
     mod test_rerun_resets;
