@@ -91,6 +91,25 @@ cd sashiko
 Copy an example config to get started. For a full reference of every
 setting, see the [Configuration Reference](docs/configuration.md).
 
+#### User-Level Configuration
+
+You can place personal overrides (credentials, paths, custom settings) in a
+separate file that is not tracked by git:
+
+```
+~/.config/sashiko/Settings.toml
+```
+
+Settings are loaded in layers — later sources override earlier ones:
+1. `./Settings.toml` — repository defaults (checked into git)
+2. `~/.config/sashiko/Settings.toml` — user overrides (optional)
+3. `SASHIKO__*` environment variables — runtime overrides
+
+This follows the XDG Base Directory Specification: if `$XDG_CONFIG_HOME` is
+set, Sashiko looks there instead of `~/.config`.  The user config file is
+entirely optional — if it doesn't exist, only the repository defaults and
+environment variables are used.
+
 #### Configuring the LLM Provider
 
 Sashiko supports multiple LLM providers. To get started with the default

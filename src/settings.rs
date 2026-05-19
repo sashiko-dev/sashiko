@@ -14,6 +14,7 @@
 
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
@@ -393,12 +394,36 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Build the user-level config path: ~/.config/sashiko/Settings.toml
+    ///
+    /// Follows the XDG Base Directory Specification: uses $XDG_CONFIG_HOME if
+    /// set, otherwise falls back to $HOME/.config.
+    fn user_config_path() -> Option<PathBuf> {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            Some(PathBuf::from(xdg).join("sashiko").join("Settings"))
+        } else {
+            std::env::var("HOME").ok().map(|h| {
+                PathBuf::from(h)
+                    .join(".config")
+                    .join("sashiko")
+                    .join("Settings")
+            })
+        }
+    }
+
+    /// Load settings from a layered set of sources (last wins):
+    ///
+    ///   1. ./Settings.toml        — repo-level defaults (checked into git)
+    ///   2. ~/.config/sashiko/Settings.toml — user overrides (credentials, paths)
+    ///   3. SASHIKO__* env vars    — per-invocation overrides
     pub fn new() -> Result<Self, ConfigError> {
-        let s = Config::builder()
-            // Start with default settings
-            .add_source(File::with_name("Settings"))
-            // Add settings from environment variables (with a prefix of SASHIKO)
-            // e.g. SASHIKO__SERVER__PORT=8081 would set the server port
+        let mut builder = Config::builder().add_source(File::with_name("Settings"));
+
+        if let Some(user_path) = Self::user_config_path() {
+            builder = builder.add_source(File::from(user_path).required(false));
+        }
+
+        let s = builder
             .add_source(Environment::with_prefix("SASHIKO").separator("__"))
             .build()?;
 
