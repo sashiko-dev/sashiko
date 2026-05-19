@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities};
@@ -20,7 +20,18 @@ pub fn fmt_thousands(n: u64) -> String {
     result
 }
 
-/// Format a token count with abbreviated suffix: 1.2M, 42.1k, or raw number.
+pub fn fmt_bytes(n: u64) -> String {
+    if n >= 1_073_741_824 {
+        format!("{:.1} GB", n as f64 / 1_073_741_824.0)
+    } else if n >= 1_048_576 {
+        format!("{:.1} MB", n as f64 / 1_048_576.0)
+    } else if n >= 1_024 {
+        format!("{:.1} KB", n as f64 / 1_024.0)
+    } else {
+        format!("{} B", n)
+    }
+}
+
 pub fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -45,6 +56,13 @@ pub struct CachingAiProvider {
 
 impl CachingAiProvider {
     pub async fn new(inner: Arc<dyn AiProvider>, cache_path: &str, ttl_days: u64) -> Result<Self> {
+        let file_size = std::fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+        info!(
+            "Opening response cache ({}, {}), this may take a moment...",
+            cache_path,
+            fmt_bytes(file_size)
+        );
+        let start = Instant::now();
         let db = libsql::Builder::new_local(cache_path).build().await?;
         let conn = db.connect()?;
 
@@ -92,12 +110,34 @@ impl CachingAiProvider {
             );
         }
 
+        let mut total_entries: u64 = 0;
+        // tokens_stored = SUM(tokens_saved) — total tokens across all unique entries,
+        // i.e. potential savings if each entry is hit once.
+        let mut total_tokens_stored: u64 = 0;
+        if let Ok(Some(row)) = conn
+            .query(
+                "SELECT COUNT(*), COALESCE(SUM(tokens_saved), 0) FROM response_cache",
+                (),
+            )
+            .await?
+            .next()
+            .await
+        {
+            total_entries = row.get::<u64>(0).unwrap_or(0);
+            total_tokens_stored = row.get::<u64>(1).unwrap_or(0);
+        }
+
         let session_start = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
 
-        info!("Response cache enabled ({})", cache_path);
+        info!(
+            "Response cache ready: {} entries, {} tokens stored, {:.2}s to load",
+            fmt_thousands(total_entries),
+            fmt_thousands(total_tokens_stored),
+            start.elapsed().as_secs_f64()
+        );
 
         Ok(Self {
             inner,
