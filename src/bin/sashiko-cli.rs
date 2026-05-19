@@ -619,14 +619,15 @@ fn find_best_review_for_patch(patch_id: i64, reviews: &[Value]) -> Option<&Value
 
 fn find_best_review_for_patch_refs<'a>(patch_id: i64, reviews: &[&'a Value]) -> Option<&'a Value> {
     let mut best: Option<&Value> = None;
+    let mut best_id: i64 = -1;
     for r in reviews {
         if r.get("patch_id").and_then(|id| id.as_i64()) != Some(patch_id) {
             continue;
         }
-        let status = r.get("status").and_then(|s| s.as_str());
-        let current_status = best.and_then(|pr| pr.get("status").and_then(|s| s.as_str()));
-        if status == Some("Reviewed") || current_status != Some("Reviewed") {
+        let rid = r.get("id").and_then(|id| id.as_i64()).unwrap_or(0);
+        if rid > best_id {
             best = Some(r);
+            best_id = rid;
         }
     }
     best

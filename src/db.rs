@@ -3453,7 +3453,15 @@ impl Database {
             )
             .await?;
 
-        // 3. Increment target_review_count only if it was previously Reviewed
+        // 3. Reset per-patch statuses so stale failure states don't persist
+        self.conn
+            .execute(
+                "UPDATE patches SET status = 'Pending', apply_error = NULL WHERE patchset_id = ?",
+                libsql::params![id],
+            )
+            .await?;
+
+        // 4. Increment target_review_count only if it was previously Reviewed
         if should_increment {
             self.conn
                 .execute(
@@ -3463,7 +3471,7 @@ impl Database {
                 .await?;
         }
 
-        // 4. Delete associated tool usages and findings for failed reviews that block retrying
+        // 5. Delete associated tool usages and findings for failed reviews that block retrying
         self.conn
             .execute(
                 "DELETE FROM tool_usages WHERE review_id IN (
