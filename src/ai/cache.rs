@@ -20,6 +20,17 @@ pub fn fmt_thousands(n: u64) -> String {
     result
 }
 
+/// Format a token count with abbreviated suffix: 1.2M, 42.1k, or raw number.
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 pub struct CachingAiProvider {
     inner: Arc<dyn AiProvider>,
     conn: libsql::Connection,
@@ -28,6 +39,8 @@ pub struct CachingAiProvider {
     hits_prev: AtomicU64,
     tokens_saved_this: AtomicU64,
     tokens_saved_prev: AtomicU64,
+    misses: AtomicU64,
+    tokens_stored: AtomicU64,
 }
 
 impl CachingAiProvider {
@@ -94,6 +107,8 @@ impl CachingAiProvider {
             hits_prev: AtomicU64::new(0),
             tokens_saved_this: AtomicU64::new(0),
             tokens_saved_prev: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            tokens_stored: AtomicU64::new(0),
         })
     }
 
@@ -182,6 +197,7 @@ impl AiProvider for CachingAiProvider {
         }
 
         debug!("Cache miss [{}]", hash_prefix);
+        self.misses.fetch_add(1, Ordering::Relaxed);
 
         let mut resp = self.inner.generate_content(request.clone()).await?;
 
@@ -227,6 +243,9 @@ impl AiProvider for CachingAiProvider {
             )
             .await;
 
+        self.tokens_stored
+            .fetch_add(tokens_saved as u64, Ordering::Relaxed);
+
         resp.cache_key = Some(hash);
         Ok(resp)
     }
@@ -257,6 +276,8 @@ impl AiProvider for CachingAiProvider {
             hits_prev_session: self.hits_prev.load(Ordering::Relaxed),
             tokens_saved_this_session: self.tokens_saved_this.load(Ordering::Relaxed),
             tokens_saved_prev_session: self.tokens_saved_prev.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            tokens_stored: self.tokens_stored.load(Ordering::Relaxed),
         })
     }
 }
@@ -290,7 +311,6 @@ mod tests {
     #[tokio::test]
     async fn test_poisoned_empty_response_evicted_on_read() {
         let conn = setup_test_db().await;
-        // Insert an entry whose response has no content and no tool calls
         let empty_resp = serde_json::json!({
             "content": null,
             "tool_calls": null,
@@ -302,7 +322,6 @@ mod tests {
             libsql::params![empty_resp.to_string()],
         ).await.unwrap();
 
-        // Verify the guard logic detects it
         let resp: AiResponse = serde_json::from_str(&empty_resp.to_string()).unwrap();
         let has_content = resp.content.as_ref().is_some_and(|c| !c.trim().is_empty());
         let has_tool_calls = resp.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
@@ -311,7 +330,6 @@ mod tests {
             "empty response should trigger eviction"
         );
 
-        // Verify a response with content passes
         let good_resp = serde_json::json!({
             "content": "{\"concerns\": [], \"dismissed_concerns\": []}",
             "tool_calls": null,
@@ -331,7 +349,6 @@ mod tests {
             libsql::params![],
         ).await.unwrap();
 
-        // Verify entry exists
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM response_cache WHERE request_hash = 'bad_entry'",
@@ -344,7 +361,6 @@ mod tests {
             1
         );
 
-        // Invalidate it
         let _ = conn
             .execute(
                 "DELETE FROM response_cache WHERE request_hash = ?",
@@ -352,7 +368,6 @@ mod tests {
             )
             .await;
 
-        // Verify it's gone
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM response_cache WHERE request_hash = 'bad_entry'",
@@ -368,8 +383,6 @@ mod tests {
 
     #[test]
     fn test_cache_key_not_serialized() {
-        // cache_key must be skipped during serialization so it doesn't
-        // get stored in the DB or alter the cached response_json.
         let resp = AiResponse {
             content: Some("test".to_string()),
             thought: None,
@@ -389,8 +402,28 @@ mod tests {
             "cache_key value must not appear in serialized JSON"
         );
 
-        // Deserializing without cache_key should default to None
         let parsed: AiResponse = serde_json::from_str(&json).unwrap();
         assert!(parsed.cache_key.is_none());
+    }
+
+    #[test]
+    fn test_fmt_tokens() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(500), "500");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
+        assert_eq!(fmt_tokens(1_500), "1.5k");
+        assert_eq!(fmt_tokens(42_100), "42.1k");
+        assert_eq!(fmt_tokens(999_999), "1000.0k");
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn test_fmt_thousands() {
+        assert_eq!(fmt_thousands(0), "0");
+        assert_eq!(fmt_thousands(999), "999");
+        assert_eq!(fmt_thousands(1_000), "1.000");
+        assert_eq!(fmt_thousands(1_234_567), "1.234.567");
     }
 }

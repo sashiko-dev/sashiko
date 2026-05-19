@@ -305,12 +305,15 @@ pub struct ProviderCapabilities {
 }
 
 /// Cache statistics returned by providers that support local response caching.
+/// Counters are cumulative; use snapshot-delta to get per-operation stats.
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
     pub hits_this_session: u64,
     pub hits_prev_session: u64,
     pub tokens_saved_this_session: u64,
     pub tokens_saved_prev_session: u64,
+    pub misses: u64,
+    pub tokens_stored: u64,
 }
 
 /// Trait defining the standard interface for all AI providers in Sashiko.

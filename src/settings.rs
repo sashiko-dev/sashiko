@@ -256,6 +256,10 @@ pub struct AiSettings {
     pub response_cache: bool,
     #[serde(default = "default_response_cache_ttl_days")]
     pub response_cache_ttl_days: u64,
+    /// Show per-patch and per-patchset response cache hit/miss statistics
+    /// in the CLI, web UI hover tooltips, and daemon log output.
+    #[serde(default)]
+    pub show_cache_stats: bool,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
