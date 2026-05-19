@@ -2635,6 +2635,67 @@ impl Database {
         }
     }
 
+    async fn fetch_reviews_json(
+        &self,
+        patchset_id: i64,
+        patch_ids: &[i64],
+        model_name: &Option<String>,
+        provider: &Option<String>,
+        prompts_git_hash: &Option<String>,
+        baseline: &Option<serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut reviews = Vec::new();
+        let mut in_clause = patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        if in_clause.is_empty() {
+            in_clause = "-1".to_string();
+        }
+        let query_str = format!(
+            "SELECT r.summary, r.created_at, ai.output_raw, \
+                    r.result_description, r.status, r.inline_review, r.logs, \
+                    ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, \
+                    r.cache_hits, r.cache_misses, r.cache_tokens_saved, r.cache_tokens_stored \
+             FROM reviews r \
+             LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id \
+             WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({})) \
+             ORDER BY r.created_at ASC",
+            in_clause
+        );
+
+        let mut params = vec![libsql::Value::Integer(patchset_id)];
+        for &pid_val in patch_ids {
+            params.push(libsql::Value::Integer(pid_val));
+        }
+
+        let mut rev_rows = self.conn.query(&query_str, params).await?;
+
+        while let Ok(Some(r)) = rev_rows.next().await {
+            reviews.push(serde_json::json!({
+                "summary": r.get::<Option<String>>(0).ok(),
+                "created_at": r.get::<Option<i64>>(1).ok(),
+                "output": r.get::<Option<String>>(2).ok(),
+                "result": r.get::<Option<String>>(3).ok(),
+                "status": r.get::<Option<String>>(4).ok(),
+                "inline_review": r.get::<Option<String>>(5).ok(),
+                "logs": r.get::<Option<String>>(6).ok(),
+                "tokens_in": r.get::<Option<u32>>(7).ok(),
+                "tokens_out": r.get::<Option<u32>>(8).ok(),
+                "patch_id": r.get::<Option<i64>>(9).ok(),
+                "id": r.get::<i64>(10).ok(),
+                "tokens_cached": r.get::<Option<u32>>(11).ok(),
+                "cache_hits": r.get::<Option<i64>>(12).ok(),
+                "cache_misses": r.get::<Option<i64>>(13).ok(),
+                "cache_tokens_saved": r.get::<Option<i64>>(14).ok(),
+                "cache_tokens_stored": r.get::<Option<i64>>(15).ok(),
+                "model": model_name.clone(),
+                "provider": provider.clone(),
+                "prompts_hash": prompts_git_hash.clone(),
+                "baseline": baseline.clone()
+            }));
+        }
+
+        Ok(reviews)
+    }
+
     pub async fn get_patchset_details(
         &self,
         id: i64,
@@ -2778,46 +2839,16 @@ impl Database {
             }
 
             // Fetch reviews
-            let mut reviews = Vec::new();
-            let mut in_clause = patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            if in_clause.is_empty() {
-                in_clause = "-1".to_string(); // Fallback so SQL doesn't error
-            }
-            let query_str = format!(
-                "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
-                 FROM reviews r
-                 LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-                 WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
-                 ORDER BY r.created_at ASC", in_clause);
-
-            let mut params = vec![libsql::Value::Integer(pid)];
-            for &pid_val in &patch_ids {
-                params.push(libsql::Value::Integer(pid_val));
-            }
-
-            let mut rev_rows = self.conn.query(&query_str, params).await?;
-
-            while let Ok(Some(r)) = rev_rows.next().await {
-                reviews.push(serde_json::json!({
-                    "summary": r.get::<Option<String>>(0).ok(),
-                    "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(3).ok(),
-                    "result": r.get::<Option<String>>(4).ok(),
-                    "status": r.get::<Option<String>>(5).ok(),
-                    "inline_review": r.get::<Option<String>>(6).ok(),
-                    "logs": r.get::<Option<String>>(7).ok(),
-                    "tokens_in": r.get::<Option<u32>>(8).ok(),
-                    "tokens_out": r.get::<Option<u32>>(9).ok(),
-                    "patch_id": r.get::<Option<i64>>(10).ok(),
-                    "id": r.get::<i64>(11).ok(),
-                    "tokens_cached": r.get::<Option<u32>>(12).ok(),
-                    "model": model_name.clone(),
-                    "provider": provider.clone(),
-                    "prompts_hash": prompts_git_hash.clone(),
-                    "baseline": baseline.clone()
-                }));
-            }
+            let reviews = self
+                .fetch_reviews_json(
+                    pid,
+                    &patch_ids,
+                    &model_name,
+                    &provider,
+                    &prompts_git_hash,
+                    &baseline,
+                )
+                .await?;
 
             // Fetch thread messages
             let mut messages = Vec::new();
@@ -3015,45 +3046,16 @@ impl Database {
                 }));
             }
 
-            let mut reviews = Vec::new();
-            let mut in_clause = patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            if in_clause.is_empty() {
-                in_clause = "-1".to_string();
-            }
-            let query_str = format!(
-                "SELECT r.summary, r.created_at, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
-                 FROM reviews r
-                 LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-                 WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
-                 ORDER BY r.created_at ASC", in_clause);
-
-            let mut params = vec![libsql::Value::Integer(pid)];
-            for &pid_val in &patch_ids {
-                params.push(libsql::Value::Integer(pid_val));
-            }
-
-            let mut rev_rows = self.conn.query(&query_str, params).await?;
-
-            while let Ok(Some(r)) = rev_rows.next().await {
-                reviews.push(serde_json::json!({
-                    "summary": r.get::<Option<String>>(0).ok(),
-                    "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(2).ok(),
-                    "result": r.get::<Option<String>>(3).ok(),
-                    "status": r.get::<Option<String>>(4).ok(),
-                    "inline_review": r.get::<Option<String>>(5).ok(),
-                    "tokens_in": r.get::<Option<u32>>(6).ok(),
-                    "tokens_out": r.get::<Option<u32>>(7).ok(),
-                    "patch_id": r.get::<Option<i64>>(8).ok(),
-                    "id": r.get::<i64>(9).ok(),
-                    "tokens_cached": r.get::<Option<u32>>(10).ok(),
-                    "model": model_name.clone(),
-                    "provider": provider.clone(),
-                    "prompts_hash": prompts_git_hash.clone(),
-                    "baseline": baseline.clone()
-                }));
-            }
+            let reviews = self
+                .fetch_reviews_json(
+                    pid,
+                    &patch_ids,
+                    &model_name,
+                    &provider,
+                    &prompts_git_hash,
+                    &baseline,
+                )
+                .await?;
 
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {

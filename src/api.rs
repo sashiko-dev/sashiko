@@ -129,6 +129,7 @@ pub struct AppState {
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
     pub dry_run: bool,
+    pub show_cache_stats: bool,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
     stats_tools_cache: AsyncCache<serde_json::Value>,
@@ -245,6 +246,7 @@ pub fn build_router(
     allow_all_submit: bool,
     smtp_enabled: bool,
     dry_run: bool,
+    show_cache_stats: bool,
 ) -> Router {
     let state = Arc::new(AppState {
         db,
@@ -254,6 +256,7 @@ pub fn build_router(
         allow_all_submit,
         smtp_enabled,
         dry_run,
+        show_cache_stats,
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -293,6 +296,7 @@ pub async fn run_server(
     allow_all_submit: bool,
     smtp_enabled: bool,
     dry_run: bool,
+    show_cache_stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(
         db,
@@ -302,6 +306,7 @@ pub async fn run_server(
         allow_all_submit,
         smtp_enabled,
         dry_run,
+        show_cache_stats,
     );
 
     let bind_addr = format!("{}:{}", settings.host, settings.port);
@@ -695,6 +700,10 @@ async fn get_patchset(
                     "dry_run".to_string(),
                     serde_json::Value::Bool(state.dry_run),
                 );
+                obj.insert(
+                    "show_cache_stats".to_string(),
+                    serde_json::Value::Bool(state.show_cache_stats),
+                );
             }
             Ok(Json(details))
         }
@@ -764,6 +773,10 @@ async fn get_patchset_summary(
                 obj.insert(
                     "dry_run".to_string(),
                     serde_json::Value::Bool(state.dry_run),
+                );
+                obj.insert(
+                    "show_cache_stats".to_string(),
+                    serde_json::Value::Bool(state.show_cache_stats),
                 );
             }
             Ok(Json(details))

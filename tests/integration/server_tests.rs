@@ -49,6 +49,7 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
         /* allow_all_submit */ true,
         /* smtp_enabled */ false,
         /* dry_run */ true,
+        /* show_cache_stats */ false,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

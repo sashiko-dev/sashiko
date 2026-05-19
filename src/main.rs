@@ -508,6 +508,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allow_all_submit = cli.enable_unsafe_all_submit;
     let smtp_enabled = settings.smtp.is_some();
     let dry_run = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false);
+    let show_cache_stats = settings.ai.show_cache_stats;
     tokio::spawn(async move {
         if let Err(e) = sashiko::api::run_server(
             api_settings,
@@ -517,6 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_all_submit,
             smtp_enabled,
             dry_run,
+            show_cache_stats,
         )
         .await
         {
