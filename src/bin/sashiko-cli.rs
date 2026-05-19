@@ -1491,6 +1491,8 @@ async fn handle_cancel(
                 }
             }
         }
+    } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!("Patchset {} not found", id));
     } else {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();

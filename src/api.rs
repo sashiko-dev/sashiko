@@ -993,7 +993,7 @@ async fn cancel_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let cancelled = state
+    let result = state
         .db
         .cancel_patchset(query.id, query.force)
         .await
@@ -1002,19 +1002,23 @@ async fn cancel_patchset(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    if cancelled {
-        info!("Patchset {} cancelled (force={})", query.id, query.force);
-        Ok(Json(serde_json::json!({ "status": "cancelled" })))
-    } else {
-        let reason = if query.force {
-            "Patchset is not in a cancellable state (must be Pending, Incomplete, or In Review)"
-        } else {
-            "Patchset is not in a cancellable state (must be Pending or Incomplete; use force=true for In Review)"
-        };
-        Ok(Json(serde_json::json!({
-            "status": "not_modified",
-            "reason": reason
-        })))
+    match result {
+        None => Err(StatusCode::NOT_FOUND),
+        Some(true) => {
+            info!("Patchset {} cancelled (force={})", query.id, query.force);
+            Ok(Json(serde_json::json!({ "status": "cancelled" })))
+        }
+        Some(false) => {
+            let reason = if query.force {
+                "Patchset is not in a cancellable state (must be Pending, Incomplete, or In Review)"
+            } else {
+                "Patchset is not in a cancellable state (must be Pending or Incomplete; use force=true for In Review)"
+            };
+            Ok(Json(serde_json::json!({
+                "status": "not_modified",
+                "reason": reason
+            })))
+        }
     }
 }
 
