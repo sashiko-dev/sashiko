@@ -548,26 +548,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to prune stale worktrees: {}", e);
     }
 
-    if let Some(custom_remotes) = &settings.git.custom_remotes {
-        for remote in custom_remotes {
-            info!(
-                "Ensuring custom remote {} -> {}",
-                remote.name,
-                sashiko::utils::redact_secret(&remote.url)
-            );
-            if let Err(e) =
-                sashiko::git_ops::ensure_remote(&repo_path, &remote.name, &remote.url, false).await
-            {
-                error!("Failed to ensure custom remote {}: {}", remote.name, e);
-            }
-        }
-    }
-
-    // Start Reviewer Service
+    // Start Reviewer Service before custom remote fetches — fetching repos
+    // from git.kernel.org over IPv6 can be sluggish, and blocking here would
+    // delay the reviewer from picking up pending patchsets.  The reviewer
+    // calls ensure_remote() itself when it needs a baseline from a custom
+    // remote, so patchsets targeting those repos will wait for the fetch at
+    // that point while other patchsets proceed without delay.
     let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
     tokio::spawn(async move {
         reviewer.start().await;
     });
+
+    // Warm up custom remotes in a background task so slow fetches
+    // (e.g. pahole from git.kernel.org via IPv6) don't block startup.
+    let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
+    if let Some(custom_remotes) = settings.git.custom_remotes.clone() {
+        tokio::spawn(async move {
+            for remote in custom_remotes {
+                info!("Ensuring custom remote {} -> {}", remote.name, remote.url);
+                if let Err(e) =
+                    sashiko::git_ops::ensure_remote(&repo_path, &remote.name, &remote.url, false)
+                        .await
+                {
+                    error!("Failed to ensure custom remote {}: {}", remote.name, e);
+                }
+            }
+        });
+    }
 
     let metrics_db = db.clone();
     tokio::spawn(async move {
