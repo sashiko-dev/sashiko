@@ -447,6 +447,20 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 effort: cfg.and_then(|c| c.effort.clone()),
             }))
         }
+        "devin-cli" => {
+            let cfg = settings.ai.devin_cli.as_ref();
+            // An empty model string in [ai] means "use the devin default".
+            let model = if settings.ai.model.is_empty() {
+                None
+            } else {
+                Some(settings.ai.model.clone())
+            };
+            Ok(Arc::new(devin_cli::DevinCliProvider {
+                model,
+                agent_config: cfg.and_then(|c| c.agent_config.clone()),
+                config: cfg.and_then(|c| c.config.clone()),
+            }))
+        }
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: settings.ai.model.clone(),
         })),
@@ -506,6 +520,7 @@ pub mod claude;
 pub mod claude_cli;
 pub mod codex_cli;
 pub mod copilot_cli;
+pub mod devin_cli;
 pub mod gemini;
 pub mod kiro_cli;
 pub mod openai;

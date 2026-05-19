@@ -219,6 +219,21 @@ pub struct ClaudeCliSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct DevinCliSettings {
+    /// Path to a Devin declarative agent config file (JSON or YAML) passed via
+    /// `--agent-config`. Use this to disable all tools for a strictly
+    /// text-completion backend.
+    #[serde(default)]
+    pub agent_config: Option<String>,
+    /// Path to a Devin config file passed via `--config`. Use this to apply
+    /// custom permission rules (e.g. deny-all) for the provider session
+    /// without polluting the user's `~/.config/devin/config.json`.
+    #[serde(default)]
+    pub config: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct AiSettings {
     pub provider: String,
     pub model: String,
@@ -250,6 +265,7 @@ pub struct AiSettings {
     pub openai_compat: Option<OpenAiCompatSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
+    pub devin_cli: Option<DevinCliSettings>,
 }
 
 fn default_response_cache_ttl_days() -> u64 {

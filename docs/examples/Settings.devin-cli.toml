@@ -1,0 +1,16 @@
+[ai]
+provider = "devin-cli"
+# Leave model as an empty string to use the devin CLI default, or set e.g. "opus", "swe", "gpt".
+model = "opus"
+max_input_tokens = 200000
+max_interactions = 150
+
+[ai.devin_cli]
+# Path to a declarative agent config (JSON/YAML) that disables tools, for use
+# as a strict text-completion backend. See `devin --help` for the schema.
+# agent_config = "/path/to/agent.json"
+
+# Path to a Devin config file with custom permission rules. Useful for
+# applying a deny-all permissions block without touching the user's
+# ~/.config/devin/config.json.
+# config = "/path/to/devin-config.json"

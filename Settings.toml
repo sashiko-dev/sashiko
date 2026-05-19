@@ -60,6 +60,12 @@ temperature = 1.0
 # max_input_tokens = 40000
 # max_interactions = 50
 
+# To use Devin CLI (fixed-cost subscription, no API key needed):
+# provider = "devin-cli"
+# model = "opus"
+# max_input_tokens = 200000
+# max_interactions = 150
+
 [ai.claude]
 prompt_caching = true
 # thinking = "enabled"    # Enable extended thinking (or "adaptive" for Sonnet 4.6+)

@@ -102,7 +102,7 @@ export LLM_API_KEY="your-api-key-here"
 ```
 
 For Claude, Claude Code CLI, GitHub Copilot CLI, AWS Bedrock, Vertex AI,
-Kiro CLI, and OpenAI-compatible endpoints, see the
+Kiro CLI, Devin CLI, and OpenAI-compatible endpoints, see the
 [LLM Provider Configuration Guide](docs/llm-providers.md).
 
 #### 3.  **Build**:

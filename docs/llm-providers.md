@@ -246,6 +246,27 @@ cp docs/examples/Settings.codex-cli.toml Settings.toml
 - Prompt sent via stdin to avoid `ARG_MAX` issues
 - No tool access -- sandbox is read-only
 
+#### Devin CLI Setup
+
+Sashiko can use a local [Devin for Terminal](https://cli.devin.ai/) install as
+a completion backend. This path uses your Devin subscription, so there is no
+per-token API charge and no API key to configure.
+
+**Prerequisites**:
+- `devin` CLI installed and on `$PATH`
+- Authenticated session (run `devin auth login` once)
+
+**Update Settings.toml**:
+Copy `examples/Settings.devin-cli.toml` to your `Settings.toml` and adjust as needed.
+
+**Notes**:
+- `model` accepts any identifier `devin --model` accepts (e.g. `opus`,
+  `swe`, `gpt`, `codex`). Leave it empty in `[ai]` to use the Devin default.
+- Sashiko invokes `devin --print --prompt-file <tmp>`
+  per request. The prompt is written to a temp file which is passed to `devin`.
+- Each review may spawn many `devin` processes. Lower `review.concurrency`
+  if you hit subscription rate limits.
+
 ## OpenAI-Compatible Providers
 
 Sashiko includes an OpenAI-compatible provider for endpoints that
