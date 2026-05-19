@@ -589,6 +589,19 @@ impl Reviewer {
                     let handle = tokio::spawn(async move {
                         let mut failed = 0;
                         loop {
+                            if ctx_clone
+                                .db
+                                .get_patchset_status(patchset_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .as_deref()
+                                == Some(ReviewStatus::Cancelled.as_str())
+                            {
+                                info!("Patchset {} cancelled, stopping review", patchset_id);
+                                queue.lock().await.clear();
+                                break;
+                            }
                             let job = {
                                 let mut q = queue.lock().await;
                                 q.pop()
@@ -636,6 +649,19 @@ impl Reviewer {
             // Main worker loop uses the existing worktree
             let mut main_failed = 0;
             loop {
+                if ctx
+                    .db
+                    .get_patchset_status(patchset_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(ReviewStatus::Cancelled.as_str())
+                {
+                    info!("Patchset {} cancelled, stopping review", patchset_id);
+                    valid_jobs_queue.lock().await.clear();
+                    break;
+                }
                 let job = {
                     let mut q = valid_jobs_queue.lock().await;
                     q.pop()
