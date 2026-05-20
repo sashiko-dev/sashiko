@@ -45,13 +45,11 @@ Provides a safe, read-only interface to the system.
     - `read_files(files, mode)`: Read one or more files or line ranges.
     - `list_dir(path)`: Explore directory structure.
 - **Worker Tools**:
-    - `todo_write(task, status)`: Help worker track progress as required by prompts.
     - `read_prompt(name)`: Read specific guideline from `review-prompts/`.
 - **Safety**: Strictly validates paths to ensure they stay within the repo or submodule.
 
 #### E. State Management
 - **Conversation History**: Full history of turns, tool calls, and results.
-- **Todo List**: Internal tracker for "TodoWrite" requests from prompts (e.g., Task 1-6 for each category).
 - **Worktree**: A dedicated `git worktree` where the patch is applied for analysis.
 
 

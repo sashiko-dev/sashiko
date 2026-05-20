@@ -22,7 +22,6 @@ use ignore::WalkBuilder;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 fn validate_git_args(
@@ -215,17 +214,6 @@ impl ToolBox {
                     "required": ["pattern"]
                 }),
             },
-            AiTool {
-                name: "TodoWrite".to_string(),
-                description: "Add a new TODO item to the TODO.md file.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "content": { "type": "string", "description": "The TODO item content." }
-                    },
-                    "required": ["content"]
-                }),
-            },
         ];
 
         if self.prompts_path.is_some() {
@@ -260,7 +248,6 @@ impl ToolBox {
             "list_dir" => self.list_dir(args).await,
             "search_file_content" => self.search_file_content(args).await,
             "find_files" => self.find_files(args).await,
-            "todowrite" => self.todowrite(args).await,
             "read_prompt" => self.read_prompt(args).await,
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
@@ -783,28 +770,6 @@ impl ToolBox {
 
         Ok(json!({ "files": content }))
     }
-
-    async fn todowrite(&self, args: Value) -> Result<Value> {
-        let content = args["content"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing content"))?;
-
-        // We use validate_path to ensure we are staying within the worktree,
-        // although we hardcode the filename.
-        let path = self.validate_path("TODO.md", &self.worktree_path)?;
-
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-
-        file.write_all(format!("- [ ] {}\n", content).as_bytes())
-            .await?;
-        file.flush().await?;
-
-        Ok(json!({ "status": "success", "message": "TODO added." }))
-    }
 }
 
 #[cfg(test)]
@@ -853,45 +818,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_todowrite() -> Result<()> {
-        let dir = tempdir()?;
-        let toolbox = ToolBox::new(dir.path().to_path_buf(), None);
-
-        let args = json!({
-            "content": "Implement more features"
-        });
-        toolbox.call("todowrite", args).await?;
-
-        let todo_path = dir.path().join("TODO.md");
-        let content = std::fs::read_to_string(todo_path)?;
-        assert!(content.contains("- [ ] Implement more features"));
-
-        // Append another one
-        let args2 = json!({
-            "content": "Fix bugs"
-        });
-        toolbox.call("todowrite", args2).await?;
-        let content = std::fs::read_to_string(dir.path().join("TODO.md"))?;
-        assert!(content.contains("- [ ] Implement more features"));
-        assert!(content.contains("- [ ] Fix bugs"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_tool_normalization() -> Result<()> {
         let dir = tempdir()?;
         let toolbox = ToolBox::new(dir.path().to_path_buf(), None);
 
         // Test with whitespace and mixed case
         let args = json!({
-            "content": "Normalization test"
+            "path": "."
         });
-        toolbox.call("  TodoWrite  ", args).await?;
+        let result = toolbox.call("  List_Dir  ", args).await?;
 
-        let todo_path = dir.path().join("TODO.md");
-        let content = std::fs::read_to_string(todo_path)?;
-        assert!(content.contains("- [ ] Normalization test"));
+        assert!(result["entries"].is_array());
 
         Ok(())
     }
