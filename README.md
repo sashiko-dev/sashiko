@@ -87,13 +87,8 @@ cd sashiko
 *Note: The `--recursive` flag is important to initialize the `linux` kernel source submodule.*
 
 #### 2.  **Configuration**:
-Copy `Settings.toml` to customize your configuration. The default `Settings.toml` includes sections for:
-*   **Database**: SQLite database path (`sashiko.db`).
-*   **NNTP**: Server details and groups to monitor.
-*   **AI**: Provider and model selection.
-*   **Server**: API server host and port.
-*   **Git**: Path to the reference kernel repository.
-*   **Review**: Concurrency and worktree settings.
+Copy an example config to get started. For a full reference of every
+setting, see the [Configuration Reference](docs/configuration.md).
 
 #### Configuring the LLM Provider
 
@@ -167,22 +162,9 @@ URL to access it from localhost.
 
 ## Benchmarking
 
-To evaluate the AI's review performance against a set of known issues, follow this workflow:
-
-1.  **Prepare the environment:**
-    Move or drop the existing database to start with a clean state.
-    ```bash
-    mv sashiko.db sashiko.db.bak
-    ```
-
-2.  **Run the benchmark tool:**
-    Use the unified `benchmark` tool with a benchmark JSON file (e.g., `benchmark_small.json`). This tool will automatically ingest the patches, wait for all AI review processes to complete in the background, and then dynamically evaluate the generated findings against ground-truth descriptions.
-    ```bash
-    cargo run --bin benchmark -- --file benchmarks/benchmark_small.json
-    ```
-
-    *   A summary of detection rates (Detected, Missed, Partially Detected) along with performance metrics (Average Tokens In/Out, Average Turns, Average Time) and counts of total concerns and findings will be printed to the console upon completion.
-    *   Detailed evaluation results are written to `benchmark_results.json` in the current working directory, which contains explanations from the AI judge for each finding.
+Sashiko includes a benchmark tool to evaluate review quality against known
+bugs. See the [Benchmarking Guide](docs/benchmarking.md) for setup and
+usage.
 
 ## Communication
 
