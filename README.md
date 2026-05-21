@@ -292,58 +292,33 @@ sashiko
 
 ### 2. CLI
 
-The CLI allows you to interact with the running Sashiko daemon from your terminal.
+The CLI (`sashiko-cli`) allows you to interact with the running Sashiko daemon
+or run standalone local reviews from your terminal. For the full command
+reference, including local review setup and all options, see the
+[CLI Reference](docs/sashiko-cli.md).
 
-To run the CLI:
+Quick start:
 
 ```bash
-sashiko-cli [OPTIONS] [COMMAND]
+# Submit patches to a running daemon
+sashiko-cli submit HEAD~3..HEAD
+
+# Run a local review (no daemon required)
+sashiko-cli local --force-local
+
+# Check review status
+sashiko-cli show latest
 ```
 
-(Or from source: `cargo run --bin sashiko-cli -- [OPTIONS] [COMMAND]`,
+(From source: `cargo run --bin sashiko-cli -- [OPTIONS] [COMMAND]`,
 or via Nix: `nix profile add github:sashiko-dev/sashiko`)
 
-**Global Options:**
+### 3. Local Review
 
-- **`--server <SERVER>`**: Override the server URL.
-- **`--format <FORMAT>`**: Switch between text and json output.
-- **`--color <COLOR>`**: Control color output (`auto`, `always`, `never`).
-- **`-V, --version`**: Print the tool version.
-
-**Commands:**
-
-- **`submit [INPUT]`**: Submit a patch or range for review.
-  - `INPUT` can be a file path (mbox), a commit SHA, or a range (e.g., `HEAD~3..HEAD`).
-  - If `INPUT` is omitted and stdin is piped, it reads an mbox from stdin.
-  - If `INPUT` is omitted and stdin is a terminal, it defaults to the current `HEAD`.
-- **`status`**: Show the current server status and queue statistics.
-- **`list [FILTER]`**: List recent patchsets.
-  - `FILTER` can be a status (e.g., `pending`, `failed`, `reviewed`) or a search term.
-- **`show [ID]`**: Show detailed information about a patchset and its AI review.
-  - `ID` defaults to `latest`.
-- **`rerun`**: Request a re-review of a completed patchset.
-- **`cancel`**: Cancel a pending review.
-- **`local`**: Run a local review.
-- **`help`**: Print help messages.
-
-### 3. Getting Sashiko to Review Your Kernel Patch Series Locally
-
-Sashiko is highly effective for reviewing your own changes during local kernel
-development. To get the most out of it:
-
-1.  **Configure `Settings.toml`**: Set `git.repository_path` to the absolute
-    path of the repository you are actively developing in.
-    ```toml
-    [git]
-    repository_path = "/home/user/src/linux"
-    ```
-2.  **Submit for Review**: Use the CLI to submit your recent commits. Since
-    the daemon is looking at the same directory, you can use relative references
-    like `HEAD` or ranges.
-    ```bash
-    # Review the latest 3 commits in your local dev tree
-    sashiko-cli submit HEAD~3..HEAD
-    ```
+Sashiko can review your patches locally without sending emails to LKML or
+updating sashiko.dev. See the
+[CLI Reference](docs/sashiko-cli.md#local) for full setup, options, and
+a comparison of all three review modes.
 
 ### 4. Web Interface
 
