@@ -1,0 +1,25 @@
+# Sashiko Email Policy Example
+#
+# Copy this file to your project root as email_policy.toml and adjust.
+# This file controls how Sashiko sends (or suppresses) review emails.
+
+[defaults]
+# Whether the bot is allowed to send emails to public mailing lists.
+# If false, emails will be restricted to private recipients (author/maintainers).
+reply_all = false
+
+# Whether to send the review email to the author of the patch.
+reply_to_author = false
+
+# Whether to include other maintainers/CCs in the review email.
+cc_maintainers = false
+
+# If true, the bot will completely mute (not send) emails for this scope.
+mute_all = true
+
+# A list of static email addresses that should always receive a copy (CC'd).
+cc = []
+
+# A list of author email addresses that will be completely ignored by the system,
+# meaning their submissions will never be considered as patches and will never be reviewed.
+ignored_emails = []

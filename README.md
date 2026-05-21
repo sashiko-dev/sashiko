@@ -99,12 +99,12 @@ Copy `Settings.toml` to customize your configuration. The default `Settings.toml
 
 Sashiko supports multiple LLM providers (e.g. `gemini`). You must configure the provider and model in `Settings.toml`. There are no default values, so please set them explicitly.
 
-For example configurations of each supported provider, see the `examples/` directory.
+For example configurations of each supported provider, see the `docs/examples/` directory.
 
 You can copy the base Gemini configuration like so:
 
 ```bash
-cp examples/Settings.example.toml Settings.toml
+cp docs/examples/Settings.example.toml Settings.toml
 ```
 
 You can also configure settings via environment variables using the `SASHIKO` prefix and `__` (double underscore) as the separator between every segment (e.g., `SASHIKO__AI__PROVIDER=gemini`).
@@ -128,7 +128,7 @@ export LLM_API_KEY="sk-ant-..."
 ```
 
 **Update Settings.toml**:
-Copy `examples/Settings.claude.toml` to your `Settings.toml` and adjust as needed.
+Copy `docs/examples/Settings.claude.toml` to your `Settings.toml` and adjust as needed.
 
 **Features**:
 - Automatic prompt caching (5-minute TTL) reduces costs for repeated context
@@ -146,7 +146,7 @@ no per-token API charge and no API key to configure.
 **Prerequisites**: Install Claude Code and sign in. Verify with `claude --version`.
 
 **Update Settings.toml**:
-Copy `examples/Settings.claude-cli.toml` to your `Settings.toml` and adjust as needed.
+Copy `docs/examples/Settings.claude-cli.toml` to your `Settings.toml` and adjust as needed.
 
 `model` accepts any identifier the CLI accepts via `--model`: aliases like
 `opus` or `sonnet`, or full names like `claude-opus-4-7`, `claude-sonnet-4-6`.
@@ -186,7 +186,7 @@ subscription, so there is no per-token API charge and no API key to configure.
 - Authenticated session (run `copilot` once interactively to authenticate)
 
 **Update Settings.toml**:
-Copy `examples/Settings.copilot-cli.toml` to your `Settings.toml` and adjust as needed.
+Copy `docs/examples/Settings.copilot-cli.toml` to your `Settings.toml` and adjust as needed.
 
 **Notes**:
 - `model` follows GitHub Copilot's catalog (e.g. `claude-sonnet-4.5`,
@@ -220,7 +220,7 @@ aws configure
 ```
 
 **Update Settings.toml**:
-Copy `examples/Settings.claude-bedrock.toml` to your `Settings.toml` and adjust as needed.
+Copy `docs/examples/Settings.claude-bedrock.toml` to your `Settings.toml` and adjust as needed.
 
 **Features**:
 - Uses the Converse API — works with any Bedrock-hosted model
@@ -246,7 +246,7 @@ export CLOUD_ML_REGION="us-east5"  # or "global" for global endpoints
 ```
 
 **Update Settings.toml**:
-Copy `examples/Settings.claude-vertex.toml` to your `Settings.toml` and adjust as needed.
+Copy `docs/examples/Settings.claude-vertex.toml` to your `Settings.toml` and adjust as needed.
 
 **Features**:
 - Model-agnostic routing layer — currently supports Claude, extensible to other model families
@@ -262,7 +262,7 @@ Sashiko supports using the local `kiro-cli` as a completion backend.
 **Prerequisites**: Install `kiro-cli` and authenticate with `KIRO_API_KEY` or a browser login.
 
 **Update Settings.toml**:
-Copy `examples/Settings.kiro-cli.toml` to your `Settings.toml` and adjust as needed.
+Copy `docs/examples/Settings.kiro-cli.toml` to your `Settings.toml` and adjust as needed.
 
 **Features**:
 - Runs `kiro-cli acp` as a stateless completion backend
