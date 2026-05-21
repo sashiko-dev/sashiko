@@ -56,7 +56,7 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compat`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compat`. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
@@ -164,16 +164,37 @@ annotated example.
 |-----|------|---------|-------------|
 | `defaults.reply_all` | bool | `false` | Allow sending to public mailing lists. |
 | `defaults.reply_to_author` | bool | `false` | Send review to the patch author. |
-| `defaults.cc_maintainers` | bool | `false` | CC maintainers on review emails. |
+| `defaults.cc_individuals` | bool | `false` | CC individual recipients (non-mailing-list) on review emails. |
 | `defaults.mute_all` | bool | `true` | Suppress all email sending. |
 | `defaults.cc` | list | `[]` | Static CC addresses. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses to ignore entirely. |
+| `defaults.subject_prefixes` | list | `[]` | Subject prefix patterns to match for this scope. |
+| `defaults.embargo_hours` | integer | -- | Hours to wait before sending a review. When a patch matches multiple subsystems, the shortest configured embargo wins. |
+| `defaults.send_positive_review` | bool | `false` | Send email even when no issues are found. |
+
+The email policy also supports per-subsystem overrides via
+`[subsystems.<name>]` sections. Each subsystem section accepts the same
+fields as `[defaults]`, plus:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `lists` | list | `[]` | Mailing list addresses that map to this subsystem. |
+| `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this subsystem. |
+| `patchwork.api_url` | string | -- | Patchwork API URL. |
+| `patchwork.token` | string | -- | Patchwork API token. |
 
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `LLM_API_KEY` | API key for the configured LLM provider (fallback for provider-specific vars). |
+| `LLM_API_KEY` | API key for the configured LLM provider (universal fallback). |
+| `GEMINI_API_KEY` | API key for Gemini (takes precedence over `LLM_API_KEY`). |
 | `ANTHROPIC_API_KEY` | API key for Claude (takes precedence over `LLM_API_KEY`). |
+| `OPENAI_API_KEY` | API key for OpenAI-compatible providers (takes precedence over `LLM_API_KEY`). |
+| `ANTHROPIC_BASE_URL` | Override the Claude API base URL (for proxies). |
+| `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID for Vertex AI provider. |
+| `CLOUD_ML_REGION` | GCP region for Vertex AI provider. |
 | `SASHIKO_SERVER` | Override daemon URL for CLI commands. |
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
+| `NO_COLOR` | Disable ANSI color output. |
+| `SASHIKO_LOG_PLAIN` | Use plain log format (no level/target/timestamp). |

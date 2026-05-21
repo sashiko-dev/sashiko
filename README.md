@@ -23,7 +23,7 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 
 - **Automated Ingestion**: Monitors mailing lists (using `lore.kernel.org`) for new patch submissions.
 - **Manual Ingestion**: Can ingest patches from a local git repository.
-- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini, Claude, and GitHub Copilot CLI are currently supported).
+- **Self-contained**: Doesn't depend on 3rd-party tools and can work with various LLM providers (Gemini, Claude, GitHub Copilot CLI, and others).
 - **Web interface and CLI**: Provides a web interface and a CLI tool. Email support will be added soon.
 
 ## Prompts

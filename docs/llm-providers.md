@@ -226,6 +226,26 @@ cp docs/examples/Settings.kiro-cli.toml Settings.toml
 - An isolated temporary agent with a deny-all hook prevents accidental
   tool execution
 
+## Codex CLI
+
+Uses a local [Codex CLI](https://github.com/openai/codex) (OpenAI)
+installation as the completion backend. This uses your Codex
+subscription -- no per-token charge, no API key.
+
+**Prerequisites:** Install the `codex` CLI and authenticate.
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.codex-cli.toml Settings.toml
+```
+
+**What you get:**
+
+- Runs `codex exec --json --sandbox read-only` as a stateless backend
+- Prompt sent via stdin to avoid `ARG_MAX` issues
+- No tool access -- sandbox is read-only
+
 ## OpenAI-Compatible Providers
 
 Sashiko includes an OpenAI-compatible provider for endpoints that

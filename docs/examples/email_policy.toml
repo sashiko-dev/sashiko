@@ -11,8 +11,8 @@ reply_all = false
 # Whether to send the review email to the author of the patch.
 reply_to_author = false
 
-# Whether to include other maintainers/CCs in the review email.
-cc_maintainers = false
+# Whether to include individual recipients (non-mailing-list) in the review email.
+cc_individuals = false
 
 # If true, the bot will completely mute (not send) emails for this scope.
 mute_all = true
