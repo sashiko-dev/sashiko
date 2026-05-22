@@ -20,6 +20,8 @@ Perform a deep, scrutinizing code review of the target code against the gathered
 - **Safety:** Are there any risky operations (e.g., unchecked unwraps, poor error handling, thread safety issues, SQL injection risks)?
 - **Idiomatic Conventions:** Does the code use the language idiomatic patterns and the project-specific coding standards defined in `GEMINI.md`?
 - **SOLID/DRY Principles:** Reference [references/principles.md](references/principles.md) and evaluate the code for adherence to SOLID and DRY principles within the Rust context.
+- **Clone Discipline:** If the code calls `.clone()` on expensive-to-clone structures, reference
+[references/clone-discipline.md](references/clone-discipline.md) and evaluate the code for adherence to clone discipline.
 - **Test Coverage:** Are unit or integration tests missing for new logic?
 
 ### 3. Reporting
