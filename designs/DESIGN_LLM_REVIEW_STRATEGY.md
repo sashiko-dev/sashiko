@@ -18,7 +18,7 @@ Instead of asking for a review directly, we force a multi-step reasoning process
 > "You are reviewing a patch. Do not output the review yet. First, perform the following analysis steps:
 > 1.  **Summary**: Briefly summarize what the patch claims to do.
 > 2.  **Safety Check**: List potential security implications (buffer overflows, UAF).
-> 3.  **Context Verification**: Identify external functions/structs modified. Do you need to see their definitions? (Use `read_file` if so).
+> 3.  **Context Verification**: Identify external functions/structs modified. Do you need to see their definitions? (Use `read_files` if so).
 > 4.  **Style Check**: Does it match kernel coding style?
 > 5.  **Plan**: What specific files or lines do you need to inspect to verify correctness?"
 
@@ -38,7 +38,7 @@ The System Prompt must strictly define the persona to avoid "helpful assistant" 
 ### A. The "Needle in a Haystack" Problem
 The Linux kernel is too large for the context window. The worker must *retrieval-augment* itself.
 -   **Initial Context**: Cover letter + Patch diffs (limited to N lines).
--   **Active Retrieval**: The Worker *must* use tools (`git_grep`, `read_file`) to fetch definitions of modified functions.
+-   **Active Retrieval**: The Worker *must* use tools (`search_file_content`, `read_files`) to fetch definitions of modified functions.
     -   *Rule*: "If a patch modifies `foo()`, you must read the definition of `foo()` unless it's trivial."
 -   **Diff Context Expansion**: Allow the worker to request `git_diff -U20` if the default context is insufficient.
 
@@ -51,7 +51,7 @@ The Linux kernel is too large for the context window. The worker must *retrieval
 ### A. Tool Use Enforcement
 -   **Problem**: LLMs might hallucinate file content or API existence.
 -   **Solution**:
-    -   **Mandatory Verification**: Before claiming "function X does not exist", the worker must execute `git_grep X`.
+    -   **Mandatory Verification**: Before claiming "function X does not exist", the worker must execute `search_file_content` for `X`.
     -   **Loop Prevention**: If the worker asks for the same file twice, interrupt and prompt: "You already have this. Proceed to analysis."
 
 ### B. Structured Output (JSON Mode)
@@ -96,6 +96,6 @@ If the patch uses a deprecated API (e.g., `simple_strtol`), the worker should su
 ## 7. Implementation Roadmap (Features)
 
 1.  **Phase 1**: Basic Review (Text output, diff-only context).
-2.  **Phase 2**: Tool-Assisted (Worker can `read_file`, `grep`).
+2.  **Phase 2**: Tool-Assisted (Worker can `read_files`, `search_file_content`).
 3.  **Phase 3**: Structured JSON Output & Database Integration.
 4.  **Phase 4**: Multi-turn "Critic" Loop.

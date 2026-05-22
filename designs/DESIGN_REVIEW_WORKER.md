@@ -40,9 +40,9 @@ Provides a safe, read-only interface to the system.
     - `git_show(ref, path)`: Read file content at specific revision.
     - `git_diff(range)`: Get patch/diff content.
     - `git_blame(path, start_line, end_line)`: Check authorship context.
-    - `git_grep(pattern, path_glob)`: Search for symbols or patterns.
+    - `search_file_content(pattern, path, context_lines)`: Search for symbols or patterns.
 - **Analysis Tools**:
-    - `read_file_lines(path, start, end)`: Read specific line range.
+    - `read_files(files, mode)`: Read one or more files or line ranges.
     - `list_dir(path)`: Explore directory structure.
 - **Worker Tools**:
     - `todo_write(task, status)`: Help worker track progress as required by prompts.
@@ -74,7 +74,7 @@ Provides a safe, read-only interface to the system.
 3.  **Analysis Loop**:
     -   Worker constructs prompt: "Review patchset: [Subject]..."
     -   **Gemini**: "I need to see `net/core/dev.c` lines 100-150 to check locking."
-    -   **Worker**: Runs `read_file` -> Returns content.
+    -   **Worker**: Runs `read_files` -> Returns content.
     -   **Gemini**: "Checks out. But who touched this last? `git blame` please."
     -   **Worker**: Runs `git blame` -> Returns result.
     -   **Gemini**: "Sashiko has reviewed this patch and found no issues. It looks great!"

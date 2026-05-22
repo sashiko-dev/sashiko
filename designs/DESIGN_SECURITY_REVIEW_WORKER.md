@@ -25,7 +25,7 @@ This document outlines the security architecture for the `sashiko-review` worker
 ### 4.1. Directory Traversal / Path Injection
 *   **Threat**: The LLM (potentially hallucinating or manipulated via prompt injection) attempts to access files outside the repository (e.g., `/etc/passwd`, `~/.ssh`).
 *   **Mitigation**:
-    *   **Path Validation**: All file path arguments passed to tools (e.g., `read_file`, `git_blame`) must be canonicalized and verified to be descendants of the authorized root (repo or prompts dir).
+    *   **Path Validation**: All file path arguments passed to tools (e.g., `read_files`, `git_blame`) must be canonicalized and verified to be descendants of the authorized root (repo or prompts dir).
     *   **Blocklist**: Explicitly reject paths containing `..` or absolute paths starting with `/` (unless resolved to within the root).
 
 ### 4.2. Command Injection
@@ -51,12 +51,12 @@ Implemented via `git` CLI, strictly parameterized.
 *   `git_diff(range)`: Safe.
 *   `git_blame(path, lines)`: Safe.
 *   `git_log(path, limit)`: Safe.
-*   `git_grep(pattern, path)`: **Caution**. Must prevent ReDoS (Regex Denial of Service) if possible, but standard git grep is generally robust. Enforce `max_count`.
+*   `search_file_content(pattern, path, context_lines)`: **Caution**. Must prevent ReDoS (Regex Denial of Service) if possible, and enforce output limits.
 
 **Banned**: `apply`, `commit`, `push`, `config`, `rm`, `add`.
 
 ### 5.2. File System Operations
-*   `read_file(path, range)`: Restricted to repo root.
+*   `read_files(files, mode)`: Restricted to repo root.
 *   `list_dir(path)`: Restricted to repo root.
 *   `write_file(path, content)`: Restricted to repo root (specifically intended for `review-inline.txt`).
 

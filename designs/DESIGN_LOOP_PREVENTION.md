@@ -54,10 +54,10 @@ When a potential stall or loop is detected, instead of killing the process, the 
 ### 2.4. Smart Tools to Reduce Steps
 One major cause of high step counts is inefficient tools. We will add "Macro-Tools" that combine operations.
 
-1.  **`search_code` (ripgrep)**: Instead of `list_dir` + `read_file` loops to find a symbol, the worker can grep the entire tree in 1 step.
+1.  **`search_file_content`**: Instead of `list_dir` + `read_files` loops to find a symbol, the worker can search the entire tree in 1 step.
     *   *Constraint*: Must return strictly limited output (e.g., top 20 matches) to prevent context flooding.
-2.  **`glob_find`**: To locate files without walking the tree manually.
-3.  **`batch_read`**: Allow `read_file` to accept a list of paths, returning a JSON map of contents. This allows reading 5 relevant files in 1 turn instead of 5 turns.
+2.  **`find_files`**: To locate files without walking the tree manually.
+3.  **`read_files`**: Accept a list of file requests, allowing the worker to read 5 relevant files in 1 turn instead of 5 turns.
 
 ## 3. Implementation Plan
 
@@ -97,13 +97,13 @@ Add to `src/worker/tools.rs`:
 ### Scenario A: The "Grep" Loop
 *Bad Worker*:
 1. `list_dir src/`
-2. `read_file src/main.rs` (No match)
-3. `read_file src/lib.rs` (No match)
+2. `read_files files=[{path:"src/main.rs"}]` (No match)
+3. `read_files files=[{path:"src/lib.rs"}]` (No match)
 ... (20 steps) ...
 
 *Smart Worker*:
 1. `search_file_content "loops"` -> Returns matches in `src/worker/mod.rs` and `DESIGN_LOOP_PREVENTION.md`.
-2. `read_file src/worker/mod.rs`
+2. `read_files files=[{path:"src/worker/mod.rs"}]`
 3. Done. (3 steps)
 
 ### Scenario B: The "Stuck" Worker

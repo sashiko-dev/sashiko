@@ -26,7 +26,7 @@ We view the context window (e.g., 32k, 1M, 2M tokens) as a **strict budget** tha
 ## 2. Truncation Algorithms
 
 ### A. The "Key-Hole" View (For Source Files)
-When the agent requests `read_file`, we rarely want the *entire* file if it's 10k lines long.
+When the agent requests `read_files`, we rarely want the *entire* file if it's 10k lines long.
 *   **Default**: Return +/- 50 lines around the requested area (if line numbers specified).
 *   **Symbol-Aware Pruning**:
     *   Parse the AST (or use regex/`tree-sitter` for C/Rust).
@@ -94,8 +94,8 @@ impl ContextWindow {
 ```
 
 ### Smart File Reader (Tool Enhancement)
-Update the `read_file` tool to support "smart mode":
-*   `read_file(path, focus_lines=[10..20], mode="smart")`
+Update the `read_files` tool to support "smart mode":
+*   `read_files(files=[{path, start_line, end_line}], mode="smart")`
 *   If `mode="smart"`, it parses the file and collapses irrelevant sections before returning.
 
 ## 4. Integration Plan
