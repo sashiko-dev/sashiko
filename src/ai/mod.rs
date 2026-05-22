@@ -286,6 +286,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
         return e.ai_error_class();
     }
+    if let Some(e) = error.downcast_ref::<kiro_cli::KiroCliError>() {
+        return e.ai_error_class();
+    }
     if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
         return e.ai_error_class();
     }

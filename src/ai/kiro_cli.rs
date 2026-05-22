@@ -34,7 +34,10 @@ use tracing::debug;
 
 use super::claude_cli::{build_prompt, parse_inner_response};
 use super::token_budget::TokenBudget;
-use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities};
+use crate::ai::{
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiUsage, ClassifyAiError, DEFAULT_RETRY_AFTER,
+    ProviderCapabilities,
+};
 use crate::utils::redact_secret;
 
 pub struct KiroCliProvider {
@@ -49,6 +52,256 @@ type StderrPreview = Arc<Mutex<String>>;
 type StdoutPreview = Arc<Mutex<String>>;
 const STDERR_PREVIEW_LIMIT: usize = 4096;
 const STDOUT_PREVIEW_LIMIT: usize = 4096;
+
+const KIRO_RETRY_AFTER: Duration = Duration::from_secs(1);
+// Classification only needs enough provider text to catch known Kiro/AWS error
+// markers. Error data can include verbose payloads, so keep marker scans bounded.
+const KIRO_MAX_CLASSIFICATION_TEXT_CHARS: usize = 64 * 1024;
+const KIRO_PERMANENT_MARKERS: &[&str] = &[
+    "validationerror",
+    "validationexception",
+    "accessdeniederror",
+    "accessdeniedexception",
+    "servicequotaexceedederror",
+    "contentlengthexceedsthreshold",
+    "invalidconversationid",
+    "invalidmodelid",
+    "invalid conversation history",
+    "prompt is too long",
+    "contextwindowoverflow",
+    "monthlylimitreached",
+    "unauthorized",
+    "autherror",
+];
+const KIRO_STREAM_CONTEXT_MARKERS: &[&str] = &[
+    "codewhispererchatresponsestream",
+    "qdeveloperchatresponsestream",
+    "chatresponsestream",
+    "chatresponsestreamerror",
+    "chatresponsestreamconversestreamerror",
+    "chatresponsestreamunmarshaller",
+];
+const KIRO_STRONG_STREAM_FAILURE_MARKERS: &[&str] = &[
+    "recverrorstreamtimeout",
+    "failed to receive the next event",
+    "failed to receive the next message",
+    "encountered an error in the response stream",
+    "request or response body error",
+    "connection closed before message completed",
+];
+const KIRO_WEAK_TRANSIENT_MARKERS: &[&str] = &[
+    "recverrorunknown",
+    "dispatchfailure",
+    "timedout",
+    "timeouterror",
+    "operation timed out",
+    "dispatch failure",
+    "error trying to connect",
+];
+const KIRO_RATE_LIMIT_MARKERS: &[&str] = &[
+    "throttlingerror",
+    "throttlingexception",
+    "too many requests",
+    "rate limit",
+    "ratelimit",
+];
+const KIRO_PROVIDER_TRANSIENT_MARKERS: &[&str] = &[
+    "serviceunavailableerror",
+    "modeltemporarilyunavailable",
+    "modeloverloadederror",
+    "requesttimeoutexception",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KiroMarkerClass {
+    Permanent,
+    StrongStreamFailure,
+    StreamContextWeakTransient,
+    RateLimit,
+    ProviderAvailability,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KiroAcpErrorClassification {
+    class: AiErrorClass,
+    marker_class: KiroMarkerClass,
+    matched_marker: Option<&'static str>,
+}
+
+impl KiroAcpErrorClassification {
+    fn new(
+        class: AiErrorClass,
+        marker_class: KiroMarkerClass,
+        matched_marker: Option<&'static str>,
+    ) -> Self {
+        Self {
+            class,
+            marker_class,
+            matched_marker,
+        }
+    }
+}
+
+fn find_marker(text: &str, markers: &'static [&'static str]) -> Option<&'static str> {
+    markers.iter().copied().find(|marker| text.contains(marker))
+}
+
+fn normalized_acp_error_text(message: &str, data: Option<&Value>) -> String {
+    let mut text = String::new();
+    push_ascii_lowercase_bounded(&mut text, message, KIRO_MAX_CLASSIFICATION_TEXT_CHARS);
+    if let Some(data) = data {
+        push_ascii_lowercase_bounded(&mut text, "\n", KIRO_MAX_CLASSIFICATION_TEXT_CHARS);
+        match data {
+            Value::String(s) => {
+                push_ascii_lowercase_bounded(&mut text, s, KIRO_MAX_CLASSIFICATION_TEXT_CHARS)
+            }
+            _ => {
+                push_json_value_for_marker_scan(&mut text, data, KIRO_MAX_CLASSIFICATION_TEXT_CHARS)
+            }
+        }
+    }
+    text
+}
+
+fn push_ascii_lowercase_bounded(buffer: &mut String, text: &str, max_chars: usize) {
+    let mut remaining = max_chars.saturating_sub(buffer.chars().count());
+    for ch in text.chars() {
+        if remaining == 0 {
+            break;
+        }
+        buffer.push(ch.to_ascii_lowercase());
+        remaining -= 1;
+    }
+}
+
+fn push_json_value_for_marker_scan(buffer: &mut String, value: &Value, max_chars: usize) {
+    if buffer.chars().count() >= max_chars {
+        return;
+    }
+
+    match value {
+        Value::Null => push_ascii_lowercase_bounded(buffer, "null", max_chars),
+        Value::Bool(value) => push_ascii_lowercase_bounded(buffer, &value.to_string(), max_chars),
+        Value::Number(value) => push_ascii_lowercase_bounded(buffer, &value.to_string(), max_chars),
+        Value::String(value) => push_ascii_lowercase_bounded(buffer, value, max_chars),
+        Value::Array(values) => {
+            push_ascii_lowercase_bounded(buffer, "[", max_chars);
+            for value in values {
+                if buffer.chars().count() >= max_chars {
+                    break;
+                }
+                push_json_value_for_marker_scan(buffer, value, max_chars);
+                push_ascii_lowercase_bounded(buffer, ",", max_chars);
+            }
+            push_ascii_lowercase_bounded(buffer, "]", max_chars);
+        }
+        Value::Object(values) => {
+            push_ascii_lowercase_bounded(buffer, "{", max_chars);
+            for (key, value) in values {
+                if buffer.chars().count() >= max_chars {
+                    break;
+                }
+                push_ascii_lowercase_bounded(buffer, key, max_chars);
+                push_ascii_lowercase_bounded(buffer, ":", max_chars);
+                push_json_value_for_marker_scan(buffer, value, max_chars);
+                push_ascii_lowercase_bounded(buffer, ",", max_chars);
+            }
+            push_ascii_lowercase_bounded(buffer, "}", max_chars);
+        }
+    }
+}
+
+#[cfg(test)]
+fn classify_kiro_acp_error(code: i64, message: &str, data: Option<&Value>) -> AiErrorClass {
+    classify_kiro_acp_error_with_details(code, message, data).class
+}
+
+fn classify_kiro_acp_error_with_details(
+    code: i64,
+    message: &str,
+    data: Option<&Value>,
+) -> KiroAcpErrorClassification {
+    if code != -32603 {
+        return KiroAcpErrorClassification::new(
+            AiErrorClass::Fatal,
+            KiroMarkerClass::Unclassified,
+            None,
+        );
+    }
+
+    let text = normalized_acp_error_text(message, data);
+    if let Some(marker) = find_marker(&text, KIRO_PERMANENT_MARKERS) {
+        return KiroAcpErrorClassification::new(
+            AiErrorClass::Fatal,
+            KiroMarkerClass::Permanent,
+            Some(marker),
+        );
+    }
+
+    if let Some(marker) = find_marker(&text, KIRO_STRONG_STREAM_FAILURE_MARKERS) {
+        return KiroAcpErrorClassification::new(
+            AiErrorClass::Transient {
+                retry_after: KIRO_RETRY_AFTER,
+            },
+            KiroMarkerClass::StrongStreamFailure,
+            Some(marker),
+        );
+    }
+
+    if find_marker(&text, KIRO_STREAM_CONTEXT_MARKERS).is_some()
+        && let Some(marker) = find_marker(&text, KIRO_WEAK_TRANSIENT_MARKERS)
+    {
+        return KiroAcpErrorClassification::new(
+            AiErrorClass::Transient {
+                retry_after: KIRO_RETRY_AFTER,
+            },
+            KiroMarkerClass::StreamContextWeakTransient,
+            Some(marker),
+        );
+    }
+
+    if let Some(marker) = find_marker(&text, KIRO_RATE_LIMIT_MARKERS) {
+        return KiroAcpErrorClassification::new(
+            AiErrorClass::RateLimit {
+                retry_after: DEFAULT_RETRY_AFTER,
+            },
+            KiroMarkerClass::RateLimit,
+            Some(marker),
+        );
+    }
+
+    if let Some(marker) = find_marker(&text, KIRO_PROVIDER_TRANSIENT_MARKERS) {
+        return KiroAcpErrorClassification::new(
+            AiErrorClass::Transient {
+                retry_after: KIRO_RETRY_AFTER,
+            },
+            KiroMarkerClass::ProviderAvailability,
+            Some(marker),
+        );
+    }
+
+    KiroAcpErrorClassification::new(AiErrorClass::Fatal, KiroMarkerClass::Unclassified, None)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct KiroCliError {
+    message: String,
+    class: AiErrorClass,
+}
+
+impl KiroCliError {
+    fn new(message: String, class: AiErrorClass) -> Self {
+        Self { message, class }
+    }
+}
+
+impl ClassifyAiError for KiroCliError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        self.class
+    }
+}
 
 /// Agent JSON for the isolated no-tool Sashiko provider agent.
 const AGENT_JSON: &str = r#"{
@@ -182,14 +435,15 @@ async fn read_rpc_response(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown ACP error");
+                let data = error.get("data");
+                let classification = classify_kiro_acp_error_with_details(code, message, data);
                 let data_context = acp_error_data_context(error);
-                anyhow::bail!(
+                let diagnostic = diagnostic_context(stderr_preview, stdout_preview).await;
+                let message = format!(
                     "kiro-cli ACP error {}: {}{}{}",
-                    code,
-                    message,
-                    data_context,
-                    diagnostic_context(stderr_preview, stdout_preview).await
+                    code, message, data_context, diagnostic
                 );
+                return Err(KiroCliError::new(message, classification.class).into());
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
         }
@@ -445,6 +699,7 @@ impl AiProvider for KiroCliProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let prompt = build_prompt(&request);
         debug!("kiro-cli prompt length: {} chars", prompt.len());
+        let prompt_tokens = TokenBudget::estimate_tokens(&prompt);
 
         let (agent_name, isolated_workspace) = match &self.agent {
             Some(a) => (a.clone(), None),
@@ -460,12 +715,22 @@ impl AiProvider for KiroCliProvider {
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!("kiro-cli ACP timed out after {} seconds", self.timeout_secs)
+            KiroCliError::new(
+                format!(
+                    "kiro-cli ACP timed out after {} seconds (model={}, prompt_chars={}, estimated_prompt_tokens={})",
+                    self.timeout_secs,
+                    self.model,
+                    prompt.len(),
+                    prompt_tokens
+                ),
+                AiErrorClass::Transient {
+                    retry_after: DEFAULT_RETRY_AFTER,
+                },
+            )
         })??;
 
         // Synthesize usage from token estimates since kiro-cli does not
         // expose provider token counts.
-        let prompt_tokens = TokenBudget::estimate_tokens(&prompt);
         let completion_tokens = TokenBudget::estimate_tokens(&text);
         let usage = Some(AiUsage {
             prompt_tokens,
@@ -801,8 +1066,12 @@ done
         let err = provider
             .generate_content(sample_request())
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Transient { .. }
+        ));
+        let err = err.to_string();
         assert!(err.contains("kiro-cli ACP error -32603: Internal error"));
         assert!(err.contains("data:"));
         assert!(err.contains("ServiceFailure"));
@@ -849,6 +1118,201 @@ done
         assert!(err.contains("kiro-cli ACP error -32603: Internal error"));
         assert!(err.contains("malformed stdout: kiro warning token=[REDACTED]"));
         assert!(!err.contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_content_timeout_is_transient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-kiro-cli");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+sleep 2
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let provider = KiroCliProvider {
+            model: "test".to_string(),
+            binary: fake.to_string_lossy().to_string(),
+            agent: None,
+            context_window_size: 200_000,
+            timeout_secs: 0,
+        };
+
+        let err = provider
+            .generate_content(sample_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Transient { .. }
+        ));
+        let err = err.to_string();
+        assert!(err.contains("kiro-cli ACP timed out after 0 seconds"));
+        assert!(err.contains("model=test"));
+        assert!(err.contains("prompt_chars="));
+        assert!(err.contains("estimated_prompt_tokens="));
+    }
+
+    #[test]
+    fn test_kiro_acp_stream_context_and_timedout_is_transient() {
+        let data = json!("CodewhispererChatResponseStream(DispatchFailure(TimedOut))");
+        assert!(matches!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Transient { retry_after } if retry_after == KIRO_RETRY_AFTER
+        ));
+    }
+
+    #[test]
+    fn test_kiro_acp_strong_stream_marker_is_transient() {
+        let data = json!("failed to receive the next event");
+        assert!(matches!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Transient { retry_after } if retry_after == KIRO_RETRY_AFTER
+        ));
+    }
+
+    #[test]
+    fn test_kiro_acp_weak_marker_alone_is_fatal() {
+        let data = json!("TimedOut");
+        assert_eq!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn test_kiro_acp_provider_operation_context_does_not_make_stream_timeout() {
+        let data = json!("GenerateAssistantResponse TimedOut");
+        assert_eq!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn test_kiro_acp_classification_text_is_bounded() {
+        let marker_after_cap = format!(
+            "{} unexpected eof",
+            "x".repeat(KIRO_MAX_CLASSIFICATION_TEXT_CHARS + 1)
+        );
+        assert_eq!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&json!(marker_after_cap))),
+            AiErrorClass::Fatal
+        );
+
+        let marker_before_cap = format!(
+            "failed to receive the next event {}",
+            "x".repeat(KIRO_MAX_CLASSIFICATION_TEXT_CHARS + 1)
+        );
+        assert!(matches!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&json!(marker_before_cap))),
+            AiErrorClass::Transient { .. }
+        ));
+    }
+
+    #[test]
+    fn test_kiro_acp_classification_scans_bounded_structured_data() {
+        let marker_before_cap = json!(["failed to receive the next event", {
+            "padding": "x".repeat(KIRO_MAX_CLASSIFICATION_TEXT_CHARS + 1),
+        }]);
+        assert!(matches!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&marker_before_cap)),
+            AiErrorClass::Transient { .. }
+        ));
+
+        let marker_after_cap = json!([
+            "x".repeat(KIRO_MAX_CLASSIFICATION_TEXT_CHARS + 1),
+            "failed to receive the next event"
+        ]);
+        assert_eq!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&marker_after_cap)),
+            AiErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn test_kiro_acp_permanent_marker_wins_over_stream_marker() {
+        let data = json!(
+            "invalid conversation history CodewhispererChatResponseStream DispatchFailure TimedOut"
+        );
+        assert_eq!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn test_kiro_acp_provider_availability_is_transient() {
+        let data = json!({"kind": "ModelOverloadedError"});
+        assert!(matches!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Transient { retry_after } if retry_after == KIRO_RETRY_AFTER
+        ));
+    }
+
+    #[test]
+    fn test_kiro_acp_additional_strong_stream_markers_are_transient() {
+        for marker in [
+            "failed to receive the next message",
+            "connection closed before message completed",
+            "RecvErrorStreamTimeout",
+        ] {
+            let data = json!(marker);
+            assert!(
+                matches!(
+                    classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+                    AiErrorClass::Transient { .. }
+                ),
+                "marker should be transient: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kiro_acp_context_marker_alone_is_fatal() {
+        let data = json!("ChatResponseStreamUnmarshaller");
+        assert_eq!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn test_kiro_acp_object_data_with_only_timedout_is_fatal() {
+        let data = json!({"reason": "TimedOut"});
+        assert_eq!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn test_kiro_acp_throttling_is_rate_limit() {
+        let data = json!({"kind": "ThrottlingError"});
+        assert!(matches!(
+            classify_kiro_acp_error(-32603, "Internal error", Some(&data)),
+            AiErrorClass::RateLimit { retry_after } if retry_after == DEFAULT_RETRY_AFTER
+        ));
+    }
+
+    #[test]
+    fn test_kiro_acp_classification_reports_marker_details() {
+        let data = json!("CodewhispererChatResponseStream(DispatchFailure(TimedOut))");
+        let classification =
+            classify_kiro_acp_error_with_details(-32603, "Internal error", Some(&data));
+        assert_eq!(
+            classification.marker_class,
+            KiroMarkerClass::StreamContextWeakTransient
+        );
+        assert_eq!(classification.matched_marker, Some("dispatchfailure"));
     }
 
     #[test]
