@@ -127,6 +127,7 @@ struct KiroAcpErrorClassification {
     class: AiErrorClass,
     marker_class: KiroMarkerClass,
     matched_marker: Option<&'static str>,
+    retry_blocked_by_side_effect_gate: bool,
 }
 
 impl KiroAcpErrorClassification {
@@ -139,7 +140,21 @@ impl KiroAcpErrorClassification {
             class,
             marker_class,
             matched_marker,
+            retry_blocked_by_side_effect_gate: false,
         }
+    }
+
+    fn apply_side_effect_gate(mut self, side_effects_seen: bool) -> Self {
+        if side_effects_seen
+            && matches!(
+                self.class,
+                AiErrorClass::RateLimit { .. } | AiErrorClass::Transient { .. }
+            )
+        {
+            self.class = AiErrorClass::Fatal;
+            self.retry_blocked_by_side_effect_gate = true;
+        }
+        self
     }
 }
 
@@ -214,13 +229,14 @@ fn push_json_value_for_marker_scan(buffer: &mut String, value: &Value, max_chars
 
 #[cfg(test)]
 fn classify_kiro_acp_error(code: i64, message: &str, data: Option<&Value>) -> AiErrorClass {
-    classify_kiro_acp_error_with_details(code, message, data).class
+    classify_kiro_acp_error_with_details(code, message, data, false).class
 }
 
 fn classify_kiro_acp_error_with_details(
     code: i64,
     message: &str,
     data: Option<&Value>,
+    side_effects_seen: bool,
 ) -> KiroAcpErrorClassification {
     if code != -32603 {
         return KiroAcpErrorClassification::new(
@@ -246,7 +262,8 @@ fn classify_kiro_acp_error_with_details(
             },
             KiroMarkerClass::StrongStreamFailure,
             Some(marker),
-        );
+        )
+        .apply_side_effect_gate(side_effects_seen);
     }
 
     if find_marker(&text, KIRO_STREAM_CONTEXT_MARKERS).is_some()
@@ -258,7 +275,8 @@ fn classify_kiro_acp_error_with_details(
             },
             KiroMarkerClass::StreamContextWeakTransient,
             Some(marker),
-        );
+        )
+        .apply_side_effect_gate(side_effects_seen);
     }
 
     if let Some(marker) = find_marker(&text, KIRO_RATE_LIMIT_MARKERS) {
@@ -268,7 +286,8 @@ fn classify_kiro_acp_error_with_details(
             },
             KiroMarkerClass::RateLimit,
             Some(marker),
-        );
+        )
+        .apply_side_effect_gate(side_effects_seen);
     }
 
     if let Some(marker) = find_marker(&text, KIRO_PROVIDER_TRANSIENT_MARKERS) {
@@ -278,7 +297,8 @@ fn classify_kiro_acp_error_with_details(
             },
             KiroMarkerClass::ProviderAvailability,
             Some(marker),
-        );
+        )
+        .apply_side_effect_gate(side_effects_seen);
     }
 
     KiroAcpErrorClassification::new(AiErrorClass::Fatal, KiroMarkerClass::Unclassified, None)
@@ -400,6 +420,8 @@ async fn read_rpc_response(
     stdout_preview: &StdoutPreview,
     mut chunks: Option<&mut Vec<String>>,
 ) -> Result<Value> {
+    let mut side_effects_seen = false;
+
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
@@ -436,7 +458,8 @@ async fn read_rpc_response(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown ACP error");
                 let data = error.get("data");
-                let classification = classify_kiro_acp_error_with_details(code, message, data);
+                let classification =
+                    classify_kiro_acp_error_with_details(code, message, data, side_effects_seen);
                 let data_context = acp_error_data_context(error);
                 let diagnostic = diagnostic_context(stderr_preview, stdout_preview).await;
                 let message = format!(
@@ -446,6 +469,10 @@ async fn read_rpc_response(
                 return Err(KiroCliError::new(message, classification.class).into());
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+        }
+
+        if acp_update_has_side_effect(&msg) {
+            side_effects_seen = true;
         }
 
         if let Some(text) = extract_acp_text_chunk(&msg)
@@ -536,6 +563,83 @@ async fn diagnostic_context(
         (true, false) => format!("; malformed stdout: {}", stdout),
         (false, false) => format!("; stderr: {}; malformed stdout: {}", stderr, stdout),
     }
+}
+
+fn acp_update_has_side_effect(msg: &Value) -> bool {
+    if msg.get("method").and_then(Value::as_str) != Some("session/update") {
+        return false;
+    }
+
+    let Some(update) = msg.get("params").and_then(|params| params.get("update")) else {
+        return false;
+    };
+
+    let update_type = update
+        .get("sessionUpdate")
+        .or_else(|| update.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if matches!(
+        update_type.as_str(),
+        "agentmessagechunk" | "agent_message_chunk"
+    ) {
+        return false;
+    }
+
+    if update_type_has_side_effect_marker(&update_type) {
+        return true;
+    }
+
+    // Unknown non-message updates are treated conservatively: if their payload
+    // mentions tool, command, or file-like mutations, do not retry after them.
+    serde_json::to_string(update)
+        .map(|serialized| update_type_has_side_effect_marker(&serialized.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
+fn update_type_has_side_effect_marker(text: &str) -> bool {
+    const SIDE_EFFECT_UPDATE_TYPES: &[&str] = &[
+        "toolcall",
+        "toolcallupdate",
+        "tool_call",
+        "tool_call_update",
+    ];
+    const SIDE_EFFECT_MARKERS: &[&str] = &[
+        "tool",
+        "approval",
+        "permission",
+        "command",
+        "cmd",
+        "exec",
+        "shell",
+        "file",
+        "write",
+        "edit",
+        "patch",
+        "mutation",
+    ];
+
+    if SIDE_EFFECT_UPDATE_TYPES.contains(&text) {
+        return true;
+    }
+
+    SIDE_EFFECT_MARKERS
+        .iter()
+        .any(|marker| contains_marker_token(text, marker))
+}
+
+fn contains_marker_token(text: &str, marker: &str) -> bool {
+    text.match_indices(marker).any(|(idx, _)| {
+        let before = text[..idx].chars().next_back();
+        let after = text[idx + marker.len()..].chars().next();
+        is_marker_boundary(before) && is_marker_boundary(after)
+    })
+}
+
+fn is_marker_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| !ch.is_ascii_alphanumeric())
 }
 
 fn extract_acp_text_chunk(msg: &Value) -> Option<String> {
@@ -1307,12 +1411,92 @@ sleep 2
     fn test_kiro_acp_classification_reports_marker_details() {
         let data = json!("CodewhispererChatResponseStream(DispatchFailure(TimedOut))");
         let classification =
-            classify_kiro_acp_error_with_details(-32603, "Internal error", Some(&data));
+            classify_kiro_acp_error_with_details(-32603, "Internal error", Some(&data), false);
         assert_eq!(
             classification.marker_class,
             KiroMarkerClass::StreamContextWeakTransient
         );
         assert_eq!(classification.matched_marker, Some("dispatchfailure"));
+        assert!(!classification.retry_blocked_by_side_effect_gate);
+    }
+
+    #[test]
+    fn test_kiro_acp_side_effect_gate_blocks_stream_retry() {
+        let data = json!("failed to receive the next event");
+        let classification =
+            classify_kiro_acp_error_with_details(-32603, "Internal error", Some(&data), true);
+        assert_eq!(classification.class, AiErrorClass::Fatal);
+        assert_eq!(
+            classification.marker_class,
+            KiroMarkerClass::StrongStreamFailure
+        );
+        assert!(classification.retry_blocked_by_side_effect_gate);
+    }
+
+    #[test]
+    fn test_kiro_acp_side_effect_gate_blocks_rate_limit_retry() {
+        let data = json!({"kind": "ThrottlingError"});
+        let classification =
+            classify_kiro_acp_error_with_details(-32603, "Internal error", Some(&data), true);
+        assert_eq!(classification.class, AiErrorClass::Fatal);
+        assert_eq!(classification.marker_class, KiroMarkerClass::RateLimit);
+        assert!(classification.retry_blocked_by_side_effect_gate);
+    }
+
+    #[test]
+    fn test_acp_update_has_side_effect_detects_tool_updates() {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {"sessionUpdate": "tool_call", "content": {}}
+            }
+        });
+        assert!(acp_update_has_side_effect(&msg));
+    }
+
+    #[test]
+    fn test_acp_update_has_side_effect_detects_camel_case_tool_updates() {
+        for update_type in ["ToolCall", "ToolCallUpdate"] {
+            let msg = json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {"sessionUpdate": update_type, "content": {}}
+                }
+            });
+            assert!(acp_update_has_side_effect(&msg), "{update_type}");
+        }
+    }
+
+    #[test]
+    fn test_acp_update_has_side_effect_ignores_agent_message_chunks() {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"text": "I might write about tools in text only"}
+                }
+            }
+        });
+        assert!(!acp_update_has_side_effect(&msg));
+    }
+
+    #[test]
+    fn test_acp_update_has_side_effect_ignores_profile_key_substring() {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "progress",
+                    "content": {"profile": "scheduler"}
+                }
+            }
+        });
+        assert!(!acp_update_has_side_effect(&msg));
     }
 
     #[test]
