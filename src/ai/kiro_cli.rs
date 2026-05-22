@@ -46,7 +46,9 @@ pub struct KiroCliProvider {
 }
 
 type StderrPreview = Arc<Mutex<String>>;
+type StdoutPreview = Arc<Mutex<String>>;
 const STDERR_PREVIEW_LIMIT: usize = 4096;
+const STDOUT_PREVIEW_LIMIT: usize = 4096;
 
 /// Agent JSON for the isolated no-tool Sashiko provider agent.
 const AGENT_JSON: &str = r#"{
@@ -125,13 +127,14 @@ async fn write_rpc_checked(
     method: &str,
     params: Value,
     stderr_preview: &StderrPreview,
+    stdout_preview: &StdoutPreview,
 ) -> Result<()> {
     if let Err(e) = write_rpc(stdin, id, method, params).await {
         anyhow::bail!(
             "kiro-cli ACP write failed for {}: {}{}",
             method,
             e,
-            stderr_context(stderr_preview).await
+            diagnostic_context(stderr_preview, stdout_preview).await
         );
     }
     Ok(())
@@ -141,6 +144,7 @@ async fn read_rpc_response(
     lines: &mut Lines<BufReader<ChildStdout>>,
     target_id: u64,
     stderr_preview: &StderrPreview,
+    stdout_preview: &StdoutPreview,
     mut chunks: Option<&mut Vec<String>>,
 ) -> Result<Value> {
     loop {
@@ -150,7 +154,7 @@ async fn read_rpc_response(
                 anyhow::bail!(
                     "kiro-cli ACP exited before response {}{}",
                     target_id,
-                    stderr_context(stderr_preview).await
+                    diagnostic_context(stderr_preview, stdout_preview).await
                 );
             }
             Err(e) => {
@@ -158,13 +162,14 @@ async fn read_rpc_response(
                     "kiro-cli ACP stdout read failed before response {}: {}{}",
                     target_id,
                     e,
-                    stderr_context(stderr_preview).await
+                    diagnostic_context(stderr_preview, stdout_preview).await
                 );
             }
         };
         let msg: Value = match serde_json::from_str(&line) {
             Ok(msg) => msg,
             Err(e) => {
+                record_malformed_stdout_line(stdout_preview, &line).await;
                 debug!("Ignoring malformed ACP stdout line: {} ({})", line, e);
                 continue;
             }
@@ -177,11 +182,13 @@ async fn read_rpc_response(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown ACP error");
+                let data_context = acp_error_data_context(error);
                 anyhow::bail!(
-                    "kiro-cli ACP error {}: {}{}",
+                    "kiro-cli ACP error {}: {}{}{}",
                     code,
                     message,
-                    stderr_context(stderr_preview).await
+                    data_context,
+                    diagnostic_context(stderr_preview, stdout_preview).await
                 );
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
@@ -211,6 +218,21 @@ async fn record_stderr_line(stderr_preview: &StderrPreview, line: &str) {
     trim_stderr_preview(&mut preview);
 }
 
+async fn record_malformed_stdout_line(stdout_preview: &StdoutPreview, line: &str) {
+    let redacted = redact_secret(line);
+
+    if redacted.trim().is_empty() {
+        return;
+    }
+
+    let mut preview = stdout_preview.lock().await;
+    if !preview.is_empty() {
+        preview.push('\n');
+    }
+    preview.push_str(redacted.trim_end());
+    trim_stdout_preview(&mut preview);
+}
+
 fn trim_stderr_preview(preview: &mut String) {
     if preview.len() <= STDERR_PREVIEW_LIMIT {
         return;
@@ -224,12 +246,41 @@ fn trim_stderr_preview(preview: &mut String) {
     preview.drain(..drain_to);
 }
 
-async fn stderr_context(stderr_preview: &StderrPreview) -> String {
-    let preview = stderr_preview.lock().await.trim().to_string();
-    if preview.is_empty() {
-        String::new()
-    } else {
-        format!("; stderr: {}", preview)
+fn trim_stdout_preview(preview: &mut String) {
+    if preview.len() <= STDOUT_PREVIEW_LIMIT {
+        return;
+    }
+
+    let excess = preview.len() - STDOUT_PREVIEW_LIMIT;
+    let drain_to = preview
+        .char_indices()
+        .find_map(|(idx, _)| (idx >= excess).then_some(idx))
+        .unwrap_or(preview.len());
+    preview.drain(..drain_to);
+}
+
+fn acp_error_data_context(error: &Value) -> String {
+    match error.get("data") {
+        Some(data) if !data.is_null() => match serde_json::to_string(data) {
+            Ok(data) => format!("; data: {}", redact_secret(&data)),
+            Err(_) => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+async fn diagnostic_context(
+    stderr_preview: &StderrPreview,
+    stdout_preview: &StdoutPreview,
+) -> String {
+    let stderr = stderr_preview.lock().await.trim().to_string();
+    let stdout = stdout_preview.lock().await.trim().to_string();
+
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("; stderr: {}", stderr),
+        (true, false) => format!("; malformed stdout: {}", stdout),
+        (false, false) => format!("; stderr: {}; malformed stdout: {}", stderr, stdout),
     }
 }
 
@@ -295,6 +346,7 @@ impl KiroCliProvider {
         })?;
 
         let stderr_preview = Arc::new(Mutex::new(String::new()));
+        let stdout_preview = Arc::new(Mutex::new(String::new()));
         if let Some(stderr) = child.stderr.take() {
             let stderr_preview = stderr_preview.clone();
             tokio::spawn(async move {
@@ -323,9 +375,10 @@ impl KiroCliProvider {
                 },
             }),
             &stderr_preview,
+            &stdout_preview,
         )
         .await?;
-        read_rpc_response(&mut lines, next_id, &stderr_preview, None).await?;
+        read_rpc_response(&mut lines, next_id, &stderr_preview, &stdout_preview, None).await?;
         next_id += 1;
 
         write_rpc_checked(
@@ -337,15 +390,17 @@ impl KiroCliProvider {
                 "mcpServers": [],
             }),
             &stderr_preview,
+            &stdout_preview,
         )
         .await?;
-        let session = read_rpc_response(&mut lines, next_id, &stderr_preview, None).await?;
+        let session =
+            read_rpc_response(&mut lines, next_id, &stderr_preview, &stdout_preview, None).await?;
         let session_id = match session.get("sessionId").and_then(Value::as_str) {
             Some(session_id) => session_id.to_string(),
             None => {
                 anyhow::bail!(
                     "kiro-cli ACP session/new response missing sessionId{}",
-                    stderr_context(&stderr_preview).await
+                    diagnostic_context(&stderr_preview, &stdout_preview).await
                 );
             }
         };
@@ -365,10 +420,18 @@ impl KiroCliProvider {
                 ],
             }),
             &stderr_preview,
+            &stdout_preview,
         )
         .await?;
         let mut chunks = Vec::new();
-        read_rpc_response(&mut lines, next_id, &stderr_preview, Some(&mut chunks)).await?;
+        read_rpc_response(
+            &mut lines,
+            next_id,
+            &stderr_preview,
+            &stdout_preview,
+            Some(&mut chunks),
+        )
+        .await?;
 
         drop(stdin);
         let _ = child.kill().await;
@@ -703,6 +766,88 @@ exit 2
             .to_string();
         assert!(err.contains("kiro-cli ACP exited before response 0"));
         assert!(err.contains("stderr: authentication failed token=[REDACTED]"));
+        assert!(!err.contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_content_includes_redacted_acp_error_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-kiro-cli");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"Internal error","data":{"kind":"ServiceFailure","reason":"Encountered an error in the response stream: CodewhispererChatResponseStream(DispatchFailure(TimedOut)) token=abc123"}}}'
+  exit 0
+done
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let provider = KiroCliProvider {
+            model: "test".to_string(),
+            binary: fake.to_string_lossy().to_string(),
+            agent: None,
+            context_window_size: 200_000,
+            timeout_secs: 5,
+        };
+
+        let err = provider
+            .generate_content(sample_request())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kiro-cli ACP error -32603: Internal error"));
+        assert!(err.contains("data:"));
+        assert!(err.contains("ServiceFailure"));
+        assert!(err.contains("CodewhispererChatResponseStream"));
+        assert!(err.contains("token=[REDACTED]"));
+        assert!(!err.contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_content_includes_redacted_malformed_stdout_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-kiro-cli");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' 'kiro warning token=abc123'
+  printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"Internal error"}}'
+  exit 0
+done
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let provider = KiroCliProvider {
+            model: "test".to_string(),
+            binary: fake.to_string_lossy().to_string(),
+            agent: None,
+            context_window_size: 200_000,
+            timeout_secs: 5,
+        };
+
+        let err = provider
+            .generate_content(sample_request())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kiro-cli ACP error -32603: Internal error"));
+        assert!(err.contains("malformed stdout: kiro warning token=[REDACTED]"));
         assert!(!err.contains("abc123"));
     }
 
