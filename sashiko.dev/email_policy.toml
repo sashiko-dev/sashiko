@@ -153,3 +153,8 @@ cc = ["kvm@vger.kernel.org"]
 lists = ["linux-modules@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-modules@vger.kernel.org"]
+
+[subsystems.nova-gpu]
+lists = ["nova-gpu@lists.linux.dev"]
+reply_all = true
+cc = ["Danilo Krummrich <dakr@kernel.org>", "Alexandre Courbot <acourbot@nvidia.com>"]
