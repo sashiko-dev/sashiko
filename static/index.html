@@ -1549,6 +1549,52 @@
             if (e.key === 'Escape') closeAbout();
         });
 
+        function formatSeriesSummary(text) {
+            if (!text) return '';
+
+            // First escape HTML
+            let formatted = String(text)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+
+            // Convert **bold** to <strong>
+            formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+            // Convert bullet points to list items
+            const lines = formatted.split('\n');
+            let inList = false;
+            let result = [];
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+
+                if (line.startsWith('* ')) {
+                    if (!inList) {
+                        result.push('<ul style="margin: 8px 0; padding-left: 24px;">');
+                        inList = true;
+                    }
+                    result.push(`<li style="margin: 4px 0;">${line.substring(2)}</li>`);
+                } else {
+                    if (inList) {
+                        result.push('</ul>');
+                        inList = false;
+                    }
+                    if (line) {
+                        result.push(`<p style="margin: 8px 0;">${line}</p>`);
+                    }
+                }
+            }
+
+            if (inList) {
+                result.push('</ul>');
+            }
+
+            return result.join('\n');
+        }
+
         function escapeHtml(text, highlightDiff = false, renderAiComments = false) {
             if (!text) return '';
             const escaped = String(text)
@@ -2482,7 +2528,7 @@
                 ${data.summary ? `
                 <div class="section" style="border-left: 3px solid var(--link); padding-left: 16px;">
                     <h2 style="margin-top: 0;">Series Summary</h2>
-                    <p style="margin: 0; line-height: 1.6; color: var(--text);">${escapeHtml(data.summary)}</p>
+                    <div style="line-height: 1.6; color: var(--text);">${formatSeriesSummary(data.summary)}</div>
                     <div style="margin-top: 8px; font-size: 0.8em; color: var(--text-muted); font-style: italic;">AI-generated summary</div>
                 </div>
                 ` : ''}
