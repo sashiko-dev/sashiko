@@ -153,3 +153,7 @@ cc = ["kvm@vger.kernel.org"]
 lists = ["linux-modules@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-modules@vger.kernel.org"]
+
+[subsystems.linux-btrfs]
+lists = ["linux-btrfs@vger.kernel.org"]
+cc = ["dsterba@suse.cz"]
