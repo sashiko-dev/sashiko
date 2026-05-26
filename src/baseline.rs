@@ -238,6 +238,10 @@ impl BaselineRegistry {
         }
 
         // 1.5 Version Tag from Subject
+        // Only add version-tag candidates if the tag actually exists
+        // locally. Subjects often contain version-like strings (e.g.,
+        // "for-7.2" or "Fixes for 7.1") that produce tags like v7.1
+        // which may not exist yet during release candidate phases.
         if let Some(version) = extract_version_tag(subject) {
             if version.ends_with(".y") {
                 candidates.push(BaselineResolution::RemoteTarget {
@@ -247,9 +251,21 @@ impl BaselineRegistry {
                     branch: Some(format!("linux-{}", version)),
                 });
                 let base_version = version.strip_suffix(".y").unwrap();
-                candidates.push(BaselineResolution::LocalRef(format!("v{}", base_version)));
+                let tag_ref = format!("v{}", base_version);
+                if crate::git_ops::get_commit_hash(&self.repo_path, &tag_ref)
+                    .await
+                    .is_ok()
+                {
+                    candidates.push(BaselineResolution::LocalRef(tag_ref));
+                }
             } else {
-                candidates.push(BaselineResolution::LocalRef(format!("v{}", version)));
+                let tag_ref = format!("v{}", version);
+                if crate::git_ops::get_commit_hash(&self.repo_path, &tag_ref)
+                    .await
+                    .is_ok()
+                {
+                    candidates.push(BaselineResolution::LocalRef(tag_ref));
+                }
             }
         }
 
