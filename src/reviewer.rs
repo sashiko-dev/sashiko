@@ -560,11 +560,13 @@ impl Reviewer {
 
             for (patch_id, index, diff, _subj, _auth, _date, _msg_id) in &diffs {
                 let mut should_skip = false;
+                let mut skip_reason = None;
 
                 // Opt-out logic
                 if skip_regexes.iter().any(|re| re.is_match(_subj)) {
                     info!("Skipping patch {} (subject matches skip filter)", patch_id);
                     should_skip = true;
+                    skip_reason = Some("Skipped: subject matches skip filter".to_string());
                 }
 
                 // Opt-in logic (if only_filters is not empty, subject MUST match at least one)
@@ -577,6 +579,8 @@ impl Reviewer {
                         patch_id
                     );
                     should_skip = true;
+                    skip_reason =
+                        Some("Skipped: subject does not match any only filter".to_string());
                 }
 
                 if !should_skip {
@@ -601,11 +605,31 @@ impl Reviewer {
                             patch_id, patch_lines_changed, patch_files_count
                         );
                         should_skip = true;
+                        skip_reason = Some(format!(
+                            "Skipped: exceeds size limits ({} changed lines, {} touched files)",
+                            patch_lines_changed, patch_files_count
+                        ));
                     }
                 }
 
                 if should_skip {
-                    let _ = ctx.db.update_patch_status(*patch_id, "Skipped").await;
+                    let reason = skip_reason.as_deref().unwrap_or("Skipped before AI review");
+                    if let Err(e) = Self::complete_skipped_review(
+                        &ctx,
+                        patchset_id,
+                        *patch_id,
+                        Some(baseline_id),
+                        prompts_hash.as_deref(),
+                        reason,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to record skipped review for patch {}: {}",
+                            patch_id, e
+                        );
+                        failed_patches += 1;
+                    }
                     continue;
                 }
                 let commit_sha = patch_commits.get(index).cloned();
@@ -1054,6 +1078,48 @@ impl Reviewer {
 
         let logs_json = serde_json::to_string(&attempts).unwrap_or_default();
         (None, HashMap::new(), logs_json)
+    }
+
+    async fn complete_skipped_review(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        patch_id: i64,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let review_id = if let Some(id) = ctx
+            .db
+            .get_pending_review_id(patchset_id, Some(patch_id))
+            .await?
+        {
+            id
+        } else {
+            ctx.db
+                .create_review(
+                    patchset_id,
+                    Some(patch_id),
+                    &ctx.settings.ai.provider,
+                    &ctx.settings.ai.model,
+                    baseline_id,
+                    prompts_hash,
+                )
+                .await?
+        };
+
+        ctx.db
+            .complete_review(
+                review_id,
+                ReviewStatus::Skipped.as_str(),
+                reason,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        ctx.db.update_patch_status(patch_id, "Skipped").await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
