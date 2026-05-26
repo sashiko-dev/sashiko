@@ -13,12 +13,5 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
-      - name: Download Binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: release-binaries
-          path: target/release
-      - name: Fix Permissions
-        run: chmod +x target/release/*
       - name: Run cargo-test via Makefile
         run: make test

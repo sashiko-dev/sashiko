@@ -23,5 +23,8 @@ jobs:
           fi
           make sob RANGE="$RANGE"
   lint:
-    needs: check-sob
+    needs: [check-sob]
     uses: ./.github/workflows/linting.yml
+  run-tests:
+    needs: [check-sob]
+    uses: ./.github/workflows/unit-tests.yml

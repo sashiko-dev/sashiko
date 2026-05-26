@@ -13,8 +13,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
-      - name: Run cargo-build
-        run: cargo build --release
       - name: Setup Python Toolchain
         uses: actions/setup-python@v6
         with:
@@ -23,11 +21,3 @@ jobs:
         run: pip install yamllint
       - name: Run Linters via Makefile
         run: make lint
-      - name: Upload Binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-binaries
-          path: |
-            target/release
-          if-no-files-found: warn
-          retention-days: 7
