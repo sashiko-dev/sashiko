@@ -189,6 +189,12 @@ pub struct OpenAiCompatSettings {
     pub max_tokens: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiSettings {
+    pub api: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct KiroCliSettings {
@@ -248,6 +254,7 @@ pub struct AiSettings {
     #[cfg(feature = "vertex")]
     pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
+    pub openai: Option<OpenAiSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
 }
