@@ -213,14 +213,21 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         || subject_lower.contains("(was:");
     let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
     let has_diff = !diff.is_empty();
+    // GIT PULL requests are maintainer pull requests containing a git
+    // URL and branch, not applicable diffs. They often include inline
+    // diffstats that trigger has_diff, but should not be treated as
+    // patchsets since they cannot be applied via git am or git apply.
+    let is_git_pull = subject_clean.contains("[git pull]");
 
     // A message is part of a series if it's a cover letter (index 0) or has multiple parts (total > 1)
     let is_series_metadata = total > 1 || index == 0;
 
     // It is a patch or cover letter if:
     // 1. It is NOT a reply (Re: ...)
-    // 2. AND (It has [PATCH]/[RFC] tag OR it has a diff OR it looks like a series cover letter/part)
-    let is_patch_or_cover = !is_reply && (has_patch_tag || has_diff || is_series_metadata);
+    // 2. It is NOT a GIT PULL request
+    // 3. AND (It has [PATCH]/[RFC] tag OR it has a diff OR it looks like a series cover letter/part)
+    let is_patch_or_cover =
+        !is_reply && !is_git_pull && (has_patch_tag || has_diff || is_series_metadata);
 
     let metadata = PatchsetMetadata {
         message_id: message_id.clone(),
@@ -568,6 +575,14 @@ Body";
     #[test]
     fn test_pure_reply() {
         let raw = b"Message-ID: <abc>\r\nSubject: Re: [PATCH] fix bug\r\n\r\nLGTM";
+        let (meta, _) = parse_email(raw).unwrap();
+        assert!(!meta.is_patch_or_cover);
+    }
+
+    #[test]
+    fn test_git_pull_ignored() {
+        // GIT PULL with inline diffstat should not be treated as a patch
+        let raw = b"Message-ID: <pull-1>\r\nSubject: [GIT PULL] tracing: Fixes for 7.1\r\n\r\nPlease pull.\n\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new";
         let (meta, _) = parse_email(raw).unwrap();
         assert!(!meta.is_patch_or_cover);
     }
