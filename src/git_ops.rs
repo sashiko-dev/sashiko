@@ -89,17 +89,30 @@ impl GitWorktree {
         let output = {
             let lock = get_worktree_lock();
             let _guard = lock.lock().await;
-            Command::new("git")
+            let out = Command::new("git")
                 .current_dir(repo_path)
                 .args(["-c", "safe.bareRepository=all"])
-                .arg("worktree")
-                .arg("add")
-                .arg("--detach")
-                .arg("--no-checkout")
+                .args(["worktree", "add", "--detach", "--no-checkout"])
                 .arg(&path)
                 .arg(commit_hash)
                 .output()
-                .await?
+                .await?;
+
+            if !out.status.success() {
+                // commit_hash may be a valid object not reachable from any
+                // named ref. git worktree add rejects such loose SHAs.
+                // Retry at HEAD; phase 2 reset --hard will reposition.
+                Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["-c", "safe.bareRepository=all"])
+                    .args(["worktree", "add", "--detach", "--no-checkout"])
+                    .arg(&path)
+                    .arg("HEAD")
+                    .output()
+                    .await?
+            } else {
+                out
+            }
         };
 
         if !output.status.success() {
