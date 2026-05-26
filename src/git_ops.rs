@@ -188,6 +188,67 @@ impl GitWorktree {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub async fn apply_raw_diff(&self, diff_content: &str) -> Result<std::process::Output> {
+        info!("Applying raw diff in {:?}", self.path);
+
+        let mut child = Command::new("git")
+            .current_dir(&self.path)
+            .args(["-c", "safe.bareRepository=all"])
+            .arg("apply")
+            .arg("-") // Read from stdin
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(diff_content.as_bytes()).await?;
+        }
+
+        let output = child.wait_with_output().await?;
+
+        Ok(output)
+    }
+
+    /// Apply a raw diff with reduced context matching (-C<n>).
+    /// Useful as a fallback when strict context matching fails due
+    /// to minor tree divergence from the patch's original baseline.
+    #[allow(dead_code)]
+    pub async fn apply_raw_diff_relaxed(
+        &self,
+        diff_content: &str,
+        context_lines: u32,
+    ) -> Result<std::process::Output> {
+        info!(
+            "Applying raw diff with -C{} in {:?}",
+            context_lines, self.path
+        );
+
+        let context_arg = format!("-C{}", context_lines);
+        let mut child = Command::new("git")
+            .current_dir(&self.path)
+            .args(["-c", "safe.bareRepository=all"])
+            .arg("apply")
+            .arg(&context_arg)
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(diff_content.as_bytes()).await?;
+        }
+
+        let output = child.wait_with_output().await?;
+        Ok(output)
+    }
+
     pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
         let output = Command::new("git")
             .current_dir(&self.path)

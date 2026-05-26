@@ -535,6 +535,10 @@ async fn apply_single_patch(
         }
     }
 
+    let mut applied_via_am = false;
+    let mut am_error = String::new();
+    let mut success = false;
+
     if let (Some(author), Some(subject)) = (&p.author, &p.subject) {
         // Try to construct mbox
         let date_str = if let Some(ts) = p.date {
@@ -561,6 +565,8 @@ async fn apply_single_patch(
 
         match worktree.apply_patch(&mbox).await {
             Ok(_) => {
+                applied_via_am = true;
+                success = true;
                 if let Ok(sha) = sashiko::git_ops::get_commit_hash(&worktree.path, "HEAD").await {
                     patch_shas.insert(p.index, sha.clone());
                     if let Ok(show) = worktree.get_commit_show(&sha).await {
@@ -575,28 +581,98 @@ async fn apply_single_patch(
                     "status": "applied",
                     "method": "git-am"
                 }));
-                return true;
             }
             Err(e) => {
-                error!("git am failed: {}", e);
-                patch_results.push(json!({
-                    "index": p.index,
-                    "status": "error",
-                    "method": "git-am",
-                    "error": e.to_string()
-                }));
-                return false;
+                info!("git am failed, falling back to git apply: {}", e);
+                am_error = e.to_string();
             }
         }
     }
 
-    patch_results.push(json!({
-        "index": p.index,
-        "status": "error",
-        "method": "unknown",
-        "error": "Missing author or subject for am apply"
-    }));
-    false
+    if !applied_via_am {
+        match worktree.apply_raw_diff(&p.diff).await {
+            Ok(output) => {
+                let status = if output.status.success() {
+                    success = true;
+                    "applied"
+                } else {
+                    "failed"
+                };
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+                if status == "failed" {
+                    info!(
+                        "Failed to apply patch {}. stdout: {}\nstderr: {}",
+                        p.index, stdout, stderr
+                    );
+                }
+
+                patch_results.push(json!({
+                    "index": p.index,
+                    "status": status,
+                    "method": "git-apply",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": output.status.code(),
+                    "am_error": if !am_error.is_empty() { Some(am_error.clone()) } else { None }
+                }));
+            }
+            Err(e) => {
+                info!("Error applying patch {}: {}", p.index, e);
+                patch_results.push(json!({
+                    "index": p.index,
+                    "status": "error",
+                    "method": "git-apply",
+                    "error": e.to_string(),
+                    "am_error": if !am_error.is_empty() { Some(am_error.clone()) } else { None }
+                }));
+            }
+        }
+    }
+
+    // Reduced-context fallback: git apply -C2
+    if !applied_via_am && !success {
+        match worktree.apply_raw_diff_relaxed(&p.diff, 2).await {
+            Ok(output) => {
+                let status = if output.status.success() {
+                    success = true;
+                    "applied"
+                } else {
+                    "failed"
+                };
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+                if status == "applied" {
+                    // Replace the last failed result with the successful one
+                    patch_results.pop();
+                }
+
+                patch_results.push(json!({
+                    "index": p.index,
+                    "status": status,
+                    "method": "git-apply-C2",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": output.status.code(),
+                    "am_error": if !am_error.is_empty() { Some(am_error.clone()) } else { None }
+                }));
+            }
+            Err(e) => {
+                info!("Error applying patch {} with -C2: {}", p.index, e);
+                patch_results.push(json!({
+                    "index": p.index,
+                    "status": "error",
+                    "method": "git-apply-C2",
+                    "error": e.to_string(),
+                    "am_error": if !am_error.is_empty() { Some(am_error) } else { None }
+                }));
+            }
+        }
+    }
+
+    success
 }
 
 #[cfg(test)]

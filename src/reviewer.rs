@@ -912,6 +912,27 @@ impl Reviewer {
                     }
                 }
 
+                // Reduced-context fallback: git apply -C2
+                if !applied
+                    && let Ok(output) = worktree.apply_raw_diff_relaxed(diff, 2).await
+                    && output.status.success()
+                {
+                    applied = true;
+                    let _ = Command::new("git")
+                        .current_dir(&worktree.path)
+                        .args(["add", "."])
+                        .output()
+                        .await;
+                    let commit_msg = format!("{}\n\n(Applied via git apply -C2)", subject);
+                    let _ = Command::new("git")
+                        .current_dir(&worktree.path)
+                        .env("GIT_AUTHOR_NAME", author)
+                        .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
+                        .args(["commit", "-m", &commit_msg])
+                        .output()
+                        .await;
+                }
+
                 if applied {
                     if fast_path_taken {
                         patch_commits.insert(*index, msg_id.clone());
