@@ -257,6 +257,11 @@ impl BaselineRegistry {
                     .is_ok()
                 {
                     candidates.push(BaselineResolution::LocalRef(tag_ref));
+                } else {
+                    info!(
+                        "Skipping version tag candidate {} (not found locally)",
+                        tag_ref
+                    );
                 }
             } else {
                 let tag_ref = format!("v{}", version);
@@ -265,6 +270,11 @@ impl BaselineRegistry {
                     .is_ok()
                 {
                     candidates.push(BaselineResolution::LocalRef(tag_ref));
+                } else {
+                    info!(
+                        "Skipping version tag candidate {} (not found locally)",
+                        tag_ref
+                    );
                 }
             }
         }

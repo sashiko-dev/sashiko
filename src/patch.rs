@@ -16,6 +16,7 @@ use anyhow::{Result, anyhow};
 use mail_parser::{HeaderValue, MessageParser};
 use regex::Regex;
 use std::sync::OnceLock;
+use tracing::info;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -218,6 +219,9 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     // diffstats that trigger has_diff, but should not be treated as
     // patchsets since they cannot be applied via git am or git apply.
     let is_git_pull = subject_clean.contains("[git pull]");
+    if is_git_pull {
+        info!("Skipping [GIT PULL] message: {}", message_id);
+    }
 
     // A message is part of a series if it's a cover letter (index 0) or has multiple parts (total > 1)
     let is_series_metadata = total > 1 || index == 0;

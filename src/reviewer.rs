@@ -907,8 +907,37 @@ impl Reviewer {
                     );
 
                     // Try git am
-                    if (worktree.apply_patch(&mbox).await).is_ok() {
-                        applied = true;
+                    match worktree.apply_patch(&mbox).await {
+                        Ok(_) => applied = true,
+                        Err(e) => {
+                            warn!(
+                                "git am failed for patch {}/{} (ID: {}): {}",
+                                patchset_id, index, patch_id, e
+                            );
+                        }
+                    }
+
+                    if !applied {
+                        // Fallback raw diff
+                        if let Ok(output) = worktree.apply_raw_diff(diff).await
+                            && output.status.success()
+                        {
+                            applied = true;
+                            // Commit raw diff
+                            let _ = Command::new("git")
+                                .current_dir(&worktree.path)
+                                .args(["add", "."])
+                                .output()
+                                .await;
+                            let commit_msg = format!("{}\n\n(Applied via git apply)", subject);
+                            let _ = Command::new("git")
+                                .current_dir(&worktree.path)
+                                .env("GIT_AUTHOR_NAME", author)
+                                .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
+                                .args(["commit", "-m", &commit_msg])
+                                .output()
+                                .await;
+                        }
                     }
                 }
 
@@ -942,6 +971,10 @@ impl Reviewer {
                 } else {
                     let msg = format!(
                         "Patch {}/{} (ID: {}) failed to apply.\n",
+                        patchset_id, index, patch_id
+                    );
+                    warn!(
+                        "All apply methods failed for patch {}/{} (ID: {})",
                         patchset_id, index, patch_id
                     );
                     apply_logs.push_str(&msg);

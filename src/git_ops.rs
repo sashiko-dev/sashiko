@@ -102,6 +102,11 @@ impl GitWorktree {
                 // commit_hash may be a valid object not reachable from any
                 // named ref. git worktree add rejects such loose SHAs.
                 // Retry at HEAD; phase 2 reset --hard will reposition.
+                warn!(
+                    "Worktree add failed for ref {}: {}. Retrying with HEAD.",
+                    commit_hash,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
                 Command::new("git")
                     .current_dir(repo_path)
                     .args(["-c", "safe.bareRepository=all"])
@@ -116,10 +121,9 @@ impl GitWorktree {
         };
 
         if !output.status.success() {
-            return Err(anyhow!(
-                "Failed to create worktree: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            error!("Failed to create worktree for {}: {}", commit_hash, stderr);
+            return Err(anyhow!("Failed to create worktree: {}", stderr));
         }
 
         let output = Command::new("git")
