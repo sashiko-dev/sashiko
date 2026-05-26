@@ -40,6 +40,8 @@ pub struct OpenAiRequest {
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -99,6 +101,13 @@ pub struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(default)]
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -251,9 +260,11 @@ impl OpenAiCompatClient {
             })?;
             match serde_json::from_str::<OpenAiResponse>(&body_text) {
                 Ok(response) => {
+                    let cached = response.usage.prompt_tokens_details.cached_tokens;
                     tracing::info!(
-                        "OpenAI response received. Tokens: in={}, out={}",
-                        response.usage.prompt_tokens,
+                        "OpenAI response received. Tokens: in={}, cached={}, out={}",
+                        response.usage.prompt_tokens.saturating_sub(cached),
+                        cached,
                         response.usage.completion_tokens
                     );
                     return Ok(response);
@@ -436,6 +447,7 @@ fn translate_ai_request(
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
         response_format,
+        reasoning: Some(serde_json::json!({"effort": "high"})),
     })
 }
 
@@ -466,7 +478,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         prompt_tokens: resp.usage.prompt_tokens as usize,
         completion_tokens: resp.usage.completion_tokens as usize,
         total_tokens: resp.usage.total_tokens as usize,
-        cached_tokens: None,
+        cached_tokens: Some(resp.usage.prompt_tokens_details.cached_tokens as usize),
     });
 
     Ok(AiResponse {
@@ -958,6 +970,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                prompt_tokens_details: PromptTokensDetails::default(),
             },
         };
 
@@ -999,6 +1012,7 @@ mod tests {
                 prompt_tokens: 15,
                 completion_tokens: 25,
                 total_tokens: 40,
+                prompt_tokens_details: PromptTokensDetails::default(),
             },
         };
 
@@ -1024,6 +1038,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 0,
                 total_tokens: 10,
+                prompt_tokens_details: PromptTokensDetails::default(),
             },
         };
 
