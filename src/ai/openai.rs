@@ -174,6 +174,8 @@ impl OpenAiCompatClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
+        let base_url = Self::normalize_base_url(&base_url);
+
         Self {
             model,
             base_url,
@@ -181,6 +183,21 @@ impl OpenAiCompatClient {
             max_tokens,
             provider_type,
             client,
+        }
+    }
+
+    /// Normalize a base URL so it always ends with `/chat/completions`.
+    ///
+    /// LM Studio and other OpenAI-compatible servers document the base URL as
+    /// `http://localhost:1234/v1`, expecting the client to append the endpoint
+    /// path.  Our `post_request` POSTs directly to `self.base_url`, so we
+    /// ensure the full path is present.
+    fn normalize_base_url(url: &str) -> String {
+        let url = url.trim_end_matches('/');
+        if url.ends_with("/chat/completions") {
+            url.to_string()
+        } else {
+            format!("{}/chat/completions", url)
         }
     }
 
@@ -1148,5 +1165,34 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_normalize_base_url_appends_chat_completions() {
+        // LM Studio style: just /v1
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        // Trailing slash
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        // Already has full path
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // Full path with trailing slash
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/chat/completions/"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        // Bare host
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234"),
+            "http://localhost:1234/chat/completions"
+        );
     }
 }
