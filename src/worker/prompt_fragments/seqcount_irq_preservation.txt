@@ -1,0 +1,5 @@
+Seqcount/IRQ preservation rule:
+- If a retained concern says removing local_irq_save/local_irq_restore can make a write_seqcount_begin/write_seqcount_end section interruptible, do not dismiss it merely because a callee such as percpu_counter_sum/add is irq-safe.
+- Callee irq-safety only proves that callee's internal lock is protected. It does not prove the surrounding sequence-counter writer cannot be interrupted by a hardirq/NMI reader that spins or retries on the same sequence counter.
+- To drop this class as false_positive, the rationale must explicitly prove the sequence counter itself is safe: no interrupt-context reader can observe/retry on that seqcount while the writer is interrupted, or an equivalent concrete mitigation exists.
+- Otherwise emit or preserve one finding that names the removed IRQ protection, the sequence counter write-side section, and the deadlock/livelock risk.

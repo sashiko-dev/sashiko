@@ -454,6 +454,8 @@ async fn main() -> Result<()> {
                                 stage_protocol: stage_protocol_for_bounded_local_model(
                                     bounded_local_model,
                                 ),
+                                enable_static_bug_seeds: false,
+                                enable_targeted_bug_pattern_prescan: false,
                             },
                         );
 

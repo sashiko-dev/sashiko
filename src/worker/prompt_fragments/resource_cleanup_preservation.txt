@@ -1,0 +1,4 @@
+Resource-cleanup preservation rule:
+- If a retained concern says a newly added allocation/resource can leak or be missed on an error/cleanup path, do not dismiss it with generic helper wording.
+- To drop this class as false_positive, the rationale must name the exact allocated resource and the concrete deallocation expression/path for that same resource, such as bitmap_free(rbio->stripe_uptodate_bitmap). Saying a helper frees all resources is not enough unless the rationale names the exact cleanup call for the newly added resource.
+- Otherwise emit or preserve one finding that names the allocated resource, the failing path, and the missing cleanup.

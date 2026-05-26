@@ -61,6 +61,58 @@ fn token_budget_failure_reason(message: &str) -> String {
     format!("TokenBudgetExceeded: {message}")
 }
 
+fn compile_subject_glob(pattern: &str) -> regex::Regex {
+    let mut re = String::from("^");
+    for c in pattern.chars() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
+                re.push('\\');
+                re.push(c);
+            }
+            _ => re.push(c),
+        }
+    }
+    re.push('$');
+    regex::Regex::new(&re).unwrap_or_else(|e| {
+        warn!("Subject glob translator produced invalid regex for {pattern:?}: {e}");
+        regex::Regex::new(r"\b\B").expect("valid never-match regex literal")
+    })
+}
+
+async fn complete_failed_review_from_tool_error(
+    ctx: &ReviewContext,
+    review_id: i64,
+    patch_id: i64,
+    error_msg: &str,
+    interaction_id: Option<&str>,
+    logs: Option<&str>,
+) -> bool {
+    let budget_failed = is_token_budget_failure_message(error_msg);
+    let result_desc = if budget_failed {
+        token_budget_failure_reason(error_msg)
+    } else {
+        error_msg.to_string()
+    };
+    let _ = ctx
+        .db
+        .complete_review(
+            review_id,
+            ReviewStatus::Failed.as_str(),
+            &result_desc,
+            None,
+            interaction_id,
+            None,
+            logs,
+        )
+        .await;
+    if budget_failed {
+        let _ = ctx.db.update_patch_status(patch_id, "FailedBudget").await;
+    }
+    budget_failed
+}
+
 #[derive(Serialize)]
 struct BaselineAttempt {
     baseline: String,
@@ -484,25 +536,14 @@ impl Reviewer {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
 
-            let compile_glob = |pattern: &str| -> regex::Regex {
-                let mut re = String::from("^");
-                for c in pattern.chars() {
-                    match c {
-                        '*' => re.push_str(".*"),
-                        '?' => re.push('.'),
-                        '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
-                            re.push('\\');
-                            re.push(c);
-                        }
-                        _ => re.push(c),
-                    }
-                }
-                re.push('$');
-                regex::Regex::new(&re).unwrap_or_else(|_| regex::Regex::new("a^").unwrap())
-            };
-
-            let skip_regexes: Vec<_> = skip_filters.iter().map(|f| compile_glob(f)).collect();
-            let only_regexes: Vec<_> = only_filters.iter().map(|f| compile_glob(f)).collect();
+            let skip_regexes: Vec<_> = skip_filters
+                .iter()
+                .map(|f| compile_subject_glob(f))
+                .collect();
+            let only_regexes: Vec<_> = only_filters
+                .iter()
+                .map(|f| compile_subject_glob(f))
+                .collect();
 
             struct ValidJob {
                 patch_id: i64,
@@ -1248,27 +1289,16 @@ impl Reviewer {
                                 "Review tool returned error for ps={} idx={}: {}",
                                 patchset_id, index, error_msg
                             );
-                            let budget_failed = is_token_budget_failure_message(error_msg);
-                            let result_desc = if budget_failed {
-                                token_budget_failure_reason(error_msg)
-                            } else {
-                                error_msg.to_string()
-                            };
-                            let _ = ctx
-                                .db
-                                .complete_review(
-                                    review_id,
-                                    ReviewStatus::Failed.as_str(),
-                                    &result_desc,
-                                    None,
-                                    interaction_id.as_deref(),
-                                    None,
-                                    logs_str.as_deref(),
-                                )
-                                .await;
-
-                            if budget_failed {
-                                let _ = ctx.db.update_patch_status(patch_id, "FailedBudget").await;
+                            if complete_failed_review_from_tool_error(
+                                ctx,
+                                review_id,
+                                patch_id,
+                                error_msg,
+                                interaction_id.as_deref(),
+                                logs_str.as_deref(),
+                            )
+                            .await
+                            {
                                 return Ok(PatchResult::ReviewFailed);
                             }
 
@@ -1454,26 +1484,16 @@ impl Reviewer {
                         let error_msg = json_output["error"]
                             .as_str()
                             .unwrap_or("Tool failed to return patch status");
-                        let budget_failed = is_token_budget_failure_message(error_msg);
-                        let result_desc = if budget_failed {
-                            token_budget_failure_reason(error_msg)
-                        } else {
-                            error_msg.to_string()
-                        };
-                        let _ = ctx
-                            .db
-                            .complete_review(
-                                review_id,
-                                ReviewStatus::Failed.as_str(),
-                                &result_desc,
-                                None,
-                                interaction_id.as_deref(),
-                                None,
-                                logs_str.as_deref(),
-                            )
-                            .await;
-                        if budget_failed {
-                            let _ = ctx.db.update_patch_status(patch_id, "FailedBudget").await;
+                        if complete_failed_review_from_tool_error(
+                            ctx,
+                            review_id,
+                            patch_id,
+                            error_msg,
+                            interaction_id.as_deref(),
+                            logs_str.as_deref(),
+                        )
+                        .await
+                        {
                             return Ok(PatchResult::ReviewFailed);
                         }
                         if retries < max_retries {
@@ -1487,26 +1507,11 @@ impl Reviewer {
                 Err(e) => {
                     error!("Review execution failed for {}: {}", patchset_id, e);
                     let error_msg = format!("Tool error: {}", e);
-                    let budget_failed = is_token_budget_failure_message(&error_msg);
-                    let result_desc = if budget_failed {
-                        token_budget_failure_reason(&error_msg)
-                    } else {
-                        error_msg
-                    };
-                    let _ = ctx
-                        .db
-                        .complete_review(
-                            review_id,
-                            ReviewStatus::Failed.as_str(),
-                            &result_desc,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                    if budget_failed {
-                        let _ = ctx.db.update_patch_status(patch_id, "FailedBudget").await;
+                    if complete_failed_review_from_tool_error(
+                        ctx, review_id, patch_id, &error_msg, None, None,
+                    )
+                    .await
+                    {
                         return Ok(PatchResult::ReviewFailed);
                     }
                     if retries < max_retries {
@@ -3208,6 +3213,23 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
     fn test_prompt_preflight_margin_requires_bounded_local_mode() {
         assert_eq!(prompt_preflight_cap(60_000, true), 54_000);
         assert_eq!(prompt_preflight_cap(60_000, false), 60_000);
+    }
+
+    #[test]
+    fn test_subject_glob_regex_matches_wildcards() {
+        let re = compile_subject_glob("drivers/**/foo?.c");
+
+        assert!(re.is_match("drivers/net/foo1.c"));
+        assert!(re.is_match("drivers/gpu/drm/fooA.c"));
+        assert!(!re.is_match("drivers/net/foo12.c"));
+    }
+
+    #[test]
+    fn test_subject_glob_regex_escapes_metacharacters() {
+        let re = compile_subject_glob(r"net/[foo]\bar.+(v2){x}$");
+
+        assert!(re.is_match(r"net/[foo]\bar.+(v2){x}$"));
+        assert!(!re.is_match("net/foobarzzv2x"));
     }
 
     #[tokio::test]
