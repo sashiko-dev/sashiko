@@ -1,9 +1,12 @@
 [ai]
 provider = "kiro-cli"
 model = "claude-opus-4.6"
-api_timeout_secs = 300
 
 [ai.kiro_cli]
 binary = "kiro-cli"
 context_window_size = 200000
 # agent = "my-custom-agent"
+
+# Kiro ACP does not use the generic [ai].api_timeout_secs guard. It uses the
+# provider-specific turn guard documented in docs/llm-providers.md:
+# SASHIKO__AI__KIRO_MAX_TURN_WALL_CLOCK_SECS, default 1200.

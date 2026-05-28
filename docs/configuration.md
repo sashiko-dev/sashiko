@@ -76,7 +76,7 @@ Core AI settings that apply to all providers.
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
 | `temperature` | float | `1.0` | Sampling temperature. |
-| `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
+| `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). Kiro ACP uses its provider-specific turn guard instead; see `SASHIKO__AI__KIRO_MAX_TURN_WALL_CLOCK_SECS` in `docs/llm-providers.md`. |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
 | `response_cache` | bool | `false` | Cache AI responses to disk. |
 | `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). |

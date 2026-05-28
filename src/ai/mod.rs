@@ -603,15 +603,13 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         })),
         "kiro-cli" => {
             let cfg = ai.kiro_cli.as_ref();
-            Ok(Arc::new(kiro_cli::KiroCliProvider {
-                model: ai.model.clone(),
-                binary: cfg
-                    .map(|c| c.binary.clone())
+            Ok(Arc::new(kiro_cli::KiroCliProvider::new(
+                ai.model.clone(),
+                cfg.map(|c| c.binary.clone())
                     .unwrap_or_else(|| "kiro-cli".to_string()),
-                agent: cfg.and_then(|c| c.agent.clone()),
-                context_window_size: cfg.map(|c| c.context_window_size).unwrap_or(200_000),
-                timeout_secs: ai.api_timeout_secs,
-            }))
+                cfg.and_then(|c| c.agent.clone()),
+                cfg.map(|c| c.context_window_size).unwrap_or(200_000),
+            )))
         }
         #[cfg(feature = "vertex")]
         "vertex" => {
