@@ -216,17 +216,35 @@ pub(crate) struct RemoteAiErrorPayload {
     pub message: String,
     #[serde(flatten)]
     pub class: AiErrorClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_kind: Option<RemoteTerminalKind>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteTerminalKind {
+    BudgetExceeded,
 }
 
 impl RemoteAiErrorPayload {
     pub fn new(message: String, class: AiErrorClass) -> Self {
-        Self { message, class }
+        Self {
+            message,
+            class,
+            terminal_kind: None,
+        }
+    }
+
+    pub fn with_terminal_kind(mut self, terminal_kind: Option<RemoteTerminalKind>) -> Self {
+        self.terminal_kind = terminal_kind;
+        self
     }
 
     pub fn into_error(self) -> RemoteAiError {
         RemoteAiError {
             message: self.message,
             class: self.class,
+            terminal_kind: self.terminal_kind,
         }
     }
 }
@@ -237,6 +255,24 @@ impl RemoteAiErrorPayload {
 pub struct RemoteAiError {
     pub message: String,
     pub class: AiErrorClass,
+    pub(crate) terminal_kind: Option<RemoteTerminalKind>,
+}
+
+impl RemoteAiError {
+    /// Restores terminal review errors that were carried over the stdio
+    /// protocol. Other remote failures retain their provider classification.
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self.terminal_kind {
+            Some(RemoteTerminalKind::BudgetExceeded) => {
+                crate::worker::prompts::ReviewError::BudgetExceeded(format!(
+                    "remote AI terminal failure: {}",
+                    self.message
+                ))
+                .into()
+            }
+            None => self.into(),
+        }
+    }
 }
 
 pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -303,7 +339,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
 
 /// Decodes a single line of the stdio AI protocol into an [`AiResponse`].
 ///
-/// Typed error payloads surface as [`RemoteAiError`].
+/// Typed error payloads surface as [`RemoteAiError`] unless they carry a
+/// provider-specific terminal marker that must preserve fail-fast behavior
+/// across the stdio boundary.
 #[allow(dead_code)]
 pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
     let resp_msg: serde_json::Value = serde_json::from_str(line)?;
@@ -312,7 +350,7 @@ pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
         Some("error") => {
             let payload: RemoteAiErrorPayload =
                 serde_json::from_value(resp_msg["payload"].clone())?;
-            Err(payload.into_error().into())
+            Err(payload.into_error().into_anyhow())
         }
         _ => bail!("Unexpected response type: {:?}", resp_msg["type"]),
     }
@@ -706,6 +744,7 @@ impl IpcRegistry {
             return Err(RemoteAiError {
                 message: "IPC channel disconnected (stdin closed)".to_string(),
                 class: AiErrorClass::Fatal,
+                terminal_kind: None,
             });
         }
         if map.insert(tx_id, tx).is_some() {
@@ -870,6 +909,7 @@ pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::Joi
             .abort_all(RemoteAiError {
                 message: "IPC channel disconnected (stdin closed)".to_string(),
                 class: AiErrorClass::Fatal,
+                terminal_kind: None,
             })
             .await;
     })
@@ -1066,6 +1106,40 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_stdio_ai_response_kiro_terminal_payload_is_review_error() -> Result<()> {
+        let raw_json = json!({
+            "type": "error",
+            "payload": RemoteAiErrorPayload::new("terminal failure".to_string(), AiErrorClass::Fatal)
+                .with_terminal_kind(Some(RemoteTerminalKind::BudgetExceeded))
+        });
+        let serialized = serde_json::to_string(&raw_json)?;
+
+        let err = decode_stdio_ai_response(&serialized).unwrap_err();
+
+        assert!(err.downcast_ref::<RemoteAiError>().is_none());
+        assert!(err.downcast_ref::<ReviewError>().is_some());
+        assert_eq!(classify_ai_error(&err), AiErrorClass::Fatal);
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_ai_error_payload_terminal_kind_wire_format() -> Result<()> {
+        let payload = RemoteAiErrorPayload::new("x".to_string(), AiErrorClass::Fatal)
+            .with_terminal_kind(Some(RemoteTerminalKind::BudgetExceeded));
+        let serialized = serde_json::to_value(&payload)?;
+
+        assert_eq!(
+            serialized,
+            json!({
+                "message": "x",
+                "class": "fatal",
+                "terminal_kind": "budget_exceeded"
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_decode_stdio_ai_response_rejects_non_object_error_payload() -> Result<()> {
         let raw_json = json!({
             "type": "error",
@@ -1103,6 +1177,7 @@ mod tests {
         let err = RemoteAiError {
             message: "remote rate limit".to_string(),
             class: AiErrorClass::RateLimit { retry_after },
+            terminal_kind: None,
         };
 
         assert_eq!(
@@ -1148,6 +1223,7 @@ mod tests {
             RemoteAiError {
                 message: "remote rate limit".to_string(),
                 class: AiErrorClass::RateLimit { retry_after },
+                terminal_kind: None,
             },
             AiErrorClass::RateLimit { retry_after },
         );
@@ -1160,6 +1236,7 @@ mod tests {
             RemoteAiError {
                 message: "remote transient".to_string(),
                 class: AiErrorClass::Transient { retry_after },
+                terminal_kind: None,
             },
             AiErrorClass::Transient { retry_after },
         );
@@ -1171,6 +1248,7 @@ mod tests {
             RemoteAiError {
                 message: "remote fatal".to_string(),
                 class: AiErrorClass::Fatal,
+                terminal_kind: None,
             },
             AiErrorClass::Fatal,
         );
@@ -1275,6 +1353,7 @@ mod tests {
             .abort_all(RemoteAiError {
                 message: "IPC channel disconnected (stdin closed)".to_string(),
                 class: AiErrorClass::Fatal,
+                terminal_kind: None,
             })
             .await;
 

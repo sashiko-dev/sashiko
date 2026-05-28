@@ -18,7 +18,7 @@ use crate::{
     toolbox::ToolBox,
     worker::{
         PatchInput, ReviewInput, Worker, WorkerConfig, calculate_series_range,
-        prompts::PromptRegistry,
+        prompts::{PromptRegistry, ReviewError},
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -615,6 +615,12 @@ async fn review_single_patch(
                     "AI review for patch {} failed with exception: {}",
                     p.index, e
                 );
+                if matches!(
+                    e.downcast_ref::<ReviewError>(),
+                    Some(ReviewError::BudgetExceeded(_))
+                ) {
+                    return Err(e);
+                }
                 last_error = Some(e);
             }
         }
