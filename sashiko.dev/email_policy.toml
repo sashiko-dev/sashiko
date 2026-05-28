@@ -163,3 +163,8 @@ cc = ["Danilo Krummrich <dakr@kernel.org>", "Alexandre Courbot <acourbot@nvidia.
 [subsystems.linux-btrfs]
 lists = ["linux-btrfs@vger.kernel.org"]
 cc = ["dsterba@suse.cz"]
+
+[subsystems.linux-media]
+lists = ["linux-media@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-media@vger.kernel.org"]
