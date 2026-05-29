@@ -846,6 +846,22 @@ impl Database {
         Ok(())
     }
 
+    pub async fn count_tool_usages(&self, review_id: i64) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM tool_usages WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(row.get(0)?)
+        } else {
+            Ok(0)
+        }
+    }
+
     pub async fn migrate_tool_usages(&self) -> Result<()> {
         // 1. Check if we have logs to parse
         info!("Migration: Checking for tool usages to backfill...");

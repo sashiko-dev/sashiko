@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponseFormat, AiRole, ClassifyAiError,
+    AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole,
+    ClassifyAiError,
 };
+use crate::review_budget::local_prompt_preflight_cap;
 use crate::worker::tools::ToolBox;
 use anyhow::{Context, Result};
 
@@ -52,6 +55,7 @@ impl ClassifyAiError for ReviewError {
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -63,6 +67,9 @@ pub const SYSTEM_IDENTITY: &str = "";
 /// Subsystem guides that are loaded per-stage in get_stage_prompt() and should
 /// be excluded from Phase 0's shared context to avoid double-counting.
 const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
+const LOCAL_MAX_SELECTED_GUIDES: usize = 4;
+const LOCAL_MAX_GUIDE_CONTEXT_TOKENS: usize = 12_000;
+const LOCAL_SKIP_EXPLORATION_PERCENT: usize = 85;
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct PatchInput {
@@ -128,6 +135,13 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub stage_protocol: StageProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageProtocol {
+    Native,
+    BoundedLocalModel,
 }
 
 pub struct WorkerResult {
@@ -457,11 +471,13 @@ pub struct Worker {
     tools: Arc<ToolBox>,
     prompts: PromptRegistry,
     global_history: Vec<AiMessage>,
+    max_input_tokens: usize,
     max_interactions: usize,
     temperature: f32,
     series_range: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    stage_protocol: StageProtocol,
 }
 
 impl Worker {
@@ -476,12 +492,91 @@ impl Worker {
             tools,
             prompts,
             global_history: Vec::new(),
+            max_input_tokens: config.max_input_tokens,
             max_interactions: config.max_interactions,
             temperature: config.temperature,
             series_range: config.series_range,
             context_tag: None,
             stages: config.stages,
+            stage_protocol: config.stage_protocol,
         }
+    }
+
+    async fn checked_generate_content(
+        &self,
+        label: &str,
+        request: AiRequest,
+    ) -> Result<AiResponse> {
+        let estimated = self.provider.estimate_tokens(&request);
+        let preflight_cap = self.prompt_preflight_cap();
+        if estimated > preflight_cap {
+            return Err(ReviewError::BudgetExceeded(format!(
+                "{label} prompt estimate {estimated} exceeds preflight cap {preflight_cap} (max_input_tokens {})",
+                self.max_input_tokens
+            ))
+            .into());
+        }
+        self.provider.generate_content(request).await
+    }
+
+    fn request_estimate(&self, request: &AiRequest) -> usize {
+        self.provider.estimate_tokens(request)
+    }
+
+    fn local_context_threshold(&self, percent: usize) -> usize {
+        self.max_input_tokens.saturating_mul(percent) / 100
+    }
+
+    fn prompt_preflight_cap(&self) -> usize {
+        if self.stage_protocol == StageProtocol::BoundedLocalModel {
+            local_prompt_preflight_cap(self.max_input_tokens)
+        } else {
+            self.max_input_tokens
+        }
+    }
+
+    fn validate_prompt_usage(&self, label: &str, prompt_tokens: usize) -> Result<()> {
+        if prompt_tokens > self.max_input_tokens {
+            return Err(ReviewError::BudgetExceeded(format!(
+                "{label} actual prompt_tokens {prompt_tokens} exceeds max_input_tokens {}",
+                self.max_input_tokens
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn limit_local_selected_prompts(&self, prompts: Vec<String>) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut limited: Vec<String> = prompts
+            .into_iter()
+            .filter(|name| !STAGE_EXCLUSIVE_GUIDES.contains(&name.as_str()))
+            .filter(|name| seen.insert(name.clone()))
+            .take(LOCAL_MAX_SELECTED_GUIDES)
+            .collect();
+
+        while !limited.is_empty() {
+            match self.prompts.build_context(Some(&limited)).await {
+                Ok((context, _)) => {
+                    let tokens = TokenBudget::estimate_tokens(&context);
+                    if tokens <= LOCAL_MAX_GUIDE_CONTEXT_TOKENS {
+                        break;
+                    }
+                    warn!(
+                        "Local Phase 0 guide context is {} tokens, over cap {}; dropping broadest selected guide",
+                        tokens, LOCAL_MAX_GUIDE_CONTEXT_TOKENS
+                    );
+                    limited.pop();
+                }
+                Err(e) => {
+                    warn!("Failed to estimate selected guide context: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Local Phase 0 capped prompts: {:?}", limited);
+        limited
     }
 
     pub async fn run(&mut self, patchset: Value) -> Result<WorkerResult> {
@@ -552,7 +647,11 @@ impl Worker {
             match tokio::fs::read_to_string(&subsystem_md_path).await {
                 Ok(subsystem_md) => {
                     info!("Executing Phase 0: Pre-screening relevant subsystem guides.");
-                    let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```";
+                    let phase0_system = if self.stage_protocol == StageProtocol::BoundedLocalModel {
+                        "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select the smallest useful set of subsystem guides from the index below.\nFor bounded local-model runs, select at most 4 guide filenames. Prefer the exact subsystem guide, then the closest parent subsystem guide, then at most one directly relevant cross-cutting guide. Exact guides beat many broad guides. Do not include broad or generic guides unless the patch directly needs them and budget remains.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```"
+                    } else {
+                        "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```"
+                    };
                     let phase0_prompt = format!(
                         "<subsystem_guide_index>\n{}\n</subsystem_guide_index>\n\n<patch>\n{}\n</patch>",
                         subsystem_md, target_commit_diff
@@ -625,6 +724,19 @@ impl Worker {
             None
         };
 
+        let mut selected_prompts = selected_prompts;
+        if self.stage_protocol == StageProtocol::BoundedLocalModel {
+            selected_prompts = match selected_prompts.take() {
+                Some(prompts) => Some(self.limit_local_selected_prompts(prompts).await),
+                None => {
+                    warn!(
+                        "Phase 0 did not return selected guides in local mode; loading no shared subsystem guides"
+                    );
+                    Some(Vec::new())
+                }
+            };
+        }
+
         let (static_context, clean_static_context) = self
             .prompts
             .build_context(selected_prompts.as_deref())
@@ -650,6 +762,11 @@ impl Worker {
         dynamic_context_no_log.push_str("\n\nTarget Commit Diff:\n");
         dynamic_context_no_log.push_str(&target_commit_diff_only);
         let mut clean_dynamic_context_no_log = dynamic_context_no_log.clone();
+
+        let base_dynamic_context = dynamic_context.clone();
+        let base_clean_dynamic_context = clean_dynamic_context.clone();
+        let base_dynamic_context_no_log = dynamic_context_no_log.clone();
+        let base_clean_dynamic_context_no_log = clean_dynamic_context_no_log.clone();
 
         // Prefetch AST context based on the diff
         let worktree_path = self.tools.get_worktree_path();
@@ -680,7 +797,7 @@ impl Worker {
             clean_dynamic_context_no_log
                 .push_str("{{prefetched_context}}\n</pre_fetched_context>\n");
         }
-        let (shared_context, clean_shared_context) = {
+        let (mut shared_context, mut clean_shared_context) = {
             // Without cache (or with implicit cache like Claude), we send everything.
             (
                 format!("{}{}", static_context, dynamic_context),
@@ -688,12 +805,52 @@ impl Worker {
             )
         };
 
-        let (shared_context_no_log, clean_shared_context_no_log) = {
+        let (mut shared_context_no_log, mut clean_shared_context_no_log) = {
             (
                 format!("{}{}", static_context, dynamic_context_no_log),
                 format!("{}{}", clean_static_context, clean_dynamic_context_no_log),
             )
         };
+
+        if self.stage_protocol == StageProtocol::BoundedLocalModel
+            && (TokenBudget::estimate_tokens(&shared_context) > self.max_input_tokens
+                || TokenBudget::estimate_tokens(&shared_context_no_log) > self.max_input_tokens)
+        {
+            warn!(
+                "Local context exceeds max_input_tokens {}; dropping shared guide context before model calls",
+                self.max_input_tokens
+            );
+            let (minimal_static_context, minimal_clean_static_context) =
+                self.prompts.build_context(Some(&[])).await?;
+            shared_context = format!("{}{}", minimal_static_context, dynamic_context);
+            clean_shared_context =
+                format!("{}{}", minimal_clean_static_context, clean_dynamic_context);
+            shared_context_no_log = format!("{}{}", minimal_static_context, dynamic_context_no_log);
+            clean_shared_context_no_log = format!(
+                "{}{}",
+                minimal_clean_static_context, clean_dynamic_context_no_log
+            );
+
+            if TokenBudget::estimate_tokens(&shared_context) > self.max_input_tokens
+                || TokenBudget::estimate_tokens(&shared_context_no_log) > self.max_input_tokens
+            {
+                warn!(
+                    "Local context still exceeds max_input_tokens {}; dropping prefetched context before model calls",
+                    self.max_input_tokens
+                );
+                shared_context = format!("{}{}", minimal_static_context, base_dynamic_context);
+                clean_shared_context = format!(
+                    "{}{}",
+                    minimal_clean_static_context, base_clean_dynamic_context
+                );
+                shared_context_no_log =
+                    format!("{}{}", minimal_static_context, base_dynamic_context_no_log);
+                clean_shared_context_no_log = format!(
+                    "{}{}",
+                    minimal_clean_static_context, base_clean_dynamic_context_no_log
+                );
+            }
+        }
 
         let mut planning_selected_stages: Option<Vec<u8>> = None;
         if self.stages.is_none() {
@@ -1480,11 +1637,7 @@ Example Output:
                 clean_user_prompt,
             )
             .await?;
-        let cleaned = crate::utils::clean_json_string(&raw_text);
-        let parsed: Value = serde_json::from_str(&cleaned).unwrap_or_else(|_| {
-            let cands = find_json_candidates(&raw_text);
-            cands.into_iter().last().unwrap_or(json!({}))
-        });
+        let parsed = parse_stage_json(&raw_text);
         Ok((parsed, t_in, t_out, t_cached, stage_history))
     }
 
@@ -1496,7 +1649,6 @@ Example Output:
         user_prompt: String,
         clean_user_prompt: String,
     ) -> Result<(String, u32, u32, u32, Vec<AiMessage>)> {
-        let mut stage_action_history = Vec::new();
         let mut stage_history = Vec::new();
         let mut local_history = Vec::new();
 
@@ -1519,12 +1671,273 @@ Example Output:
             tool_call_id: None,
         });
 
-        let mut turns = 0;
         let mut t_in = 0;
         let mut t_out = 0;
         let mut t_cached = 0;
-        let mut recitation_retries = 0;
+        if self.stage_protocol == StageProtocol::Native {
+            return self
+                .run_ai_stage_raw_native(
+                    _stage,
+                    system_prompt,
+                    local_history,
+                    stage_history,
+                    t_in,
+                    t_out,
+                    t_cached,
+                )
+                .await;
+        }
 
+        let policy = exploration_policy(_stage, self.max_interactions);
+        let tool_declarations = stage_tool_declarations(&self.tools, _stage);
+        let mut exploration_turns = 0usize;
+        let mut progress_tool_calls_seen = 0usize;
+        let mut empty_no_tool_reprompt_used = false;
+        let mut tool_cache: HashMap<String, CachedToolCall> = HashMap::new();
+
+        loop {
+            if exploration_turns >= policy.max_interactions {
+                let (content, t_in, t_out, t_cached) = self
+                    .finalize_stage_output(
+                        _stage,
+                        &system_prompt,
+                        &mut local_history,
+                        &mut stage_history,
+                        &mut t_in,
+                        &mut t_out,
+                        &mut t_cached,
+                    )
+                    .await?;
+                return Ok((content, t_in, t_out, t_cached, stage_history));
+            }
+            exploration_turns += 1;
+
+            let request = crate::ai::AiRequest {
+                system: Some(system_prompt.clone()),
+                messages: local_history.clone(),
+                tools: Some(tool_declarations.clone()),
+                temperature: Some(self.temperature),
+                response_format: None,
+                context_tag: self
+                    .context_tag
+                    .as_ref()
+                    .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)),
+            };
+
+            let estimated = self.request_estimate(&request);
+            if estimated > self.local_context_threshold(LOCAL_SKIP_EXPLORATION_PERCENT) {
+                warn!(
+                    "Stage {} prompt estimate {} is over the local {}% context guard (max_input_tokens {}); skipping exploration",
+                    _stage, estimated, LOCAL_SKIP_EXPLORATION_PERCENT, self.max_input_tokens
+                );
+                let (content, t_in, t_out, t_cached) = self
+                    .finalize_stage_output(
+                        _stage,
+                        &system_prompt,
+                        &mut local_history,
+                        &mut stage_history,
+                        &mut t_in,
+                        &mut t_out,
+                        &mut t_cached,
+                    )
+                    .await?;
+                return Ok((content, t_in, t_out, t_cached, stage_history));
+            }
+
+            let label = format!("stage {} exploration", _stage);
+            let resp = self.checked_generate_content(&label, request).await?;
+            if resp.truncated {
+                return Err(ReviewError::OutputTruncated.into());
+            }
+
+            let mut force_finalize_due_to_context = false;
+            if let Some(usage) = &resp.usage {
+                self.validate_prompt_usage(
+                    &format!("stage {} exploration", _stage),
+                    usage.prompt_tokens,
+                )?;
+                t_in += usage.prompt_tokens as u32;
+                t_out += usage.completion_tokens as u32;
+                t_cached += usage.cached_tokens.unwrap_or(0) as u32;
+                if usage.prompt_tokens
+                    > self.local_context_threshold(LOCAL_SKIP_EXPLORATION_PERCENT)
+                {
+                    force_finalize_due_to_context = true;
+                    warn!(
+                        "Stage {} actual prompt_tokens {} crossed the local {}% context guard; blocking further tool expansion",
+                        _stage, usage.prompt_tokens, LOCAL_SKIP_EXPLORATION_PERCENT
+                    );
+                }
+            }
+
+            let assistant_msg = AiMessage {
+                role: AiRole::Assistant,
+                content: resp.content.clone(),
+                thought: resp.thought.clone(),
+                thought_signature: resp.thought_signature.clone(),
+                tool_calls: resp.tool_calls.clone(),
+                tool_call_id: None,
+            };
+            local_history.push(assistant_msg.clone());
+            stage_history.push(assistant_msg);
+
+            let tool_calls = resp.tool_calls.unwrap_or_default();
+            if !tool_calls.is_empty() {
+                let mut tool_responses = Vec::new();
+                let mut force_finalize = force_finalize_due_to_context;
+                let remaining_stage_budget = policy
+                    .max_tool_calls
+                    .saturating_sub(progress_tool_calls_seen);
+                let allowed_this_turn = if force_finalize_due_to_context {
+                    0
+                } else {
+                    per_turn_tool_call_cap(_stage).min(remaining_stage_budget)
+                };
+                for (idx, call) in tool_calls.into_iter().enumerate() {
+                    let tool_name = call.function_name.trim().to_ascii_lowercase();
+                    let result = if idx >= allowed_this_turn {
+                        force_finalize = true;
+                        json!({
+                            "error": "Tool call blocked: per-turn or context tool budget exceeded. Finalize using the code/context evidence gathered so far."
+                        })
+                        .to_string()
+                    } else if (1..=9).contains(&_stage) && tool_name == "todowrite" {
+                        force_finalize = true;
+                        json!({
+                            "error": "TodoWrite is disabled during review-stage exploration. Finalize using the code/context evidence gathered so far."
+                        })
+                        .to_string()
+                    } else {
+                        progress_tool_calls_seen += 1;
+                        let key = tool_cache_key(&call.function_name, &call.arguments);
+                        if let Some(cached) = tool_cache.get_mut(&key) {
+                            cached.requests += 1;
+                            if cached.requests == 2 {
+                                json!({
+                                    "cached": true,
+                                    "content": cached.result.clone()
+                                })
+                                .to_string()
+                            } else {
+                                force_finalize = true;
+                                json!({
+                                    "error": "Repeated identical tool call blocked. Finalize the stage using the evidence already gathered."
+                                })
+                                .to_string()
+                            }
+                        } else {
+                            let result = match self
+                                .tools
+                                .call(&call.function_name, call.arguments.clone())
+                                .await
+                            {
+                                Ok(v) => v.to_string(),
+                                Err(e) => json!({"error": e.to_string()}).to_string(),
+                            };
+                            tool_cache.insert(
+                                key,
+                                CachedToolCall {
+                                    requests: 1,
+                                    result: result.clone(),
+                                },
+                            );
+                            result
+                        }
+                    };
+                    tool_responses.push(AiMessage {
+                        role: AiRole::Tool,
+                        content: Some(result),
+                        thought: None,
+                        thought_signature: None,
+                        tool_calls: None,
+                        tool_call_id: Some(call.id.clone()),
+                    });
+                }
+                local_history.extend(tool_responses.clone());
+                stage_history.extend(tool_responses);
+                if force_finalize || progress_tool_calls_seen >= policy.max_tool_calls {
+                    let (content, t_in, t_out, t_cached) = self
+                        .finalize_stage_output(
+                            _stage,
+                            &system_prompt,
+                            &mut local_history,
+                            &mut stage_history,
+                            &mut t_in,
+                            &mut t_out,
+                            &mut t_cached,
+                        )
+                        .await?;
+                    return Ok((content, t_in, t_out, t_cached, stage_history));
+                }
+            } else if resp.content.is_some() || resp.thought.is_some() {
+                if stage_response_schema(_stage).is_none() {
+                    return Ok((
+                        resp.content.unwrap_or_default(),
+                        t_in,
+                        t_out,
+                        t_cached,
+                        stage_history,
+                    ));
+                }
+
+                let final_content = self
+                    .finalize_stage_output(
+                        _stage,
+                        &system_prompt,
+                        &mut local_history,
+                        &mut stage_history,
+                        &mut t_in,
+                        &mut t_out,
+                        &mut t_cached,
+                    )
+                    .await?;
+
+                if (1..=7).contains(&_stage)
+                    && progress_tool_calls_seen == 0
+                    && !empty_no_tool_reprompt_used
+                    && stage_has_empty_concerns(&final_content.0)
+                {
+                    empty_no_tool_reprompt_used = true;
+                    let reprompt = "You returned an empty stage result without inspecting any available context.\nBefore emitting an empty concerns list, use the available tools to inspect the target diff and relevant surrounding code.";
+                    let reprompt_msg = AiMessage {
+                        role: AiRole::User,
+                        content: Some(reprompt.to_string()),
+                        thought: None,
+                        thought_signature: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    };
+                    local_history.push(reprompt_msg.clone());
+                    stage_history.push(reprompt_msg);
+                    continue;
+                }
+
+                return Ok((
+                    final_content.0,
+                    final_content.1,
+                    final_content.2,
+                    final_content.3,
+                    stage_history,
+                ));
+            } else {
+                return Err(anyhow::anyhow!("No content or tool calls from AI"));
+            }
+        }
+    }
+
+    async fn run_ai_stage_raw_native(
+        &self,
+        stage: u8,
+        system_prompt: String,
+        mut local_history: Vec<AiMessage>,
+        mut stage_history: Vec<AiMessage>,
+        mut t_in: u32,
+        mut t_out: u32,
+        mut t_cached: u32,
+    ) -> Result<(String, u32, u32, u32, Vec<AiMessage>)> {
+        let mut turns = 0;
+        let mut recitation_retries = 0;
+        let mut stage_action_history = Vec::new();
         let tools_ref = self.tools.clone();
 
         loop {
@@ -1538,15 +1951,15 @@ Example Output:
                 messages: local_history.clone(),
                 tools: Some(self.tools.get_declarations_generic()),
                 temperature: Some(self.temperature),
-
                 response_format: None,
                 context_tag: self
                     .context_tag
                     .as_ref()
-                    .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)),
+                    .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], stage)),
             };
 
-            let resp = match self.provider.generate_content(request).await {
+            let label = format!("stage {} native", stage);
+            let resp = match self.checked_generate_content(&label, request).await {
                 Ok(r) => r,
                 Err(e) => {
                     let err_msg = e.to_string();
@@ -1581,6 +1994,10 @@ Example Output:
             }
 
             if let Some(usage) = &resp.usage {
+                self.validate_prompt_usage(
+                    &format!("stage {} native", stage),
+                    usage.prompt_tokens,
+                )?;
                 t_in += usage.prompt_tokens as u32;
                 t_out += usage.completion_tokens as u32;
                 t_cached += usage.cached_tokens.unwrap_or(0) as u32;
@@ -1684,6 +2101,97 @@ Example Output:
         Err(ReviewError::LimitExceeded.into())
     }
 
+    async fn finalize_stage_output(
+        &self,
+        stage: u8,
+        system_prompt: &str,
+        local_history: &mut Vec<AiMessage>,
+        stage_history: &mut Vec<AiMessage>,
+        t_in: &mut u32,
+        t_out: &mut u32,
+        t_cached: &mut u32,
+    ) -> Result<(String, u32, u32, u32)> {
+        let Some(schema) = stage_response_schema(stage) else {
+            return Err(ReviewError::LimitExceeded.into());
+        };
+
+        let final_prompt = stage_finalization_prompt(stage);
+        let final_user_msg = AiMessage {
+            role: AiRole::User,
+            content: Some(final_prompt.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        local_history.push(final_user_msg.clone());
+        stage_history.push(final_user_msg);
+
+        let final_request = crate::ai::AiRequest {
+            system: Some(system_prompt.to_string()),
+            messages: local_history.clone(),
+            tools: None,
+            temperature: Some(self.temperature),
+            response_format: Some(AiResponseFormat::Json {
+                schema: Some(schema),
+            }),
+            context_tag: self
+                .context_tag
+                .as_ref()
+                .map(|prefix| format!("{} s:{}:final] ", &prefix[..prefix.len() - 2], stage)),
+        };
+
+        let estimated = self.request_estimate(&final_request);
+        if estimated > self.prompt_preflight_cap() {
+            let fallback = empty_stage_output(stage);
+            warn!(
+                "Stage {} finalization prompt estimate {} exceeds preflight cap {} (max_input_tokens {}); returning empty schema result without a model call",
+                stage,
+                estimated,
+                self.prompt_preflight_cap(),
+                self.max_input_tokens
+            );
+            let final_assistant_msg = AiMessage {
+                role: AiRole::Assistant,
+                content: Some(fallback.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            };
+            local_history.push(final_assistant_msg.clone());
+            stage_history.push(final_assistant_msg);
+            return Ok((fallback.to_string(), *t_in, *t_out, *t_cached));
+        }
+
+        let label = format!("stage {} finalization", stage);
+        let final_resp = self.checked_generate_content(&label, final_request).await?;
+
+        if let Some(usage) = &final_resp.usage {
+            self.validate_prompt_usage(
+                &format!("stage {} finalization", stage),
+                usage.prompt_tokens,
+            )?;
+            *t_in += usage.prompt_tokens as u32;
+            *t_out += usage.completion_tokens as u32;
+            *t_cached += usage.cached_tokens.unwrap_or(0) as u32;
+        }
+
+        let final_content = final_resp.content.unwrap_or_default();
+        let final_assistant_msg = AiMessage {
+            role: AiRole::Assistant,
+            content: Some(final_content.clone()),
+            thought: final_resp.thought,
+            thought_signature: final_resp.thought_signature,
+            tool_calls: final_resp.tool_calls,
+            tool_call_id: None,
+        };
+        local_history.push(final_assistant_msg.clone());
+        stage_history.push(final_assistant_msg);
+
+        Ok((final_content, *t_in, *t_out, *t_cached))
+    }
+
     async fn json_request(
         &self,
         label: &str,
@@ -1714,7 +2222,7 @@ Example Output:
         }
 
         let retry_base = req.clone();
-        let resp = match self.provider.generate_content(req).await {
+        let resp = match self.checked_generate_content(label, req).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("{} completion failed: {}", label, e);
@@ -1726,6 +2234,10 @@ Example Output:
             return None;
         }
         if let Some(usage) = &resp.usage {
+            if let Err(e) = self.validate_prompt_usage(label, usage.prompt_tokens) {
+                warn!("{} completion exceeded input cap: {}", label, e);
+                return None;
+            }
             accumulate(tokens, usage);
         }
         let content = resp.content.as_deref().unwrap_or("");
@@ -1753,13 +2265,17 @@ Example Output:
                     tool_calls: None,
                     tool_call_id: None,
                 });
-                match self.provider.generate_content(retry_req).await {
+                match self.checked_generate_content(label, retry_req).await {
                     Ok(resp2) => {
                         if resp2.truncated {
                             warn!("{} retry completion truncated by provider limit", label);
                             return None;
                         }
                         if let Some(usage) = &resp2.usage {
+                            if let Err(e) = self.validate_prompt_usage(label, usage.prompt_tokens) {
+                                warn!("{} retry exceeded input cap: {}", label, e);
+                                return None;
+                            }
                             accumulate(tokens, usage);
                         }
                         let content2 = resp2.content.as_deref().unwrap_or("");
@@ -1973,6 +2489,121 @@ struct StageExecutionResult {
     tokens_out: u32,
     tokens_cached: u32,
     history: Vec<AiMessage>,
+}
+
+fn parse_stage_json(raw_text: &str) -> Value {
+    let cleaned = crate::utils::clean_json_string(raw_text);
+    serde_json::from_str(&cleaned).unwrap_or_else(|_| {
+        let cands = find_json_candidates(raw_text);
+        cands.into_iter().last().unwrap_or(json!({}))
+    })
+}
+
+fn stage_has_empty_concerns(raw_text: &str) -> bool {
+    parse_stage_json(raw_text)
+        .get("concerns")
+        .and_then(|c| c.as_array())
+        .is_some_and(|concerns| concerns.is_empty())
+}
+
+fn stage_finalization_prompt(stage: u8) -> &'static str {
+    match stage {
+        9 => {
+            "Finalize this stage now. Tools are disabled. Based only on the stage instructions, target patch, and context/tool results above, emit ONLY a JSON object with a top-level \"findings\" array. If the exploration above produced a draft findings object or plausible finding, preserve every item still supported by the gathered evidence. If there are no findings, return {\"findings\": []}. Do not include markdown, prose, TODOs, or tool calls."
+        }
+        _ => {
+            "Finalize this stage now. Tools are disabled. Based only on the stage instructions, target patch, and context/tool results above, emit ONLY a JSON object with a top-level \"concerns\" array. If the exploration above produced a draft concerns object or plausible concern, preserve every item still supported by the gathered evidence. If there are no concerns, return {\"concerns\": []}. Do not include markdown, prose, TODOs, or tool calls."
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedToolCall {
+    requests: usize,
+    result: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExplorationPolicy {
+    max_tool_calls: usize,
+    max_interactions: usize,
+}
+
+fn exploration_policy(stage: u8, configured_max_interactions: usize) -> ExplorationPolicy {
+    let (max_tool_calls, max_interactions) = match stage {
+        1 | 2 => (10, 16),
+        3 => (18, 24),
+        4..=8 => (12, 18),
+        9 => (18, 24),
+        _ => (usize::MAX, configured_max_interactions),
+    };
+
+    ExplorationPolicy {
+        max_tool_calls,
+        max_interactions: max_interactions.min(configured_max_interactions),
+    }
+}
+
+fn per_turn_tool_call_cap(stage: u8) -> usize {
+    if stage == 3 { 6 } else { 4 }
+}
+
+fn stage_tool_declarations(tools: &ToolBox, stage: u8) -> Vec<crate::ai::AiTool> {
+    let mut declarations = tools.get_declarations_generic();
+    if (1..=9).contains(&stage) {
+        declarations.retain(|tool| !tool.name.eq_ignore_ascii_case("TodoWrite"));
+    }
+    declarations
+}
+
+fn tool_cache_key(function_name: &str, arguments: &Value) -> String {
+    format!(
+        "{}:{}",
+        function_name.trim().to_ascii_lowercase(),
+        serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string())
+    )
+}
+
+fn empty_stage_output(stage: u8) -> &'static str {
+    if stage == 9 {
+        "{\"findings\":[]}"
+    } else {
+        "{\"concerns\":[]}"
+    }
+}
+
+fn stage_response_schema(stage: u8) -> Option<Value> {
+    match stage {
+        1..=8 => Some(json!({
+            "type": "object",
+            "properties": {
+                "concerns": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                }
+            },
+            "required": ["concerns"],
+            "additionalProperties": false
+        })),
+        9 => Some(json!({
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                }
+            },
+            "required": ["findings"],
+            "additionalProperties": false
+        })),
+        _ => None,
+    }
 }
 
 pub fn calculate_series_range(
@@ -2206,6 +2837,35 @@ mod tests {
     }
 
     #[test]
+    fn test_exploration_policy_caps_verification_stage() {
+        let policy = exploration_policy(9, 50);
+
+        assert_eq!(policy.max_tool_calls, 18);
+        assert_eq!(policy.max_interactions, 24);
+    }
+
+    #[test]
+    fn test_exploration_policy_respects_configured_interaction_limit() {
+        let policy = exploration_policy(3, 12);
+
+        assert_eq!(policy.max_tool_calls, 18);
+        assert_eq!(policy.max_interactions, 12);
+    }
+
+    #[test]
+    fn test_per_turn_tool_call_cap_allows_more_for_execution_flow() {
+        assert_eq!(per_turn_tool_call_cap(3), 6);
+        assert_eq!(per_turn_tool_call_cap(1), 4);
+        assert_eq!(per_turn_tool_call_cap(8), 4);
+    }
+
+    #[test]
+    fn test_empty_stage_output_matches_stage_schema() {
+        assert_eq!(empty_stage_output(1), "{\"concerns\":[]}");
+        assert_eq!(empty_stage_output(9), "{\"findings\":[]}");
+    }
+
+    #[test]
     fn test_calculate_series_range_single_patch() {
         let p = PatchInput {
             index: 1,
@@ -2354,6 +3014,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: None,
+            stage_protocol: StageProtocol::Native,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

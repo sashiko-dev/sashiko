@@ -275,6 +275,7 @@
         }
 
         .status-Failed,
+        .status-FailedBudget,
         .status-FailedToApply {
             color: var(--status-failed);
         }
@@ -373,6 +374,7 @@
         .status-dot.status-InReview { background-color: var(--status-inreview); }
         .status-dot.status-Reviewed { background-color: var(--status-reviewed); }
         .status-dot.status-Failed { background-color: var(--status-failed); }
+        .status-dot.status-FailedBudget { background-color: var(--status-failed); }
         .status-dot.status-FailedToApply { background-color: var(--status-failed); }
         .status-dot.status-Embargoed { background-color: var(--status-embargoed); }
         .status-dot.status-Cancelled { background-color: var(--thought-color); }
@@ -2957,4 +2959,3 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 </body>
 
 </html>
-

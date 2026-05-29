@@ -16,10 +16,12 @@ use anyhow::Result;
 use clap::Parser;
 use sashiko::{
     git_ops::GitWorktree,
+    review_budget::is_token_budget_failure_message,
     settings::Settings,
     worker::{
         PatchInput, ReviewInput, Worker, WorkerConfig, calculate_series_range,
-        prompts::PromptRegistry, tools::ToolBox,
+        prompts::{PromptRegistry, ReviewError, StageProtocol},
+        tools::ToolBox,
     },
 };
 use serde_json::json;
@@ -78,6 +80,36 @@ struct Args {
     stages: Option<Vec<u8>>,
 }
 
+fn is_stdio_transport_provider(provider: &str) -> bool {
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "stdio-gemini" | "stdio-claude"
+    )
+}
+
+fn effective_stage_protocol_provider<'a>(
+    configured_provider: &'a str,
+    ai_provider_override: Option<&'a str>,
+) -> &'a str {
+    match ai_provider_override {
+        Some(provider) if !is_stdio_transport_provider(provider) => provider,
+        _ => configured_provider,
+    }
+}
+
+fn stage_protocol_for_bounded_local_model(enabled: bool) -> StageProtocol {
+    if enabled {
+        StageProtocol::BoundedLocalModel
+    } else {
+        StageProtocol::Native
+    }
+}
+
+fn is_non_retryable_review_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReviewError>().is_some()
+        || is_token_budget_failure_message(&error.to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     std::panic::set_hook(Box::new(|info| {
@@ -104,6 +136,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let mut settings = Settings::new().expect("Failed to load settings");
+    let stage_protocol_provider =
+        effective_stage_protocol_provider(&settings.ai.provider, args.ai_provider.as_deref())
+            .to_string();
+    let bounded_local_model = settings
+        .ai
+        .bounded_local_model_for_provider(&stage_protocol_provider);
 
     if let Some(p) = &args.ai_provider {
         settings.ai.provider = p.clone();
@@ -413,6 +451,9 @@ async fn main() -> Result<()> {
                                 custom_prompt: args.custom_prompt.clone(),
                                 series_range,
                                 stages: args.stages.clone(),
+                                stage_protocol: stage_protocol_for_bounded_local_model(
+                                    bounded_local_model,
+                                ),
                             },
                         );
 
@@ -459,7 +500,7 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 error!("AI review failed with exception: {}", e);
-                                if attempt < 3 {
+                                if attempt < 3 && !is_non_retryable_review_error(&e) {
                                     continue;
                                 }
                                 // Even on failure, we print what we have (patches status)
@@ -673,9 +714,75 @@ async fn apply_single_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sashiko::settings::AiSettings;
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
+
+    #[test]
+    fn test_stage_protocol_provider_keeps_configured_provider_for_stdio_transport() {
+        let provider = effective_stage_protocol_provider("openai-compatible", Some("stdio-gemini"));
+
+        assert_eq!(provider, "openai-compatible");
+    }
+
+    #[test]
+    fn test_stage_protocol_provider_uses_non_transport_override() {
+        let provider = effective_stage_protocol_provider("gemini", Some("openai-compatible"));
+
+        assert_eq!(provider, "openai-compatible");
+    }
+
+    #[test]
+    fn test_stage_protocol_requires_bounded_local_model_flag() {
+        assert_eq!(
+            stage_protocol_for_bounded_local_model(false),
+            StageProtocol::Native
+        );
+        assert_eq!(
+            stage_protocol_for_bounded_local_model(true),
+            StageProtocol::BoundedLocalModel
+        );
+    }
+
+    #[test]
+    fn test_openai_compatible_vanilla_uses_native_stage_protocol() {
+        let ai: AiSettings = toml::from_str(
+            r#"
+provider = "openai-compatible"
+model = "remote-compatible"
+"#,
+        )
+        .unwrap();
+        let provider = effective_stage_protocol_provider(&ai.provider, None);
+
+        assert!(!ai.bounded_local_model_for_provider(provider));
+        assert_eq!(
+            stage_protocol_for_bounded_local_model(ai.bounded_local_model_for_provider(provider)),
+            StageProtocol::Native
+        );
+    }
+
+    #[test]
+    fn test_bounded_openai_compatible_uses_bounded_stage_protocol() {
+        let ai: AiSettings = toml::from_str(
+            r#"
+provider = "openai-compatible"
+model = "qwen-local"
+
+[openai_compat]
+bounded_local_model = true
+"#,
+        )
+        .unwrap();
+        let provider = effective_stage_protocol_provider(&ai.provider, None);
+
+        assert!(ai.bounded_local_model_for_provider(provider));
+        assert_eq!(
+            stage_protocol_for_bounded_local_model(ai.bounded_local_model_for_provider(provider)),
+            StageProtocol::BoundedLocalModel
+        );
+    }
 
     #[tokio::test]
     async fn test_apply_single_patch_remote_checkout() -> Result<()> {
