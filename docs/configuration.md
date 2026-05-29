@@ -56,7 +56,7 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compat`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compatible`. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
@@ -96,13 +96,14 @@ Settings for the Gemini provider (`provider = "gemini"`).
 
 #### `[ai.openai_compat]`
 
-Settings for OpenAI-compatible providers (`provider = "openai-compat"`).
+Settings for OpenAI-compatible providers (`provider = "openai-compatible"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `base_url` | string | -- | API endpoint URL. |
 | `context_window_size` | integer | -- | Context window size (optional). |
 | `max_tokens` | integer | -- | Max output tokens (optional). |
+| `bounded_local_model` | bool | `false` | Enable bounded local-model review policy for local/Ollama-style OpenAI-compatible models. This is not implied by `provider = "openai-compatible"`. |
 
 #### `[ai.kiro_cli]`
 
