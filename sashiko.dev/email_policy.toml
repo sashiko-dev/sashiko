@@ -177,3 +177,10 @@ cc = ["linux-media@vger.kernel.org"]
 lists = ["ntb@lists.linux.dev"]
 reply_to_author = true
 cc = ["ntb@lists.linux.dev"]
+
+[subsystems.selinux]
+lists = ["selinux@vger.kernel.org"]
+reply_all = false
+reply_to_author = false
+cc_individuals = false
+cc = ["paul@paul-moore.com"]
