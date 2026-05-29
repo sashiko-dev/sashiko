@@ -2382,9 +2382,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!res.ok) throw new Error('Review not found');
             const data = await res.json();
 
+            const failedLogView = String(data.status || '').toLowerCase().includes('failed') ||
+                String(data.status || '').toLowerCase().includes('error');
+            const failureReasonHtml = failedLogView ? `
+                <div class="section" style="background:var(--error-bg); border:1px solid var(--error-border); padding:12px; border-radius:4px; margin-bottom:16px;">
+                    <h2 style="margin-top:0; color:var(--error-title);">Final Failure Reason</h2>
+                    <div style="color:var(--error-text); white-space:pre-wrap;">${escapeHtml(data.result || 'No failure reason recorded.')}</div>
+                </div>
+            ` : '';
+
             const totalTokens = (data.tokens_in || 0) + (data.tokens_out || 0) + (data.tokens_cached || 0);
             let logs = [];
-            try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
+            try {
+                const parsedLogs = JSON.parse(data.logs || '[]');
+                logs = Array.isArray(parsedLogs) ? parsedLogs : [];
+            } catch (e) { }
 
             let logsHtml = '';
             if (!logs.length) {
@@ -2408,7 +2420,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     if (entry.thought && typeof entry.thought === 'string') {
                         content += `<div style="color: var(--thought-color); font-style: italic; border-left: 2px solid var(--thought-border); padding-left: 8px; margin: 4px 0; white-space: pre-wrap;">${escapeHtml(entry.thought)}</div>`;
                     }
-                    
+
                     if (entry.content && typeof entry.content === 'string') {
                         if (role === 'tool') {
                             content += formatJsonExpandable(entry.content, jsonCounter++);
@@ -2456,6 +2468,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <span class="status-badge status-${(data.status || '').replace(/ /g, '')}">${data.status}</span>
                     </span>
                 </h1>
+                ${failureReasonHtml}
                 <div>${logsHtml}</div>
             `;
         }

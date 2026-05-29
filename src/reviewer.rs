@@ -38,6 +38,9 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
+const REVIEW_LOG_MAX_ENTRIES: usize = 2000;
+const REVIEW_LOG_STRING_LIMIT: usize = 12_000;
+
 #[derive(Clone)]
 struct ReviewContext {
     semaphore: Arc<Semaphore>,
@@ -1473,6 +1476,65 @@ impl Reviewer {
     }
 }
 
+fn truncate_review_log_string(s: &str) -> String {
+    let redacted = redact_secret(s);
+    if redacted.chars().count() <= REVIEW_LOG_STRING_LIMIT {
+        return redacted;
+    }
+
+    let mut truncated: String = redacted.chars().take(REVIEW_LOG_STRING_LIMIT).collect();
+    truncated.push_str("\n...[truncated]");
+    truncated
+}
+
+fn truncate_review_log_value(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            *s = truncate_review_log_string(s);
+        }
+        Value::Array(values) => {
+            for value in values {
+                truncate_review_log_value(value);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                truncate_review_log_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_review_log_entry(log: &mut Vec<Value>, mut entry: Value) {
+    truncate_review_log_value(&mut entry);
+
+    if log.len() < REVIEW_LOG_MAX_ENTRIES {
+        log.push(entry);
+    } else if log.len() == REVIEW_LOG_MAX_ENTRIES {
+        log.push(json!({
+            "role": "system",
+            "content": "Additional review log entries were omitted."
+        }));
+    }
+}
+
+fn review_logs_json(log: &[Value]) -> Option<String> {
+    if log.is_empty() {
+        None
+    } else {
+        serde_json::to_string_pretty(log).ok()
+    }
+}
+
+fn review_history_needs_fallback(json: &Value) -> bool {
+    match json.get("history") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(entries)) => entries.is_empty(),
+        Some(_) => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_review_tool(
     patchset_id: i64,
@@ -1575,6 +1637,7 @@ async fn run_review_tool(
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
+    let mut captured_log = Vec::new();
 
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
@@ -1665,6 +1728,26 @@ async fn run_review_tool(
                                         serde_json::from_value::<AiRequest>(payload_val.clone())
                                 {
                                     turn_count += 1;
+                                    let mut request_entry = req
+                                        .messages
+                                        .last()
+                                        .and_then(|m| serde_json::to_value(m).ok())
+                                        .unwrap_or_else(|| {
+                                            json!({
+                                                "role": "user",
+                                                "content": "AI request contained no messages"
+                                            })
+                                        });
+                                    if let Some(obj) = request_entry.as_object_mut() {
+                                        obj.insert(
+                                            "context_tag".to_string(),
+                                            Value::String(
+                                                req.context_tag.clone().unwrap_or_default(),
+                                            ),
+                                        );
+                                        obj.insert("turn".to_string(), json!(turn_count));
+                                    }
+                                    push_review_log_entry(&mut captured_log, request_entry);
                                     if settings.ai.log_turns {
                                         let n_msgs = req.messages.len();
                                         let last = req.messages.last();
@@ -1726,6 +1809,20 @@ async fn run_review_tool(
 
                                     let reply = match resp_payload {
                                         Ok(p) => {
+                                            let mut response_entry = serde_json::to_value(&p)
+                                                .unwrap_or_else(|_| {
+                                                    json!({
+                                                        "content": "Failed to serialize AI response"
+                                                    })
+                                                });
+                                            if let Some(obj) = response_entry.as_object_mut() {
+                                                obj.insert(
+                                                    "role".to_string(),
+                                                    Value::String("assistant".to_string()),
+                                                );
+                                                obj.insert("turn".to_string(), json!(turn_count));
+                                            }
+                                            push_review_log_entry(&mut captured_log, response_entry);
                                             if let Some(usage) = &p.usage {
                                                 let cached = usage.cached_tokens.unwrap_or(0);
                                                 let uncached_input = usage.prompt_tokens.saturating_sub(cached);
@@ -1791,6 +1888,13 @@ async fn run_review_tool(
                                         Err(e) => {
                                             let message = e.to_string();
                                             let class = classify_ai_error(&e);
+                                            push_review_log_entry(
+                                                &mut captured_log,
+                                                json!({
+                                                    "role": "system",
+                                                    "content": format!("AI provider error: {message}")
+                                                }),
+                                            );
                                             let payload = RemoteAiErrorPayload::new(message, class);
                                             json!({ "type": "error", "payload": payload })
                                         }
@@ -1840,7 +1944,14 @@ async fn run_review_tool(
     let _ = child.wait().await; // Reap zombie
 
     match interaction_result {
-        Ok(json) => {
+        Ok(mut json) => {
+            if review_history_needs_fallback(&json)
+                && let Some(logs) = review_logs_json(&captured_log)
+                && let Ok(history) = serde_json::from_str::<Value>(&logs)
+                && let Some(obj) = json.as_object_mut()
+            {
+                obj.insert("history".to_string(), history);
+            }
             // Update DB with patch statuses if final_result available
             if let Some(patches) = json["patches"].as_array() {
                 for p in patches {
@@ -1887,6 +1998,16 @@ async fn run_review_tool(
             Ok(json)
         }
         Err(e) => {
+            if let Some(logs) = review_logs_json(&captured_log)
+                && let Err(log_err) = db
+                    .update_review_status(review_id, ReviewStatus::InReview.as_str(), Some(&logs))
+                    .await
+            {
+                warn!(
+                    "Failed to persist partial review log for review {}: {}",
+                    review_id, log_err
+                );
+            }
             // Check if it's the specific active time exceeded error we throw in the loop
             if e.to_string()
                 .contains("Review tool timed out (active time exceeded)")

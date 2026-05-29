@@ -762,7 +762,7 @@ impl Database {
     ) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
+                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = COALESCE(?, logs) WHERE id = ?",
                 libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
             )
             .await?;
