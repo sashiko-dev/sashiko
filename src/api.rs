@@ -382,7 +382,7 @@ async fn submit_patch(
             );
 
             // Create a placeholder record in the DB so the user can track status
-            if let Err(e) = state
+            let patchset_id = match state
                 .db
                 .create_fetching_patchset(
                     &id,
@@ -392,9 +392,12 @@ async fn submit_patch(
                 )
                 .await
             {
-                error!("Failed to create placeholder patchset: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Failed to create placeholder patchset: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
 
             let req = FetchRequest {
                 repo_url: repo,
@@ -408,7 +411,7 @@ async fn submit_patch(
 
             Ok(Json(SubmitResponse {
                 status: "accepted".to_string(),
-                id,
+                id: patchset_id.to_string(),
             }))
         }
         SubmitRequest::Thread { msgid } => {

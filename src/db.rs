@@ -299,7 +299,8 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
+                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?
+                 ORDER BY date DESC, id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -312,7 +313,11 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
+                "SELECT p.patchset_id
+                 FROM patches p
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.message_id = ?
+                 ORDER BY ps.date DESC, ps.id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -437,6 +442,8 @@ impl Database {
             .await;
         let _ = self.try_add_column("patches", "status", "TEXT").await;
         let _ = self.try_add_column("patches", "apply_error", "TEXT").await;
+        self.migrate_patches_message_id_uniqueness().await?;
+        self.migrate_stale_fetching_placeholders().await?;
         let _ = self.try_add_column("reviews", "provider", "TEXT").await;
         let _ = self
             .try_add_column("reviews", "prompts_git_hash", "TEXT")
@@ -1232,6 +1239,191 @@ impl Database {
         Ok(())
     }
 
+    async fn migrate_patches_message_id_uniqueness(&self) -> Result<()> {
+        let mut table_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'patches'",
+                (),
+            )
+            .await?;
+
+        if table_rows.next().await?.is_none() {
+            return Ok(());
+        }
+        drop(table_rows);
+
+        if !self.patches_has_global_message_id_unique().await? {
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS idx_patches_message_id ON patches(message_id)",
+                    (),
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_patchset_message_id ON patches(patchset_id, message_id)",
+                    (),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        info!("Migration: rebuilding patches table without global message_id uniqueness");
+        self.conn
+            .execute_batch(
+                "
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE patches_new (
+                    id INTEGER PRIMARY KEY,
+                    patchset_id INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    part_index INTEGER,
+                    diff TEXT,
+                    status TEXT,
+                    apply_error TEXT,
+                    FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+                    FOREIGN KEY(message_id) REFERENCES messages(message_id)
+                );
+                INSERT INTO patches_new (id, patchset_id, message_id, part_index, diff, status, apply_error)
+                    SELECT id, patchset_id, message_id, part_index, diff, status, apply_error FROM patches;
+                DROP TABLE patches;
+                ALTER TABLE patches_new RENAME TO patches;
+                CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);
+                CREATE INDEX IF NOT EXISTS idx_patches_message_id ON patches(message_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_patchset_message_id ON patches(patchset_id, message_id);
+                PRAGMA foreign_keys=ON;
+                ",
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn patches_has_global_message_id_unique(&self) -> Result<bool> {
+        let mut index_rows = self.conn.query("PRAGMA index_list(patches)", ()).await?;
+
+        while let Some(row) = index_rows.next().await? {
+            let unique: i64 = row.get(2)?;
+            if unique == 0 {
+                continue;
+            }
+
+            let index_name: String = row.get(1)?;
+            let escaped_index_name = index_name.replace('\'', "''");
+            let mut column_rows = self
+                .conn
+                .query(&format!("PRAGMA index_info('{escaped_index_name}')"), ())
+                .await?;
+
+            let mut columns = Vec::new();
+            while let Some(column_row) = column_rows.next().await? {
+                columns.push(column_row.get::<String>(2)?);
+            }
+
+            if columns == ["message_id"] {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn migrate_stale_fetching_placeholders(&self) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, cover_letter_message_id, skip_filters, only_filters
+                 FROM patchsets
+                 WHERE status = 'Fetching'
+                   AND subject LIKE 'Fetching % from local...'
+                   AND total_parts IS NULL
+                   AND received_parts IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patches WHERE patchset_id = patchsets.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews WHERE patchset_id = patchsets.id
+                   )",
+                (),
+            )
+            .await?;
+
+        let mut placeholders = Vec::new();
+        while let Some(row) = rows.next().await? {
+            placeholders.push((
+                row.get::<i64>(0)?,
+                row.get::<String>(1)?,
+                row.get::<Option<String>>(2).ok().flatten(),
+                row.get::<Option<String>>(3).ok().flatten(),
+            ));
+        }
+        drop(rows);
+
+        for (placeholder_id, cover_id, skip_filters, only_filters) in placeholders {
+            let Some(prefix) = cover_id.strip_suffix("@sashiko.local") else {
+                continue;
+            };
+            if !(7..=40).contains(&prefix.len()) || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+
+            let like_pattern = format!("{prefix}%");
+            let mut real_rows = self
+                .conn
+                .query(
+                    "SELECT ps.id
+                     FROM patchsets ps
+                     JOIN patches p ON p.patchset_id = ps.id
+                     WHERE ps.id != ?
+                       AND ps.total_parts = 1
+                       AND p.part_index = 1
+                       AND p.message_id LIKE ?
+                     ORDER BY ps.id
+                     LIMIT 1",
+                    libsql::params![placeholder_id, like_pattern],
+                )
+                .await?;
+
+            let Some(real_row) = real_rows.next().await? else {
+                continue;
+            };
+            let real_id: i64 = real_row.get(0)?;
+            drop(real_rows);
+
+            self.conn
+                .execute(
+                    "UPDATE patchsets
+                     SET skip_filters = COALESCE(skip_filters, ?),
+                         only_filters = COALESCE(only_filters, ?)
+                     WHERE id = ?",
+                    libsql::params![skip_filters, only_filters, real_id],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM patchsets_subsystems WHERE patchset_id = ?",
+                    libsql::params![placeholder_id],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM patchsets
+                     WHERE id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM patches WHERE patchset_id = ?
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM reviews WHERE patchset_id = ?
+                       )",
+                    libsql::params![placeholder_id, placeholder_id, placeholder_id],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     // People & Recipients
     pub async fn ensure_person(&self, name: Option<&str>, email: &str) -> Result<i64> {
         let email = email.trim();
@@ -1650,7 +1842,18 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?",
+                    "SELECT id, date, author, subject, subject_index, total_parts, status
+                     FROM patchsets
+                     WHERE cover_letter_message_id = ?
+                     ORDER BY
+                        CASE
+                            WHEN status = 'Fetching' THEN 0
+                            WHEN status IN ('Incomplete', 'Pending', 'In Review', 'Applying', 'Reviewing') THEN 1
+                            WHEN status = 'Failed' THEN 2
+                            ELSE 3
+                        END,
+                        date DESC,
+                        id DESC",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -1937,10 +2140,99 @@ impl Database {
                 let merge_from_id = *merge_from_id;
                 info!("Merging patchset {} into {}", merge_from_id, target_id);
 
+                // Drop duplicate patch rows before reassigning. With local
+                // commit ranges the same commit SHA can appear in multiple
+                // patchsets, and the composite patch uniqueness would
+                // otherwise leave skipped rows attached to the deleted set.
+                // Preserve per-patch dependencies by moving them from the
+                // soon-to-be-deleted duplicate patch row to the matching patch
+                // row that already exists in the target patchset.
+                self.conn
+                    .execute(
+                        "UPDATE reviews
+                         SET patch_id = (
+                             SELECT target.id
+                             FROM patches source
+                             JOIN patches target
+                               ON target.patchset_id = ?
+                              AND target.message_id = source.message_id
+                             WHERE source.id = reviews.patch_id
+                         )
+                         WHERE patch_id IN (
+                             SELECT source.id
+                             FROM patches source
+                             JOIN patches target
+                               ON target.patchset_id = ?
+                              AND target.message_id = source.message_id
+                             WHERE source.patchset_id = ?
+                         )",
+                        libsql::params![target_id, target_id, merge_from_id],
+                    )
+                    .await?;
+                self.conn
+                    .execute(
+                        "UPDATE email_outbox
+                         SET patch_id = (
+                             SELECT target.id
+                             FROM patches source
+                             JOIN patches target
+                               ON target.patchset_id = ?
+                              AND target.message_id = source.message_id
+                             WHERE source.id = email_outbox.patch_id
+                         )
+                         WHERE patch_id IN (
+                             SELECT source.id
+                             FROM patches source
+                             JOIN patches target
+                               ON target.patchset_id = ?
+                              AND target.message_id = source.message_id
+                             WHERE source.patchset_id = ?
+                         )",
+                        libsql::params![target_id, target_id, merge_from_id],
+                    )
+                    .await?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id)
+                         SELECT target.id, ps.subsystem_id
+                         FROM patches_subsystems ps
+                         JOIN patches source ON source.id = ps.patch_id
+                         JOIN patches target
+                           ON target.patchset_id = ?
+                          AND target.message_id = source.message_id
+                         WHERE source.patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                self.conn
+                    .execute(
+                        "DELETE FROM patches_subsystems
+                         WHERE patch_id IN (
+                             SELECT source.id
+                             FROM patches source
+                             JOIN patches target
+                               ON target.patchset_id = ?
+                              AND target.message_id = source.message_id
+                             WHERE source.patchset_id = ?
+                         )",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                self.conn
+                    .execute(
+                        "DELETE FROM patches
+                         WHERE patchset_id = ?
+                         AND message_id IN (
+                             SELECT message_id FROM patches WHERE patchset_id = ?
+                         )",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
                 // Reassign patches
                 self.conn
                     .execute(
-                        "UPDATE OR IGNORE patches SET patchset_id = ? WHERE patchset_id = ?",
+                        "UPDATE patches SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -2082,7 +2374,7 @@ impl Database {
         part_index: u32,
         diff: &str,
     ) -> Result<i64> {
-        // Check if index collision occurs for this patchset
+        // Check if index collision occurs for this patchset.
         let collision_exists: bool = {
             let mut rows = self
                 .conn
@@ -2102,27 +2394,12 @@ impl Database {
             ));
         }
 
-        // Check if patch exists and get old patchset_id to fix counts if we steal it
-        let old_patchset_id: Option<i64> = {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT patchset_id FROM patches WHERE message_id = ?",
-                    libsql::params![message_id],
-                )
-                .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                Some(row.get(0)?)
-            } else {
-                None
-            }
-        };
-
-        // Insert or Update (Move patch to new patchset if duplicate)
+        // Local commit submissions use the commit SHA as message_id, and the
+        // same commit may be part of multiple submitted ranges, so only upsert
+        // an existing patch within the same patchset.
         self.conn.execute(
             "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
-             ON CONFLICT(message_id) DO UPDATE SET
-                patchset_id=excluded.patchset_id,
+             ON CONFLICT(patchset_id, message_id) DO UPDATE SET
                 part_index=excluded.part_index,
                 diff=excluded.diff",
             libsql::params![patchset_id, message_id, part_index, diff]
@@ -2136,18 +2413,6 @@ impl Database {
             )
             .await?;
 
-        // Update received_parts for the OLD patchset (if we moved it)
-        if let Some(old_id) = old_patchset_id
-            && old_id != patchset_id
-        {
-            self.conn
-                        .execute(
-                            "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
-                            libsql::params![old_id, old_id],
-                        )
-                        .await?;
-        }
-
         // Check if complete and update status
         // We transition from 'Incomplete' OR 'Fetching' to 'Pending' (ready for review)
         self.conn.execute(
@@ -2159,8 +2424,8 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patches WHERE message_id = ?",
-                libsql::params![message_id],
+                "SELECT id FROM patches WHERE patchset_id = ? AND message_id = ?",
+                libsql::params![patchset_id, message_id],
             )
             .await?;
 
@@ -2983,7 +3248,8 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
+                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?
+                 ORDER BY date DESC, id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -2995,7 +3261,11 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
+                "SELECT p.patchset_id
+                 FROM patches p
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.message_id = ?
+                 ORDER BY ps.date DESC, ps.id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -3388,7 +3658,16 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id, status FROM patchsets WHERE cover_letter_message_id = ?",
+                    "SELECT id, status FROM patchsets WHERE cover_letter_message_id = ?
+                     ORDER BY
+                        CASE
+                            WHEN status IN ('Fetching', 'Failed') THEN 0
+                            WHEN status IN ('Incomplete', 'Pending', 'In Review', 'Applying', 'Reviewing') THEN 1
+                            ELSE 2
+                        END,
+                        date DESC,
+                        id DESC
+                     LIMIT 1",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -3398,14 +3677,22 @@ impl Database {
                 let status: String = row.get(1).unwrap_or_default();
 
                 // Only reset to Fetching if it failed or is currently fetching.
-                // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
+                // We don't want to reset if it is already Incomplete or Pending.
+                // Reviewed/Cancelled patchsets are completed submissions; a new
+                // API request for the same local commit should create a new run.
                 if status == "Failed" || status == "Fetching" {
                     self.conn.execute(
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ? WHERE id = ?",
                         libsql::params![skip_filters_json.clone(), only_filters_json.clone(), id]
                     ).await?;
+                    return Ok(id);
                 }
-                return Ok(id);
+                if matches!(
+                    status.as_str(),
+                    "Incomplete" | "Pending" | "In Review" | "Applying" | "Reviewing"
+                ) {
+                    return Ok(id);
+                }
             }
         }
 
@@ -3437,6 +3724,20 @@ impl Database {
             .execute(
                 "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
                 libsql::params![error, root_msg_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_patchset_cover_letter_message_id(
+        &self,
+        patchset_id: i64,
+        cover_letter_message_id: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                libsql::params![cover_letter_message_id, patchset_id],
             )
             .await?;
         Ok(())
@@ -3655,6 +3956,94 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    async fn setup_db_with_old_patches_schema() -> Arc<Database> {
+        let settings = DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.conn
+            .execute_batch(
+                "
+                CREATE TABLE patches (
+                    id INTEGER PRIMARY KEY,
+                    patchset_id INTEGER NOT NULL,
+                    message_id TEXT NOT NULL UNIQUE,
+                    part_index INTEGER,
+                    diff TEXT,
+                    status TEXT,
+                    apply_error TEXT,
+                    FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+                    FOREIGN KEY(message_id) REFERENCES messages(message_id)
+                );
+                ",
+            )
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        Arc::new(db)
+    }
+
+    async fn create_test_message(
+        db: &Database,
+        message_id: &str,
+        thread_id: i64,
+        in_reply_to: Option<&str>,
+        author: &str,
+        subject: &str,
+        date: i64,
+    ) {
+        db.create_message(
+            message_id,
+            thread_id,
+            in_reply_to,
+            author,
+            subject,
+            date,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn create_test_patchset(
+        db: &Database,
+        thread_id: i64,
+        cover_letter_message_id: Option<&str>,
+        message_id: &str,
+        subject: &str,
+        author: &str,
+        date: i64,
+        total_parts: u32,
+        part_index: u32,
+    ) -> i64 {
+        db.create_patchset(
+            thread_id,
+            cover_letter_message_id,
+            message_id,
+            subject,
+            author,
+            date,
+            total_parts,
+            0,
+            "",
+            "",
+            None,
+            part_index,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -4940,6 +5329,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_duplicate_patch_preserves_dependencies() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("dup_root", "Duplicate dependency merge", 91000)
+            .await
+            .unwrap();
+        let author = "Deps Author <deps@example.com>";
+        let duplicate_msg = "dup_patch_msg";
+
+        for (message_id, subject, date) in [
+            ("dup_root", "[PATCH 0/2] Cover", 91000),
+            (duplicate_msg, "[PATCH 1/2] Duplicate", 91001),
+            ("other_patch_msg", "[PATCH 2/2] Other", 91002),
+            ("cover_merge_dup", "[PATCH 0/2] Cover", 91003),
+        ] {
+            create_test_message(&db, message_id, thread_id, None, author, subject, date).await;
+        }
+
+        let target_id = create_test_patchset(
+            &db,
+            thread_id,
+            None,
+            duplicate_msg,
+            "[PATCH 1/2] Duplicate",
+            author,
+            91001,
+            2,
+            1,
+        )
+        .await;
+
+        let mut source_rows = db
+            .conn
+            .query(
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, subject_index)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?) RETURNING id",
+                libsql::params![
+                    thread_id,
+                    "other_patch_msg",
+                    "[PATCH 2/2] Other",
+                    author,
+                    91002_i64,
+                    2_u32,
+                    2_u32
+                ],
+            )
+            .await
+            .unwrap();
+        let source_id: i64 = source_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_ne!(target_id, source_id);
+
+        let target_patch_id = db
+            .create_patch(target_id, duplicate_msg, 1, "target diff")
+            .await
+            .unwrap();
+        let source_patch_id = db
+            .create_patch(source_id, duplicate_msg, 1, "source diff")
+            .await
+            .unwrap();
+
+        let review_id = db
+            .create_review(
+                source_id,
+                Some(source_patch_id),
+                "gemini",
+                "test-model",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let sub_id = db
+            .ensure_subsystem("dup_sub", "dup@example.com")
+            .await
+            .unwrap();
+        db.add_subsystem_to_patch(source_patch_id, sub_id)
+            .await
+            .unwrap();
+        db.insert_email_outbox(
+            source_patch_id,
+            "Pending",
+            "to@example.com",
+            "cc@example.com",
+            "review",
+            duplicate_msg,
+            duplicate_msg,
+            "body",
+        )
+        .await
+        .unwrap();
+
+        let merged_id = create_test_patchset(
+            &db,
+            thread_id,
+            Some("cover_merge_dup"),
+            "cover_merge_dup",
+            "[PATCH 0/2] Cover",
+            author,
+            91003,
+            2,
+            0,
+        )
+        .await;
+        assert_eq!(merged_id, target_id);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT patchset_id, patch_id FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), target_id);
+        assert_eq!(row.get::<i64>(1).unwrap(), target_patch_id);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT patch_id FROM email_outbox WHERE subject = 'review'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), target_patch_id);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches_subsystems WHERE patch_id = ? AND subsystem_id = ?",
+                libsql::params![target_patch_id, sub_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches WHERE id = ?",
+                libsql::params![source_patch_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn test_create_ai_interaction_with_cached_tokens() {
         let db = setup_db().await;
 
@@ -5328,6 +5869,427 @@ mod tests {
             ps1, ps3,
             "Should create NEW patchset for non-duplicate when full"
         );
+    }
+
+    #[tokio::test]
+    async fn test_same_message_id_can_belong_to_multiple_patchsets() {
+        let db = setup_db().await;
+        let shared_commit = "shared_commit_sha";
+
+        let t1 = db
+            .create_thread("range_root", "[PATCH 0/2] Range", 1000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            "range_root",
+            t1,
+            None,
+            "Author One",
+            "[PATCH 0/2] Range",
+            1000,
+        )
+        .await;
+        create_test_message(
+            &db,
+            shared_commit,
+            t1,
+            Some("range_root"),
+            "Author One",
+            "[PATCH 2/2] Shared commit",
+            1001,
+        )
+        .await;
+
+        let ps_range = create_test_patchset(
+            &db,
+            t1,
+            Some("range_root"),
+            "range_root",
+            "[PATCH 0/2] Range",
+            "Author One",
+            1000,
+            2,
+            0,
+        )
+        .await;
+
+        let t2 = db
+            .create_thread("single_root", "[PATCH 1/1] Single", 2000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            "single_root",
+            t2,
+            None,
+            "Author Two",
+            "[PATCH 1/1] Single",
+            2000,
+        )
+        .await;
+
+        let ps_single = create_test_patchset(
+            &db,
+            t2,
+            Some("single_root"),
+            "single_root",
+            "[PATCH 1/1] Single",
+            "Author Two",
+            2000,
+            1,
+            0,
+        )
+        .await;
+
+        db.create_patch(ps_range, shared_commit, 2, "range diff")
+            .await
+            .unwrap();
+        db.create_patch(ps_single, shared_commit, 1, "single diff")
+            .await
+            .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT patchset_id, part_index, diff FROM patches WHERE message_id = ? ORDER BY patchset_id",
+                libsql::params![shared_commit],
+            )
+            .await
+            .unwrap();
+
+        let mut patches = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            patches.push((
+                row.get::<i64>(0).unwrap(),
+                row.get::<u32>(1).unwrap(),
+                row.get::<String>(2).unwrap(),
+            ));
+        }
+
+        assert_eq!(
+            patches,
+            vec![
+                (ps_range, 2, "range diff".to_string()),
+                (ps_single, 1, "single diff".to_string()),
+            ]
+        );
+
+        let range_details = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(range_details["received_parts"].as_u64(), Some(1));
+        assert_eq!(range_details["total_patches_in_db"].as_u64(), Some(1));
+
+        let single_details = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(single_details["received_parts"].as_u64(), Some(1));
+        assert_eq!(single_details["total_patches_in_db"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_migrates_old_patches_global_message_id_unique() {
+        let db = setup_db_with_old_patches_schema().await;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'patches'",
+                (),
+            )
+            .await
+            .unwrap();
+        let schema_sql = rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        assert!(
+            !schema_sql
+                .to_ascii_uppercase()
+                .contains("MESSAGE_ID TEXT NOT NULL UNIQUE")
+        );
+
+        let shared_commit = "migrated_shared_commit";
+        let t1 = db
+            .create_thread("migrated_range", "[PATCH 0/2] Range", 1000)
+            .await
+            .unwrap();
+        let t2 = db
+            .create_thread("migrated_single", "[PATCH 1/1] Single", 2000)
+            .await
+            .unwrap();
+
+        for (message_id, thread_id, subject) in [
+            ("migrated_range", t1, "[PATCH 0/2] Range"),
+            ("migrated_single", t2, "[PATCH 1/1] Single"),
+            (shared_commit, t1, "[PATCH 2/2] Shared commit"),
+        ] {
+            create_test_message(&db, message_id, thread_id, None, "Author", subject, 1000).await;
+        }
+
+        let ps_range = create_test_patchset(
+            &db,
+            t1,
+            Some("migrated_range"),
+            "migrated_range",
+            "[PATCH 0/2] Range",
+            "Author One",
+            1000,
+            2,
+            0,
+        )
+        .await;
+        let ps_single = create_test_patchset(
+            &db,
+            t2,
+            Some("migrated_single"),
+            "migrated_single",
+            "[PATCH 1/1] Single",
+            "Author Two",
+            2000,
+            1,
+            0,
+        )
+        .await;
+
+        db.create_patch(ps_range, shared_commit, 2, "range diff")
+            .await
+            .unwrap();
+        db.create_patch(ps_single, shared_commit, 1, "single diff")
+            .await
+            .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches WHERE message_id = ?",
+                libsql::params![shared_commit],
+            )
+            .await
+            .unwrap();
+        let count = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_short_sha_fetching_placeholder_is_reused_for_singleton() {
+        let db = setup_db().await;
+        let short_sha = "e6720191bd29";
+        let full_sha = "e6720191bd2963314f5410014452876ea96c32cf";
+        let placeholder_id = db
+            .create_fetching_patchset(
+                short_sha,
+                &format!("Fetching {short_sha} from local..."),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let thread_id = db
+            .create_thread(full_sha, "mm/mm_init: Check zone consistency", 1000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            full_sha,
+            thread_id,
+            None,
+            "Author",
+            "mm/mm_init: Check zone consistency",
+            1000,
+        )
+        .await;
+
+        let ps_id = create_test_patchset(
+            &db,
+            thread_id,
+            Some(&format!("{short_sha}@sashiko.local")),
+            full_sha,
+            "mm/mm_init: Check zone consistency",
+            "Author",
+            1000,
+            1,
+            1,
+        )
+        .await;
+        assert_eq!(ps_id, placeholder_id);
+
+        db.update_patchset_cover_letter_message_id(ps_id, full_sha)
+            .await
+            .unwrap();
+        db.create_patch(ps_id, full_sha, 1, "diff").await.unwrap();
+
+        let details = db
+            .get_patchset_details_by_msgid(full_sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["id"].as_i64(), Some(placeholder_id));
+        assert_eq!(details["status"].as_str(), Some("Pending"));
+        assert_eq!(
+            details["subject"].as_str(),
+            Some("mm/mm_init: Check zone consistency")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_reviewed_local_commit_creates_new_fetching_patchset() {
+        let db = setup_db().await;
+        let full_sha = "93880926243211e066b07426c5d8fa4a46052cc8";
+        let synthetic_cover = format!("{full_sha}@sashiko.local");
+
+        let first_id = db
+            .create_fetching_patchset(
+                full_sha,
+                &format!("Fetching {full_sha} from local..."),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let thread_id = db
+            .create_thread(full_sha, "mm/mm_init: Initialize pageblock", 2000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            full_sha,
+            thread_id,
+            None,
+            "Author",
+            "mm/mm_init: Initialize pageblock",
+            2000,
+        )
+        .await;
+        db.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ?, status = 'Reviewed', date = ? WHERE id = ?",
+                libsql::params![full_sha, 1000_i64, first_id],
+            )
+            .await
+            .unwrap();
+
+        let second_id = db
+            .create_fetching_patchset(
+                full_sha,
+                &format!("Fetching {full_sha} from local..."),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(first_id, second_id);
+
+        let matched_id = create_test_patchset(
+            &db,
+            thread_id,
+            Some(&synthetic_cover),
+            full_sha,
+            "mm/mm_init: Initialize pageblock",
+            "Author",
+            2000,
+            1,
+            1,
+        )
+        .await;
+        assert_eq!(matched_id, second_id);
+
+        db.update_patchset_cover_letter_message_id(second_id, full_sha)
+            .await
+            .unwrap();
+        db.create_patch(first_id, full_sha, 1, "old review diff")
+            .await
+            .unwrap();
+        db.create_patch(second_id, full_sha, 1, "new review diff")
+            .await
+            .unwrap();
+
+        let details = db
+            .get_patchset_details_by_msgid(full_sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["id"].as_i64(), Some(second_id));
+
+        let summary = db
+            .get_patchset_summary_by_msgid(full_sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["id"].as_i64(), Some(second_id));
+    }
+
+    #[tokio::test]
+    async fn test_migrates_stale_short_sha_fetching_placeholder() {
+        let db = setup_db().await;
+        let short_sha = "e6720191bd29";
+        let full_sha = "e6720191bd2963314f5410014452876ea96c32cf";
+        let skip_filters = vec!["mm/*".to_string()];
+        let placeholder_id = db
+            .create_fetching_patchset(
+                short_sha,
+                &format!("Fetching {short_sha} from local..."),
+                Some(&skip_filters),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let thread_id = db
+            .create_thread(full_sha, "mm/mm_init: Check zone consistency", 1000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            full_sha,
+            thread_id,
+            None,
+            "Author",
+            "mm/mm_init: Check zone consistency",
+            1000,
+        )
+        .await;
+        let real_id = create_test_patchset(
+            &db,
+            thread_id,
+            Some(full_sha),
+            full_sha,
+            "mm/mm_init: Check zone consistency",
+            "Author",
+            1000,
+            1,
+            1,
+        )
+        .await;
+        assert_ne!(real_id, placeholder_id);
+        db.create_patch(real_id, full_sha, 1, "diff").await.unwrap();
+
+        db.migrate_stale_fetching_placeholders().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query("SELECT id, skip_filters FROM patchsets ORDER BY id", ())
+            .await
+            .unwrap();
+
+        let mut patchsets = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            patchsets.push((
+                row.get::<i64>(0).unwrap(),
+                row.get::<Option<String>>(1).ok().flatten(),
+            ));
+        }
+
+        assert_eq!(patchsets, vec![(real_id, Some("[\"mm/*\"]".to_string()))]);
     }
 
     #[tokio::test]

@@ -90,9 +90,11 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
 CREATE TABLE IF NOT EXISTS patches (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER NOT NULL,
-    message_id TEXT NOT NULL UNIQUE,
+    message_id TEXT NOT NULL,
     part_index INTEGER,
     diff TEXT,
+    status TEXT,
+    apply_error TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(message_id) REFERENCES messages(message_id)
 );
@@ -182,6 +184,8 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_cover_message_id ON patchsets(cover_let
 
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);
+CREATE INDEX IF NOT EXISTS idx_patches_message_id ON patches(message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_patchset_message_id ON patches(patchset_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
 
 CREATE INDEX IF NOT EXISTS idx_messages_day ON messages(strftime('%Y-%m-%d', date, 'unixepoch'));
@@ -245,4 +249,3 @@ CREATE INDEX IF NOT EXISTS idx_email_outbox_status ON email_outbox(status);
 CREATE INDEX IF NOT EXISTS idx_ai_interactions_tokens ON ai_interactions(id, tokens_in, tokens_out, tokens_cached);
 CREATE INDEX IF NOT EXISTS idx_reviews_grouping ON reviews(provider, model, status, interaction_id);
 CREATE INDEX IF NOT EXISTS idx_tool_usages_stats ON tool_usages(provider, model, tool_name, output_length);
-

@@ -831,18 +831,20 @@ async fn process_parsed_article(
     );
     */
 
-    let root_msg_id = format!("{}@sashiko.local", article_id);
+    let submitted_root_msg_id = format!("{}@sashiko.local", article_id);
     let cover_letter_id = if group == "git-fetch" || group == "api-submit" {
-        if metadata.total == 1 {
-            Some(metadata.message_id.as_str())
-        } else {
-            Some(root_msg_id.as_str())
-        }
+        Some(submitted_root_msg_id.as_str())
     } else if metadata.index == 0 || metadata.total == 1 {
         Some(metadata.message_id.as_str())
     } else {
         metadata.in_reply_to.as_deref()
     };
+    let canonical_cover_letter_id =
+        if (group == "git-fetch" || group == "api-submit") && metadata.total == 1 {
+            Some(metadata.message_id.as_str())
+        } else {
+            cover_letter_id
+        };
 
     if metadata.is_patch_or_cover {
         let (subject, author, total_parts, strict_author) = if is_git_import {
@@ -905,6 +907,18 @@ async fn process_parsed_article(
             .await
         {
             Ok(Some(patchset_id)) => {
+                if canonical_cover_letter_id != cover_letter_id
+                    && let Some(canonical_clid) = canonical_cover_letter_id
+                    && let Err(e) = worker_db
+                        .update_patchset_cover_letter_message_id(patchset_id, canonical_clid)
+                        .await
+                {
+                    error!(
+                        "Failed to update canonical cover letter for patchset {}: {}",
+                        patchset_id, e
+                    );
+                }
+
                 #[allow(clippy::collapsible_if)]
                 if let Some(until) = embargo_until {
                     if let Err(e) = worker_db

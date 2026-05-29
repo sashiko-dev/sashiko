@@ -1518,7 +1518,10 @@
 
                     const clickHandler = (e) => {
                         if (e.target.closest('.copy-btn')) return;
-                        const target = `#/patchset/${encodeURIComponent(p.message_id || p.id)}`;
+                        const patchsetTarget = (p.id !== undefined && p.id !== null)
+                            ? p.id
+                            : p.message_id;
+                        const target = `#/patchset/${encodeURIComponent(patchsetTarget)}`;
                         if (e.button === 1 || e.ctrlKey || e.metaKey) {
                             window.open(target, '_blank');
                         } else if (e.button === 0) {
