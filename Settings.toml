@@ -97,3 +97,8 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+# Strip author-reputation cues (Signed-off-by/Reviewed-by and other identity
+# trailers, the author header, and e-mail addresses) from the commit-message
+# region of the patch the model sees. The diff body, e-mail routing, the
+# stored patch, and the public report are unaffected. On by default; set to false to show author identity.
+# anonymize_authors = false

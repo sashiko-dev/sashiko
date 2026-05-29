@@ -400,9 +400,172 @@ pub fn extract_email(author: &str) -> String {
     author.trim().to_string()
 }
 
+/// Author-identity trailer lines removed from the model's view of a commit
+/// message when `[review] anonymize_authors` is enabled. Matched
+/// case-insensitively against each line after trimming leading whitespace
+/// (`git show` indents commit-message bodies, so trailers appear as
+/// "    Signed-off-by:"). The trailing colon is load-bearing: it keeps prose
+/// lines such as "From the previous discussion" from being mistaken for
+/// trailers.
+///
+/// `Fixes:` is deliberately absent: it carries a SHA and a description of
+/// the prior commit being fixed, which is technical provenance the model
+/// needs to trace code history, not an identity cue.
+const IDENTITY_LINE_PREFIXES: &[&str] = &[
+    "from:",
+    "author:",
+    "signed-off-by:",
+    "co-developed-by:",
+    "co-authored-by:",
+    "reviewed-by:",
+    "acked-by:",
+    "tested-by:",
+    "reported-by:",
+    "suggested-by:",
+    "cc:",
+];
+
+/// Byte offset at which the diff body begins (the first line starting with
+/// `diff --git `), or `text.len()` if there is none. Everything from this
+/// offset onward is the diff and is never anonymized.
+fn diff_body_start(text: &str) -> usize {
+    const MARKER: &str = "diff --git ";
+    if text.starts_with(MARKER) {
+        return 0;
+    }
+    match text.find(&format!("\n{MARKER}")) {
+        Some(pos) => pos + 1,
+        None => text.len(),
+    }
+}
+
+/// Strip author-reputation cues from the commit-message region of patch text,
+/// for the model's view only. Drops identity trailer lines (Signed-off-by,
+/// Reviewed-by, Author, Cc, ...) and redacts e-mail addresses. The diff
+/// body (everything from the first `diff --git` line onward) is left
+/// byte-for-byte unchanged, so the code under review and the model's quotes are
+/// unaffected. This runs only while assembling the model's input; the patch as
+/// stored in the database, applied to the worktree, and quoted in the public
+/// report is untouched. Removing the author-reputation cue ("X wrote this, so
+/// it must be right") is the point: see `[review] anonymize_authors`.
+pub fn anonymize_patch_text(text: &str) -> String {
+    static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
+    let email_re = EMAIL_RE.get_or_init(|| {
+        Regex::new(r"<?[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}>?").unwrap()
+    });
+
+    let (message_region, diff_body) = text.split_at(diff_body_start(text));
+
+    let mut out = String::with_capacity(text.len());
+    for line in message_region.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = content.trim_start().to_ascii_lowercase();
+        if IDENTITY_LINE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+            continue;
+        }
+        out.push_str(&email_re.replace_all(line, "<redacted>"));
+    }
+    out.push_str(diff_body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_anonymize_strips_trailers_and_preserves_diff_body() {
+        let input = "mm: fix the thing\n\
+\n\
+This rewrites the allocator to avoid a leak.\n\
+\n\
+Signed-off-by: Marc Zyngier <maz@kernel.org>\n\
+Reviewed-by: Will Deacon <will@kernel.org>\n\
+Cc: stable@vger.kernel.org\n\
+Fixes: 0123456789ab (\"mm: introduce the thing\")\n\
+---\n\
+ mm/foo.c | 2 +-\n\
+ 1 file changed, 1 insertion(+), 1 deletion(-)\n\
+\n\
+diff --git a/mm/foo.c b/mm/foo.c\n\
+index 1234..5678 100644\n\
+--- a/mm/foo.c\n\
++++ b/mm/foo.c\n\
+@@ -1,3 +1,3 @@\n\
+-\told(); /* Cc: looks like a trailer but is code */\n\
++\tnew(buf@host.example_stays_in_diff);\n";
+        let out = anonymize_patch_text(input);
+
+        // Identity trailers and the names/emails they carry are gone.
+        assert!(!out.contains("Signed-off-by"));
+        assert!(!out.contains("Reviewed-by"));
+        assert!(!out.contains("Marc Zyngier"));
+        assert!(!out.contains("Will Deacon"));
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().to_ascii_lowercase().starts_with("cc:"))
+        );
+        // Fixes: is technical provenance, not an identity cue; it survives.
+        assert!(out.contains("Fixes: 0123456789ab"));
+        // Subject and prose survive.
+        assert!(out.contains("mm: fix the thing"));
+        assert!(out.contains("This rewrites the allocator"));
+        // The diff body is byte-for-byte unchanged, including its trailer-like
+        // and email-like text inside code.
+        let in_body = &input[input.find("diff --git").unwrap()..];
+        let out_body = &out[out.find("diff --git").unwrap()..];
+        assert_eq!(in_body, out_body);
+        assert!(out.contains("buf@host.example_stays_in_diff"));
+    }
+
+    #[test]
+    fn test_anonymize_redacts_emails_in_kept_prose() {
+        let input = "Reported by alice@example.com after testing.\n";
+        let out = anonymize_patch_text(input);
+        assert!(!out.contains("alice@example.com"));
+        assert!(out.contains("<redacted>"));
+        assert!(out.contains("Reported by"));
+        assert!(out.contains("after testing."));
+    }
+
+    #[test]
+    fn test_anonymize_handles_git_show_indented_trailers() {
+        let input = "commit 0123456789abcdef0123456789abcdef01234567\n\
+Author: Marc Zyngier <maz@kernel.org>\n\
+Date:   Mon May 1 00:00:00 2026 +0000\n\
+\n\
+    KVM: arm64: fix the thing\n\
+\n\
+    Body of the message.\n\
+\n\
+    Signed-off-by: Marc Zyngier <maz@kernel.org>\n\
+\n\
+diff --git a/x b/x\n\
+@@ -1 +1 @@\n\
+-a\n\
++b\n";
+        let out = anonymize_patch_text(input);
+        assert!(!out.contains("Author: Marc"));
+        assert!(!out.contains("maz@kernel.org"));
+        assert!(!out.contains("Signed-off-by"));
+        // The commit hash line, subject, and body survive.
+        assert!(out.contains("commit 0123456789abcdef"));
+        assert!(out.contains("KVM: arm64: fix the thing"));
+        assert!(out.contains("Body of the message."));
+        // Diff preserved.
+        assert!(out.contains("diff --git a/x b/x"));
+        assert!(out.contains("+b"));
+    }
+
+    #[test]
+    fn test_anonymize_message_without_diff() {
+        let input = "Subject line\n\nBody.\n\nAcked-by: Someone <s@e.org>\n";
+        let out = anonymize_patch_text(input);
+        assert!(!out.contains("Acked-by"));
+        assert!(!out.contains("s@e.org"));
+        assert!(out.contains("Subject line"));
+        assert!(out.contains("Body."));
+    }
 
     #[test]
     fn test_extract_email() {

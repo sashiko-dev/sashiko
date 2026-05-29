@@ -308,6 +308,15 @@ pub struct ReviewSettings {
     pub max_files_touched: usize,
     #[serde(default)]
     pub ignore_files: Vec<String>,
+    /// When true, strip author-reputation cues (identity trailers such as
+    /// Signed-off-by/Reviewed-by, the author header, and e-mail addresses)
+    /// from the commit-message region of the patch the model sees. The diff
+    /// body, e-mail routing, MAINTAINERS handling, the stored patch, and the
+    /// public report are all unaffected. Defaults to on, so the model judges a
+    /// patch on its merits and never sees author identity unless an operator
+    /// explicitly sets this to false.
+    #[serde(default = "default_anonymize_authors")]
+    pub anonymize_authors: bool,
     #[serde(default = "default_email_policy_path")]
     pub email_policy_path: String,
     /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
@@ -355,6 +364,10 @@ fn default_max_retries() -> u32 {
 
 fn default_email_policy_path() -> String {
     "email_policy.toml".to_string()
+}
+
+fn default_anonymize_authors() -> bool {
+    true
 }
 
 fn default_log_level() -> String {

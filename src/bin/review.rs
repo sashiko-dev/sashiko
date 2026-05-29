@@ -336,14 +336,41 @@ async fn main() -> Result<()> {
                                     String::new()
                                 };
 
+                            // Anonymize the author-reputation cues in the
+                            // model's view only (diff body, patch application,
+                            // routing, and the stored/public patch are
+                            // untouched). Off unless `[review] anonymize_authors`.
+                            let anonymize = settings.review.anonymize_authors;
+                            let author = if anonymize { None } else { p.author.clone() };
+                            let diff = if anonymize {
+                                sashiko::patch::anonymize_patch_text(&p.diff)
+                            } else {
+                                p.diff.clone()
+                            };
+                            let git_show = patch_shows.get(&p.index).cloned().map(|s| {
+                                if anonymize {
+                                    sashiko::patch::anonymize_patch_text(&s)
+                                } else {
+                                    s
+                                }
+                            });
+                            let commit_message_full =
+                                patch_messages.get(&p.index).cloned().map(|s| {
+                                    if anonymize {
+                                        sashiko::patch::anonymize_patch_text(&s)
+                                    } else {
+                                        s
+                                    }
+                                });
+
                             json!({
                                 "subject": p.subject,
-                                "author": p.author,
+                                "author": author,
                                 "date_string": date_str,
-                                "diff": p.diff,
+                                "diff": diff,
                                 "commit_id": patch_shas.get(&p.index).cloned(),
-                                "git_show": patch_shows.get(&p.index).cloned(),
-                                "commit_message_full": patch_messages.get(&p.index).cloned()
+                                "git_show": git_show,
+                                "commit_message_full": commit_message_full
                             })
                         })
                         .collect();
