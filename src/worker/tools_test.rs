@@ -202,26 +202,6 @@ mod tests {
     }
 
     #[test]
-    fn test_git_show_smart_mode() {
-        let (linux_path, _prompts_path) = get_test_paths();
-        let toolbox = ToolBox::new(linux_path, None);
-        let rt = Runtime::new().unwrap();
-
-        let args = json!({
-            "object": "HEAD:README.md",
-            "start_line": 20,
-            "end_line": 30,
-            "mode": "smart"
-        });
-        let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
-        let content = result["content"].as_str().unwrap();
-        let mode = result["mode"].as_str().unwrap();
-
-        assert_eq!(mode, "smart");
-        assert!(content.contains("lines collapsed") || content.contains("Sashiko"));
-    }
-
-    #[test]
     fn test_git_blame_readme() {
         let (linux_path, _prompts_path) = get_test_paths();
         let toolbox = ToolBox::new(linux_path, None);

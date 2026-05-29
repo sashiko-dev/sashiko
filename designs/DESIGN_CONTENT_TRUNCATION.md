@@ -93,11 +93,6 @@ impl ContextWindow {
 }
 ```
 
-### Smart File Reader (Tool Enhancement)
-Update the `read_files` tool to support "smart mode":
-*   `read_files(files=[{path, start_line, end_line}], mode="smart")`
-*   If `mode="smart"`, it parses the file and collapses irrelevant sections before returning.
-
 ## 4. Integration Plan
 
 1.  **Step 1**: Implement `src/ai/token_budget.rs` for basic counting.

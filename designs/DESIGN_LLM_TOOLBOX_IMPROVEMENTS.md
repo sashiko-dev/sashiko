@@ -1,9 +1,7 @@
 # Design: LLM Toolbox Improvements for Truncation and Efficiency
 
 ## 1. Objective
-Improve Sashiko's LLM review workflow by:
-1.  **Eliminating Silent Truncations & LLM Confusion**: Explicitly instructing the LLM to detect and handle truncated tool outputs.
-2.  **Improving Token Efficiency**: Actively promoting the use of `smart` mode for `git_read_files` to reduce context bloat.
+Improve Sashiko's LLM review workflow by explicitly instructing the LLM to detect and handle truncated tool outputs (Eliminating Silent Truncations & LLM Confusion).
 
 ## 2. Proposed Changes
 
@@ -21,36 +19,6 @@ When truncation occurs, the tool's JSON response will contain:
 You MUST actively check for the `"truncated"` flag in every tool response. If `"truncated"` is `true`, you MUST NOT assume you have the complete picture. You are REQUIRED to follow the `"next_page_hint"` and make subsequent tool calls with adjusted parameters (e.g., `start_line`, `end_line`, narrower `paths`, or specific regex) to fetch the remaining content before finalizing your analysis. Failing to retrieve truncated content is a failure of rigor.
 ```
 
-### 2.2. Promoting `smart` Mode for `git_read_files`
-We will update the tool declaration for `git_read_files` in `src/worker/tools.rs` to strongly recommend `smart` mode.
-
-**Changes in `src/worker/tools.rs`:**
-*   Update the tool `description` to highlight `smart` mode.
-*   Update the `description` of the `mode` parameter to highly recommend `smart` mode for large files.
-
-**Updated Tool Declaration:**
-```json
-            AiTool {
-                name: "git_read_files".to_string(),
-                description: "Read the content of one or more files at a specific Git revision. 'smart' mode is HIGHLY RECOMMENDED for large files as it collapses irrelevant code around focus lines to save tokens."
-                    .to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "revision": { "type": "string", "description": "The Git commit SHA or reference (e.g., HEAD, baseline SHA, or target commit SHA) to read from." },
-                        "files": {
-                            "type": "array",
-                            "description": "List of files to read (maximum 10 files per request).",
-                            "items": {
-                                ...
-                            }
-                        },
-                        "mode": { "type": "string", "enum": ["raw", "smart"], "description": "Read mode. 'smart' mode is highly recommended to avoid truncation and save tokens. Defaults to 'raw'." }
-                    },
-                    "required": ["revision", "files"]
-                }),
-            }
-```
 
 ## 3. Verification Plan
 
