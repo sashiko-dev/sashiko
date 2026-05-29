@@ -92,7 +92,7 @@ repository_path = "third_party/linux"
 # only_branches = []
 
 [review]
-concurrency = 20
+concurrency = 16
 worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
