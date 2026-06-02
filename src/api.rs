@@ -233,20 +233,24 @@ pub struct SubmitResponse {
     pub id: String,
 }
 
-pub async fn run_server(
-    settings: ServerSettings,
+/// Build the API router with all routes and shared state.
+///
+/// Extracted from [`run_server`] so that integration tests can construct the
+/// router independently (e.g. bind to port 0 for random-port testing).
+pub fn build_router(
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
+    read_only: bool,
     allow_all_submit: bool,
     smtp_enabled: bool,
     dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Router {
     let state = Arc::new(AppState {
         db,
         sender,
         fetch_sender,
-        read_only: settings.read_only,
+        read_only,
         allow_all_submit,
         smtp_enabled,
         dry_run,
@@ -259,7 +263,7 @@ pub async fn run_server(
         messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
     });
 
-    let app = Router::new()
+    Router::new()
         .route("/api/lists", get(list_mailing_lists))
         .route("/api/patchsets", get(list_patchsets))
         .route("/api/messages", get(list_messages))
@@ -278,7 +282,27 @@ pub async fn run_server(
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
-        .with_state(state);
+        .with_state(state)
+}
+
+pub async fn run_server(
+    settings: ServerSettings,
+    db: Arc<Database>,
+    sender: mpsc::Sender<Event>,
+    fetch_sender: mpsc::Sender<FetchRequest>,
+    allow_all_submit: bool,
+    smtp_enabled: bool,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = build_router(
+        db,
+        sender,
+        fetch_sender,
+        settings.read_only,
+        allow_all_submit,
+        smtp_enabled,
+        dry_run,
+    );
 
     let bind_addr = format!("{}:{}", settings.host, settings.port);
     let addrs: Vec<SocketAddr> = bind_addr

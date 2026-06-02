@@ -8,6 +8,7 @@ mod integration {
     mod merge_should_happen;
     mod prefetch_e2e_test;
     mod quilt_merge_test;
+    mod server_tests;
     mod singleton_cover_merge_test;
     mod singleton_root_overwrite;
     mod test_nested;
