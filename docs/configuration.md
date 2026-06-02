@@ -154,6 +154,26 @@ Optional array of additional git remotes to track.
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
+### `[tools]` (optional)
+
+Configure which AI tools are available during review. See [AI Tools](tools.md) for full documentation.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | list | `[]` | Allowlist of tool names. Empty = all enabled. |
+| `disabled` | list | `[]` | Denylist of tool names. Takes precedence over `enabled`. |
+| `custom` | list | `[]` | Custom shell-based tool definitions. |
+
+### `[prompts]` (optional)
+
+Customize review prompts and stages. See [Prompt Customization](prompts.md) for full documentation.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `directory` | string | `"third_party/prompts/kernel"` | Prompts directory (local path, HTTP URL, or git URL). |
+| `stages_config` | string | `"stages.toml"` | Path to stages configuration file (relative to prompts dir). |
+| `variables` | table | `{}` | Template variables for `{{key}}` substitution in prompts. |
+
 ## email_policy.toml
 
 Controls how Sashiko sends (or suppresses) review emails. See
