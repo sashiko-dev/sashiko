@@ -62,5 +62,5 @@ toml = "0.8"
 tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-tree-sitter = "0.26.6"
+tree-sitter = "0.26.9"
 tree-sitter-c = "0.24.1"
