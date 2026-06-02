@@ -417,6 +417,149 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_tool_filtering_allowlist() -> anyhow::Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempfile::tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec!["git_read_files".to_string(), "git_diff".to_string()],
+            disabled: vec![],
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls = toolbox.get_declarations_generic();
+
+        assert_eq!(decls.len(), 2);
+        assert!(decls.iter().any(|t| t.name == "git_read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+        assert!(!decls.iter().any(|t| t.name == "git_log"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_denylist() -> anyhow::Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempfile::tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec![],
+            disabled: vec!["git_ls".to_string(), "git_blame".to_string()],
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls = toolbox.get_declarations_generic();
+
+        assert!(decls.len() > 5);
+        assert!(!decls.iter().any(|t| t.name == "git_ls"));
+        assert!(!decls.iter().any(|t| t.name == "git_blame"));
+        assert!(decls.iter().any(|t| t.name == "git_read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_combined() -> anyhow::Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempfile::tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec![
+                "git_read_files".to_string(),
+                "git_diff".to_string(),
+                "git_ls".to_string(),
+            ],
+            disabled: vec!["git_ls".to_string()], // Takes precedence
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls = toolbox.get_declarations_generic();
+
+        assert_eq!(decls.len(), 2);
+        assert!(decls.iter().any(|t| t.name == "git_read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+        assert!(!decls.iter().any(|t| t.name == "git_ls"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_call_disabled() -> anyhow::Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempfile::tempdir()?;
+        let config = ToolsSettings {
+            enabled: vec!["git_read_files".to_string()],
+            disabled: vec![],
+            custom: vec![],
+        };
+
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+
+        let args = json!({
+            "args": ["--oneline"]
+        });
+        let result = toolbox.call("git_log", args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not enabled"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_default_all_enabled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let toolbox = ToolBox::with_config(dir.path().to_path_buf(), None, None);
+        let decls = toolbox.get_declarations_generic();
+
+        // All built-in tools (8 tools, read_prompt excluded without prompts_path)
+        assert_eq!(decls.len(), 8);
+        assert!(decls.iter().any(|t| t.name == "git_read_files"));
+        assert!(decls.iter().any(|t| t.name == "git_diff"));
+        assert!(decls.iter().any(|t| t.name == "git_log"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_filtering_read_prompt_conditional() -> anyhow::Result<()> {
+        use crate::settings::ToolsSettings;
+
+        let dir = tempfile::tempdir()?;
+        let prompts_dir = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir)?;
+
+        let config = ToolsSettings {
+            enabled: vec!["git_read_files".to_string(), "read_prompt".to_string()],
+            disabled: vec![],
+            custom: vec![],
+        };
+
+        // With prompts_path, read_prompt should be available
+        let toolbox = ToolBox::with_config(
+            dir.path().to_path_buf(),
+            Some(prompts_dir.clone()),
+            Some(&config),
+        );
+        let decls = toolbox.get_declarations_generic();
+        assert_eq!(decls.len(), 2);
+        assert!(decls.iter().any(|t| t.name == "read_prompt"));
+
+        // Without prompts_path, read_prompt should not be available even if enabled
+        let toolbox_no_prompts =
+            ToolBox::with_config(dir.path().to_path_buf(), None, Some(&config));
+        let decls_no_prompts = toolbox_no_prompts.get_declarations_generic();
+        assert_eq!(decls_no_prompts.len(), 1);
+        assert!(!decls_no_prompts.iter().any(|t| t.name == "read_prompt"));
+
+        Ok(())
+    }
+
     #[test]
     fn test_git_read_files_truncation() {
         let (linux_path, _prompts_path) = get_test_paths();
