@@ -129,3 +129,16 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+
+[tools]
+# enabled = ["git_read_files", "git_diff"]  # allowlist (empty = all enabled)
+# disabled = []                              # denylist (takes precedence)
+
+[prompts]
+# directory = "third_party/prompts/kernel"   # local path
+# directory = "https://example.com/prompts"  # remote HTTP(S)
+# directory = "git://github.com/user/prompts.git"  # git repo
+# stages_config = "stages.toml"
+
+[prompts.variables]
+# Custom template variables for prompt substitution: {{variable_name}}

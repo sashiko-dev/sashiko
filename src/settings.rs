@@ -418,6 +418,36 @@ fn default_log_level() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct CustomToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: String,
+    pub command: String,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct ToolsSettings {
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    #[serde(default)]
+    pub custom: Vec<CustomToolDefinition>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct PromptsSettings {
+    pub directory: Option<String>,
+    pub stages_config: Option<PathBuf>,
+    #[serde(default)]
+    pub variables: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct Settings {
     #[serde(default = "default_log_level")]
@@ -436,6 +466,8 @@ pub struct Settings {
     pub server: ServerSettings,
     pub git: GitSettings,
     pub review: ReviewSettings,
+    pub tools: Option<ToolsSettings>,
+    pub prompts: Option<PromptsSettings>,
 }
 
 fn default_subsystems() -> SubsystemsSettings {
@@ -477,6 +509,13 @@ impl Settings {
             .build()?;
 
         s.try_deserialize()
+    }
+
+    pub fn get_prompts_dir(&self) -> String {
+        self.prompts
+            .as_ref()
+            .and_then(|p| p.directory.clone())
+            .unwrap_or_else(|| "third_party/prompts/kernel".to_string())
     }
 
     pub fn local_review_path() -> PathBuf {
