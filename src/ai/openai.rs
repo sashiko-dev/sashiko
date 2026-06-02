@@ -1227,7 +1227,9 @@ mod tests {
         );
         // Test arbitrary deep nested paths that shouldn't be accepted
         assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/v1v1/text/completions"),
+            OpenAiCompatClient::normalize_base_url(
+                "http://localhost:1234/v1/v1v1/text/completions"
+            ),
             ""
         );
         // Test strings completely lacking a valid protocol scheme format
