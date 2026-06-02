@@ -12,11 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![warn(
+    clippy::all,
+    clippy::pedantic,
+    clippy::cargo,
+    clippy::redundant_closure,
+    clippy::large_futures,
+    clippy::unwrap_used,
+    clippy::undocumented_unsafe_blocks,
+    clippy::allow_attributes_without_reason
+)]
+#![deny(clippy::redundant_clone, clippy::await_holding_lock)]
+#![allow(
+    clippy::must_use_candidate,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::cargo_common_metadata,
+    reason = "Deferred until the global lint policy lands."
+)]
+
 //! AI provider that shells out to `kiro-cli acp`.
 //!
 //! By default, Kiro runs under an isolated temporary agent with all native
 //! tools disabled. A deny-all pre-tool hook acts as a defensive backstop.
-//! This makes the provider a pure completion backend: Sashiko's own ToolBox
+//! This makes the provider a pure completion backend: Sashiko's own `ToolBox`
 //! remains the only tool execution layer.
 
 use anyhow::{Context, Result};
@@ -84,7 +104,7 @@ fn build_args(model: &str, agent: &str) -> Vec<String> {
 }
 
 /// Create the isolated temporary workspace with a no-tool agent and deny-all hook.
-/// Returns the TempDir (must be kept alive for the duration of the process).
+/// Returns the `TempDir` (must be kept alive for the duration of the process).
 fn create_isolated_workspace() -> Result<TempDir> {
     let tmp = tempfile::tempdir()?;
     let agents_dir = tmp.path().join(".kiro/agents");
@@ -229,7 +249,7 @@ async fn stderr_context(stderr_preview: &StderrPreview) -> String {
     if preview.is_empty() {
         String::new()
     } else {
-        format!("; stderr: {}", preview)
+        format!("; stderr: {preview}")
     }
 }
 
@@ -261,8 +281,7 @@ fn extract_text_content(content: &Value) -> Option<String> {
             let text = items
                 .iter()
                 .filter_map(extract_text_content)
-                .collect::<Vec<_>>()
-                .join("");
+                .collect::<String>();
             (!text.is_empty()).then_some(text)
         }
         _ => None,
@@ -290,9 +309,9 @@ impl KiroCliProvider {
         }
 
         cmd.kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn kiro-cli ACP: {}. Is it installed?", e)
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn kiro-cli ACP: {e}. Is it installed?"))?;
 
         let stderr_preview = Arc::new(Mutex::new(String::new()));
         if let Some(stderr) = child.stderr.take() {
@@ -383,12 +402,11 @@ impl AiProvider for KiroCliProvider {
         let prompt = build_prompt(&request);
         debug!("kiro-cli prompt length: {} chars", prompt.len());
 
-        let (agent_name, isolated_workspace) = match &self.agent {
-            Some(a) => (a.clone(), None),
-            None => {
-                let tmp = create_isolated_workspace()?;
-                ("sashiko-provider".to_string(), Some(tmp))
-            }
+        let (agent_name, isolated_workspace) = if let Some(agent) = &self.agent {
+            (agent.clone(), None)
+        } else {
+            let tmp = create_isolated_workspace()?;
+            ("sashiko-provider".to_string(), Some(tmp))
         };
 
         let text = timeout(
@@ -461,7 +479,7 @@ mod tests {
         settings.ai.provider = "kiro-cli".to_string();
         settings.ai.model = "claude-sonnet-4".to_string();
 
-        let provider = create_provider(&settings).unwrap();
+        let provider = create_provider(&settings).expect("kiro-cli provider should be created");
         let caps = provider.get_capabilities();
         assert_eq!(caps.model_name, "claude-sonnet-4");
         assert_eq!(caps.context_window_size, 200_000);
@@ -494,12 +512,14 @@ mod tests {
 
     #[test]
     fn test_isolated_workspace_agent_json() {
-        let tmp = create_isolated_workspace().unwrap();
+        let tmp = create_isolated_workspace().expect("isolated workspace should be created");
         let agent_path = tmp.path().join(".kiro/agents/sashiko-provider.json");
         assert!(agent_path.exists());
 
+        let agent_json =
+            std::fs::read_to_string(&agent_path).expect("agent json should be readable");
         let content: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&agent_path).unwrap()).unwrap();
+            serde_json::from_str(&agent_json).expect("agent json should parse");
 
         assert_eq!(content["tools"], serde_json::json!([]));
         assert_eq!(content["allowedTools"], serde_json::json!([]));
@@ -509,27 +529,29 @@ mod tests {
         assert!(
             content["prompt"]
                 .as_str()
-                .unwrap()
+                .expect("agent prompt should be a string")
                 .contains("Follow the user-provided instructions exactly")
         );
 
         // Verify deny-all hook is wired
         let hooks = &content["hooks"]["preToolUse"];
         assert!(hooks.is_array());
-        let hook_cmd = hooks[0]["command"].as_str().unwrap();
+        let hook_cmd = hooks[0]["command"]
+            .as_str()
+            .expect("preToolUse hook command should be a string");
         assert_eq!(hook_cmd, ".kiro/hooks/deny-all-tools.sh");
     }
 
     #[test]
     fn test_deny_all_hook_exits_nonzero() {
-        let tmp = create_isolated_workspace().unwrap();
+        let tmp = create_isolated_workspace().expect("isolated workspace should be created");
         let hook_path = tmp.path().join(".kiro/hooks/deny-all-tools.sh");
         assert!(hook_path.exists());
 
         let output = std::process::Command::new("sh")
             .arg(&hook_path)
             .output()
-            .unwrap();
+            .expect("deny-all hook should execute");
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("disabled"));
@@ -586,9 +608,9 @@ mod tests {
     #[test]
     fn test_parse_tool_calls_json() {
         let text = r#"{"tool_calls":[{"id":"c1","function_name":"read_file","arguments":{"path":"README.md"}}]}"#;
-        let resp = parse_inner_response(text, None).unwrap();
+        let resp = parse_inner_response(text, None).expect("tool call response should parse");
         assert!(resp.tool_calls.is_some());
-        let calls = resp.tool_calls.unwrap();
+        let calls = resp.tool_calls.expect("tool calls should be present");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function_name, "read_file");
         assert_eq!(calls[0].arguments["path"], "README.md");
@@ -597,7 +619,7 @@ mod tests {
     #[test]
     fn test_parse_plain_content() {
         let text = r#"{"content":"No issues found in this patch."}"#;
-        let resp = parse_inner_response(text, None).unwrap();
+        let resp = parse_inner_response(text, None).expect("plain content response should parse");
         assert_eq!(
             resp.content.as_deref(),
             Some("No issues found in this patch.")
@@ -608,7 +630,7 @@ mod tests {
     #[test]
     fn test_parse_raw_text_fallback() {
         let text = "This is not JSON at all.";
-        let resp = parse_inner_response(text, None).unwrap();
+        let resp = parse_inner_response(text, None).expect("raw text fallback should parse");
         assert_eq!(resp.content.as_deref(), Some(text));
     }
 
@@ -629,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_content_with_fake_acp_server() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("temporary directory should be created");
         let fake = tmp.path().join("fake-kiro-cli");
         std::fs::write(
             &fake,
@@ -649,12 +671,13 @@ while IFS= read -r line; do
 done
 "#,
         )
-        .unwrap();
+        .expect("fake kiro-cli script should be written");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .expect("fake kiro-cli script should be executable");
         }
 
         let provider = KiroCliProvider {
@@ -664,28 +687,32 @@ done
             context_window_size: 200_000,
             timeout_secs: 5,
         };
-        let response = provider.generate_content(sample_request()).await.unwrap();
+        let response = provider
+            .generate_content(sample_request())
+            .await
+            .expect("fake ACP server should return a response");
         assert_eq!(response.content.as_deref(), Some("ok"));
     }
 
     #[tokio::test]
     async fn test_generate_content_includes_redacted_stderr_on_startup_exit() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("temporary directory should be created");
         let fake = tmp.path().join("fake-kiro-cli");
         std::fs::write(
             &fake,
-            r#"#!/bin/sh
+            r"#!/bin/sh
 printf '%s\n' 'authentication failed token=abc123' >&2
 sleep 0.1
 exit 2
-"#,
+",
         )
-        .unwrap();
+        .expect("fake kiro-cli script should be written");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .expect("fake kiro-cli script should be executable");
         }
 
         let provider = KiroCliProvider {
@@ -699,7 +726,7 @@ exit 2
         let err = provider
             .generate_content(sample_request())
             .await
-            .unwrap_err()
+            .expect_err("fake ACP server should fail before response")
             .to_string();
         assert!(err.contains("kiro-cli ACP exited before response 0"));
         assert!(err.contains("stderr: authentication failed token=[REDACTED]"));
