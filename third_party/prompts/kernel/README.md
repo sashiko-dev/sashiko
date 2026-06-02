@@ -1,7 +1,9 @@
 # Kernel patch review prompts
 
 These prompts give AI extra context to more effectively review
-kernel code.  They can be paired with semcode, which makes the review
+kernel code.
+
+They can be paired with semcode, which makes the review
 sessions faster and more accurate by indexing the kernel tree, reducing the
 time AI spends grepping for function/type definitions, and call graphs.
 
