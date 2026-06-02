@@ -493,6 +493,8 @@ pub struct LocalReviewReviewSettings {
 pub struct LocalReviewSettings {
     pub ai: AiSettings,
     pub review: Option<LocalReviewReviewSettings>,
+    pub tools: Option<ToolsSettings>,
+    pub prompts: Option<PromptsSettings>,
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {

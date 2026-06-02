@@ -95,34 +95,21 @@ impl Reviewer {
     ///
     /// * `db` - The database connection.
     /// * `settings` - Application settings.
-    pub async fn new(db: Arc<Database>, settings: Settings) -> Self {
+    pub async fn new(db: Arc<Database>, settings: Settings) -> anyhow::Result<Self> {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
-        let baseline_registry =
-            match BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone()) {
-                Ok(r) => Arc::new(r),
-                Err(e) => {
-                    error!(
-                        "Failed to initialize BaselineRegistry: {}. Using empty registry.",
-                        e
-                    );
-                    Arc::new(
-                        BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone())
-                            .unwrap_or_else(|_| {
-                                panic!("Critical error initializing BaselineRegistry: {}", e)
-                            }),
-                    )
-                }
-            };
+        let baseline_registry = Arc::new(BaselineRegistry::new(
+            &repo_path,
+            settings.git.custom_remotes.clone(),
+        )?);
 
         let provider = create_provider_cached(
             &settings,
             settings.ai.response_cache,
             settings.ai.response_cache_ttl_days,
         )
-        .await
-        .expect("Failed to create AI provider");
+        .await?;
 
         // Mathematically derived from Sashiko's review pipeline stage composition:
         // Stages 1-7 run in parallel (7 slots), while Stages 8-11 run sequentially (1 slot).
@@ -131,7 +118,7 @@ impl Reviewer {
         // saturate LLM capacity while gating local processes/worktrees strictly to `concurrency`.
         let llm_concurrency = std::cmp::max(1, concurrency * 3);
 
-        Self {
+        Ok(Self {
             db,
             settings,
             semaphore: Arc::new(Semaphore::new(concurrency)),
@@ -139,7 +126,7 @@ impl Reviewer {
             baseline_registry,
             quota_manager: Arc::new(QuotaManager::new()),
             provider,
-        }
+        })
     }
 
     /// Starts the reviewer service loop.
@@ -1543,6 +1530,8 @@ async fn run_review_tool(
             .join(",");
         cmd.arg("--stages").arg(stages_str);
     }
+
+    cmd.arg("--prompts").arg(settings.get_prompts_dir());
 
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());

@@ -14,7 +14,7 @@
 
 use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
-    settings::{AiSettings, Settings},
+    settings::{AiSettings, PromptsSettings, Settings, ToolsSettings},
     toolbox::ToolBox,
     worker::{PatchInput, ReviewInput, Worker, WorkerConfig, prompts::PromptRegistry},
 };
@@ -272,30 +272,45 @@ pub async fn run_worker(
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency) = if let Some(path) = &options.settings_path {
-        let local_settings = Settings::local_review_from_file(path)
-            .with_context(|| format!("Failed to load settings from {}", path.display()))?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else if repo_override.is_some() {
-        let local_settings =
-            Settings::local_review_settings().context("Failed to load local review settings")?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else {
-        let settings = Settings::new().context("Failed to load settings")?;
-        (
-            settings.ai,
-            Some(PathBuf::from(settings.git.repository_path)),
-            settings.review.concurrency,
-        )
-    };
+    let (mut ai, configured_repo_path, concurrency, tools_settings, prompts_settings) =
+        if let Some(path) = &options.settings_path {
+            let local_settings = Settings::local_review_from_file(path)
+                .with_context(|| format!("Failed to load settings from {}", path.display()))?;
+            let concurrency = local_settings
+                .review
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            (
+                local_settings.ai,
+                None,
+                concurrency,
+                local_settings.tools,
+                local_settings.prompts,
+            )
+        } else if repo_override.is_some() {
+            let local_settings = Settings::local_review_settings()
+                .context("Failed to load local review settings")?;
+            let concurrency = local_settings
+                .review
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            (
+                local_settings.ai,
+                None,
+                concurrency,
+                local_settings.tools,
+                local_settings.prompts,
+            )
+        } else {
+            let settings = Settings::new().context("Failed to load settings")?;
+            (
+                settings.ai,
+                Some(PathBuf::from(settings.git.repository_path)),
+                settings.review.concurrency,
+                settings.tools,
+                settings.prompts,
+            )
+        };
 
     if let Some(provider) = &options.ai_provider {
         ai.provider = provider.clone();
@@ -393,6 +408,8 @@ pub async fn run_worker(
         &baseline_arg,
         &baseline_sha,
         &options,
+        &tools_settings,
+        &prompts_settings,
         progress,
     )
     .await;
@@ -418,6 +435,8 @@ async fn review_single_patch(
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
     baseline_sha: &str,
+    tools_settings: Option<&ToolsSettings>,
+    prompts_settings: Option<&PromptsSettings>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     let mut last_error = None;
@@ -466,7 +485,8 @@ async fn review_single_patch(
             p.index, patch_files
         );
 
-        let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        let mut tools =
+            ToolBox::with_config(worktree.path.clone(), prompts_tool_path, tools_settings);
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
@@ -474,7 +494,13 @@ async fn review_single_patch(
             tools.set_virtual_head(sha.clone());
         }
 
-        let prompts = PromptRegistry::new(options.prompts.clone());
+        let prompts = if prompts_settings.is_some() {
+            PromptRegistry::with_settings(prompts_settings)
+                .await
+                .context("Failed to load prompts with settings")?
+        } else {
+            PromptRegistry::new(options.prompts.clone())
+        };
         let series_range = patch_shas
             .get(&p.index)
             .map(|sha| format!("{}..{}", baseline_sha, sha));
@@ -625,6 +651,8 @@ async fn run_worker_in_worktree(
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
+    tools_settings: &Option<ToolsSettings>,
+    prompts_settings: &Option<PromptsSettings>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     info!("Worktree at {:?}", worktree.path);
@@ -799,6 +827,8 @@ async fn run_worker_in_worktree(
         .collect();
 
     // Execute patch reviews concurrently with a limit
+    let tools_settings_ref = tools_settings.as_ref();
+    let prompts_settings_ref = prompts_settings.as_ref();
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
@@ -815,6 +845,8 @@ async fn run_worker_in_worktree(
                 patch_shas,
                 options,
                 baseline_sha,
+                tools_settings_ref,
+                prompts_settings_ref,
                 progress,
             )
             .await

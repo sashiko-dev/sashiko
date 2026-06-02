@@ -819,10 +819,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start Reviewer Service
-    let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
-    tokio::spawn(async move {
-        reviewer.start().await;
-    });
+    match Reviewer::new(db.clone(), settings.clone()).await {
+        Ok(reviewer) => {
+            tokio::spawn(async move {
+                reviewer.start().await;
+            });
+        }
+        Err(e) => {
+            error!("Failed to initialize Reviewer service: {}", e);
+        }
+    }
 
     let metrics_db = db.clone();
     tokio::spawn(async move {
