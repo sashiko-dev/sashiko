@@ -41,7 +41,7 @@ chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 config = "0.15.19"
 google-cloud-auth = { version = "1.10", optional = true }
-fastrand = "2.3.0"
+fastrand = "2.4.1"
 flate2 = "1.1.9"
 futures = "0.3.31"
 lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
