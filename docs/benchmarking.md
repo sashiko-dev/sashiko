@@ -60,6 +60,22 @@ The tool prints a summary to the console:
 Detailed results are written to `benchmark_results.json` in the current
 directory, including the AI judge's explanation for each finding.
 
+## Local Model Benchmark Profiles
+
+When benchmarking a bounded local OpenAI-compatible model, report these
+profiles separately:
+
+| Profile | `enable_static_bug_seeds` | `enable_targeted_bug_pattern_prescan` | Purpose |
+|---------|---------------------------|---------------------------------------|---------|
+| Neutral | `false` | `false` | Model-quality runs without regression aids. |
+| Generic static | `true` | `false` | Measures opt-in deterministic diff-local bug-pattern detectors without the LLM prescan. |
+| Regression | `true` | `true` | Tracks regression behavior with all opt-in regression aids enabled. |
+
+Static seeds are opt-in generic bug-pattern detectors. For example, the skb
+fragment seed looks for diff-local skb fragment append/growth sites that lack an
+apparent `MAX_SKB_FRAGS`-style capacity guard; it is not keyed to a specific
+benchmark commit. Keep seeded and neutral results separate in benchmark reports.
+
 ## Re-evaluating existing results
 
 If you have already run ingestion and reviews but want to re-score with

@@ -546,7 +546,7 @@ async fn handle_list(
                     let status_color = match status_str {
                         "Reviewed" => Color::Green,
                         "Embargoed" => Color::Magenta,
-                        "Failed" | "Error" | "Failed To Apply" => Color::Red,
+                        "Failed" | "FailedBudget" | "Error" | "Failed To Apply" => Color::Red,
                         "Pending" | "In Review" => Color::Yellow,
                         "Cancelled" => Color::Red,
                         _ => Color::White,
@@ -662,7 +662,7 @@ fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
     if !status.is_empty() && status != "Pending" {
         print!(" (");
         let color = match status {
-            "Failed" | "Failed To Apply" | "Error" => Color::Red,
+            "Failed" | "FailedBudget" | "Failed To Apply" | "Error" => Color::Red,
             "Embargoed" => Color::Magenta,
             _ => Color::Green,
         };
@@ -676,7 +676,7 @@ fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
         print!(" [");
         let color = if has_issues {
             Color::Yellow
-        } else if rev_status == "Failed" {
+        } else if matches!(rev_status, "Failed" | "FailedBudget") {
             Color::Red
         } else {
             Color::Green
@@ -743,7 +743,13 @@ async fn handle_show(
 
             let is_terminal = matches!(
                 status.as_str(),
-                "Reviewed" | "Failed" | "Error" | "Cancelled" | "Embargoed" | "Failed To Apply"
+                "Reviewed"
+                    | "Failed"
+                    | "FailedBudget"
+                    | "Error"
+                    | "Cancelled"
+                    | "Embargoed"
+                    | "Failed To Apply"
             );
 
             if watch && status != last_status {
@@ -765,7 +771,10 @@ async fn handle_show(
             let numeric_id = details["id"].to_string();
 
             let mut review_data = None;
-            if status == "Reviewed" || status == "Failed" || status == "Failed To Apply" {
+            if matches!(
+                status.as_str(),
+                "Reviewed" | "Failed" | "FailedBudget" | "Failed To Apply"
+            ) {
                 let review_url = format!("{}/api/review_log?patchset_id={}", base_url, numeric_id);
                 let review_resp = client.get(&review_url).send().await?;
 
@@ -974,7 +983,7 @@ fn show_summary(
                         reviewed_clean += 1;
                     }
                 }
-                "Failed" | "Error" => failed += 1,
+                "Failed" | "FailedBudget" | "Error" => failed += 1,
                 _ => in_review += 1,
             }
         }

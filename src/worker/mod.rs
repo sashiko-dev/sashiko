@@ -15,6 +15,7 @@
 pub mod email;
 pub mod prefetch;
 pub mod prompts;
+pub(crate) mod stage9;
 pub mod tools;
 #[cfg(test)]
 mod tools_test;

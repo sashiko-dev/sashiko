@@ -1,0 +1,5 @@
+Root-cause compaction rule:
+- Prefer one canonical finding per root cause when retained concerns share the same changed file/function or call path, resource/object, trigger path, and consequence class.
+- Mark duplicate or overlapping concerns as drop_reason=subsumed_by with subsumed_by_finding_id pointing at the canonical finding.
+- The canonical finding must preserve the strongest concrete evidence from the group.
+- For proof-required, argument-order, seqcount/IRQ, retry-resource, resource-cleanup, and lifecycle-ordering concerns, compaction is allowed only if the surviving finding still satisfies that concern's preservation rule.

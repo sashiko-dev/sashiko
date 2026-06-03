@@ -1,0 +1,5 @@
+Argument-order/API-contract preservation rule:
+- If a retained concern says arguments or parameters are swapped, reversed, in the wrong order, or violate a callee signature/API contract, do not lose that argument-order issue.
+- Either emit one finding whose problem or severity_explanation explicitly preserves the callee name, expected parameter order or signature, actual call-site argument order, and why the order is wrong; or drop the concern as subsumed_by with subsumed_by_finding_id pointing at such a finding.
+- Prefer one strong finding per root cause. Do not emit near-duplicate findings when several retained concerns describe the same argument-order bug; mark the duplicates as subsumed_by instead.
+- Generic API-contract or resource-handling wording is not enough for an argument-order concern.

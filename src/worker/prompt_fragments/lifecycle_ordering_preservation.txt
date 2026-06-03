@@ -1,0 +1,4 @@
+Lifecycle-ordering preservation rule:
+- If a retained concern involves teardown ordering of workqueues, timers, rfkill, unregister callbacks, close/remove paths, or callbacks that can re-enter teardown, Stage 9 must not drop it as a generic false_positive unless it proves the callback cannot run after the resource is destroyed.
+- To drop this class as false_positive, the rationale must name the exact unregister/destroy order, the callback path that would otherwise re-enter close/remove, the synchronization/barrier/cancel operation that prevents the race, and why nci_close_device or the equivalent callback cannot observe freed state.
+- Duplicate or subsumed lifecycle concerns may be merged only if the surviving finding preserves the destroyed resource, unregister/callback source, re-entry path, bad ordering, and concrete consequence.

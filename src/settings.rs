@@ -187,6 +187,11 @@ pub struct OpenAiCompatSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Enables bounded local-model policy for OpenAI-compatible local
+    /// endpoints such as Ollama. This is separate from the transport
+    /// shape and remains disabled by default.
+    #[serde(default)]
+    pub bounded_local_model: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -266,6 +271,17 @@ fn default_temperature() -> f32 {
 
 fn default_max_interactions() -> usize {
     100
+}
+
+impl AiSettings {
+    pub fn bounded_local_model_for_provider(&self, provider: &str) -> bool {
+        provider.eq_ignore_ascii_case("openai-compatible")
+            && self
+                .openai_compat
+                .as_ref()
+                .map(|settings| settings.bounded_local_model)
+                .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -387,5 +403,48 @@ impl Settings {
             .build()?;
 
         s.try_deserialize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_compat_bounded_local_model_defaults_false() {
+        let settings: OpenAiCompatSettings = toml::from_str("").unwrap();
+
+        assert!(!settings.bounded_local_model);
+    }
+
+    #[test]
+    fn bounded_local_model_requires_openai_compat_provider_and_flag() {
+        let ai: AiSettings = toml::from_str(
+            r#"
+provider = "openai-compatible"
+model = "qwen-local"
+
+[openai_compat]
+bounded_local_model = true
+"#,
+        )
+        .unwrap();
+
+        assert!(ai.bounded_local_model_for_provider("openai-compatible"));
+        assert!(!ai.bounded_local_model_for_provider("openai"));
+        assert!(!ai.bounded_local_model_for_provider("gemini"));
+
+        let ai: AiSettings = toml::from_str(
+            r#"
+provider = "openai-compatible"
+model = "remote-compatible"
+
+[openai_compat]
+bounded_local_model = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!ai.bounded_local_model_for_provider("openai-compatible"));
     }
 }

@@ -56,7 +56,7 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compat`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compatible`. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
@@ -96,13 +96,14 @@ Settings for the Gemini provider (`provider = "gemini"`).
 
 #### `[ai.openai_compat]`
 
-Settings for OpenAI-compatible providers (`provider = "openai-compat"`).
+Settings for OpenAI-compatible providers (`provider = "openai-compatible"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `base_url` | string | -- | API endpoint URL. |
 | `context_window_size` | integer | -- | Context window size (optional). |
 | `max_tokens` | integer | -- | Max output tokens (optional). |
+| `bounded_local_model` | bool | `false` | Enable bounded local-model review policy for local/Ollama-style OpenAI-compatible models. This is not implied by `provider = "openai-compatible"`. |
 
 #### `[ai.kiro_cli]`
 
@@ -153,6 +154,8 @@ Optional array of additional git remotes to track.
 | `email_policy_path` | string | `"email_policy.toml"` | Path to the email policy file. |
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
+| `enable_static_bug_seeds` | bool | `false` | Enable deterministic proof-required bug-pattern seeds for local regression profiles. Not intended for neutral production review. |
+| `enable_targeted_bug_pattern_prescan` | bool | `false` | Enable the LLM-based diff prescan for selected high-signal kernel bug-pattern classes. The prescan is keyword-gated, capped, and should stay disabled for neutral production review while evaluating that mode. |
 
 ## email_policy.toml
 

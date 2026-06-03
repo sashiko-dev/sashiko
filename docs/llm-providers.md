@@ -258,3 +258,9 @@ cp docs/examples/Settings.openai-compat.toml Settings.toml
 ```
 
 Adjust `base_url` to point to your provider's endpoint.
+
+For local/Ollama-style models that need host-side controls, set
+`[ai.openai_compat] bounded_local_model = true`. This enables bounded
+exploration, finalization-only schemas, Todo tool filtering, prompt preflight
+margins, and minimal fallback. It is not enabled merely by choosing
+`provider = "openai-compatible"`.

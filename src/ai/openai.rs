@@ -22,7 +22,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -55,15 +55,19 @@ pub struct OpenAiMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OpenAiToolCall {
+    #[serde(default, deserialize_with = "deserialize_jsonish_string")]
     pub id: String,
     #[serde(rename = "type")]
+    #[serde(default, deserialize_with = "deserialize_jsonish_string")]
     pub tool_type: String,
     pub function: OpenAiToolCallFunction,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OpenAiToolCallFunction {
+    #[serde(default, deserialize_with = "deserialize_jsonish_string")]
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_jsonish_string")]
     pub arguments: String,
 }
 
@@ -91,6 +95,7 @@ pub struct OpenAiResponse {
 pub struct OpenAiChoice {
     pub index: u32,
     pub message: OpenAiMessage,
+    #[serde(default, deserialize_with = "deserialize_jsonish_string")]
     pub finish_reason: String,
 }
 
@@ -99,6 +104,18 @@ pub struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+fn deserialize_jsonish_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::String(s)) => s,
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,11 +140,22 @@ impl ClassifyAiError for OpenAiCompatError {
                 retry_after: *retry_after,
             },
             OpenAiCompatError::AuthenticationError(_) => AiErrorClass::Fatal,
-            OpenAiCompatError::ApiError(status, _) => {
-                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+            OpenAiCompatError::ApiError(status, error_text) => {
+                if is_non_retryable_server_error(error_text) {
+                    AiErrorClass::Fatal
+                } else {
+                    classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+                }
             }
         }
     }
+}
+
+fn is_non_retryable_server_error(error_text: &str) -> bool {
+    // Ollama can surface deterministic tool-call/template parser failures as
+    // HTTP 500 responses. Retrying the same malformed generation prompt just
+    // stalls the review until the outer timeout expires.
+    error_text.to_ascii_lowercase().contains("xml syntax error")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,10 +335,14 @@ impl OpenAiCompatClient {
             401 | 403 => Err(OpenAiCompatError::AuthenticationError(error_text))?,
             500..=599 => {
                 tracing::warn!("OpenAI Server Error {}: {}", status, error_text);
-                Err(OpenAiCompatError::TransientError(
-                    retry_after_duration.unwrap_or(Duration::from_secs(0)),
-                    error_text,
-                ))?
+                if is_non_retryable_server_error(&error_text) {
+                    Err(OpenAiCompatError::ApiError(status, error_text))?
+                } else {
+                    Err(OpenAiCompatError::TransientError(
+                        retry_after_duration.unwrap_or(Duration::from_secs(0)),
+                        error_text,
+                    ))?
+                }
             }
             _ => Err(OpenAiCompatError::ApiError(status, error_text))?,
         }
@@ -401,7 +433,17 @@ fn translate_ai_request(
     });
 
     let response_format = request.response_format.map(|rf| match rf {
-        AiResponseFormat::Json { .. } => serde_json::json!({"type": "json_object"}),
+        AiResponseFormat::Json {
+            schema: Some(schema),
+        } => serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "sashiko_stage_output",
+                "strict": false,
+                "schema": normalize_json_schema(schema),
+            }
+        }),
+        AiResponseFormat::Json { schema: None } => serde_json::json!({"type": "json_object"}),
         AiResponseFormat::Text => serde_json::json!({"type": "text"}),
     });
 
@@ -448,6 +490,83 @@ fn translate_ai_request(
         max_completion_tokens: max_completion_tokens_field,
         response_format,
     })
+}
+
+fn normalize_json_schema(mut schema: Value) -> Value {
+    fn normalize(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(type_value) = map.get_mut("type") {
+                    match type_value {
+                        Value::String(s) => {
+                            *s = s.to_ascii_lowercase();
+                        }
+                        Value::Array(values) => {
+                            for item in values {
+                                if let Value::String(s) = item {
+                                    *s = s.to_ascii_lowercase();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                for child in map.values_mut() {
+                    normalize(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    normalize(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    normalize(&mut schema);
+    schema
+}
+
+fn json_schema_injection_text(schema: &Value) -> String {
+    let normalized_schema = normalize_json_schema(schema.clone());
+    let schema_text = serde_json::to_string_pretty(&normalized_schema)
+        .unwrap_or_else(|_| normalized_schema.to_string());
+    format!(
+        "Return ONLY valid JSON matching this JSON Schema. Do not include markdown or prose.\nJSON Schema:\n{schema_text}"
+    )
+}
+
+fn rejects_json_schema_response_format(error: &OpenAiCompatError) -> bool {
+    let OpenAiCompatError::ApiError(status, body) = error else {
+        return false;
+    };
+    if !matches!(
+        *status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let body = body.to_ascii_lowercase();
+    body.contains("json_schema")
+        || (body.contains("response_format") && body.contains("schema"))
+        || body.contains("unsupported response format")
+}
+
+fn downgrade_schema_request_for_json_object(mut request: AiRequest, schema: Value) -> AiRequest {
+    let normalized_schema = normalize_json_schema(schema);
+    let instruction = json_schema_injection_text(&normalized_schema);
+
+    if let Some(system) = &mut request.system {
+        system.push_str("\n\n");
+        system.push_str(&instruction);
+    } else {
+        request.system = Some(instruction);
+    }
+    request.response_format = Some(AiResponseFormat::Json { schema: None });
+    request
 }
 
 fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
@@ -522,6 +641,12 @@ fn estimate_tokens_generic(request: &AiRequest) -> usize {
             total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
         }
     }
+    if let Some(AiResponseFormat::Json {
+        schema: Some(schema),
+    }) = &request.response_format
+    {
+        total += TokenBudget::estimate_tokens(&json_schema_injection_text(schema));
+    }
     total
 }
 
@@ -530,11 +655,36 @@ impl AiProvider for OpenAiCompatClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         tracing::info!("Sending OpenAI request...");
 
+        let original_request = request.clone();
         let mut openai_req = translate_ai_request(request, self.max_tokens, self.provider_type)?;
         openai_req.model = self.model.clone();
 
         let resp_body = serde_json::to_value(&openai_req)?;
-        let resp = self.post_request(&resp_body).await?;
+        let resp = match self.post_request(&resp_body).await {
+            Ok(resp) => resp,
+            Err(err)
+                if self.provider_type == OpenAiProviderType::OpenAiCompatible
+                    && rejects_json_schema_response_format(&err) =>
+            {
+                let Some(AiResponseFormat::Json {
+                    schema: Some(schema),
+                }) = original_request.response_format.clone()
+                else {
+                    return Err(err.into());
+                };
+                tracing::warn!(
+                    "OpenAI-compatible endpoint rejected json_schema response_format; retrying with json_object and schema instruction"
+                );
+                let fallback_request =
+                    downgrade_schema_request_for_json_object(original_request, schema);
+                let mut fallback_openai_req =
+                    translate_ai_request(fallback_request, self.max_tokens, self.provider_type)?;
+                fallback_openai_req.model = self.model.clone();
+                let fallback_body = serde_json::to_value(&fallback_openai_req)?;
+                self.post_request(&fallback_body).await?
+            }
+            Err(err) => return Err(err.into()),
+        };
         translate_ai_response(resp)
     }
 
@@ -601,6 +751,16 @@ mod tests {
     }
 
     #[test]
+    fn test_ollama_xml_parser_server_error_classifies_as_fatal() {
+        let err = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"message":"XML syntax error on line 3: unexpected EOF"}}"#.to_string(),
+        );
+
+        assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
     fn test_api_error_client_status_classifies_as_fatal() {
         let err = OpenAiCompatError::ApiError(
             reqwest::StatusCode::BAD_REQUEST,
@@ -608,6 +768,69 @@ mod tests {
         );
 
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_rejects_json_schema_response_format() {
+        let err = OpenAiCompatError::ApiError(
+            reqwest::StatusCode::BAD_REQUEST,
+            "response_format json_schema is not supported".to_string(),
+        );
+
+        assert!(rejects_json_schema_response_format(&err));
+    }
+
+    #[test]
+    fn test_downgrade_schema_request_for_json_object_adds_schema_instruction() -> Result<()> {
+        let request = AiRequest {
+            system: Some("You are helpful.".to_string()),
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Score this.".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: Some(AiResponseFormat::Json {
+                schema: Some(json!({
+                    "type": "OBJECT",
+                    "properties": {"score": {"type": "NUMBER"}}
+                })),
+            }),
+            context_tag: None,
+        };
+
+        let fallback = downgrade_schema_request_for_json_object(request, json!({"type": "OBJECT"}));
+        assert!(
+            fallback
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("JSON Schema")
+        );
+        assert!(
+            fallback
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("\"type\": \"object\"")
+        );
+        assert_eq!(
+            fallback.response_format,
+            Some(AiResponseFormat::Json { schema: None })
+        );
+
+        let openai_req =
+            translate_ai_request(fallback, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        assert_eq!(
+            openai_req.response_format,
+            Some(json!({"type": "json_object"}))
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -865,6 +1088,10 @@ mod tests {
     #[test]
     fn test_translate_request_json_format() -> Result<()> {
         let schema = json!({
+            "type": "OBJECT",
+            "properties": {"score": {"type": "NUMBER"}}
+        });
+        let normalized_schema = json!({
             "type": "object",
             "properties": {"score": {"type": "number"}}
         });
@@ -890,9 +1117,44 @@ mod tests {
 
         assert_eq!(
             openai_req.response_format,
+            Some(json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "sashiko_stage_output",
+                    "strict": false,
+                    "schema": normalized_schema,
+                }
+            }))
+        );
+        assert_eq!(openai_req.messages.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_request_json_format_without_schema_injects_json_instruction() -> Result<()> {
+        let request = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Score this.".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: Some(AiResponseFormat::Json { schema: None }),
+            context_tag: None,
+        };
+
+        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+
+        assert_eq!(
+            openai_req.response_format,
             Some(json!({"type": "json_object"}))
         );
-        // "json" not in any message, so a system message should be prepended
         assert_eq!(openai_req.messages[0].role, "system");
         assert_eq!(
             openai_req.messages[0].content,
@@ -1033,6 +1295,44 @@ mod tests {
         assert_eq!(tool_calls[0].function_name, "my_tool");
         assert_eq!(tool_calls[0].arguments["arg"], "val");
         assert_eq!(tool_calls[0].thought_signature, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_response_accepts_null_tool_call_arguments() -> Result<()> {
+        let raw = r#"{
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "my_tool",
+                            "arguments": null
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }],
+            "usage": {
+                "prompt_tokens": 15,
+                "completion_tokens": 25,
+                "total_tokens": 40
+            }
+        }"#;
+
+        let openai_resp: OpenAiResponse = serde_json::from_str(raw)?;
+        let ai_resp = translate_ai_response(openai_resp)?;
+
+        let tool_calls = ai_resp.tool_calls.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_abc");
+        assert_eq!(tool_calls[0].function_name, "my_tool");
+        assert!(tool_calls[0].arguments.is_null());
 
         Ok(())
     }

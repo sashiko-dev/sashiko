@@ -1,0 +1,5 @@
+Retry/error-path resource preservation rule:
+- If a retained concern involves an error path that retries or falls back after receiving or partially initializing a response/resource buffer, Stage 9 must preserve the leak-before-retry mechanism instead of rewriting it as generic cleanup or use-after-free.
+- A valid finding must preserve the operation/helper, the resource buffer, the cleanup helper, the failed operation followed by retry/fallback trigger, and the bug mechanism that the buffer is not freed before retry, overwrite, reuse, or return.
+- To drop this class as false_positive, the rationale must name the exact cleanup label/path, the exact free call, why that cleanup runs before the retry/fallback or before the resource is overwritten/reused, and why the resource cannot leak.
+- Duplicate or subsumed retry-resource concerns may be merged only if the surviving finding preserves the same resource and retry path.

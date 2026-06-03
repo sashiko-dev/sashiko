@@ -23,6 +23,7 @@ use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, T
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
+use crate::review_budget::{is_token_budget_failure_message, prompt_preflight_cap};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
@@ -44,6 +45,7 @@ struct ReviewContext {
     llm_semaphore: Arc<Semaphore>,
     db: Arc<Database>,
     settings: Settings,
+    bounded_local_model: bool,
     baseline_registry: Arc<BaselineRegistry>,
     quota_manager: Arc<QuotaManager>,
     target_review_count: usize,
@@ -53,6 +55,62 @@ struct ReviewContext {
 enum PatchResult {
     Success,
     ReviewFailed,
+}
+
+fn token_budget_failure_reason(message: &str) -> String {
+    format!("TokenBudgetExceeded: {message}")
+}
+
+fn compile_subject_glob(pattern: &str) -> regex::Regex {
+    let mut re = String::from("^");
+    for c in pattern.chars() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
+                re.push('\\');
+                re.push(c);
+            }
+            _ => re.push(c),
+        }
+    }
+    re.push('$');
+    regex::Regex::new(&re).unwrap_or_else(|e| {
+        warn!("Subject glob translator produced invalid regex for {pattern:?}: {e}");
+        regex::Regex::new(r"\b\B").expect("valid never-match regex literal")
+    })
+}
+
+async fn complete_failed_review_from_tool_error(
+    ctx: &ReviewContext,
+    review_id: i64,
+    patch_id: i64,
+    error_msg: &str,
+    interaction_id: Option<&str>,
+    logs: Option<&str>,
+) -> bool {
+    let budget_failed = is_token_budget_failure_message(error_msg);
+    let result_desc = if budget_failed {
+        token_budget_failure_reason(error_msg)
+    } else {
+        error_msg.to_string()
+    };
+    let _ = ctx
+        .db
+        .complete_review(
+            review_id,
+            ReviewStatus::Failed.as_str(),
+            &result_desc,
+            None,
+            interaction_id,
+            None,
+            logs,
+        )
+        .await;
+    if budget_failed {
+        let _ = ctx.db.update_patch_status(patch_id, "FailedBudget").await;
+    }
+    budget_failed
 }
 
 #[derive(Serialize)]
@@ -81,6 +139,7 @@ fn generate_id() -> String {
 pub struct Reviewer {
     db: Arc<Database>,
     settings: Settings,
+    bounded_local_model: bool,
     semaphore: Arc<Semaphore>,
     llm_semaphore: Arc<Semaphore>,
     baseline_registry: Arc<BaselineRegistry>,
@@ -98,6 +157,9 @@ impl Reviewer {
     pub async fn new(db: Arc<Database>, settings: Settings) -> Self {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
+        let bounded_local_model = settings
+            .ai
+            .bounded_local_model_for_provider(&settings.ai.provider);
 
         let baseline_registry =
             match BaselineRegistry::new(&repo_path, settings.git.custom_remotes.clone()) {
@@ -134,6 +196,7 @@ impl Reviewer {
         Self {
             db,
             settings,
+            bounded_local_model,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             llm_semaphore: Arc::new(Semaphore::new(llm_concurrency)),
             baseline_registry,
@@ -214,6 +277,7 @@ impl Reviewer {
                 llm_semaphore: self.llm_semaphore.clone(),
                 db: self.db.clone(),
                 settings: self.settings.clone(),
+                bounded_local_model: self.bounded_local_model,
                 baseline_registry: self.baseline_registry.clone(),
                 quota_manager: self.quota_manager.clone(),
                 target_review_count,
@@ -260,6 +324,7 @@ impl Reviewer {
                 llm_semaphore: self.llm_semaphore.clone(),
                 db: self.db.clone(),
                 settings: self.settings.clone(),
+                bounded_local_model: self.bounded_local_model,
                 baseline_registry: self.baseline_registry.clone(),
                 quota_manager: self.quota_manager.clone(),
                 target_review_count: 1,
@@ -471,25 +536,14 @@ impl Reviewer {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
 
-            let compile_glob = |pattern: &str| -> regex::Regex {
-                let mut re = String::from("^");
-                for c in pattern.chars() {
-                    match c {
-                        '*' => re.push_str(".*"),
-                        '?' => re.push('.'),
-                        '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
-                            re.push('\\');
-                            re.push(c);
-                        }
-                        _ => re.push(c),
-                    }
-                }
-                re.push('$');
-                regex::Regex::new(&re).unwrap_or_else(|_| regex::Regex::new("a^").unwrap())
-            };
-
-            let skip_regexes: Vec<_> = skip_filters.iter().map(|f| compile_glob(f)).collect();
-            let only_regexes: Vec<_> = only_filters.iter().map(|f| compile_glob(f)).collect();
+            let skip_regexes: Vec<_> = skip_filters
+                .iter()
+                .map(|f| compile_subject_glob(f))
+                .collect();
+            let only_regexes: Vec<_> = only_filters
+                .iter()
+                .map(|f| compile_subject_glob(f))
+                .collect();
 
             struct ValidJob {
                 patch_id: i64,
@@ -506,11 +560,13 @@ impl Reviewer {
 
             for (patch_id, index, diff, _subj, _auth, _date, _msg_id) in &diffs {
                 let mut should_skip = false;
+                let mut skip_reason = None;
 
                 // Opt-out logic
                 if skip_regexes.iter().any(|re| re.is_match(_subj)) {
                     info!("Skipping patch {} (subject matches skip filter)", patch_id);
                     should_skip = true;
+                    skip_reason = Some("Skipped: subject matches skip filter".to_string());
                 }
 
                 // Opt-in logic (if only_filters is not empty, subject MUST match at least one)
@@ -523,6 +579,8 @@ impl Reviewer {
                         patch_id
                     );
                     should_skip = true;
+                    skip_reason =
+                        Some("Skipped: subject does not match any only filter".to_string());
                 }
 
                 if !should_skip {
@@ -547,11 +605,31 @@ impl Reviewer {
                             patch_id, patch_lines_changed, patch_files_count
                         );
                         should_skip = true;
+                        skip_reason = Some(format!(
+                            "Skipped: exceeds size limits ({} changed lines, {} touched files)",
+                            patch_lines_changed, patch_files_count
+                        ));
                     }
                 }
 
                 if should_skip {
-                    let _ = ctx.db.update_patch_status(*patch_id, "Skipped").await;
+                    let reason = skip_reason.as_deref().unwrap_or("Skipped before AI review");
+                    if let Err(e) = Self::complete_skipped_review(
+                        &ctx,
+                        patchset_id,
+                        *patch_id,
+                        Some(baseline_id),
+                        prompts_hash.as_deref(),
+                        reason,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to record skipped review for patch {}: {}",
+                            patch_id, e
+                        );
+                        failed_patches += 1;
+                    }
                     continue;
                 }
                 let commit_sha = patch_commits.get(index).cloned();
@@ -1002,6 +1080,48 @@ impl Reviewer {
         (None, HashMap::new(), logs_json)
     }
 
+    async fn complete_skipped_review(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        patch_id: i64,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let review_id = if let Some(id) = ctx
+            .db
+            .get_pending_review_id(patchset_id, Some(patch_id))
+            .await?
+        {
+            id
+        } else {
+            ctx.db
+                .create_review(
+                    patchset_id,
+                    Some(patch_id),
+                    &ctx.settings.ai.provider,
+                    &ctx.settings.ai.model,
+                    baseline_id,
+                    prompts_hash,
+                )
+                .await?
+        };
+
+        ctx.db
+            .complete_review(
+                review_id,
+                ReviewStatus::Skipped.as_str(),
+                reason,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        ctx.db.update_patch_status(patch_id, "Skipped").await?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn process_patch_review(
         ctx: &ReviewContext,
@@ -1145,6 +1265,7 @@ impl Reviewer {
                 worktree_path,
                 ctx.provider.clone(),
                 ctx.llm_semaphore.clone(),
+                ctx.bounded_local_model,
             )
             .await;
 
@@ -1165,8 +1286,11 @@ impl Reviewer {
                         None
                     };
 
-                    if let Some(h) = history.and_then(|h| h.as_array()) {
-                        // Tool usage recording (same as before)
+                    if let Some(h) = history.and_then(|h| h.as_array())
+                        && ctx.db.count_tool_usages(review_id).await.unwrap_or(0) == 0
+                    {
+                        // Backfill tool usage from child history only when the parent did not
+                        // already record live tool calls from the provider proxy.
                         for item in h {
                             if let Some(role) = item.get("role").and_then(|r| r.as_str())
                                 && role == "assistant"
@@ -1231,18 +1355,18 @@ impl Reviewer {
                                 "Review tool returned error for ps={} idx={}: {}",
                                 patchset_id, index, error_msg
                             );
-                            let _ = ctx
-                                .db
-                                .complete_review(
-                                    review_id,
-                                    ReviewStatus::Failed.as_str(),
-                                    error_msg,
-                                    None,
-                                    interaction_id.as_deref(),
-                                    None,
-                                    logs_str.as_deref(),
-                                )
-                                .await;
+                            if complete_failed_review_from_tool_error(
+                                ctx,
+                                review_id,
+                                patch_id,
+                                error_msg,
+                                interaction_id.as_deref(),
+                                logs_str.as_deref(),
+                            )
+                            .await
+                            {
+                                return Ok(PatchResult::ReviewFailed);
+                            }
 
                             if retries < max_retries {
                                 retries += 1;
@@ -1426,18 +1550,18 @@ impl Reviewer {
                         let error_msg = json_output["error"]
                             .as_str()
                             .unwrap_or("Tool failed to return patch status");
-                        let _ = ctx
-                            .db
-                            .complete_review(
-                                review_id,
-                                ReviewStatus::Failed.as_str(),
-                                error_msg,
-                                None,
-                                interaction_id.as_deref(),
-                                None,
-                                logs_str.as_deref(),
-                            )
-                            .await;
+                        if complete_failed_review_from_tool_error(
+                            ctx,
+                            review_id,
+                            patch_id,
+                            error_msg,
+                            interaction_id.as_deref(),
+                            logs_str.as_deref(),
+                        )
+                        .await
+                        {
+                            return Ok(PatchResult::ReviewFailed);
+                        }
                         if retries < max_retries {
                             retries += 1;
                             continue;
@@ -1448,18 +1572,14 @@ impl Reviewer {
                 }
                 Err(e) => {
                     error!("Review execution failed for {}: {}", patchset_id, e);
-                    let _ = ctx
-                        .db
-                        .complete_review(
-                            review_id,
-                            ReviewStatus::Failed.as_str(),
-                            &format!("Tool error: {}", e),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                    let error_msg = format!("Tool error: {}", e);
+                    if complete_failed_review_from_tool_error(
+                        ctx, review_id, patch_id, &error_msg, None, None,
+                    )
+                    .await
+                    {
+                        return Ok(PatchResult::ReviewFailed);
+                    }
                     if retries < max_retries {
                         retries += 1;
                         continue;
@@ -1486,6 +1606,7 @@ async fn run_review_tool(
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
+    bounded_local_model_enabled: bool,
 ) -> Result<serde_json::Value> {
     let mut cmd = if let Some(ref override_bin) = settings.review.review_tool_override {
         Command::new(override_bin)
@@ -1698,6 +1819,7 @@ async fn run_review_tool(
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
                                         let llm_semaphore_clone = llm_semaphore.clone();
+                                        let bounded_local_model_enabled_clone = bounded_local_model_enabled;
 
                                         let handle = tokio::spawn(async move {
                                             let req: AiRequest = match serde_json::from_value(payload) {
@@ -1707,6 +1829,44 @@ async fn run_review_tool(
                                                     return;
                                                 }
                                             };
+
+                                            let prompt_tokens = provider_clone.estimate_tokens(&req);
+                                            let preflight_cap = prompt_preflight_cap(
+                                                settings_clone.ai.max_input_tokens,
+                                                bounded_local_model_enabled_clone,
+                                            );
+                                            if prompt_tokens > preflight_cap {
+                                                let err_msg = format!(
+                                                    "Prompt estimate {} exceeds preflight cap {} (max_input_tokens {})",
+                                                    prompt_tokens,
+                                                    preflight_cap,
+                                                    settings_clone.ai.max_input_tokens
+                                                );
+                                                error!("{}; aborting review", err_msg);
+
+                                                let payload = RemoteAiErrorPayload::new(
+                                                    err_msg.clone(),
+                                                    AiErrorClass::Fatal,
+                                                );
+                                                let reply = json!({
+                                                    "type": "error",
+                                                    "tx_id": tx_id,
+                                                    "payload": payload
+                                                });
+                                                let mut reply_str =
+                                                    serde_json::to_string(&reply).unwrap();
+                                                reply_str.push('\n');
+                                                {
+                                                    let mut writer = stdin_clone.lock().await;
+                                                    let _ = writer.write_all(reply_str.as_bytes()).await;
+                                                    let _ = writer.flush().await;
+                                                }
+
+                                                let _ = abort_tx_clone
+                                                    .send(ReviewError::BudgetExceeded(err_msg).into())
+                                                    .await;
+                                                return;
+                                            }
 
                                             let mut tool_calls_map = std::collections::HashMap::new();
                                             for msg in &req.messages {
@@ -1813,6 +1973,38 @@ async fn run_review_tool(
                                             let reply = match resp_payload {
                                                 Ok(p) => {
                                                     if let Some(usage) = &p.usage {
+                                                        if usage.prompt_tokens > settings_clone.ai.max_input_tokens {
+                                                            let err_msg = format!(
+                                                                "Actual prompt_tokens {} exceeded max_input_tokens {}",
+                                                                usage.prompt_tokens,
+                                                                settings_clone.ai.max_input_tokens
+                                                            );
+                                                            error!("{}; aborting review", err_msg);
+
+                                                            let payload = RemoteAiErrorPayload::new(
+                                                                err_msg.clone(),
+                                                                AiErrorClass::Fatal,
+                                                            );
+                                                            let reply = json!({
+                                                                "type": "error",
+                                                                "tx_id": tx_id,
+                                                                "payload": payload
+                                                            });
+                                                            let mut reply_str =
+                                                                serde_json::to_string(&reply).unwrap();
+                                                            reply_str.push('\n');
+                                                            {
+                                                                let mut writer = stdin_clone.lock().await;
+                                                                let _ = writer.write_all(reply_str.as_bytes()).await;
+                                                                let _ = writer.flush().await;
+                                                            }
+
+                                                            let _ = abort_tx_clone
+                                                                .send(ReviewError::BudgetExceeded(err_msg).into())
+                                                                .await;
+                                                            return;
+                                                        }
+
                                                         let cached = usage.cached_tokens.unwrap_or(0);
                                                         let uncached_input = usage.prompt_tokens.saturating_sub(cached);
                                                         let current_total = total_tokens_used_clone.fetch_add(uncached_input + usage.completion_tokens, Ordering::SeqCst) + uncached_input + usage.completion_tokens;
@@ -2572,6 +2764,9 @@ mod tests {
             None,
             provider,
             Arc::new(Semaphore::new(56)),
+            settings
+                .ai
+                .bounded_local_model_for_provider(&settings.ai.provider),
         )
         .await
     }
@@ -2745,6 +2940,9 @@ fi
             llm_semaphore: Arc::new(Semaphore::new(56)),
             db: db.clone(),
             settings: settings.clone(),
+            bounded_local_model: settings
+                .ai
+                .bounded_local_model_for_provider(&settings.ai.provider),
             baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
             quota_manager,
             target_review_count: 1,
@@ -3031,6 +3229,9 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             None,
             provider,
             Arc::new(Semaphore::new(56)),
+            settings
+                .ai
+                .bounded_local_model_for_provider(&settings.ai.provider),
         )
         .await
         .map(|_| ())
@@ -3059,6 +3260,42 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             "unexpected error: {err}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_token_budget_failure_detection() {
+        assert!(is_token_budget_failure_message(
+            "Token budget exceeded: 123 tokens used"
+        ));
+        assert!(is_token_budget_failure_message(
+            "Prompt estimate 61000 exceeds max_input_tokens 60000"
+        ));
+        assert!(!is_token_budget_failure_message(
+            "Stage 9 failed to produce JSON"
+        ));
+    }
+
+    #[test]
+    fn test_prompt_preflight_margin_requires_bounded_local_mode() {
+        assert_eq!(prompt_preflight_cap(60_000, true), 54_000);
+        assert_eq!(prompt_preflight_cap(60_000, false), 60_000);
+    }
+
+    #[test]
+    fn test_subject_glob_regex_matches_wildcards() {
+        let re = compile_subject_glob("drivers/**/foo?.c");
+
+        assert!(re.is_match("drivers/net/foo1.c"));
+        assert!(re.is_match("drivers/gpu/drm/fooA.c"));
+        assert!(!re.is_match("drivers/net/foo12.c"));
+    }
+
+    #[test]
+    fn test_subject_glob_regex_escapes_metacharacters() {
+        let re = compile_subject_glob(r"net/[foo]\bar.+(v2){x}$");
+
+        assert!(re.is_match(r"net/[foo]\bar.+(v2){x}$"));
+        assert!(!re.is_match("net/foobarzzv2x"));
     }
 
     #[tokio::test]
@@ -3145,6 +3382,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             llm_semaphore: Arc::new(Semaphore::new(56)),
             db: db.clone(),
             settings,
+            bounded_local_model: false,
             baseline_registry: Arc::new(
                 crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
             ),
