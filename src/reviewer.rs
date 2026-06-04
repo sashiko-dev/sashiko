@@ -2981,6 +2981,7 @@ echo '{"type": "ai_request", "payload": {"messages": [{"role": "user", "content"
 read -r ai_response
 echo '{"type": "ai_request", "payload": {"messages": [{"role": "user", "content": "second"}], "temperature": 0.5}}'
 read -r ai_response
+sleep 1  # make less sensitive to race condition
 echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 "#;
         std::fs::write(&bin_path, mock_script)?;
