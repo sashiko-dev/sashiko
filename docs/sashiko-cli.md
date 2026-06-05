@@ -256,6 +256,25 @@ with `sashiko-cli submit` or `sashiko-cli local`.
 This mode is useful when you want to review multiple patch series over
 time and compare results.
 
+## Database Seeding for Development
+
+For feature development that requires a populated database, you can seed it
+with real patches from lore.kernel.org without running any AI reviews.
+
+Run the `sashiko` daemon with the `--download` and `--no-ai` flags:
+
+```bash
+# Download the last 50 patches from configured mailing lists
+# and apply them to worktrees, skipping AI review
+sashiko --download 50 --no-ai
+```
+
+This will:
+1. Ingest the specified number of patches from LKML.
+2. Populate the local database with these patchsets.
+3. Apply the patches to git worktrees in the configured `worktree_dir`.
+4. Skip all AI interaction.
+
 ### 3. Full deployment (daemon + email)
 
 Configure SMTP in `Settings.toml` and adjust `email_policy.toml` to
