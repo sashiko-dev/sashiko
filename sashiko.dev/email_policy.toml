@@ -199,3 +199,8 @@ cc = ["linux-i3c@lists.infradead.org", "Frank.Li@kernel.org"]
 lists = ["linux-raid@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-raid@vger.kernel.org", "yukuai@fygo.io"]
+
+[subsystems.linux-rt]
+lists = ["linux-rt-devel@lists.linux.dev"]
+reply_to_author = true
+cc = ["linux-rt-devel@lists.linux.dev", "linux-kernel@vger.kernel.org"]
