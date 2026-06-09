@@ -448,7 +448,11 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
         {
             hasher.update(json);
         }
-        format!("{:x}", hasher.finalize())
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 }
 
