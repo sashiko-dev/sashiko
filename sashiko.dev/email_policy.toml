@@ -200,3 +200,12 @@ cc = ["linux-raid@vger.kernel.org", "yukuai@fygo.io"]
 lists = ["linux-rt-devel@lists.linux.dev"]
 reply_to_author = true
 cc = ["linux-rt-devel@lists.linux.dev", "linux-kernel@vger.kernel.org"]
+
+[subsystems.linux-can]
+lists = ["linux-can@vger.kernel.org"]
+reply_to_author = true
+cc = ["Marc Kleine-Budde <mkl@pengutronix.de>",
+      "Oliver Hartkopp <socketcan@hartkopp.net>",
+      "Vincent Mailhol <mailhol@kernel.org>",
+      "Oleksij Rempel <o.rempel@pengutronix.de>",
+      "linux-can@vger.kernel.org"]
