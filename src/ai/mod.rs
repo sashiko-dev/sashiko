@@ -406,14 +406,34 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 _ => openai::OpenAiProviderType::OpenAiCompatible,
             };
 
+            let openai_settings = settings.ai.openai.as_ref();
+
+            let api_type = openai_settings
+                .and_then(|s| s.api.as_deref())
+                .map(|api| match api {
+                    "chat" => openai::OpenAiApiType::Chat,
+                    _ => openai::OpenAiApiType::Responses,
+                })
+                .unwrap_or_else(|| match provider_type {
+                    openai::OpenAiProviderType::OpenAi => openai::OpenAiApiType::Responses,
+                    openai::OpenAiProviderType::OpenAiCompatible => openai::OpenAiApiType::Chat,
+                });
+
+            let default_base_url = match api_type {
+                openai::OpenAiApiType::Responses => {
+                    openai::OpenAiCompatClient::default_base_url_for_responses()
+                }
+                openai::OpenAiApiType::Chat => {
+                    openai::OpenAiCompatClient::default_base_url_for_model(&settings.ai.model)
+                }
+            };
+
             let base_url = settings
                 .ai
                 .openai_compat
                 .as_ref()
                 .and_then(|c| c.base_url.clone())
-                .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_base_url_for_model(&settings.ai.model)
-                });
+                .unwrap_or(default_base_url);
 
             let context_window = settings
                 .ai
@@ -431,13 +451,28 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 .and_then(|c| c.max_tokens)
                 .unwrap_or(4096);
 
+            let reasoning_effort = openai_settings.and_then(|s| s.reasoning_effort.clone());
+
+            if let Some(ref effort) = reasoning_effort {
+                const ALLOWED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+                if !ALLOWED_REASONING_EFFORTS.contains(&effort.as_str()) {
+                    bail!(
+                        "Invalid reasoning_effort '{}'. Allowed values: {:?}",
+                        effort,
+                        ALLOWED_REASONING_EFFORTS
+                    );
+                }
+            }
+
             Ok(Arc::new(openai::OpenAiCompatClient::new(
                 base_url,
                 provider_type,
+                api_type,
                 settings.ai.model.clone(),
                 context_window,
                 max_tokens,
                 settings.ai.api_timeout_secs,
+                reasoning_effort,
             )))
         }
         "claude-cli" => {
