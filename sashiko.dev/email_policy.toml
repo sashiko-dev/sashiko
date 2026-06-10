@@ -95,6 +95,7 @@ reply_all = true
 
 [subsystems.pci]
 lists = ["linux-pci@vger.kernel.org"]
+send_positive_review = true
 reply_to_author = true
 cc = ["linux-pci@vger.kernel.org"]
 
