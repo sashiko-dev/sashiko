@@ -155,7 +155,7 @@ impl OpenAiCompatClient {
         context_window_size: usize,
         max_tokens: u32,
         api_timeout_secs: u64,
-    ) -> Self {
+    ) -> Result<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default();
@@ -174,16 +174,16 @@ impl OpenAiCompatClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        let base_url = Self::normalize_base_url(&base_url);
+        let base_url = Self::normalize_base_url(&base_url)?;
 
-        Self {
+        Ok(Self {
             model,
             base_url,
             context_window_size,
             max_tokens,
             provider_type,
             client,
-        }
+        })
     }
 
     /// Normalize a base URL so it always ends with `/chat/completions`.
@@ -192,7 +192,7 @@ impl OpenAiCompatClient {
     /// `http://localhost:1234/v1`, expecting the client to append the endpoint
     /// path.  Our `post_request` POSTs directly to `self.base_url`, so we
     /// ensure the full path is present.
-    fn normalize_base_url(url: &str) -> String {
+    fn normalize_base_url(url: &str) -> Result<String> {
         let trimmed = url.trim_end_matches('/');
 
         let (base, path) = match trimmed.split_once("://") {
@@ -200,16 +200,16 @@ impl OpenAiCompatClient {
                 Some((host, path)) => (format!("{scheme}://{host}"), format!("/{}", path)),
                 None => (trimmed.to_string(), String::new()),
             },
-            None => return String::new(),
+            None => return Err(anyhow::anyhow!("Invalid url scheme in OpenAI url {}", url)),
         };
 
         let path = match path.as_str() {
             "" => "/chat/completions",
             "/v1" | "/v1/chat/completions" => "/v1/chat/completions",
-            _ => return String::new(),
+            _ => return Err(anyhow::anyhow!("Invalid OpenAI url {}", url)),
         };
 
-        format!("{base}{path}")
+        Ok(format!("{base}{path}"))
     }
 
     pub fn default_base_url_for_model(model: &str) -> String {
@@ -1192,50 +1192,49 @@ mod tests {
     fn test_normalize_base_url_appends_chat_completions() {
         // LM Studio style: just /v1
         assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1"),
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1").unwrap(),
             "http://localhost:1234/v1/chat/completions"
         );
         // Trailing slash
         assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/"),
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/").unwrap(),
             "http://localhost:1234/v1/chat/completions"
         );
         // Already has full path
         assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://api.openai.com/v1/chat/completions"),
+            OpenAiCompatClient::normalize_base_url("https://api.openai.com/v1/chat/completions")
+                .unwrap(),
             "https://api.openai.com/v1/chat/completions"
         );
         // Full path with trailing slash
         assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/chat/completions/"),
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/chat/completions/")
+                .unwrap(),
             "http://localhost:1234/v1/chat/completions"
         );
         // Bare host
         assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234"),
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234").unwrap(),
             "http://localhost:1234/chat/completions"
         );
         // Test the specific nested bogus path scenario we analyzed
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/text/completions"),
-            ""
+        assert!(
+            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/text/completions")
+                .is_err()
         );
         // Bare host with different host
         assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://openai.com"),
+            OpenAiCompatClient::normalize_base_url("https://openai.com").unwrap(),
             "https://openai.com/chat/completions"
         );
         // Test arbitrary deep nested paths that shouldn't be accepted
-        assert_eq!(
+        assert!(
             OpenAiCompatClient::normalize_base_url(
                 "http://localhost:1234/v1/v1v1/text/completions"
-            ),
-            ""
+            )
+            .is_err()
         );
         // Test strings completely lacking a valid protocol scheme format
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("completely-broken-input-string"),
-            ""
-        );
+        assert!(OpenAiCompatClient::normalize_base_url("completely-broken-input-string").is_err());
     }
 }

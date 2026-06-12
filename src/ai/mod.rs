@@ -431,14 +431,16 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
                 .and_then(|c| c.max_tokens)
                 .unwrap_or(4096);
 
-            Ok(Arc::new(openai::OpenAiCompatClient::new(
+            let provider = openai::OpenAiCompatClient::new(
                 base_url,
                 provider_type,
                 settings.ai.model.clone(),
                 context_window,
                 max_tokens,
                 settings.ai.api_timeout_secs,
-            )))
+            )?;
+
+            Ok(Arc::new(provider))
         }
         "claude-cli" => {
             let cfg = settings.ai.claude_cli.as_ref();
