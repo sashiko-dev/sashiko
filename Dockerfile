@@ -17,8 +17,17 @@ COPY . .
 ## This makes the image large but ensures fast startup in Cloud Run
 #RUN wget -c https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/clone.bundle -O /usr/src/sashiko/linux-kernel.bundle
 
-# Build for release
-RUN cargo build --release
+# Build for release with persistent cache
+# Note: some Docker versions could run into bugs when a later stage accesses a
+# cached directory from previous stages, so copy the binaries into a separate
+# directory first.
+RUN --mount=type=cache,target=/usr/src/sashiko/target/ \
+    --mount=type=cache,target=/usr/local/cargo/git/db/ \
+    --mount=type=cache,target=/usr/local/cargo/registry/ \
+    cargo build --release && \
+    mkdir -p /app && \
+    cd /usr/src/sashiko/target/release/ && \
+    cp -a sashiko review sashiko-cli /app
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -36,9 +45,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy binaries from builder
-COPY --from=builder /usr/src/sashiko/target/release/sashiko /usr/local/bin/sashiko
-COPY --from=builder /usr/src/sashiko/target/release/review /usr/local/bin/review
-COPY --from=builder /usr/src/sashiko/target/release/sashiko-cli /usr/local/bin/sashiko-cli
+COPY --from=builder /app /usr/local/bin
 
 ## Copy the pre-downloaded kernel bundle
 #COPY --from=builder /usr/src/sashiko/linux-kernel.bundle /opt/linux-kernel.bundle
