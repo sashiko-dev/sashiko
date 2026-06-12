@@ -206,6 +206,7 @@ impl OpenAiCompatClient {
         let path = match path.as_str() {
             "" => "/chat/completions",
             "/v1" | "/v1/chat/completions" => "/v1/chat/completions",
+            "/api/v1" | "/api/v1/chat/completions" => "/api/v1/chat/completions",
             _ => return Err(anyhow::anyhow!("Invalid OpenAI url {}", url)),
         };
 
@@ -1226,6 +1227,20 @@ mod tests {
         assert_eq!(
             OpenAiCompatClient::normalize_base_url("https://openai.com").unwrap(),
             "https://openai.com/chat/completions"
+        );
+        // OpenRouter /api/v1 style paths
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("https://openrouter.ai/api/v1").unwrap(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("https://openrouter.ai/api/v1/").unwrap(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("https://openrouter.ai/api/v1/chat/completions")
+                .unwrap(),
+            "https://openrouter.ai/api/v1/chat/completions"
         );
         // Test arbitrary deep nested paths that shouldn't be accepted
         assert!(
