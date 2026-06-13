@@ -1,6 +1,9 @@
 # Stage 1: Build
 FROM rust:1.90-bookworm AS builder
 
+# Install clippy and rustfmt first to allow the persistent cache to cover them
+RUN rustup component add clippy rustfmt
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     clang \
