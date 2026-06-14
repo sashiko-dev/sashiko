@@ -146,6 +146,11 @@ pub struct AiResponse {
     /// Whether the response was truncated by the provider (e.g., hit max tokens).
     #[serde(default)]
     pub truncated: bool,
+    /// Cache key identifying this response in the local response cache.
+    /// Set by `CachingAiProvider`; not serialized to the cache DB.
+    #[serde(skip)]
+    #[serde(default)]
+    pub cache_key: Option<String>,
 }
 
 /// Classifies a remote AI error using the typed stdio protocol payload.
@@ -319,6 +324,11 @@ pub trait AiProvider: Send + Sync {
 
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
+
+    /// Removes a cached response by its cache key.  Called by the worker
+    /// when a cached response fails downstream validation, so the next
+    /// attempt gets a fresh AI response instead of replaying the bad one.
+    async fn invalidate_cache_entry(&self, _key: &str) {}
 
     /// Returns cache statistics, if the provider supports local response caching.
     fn cache_stats(&self) -> Option<CacheStats> {
