@@ -1611,7 +1611,7 @@ async fn run_review_tool(
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::Instant as TokioInstant;
-    use tokio::time::timeout_at;
+    use tokio::time::{timeout, timeout_at};
 
     // Perform interaction with timeout
     let deadline = Arc::new(std::sync::Mutex::new(
@@ -1991,7 +1991,23 @@ async fn run_review_tool(
     }
     drop(stdin_writer);
 
-    let _ = child.wait().await; // Reap zombie
+    let timed_out = match &interaction_result {
+        Err(e) => e
+            .to_string()
+            .contains("Review tool timed out (active time exceeded)"),
+        Ok(_) => false,
+    };
+
+    if timed_out {
+        error!(
+            "Review tool timed out after {} active seconds. Killing process.",
+            settings.review.timeout_seconds
+        );
+        let _ = child.start_kill();
+        let _ = timeout(Duration::from_secs(5), child.wait()).await;
+    } else {
+        let _ = child.wait().await; // Reap zombie
+    }
 
     match interaction_result {
         Ok(json) => {
@@ -2040,19 +2056,7 @@ async fn run_review_tool(
             }
             Ok(json)
         }
-        Err(e) => {
-            // Check if it's the specific active time exceeded error we throw in the loop
-            if e.to_string()
-                .contains("Review tool timed out (active time exceeded)")
-            {
-                error!(
-                    "Review tool timed out after {} active seconds. Killing process.",
-                    settings.review.timeout_seconds
-                );
-                let _ = child.kill().await;
-            }
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 impl Reviewer {
@@ -2705,6 +2709,83 @@ fi
         let result = run_single_ai_request_mock(mock_script, Arc::new(FailingProvider)).await?;
 
         assert_eq!(result["patches"][0]["status"], "typed_fatal");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_review_tool_timeout_reaps_stuck_child() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
+        let mock_script = r#"#!/bin/bash
+read -r input
+sleep 30
+"#;
+
+        std::fs::write(&bin_path, mock_script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.review_tool_override = Some(bin_path);
+        settings.review.timeout_seconds = 1;
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let quota_manager = Arc::new(QuotaManager::new());
+        let provider = Arc::new(MockProvider);
+
+        let thread_id = db.create_thread("msg_id", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg_id", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await?
+            .expect("Failed to create patchset");
+        let p_id = db
+            .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/a b/a\n")
+            .await?;
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await?;
+
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_review_tool(
+                ps_id,
+                &json!({}),
+                &settings,
+                db,
+                "HEAD",
+                Some(1),
+                None,
+                quota_manager,
+                review_id,
+                None,
+                provider,
+                Arc::new(Semaphore::new(56)),
+            ),
+        )
+        .await;
+
+        assert!(
+            completed.is_ok(),
+            "run_review_tool should kill/reap a timed-out child promptly"
+        );
         Ok(())
     }
 
