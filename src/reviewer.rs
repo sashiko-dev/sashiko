@@ -2098,12 +2098,20 @@ impl Reviewer {
         let findings_count = findings.map(|f| f.len()).unwrap_or(0);
 
         let msg_id = patch_message_id;
+        let msg_id_clean = msg_id.trim_matches(|c| c == '<' || c == '>');
         let patchset_msg_id = patchset_message_id;
         let patchset_msg_id_clean = patchset_msg_id.trim_matches(|c| c == '<' || c == '>');
 
         let msg_details = match ctx.db.get_message_details_by_msgid(msg_id).await? {
             Some(d) => d,
             None => return Ok(()),
+        };
+
+        let references_hdr = match &msg_details.references_hdr {
+            Some(refs) if !refs.trim().is_empty() => {
+                format!("{} {}", refs.trim(), msg_id_clean)
+            }
+            _ => msg_id_clean.to_string(),
         };
 
         let policy = EmailPolicyConfig::load(&ctx.settings.review.email_policy_path)
@@ -2254,8 +2262,8 @@ impl Reviewer {
                             &to_json,
                             &cc_json,
                             &final_subject,
-                            msg_id.trim_matches(|c| c == '<' || c == '>'),
-                            msg_id.trim_matches(|c| c == '<' || c == '>'),
+                            msg_id_clean,
+                            &references_hdr,
                             &final_body,
                         )
                         .await?;
@@ -2272,8 +2280,8 @@ impl Reviewer {
                         "[]",
                         "[]",
                         "Skipped",
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
+                        msg_id_clean,
+                        &references_hdr,
                         "Skipped due to no findings",
                     )
                     .await?;
@@ -2291,8 +2299,8 @@ impl Reviewer {
                         "[]",
                         "[]",
                         "Muted",
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
+                        msg_id_clean,
+                        &references_hdr,
                         "Muted by policy",
                     )
                     .await?;
@@ -2404,7 +2412,7 @@ impl Reviewer {
                         &cc_json,
                         &final_subject,
                         msg_id_clean,
-                        msg_id_clean,
+                        &references_hdr,
                         &final_body,
                     )
                     .await?;
@@ -3324,6 +3332,148 @@ Pre-existing issues:
 
 inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=3";
         assert_eq!(body, expected_preexisting_only_body);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_notifications_email_references() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let policy_path = temp_dir.path().join("email_policy.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            mute_all = false
+            reply_all = true
+            "#,
+        )?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "localhost".to_string(),
+            port: 25,
+            username: None,
+            password: None,
+            sender_address: "bot@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+
+        // 1. Scenario A: Parent has no references (NULL in DB)
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Subject 1",
+            1000,
+            "Body 1",
+            "to@example.com",
+            "cc@example.com",
+            None,
+            None,
+        )
+        .await?;
+
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .unwrap();
+
+        let p_id_1 = db.create_patch(ps_id, "msg_id_p1", 1, "diff").await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(56)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(
+                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+            ),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+
+        Reviewer::queue_notifications(
+            &ctx,
+            p_id_1,
+            "msg_id_p1",
+            "msg_id_1",
+            1,
+            "inline review content 1",
+            None,
+            "summary 1",
+        )
+        .await?;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT in_reply_to, references_hdr FROM email_outbox WHERE patch_id = ?",
+                libsql::params![p_id_1],
+            )
+            .await?;
+        let row = rows.next().await?.expect("Expected email in outbox");
+        let in_reply_to: String = row.get(0)?;
+        let references_hdr: String = row.get(1)?;
+        assert_eq!(in_reply_to, "msg_id_p1");
+        assert_eq!(references_hdr, "msg_id_p1");
+
+        // 2. Scenario B: Parent has existing references (standard references chain)
+        db.create_message_with_references(
+            "msg_id_p2",
+            thread_id,
+            Some("msg_id_1"),
+            "Author <author@example.com>",
+            "Subject 2",
+            1001,
+            "Body 2",
+            "to@example.com",
+            "cc@example.com",
+            None,
+            None,
+            Some("msg_id_1"),
+        )
+        .await?;
+
+        let p_id_2 = db.create_patch(ps_id, "msg_id_p2", 2, "diff").await?;
+
+        Reviewer::queue_notifications(
+            &ctx,
+            p_id_2,
+            "msg_id_p2",
+            "msg_id_1",
+            2,
+            "inline review content 2",
+            None,
+            "summary 2",
+        )
+        .await?;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT in_reply_to, references_hdr FROM email_outbox WHERE patch_id = ?",
+                libsql::params![p_id_2],
+            )
+            .await?;
+        let row = rows.next().await?.expect("Expected email in outbox");
+        let in_reply_to: String = row.get(0)?;
+        let references_hdr: String = row.get(1)?;
+        assert_eq!(in_reply_to, "msg_id_p2");
+        assert_eq!(references_hdr, "msg_id_1 msg_id_p2");
 
         Ok(())
     }

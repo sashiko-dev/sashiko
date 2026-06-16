@@ -86,6 +86,7 @@ pub struct MessageRow {
     pub git_blob_hash: Option<String>,
     pub mailing_list: Option<String>,
     pub diff: Option<String>,
+    pub references_hdr: Option<String>,
 }
 
 pub struct AiInteractionParams<'a> {
@@ -175,7 +176,7 @@ impl Database {
 
     pub async fn get_message_details(&self, id: i64) -> Result<Option<MessageRow>> {
         let mut rows = self.conn.query(
-            "SELECT m.id, m.message_id, m.thread_id, m.in_reply_to, m.author, m.subject, m.date, m.body, m.to_recipients, m.cc_recipients, m.git_blob_hash, m.mailing_list, p.diff 
+            "SELECT m.id, m.message_id, m.thread_id, m.in_reply_to, m.author, m.subject, m.date, m.body, m.to_recipients, m.cc_recipients, m.git_blob_hash, m.mailing_list, p.diff, m.references_hdr 
              FROM messages m 
              LEFT JOIN patches p ON m.message_id = p.message_id
              WHERE m.id = ?",
@@ -197,6 +198,7 @@ impl Database {
                 row.get::<Option<String>>(10).ok().flatten(),
                 row.get::<Option<String>>(11).ok().flatten(),
                 row.get::<Option<String>>(12).ok().flatten(),
+                row.get::<Option<String>>(13).ok().flatten(),
             ))
         } else {
             None
@@ -216,6 +218,7 @@ impl Database {
             git_blob_hash,
             mailing_list,
             raw_diff,
+            references_hdr,
         )) = row_data
         {
             // Fetch thread messages
@@ -260,6 +263,7 @@ impl Database {
                 git_blob_hash,
                 mailing_list,
                 diff,
+                references_hdr,
                 thread: Some(messages),
             }))
         } else {
@@ -427,6 +431,9 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("messages", "mailing_list", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("messages", "references_hdr", "TEXT")
             .await;
         let _ = self
             .try_create_index(
@@ -1572,6 +1579,39 @@ impl Database {
         git_blob_hash: Option<&str>,
         mailing_list: Option<&str>,
     ) -> Result<()> {
+        self.create_message_with_references(
+            message_id,
+            thread_id,
+            in_reply_to,
+            author,
+            subject,
+            date,
+            body,
+            to,
+            cc,
+            git_blob_hash,
+            mailing_list,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_message_with_references(
+        &self,
+        message_id: &str,
+        thread_id: i64,
+        in_reply_to: Option<&str>,
+        author: &str,
+        subject: &str,
+        date: i64,
+        body: &str,
+        to: &str,
+        cc: &str,
+        git_blob_hash: Option<&str>,
+        mailing_list: Option<&str>,
+        references_hdr: Option<&str>,
+    ) -> Result<()> {
         // Check for thread merge (Thread split resolution)
         if let Ok(Some(old_thread_id)) = self.get_thread_id_for_message(message_id).await
             && old_thread_id != thread_id
@@ -1629,8 +1669,8 @@ impl Database {
         // But main.rs logic should ensure consistency.
         // Use INSERT OR REPLACE.
         self.conn.execute(
-            "INSERT INTO messages (message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO messages (message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id) DO UPDATE SET
                 thread_id=excluded.thread_id,
                 in_reply_to=excluded.in_reply_to,
@@ -1641,8 +1681,9 @@ impl Database {
                 to_recipients=excluded.to_recipients,
                 cc_recipients=excluded.cc_recipients,
                 git_blob_hash=excluded.git_blob_hash,
-                mailing_list=excluded.mailing_list",
-            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, body, to, cc, git_blob_hash, mailing_list],
+                mailing_list=excluded.mailing_list,
+                references_hdr=excluded.references_hdr",
+            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, body, to, cc, git_blob_hash, mailing_list, references_hdr],
         ).await?;
         Ok(())
     }
@@ -2484,7 +2525,7 @@ impl Database {
     ) -> Result<Vec<MessageRow>> {
         let (where_clause, params) = self.build_search(query, mailing_list, "message");
         let sql = format!(
-            "SELECT id, message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list FROM messages {} ORDER BY date DESC LIMIT ? OFFSET ?",
+            "SELECT id, message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr FROM messages {} ORDER BY date DESC LIMIT ? OFFSET ?",
             where_clause
         );
 
@@ -2512,6 +2553,7 @@ impl Database {
                 git_blob_hash: row.get(10).ok(),
                 mailing_list: row.get(11).ok(),
                 diff: None,
+                references_hdr: row.get(12).ok(),
                 thread: None,
             });
         }
@@ -5913,5 +5955,86 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let length: i64 = row.get(0).unwrap();
         assert_eq!(length, 456);
+    }
+
+    #[tokio::test]
+    async fn test_message_references_header_storage() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root", "References Thread", 1000)
+            .await
+            .unwrap();
+
+        db.create_message_with_references(
+            "msg1",
+            thread_id,
+            None,
+            "Author",
+            "Subject 1",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.create_message_with_references(
+            "msg2",
+            thread_id,
+            Some("msg1"),
+            "Author",
+            "Subject 2",
+            1001,
+            "",
+            "",
+            "",
+            None,
+            None,
+            Some("msg1"),
+        )
+        .await
+        .unwrap();
+
+        db.create_message_with_references(
+            "msg3",
+            thread_id,
+            Some("msg2"),
+            "Author",
+            "Subject 3",
+            1002,
+            "",
+            "",
+            "",
+            None,
+            None,
+            Some("msg1 msg2"),
+        )
+        .await
+        .unwrap();
+
+        let msg3 = db
+            .get_message_details_by_msgid("msg3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg3.references_hdr.as_deref(), Some("msg1 msg2"));
+
+        let msg2 = db
+            .get_message_details_by_msgid("msg2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg2.references_hdr.as_deref(), Some("msg1"));
+
+        let msg1 = db
+            .get_message_details_by_msgid("msg1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(msg1.references_hdr.is_none());
     }
 }

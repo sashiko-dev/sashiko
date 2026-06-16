@@ -105,10 +105,12 @@ impl EmailWorker {
         }
 
         if !email_row.references_hdr.is_empty() {
-            builder = builder.header(lettre::message::header::References::from(format!(
-                "<{}>",
-                email_row.references_hdr
-            )));
+            let refs: Vec<String> = email_row
+                .references_hdr
+                .split_whitespace()
+                .map(|part| format!("<{}>", part))
+                .collect();
+            builder = builder.references(refs.join(" "));
         }
 
         let msg = builder

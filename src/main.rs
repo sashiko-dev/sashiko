@@ -743,9 +743,20 @@ async fn process_parsed_article(
         (metadata.body.as_str(), None)
     };
 
+    let refs_hdr = if metadata.references.is_empty() {
+        None
+    } else {
+        let cleaned_refs: Vec<String> = metadata
+            .references
+            .iter()
+            .map(|r| r.trim_matches(|c| c == '<' || c == '>').to_string())
+            .collect();
+        Some(cleaned_refs.join(" "))
+    };
+
     // 2. Create Message
     if let Err(e) = worker_db
-        .create_message(
+        .create_message_with_references(
             &metadata.message_id,
             thread_id,
             metadata.in_reply_to.as_deref(),
@@ -757,6 +768,7 @@ async fn process_parsed_article(
             &metadata.cc,
             git_hash_opt,
             Some(&group),
+            refs_hdr.as_deref(),
         )
         .await
     {
