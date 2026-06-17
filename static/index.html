@@ -1561,6 +1561,10 @@
                 .replace(/'/g, "&#039;");
 
             // Convert **bold** to <strong>
+            // SAFETY: This runs AFTER HTML escaping above, so content between
+            // ** markers is already entity-escaped. Do not reorder with the
+            // escaping step — the escape-first-then-transform order is the XSS
+            // safety invariant for this function.
             formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 
             // Convert bullet points to list items
@@ -2523,7 +2527,7 @@
                     ${threadHtml}
                 </div>` : ''}
 
-                 ${baselineLogsHtml}
+                ${baselineLogsHtml}
 
                 ${data.summary ? `
                 <div class="section" style="border-left: 3px solid var(--link); padding-left: 16px;">
@@ -2533,7 +2537,8 @@
                 </div>
                 ` : ''}
 
-                 <div class="section">                    <h2 id="ai-reviews">AI Reviews</h2>
+                <div class="section">
+                    <h2 id="ai-reviews">AI Reviews</h2>
                     ${summaryHtml}
                     ${reviewsHtml}
                     ${paginationHtml}

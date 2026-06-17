@@ -337,31 +337,11 @@ impl Reviewer {
             }
         };
 
-        // patches_json for input payload (contains all patches)
-        let patches_json: Vec<_> = diffs
-            .iter()
-            .map(|(_id, idx, diff, subj, auth, date, msg_id)| {
-                let is_sha = msg_id.len() == 40 && msg_id.chars().all(|c| c.is_ascii_hexdigit());
-                json!({
-                    "index": idx,
-                    "diff": diff,
-                    "subject": subj,
-                    "author": auth,
-                    "date": date,
-                    "message_id": msg_id,
-                    "commit_id": if is_sha { Some(msg_id) } else { None }
-                })
-            })
-            .collect();
-
         // Determine Baseline Candidates and check patchset size limits
         let mut all_files = Vec::new();
 
-        for p in patches_json.iter() {
-            if let Some(diff_str) = p["diff"].as_str() {
-                let files = extract_files_from_diff(diff_str);
-                all_files.extend(files);
-            }
+        for (_, _, diff, _, _, _, _) in &diffs {
+            all_files.extend(extract_files_from_diff(diff));
         }
 
         all_files.sort();
@@ -370,7 +350,7 @@ impl Reviewer {
         let body = if let Some(mid) = &patchset.message_id {
             ctx.db.get_message_body(mid).await.unwrap_or(None)
         } else if let Some(first_patch_msg_id) =
-            patches_json.first().and_then(|p| p["message_id"].as_str())
+            diffs.first().map(|(_, _, _, _, _, _, msg_id)| msg_id.as_str())
         {
             ctx.db
                 .get_message_body(first_patch_msg_id)
@@ -462,13 +442,37 @@ impl Reviewer {
                 .iter()
                 .map(|(_, _, diff, _, _, _, _)| diff.as_str())
                 .collect();
-            let series_map = crate::summarizer::generate_series_map(
-                ctx.provider.as_ref(),
-                body.as_deref(),
-                &diffs_str,
-            )
-            .await
-            .ok();
+
+            // Skip SeriesMap for single-patch series — no cross-patch
+            // dependencies to track, so the AI call adds latency for no value.
+            let series_map = if diffs_str.len() <= 1 {
+                None
+            } else {
+                match crate::summarizer::generate_series_map(
+                    ctx.provider.as_ref(),
+                    body.as_deref(),
+                    &diffs_str,
+                )
+                .await
+                {
+                    Ok(map) => {
+                        info!(
+                            "Generated SeriesMap for patchset {} with {} symbols, {} cross-patch fixes",
+                            patchset_id,
+                            map.introduced_symbols.len(),
+                            map.cross_patch_fixes.len()
+                        );
+                        Some(map)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "SeriesMap generation failed for patchset {}: {}",
+                            patchset_id, e
+                        );
+                        None
+                    }
+                }
+            };
 
             if let Err(e) = crate::summarizer::generate_patchset_summary(
                 &ctx.db,

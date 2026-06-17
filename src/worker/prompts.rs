@@ -88,8 +88,18 @@ pub struct SymbolReference {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CrossPatchFix {
+    pub introduced_in_patch_index: i64,
+    pub fixed_in_patch_index: i64,
+    pub description: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct SeriesMap {
+    #[serde(default)]
     pub introduced_symbols: Vec<SymbolReference>,
+    #[serde(default)]
+    pub cross_patch_fixes: Vec<CrossPatchFix>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -671,22 +681,12 @@ impl Worker {
         // Prefetch AST context based on the diff
         let worktree_path = self.tools.get_worktree_path();
 
-        if let Some(series_map) = patchset.get("series_map").and_then(|v| v.as_object()) {
-            let map_json = serde_json::to_string_pretty(series_map).unwrap_or_default();
-            let map_context = format!(
-                "\n\n<series_map>\n\
-                You are reviewing Patch {p_id}. You have access to the following Series Map which maps symbols introduced across the entire patchset.\n\
-                If you detect an incomplete interface, missing method, or unused struct, consult this map.\n\
-                If the map indicates the symbol is completed or used in Patch M (where M > {p_id}), DO NOT flag it as a concern.\n\
-                {}\n\
-                </series_map>\n",
-                map_json
-            );
-            dynamic_context.push_str(&map_context);
-            clean_dynamic_context.push_str(&map_context);
-
-            dynamic_context_no_log.push_str(&map_context);
-            clean_dynamic_context_no_log.push_str(&map_context);
+        let series_ctx = build_series_context(&patchset, &p_id);
+        if !series_ctx.is_empty() {
+            dynamic_context.push_str(&series_ctx);
+            clean_dynamic_context.push_str(&series_ctx);
+            dynamic_context_no_log.push_str(&series_ctx);
+            clean_dynamic_context_no_log.push_str(&series_ctx);
         }
 
         if let Ok(prefetched) =
@@ -1678,6 +1678,79 @@ struct StageExecutionResult {
     tokens_out: u32,
     tokens_cached: u32,
     history: Vec<AiMessage>,
+}
+
+/// Build combined series context from the SeriesMap and/or all_patches
+/// subject list. Returns an empty string if no series context is available.
+fn build_series_context(patchset: &Value, patch_id: &str) -> String {
+    let mut ctx = String::new();
+
+    if let Some(series_map) = patchset.get("series_map").and_then(|v| v.as_object()) {
+        let map_json = match serde_json::to_string_pretty(series_map) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("Failed to serialize SeriesMap for prompt: {}", e);
+                String::new()
+            }
+        };
+        if !map_json.is_empty() {
+            ctx.push_str(&format!(
+            "\n\n<series_map>\n\
+            You are reviewing Patch {patch_id}. You have access to the following Series Map \
+            which maps dependencies across the entire patchset.\n\
+            SUPPRESSION RULES — consult this map before flagging any concern:\n\
+            1. INCOMPLETE SYMBOLS: If you detect an incomplete interface, missing method, or \
+            unused struct, check \"introduced_symbols\". \
+            If the map indicates the symbol is completed or used in Patch M \
+            (where M > {patch_id}), DO NOT flag it.\n\
+            2. CROSS-PATCH FIXES: If you detect a bug, errant change, or removed code, \
+            check \"cross_patch_fixes\". \
+            If the map indicates the issue is fixed in Patch M \
+            (where M > {patch_id}), DO NOT flag it as a bug — it is an intermediate state \
+            corrected later in the series.\n\
+            3. SERIES COMPLETENESS: The series may contain fixup patches that correct \
+            intermediate issues. \
+            Do not flag the series as incomplete if the fixes are present as later patches.\n\
+            {}\n\
+            </series_map>\n",
+            map_json
+        ));
+        }
+    }
+
+    if let Some(all_patches) = patchset.get("all_patches").and_then(|v| v.as_array())
+        && all_patches.len() > 1
+    {
+        let patch_list: Vec<String> = all_patches
+            .iter()
+            .filter_map(|p| {
+                let idx = p["index"].as_i64()?;
+                let subj = p["subject"].as_str()?;
+                Some(format!("  Patch {}: {}", idx, subj))
+            })
+            .collect();
+        ctx.push_str(&format!(
+            "\n\n<series_context>\n\
+            You are reviewing Patch {patch_id} of a {}-patch series. \
+            ALL patches in this merge request:\n{}\n\
+            CRITICAL RULES:\n\
+            1. SERIES COMPLETENESS: Before flagging an upstream series as incomplete or \
+            missing patches, check this list. If the supposedly missing upstream patches \
+            correspond to other patches in this merge request (by subject or content), \
+            they are NOT missing — they will be applied as part of this series. \
+            Do NOT flag them.\n\
+            2. CROSS-PATCH FIXES: Issues introduced in this patch (bugs, errant changes, \
+            removed code) may be corrected by a subsequent patch in this series. Check the \
+            patch subjects above before flagging.\n\
+            3. INCOMPLETE IMPLEMENTATIONS: Features or interfaces introduced here may be \
+            completed by later patches.\n\
+            </series_context>\n",
+            all_patches.len(),
+            patch_list.join("\n")
+        ));
+    }
+
+    ctx
 }
 
 pub fn calculate_series_range(

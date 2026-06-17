@@ -511,7 +511,9 @@ impl Database {
                 (),
             )
             .await;
-        let _ = self.try_add_column("patchsets", "summary", "TEXT").await;
+        if let Err(e) = self.try_add_column("patchsets", "summary", "TEXT").await {
+            tracing::warn!("Failed to add summary column to patchsets: {}", e);
+        }
         let _ = self
             .try_create_index(
                 "idx_patchsets_status_embargo_until",
