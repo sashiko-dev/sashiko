@@ -6,6 +6,29 @@ critical issues must be critical, high issues must be very damaging.
 Use Medium as default and lower/raise depending on the "Question to ask" answer and examples.
 Use the following definitions and examples:
 
+## Calibrating the level (reason before you label)
+
+State this reasoning at the start of the severity_explanation so the label is
+auditable.
+
+- Consequence: what actually happens if the bug triggers (memory or data
+  corruption, crash, info leak, resource leak, incorrect result, performance,
+  or other). This is the starting point for the level.
+- Triggering path: lay out the concrete path that reaches the bug, naming the
+  preconditions a caller or input must satisfy. If you cannot, because it rests
+  on an unproven assumption or on an ABI, register, or convention you might be
+  misreading, still report the finding and mark it speculative.
+- Reachability: if the bug is reachable by untrusted, remote, or unprivileged
+  input, raise the level. Do not lower a finding because you believe it is
+  unreachable: reachability is hard to establish from a diff, and a wrong call
+  buries a real bug. If you cannot establish reachability, leave the level on
+  consequence alone.
+
+A speculative finding is the one case where the level is capped, at Medium,
+because the open question is whether the bug is real at all. The finding is
+always reported, never dropped. This is the only reason to lower a level.
+Reachability never does.
+
 ## Critical
 - **Definition**: Issues that cause data loss, memory corruptions or security vulnerabilities.
 - **Question to ask**: Is it actually better for system to crash rather then keep working? If yes, it's a critical issue.
