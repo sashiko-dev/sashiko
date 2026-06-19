@@ -2146,35 +2146,56 @@ impl Reviewer {
         let patchwork_policies =
             crate::email_router::EmailRouter::resolve_patchwork(&policy, &to_list, &cc_list);
 
-        let patchwork_status = if findings_count > 0 {
-            "warning"
-        } else {
-            "success"
-        };
-        let patchwork_desc = if findings_count > 0 {
-            format!(
-                "Sashiko AI review found {} potential issue(s)",
-                findings_count
-            )
-        } else {
-            "Sashiko AI review found no regressions".to_string()
-        };
+        let findings_slice = findings.map(|f| f.as_slice()).unwrap_or(&[]);
 
-        for pw_policy in patchwork_policies {
-            let msg_id_owned = msg_id.to_string();
-            let status_owned = patchwork_status.to_string();
-            let desc_owned = patchwork_desc.clone();
-            let url_owned = target_url.clone();
-            tokio::spawn(async move {
-                crate::patchwork::post_patchwork_check(
-                    &pw_policy,
-                    &msg_id_owned,
-                    &status_owned,
-                    &desc_owned,
-                    &url_owned,
-                )
-                .await;
-            });
+        for pw_policy in &patchwork_policies {
+            let check_result =
+                crate::patchwork::PatchworkCheckResult::from_policy(pw_policy, findings_slice);
+
+            // API mode: insert into patchwork_outbox for retry-queued delivery
+            if let Some(api_url) = &pw_policy.api_url {
+                ctx.db
+                    .insert_patchwork_outbox(
+                        msg_id,
+                        api_url,
+                        &check_result.state,
+                        &check_result.description,
+                        &target_url,
+                        "sashiko",
+                    )
+                    .await?;
+            }
+
+            // Email mode: queue structured notification via email outbox
+            if let Some(email_addr) = &pw_policy.email {
+                let (pw_subject, pw_body) = crate::patchwork::compose_patchwork_email(
+                    msg_id,
+                    &check_result.state,
+                    &check_result.description,
+                    &target_url,
+                    &patch_subject,
+                );
+                let pw_email_status = match &ctx.settings.smtp {
+                    None => "Disabled",
+                    Some(s) if s.dry_run => "Dry-Run",
+                    _ => "Pending",
+                };
+                ctx.db
+                    .insert_patchwork_notification(
+                        pw_email_status,
+                        email_addr,
+                        &pw_subject,
+                        msg_id.trim_matches(|c| c == '<' || c == '>'),
+                        msg_id.trim_matches(|c| c == '<' || c == '>'),
+                        &pw_body,
+                    )
+                    .await?;
+            }
+
+            // Neither mode configured but patchwork enabled
+            if pw_policy.api_url.is_none() && pw_policy.email.is_none() {
+                tracing::warn!("Patchwork enabled but no api_url or email provided");
+            }
         }
 
         let action = EmailRouter::resolve_recipients(

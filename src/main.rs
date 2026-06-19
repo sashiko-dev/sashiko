@@ -532,6 +532,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Start Patchwork Worker (processes API check entries when they exist)
+    {
+        let pw_policy_path = settings.review.email_policy_path.clone();
+        let pw_max_retries = settings.review.max_retries;
+        let patchwork_worker = sashiko::worker::patchwork::PatchworkWorker::new(
+            db.clone(),
+            pw_policy_path,
+            pw_max_retries,
+        );
+        tokio::spawn(async move {
+            patchwork_worker.run().await;
+        });
+    }
+
     // Initialize custom remotes
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 

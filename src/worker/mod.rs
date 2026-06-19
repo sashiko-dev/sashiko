@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod email;
+pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;
 pub mod tools;

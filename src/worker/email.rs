@@ -28,7 +28,7 @@ impl EmailWorker {
             match self.db.lock_pending_email().await {
                 Ok(Some(email)) => {
                     info!(
-                        "Locked pending email ID {} for patch {}",
+                        "Locked pending email ID {} for patch {:?}",
                         email.id, email.patch_id
                     );
                     match self.send_email(&email).await {

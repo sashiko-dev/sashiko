@@ -252,4 +252,21 @@ CREATE INDEX IF NOT EXISTS idx_reviews_patchset_status ON reviews(patchset_id, s
 CREATE INDEX IF NOT EXISTS idx_reviews_day ON reviews(strftime('%Y-%m-%d', created_at, 'unixepoch'), status);
 CREATE INDEX IF NOT EXISTS idx_email_outbox_patch_id ON email_outbox(patch_id);
 
+CREATE TABLE IF NOT EXISTS patchwork_outbox (
+    id INTEGER PRIMARY KEY,
+    patch_msg_id TEXT NOT NULL,
+    api_url TEXT NOT NULL,
+    check_state TEXT NOT NULL,
+    description TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    context TEXT NOT NULL DEFAULT 'sashiko',
+    status TEXT DEFAULT 'Pending',
+    retry_count INTEGER DEFAULT 0,
+    next_retry_at INTEGER,
+    locked_at INTEGER,
+    error_log TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(status);
+
 

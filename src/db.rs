@@ -147,7 +147,7 @@ pub struct Finding {
 
 pub struct EmailOutboxRow {
     pub id: i64,
-    pub patch_id: i64,
+    pub patch_id: Option<i64>,
     pub status: String,
     pub to_addresses: String,
     pub cc_addresses: String,
@@ -155,6 +155,22 @@ pub struct EmailOutboxRow {
     pub in_reply_to: String,
     pub references_hdr: String,
     pub body: String,
+    pub locked_at: Option<i64>,
+    pub error_log: Option<String>,
+    pub created_at: i64,
+}
+
+pub struct PatchworkOutboxRow {
+    pub id: i64,
+    pub patch_msg_id: String,
+    pub api_url: String,
+    pub check_state: String,
+    pub description: String,
+    pub target_url: String,
+    pub context: String,
+    pub status: String,
+    pub retry_count: i64,
+    pub next_retry_at: Option<i64>,
     pub locked_at: Option<i64>,
     pub error_log: Option<String>,
     pub created_at: i64,
@@ -3766,7 +3782,7 @@ impl Database {
 
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
-            let patch_id: i64 = row.get(1)?;
+            let patch_id: Option<i64> = row.get::<i64>(1).ok();
             let status: String = row.get(2)?;
             let to_addresses: String = row.get(3)?;
             let cc_addresses: String = row.get(4)?;
@@ -3819,6 +3835,168 @@ impl Database {
             libsql::params![ten_mins_ago]
         ).await?;
         Ok(count)
+    }
+
+    // -- Patchwork outbox operations --
+
+    pub async fn insert_patchwork_outbox(
+        &self,
+        patch_msg_id: &str,
+        api_url: &str,
+        check_state: &str,
+        description: &str,
+        target_url: &str,
+        context: &str,
+    ) -> Result<()> {
+        let created_at = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO patchwork_outbox (patch_msg_id, api_url, check_state, description, target_url, context, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    patch_msg_id,
+                    api_url,
+                    check_state,
+                    description,
+                    target_url,
+                    context,
+                    created_at,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lock_pending_patchwork(&self) -> Result<Option<PatchworkOutboxRow>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE patchwork_outbox
+                 SET status = 'Sending', locked_at = ?
+                 WHERE id = (
+                     SELECT id FROM patchwork_outbox
+                     WHERE status = 'Pending'
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                     LIMIT 1
+                 )
+                 RETURNING id, patch_msg_id, api_url, check_state, description, target_url, context, status, retry_count, next_retry_at, locked_at, error_log, created_at",
+                libsql::params![now, now],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let patch_msg_id: String = row.get(1)?;
+            let api_url: String = row.get(2)?;
+            let check_state: String = row.get(3)?;
+            let description: String = row.get(4)?;
+            let target_url: String = row.get(5)?;
+            let context: String = row.get(6)?;
+            let status: String = row.get(7)?;
+            let retry_count: i64 = row.get(8)?;
+            let next_retry_at: Option<i64> = row.get::<i64>(9).ok();
+            let locked_at: Option<i64> = row.get::<i64>(10).ok();
+            let error_log: Option<String> = row.get::<String>(11).ok();
+            let created_at: i64 = row.get(12)?;
+
+            Ok(Some(PatchworkOutboxRow {
+                id,
+                patch_msg_id,
+                api_url,
+                check_state,
+                description,
+                target_url,
+                context,
+                status,
+                retry_count,
+                next_retry_at,
+                locked_at,
+                error_log,
+                created_at,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn mark_patchwork_sent(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchwork_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_patchwork_failed(&self, id: i64, error_log: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchwork_outbox SET status = 'Failed', error_log = ?, locked_at = NULL WHERE id = ?",
+                libsql::params![error_log.to_string(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Mark a patchwork outbox entry for retry at a future timestamp.
+    /// Increments retry_count, sets next_retry_at, and returns to
+    /// Pending status so the worker loop continues without blocking.
+    pub async fn set_patchwork_retry_at(&self, id: i64, next_retry_at: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchwork_outbox SET status = 'Pending', retry_count = retry_count + 1, next_retry_at = ?, locked_at = NULL WHERE id = ?",
+                libsql::params![next_retry_at, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn sweep_ghost_patchwork(&self) -> Result<u64> {
+        let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
+        let count = self.conn
+            .execute(
+                "UPDATE patchwork_outbox SET status = 'Pending', locked_at = NULL WHERE status = 'Sending' AND locked_at < ?",
+                libsql::params![ten_mins_ago],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Insert a patchwork notification email into the email outbox.
+    ///
+    /// Uses patch_id = NULL to avoid colliding with the per-patch dedup
+    /// guard in insert_email_outbox(). The EmailWorker processes these
+    /// rows normally since it picks up any row with status = 'Pending'.
+    pub async fn insert_patchwork_notification(
+        &self,
+        status: &str,
+        to_address: &str,
+        subject: &str,
+        in_reply_to: &str,
+        references_hdr: &str,
+        body: &str,
+    ) -> Result<()> {
+        let created_at = chrono::Utc::now().timestamp();
+        let to_json = serde_json::to_string(&[to_address])
+            .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES (NULL, ?, ?, '[]', ?, ?, ?, ?, ?)",
+                libsql::params![
+                    status,
+                    to_json,
+                    subject,
+                    in_reply_to,
+                    references_hdr,
+                    body,
+                    created_at,
+                ],
+            )
+            .await?;
+        Ok(())
     }
 }
 
