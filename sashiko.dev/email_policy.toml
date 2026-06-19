@@ -236,3 +236,9 @@ lists = ["mfd@lists.linux.dev"]
 reply_to_author = true
 send_positive_review = true
 cc = ["mfd@lists.linux.dev", "lee@kernel.org"]
+
+[subsystems.leds]
+lists = ["linux-leds@vger.kernel.org"]
+reply_to_author = true
+send_positive_review = true
+cc = ["linux-leds@vger.kernel.org", "lee@kernel.org"]
