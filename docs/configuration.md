@@ -180,8 +180,92 @@ fields as `[defaults]`, plus:
 |-----|------|---------|-------------|
 | `lists` | list | `[]` | Mailing list addresses that map to this subsystem. |
 | `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this subsystem. |
-| `patchwork.api_url` | string | -- | Patchwork API URL. |
-| `patchwork.token` | string | -- | Patchwork API token. |
+| `patchwork.api_url` | string | -- | Patchwork REST API URL (e.g. `https://patchwork.kernel.org/api/1.3`). Trailing slashes are stripped automatically. Invalid schemes are rejected with a warning. |
+| `patchwork.token` | string | -- | Patchwork API token. Can also be set via `SASHIKO_PATCHWORK_TOKEN` env var (fills in where token is omitted in TOML). |
+| `patchwork.email` | string | -- | Email address for email-based Patchwork notifications. |
+| `patchwork.min_severity` | string | -- | Minimum finding severity to include in patchwork checks. Findings below this threshold are excluded. Accepts: `Low`, `Medium`, `High`, `Critical` (case-insensitive). Default: all findings included. |
+| `patchwork.fail_severity` | string | `High` | Minimum severity of NEW findings that triggers the `fail` check state instead of `warning`. New findings at or above this threshold produce `fail`; below it produce `warning`. Pre-existing findings never affect the check state. |
+
+### Patchwork integration
+
+Sashiko can report review results as
+[checks](https://patchwork.readthedocs.io/en/latest/usage/overview/#checks)
+on a Patchwork instance. Two delivery modes are available and can be
+enabled simultaneously for the same subsystem.
+
+**API mode** posts checks directly to the Patchwork REST API with
+retry-queuing (3 attempts, exponential backoff). Requires a maintainer
+API token. Note: Patchwork tokens grant full project-maintainer
+permissions (state changes, delegation, etc.), not just check access.
+
+```toml
+[subsystems.net.patchwork]
+enabled = true
+api_url = "https://patchwork.kernel.org/api/1.3"
+token = "your-api-token"   # or set SASHIKO_PATCHWORK_TOKEN env var
+```
+
+**Email mode** sends a structured notification email to a bot address.
+A local script (such as
+[pw_tools](https://github.com/mchehab/pw_tools)) parses the email and
+posts the check. This avoids giving Sashiko a write token.
+
+```toml
+[subsystems.linux-media.patchwork]
+enabled = true
+email = "pw-bot@lists.example.org"
+```
+
+#### Severity filtering and check state mapping
+
+By default, all findings are included in the patchwork check count.
+Set `min_severity` to exclude findings below a threshold. When all
+findings fall below the threshold, the check is posted as `success`.
+
+The check state depends only on **new** findings (not pre-existing):
+
+- `fail` -- new findings at or above `fail_severity` (default: `High`)
+- `warning` -- new findings below `fail_severity`
+- `success` -- no new findings (pre-existing findings are still
+  shown in the description but do not affect the state)
+
+The check description shows a per-severity breakdown with
+pre-existing counts in parentheses, dropping zero-count severities.
+For example: `Critical: 1 · High: 2 (1 pre-existing)`.
+
+```toml
+[subsystems.net.patchwork]
+enabled = true
+api_url = "https://patchwork.kernel.org/api/1.3"
+min_severity = "Medium"    # exclude Low findings entirely
+fail_severity = "High"     # High+ new findings = fail (default)
+```
+
+Edge case behaviors:
+
+- Missing or null `preexisting` flag on a finding is treated as new
+- When `min_severity` filters out all findings, the check is `success`
+  with "Sashiko AI review found no regressions"
+- When only pre-existing findings remain after filtering, the check
+  is `success` but the description shows the pre-existing breakdown
+
+#### Email notification format
+
+When email mode is enabled, Sashiko sends a plain-text email with:
+
+- **To**: the configured `patchwork.email` address
+- **Subject**: `[sashiko-check] {status} - {patch_subject}`
+- **Body** (one key-value pair per line):
+
+```
+msgid: <message-id>
+status: success|warning
+description: Sashiko AI review found N potential issue(s)
+target_url: https://sashiko.dev/#/patchset/...
+context: sashiko
+```
+
+Downstream tools can parse this format with simple line splitting.
 
 ## Environment variables
 
@@ -196,5 +280,6 @@ fields as `[defaults]`, plus:
 | `CLOUD_ML_REGION` | GCP region for Vertex AI provider. |
 | `SASHIKO_SERVER` | Override daemon URL for CLI commands. |
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
+| `SASHIKO_PATCHWORK_TOKEN` | Patchwork API token. Fills in `patchwork.token` for enabled subsystems that have `api_url` set but no explicit token in TOML. |
 | `NO_COLOR` | Disable ANSI color output. |
 | `SASHIKO_LOG_PLAIN` | Use plain log format (no level/target/timestamp). |
