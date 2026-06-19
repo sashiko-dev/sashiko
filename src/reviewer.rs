@@ -913,11 +913,16 @@ impl Reviewer {
                 }
 
                 if applied {
-                    if fast_path_taken {
-                        patch_commits.insert(*index, msg_id.clone());
-                    } else if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
-                        patch_commits.insert(*index, sha);
-                    }
+                    let sha = if fast_path_taken {
+                        msg_id.clone()
+                    } else {
+                        get_commit_hash(&worktree.path, "HEAD")
+                            .await
+                            .unwrap_or_else(|e| {
+                                panic!("No commit hash for HEAD in {:?}: {:?}", worktree.path, e)
+                            })
+                    };
+                    patch_commits.insert(*index, sha);
                 } else {
                     let msg = format!(
                         "Patch {}/{} (ID: {}) failed to apply.\n",
