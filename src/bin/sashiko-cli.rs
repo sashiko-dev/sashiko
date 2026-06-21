@@ -589,6 +589,16 @@ async fn handle_list(
     Ok(())
 }
 
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 fn review_has_issues(review: &Value) -> bool {
     review
         .get("inline_review")
@@ -619,14 +629,15 @@ fn find_best_review_for_patch(patch_id: i64, reviews: &[Value]) -> Option<&Value
 
 fn find_best_review_for_patch_refs<'a>(patch_id: i64, reviews: &[&'a Value]) -> Option<&'a Value> {
     let mut best: Option<&Value> = None;
+    let mut best_id: i64 = -1;
     for r in reviews {
         if r.get("patch_id").and_then(|id| id.as_i64()) != Some(patch_id) {
             continue;
         }
-        let status = r.get("status").and_then(|s| s.as_str());
-        let current_status = best.and_then(|pr| pr.get("status").and_then(|s| s.as_str()));
-        if status == Some("Reviewed") || current_status != Some("Reviewed") {
+        let rid = r.get("id").and_then(|id| id.as_i64()).unwrap_or(0);
+        if rid > best_id {
             best = Some(r);
+            best_id = rid;
         }
     }
     best
@@ -653,7 +664,7 @@ async fn fetch_patchset(client: &Client, base_url: &str, id: &str) -> Result<Val
     }
 }
 
-fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
+fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool, cache_suffix: &str) {
     let idx = patch["part_index"].as_i64().unwrap_or(0);
     let status = patch["status"].as_str().unwrap_or("");
     let apply_err = patch["apply_error"].as_str();
@@ -683,6 +694,9 @@ fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
         };
         print_colored(color, review_result_label(rev));
         print!("]");
+    }
+    if !cache_suffix.is_empty() {
+        print!(" {}", cache_suffix);
     }
     println!();
 
@@ -849,11 +863,83 @@ async fn handle_show(
                         println!("{}", reason);
                     }
 
+                    let show_cache_stats = details
+                        .get("show_cache_stats")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let mut total_cache_hits: u64 = 0;
+                    let mut total_cache_misses: u64 = 0;
+                    let mut total_cache_tokens_saved: u64 = 0;
+                    let mut total_cache_tokens_stored: u64 = 0;
+
                     println!("\nPatches ({}):", patches.len());
                     for patch in &patches {
                         let p_id = patch["id"].as_i64().unwrap_or(0);
                         let review = find_best_review_for_patch(p_id, &reviews);
-                        print_patch_line(patch, review, opts.inline);
+
+                        let cache_suffix = if show_cache_stats {
+                            if let Some(rev) = review {
+                                let hits =
+                                    rev.get("cache_hits").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let misses = rev
+                                    .get("cache_misses")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let saved = rev
+                                    .get("cache_tokens_saved")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let stored = rev
+                                    .get("cache_tokens_stored")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+
+                                total_cache_hits += hits;
+                                total_cache_misses += misses;
+                                total_cache_tokens_saved += saved;
+                                total_cache_tokens_stored += stored;
+
+                                let total_requests = hits + misses;
+                                if total_requests > 0 {
+                                    let mut s =
+                                        format!("{{cache: {}/{} hits", hits, total_requests);
+                                    if saved > 0 {
+                                        s.push_str(&format!(
+                                            ", {} tokens saved",
+                                            fmt_tokens(saved)
+                                        ));
+                                    }
+                                    s.push('}');
+                                    s
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        print_patch_line(patch, review, opts.inline, &cache_suffix);
+                    }
+
+                    if show_cache_stats {
+                        let total_requests = total_cache_hits + total_cache_misses;
+                        if total_requests > 0 {
+                            let hit_rate = total_cache_hits as f64 / total_requests as f64 * 100.0;
+                            print!(
+                                "\nCache: {}/{} hits ({:.1}%)",
+                                total_cache_hits, total_requests, hit_rate
+                            );
+                            if total_cache_tokens_saved > 0 {
+                                print!(", {} tokens saved", fmt_tokens(total_cache_tokens_saved));
+                            }
+                            if total_cache_tokens_stored > 0 {
+                                print!(", {} tokens stored", fmt_tokens(total_cache_tokens_stored));
+                            }
+                            println!();
+                        }
                     }
 
                     if let Some(review) = review_data {
@@ -1032,7 +1118,7 @@ fn show_summary(
                     if let Some(rev) = find_best_review_for_patch_refs(p_id, &all_reviews)
                         && review_has_new_issues(rev)
                     {
-                        print_patch_line(patch, Some(rev), opts.inline);
+                        print_patch_line(patch, Some(rev), opts.inline, "");
                     }
                 }
             }
@@ -1085,7 +1171,7 @@ fn show_single_patch(
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         OutputFormat::Text => {
-            print_patch_line(patch, review, show_inline);
+            print_patch_line(patch, review, show_inline, "");
 
             if let Some(rev) = review
                 && let Some(output_str) = rev.get("output").and_then(|o| o.as_str())
@@ -1146,7 +1232,7 @@ fn show_issues(
                 return Ok(());
             }
             for (patch, rev) in &issue_patches {
-                print_patch_line(patch, Some(rev), show_inline);
+                print_patch_line(patch, Some(rev), show_inline, "");
 
                 if !show_inline
                     && let Some(output_str) = rev.get("output").and_then(|o| o.as_str())
@@ -1405,6 +1491,8 @@ async fn handle_cancel(
                 }
             }
         }
+    } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!("Patchset {} not found", id));
     } else {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();

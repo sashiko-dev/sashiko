@@ -490,6 +490,132 @@
             display: block;
         }
 
+        /* Cache stats expandable rows in summary table */
+        .cache-detail-row td {
+            padding: 0;
+            border-bottom: none;
+        }
+
+        .cache-detail-row:hover {
+            background: none;
+        }
+
+        .cache-detail-row .cache-panel {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+                        opacity 0.2s ease;
+            opacity: 0;
+        }
+
+        .cache-detail-row.open .cache-panel {
+            max-height: 200px;
+            opacity: 1;
+        }
+
+        .cache-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1px;
+            background: var(--border-light);
+            margin: 4px 8px 8px;
+            border: 1px solid var(--border-light);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .cache-stat-cell {
+            background: var(--code-bg);
+            padding: 6px 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .cache-stat-label {
+            font-size: 0.75em;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .cache-stat-val {
+            font-size: 0.9em;
+            font-weight: 600;
+        }
+
+        .cache-bar-row {
+            margin: 0 8px 8px;
+        }
+
+        .cache-bar-label {
+            font-size: 0.75em;
+            color: var(--text-dim);
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 2px;
+        }
+
+        .cache-bar-track {
+            height: 3px;
+            background: var(--border-light);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .cache-bar-fill {
+            height: 100%;
+            border-radius: 2px;
+            background: var(--status-reviewed);
+            width: 0;
+            transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1) 0.1s;
+        }
+
+        .cache-detail-row.open .cache-bar-fill {
+            width: var(--pct);
+        }
+
+        /* Expandable model/cache detail in metadata section */
+        .model-expandable {
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .model-expandable .toggle-indicator {
+            font-size: 0.8em;
+            color: var(--text-dim);
+            margin-right: 4px;
+            display: inline-block;
+            transition: transform 0.2s ease;
+        }
+
+        .model-expandable.open .toggle-indicator {
+            transform: rotate(90deg);
+        }
+
+        .model-detail {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+                        opacity 0.2s ease;
+            opacity: 0;
+            margin-top: 4px;
+        }
+
+        .model-detail.open {
+            max-height: 300px;
+            opacity: 1;
+        }
+
+        .model-detail .cache-bar-fill {
+            width: 0;
+            transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1) 0.1s;
+        }
+
+        .model-detail.open .cache-bar-fill {
+            width: var(--pct);
+        }
+
         /* Code/Log blocks */
         .log-block {
             background: var(--code-bg);
@@ -1292,6 +1418,27 @@
             return full ? d.toLocaleString() : d.toISOString().split('T')[0];
         }
 
+        function fmtTokens(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+            return String(n);
+        }
+
+        function toggleCacheRow(pid, event) {
+            event.stopPropagation();
+            const row = document.getElementById('cache-' + pid);
+            if (row) row.classList.toggle('open');
+        }
+
+        function toggleModelDetail() {
+            const wrapper = document.getElementById('model-wrapper');
+            const detail = document.getElementById('model-detail');
+            if (wrapper && detail) {
+                wrapper.classList.toggle('open');
+                detail.classList.toggle('open');
+            }
+        }
+
         function copyToClipboard(text) {
             navigator.clipboard.writeText(text).then(() => {
                 console.log('Copied:', text);
@@ -1724,6 +1871,8 @@
                 summaryHtml = '<table style="margin-bottom: 20px;"><thead><tr><th>Patch</th><th>Potential Regressions</th></tr></thead><tbody>';
             }
 
+            let psTotalHits = 0, psTotalMisses = 0, psTotalSaved = 0, psTotalStored = 0;
+
             sortedPatchIds.forEach((pid, index) => {
                 const patch = patchMap.get(pid);
                 const reviews = reviewsByPatch.get(pid);
@@ -1864,7 +2013,42 @@
                     }
                     const patchLabel = patch ? `Patch ${patch.part_index}` : `Patch ${pid}`;
                     const patchSubject = patch ? escapeHtml(patch.subject || '(no subject)') : '';
-                    summaryHtml += `<tr onclick="document.getElementById('patch-${pid}').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>${patchLabel}</strong>: ${patchSubject}</td><td>${summaryStatus}</td></tr>`;
+
+                    let cacheIndicator = '';
+                    let cacheDetailHtml = '';
+                    if (data.show_cache_stats && reviews && reviews.length > 0) {
+                        const latest = reviews.reduce((best, r) => (!best || (r.id || 0) > (best.id || 0)) ? r : best, null);
+                        if (latest) {
+                            const h = latest.cache_hits || 0;
+                            const m = latest.cache_misses || 0;
+                            const sv = latest.cache_tokens_saved || 0;
+                            const st = latest.cache_tokens_stored || 0;
+                            psTotalHits += h; psTotalMisses += m;
+                            psTotalSaved += sv; psTotalStored += st;
+                            const t = h + m;
+                            if (t > 0) {
+                                const rate = (h / t * 100).toFixed(1);
+                                cacheIndicator = ` <span onclick="toggleCacheRow(${pid}, event)" style="cursor:pointer;color:var(--text-dim);font-size:0.85em" title="Cache stats">▶</span>`;
+                                cacheDetailHtml = `<tr class="cache-detail-row" id="cache-${pid}"><td colspan="2"><div class="cache-panel">
+                                    <div class="cache-stats-grid">
+                                        <div class="cache-stat-cell"><span class="cache-stat-label">Hits</span><span class="cache-stat-val" style="color:var(--status-reviewed)">${h}</span></div>
+                                        <div class="cache-stat-cell"><span class="cache-stat-label">Misses</span><span class="cache-stat-val" style="color:${m > 0 ? 'var(--error-text)' : 'var(--text)'}">${m}</span></div>
+                                        <div class="cache-stat-cell"><span class="cache-stat-label">Hit Rate</span><span class="cache-stat-val">${rate}%</span></div>
+                                        <div class="cache-stat-cell"><span class="cache-stat-label">Saved</span><span class="cache-stat-val" style="color:var(--status-reviewed)">${fmtTokens(sv)}</span></div>
+                                        <div class="cache-stat-cell"><span class="cache-stat-label">Stored</span><span class="cache-stat-val">${fmtTokens(st)}</span></div>
+                                        <div class="cache-stat-cell"><span class="cache-stat-label">Calls</span><span class="cache-stat-val">${t}</span></div>
+                                    </div>
+                                    <div class="cache-bar-row">
+                                        <div class="cache-bar-label"><span>hit rate</span><span>${rate}%</span></div>
+                                        <div class="cache-bar-track"><div class="cache-bar-fill" style="--pct:${rate}%"></div></div>
+                                    </div>
+                                </div></td></tr>`;
+                            }
+                        }
+                    }
+
+                    summaryHtml += `<tr onclick="document.getElementById('patch-${pid}').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>${patchLabel}</strong>: ${patchSubject}${cacheIndicator}</td><td>${summaryStatus}</td></tr>`;
+                    summaryHtml += cacheDetailHtml;
                 }
             });
 
@@ -1996,6 +2180,30 @@
 
             let currentStatus = data.status || 'Pending';
 
+            let modelDetailHtml = '';
+            let modelClickable = false;
+            if (data.show_cache_stats) {
+                const psTotal = psTotalHits + psTotalMisses;
+                if (psTotal > 0) {
+                    modelClickable = true;
+                    const rate = (psTotalHits / psTotal * 100).toFixed(1);
+                    modelDetailHtml = `<div class="model-detail" id="model-detail">
+                        <div class="cache-stats-grid">
+                            <div class="cache-stat-cell"><span class="cache-stat-label">Hits</span><span class="cache-stat-val" style="color:var(--status-reviewed)">${psTotalHits}</span></div>
+                            <div class="cache-stat-cell"><span class="cache-stat-label">Misses</span><span class="cache-stat-val" style="color:${psTotalMisses > 0 ? 'var(--error-text)' : 'var(--text)'}">${psTotalMisses}</span></div>
+                            <div class="cache-stat-cell"><span class="cache-stat-label">Hit Rate</span><span class="cache-stat-val">${rate}%</span></div>
+                            <div class="cache-stat-cell"><span class="cache-stat-label">Saved</span><span class="cache-stat-val" style="color:var(--status-reviewed)">${fmtTokens(psTotalSaved)}</span></div>
+                            <div class="cache-stat-cell"><span class="cache-stat-label">Stored</span><span class="cache-stat-val">${fmtTokens(psTotalStored)}</span></div>
+                            <div class="cache-stat-cell"><span class="cache-stat-label">Calls</span><span class="cache-stat-val">${psTotal}</span></div>
+                        </div>
+                        <div class="cache-bar-row">
+                            <div class="cache-bar-label"><span>hit rate</span><span>${rate}%</span></div>
+                            <div class="cache-bar-track"><div class="cache-bar-fill" style="--pct:${rate}%"></div></div>
+                        </div>
+                    </div>`;
+                }
+            }
+
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
                 <h1>
@@ -2013,7 +2221,11 @@
                     <div class="kv"><div class="label">Date:</div><div>${date}</div></div>
                     <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
                     <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
-                    <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
+                    <div class="kv${modelClickable ? ' model-expandable' : ''}" id="model-wrapper" ${modelClickable ? 'onclick="toggleModelDetail()"' : ''}>
+                        <div class="label">Model:</div>
+                        <div>${modelClickable ? '<span class="toggle-indicator">▶</span>' : ''}${escapeHtml(providerModel)}</div>
+                    </div>
+                    ${modelDetailHtml}
                     <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>
                 </div>
                 

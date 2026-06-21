@@ -30,6 +30,17 @@ max_input_tokens = 900000
 max_interactions = 100
 temperature = 1.0
 
+# Response cache: stores AI responses in a local SQLite database so that
+# re-reviewing the same patchset (e.g. via `rerun`) avoids redundant API
+# calls.  Cached entries are keyed by a SHA-256 hash of the request.
+# response_cache = true
+# response_cache_ttl_days = 7  # Expire cached entries after this many days
+
+# Show per-patch and per-patchset response cache hit/miss statistics in
+# the CLI `show` output, web UI hover tooltips, and daemon log output.
+# Requires response_cache = true to produce meaningful data.
+# show_cache_stats = false
+
 # To use Claude API directly:
 # provider = "claude"
 # model = "claude-sonnet-4-6"

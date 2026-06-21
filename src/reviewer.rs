@@ -19,7 +19,9 @@ use crate::ai::{
     create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
-use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity, ToolUsage};
+use crate::db::{
+    AiInteractionParams, Database, Finding, PatchsetRow, ReviewCacheStats, Severity, ToolUsage,
+};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
@@ -587,6 +589,19 @@ impl Reviewer {
                     let handle = tokio::spawn(async move {
                         let mut failed = 0;
                         loop {
+                            if ctx_clone
+                                .db
+                                .get_patchset_status(patchset_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .as_deref()
+                                == Some(ReviewStatus::Cancelled.as_str())
+                            {
+                                info!("Patchset {} cancelled, stopping review", patchset_id);
+                                queue.lock().await.clear();
+                                break;
+                            }
                             let job = {
                                 let mut q = queue.lock().await;
                                 q.pop()
@@ -634,6 +649,19 @@ impl Reviewer {
             // Main worker loop uses the existing worktree
             let mut main_failed = 0;
             loop {
+                if ctx
+                    .db
+                    .get_patchset_status(patchset_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(ReviewStatus::Cancelled.as_str())
+                {
+                    info!("Patchset {} cancelled, stopping review", patchset_id);
+                    valid_jobs_queue.lock().await.clear();
+                    break;
+                }
                 let job = {
                     let mut q = valid_jobs_queue.lock().await;
                     q.pop()
@@ -716,7 +744,9 @@ impl Reviewer {
                 .await;
         }
 
-        if let Some(stats) = ctx.provider.cache_stats() {
+        if ctx.settings.ai.show_cache_stats
+            && let Some(stats) = ctx.provider.cache_stats()
+        {
             use crate::ai::cache::fmt_thousands;
             let total_hits = stats.hits_this_session + stats.hits_prev_session;
             let total_tokens = stats.tokens_saved_this_session + stats.tokens_saved_prev_session;
@@ -1099,6 +1129,7 @@ impl Reviewer {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
 
@@ -1134,6 +1165,8 @@ impl Reviewer {
                 .update_review_status(review_id, ReviewStatus::InReview.as_str(), None)
                 .await;
 
+            let cache_before = ctx.provider.cache_stats();
+
             let result = run_review_tool(
                 patchset_id,
                 input_payload,
@@ -1149,6 +1182,32 @@ impl Reviewer {
                 ctx.llm_semaphore.clone(),
             )
             .await;
+
+            let patch_cache_stats = cache_before.and_then(|before| {
+                ctx.provider.cache_stats().map(|after| ReviewCacheStats {
+                    hits: (after.hits_this_session + after.hits_prev_session)
+                        - (before.hits_this_session + before.hits_prev_session),
+                    misses: after.misses - before.misses,
+                    tokens_saved: (after.tokens_saved_this_session
+                        + after.tokens_saved_prev_session)
+                        - (before.tokens_saved_this_session + before.tokens_saved_prev_session),
+                    tokens_stored: after.tokens_stored - before.tokens_stored,
+                })
+            });
+
+            if ctx.settings.ai.show_cache_stats
+                && let Some(ref cs) = patch_cache_stats
+            {
+                use crate::ai::cache::fmt_tokens;
+                info!(
+                    "Patch {}/{} cache: {} hits, {} misses, {} tokens saved",
+                    patchset_id,
+                    index,
+                    cs.hits,
+                    cs.misses,
+                    fmt_tokens(cs.tokens_saved)
+                );
+            }
 
             match result {
                 Ok(json_output) => {
@@ -1243,6 +1302,7 @@ impl Reviewer {
                                     interaction_id.as_deref(),
                                     None,
                                     logs_str.as_deref(),
+                                    patch_cache_stats.as_ref(),
                                 )
                                 .await;
 
@@ -1302,6 +1362,7 @@ impl Reviewer {
                                         interaction_id.as_deref(),
                                         inline_review,
                                         logs_str.as_deref(),
+                                        patch_cache_stats.as_ref(),
                                     )
                                     .await
                                 {
@@ -1379,6 +1440,7 @@ impl Reviewer {
                                         interaction_id.as_deref(),
                                         None,
                                         logs_str.as_deref(),
+                                        patch_cache_stats.as_ref(),
                                     )
                                     .await;
                                 let _ = ctx.db.update_patch_status(patch_id, "Skipped").await;
@@ -1394,6 +1456,7 @@ impl Reviewer {
                                         interaction_id.as_deref(),
                                         None,
                                         logs_str.as_deref(),
+                                        patch_cache_stats.as_ref(),
                                     )
                                     .await;
                                 if retries < max_retries {
@@ -1418,6 +1481,7 @@ impl Reviewer {
                                     interaction_id.as_deref(),
                                     None,
                                     logs_str.as_deref(),
+                                    patch_cache_stats.as_ref(),
                                 )
                                 .await;
                             let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
@@ -1438,6 +1502,7 @@ impl Reviewer {
                                 interaction_id.as_deref(),
                                 None,
                                 logs_str.as_deref(),
+                                patch_cache_stats.as_ref(),
                             )
                             .await;
                         if retries < max_retries {
@@ -1460,6 +1525,7 @@ impl Reviewer {
                             None,
                             None,
                             None,
+                            patch_cache_stats.as_ref(),
                         )
                         .await;
                     if retries < max_retries {
@@ -2452,6 +2518,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                cache_key: None,
             })
         }
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
@@ -2506,6 +2573,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                cache_key: None,
             })
         }
 
@@ -2962,6 +3030,7 @@ fi
                     cached_tokens: Some(self.cached_tokens),
                 }),
                 truncated: false,
+                cache_key: None,
             })
         }
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {

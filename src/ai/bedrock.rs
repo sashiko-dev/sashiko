@@ -397,6 +397,7 @@ fn translate_response(
         },
         usage,
         truncated: false,
+        cache_key: None,
     })
 }
 

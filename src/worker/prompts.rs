@@ -1000,7 +1000,7 @@ Example Output:
                 )
                 .await
             {
-                Ok((result_json, t_in, t_out, t_cached, stage_history)) => {
+                Ok((result_json, t_in, t_out, t_cached, stage_history, cache_key)) => {
                     total_tokens_in += t_in;
                     total_tokens_out += t_out;
                     total_tokens_cached += t_cached;
@@ -1010,11 +1010,17 @@ Example Output:
                         if c.is_array() {
                             deduplicated_concerns = c.clone();
                         } else {
+                            if let Some(ref key) = cache_key {
+                                self.provider.invalidate_cache_entry(key).await;
+                            }
                             return Err(anyhow::anyhow!(
                                 "Stage 8 output 'concerns' is not an array"
                             ));
                         }
                     } else {
+                        if let Some(ref key) = cache_key {
+                            self.provider.invalidate_cache_entry(key).await;
+                        }
                         return Err(anyhow::anyhow!(
                             "Stage 8 failed to produce a valid 'concerns' array in output."
                         ));
@@ -1024,11 +1030,17 @@ Example Output:
                         if c.is_array() {
                             deduplicated_dismissed_concerns = c.clone();
                         } else {
+                            if let Some(ref key) = cache_key {
+                                self.provider.invalidate_cache_entry(key).await;
+                            }
                             return Err(anyhow::anyhow!(
                                 "Stage 8 output 'dismissed_concerns' is not an array"
                             ));
                         }
                     } else {
+                        if let Some(ref key) = cache_key {
+                            self.provider.invalidate_cache_entry(key).await;
+                        }
                         return Err(anyhow::anyhow!(
                             "Stage 8 failed to produce a valid 'dismissed_concerns' array in output."
                         ));
@@ -1168,7 +1180,7 @@ Example Output:
                 )
                 .await
             {
-                Ok((result_json, t_in, t_out, t_cached, stage_history)) => {
+                Ok((result_json, t_in, t_out, t_cached, stage_history, cache_key)) => {
                     total_tokens_in += t_in;
                     total_tokens_out += t_out;
                     total_tokens_cached += t_cached;
@@ -1178,11 +1190,17 @@ Example Output:
                         if c.is_array() {
                             conflict_resolved_concerns = c.clone();
                         } else {
+                            if let Some(ref key) = cache_key {
+                                self.provider.invalidate_cache_entry(key).await;
+                            }
                             return Err(anyhow::anyhow!(
                                 "Stage 9 output 'concerns' is not an array"
                             ));
                         }
                     } else {
+                        if let Some(ref key) = cache_key {
+                            self.provider.invalidate_cache_entry(key).await;
+                        }
                         return Err(anyhow::anyhow!(
                             "Stage 9 failed to produce a valid 'concerns' array in output."
                         ));
@@ -1283,7 +1301,7 @@ Example Output:
                 )
                 .await
             {
-                Ok((result_json, t_in, t_out, t_cached, stage_history)) => {
+                Ok((result_json, t_in, t_out, t_cached, stage_history, cache_key)) => {
                     total_tokens_in += t_in;
                     total_tokens_out += t_out;
                     total_tokens_cached += t_cached;
@@ -1293,11 +1311,17 @@ Example Output:
                         if f.is_array() {
                             findings_json = f.clone();
                         } else {
+                            if let Some(ref key) = cache_key {
+                                self.provider.invalidate_cache_entry(key).await;
+                            }
                             return Err(anyhow::anyhow!(
                                 "Stage 10 output 'findings' is not an array"
                             ));
                         }
                     } else {
+                        if let Some(ref key) = cache_key {
+                            self.provider.invalidate_cache_entry(key).await;
+                        }
                         return Err(anyhow::anyhow!(
                             "Stage 10 failed to produce a valid 'findings' array in output."
                         ));
@@ -1371,7 +1395,7 @@ Example Output:
                     )
                     .await
                 {
-                    Ok((result_text, t_in, t_out, t_cached, stage_history)) => {
+                    Ok((result_text, t_in, t_out, t_cached, stage_history, cache_key)) => {
                         total_tokens_in += t_in;
                         total_tokens_out += t_out;
                         total_tokens_cached += t_cached;
@@ -1386,6 +1410,9 @@ Example Output:
                                     break;
                                 }
                                 Err(violation) => {
+                                    if let Some(ref key) = cache_key {
+                                        self.provider.invalidate_cache_entry(key).await;
+                                    }
                                     tracing::warn!(
                                         "Stage 11 format validation failed (attempt {}/{}): {}. Retrying with augmented prompt.",
                                         retries + 1,
@@ -1471,8 +1498,8 @@ Example Output:
         clean_system_prompt: String,
         user_prompt: String,
         clean_user_prompt: String,
-    ) -> Result<(Value, u32, u32, u32, Vec<AiMessage>)> {
-        let (raw_text, t_in, t_out, t_cached, stage_history) = self
+    ) -> Result<(Value, u32, u32, u32, Vec<AiMessage>, Option<String>)> {
+        let (raw_text, t_in, t_out, t_cached, stage_history, cache_key) = self
             .run_ai_stage_raw(
                 stage,
                 system_prompt,
@@ -1486,7 +1513,7 @@ Example Output:
             let cands = find_json_candidates(&raw_text);
             cands.into_iter().last().unwrap_or(json!({}))
         });
-        Ok((parsed, t_in, t_out, t_cached, stage_history))
+        Ok((parsed, t_in, t_out, t_cached, stage_history, cache_key))
     }
 
     async fn run_ai_stage_raw(
@@ -1496,10 +1523,11 @@ Example Output:
         _clean_system_prompt: String,
         user_prompt: String,
         clean_user_prompt: String,
-    ) -> Result<(String, u32, u32, u32, Vec<AiMessage>)> {
+    ) -> Result<(String, u32, u32, u32, Vec<AiMessage>, Option<String>)> {
         let mut stage_action_history = Vec::new();
         let mut stage_history = Vec::new();
         let mut local_history = Vec::new();
+        let mut first_turn_cache_key: Option<String> = None;
 
         let user_msg = AiMessage {
             role: AiRole::User,
@@ -1576,6 +1604,10 @@ Example Output:
                     }
                 }
             };
+
+            if first_turn_cache_key.is_none() {
+                first_turn_cache_key = resp.cache_key.clone();
+            }
 
             if resp.truncated {
                 return Err(ReviewError::OutputTruncated.into());
@@ -1676,6 +1708,7 @@ Example Output:
                     t_out,
                     t_cached,
                     stage_history,
+                    first_turn_cache_key,
                 ));
             } else {
                 return Err(anyhow::anyhow!("No content or tool calls from AI"));
@@ -1884,7 +1917,7 @@ Example:
                     )
                     .await
                 {
-                    Ok((result_json, t_in, t_out, t_cached, stage_history)) => {
+                    Ok((result_json, t_in, t_out, t_cached, stage_history, cache_key)) => {
                         total_tokens_in += t_in;
                         total_tokens_out += t_out;
                         total_tokens_cached += t_cached;
@@ -1897,6 +1930,9 @@ Example:
                                 success = true;
                             }
                             Err(violation) => {
+                                if let Some(ref key) = cache_key {
+                                    self.provider.invalidate_cache_entry(key).await;
+                                }
                                 tracing::warn!(
                                     "Stage {} format validation failed (inner attempt {}/{}): {}. Retrying with augmented prompt.",
                                     stage,
@@ -2460,6 +2496,7 @@ mod tests {
                     }]),
                     usage: None,
                     truncated: false,
+                    cache_key: None,
                 })
             } else if turn == 1 {
                 Ok(crate::ai::AiResponse {
@@ -2474,6 +2511,7 @@ mod tests {
                     }]),
                     usage: None,
                     truncated: false,
+                    cache_key: None,
                 })
             } else {
                 Ok(crate::ai::AiResponse {
@@ -2483,6 +2521,7 @@ mod tests {
                     tool_calls: None,
                     usage: None,
                     truncated: false,
+                    cache_key: None,
                 })
             }
         }
@@ -2521,6 +2560,7 @@ mod tests {
                     }]),
                     usage: None,
                     truncated: false,
+                    cache_key: None,
                 })
             } else if turn == 1 {
                 Ok(crate::ai::AiResponse {
@@ -2535,6 +2575,7 @@ mod tests {
                     }]),
                     usage: None,
                     truncated: false,
+                    cache_key: None,
                 })
             } else if turn == 2 {
                 Ok(crate::ai::AiResponse {
@@ -2549,6 +2590,7 @@ mod tests {
                     }]),
                     usage: None,
                     truncated: false,
+                    cache_key: None,
                 })
             } else {
                 Ok(crate::ai::AiResponse {
@@ -2558,6 +2600,7 @@ mod tests {
                     tool_calls: None,
                     usage: None,
                     truncated: false,
+                    cache_key: None,
                 })
             }
         }
@@ -2601,7 +2644,7 @@ mod tests {
             .await;
 
         assert!(res.is_ok());
-        let (_, _, _, _, stage_history) = res.unwrap();
+        let (_, _, _, _, stage_history, _) = res.unwrap();
         assert_eq!(stage_history.len(), 6);
 
         let blocked_msg = &stage_history[4];
@@ -2639,7 +2682,7 @@ mod tests {
             .await;
 
         assert!(res.is_ok());
-        let (_, _, _, _, stage_history) = res.unwrap();
+        let (_, _, _, _, stage_history, _) = res.unwrap();
         assert_eq!(stage_history.len(), 8);
 
         let response_msg = &stage_history[6];
@@ -2679,6 +2722,7 @@ mod tests {
                         tool_calls: None,
                         usage: None,
                         truncated: false,
+                        cache_key: None,
                     });
                 }
                 anyhow::bail!(

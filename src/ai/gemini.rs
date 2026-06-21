@@ -771,6 +771,7 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
         },
         usage,
         truncated,
+        cache_key: None,
     })
 }
 

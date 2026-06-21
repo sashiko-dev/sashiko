@@ -587,6 +587,7 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         },
         usage: Some(usage),
         truncated,
+        cache_key: None,
     })
 }
 

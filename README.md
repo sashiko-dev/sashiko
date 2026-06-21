@@ -91,6 +91,25 @@ cd sashiko
 Copy an example config to get started. For a full reference of every
 setting, see the [Configuration Reference](docs/configuration.md).
 
+#### User-Level Configuration
+
+You can place personal overrides (credentials, paths, custom settings) in a
+separate file that is not tracked by git:
+
+```
+~/.config/sashiko/Settings.toml
+```
+
+Settings are loaded in layers — later sources override earlier ones:
+1. `./Settings.toml` — repository defaults (checked into git)
+2. `~/.config/sashiko/Settings.toml` — user overrides (optional)
+3. `SASHIKO__*` environment variables — runtime overrides
+
+This follows the XDG Base Directory Specification: if `$XDG_CONFIG_HOME` is
+set, Sashiko looks there instead of `~/.config`.  The user config file is
+entirely optional — if it doesn't exist, only the repository defaults and
+environment variables are used.
+
 #### Configuring the LLM Provider
 
 Sashiko supports multiple LLM providers. To get started with the default
@@ -156,7 +175,36 @@ updating sashiko.dev. See the
 [CLI Reference](docs/sashiko-cli.md#local) for full setup, options, and
 a comparison of all three review modes.
 
-### 4. Web Interface
+### 4. Response Cache
+
+Sashiko can cache AI responses locally so that re-reviewing the same patchset
+(e.g. via `sashiko-cli rerun`) avoids redundant API calls and costs.  Each
+request is keyed by a SHA-256 hash of its content; identical requests return
+the cached response instantly.
+
+Enable in `Settings.toml` (or your user config):
+
+```toml
+[ai]
+response_cache = true
+response_cache_ttl_days = 7   # Expire entries after 7 days (default)
+```
+
+To see how the cache is performing, enable cache statistics:
+
+```toml
+[ai]
+show_cache_stats = true
+```
+
+This adds:
+- **CLI** (`sashiko-cli show`): per-patch `{cache: 7/7 hits, 42.1k tokens saved}`
+  after each review status, plus a patchset-level summary line.
+- **Web UI**: hover over a patch row or the patchset title to see cache
+  hit/miss ratios and token savings in a tooltip.
+- **Daemon logs**: per-patch cache delta lines after each patch review completes.
+
+### 5. Web Interface
 
 Once the daemon is running, you can access the Web UI, the daemon will print the
 URL to access it from localhost.
