@@ -230,3 +230,8 @@ cc = ["linux-s390@vger.kernel.org", "Heiko Carstens <hca@linux.ibm.com>", "Vasil
 lists = ["kvmarm@lists.linux.dev"]
 reply_to_author = true
 cc = ["kvmarm@lists.linux.dev", "Oliver Upton <oupton@kernel.org>", "Marc Zyngier <maz@kernel.org>"]
+
+[subsystems.nvdimm]
+lists = ["nvdimm@lists.linux.dev"]
+reply_to_author = true
+cc = ["nvdimm@lists.linux.dev"]
