@@ -995,7 +995,7 @@ async fn cancel_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().is_loopback() {
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
         return Err(StatusCode::FORBIDDEN);
     }
 
