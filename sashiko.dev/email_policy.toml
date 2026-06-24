@@ -191,10 +191,11 @@ cc = ["ntb@lists.linux.dev"]
 
 [subsystems.selinux]
 lists = ["selinux@vger.kernel.org"]
+send_positive_review = true
 reply_all = false
 reply_to_author = false
 cc_individuals = false
-cc = ["paul@paul-moore.com"]
+cc = ["selinux@vger.kernel.org"]
 
 [subsystems.i3c]
 lists = ["linux-i3c@lists.infradead.org"]
