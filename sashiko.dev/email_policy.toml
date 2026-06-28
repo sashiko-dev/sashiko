@@ -200,7 +200,7 @@ cc = ["selinux@vger.kernel.org"]
 [subsystems.i3c]
 lists = ["linux-i3c@lists.infradead.org"]
 reply_to_author = true
-cc = ["linux-i3c@lists.infradead.org", "Frank.Li@kernel.org"]
+cc = ["linux-i3c@lists.infradead.org", "Frank.Li@kernel.org", "Alexandre Belloni <alexandre.belloni@bootlin.com>"]
 
 [subsystems.linux-raid]
 lists = ["linux-raid@vger.kernel.org"]
