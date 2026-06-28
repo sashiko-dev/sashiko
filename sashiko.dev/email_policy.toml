@@ -256,3 +256,8 @@ reply_to_author = true
 send_positive_review = true
 cc = ["linux-leds@vger.kernel.org", "lee@kernel.org"]
 
+[subsystems.rtc]
+lists = ["linux-rtc@vger.kernel.org"]
+reply_to_author = true
+send_positive_review = true
+cc = ["linux-rtc@vger.kernel.org", "Alexandre Belloni <alexandre.belloni@bootlin.com>"]
