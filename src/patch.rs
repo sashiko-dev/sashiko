@@ -131,12 +131,19 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     {
         let name = first_addr.name().unwrap_or_default().trim();
         let address = first_addr.address().unwrap_or("").trim();
+        let author_email = extract_email(&author);
         if !address.is_empty() && address.contains('@') {
-            author = if name.is_empty() || name.to_lowercase() == "unknown" {
-                address.to_string()
-            } else {
-                format!("{} <{}>", name, address)
-            };
+            if is_b4_alias(&author_email, address) {
+                author = if name.is_empty() || name.to_lowercase() == "unknown" {
+                    address.to_string()
+                } else {
+                    format!("{} <{}>", name, address)
+                };
+            } else if author_email.to_lowercase().starts_with("devnull+") {
+                tracing::warn!(
+                    "Ignoring unverified X-Original-From header due to alias mismatch with From header"
+                );
+            }
         }
     }
 
@@ -423,6 +430,25 @@ pub fn extract_email(author: &str) -> String {
     author.trim().to_string()
 }
 
+fn is_b4_alias(alias: &str, real: &str) -> bool {
+    let alias_lower = alias.to_lowercase();
+    if !alias_lower.starts_with("devnull+") {
+        return false;
+    }
+    let Some(at_idx) = alias_lower.rfind('@') else { return false; };
+    if at_idx <= 8 { return false; }
+
+    let encoded_part = &alias_lower[8..at_idx];
+    let alias_domain = &alias_lower[at_idx + 1..];
+
+    if alias_domain != "kernel.org" && alias_domain != "linux.dev" {
+        return false;
+    }
+
+    let real_lower = real.to_lowercase();
+    encoded_part == real_lower.replace('@', ".")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +550,21 @@ Body";
                     Subject: Test B4 Relay\r\n\r\nBody";
         let (meta, _) = parse_email(raw).unwrap();
         assert_eq!(meta.author, "Real Author <author@example.com>");
+    }
+
+    #[test]
+    fn test_b4_relay_mismatch_fallback() {
+        // Verification: If From is a B4 Relay alias, but X-Original-From is a completely
+        // different address, Sashiko ignores the override and falls back to the From alias.
+        let raw_mismatch = b"Message-ID: <mismatch-test-2>\r\n\
+                             From: Real Author via B4 Relay <devnull+author.example.com@kernel.org>\r\n\
+                             X-Original-From: Author Two <author2@example.com>\r\n\
+                             Subject: Normal Patch\r\n\r\nBody";
+        let (meta_mismatch, _) = parse_email(raw_mismatch).unwrap();
+        assert_eq!(
+            meta_mismatch.author,
+            "Real Author via B4 Relay <devnull+author.example.com@kernel.org>"
+        );
     }
 
     #[test]
