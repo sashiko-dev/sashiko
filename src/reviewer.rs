@@ -219,9 +219,23 @@ impl Reviewer {
 
         info!("Found {} pending patchsets for review", patchsets.len());
 
-        for patchset in patchsets {
+        for mut patchset in patchsets {
             let permit = self.semaphore.clone().acquire_owned().await?;
             let target_review_count = patchset.target_review_count.unwrap_or(1) as usize;
+
+            // Mark status as 'In Review' in the DB immediately to prevent double-fetching
+            if let Err(e) = self
+                .db
+                .update_patchset_status(patchset.id, ReviewStatus::InReview.as_str())
+                .await
+            {
+                error!(
+                    "Failed to update status to In Review for {}: {}",
+                    patchset.id, e
+                );
+                continue;
+            }
+            patchset.status = Some(ReviewStatus::InReview.as_str().to_string());
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
