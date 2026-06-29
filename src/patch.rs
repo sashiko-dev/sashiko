@@ -88,6 +88,11 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     let received_date = extract_received_date(raw_email);
 
     let message = MessageParser::default()
+        .with_address_headers()
+        .with_message_ids()
+        .header_text(mail_parser::HeaderName::Subject)
+        .header_date(mail_parser::HeaderName::Date)
+        .header_address("X-Original-From")
         .parse(raw_email)
         .ok_or_else(|| anyhow!("Failed to parse email"))?;
 
@@ -98,7 +103,7 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
 
     let subject = message.subject().unwrap_or("(no subject)").to_string();
 
-    let author = message
+    let mut author = message
         .from()
         .and_then(|addr| addr.first())
         .map(|a| {
@@ -116,6 +121,24 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
             }
         })
         .unwrap_or_else(|| "unknown@localhost".to_string());
+
+    if let Some(first_addr) = message
+        .header("X-Original-From")
+        .and_then(|h| match h {
+            mail_parser::HeaderValue::Address(x_orig_addr) => x_orig_addr.first(),
+            _ => None,
+        })
+    {
+        let name = first_addr.name().unwrap_or_default().trim();
+        let address = first_addr.address().unwrap_or("").trim();
+        if !address.is_empty() && address.contains('@') {
+            author = if name.is_empty() || name.to_lowercase() == "unknown" {
+                address.to_string()
+            } else {
+                format!("{} <{}>", name, address)
+            };
+        }
+    }
 
     let date = message.date().map(|d| d.to_timestamp()).unwrap_or(0);
 
@@ -491,6 +514,16 @@ Body";
             b"Message-ID: <789>\r\nFrom: \"fqr\" <user.email>\r\nSubject: Test\r\n\r\nBody";
         let (meta3, _) = parse_email(raw_malformed).unwrap();
         assert_eq!(meta3.author, "fqr <unknown@localhost>");
+    }
+
+    #[test]
+    fn test_b4_relay_author_parsing() {
+        let raw = b"Message-ID: <b4-relay-test>\r\n\
+                    From: Real Author via B4 Relay <devnull+author.example.com@kernel.org>\r\n\
+                    X-Original-From: Real Author <author@example.com>\r\n\
+                    Subject: Test B4 Relay\r\n\r\nBody";
+        let (meta, _) = parse_email(raw).unwrap();
+        assert_eq!(meta.author, "Real Author <author@example.com>");
     }
 
     #[test]
