@@ -122,13 +122,10 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         })
         .unwrap_or_else(|| "unknown@localhost".to_string());
 
-    if let Some(first_addr) = message
-        .header("X-Original-From")
-        .and_then(|h| match h {
-            mail_parser::HeaderValue::Address(x_orig_addr) => x_orig_addr.first(),
-            _ => None,
-        })
-    {
+    if let Some(first_addr) = message.header("X-Original-From").and_then(|h| match h {
+        mail_parser::HeaderValue::Address(x_orig_addr) => x_orig_addr.first(),
+        _ => None,
+    }) {
         let name = first_addr.name().unwrap_or_default().trim();
         let address = first_addr.address().unwrap_or("").trim();
         let author_email = extract_email(&author);
@@ -430,13 +427,28 @@ pub fn extract_email(author: &str) -> String {
     author.trim().to_string()
 }
 
+pub fn authors_match(a: &str, b: &str) -> bool {
+    let email_a = extract_email(a);
+    let email_b = extract_email(b);
+
+    if email_a == email_b {
+        return true;
+    }
+
+    is_b4_alias(&email_a, &email_b) || is_b4_alias(&email_b, &email_a)
+}
+
 fn is_b4_alias(alias: &str, real: &str) -> bool {
     let alias_lower = alias.to_lowercase();
     if !alias_lower.starts_with("devnull+") {
         return false;
     }
-    let Some(at_idx) = alias_lower.rfind('@') else { return false; };
-    if at_idx <= 8 { return false; }
+    let Some(at_idx) = alias_lower.rfind('@') else {
+        return false;
+    };
+    if at_idx <= 8 {
+        return false;
+    }
 
     let encoded_part = &alias_lower[8..at_idx];
     let alias_domain = &alias_lower[at_idx + 1..];
@@ -452,6 +464,27 @@ fn is_b4_alias(alias: &str, real: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_authors_match() {
+        assert!(authors_match(
+            "Real Author <author@example.com>",
+            "Real Author <author@example.com>"
+        ));
+        assert!(authors_match(
+            "devnull+author.example.com@kernel.org",
+            "author@example.com"
+        ));
+        assert!(authors_match(
+            "Real Author <author@example.com>",
+            "Real Author via B4 Relay <devnull+author.example.com@kernel.org>"
+        ));
+        assert!(!authors_match("other@example.com", "author@example.com"));
+        assert!(!authors_match(
+            "devnull+author.example.com@spam.org",
+            "author@example.com"
+        ));
+    }
 
     #[test]
     fn test_extract_email() {

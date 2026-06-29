@@ -2020,8 +2020,7 @@ impl Database {
             };
 
             // Relaxed author check logic
-            let author_match = crate::patch::extract_email(&existing_author)
-                == crate::patch::extract_email(author);
+            let author_match = crate::patch::authors_match(&existing_author, author);
             let series_match = (total_parts > 1 && total_parts == existing_total)
                 || existing_total == 1
                 || total_parts == 1;
@@ -6206,5 +6205,70 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(msg1.references_hdr.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_merge_b4_relay_alias_with_real_author() {
+        let db = setup_db().await;
+
+        // 1. Create Thread
+        let thread_id = db
+            .create_thread("root_b4_merge", "Subject", 1000)
+            .await
+            .unwrap();
+
+        // 2. Create Patchset Part 1 (devnull alias)
+        let ps1 = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_b4_1",
+                "[PATCH 1/2] B4 Merge Series",
+                "devnull+author.example.com@kernel.org",
+                1000,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // 3. Create Patchset Part 2 (real email address)
+        let ps2 = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_b4_2",
+                "[PATCH 2/2] B4 Merge Series",
+                "Real Author <author@example.com>",
+                1010,
+                2,
+                0,
+                "",
+                "",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // 4. Assert they merged (ps1 == ps2)
+        assert_eq!(
+            ps1, ps2,
+            "Patchset from B4 Relay devnull alias and real author email MUST merge"
+        );
     }
 }
