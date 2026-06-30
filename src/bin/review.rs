@@ -40,6 +40,10 @@ struct Args {
     #[arg(long)]
     baseline: Option<String>,
 
+    /// Path to the git repository. Overrides settings.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
     /// Parent directory for creating worktrees.
     #[arg(long)]
     worktree_dir: Option<PathBuf>,
@@ -123,7 +127,10 @@ async fn main() -> Result<()> {
     );
     let (patchset_id, subject, patches) = (input.id, input.subject, input.patches);
     let baseline_arg = args.baseline.clone().unwrap_or_else(|| "HEAD".to_string());
-    let repo_path = PathBuf::from(&settings.git.repository_path);
+    let repo_path = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&settings.git.repository_path));
 
     let run_logic = async {
         info!("Resolving baseline: {}", baseline_arg);

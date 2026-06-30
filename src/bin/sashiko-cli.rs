@@ -1551,7 +1551,12 @@ async fn handle_local(
             format!("{}^", first_sha)
         };
 
-        let mut args = vec!["--baseline".to_string(), baseline_ref];
+        let mut args = vec![
+            "--baseline".to_string(),
+            baseline_ref,
+            "--repo".to_string(),
+            repo_path.to_string_lossy().to_string(),
+        ];
 
         if no_ai {
             args.push("--no-ai".to_string());
