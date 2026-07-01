@@ -1,5 +1,10 @@
 # Forge Integration Setup
 
+> **Experimental / Unsupported:** Git forge integration is experimental and
+> unofficial. It is provided as-is, without guarantees of stability or
+> correctness. Use it at your own risk. Breaking changes may occur without
+> notice, and community support is best-effort only.
+
 This guide explains how to integrate Sashiko with Git forges (GitHub, GitLab, etc.) for automatic code review.
 
 ## Overview

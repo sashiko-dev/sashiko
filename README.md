@@ -23,7 +23,7 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 
 - **Automated Ingestion**: Monitors mailing lists (`lore.kernel.org`), GitHub PRs, and GitLab MRs for new patch submissions.
 - **Manual Ingestion**: Can ingest patches from local git repositories or specific PRs/MRs.
-- **Forge Integration**: Automatic PR/MR review via GitHub and GitLab webhooks.
+- **Forge Integration** *(Experimental)*: Automatic PR/MR review via GitHub and GitLab webhooks. This feature is unofficial and unsupported — use at your own risk.
 - **Self-contained**: Doesn't depend on 3rd-party tools and works with multiple LLM providers (Gemini, Claude, and GitHub Copilot CLI are currently supported).
 - **Web interface and CLI**: Provides a web interface for monitoring and a CLI tool for local development. Email support will be added soon.
 
@@ -97,7 +97,7 @@ setting, see the [Configuration Reference](docs/configuration.md). The default `
 *   **Server**: API server host and port.
 *   **Git**: Path to the reference kernel repository.
 *   **Review**: Concurrency and worktree settings.
-    *   **Forge**: GitHub/GitLab webhook integration (optional). See forge setup guides below.
+    *   **Forge** *(Experimental)*: GitHub/GitLab webhook integration (optional, unsupported). See forge setup guides below.
         *   When enabling `[forge]`, the NNTP (mailing list) ingestor is disabled by default. If you need to monitor both, set `disable_nntp = false` in the `[forge]` section of your config.
     *   **Subsystems**: Map file patterns to subsystems for targeted reviews (optional).
 
