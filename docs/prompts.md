@@ -1,5 +1,11 @@
 # Prompt Customization
 
+> **Experimental / Unsupported:** Custom prompt configuration is experimental
+> and provided as-is. Bugs and issues with the Sashiko ingestor, reviewer, or
+> core tooling can and should still be filed. However, we will not provide
+> support for debugging custom prompts or troubleshooting token consumption
+> caused by custom prompt configurations.
+
 Sashiko's multi-stage review pipeline loads its prompts from a
 configurable directory. You can override prompt content, reorder or
 disable stages, define template variables, and point to a remote prompt

@@ -154,7 +154,9 @@ Optional array of additional git remotes to track.
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
-### `[tools]` (optional)
+### `[tools]` (optional, experimental)
+
+> **Experimental / Unsupported** -- see [AI Tools](tools.md) for details.
 
 Configure which AI tools are available during review. See [AI Tools](tools.md) for full documentation.
 
@@ -164,7 +166,9 @@ Configure which AI tools are available during review. See [AI Tools](tools.md) f
 | `disabled` | list | `[]` | Denylist of tool names. Takes precedence over `enabled`. |
 | `custom` | list | `[]` | Custom shell-based tool definitions. |
 
-### `[prompts]` (optional)
+### `[prompts]` (optional, experimental)
+
+> **Experimental / Unsupported** -- see [Prompt Customization](prompts.md) for details.
 
 Customize review prompts and stages. See [Prompt Customization](prompts.md) for full documentation.
 

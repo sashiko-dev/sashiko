@@ -101,7 +101,7 @@ setting, see the [Configuration Reference](docs/configuration.md). The default `
         *   When enabling `[forge]`, the NNTP (mailing list) ingestor is disabled by default. If you need to monitor both, set `disable_nntp = false` in the `[forge]` section of your config.
     *   **Subsystems**: Map file patterns to subsystems for targeted reviews (optional).
 
-Optional customization sections:
+Optional customization sections (experimental -- see linked docs for support policy):
 *   **Tools**: Configure which AI tools are enabled (optional). See [docs/tools.md](docs/tools.md) for details.
 *   **Prompts**: Customize review stages and prompts (optional). See [docs/prompts.md](docs/prompts.md) for details.
 

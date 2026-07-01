@@ -1,5 +1,11 @@
 # AI Tools
 
+> **Experimental / Unsupported:** Custom tool configuration is experimental
+> and provided as-is. Bugs and issues with the Sashiko ingestor, reviewer, or
+> core tooling can and should still be filed. However, we will not provide
+> support for debugging custom tool definitions or troubleshooting token
+> consumption caused by custom tool configurations.
+
 Sashiko gives the AI reviewer a set of built-in tools for navigating the
 codebase under review. All built-in tools are enabled by default; you can
 restrict or extend them via `Settings.toml`.
