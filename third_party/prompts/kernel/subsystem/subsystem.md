@@ -28,6 +28,7 @@ and symbols regexes.
 | MM Allocation | `alloc_pages`, `__GFP_*`, `kmalloc`, `kmem_cache_*`, `slub`, `vmalloc`, `zone_watermark`, `mempool`, `memblock`, mm/page_alloc.c, mm/slub.c, mm/vmalloc.c | mm-alloc.md |
 | MM Reclaim/Swap/Migration | `vmscan`, `shrink_*`, `lru_*`, `swap_*`, `shmem_*`, `mem_cgroup_*`, `writeback`, `migrate_*`, mm/vmscan.c, mm/swap_state.c, mm/migrate.c, mm/memcontrol.c | mm-reclaim.md |
 | VFS | inode, dentry, vfs_, fs/*.c | vfs.md |
+| LEDs | drivers/leds/, include/linux/leds.h, led_classdev_register, devm_led_classdev_register | leds.md |
 | Locking | spin_lock*, mutex_*, rwsem*, seqlock*, *seqcount* | locking.md |
 | Scheduler | kernel/sched/, sched_, schedule, *wakeup* | scheduler.md |
 | Timers | timer_list, timer_setup, mod_timer, del_timer, hrtimer, delayed_work | timers.md |
