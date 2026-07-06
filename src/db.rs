@@ -2765,9 +2765,16 @@ impl Database {
             // unless they share a git send-email Message-ID prefix indicating they were sent together unthreaded.
             let thread_compatible = same_thread || is_singleton || msgid_prefix_match;
 
+            // Allow same-thread merging when one version is implicit (None/1)
+            // and the other is explicit — this handles series where the cover
+            // letter has [PATCH v6 00/33] but patches have [PATCH 01/33].
+            // Block merging only when both versions are explicit and different.
+            let both_explicit = version.is_some() && existing_version.is_some();
+            let merge_compatible = versions_compatible || (same_thread && !both_explicit);
+
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
-                && (versions_compatible || same_thread)
+                && merge_compatible
                 && (total_parts == existing_total || existing_total == 1 || total_parts == 1)
                 && subject_match
                 && prefix_match
@@ -2932,6 +2939,22 @@ impl Database {
 
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
+
+            // Link to previous version if this is v2+
+            let v = version.unwrap_or(1) as i32;
+            if v > 1
+                && let Some(prev_id) = self
+                    .find_previous_version(thread_id, author, subject, v)
+                    .await?
+            {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET previous_version_id = ?1 WHERE id = ?2",
+                        libsql::params![prev_id, id],
+                    )
+                    .await?;
+            }
+
             Ok(Some(id))
         } else {
             Err(anyhow::anyhow!(
@@ -2978,6 +3001,62 @@ impl Database {
                 .await?;
             rows.next().await.ok().flatten().is_some()
         };
+
+        // Check if patch exists and get old patchset_id to fix counts if we steal it
+        let old_patchset_id: Option<i64> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT patchset_id FROM patches WHERE message_id = ?",
+                    libsql::params![message_id],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                Some(row.get(0)?)
+            } else {
+                None
+            }
+        };
+
+        // Prevent cross-version patch reassignment: if the patch already
+        // exists in a patchset with a different version, keep it there.
+        if let Some(old_id) = old_patchset_id
+            && old_id != patchset_id
+        {
+            let mut v_rows = self
+                .conn
+                .query(
+                    "SELECT version FROM patchsets WHERE id = ?",
+                    libsql::params![old_id],
+                )
+                .await?;
+            if let Ok(Some(v_row)) = v_rows.next().await {
+                let old_version: i32 = v_row.get(0).unwrap_or(1);
+                let mut new_v_rows = self
+                    .conn
+                    .query(
+                        "SELECT version FROM patchsets WHERE id = ?",
+                        libsql::params![patchset_id],
+                    )
+                    .await?;
+                if let Ok(Some(new_v_row)) = new_v_rows.next().await {
+                    let new_version: i32 = new_v_row.get(0).unwrap_or(1);
+                    if old_version != new_version {
+                        // Patch belongs to a different version — skip reassignment
+                        let mut id_rows = self
+                            .conn
+                            .query(
+                                "SELECT id FROM patches WHERE message_id = ?",
+                                libsql::params![message_id],
+                            )
+                            .await?;
+                        if let Ok(Some(id_row)) = id_rows.next().await {
+                            return Ok(id_row.get(0)?);
+                        }
+                    }
+                }
+            }
+        }
 
         // Insert or update within THIS patchset.
         self.conn
@@ -4537,6 +4616,115 @@ impl Database {
             }
         }
         Ok(false)
+    }
+
+    /// Find the previous version of a patchset for chain linkage using
+    /// signal-based matching. No time window — signals are the truth.
+    ///
+    /// Priority:
+    /// 1. Same thread_id with version = current - 1
+    /// 2. Same author + stripped subject match with version = current - 1
+    ///
+    /// Returns None if no match found (patchset proceeds as independent).
+    pub async fn find_previous_version(
+        &self,
+        thread_id: i64,
+        author_email: &str,
+        subject: &str,
+        version: i32,
+    ) -> Result<Option<i64>> {
+        if version <= 1 {
+            return Ok(None);
+        }
+        let target_version = version - 1;
+
+        // Signal 1: Same thread, version - 1
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE thread_id = ?1 AND version = ?2 ORDER BY id DESC LIMIT 1",
+                libsql::params![thread_id, target_version],
+            )
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            return Ok(Some(row.get(0)?));
+        }
+
+        // Signal 2: Same author + stripped subject match
+        // Author matching uses `authors_match` rather than SQL equality so
+        // that B4 relay aliases (e.g. `devnull+...@kernel.org`) and varied
+        // name formatting across revisions still match.
+        let stripped_new = crate::patch::strip_subject_version(subject).to_lowercase();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id, p.author, p.subject FROM patchsets p
+                 WHERE p.version = ?1
+                 ORDER BY p.id DESC",
+                libsql::params![target_version],
+            )
+            .await?;
+        while let Ok(Some(row)) = rows.next().await {
+            let candidate_id: i64 = row.get(0)?;
+            let candidate_author: String = row.get(1).unwrap_or_default();
+            let candidate_subject: String = row.get(2).unwrap_or_default();
+            if !crate::patch::authors_match(&candidate_author, author_email) {
+                continue;
+            }
+            let stripped_candidate =
+                crate::patch::strip_subject_version(&candidate_subject).to_lowercase();
+            if stripped_new == stripped_candidate {
+                return Ok(Some(candidate_id));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Find the most recent patchset for a given MR/PR number, scoped to a
+    /// repository. MR/PR numbers restart at 1 for every repository, so the
+    /// lookup must be scoped by the forge URL to avoid linking unrelated
+    /// repositories into the same version chain.
+    /// Returns (id, version, commit_range) if found.
+    pub async fn find_patchset_by_mr_number(
+        &self,
+        mr_number: i64,
+        repo_url: Option<&str>,
+    ) -> Result<Option<(i64, i32, Option<String>)>> {
+        let repo_path = repo_url.and_then(crate::forge::extract_repo_path_from_url);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, version, commit_range FROM patchsets WHERE mr_number = ? AND (?2 IS NULL OR instr(mr_url, ?2) > 0) ORDER BY version DESC LIMIT 1",
+                libsql::params![mr_number, repo_path],
+            )
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(Some((
+                row.get(0)?,
+                row.get(1).unwrap_or(1),
+                row.get(2).ok(),
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update metadata (title, URL) on an existing patchset without creating
+    /// a new version. Used for forge metadata-only changes (e.g., Draft-to-Ready).
+    pub async fn update_patchset_metadata(
+        &self,
+        patchset_id: i64,
+        title: Option<&str>,
+        url: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET mr_title = COALESCE(?1, mr_title), mr_url = COALESCE(?2, mr_url) WHERE id = ?3",
+                libsql::params![title, url, patchset_id],
+            )
+            .await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10177,6 +10365,7 @@ mod tests {
         let version: i32 = row.get(0).unwrap();
         assert_eq!(version, 1, "Version should default to 1");
     }
+
     #[tokio::test]
     async fn test_bug_crud_and_links() {
         let db_settings = crate::settings::DatabaseSettings {
@@ -10303,5 +10492,305 @@ mod tests {
         let all_bugs = db.list_all_bugs_for_vector_search().await.unwrap();
         assert_eq!(all_bugs.len(), 1);
         assert_eq!(all_bugs[0].id, bug_id);
+    }
+    #[tokio::test]
+    async fn test_version_chain_linkage_same_thread() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root-chain", "Chain Test", 1000)
+            .await
+            .unwrap();
+
+        // Create v1 patchset with explicit version
+        db.create_message(
+            "chain-v1",
+            thread_id,
+            None,
+            "Author A",
+            "[PATCH v1 1/1] Fix bug",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v1 = db
+            .create_patchset(
+                thread_id,
+                None,
+                "chain-v1",
+                "[PATCH v1 1/1] Fix bug",
+                "Author A",
+                1000,
+                1,
+                2,
+                "",
+                "",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Create v2 patchset in the same thread with explicit version
+        db.create_message(
+            "chain-v2",
+            thread_id,
+            None,
+            "Author A",
+            "[PATCH v2 1/1] Fix bug",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v2 = db
+            .create_patchset(
+                thread_id,
+                None,
+                "chain-v2",
+                "[PATCH v2 1/1] Fix bug",
+                "Author A",
+                2000,
+                1,
+                2,
+                "",
+                "",
+                Some(2),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Verify they are different patchsets (not merged)
+        assert_ne!(ps_v1, ps_v2, "v1 and v2 must be separate patchsets");
+
+        // Verify chain linkage: v2 points to v1
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_version_id FROM patchsets WHERE id = ?",
+                libsql::params![ps_v2],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let prev_id: Option<i64> = row.get(0).ok();
+        assert_eq!(prev_id, Some(ps_v1), "v2 should link to v1");
+
+        // v1 should have no previous version
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_version_id FROM patchsets WHERE id = ?",
+                libsql::params![ps_v1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let prev_id: Option<i64> = row.get(0).ok();
+        assert_eq!(prev_id, None, "v1 should have no previous version");
+    }
+
+    #[tokio::test]
+    async fn test_version_chain_no_match_stays_independent() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root-orphan", "Orphan Test", 3000)
+            .await
+            .unwrap();
+
+        // Create v2 with no matching v1
+        db.create_message(
+            "orphan-v2",
+            thread_id,
+            None,
+            "Author B",
+            "[PATCH v2 1/1] New driver",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v2 = db
+            .create_patchset(
+                thread_id,
+                None,
+                "orphan-v2",
+                "[PATCH v2 1/1] New driver",
+                "Author B",
+                3000,
+                1,
+                2,
+                "",
+                "",
+                Some(2),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // v2 should have no previous version (no v1 to match)
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_version_id FROM patchsets WHERE id = ?",
+                libsql::params![ps_v2],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let prev_id: Option<i64> = row.get(0).ok();
+        assert_eq!(prev_id, None, "v2 with no matching v1 should have no chain");
+    }
+
+    #[tokio::test]
+    async fn test_find_patchset_by_mr_number_scoped_to_repo() {
+        let db = setup_db().await;
+
+        // Two repositories both have PR #42. They must not collide.
+        let id_a = db
+            .create_fetching_patchset(
+                "mr-42-abc",
+                "PR 42",
+                None,
+                None,
+                Some("https://github.com/owner/repo-a/pull/42"),
+                Some("PR 42"),
+                Some(42),
+                Some("repo-a-42"),
+                Some(1),
+                Some("abc"),
+            )
+            .await
+            .unwrap();
+        let id_b = db
+            .create_fetching_patchset(
+                "mr-42-def",
+                "PR 42",
+                None,
+                None,
+                Some("https://github.com/owner/repo-b/pull/42"),
+                Some("PR 42"),
+                Some(42),
+                Some("repo-b-42"),
+                Some(1),
+                Some("def"),
+            )
+            .await
+            .unwrap();
+
+        // Unscoped lookup must find only one (the highest version, ties by row).
+        let unscoped = db.find_patchset_by_mr_number(42, None).await.unwrap();
+        assert!(unscoped.is_some(), "unscoped lookup should still find one");
+
+        // Scoped to repo-a: must return only repo-a's patchset.
+        let in_a = db
+            .find_patchset_by_mr_number(42, Some("https://github.com/owner/repo-a.git"))
+            .await
+            .unwrap();
+        assert_eq!(in_a.as_ref().map(|t| t.0), Some(id_a));
+
+        // Scoped to repo-b: must return only repo-b's patchset.
+        let in_b = db
+            .find_patchset_by_mr_number(42, Some("https://github.com/owner/repo-b.git"))
+            .await
+            .unwrap();
+        assert_eq!(in_b.as_ref().map(|t| t.0), Some(id_b));
+    }
+
+    #[tokio::test]
+    async fn test_find_previous_version_matches_b4_alias_author() {
+        let db = setup_db().await;
+
+        // v1 authored by the real address.
+        let thread1 = db
+            .create_thread("root-b4-1", "B4 Alias 1", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "b4-v1",
+            thread1,
+            None,
+            "dev@kernel.org",
+            "[PATCH 1/1] Fix alias",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v1 = db
+            .create_patchset(
+                thread1,
+                None,
+                "b4-v1",
+                "[PATCH 1/1] Fix alias",
+                "dev@kernel.org",
+                1000,
+                1,
+                2,
+                "",
+                "",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // v2 submitted through the B4 relay: author is a devnull alias. The
+        // strict SQL equality check would miss this; authors_match must find it.
+        let thread2 = db
+            .create_thread("root-b4-2", "B4 Alias 2", 2000)
+            .await
+            .unwrap();
+        let result = db
+            .find_previous_version(
+                thread2,
+                "devnull+dev.kernel.org@kernel.org",
+                "[PATCH v2 1/1] Fix alias",
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            Some(ps_v1),
+            "v2 authored by B4 relay alias should chain to v1 by the real author"
+        );
     }
 }

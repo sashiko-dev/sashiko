@@ -347,6 +347,23 @@ pub fn parse_subject_version(subject: &str) -> Option<u32> {
     None
 }
 
+/// Strip version indicators from a subject for cross-version comparison.
+/// `[PATCH v2 0/5] Refactor scheduler` becomes `[PATCH 0/5] Refactor scheduler`.
+/// Extra whitespace left by the removal is collapsed.
+pub fn strip_subject_version(subject: &str) -> String {
+    static RE_STRIP: OnceLock<Regex> = OnceLock::new();
+    static RE_WS: OnceLock<Regex> = OnceLock::new();
+    // Remove vN (case-insensitive) either as a standalone token preceded by a
+    // word boundary, or immediately following "PATCH" (e.g. `PATCHv2`) — the
+    // same forms `parse_subject_version` recognizes. The optional PATCH prefix
+    // is preserved so `[PATCHv2 1/1]` becomes `[PATCH 1/1]`, not `[ 1/1]`.
+    let re = RE_STRIP.get_or_init(|| Regex::new(r"(?i)(\bPATCH)?\s*v\d+\b").unwrap());
+    let stripped = re.replace_all(subject, "$1");
+    // Collapse any runs of whitespace left behind.
+    let ws = RE_WS.get_or_init(|| Regex::new(r"  +").unwrap());
+    ws.replace_all(&stripped, " ").to_string()
+}
+
 /// Sanitize a message-ID by stripping null bytes and control characters
 /// (ASCII < 32 except tab). Logs a warning if any were removed.
 pub fn sanitize_message_id(msg_id: &str) -> String {
@@ -999,5 +1016,57 @@ diff --git a/file.c b/file.c";
             sanitize_message_id("<test\t@kernel.org>"),
             "<test\t@kernel.org>"
         );
+    }
+
+    #[test]
+    fn test_strip_subject_version_removes_v2() {
+        let stripped = strip_subject_version("[PATCH v2 0/5] Refactor scheduler");
+        assert!(!stripped.contains("v2"));
+        assert!(stripped.contains("Refactor scheduler"));
+    }
+
+    #[test]
+    fn test_strip_subject_version_v1_and_v2_match() {
+        let v1 = strip_subject_version("[PATCH 0/5] Refactor scheduler");
+        let v2 = strip_subject_version("[PATCH v2 0/5] Refactor scheduler");
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn test_strip_subject_version_no_version_unchanged() {
+        let original = "[PATCH 1/1] Add null check";
+        let stripped = strip_subject_version(original);
+        assert_eq!(stripped, original);
+    }
+
+    #[test]
+    fn test_strip_subject_version_handles_formats() {
+        // Uppercase V
+        let stripped = strip_subject_version("[PATCH V3 1/2] Fix");
+        assert!(!stripped.contains("V3"));
+        // Multi-digit
+        let stripped = strip_subject_version("[PATCH v12 0/10] Big series");
+        assert!(!stripped.contains("v12"));
+    }
+
+    #[test]
+    fn test_strip_subject_version_unspaced_patchv() {
+        // `PATCHvN` with no space between PATCH and v — must strip the version
+        // while preserving the PATCH token, matching `parse_subject_version`.
+        let stripped = strip_subject_version("[PATCHv2 1/1] Fix bug");
+        assert!(!stripped.contains("v2"), "got: {}", stripped);
+        assert!(stripped.contains("PATCH"), "got: {}", stripped);
+        assert_eq!(
+            strip_subject_version("[PATCHv2 1/1] Fix bug"),
+            "[PATCH 1/1] Fix bug"
+        );
+        // The stripped forms must agree across spaced and unspaced variants.
+        assert_eq!(
+            strip_subject_version("[PATCH v2 1/1] Fix bug"),
+            strip_subject_version("[PATCHv2 1/1] Fix bug")
+        );
+        // No version indicator — unchanged.
+        let original = "[PATCH 1/1] Add null check";
+        assert_eq!(strip_subject_version(original), original);
     }
 }

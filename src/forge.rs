@@ -425,6 +425,33 @@ pub fn extract_repo_name_from_mr_url(url: &str) -> Option<String> {
     }
 }
 
+/// Extract the repository path (e.g. "owner/repo" or "group/sub/repo") from a
+/// forge repo URL. Handles https and git@ clone URLs, stripping the scheme,
+/// host, and a trailing `.git`.
+pub fn extract_repo_path_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
+    // git@host:owner/repo form — the path starts right after the colon.
+    if !trimmed.contains("://")
+        && let Some((_, after_colon)) = trimmed.split_once(':')
+    {
+        let repo = after_colon
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        return if repo.is_empty() { None } else { Some(repo) };
+    }
+    // https://host/owner/repo form — strip the scheme and host.
+    let rest = trimmed
+        .rsplit_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(trimmed);
+    let mut parts = rest.split('/').filter(|s| !s.is_empty());
+    parts.next()?; // skip host
+    let repo = parts.collect::<Vec<_>>().join("/");
+    if repo.is_empty() { None } else { Some(repo) }
+}
+
 /// Registry for forge providers
 pub struct ForgeRegistry {
     providers: HashMap<String, Arc<dyn ForgeProvider>>,
@@ -564,6 +591,28 @@ mod tests {
         assert!(is_safe_repo_url(
             "http://gitlab.internal:8929/group/project.git"
         ));
+    }
+
+    #[test]
+    fn test_extract_repo_path_from_url() {
+        assert_eq!(
+            extract_repo_path_from_url("https://github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_path_from_url("git@github.com:owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_path_from_url("https://gitlab.com/group/sub/repo"),
+            Some("group/sub/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_path_from_url("https://github.com/owner/repo/"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(extract_repo_path_from_url(""), None);
+        assert_eq!(extract_repo_path_from_url("https://github.com"), None);
     }
 
     #[test]
