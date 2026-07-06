@@ -111,6 +111,16 @@ cp docs/examples/Settings.example.toml Settings.toml
 export LLM_API_KEY="your-api-key-here"
 ```
 
+When installed with `cargo install`, create the user config with:
+
+```bash
+sashiko init
+```
+
+This writes `~/.config/sashiko.toml` by default. Use `sashiko init --print`
+to print the template or `sashiko init --path <file>` to choose a different
+location.
+
 For Claude, Claude Code CLI, GitHub Copilot CLI, AWS Bedrock, Vertex AI,
 Kiro CLI, Devin CLI, and OpenAI-compatible endpoints, see the
 [LLM Provider Configuration Guide](docs/llm-providers.md).
@@ -150,7 +160,7 @@ Quick start:
 sashiko-cli submit HEAD~3..HEAD
 
 # Run a local review (no daemon required)
-sashiko-cli local --force-local
+sashiko review
 
 # Check review status
 sashiko-cli show latest
@@ -162,9 +172,25 @@ or via Nix: `nix profile add github:sashiko-dev/sashiko`)
 ### 3. Local Review
 
 Sashiko can review your patches locally without sending emails to LKML or
-updating sashiko.dev. See the
-[CLI Reference](docs/sashiko-cli.md#local) for full setup, options, and
-a comparison of all three review modes.
+updating sashiko.dev:
+
+```bash
+sashiko review
+sashiko review HEAD~3..HEAD
+```
+
+Run it from the Linux source checkout containing the commits to review. This
+mode does not start the daemon, does not open the Sashiko database, and does
+not fetch or configure git remotes. It uses a temporary scratch clone for patch
+application and review context, leaving the source checkout and its git
+metadata alone.
+
+For local review, Sashiko loads settings from `./Settings.toml` if that file
+exists in the current directory, otherwise from `~/.config/sashiko.toml`. Use
+`--settings <path>` to point at a specific settings file.
+
+See the [CLI Reference](docs/sashiko-cli.md#local) for the older
+`sashiko-cli local` workflow and a comparison of review modes.
 
 ### 4. Web Interface
 

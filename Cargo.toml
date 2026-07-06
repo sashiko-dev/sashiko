@@ -19,7 +19,6 @@ exclude = [
     "designs/",
     ".sashiko*",
     "*.log",
-    "*.txt",
     "*.pid",
     "install.sh",
     "test_*.rs",

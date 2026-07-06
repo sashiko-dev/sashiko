@@ -95,6 +95,26 @@ pub struct WorkerConfig {
     pub stages: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub enum WorkerProgressEvent {
+    PreScreenStarted,
+    PlanningStarted,
+    ReviewStarted {
+        planned_stages: Vec<u8>,
+    },
+    StageStarted {
+        stage: u8,
+    },
+    StageFinished {
+        stage: u8,
+    },
+    StageTurn {
+        stage: u8,
+        turn: usize,
+        max_turns: usize,
+    },
+}
+
 pub struct WorkerResult {
     pub output: Option<Value>,
     pub error: Option<String>,
@@ -453,7 +473,11 @@ impl Worker {
         }
     }
 
-    pub async fn run(&mut self, patchset: Value) -> Result<WorkerResult> {
+    pub async fn run(
+        &mut self,
+        patchset: Value,
+        progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+    ) -> Result<WorkerResult> {
         // 1. Extract inputs
         let mut target_commit_diff = String::new();
         let mut target_commit_diff_only = String::new();
@@ -516,6 +540,9 @@ impl Worker {
         let mut total_tokens_cached = 0;
 
         // Phase 0: Pre-screen relevant prompts
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::PreScreenStarted);
+        }
         let subsystem_md_path = self.prompts.base_dir.join("subsystem/subsystem.md");
         let selected_prompts = if subsystem_md_path.exists() {
             match tokio::fs::read_to_string(&subsystem_md_path).await {
@@ -663,6 +690,9 @@ impl Worker {
 
         let mut planning_selected_stages: Option<Vec<u8>> = None;
         if self.stages.is_none() {
+            if let Some(progress_cb) = progress {
+                progress_cb(WorkerProgressEvent::PlanningStarted);
+            }
             let schema = serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -737,6 +767,30 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             }
         }
 
+        let mut planned_stages = Vec::new();
+        for stage_num in 1..=7 {
+            if let Some(ref selected_stages) = self.stages {
+                if selected_stages.contains(&stage_num) {
+                    planned_stages.push(stage_num);
+                }
+            } else if let Some(ref planned_stages_ref) = planning_selected_stages {
+                if planned_stages_ref.contains(&stage_num) {
+                    planned_stages.push(stage_num);
+                }
+            } else {
+                planned_stages.push(stage_num);
+            }
+        }
+        if !planned_stages.is_empty() {
+            planned_stages.push(8);
+            planned_stages.push(9);
+            planned_stages.push(10);
+            planned_stages.push(11);
+        }
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::ReviewStarted { planned_stages });
+        }
+
         // Initialize system message in global history once before running stages
         if self.global_history.is_empty() {
             self.global_history.push(AiMessage {
@@ -776,7 +830,12 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 clean_shared_context_no_log.clone()
             };
 
-            stage_futures.push(self.execute_stage(stage, system_prompt, clean_system_prompt));
+            stage_futures.push(self.execute_stage(
+                stage,
+                system_prompt,
+                clean_system_prompt,
+                progress,
+            ));
         }
 
         // Run planned stages concurrently
@@ -834,6 +893,9 @@ You MUST respond with ONLY a JSON object, no other text. Example:
         }
 
         // Stage 8: Deduplication
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageStarted { stage: 8 });
+        }
         info!("Running Stage 8 (Deduplication)");
         let deduplicated_concerns;
         let deduplicated_dismissed_concerns;
@@ -930,7 +992,16 @@ Preserve the most precise location details from the input. Do not invent line nu
             );
             let runner = SessionRunner::new(self.provider.as_ref())
                 .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions);
+                .with_max_turns(self.max_interactions)
+                .with_turn_callback(move |turn, max_turns| {
+                    if let Some(progress_cb) = progress {
+                        progress_cb(WorkerProgressEvent::StageTurn {
+                            stage,
+                            turn,
+                            max_turns,
+                        });
+                    }
+                });
             let result = runner.run(&mut session).await?;
 
             total_tokens_in += result.usage.prompt_tokens as u32;
@@ -941,6 +1012,9 @@ Preserve the most precise location details from the input. Do not invent line nu
             deduplicated_concerns = result.output.get("concerns").unwrap().clone();
             deduplicated_dismissed_concerns =
                 result.output.get("dismissed_concerns").unwrap().clone();
+        }
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageFinished { stage: 8 });
         }
 
         if let Some(c) = deduplicated_concerns.as_array()
@@ -973,6 +1047,9 @@ Preserve the most precise location details from the input. Do not invent line nu
         }
 
         // Stage 9: Concern/dismissed-concern conflict resolution
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageStarted { stage: 9 });
+        }
         info!("Running Stage 9 (Concern/dismissed-concern conflict resolution)");
         let conflict_resolved_concerns;
         {
@@ -1073,7 +1150,16 @@ Example Output:
             );
             let runner = SessionRunner::new(self.provider.as_ref())
                 .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions);
+                .with_max_turns(self.max_interactions)
+                .with_turn_callback(move |turn, max_turns| {
+                    if let Some(progress_cb) = progress {
+                        progress_cb(WorkerProgressEvent::StageTurn {
+                            stage,
+                            turn,
+                            max_turns,
+                        });
+                    }
+                });
             let result = runner.run(&mut session).await?;
 
             total_tokens_in += result.usage.prompt_tokens as u32;
@@ -1082,6 +1168,9 @@ Example Output:
             self.global_history.extend(result.history);
 
             conflict_resolved_concerns = result.output.get("concerns").unwrap().clone();
+        }
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageFinished { stage: 9 });
         }
 
         if let Some(c) = conflict_resolved_concerns.as_array()
@@ -1114,6 +1203,9 @@ Example Output:
         }
 
         // Stage 10: Verification
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageStarted { stage: 10 });
+        }
         info!("Running Stage 10 (Verification)");
         let findings_json;
         {
@@ -1176,7 +1268,16 @@ Example Output:
             );
             let runner = SessionRunner::new(self.provider.as_ref())
                 .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions);
+                .with_max_turns(self.max_interactions)
+                .with_turn_callback(move |turn, max_turns| {
+                    if let Some(progress_cb) = progress {
+                        progress_cb(WorkerProgressEvent::StageTurn {
+                            stage,
+                            turn,
+                            max_turns,
+                        });
+                    }
+                });
             let result = runner.run(&mut session).await?;
 
             total_tokens_in += result.usage.prompt_tokens as u32;
@@ -1185,6 +1286,9 @@ Example Output:
             self.global_history.extend(result.history);
 
             findings_json = result.output.get("findings").unwrap().clone();
+        }
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageFinished { stage: 10 });
         }
 
         if let Some(f) = findings_json.as_array()
@@ -1215,6 +1319,9 @@ Example Output:
         }
 
         // Stage 11
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageStarted { stage: 11 });
+        }
         info!("Running Stage 11");
         let review_inline_text;
         {
@@ -1243,7 +1350,16 @@ Example Output:
             );
             let runner = SessionRunner::new(self.provider.as_ref())
                 .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions);
+                .with_max_turns(self.max_interactions)
+                .with_turn_callback(move |turn, max_turns| {
+                    if let Some(progress_cb) = progress {
+                        progress_cb(WorkerProgressEvent::StageTurn {
+                            stage,
+                            turn,
+                            max_turns,
+                        });
+                    }
+                });
             let result = runner.run(&mut session).await?;
 
             total_tokens_in += result.usage.prompt_tokens as u32;
@@ -1252,6 +1368,9 @@ Example Output:
             self.global_history.extend(result.history);
 
             review_inline_text = result.output.as_str().unwrap().to_string();
+        }
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageFinished { stage: 11 });
         }
 
         let fixes_text = String::new();
@@ -1384,8 +1503,12 @@ Example Output:
         stage: Box<dyn ReviewStage>,
         system_prompt: String,
         _clean_system_prompt: String,
+        progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
     ) -> Result<StageExecutionResult> {
         let stage_num = stage.number();
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageStarted { stage: stage_num });
+        }
         info!("Running Stage {}", stage_num);
         let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage_num).await?;
 
@@ -1461,7 +1584,16 @@ Example:
 
         let runner = SessionRunner::new(self.provider.as_ref())
             .with_max_validation_attempts(3)
-            .with_max_turns(self.max_interactions);
+            .with_max_turns(self.max_interactions)
+            .with_turn_callback(move |turn, max_turns| {
+                if let Some(progress_cb) = progress {
+                    progress_cb(WorkerProgressEvent::StageTurn {
+                        stage: stage_num,
+                        turn,
+                        max_turns,
+                    });
+                }
+            });
 
         let result = runner.run(&mut session).await?;
 
@@ -1477,6 +1609,10 @@ Example:
             .and_then(|v| v.as_array())
         {
             dismissed_concerns_out = c.clone();
+        }
+
+        if let Some(progress_cb) = progress {
+            progress_cb(WorkerProgressEvent::StageFinished { stage: stage_num });
         }
 
         Ok(StageExecutionResult {
@@ -1983,7 +2119,7 @@ mod tests {
             "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
         });
 
-        match worker.run(patchset).await {
+        match worker.run(patchset, None).await {
             Ok(_) => panic!("Expected stage failure error, got Ok"),
             Err(e) => assert!(
                 e.to_string().contains("simulated AI failure"),
@@ -2330,7 +2466,7 @@ mod tests {
             "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
         });
 
-        let res = worker.run(patchset).await;
+        let res = worker.run(patchset, None).await;
         if let Err(e) = &res {
             panic!("Expected run to succeed, got error: {:?}", e);
         }

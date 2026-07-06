@@ -40,7 +40,7 @@ pub const GIT_PROTOCOL_RESTRICTIONS: &[&str] = &[
 
 #[allow(dead_code)]
 pub struct GitWorktree {
-    pub dir: TempDir,
+    pub dir: Option<TempDir>,
     pub path: PathBuf,
     pub repo_path: PathBuf,
     pub is_managed: bool,
@@ -49,14 +49,8 @@ pub struct GitWorktree {
 impl GitWorktree {
     #[allow(dead_code)]
     pub fn from_path(path: PathBuf, repo_path: PathBuf) -> Self {
-        // Create a dummy tempdir to satisfy the struct (it won't be deleted or used).
-        // Actually, we can't easily construct a TempDir that doesn't delete on drop unless we use into_path() but we need to keep it in struct.
-        // Or we make dir: Option<TempDir>.
-        // Let's change struct to Option<TempDir>.
         Self {
-            dir: tempfile::Builder::new().prefix("dummy").tempdir().unwrap(), // Hack: create a dummy tempdir, but we won't use it.
-            // If we drop this struct, the dummy tempdir is deleted, which is acceptable.
-            // Do not delete the path.
+            dir: None,
             path,
             repo_path,
             is_managed: false,
@@ -124,10 +118,70 @@ impl GitWorktree {
         }
 
         Ok(Self {
-            dir: temp_dir,
+            dir: Some(temp_dir),
             path,
             repo_path: repo_path.to_path_buf(),
             is_managed: true,
+        })
+    }
+
+    pub async fn new_scratch_clone(
+        repo_path: &Path,
+        commit_hash: &str,
+        parent_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let temp_dir = if let Some(parent) = parent_dir {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+            tempfile::Builder::new()
+                .prefix("sashiko-review-")
+                .tempdir_in(parent)?
+        } else {
+            tempfile::Builder::new()
+                .prefix("sashiko-review-")
+                .tempdir()?
+        };
+        let path = temp_dir.path().to_path_buf();
+
+        info!("Creating scratch clone at {:?}", path);
+
+        let output = Command::new("git")
+            .args(["-c", "safe.bareRepository=all"])
+            .arg("clone")
+            .arg("--shared")
+            .arg("--no-checkout")
+            .arg(repo_path)
+            .arg(&path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Failed to create scratch clone: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        let output = Command::new("git")
+            .current_dir(&path)
+            .args(["-c", "safe.bareRepository=all"])
+            .args(["reset", "--hard", commit_hash])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Failed to populate scratch clone: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        Ok(Self {
+            dir: Some(temp_dir),
+            path,
+            repo_path: repo_path.to_path_buf(),
+            is_managed: false,
         })
     }
 
@@ -975,6 +1029,25 @@ pub async fn extract_patch_metadata(repo_path: &Path, commit: &str) -> Result<Pa
         base_commit,
         timestamp,
     })
+}
+
+pub async fn is_dirty(repo_path: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .args(["status", "--porcelain"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(!stdout.trim().is_empty())
 }
 
 #[cfg(test)]

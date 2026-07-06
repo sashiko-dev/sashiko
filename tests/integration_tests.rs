@@ -1,4 +1,5 @@
 mod integration {
+    mod cli_tests;
     mod cover_letter_late_merge_test;
     mod db_version_merge_test;
     mod findings_sum_test;

@@ -14,6 +14,7 @@
 
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
@@ -451,16 +452,125 @@ fn default_forge() -> ForgeSettings {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct LocalReviewReviewSettings {
+    pub concurrency: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LocalReviewSettings {
+    pub ai: AiSettings,
+    pub review: Option<LocalReviewReviewSettings>,
+}
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
+        Self::from_file("Settings")
+    }
+
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let s = Config::builder()
             // Start with default settings
-            .add_source(File::with_name("Settings"))
+            .add_source(File::from(path.as_ref()))
             // Add settings from environment variables (with a prefix of SASHIKO)
             // e.g. SASHIKO__SERVER__PORT=8081 would set the server port
             .add_source(Environment::with_prefix("SASHIKO").separator("__"))
             .build()?;
 
         s.try_deserialize()
+    }
+
+    pub fn local_review_path() -> PathBuf {
+        Self::local_review_path_in(Path::new("."))
+    }
+
+    pub fn local_review_path_in(base: &Path) -> PathBuf {
+        let local = base.join("Settings.toml");
+        if local.exists() {
+            return local;
+        }
+
+        Self::user_config_path()
+    }
+
+    pub fn user_config_path() -> PathBuf {
+        if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(config_home).join("sashiko.toml");
+        }
+
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".config/sashiko.toml");
+        }
+
+        PathBuf::from(".config/sashiko.toml")
+    }
+
+    pub fn local_review() -> Result<Self, ConfigError> {
+        Self::from_file(Self::local_review_path())
+    }
+
+    pub fn local_review_settings() -> Result<LocalReviewSettings, ConfigError> {
+        Self::local_review_from_file(Self::local_review_path())
+    }
+
+    pub fn local_review_from_file(
+        path: impl AsRef<Path>,
+    ) -> Result<LocalReviewSettings, ConfigError> {
+        let s = Config::builder()
+            .add_source(File::from(path.as_ref()))
+            .add_source(Environment::with_prefix("SASHIKO").separator("__"))
+            .build()?;
+
+        s.try_deserialize()
+    }
+
+    pub fn local_review_ai() -> Result<AiSettings, ConfigError> {
+        Self::ai_from_file(Self::local_review_path())
+    }
+
+    pub fn ai_from_file(path: impl AsRef<Path>) -> Result<AiSettings, ConfigError> {
+        let s = Config::builder()
+            .add_source(File::from(path.as_ref()))
+            .add_source(Environment::with_prefix("SASHIKO").separator("__"))
+            .build()?;
+
+        let settings: LocalReviewSettings = s.try_deserialize()?;
+        Ok(settings.ai)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_local_review_path_prefers_current_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Settings.toml"), "").unwrap();
+        assert_eq!(
+            Settings::local_review_path_in(temp.path()),
+            temp.path().join("Settings.toml")
+        );
+    }
+
+    #[test]
+    fn test_user_config_path_uses_xdg_config_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path());
+        }
+
+        assert_eq!(
+            Settings::user_config_path(),
+            temp.path().join("sashiko.toml")
+        );
+
+        unsafe {
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_CONFIG_HOME", value);
+            } else {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
     }
 }

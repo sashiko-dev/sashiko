@@ -12,17 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use sashiko::db::Database;
 use sashiko::events::{Event, ParsedArticle};
 use sashiko::ingestor::Ingestor;
+use sashiko::local_review::{
+    ProgressEvent, ReviewOptions, WorkerOptions, print_worker_json, result_has_error,
+    result_has_high_or_critical_findings, run_git_review, run_worker_from_stdin,
+};
+use sashiko::prompt_bundle;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
+use serde_json::Value;
 use std::io::IsTerminal;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+
+const DEFAULT_SETTINGS: &str = include_str!("../docs/examples/Settings.example.toml");
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -58,6 +69,139 @@ struct Cli {
     /// Debug feature: select which stages from 1-7 to run
     #[arg(long, hide = true, value_delimiter = ',')]
     stages: Option<Vec<u8>>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Create a user settings file
+    Init {
+        /// Write settings to this path (default: ~/.config/sashiko.toml)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Overwrite an existing settings file
+        #[arg(long)]
+        force: bool,
+
+        /// Print the default settings template instead of writing it
+        #[arg(long)]
+        print: bool,
+
+        /// Reinstall bundled prompt files
+        #[arg(long)]
+        prompts: bool,
+    },
+
+    /// Review a local commit or commit range without starting the daemon
+    Review {
+        /// Git commit or range, for example HEAD or HEAD~3..HEAD
+        #[arg(default_value = "HEAD")]
+        input: String,
+
+        /// Baseline reference (default: parent of the first commit)
+        #[arg(long)]
+        baseline: Option<String>,
+
+        /// Settings file (default: ./Settings.toml, then ~/.config/sashiko.toml)
+        #[arg(long)]
+        settings: Option<PathBuf>,
+
+        /// Skip AI review and only validate patch extraction/application
+        #[arg(long)]
+        no_ai: bool,
+
+        /// Custom prompt to append to the review task
+        #[arg(long)]
+        custom_prompt: Option<String>,
+
+        /// AI provider override
+        #[arg(long)]
+        ai_provider: Option<String>,
+
+        /// Prompt directory
+        #[arg(long)]
+        prompts: Option<PathBuf>,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+
+        /// When to use color
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
+
+        /// Select which stages from 1-7 to run
+        #[arg(long, hide = true, value_delimiter = ',')]
+        stages: Option<Vec<u8>>,
+    },
+
+    /// Internal worker mode for JSON-over-stdio review execution
+    #[command(hide = true)]
+    Worker {
+        /// Read patchset data from JSON via stdin
+        #[arg(long)]
+        json: bool,
+
+        /// Git revision to use as baseline
+        #[arg(long)]
+        baseline: Option<String>,
+
+        /// Path to the git repository. Overrides settings.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Parent directory for creating worktrees
+        #[arg(long)]
+        worktree_dir: Option<PathBuf>,
+
+        /// Prompt directory
+        #[arg(long)]
+        prompts: Option<PathBuf>,
+
+        /// Review only this patch index
+        #[arg(long)]
+        review_patch_index: Option<i64>,
+
+        /// Review this commit directly without applying patches
+        #[arg(long)]
+        review_commit: Option<String>,
+
+        /// Skip AI review but still validate patch application
+        #[arg(long)]
+        no_ai: bool,
+
+        /// Reuse an existing worktree path
+        #[arg(long)]
+        reuse_worktree: Option<PathBuf>,
+
+        /// AI provider override
+        #[arg(long)]
+        ai_provider: Option<String>,
+
+        /// Custom prompt to append to the review task
+        #[arg(long)]
+        custom_prompt: Option<String>,
+
+        /// Select which stages from 1-7 to run
+        #[arg(long, hide = true, value_delimiter = ',')]
+        stages: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 const PARSER_VERSION: i32 = 2;
@@ -74,8 +218,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. CLI --debug takes precedence (implies "info")
     // 2. Settings log_level
     // 3. Fallback to "warn" (if settings failed)
+    let is_review = matches!(cli.command, Some(Commands::Review { .. }));
     let log_level = if cli.debug {
         "info"
+    } else if is_review {
+        "warn"
     } else {
         match &settings_result {
             Ok(s) => &s.log_level,
@@ -94,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let builder = fmt()
         .with_env_filter(env_filter)
-        .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stdout))
+        .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stderr))
         .with_ansi(use_ansi);
 
     if plain_logs {
@@ -109,6 +256,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.debug {
         info!("Debug logging enabled");
+    }
+
+    if let Some(command) = &cli.command {
+        match command {
+            Commands::Init {
+                path,
+                force,
+                print,
+                prompts,
+            } => {
+                handle_init_command(path.clone(), *force, *print, *prompts)?;
+                return Ok(());
+            }
+            Commands::Review {
+                input,
+                baseline,
+                settings,
+                no_ai,
+                custom_prompt,
+                ai_provider,
+                prompts,
+                format,
+                color,
+                stages,
+            } => {
+                return handle_review_command(
+                    input.clone(),
+                    baseline.clone(),
+                    settings.clone(),
+                    *no_ai,
+                    custom_prompt.clone(),
+                    ai_provider.clone(),
+                    resolve_prompts_path(prompts.clone())?,
+                    *format,
+                    *color,
+                    stages.clone(),
+                )
+                .await;
+            }
+            Commands::Worker {
+                json: _,
+                baseline,
+                repo,
+                worktree_dir,
+                prompts,
+                review_patch_index,
+                review_commit,
+                no_ai,
+                reuse_worktree,
+                ai_provider,
+                custom_prompt,
+                stages,
+            } => {
+                let result = run_worker_from_stdin(WorkerOptions {
+                    settings_path: None,
+                    baseline: baseline.clone(),
+                    repo: repo.clone(),
+                    worktree_dir: worktree_dir.clone(),
+                    prompts: resolve_prompts_path(prompts.clone())?,
+                    review_patch_index: *review_patch_index,
+                    review_commit: review_commit.clone(),
+                    no_ai: *no_ai,
+                    reuse_worktree: reuse_worktree.clone(),
+                    ai_provider: ai_provider.clone(),
+                    custom_prompt: custom_prompt.clone(),
+                    stages: stages.clone(),
+                    scratch_clone: false,
+                    current_tree: false,
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    serde_json::json!({
+                        "patchset_id": 0,
+                        "error": e.to_string()
+                    })
+                });
+                print_worker_json(&result).map_err(Box::<dyn std::error::Error>::from)?;
+                return Ok(());
+            }
+        }
     }
 
     // Now handle settings result properly
@@ -625,6 +852,744 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     parser_handle.abort();
 
     Ok(())
+}
+
+fn handle_init_command(
+    path: Option<PathBuf>,
+    force: bool,
+    print: bool,
+    reinstall_prompts: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if print {
+        print!("{}", DEFAULT_SETTINGS);
+        return Ok(());
+    }
+
+    let path = path.unwrap_or_else(Settings::user_config_path);
+    if path.exists() && !force {
+        if reinstall_prompts {
+            let prompts_root = prompt_bundle::install_prompt_bundle(true)?;
+            println!("Installed prompts in {}", prompts_root.display());
+            return Ok(());
+        }
+        return Err(format!(
+            "{} already exists; use --force to overwrite it",
+            path.display()
+        )
+        .into());
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(&path, DEFAULT_SETTINGS)?;
+    println!("Wrote {}", path.display());
+
+    let prompts_root = prompt_bundle::install_prompt_bundle(reinstall_prompts)?;
+    println!("Installed prompts in {}", prompts_root.display());
+    Ok(())
+}
+
+fn resolve_prompts_path(path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = path {
+        return Ok(path);
+    }
+
+    Ok(prompt_bundle::default_kernel_prompts_path()?)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PatchStatus {
+    Queued,
+    PreScreening,
+    Planning,
+    Reviewing,
+    Finished,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PatchState {
+    index: i64,
+    subject: String,
+    status: PatchStatus,
+    planned_stages: Vec<u8>,
+    active_stages: std::collections::BTreeSet<u8>,
+    completed_stages: usize,
+    active_stage_turns: std::collections::HashMap<u8, usize>,
+}
+
+fn get_terminal_width() -> usize {
+    if let Ok(output) = std::process::Command::new("stty").arg("size").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parts: Vec<&str> = stdout.split_whitespace().collect();
+        if let Some(cols) = parts
+            .get(1)
+            .filter(|_| parts.len() == 2)
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            return cols;
+        }
+    }
+
+    if let Ok(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or(())
+    {
+        return cols;
+    }
+
+    80
+}
+
+struct ProgressState {
+    patches: std::collections::BTreeMap<i64, PatchState>,
+    printed_lines: usize,
+    total_turns: usize,
+    terminal_width: usize,
+    color_choice: ColorChoice,
+}
+
+fn stage_short_name(stage: u8) -> &'static str {
+    match stage {
+        1 => "Goal Analysis",
+        2 => "Implementation",
+        3 => "Execution Flow",
+        4 => "Resource Mgmt",
+        5 => "Locking & Sync",
+        6 => "Security Audit",
+        7 => "Hardware Review",
+        8 => "Deduplication",
+        9 => "Conflict Resolution",
+        10 => "Severity Estimation",
+        11 => "Report Generation",
+        _ => "Unknown",
+    }
+}
+
+struct TruncatingWriter {
+    limit: usize,
+    written: usize,
+    color_choice: ColorChoice,
+}
+
+impl TruncatingWriter {
+    fn new(limit: usize, color_choice: ColorChoice) -> Self {
+        Self {
+            limit,
+            written: 0,
+            color_choice,
+        }
+    }
+
+    fn write_segment(
+        &mut self,
+        text: &str,
+        color: Option<Color>,
+        bold: bool,
+    ) -> std::io::Result<()> {
+        if self.written >= self.limit {
+            return Ok(());
+        }
+
+        let remaining = self.limit - self.written;
+        let (to_write, suffix) = if text.chars().count() > remaining {
+            let taken: String = text.chars().take(remaining.saturating_sub(3)).collect();
+            (taken, "...")
+        } else {
+            (text.to_string(), "")
+        };
+
+        let mut stderr = StandardStream::stderr(self.color_choice);
+        let mut spec = ColorSpec::new();
+        if let Some(c) = color {
+            spec.set_fg(Some(c));
+        }
+        if bold {
+            spec.set_bold(true);
+        }
+        stderr.set_color(&spec)?;
+        write!(&mut stderr, "{}", to_write)?;
+
+        self.written += to_write.chars().count();
+
+        if !suffix.is_empty() {
+            stderr.reset()?;
+            write!(&mut stderr, "{}", suffix)?;
+            self.written += 3;
+        }
+
+        stderr.reset()
+    }
+}
+
+fn render_progress(state: &mut ProgressState) {
+    if state.printed_lines > 0 {
+        for _ in 0..state.printed_lines {
+            eprint!("\x1b[F\x1b[2K");
+        }
+        let _ = std::io::stderr().flush();
+    }
+
+    let mut lines_printed = 0;
+    let limit = state.terminal_width.saturating_sub(5);
+
+    for (&idx, p) in &state.patches {
+        let status_str = match &p.status {
+            PatchStatus::Queued => "Queued".to_string(),
+            PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
+            PatchStatus::Planning => "Planning stages...".to_string(),
+            PatchStatus::Reviewing => {
+                if p.active_stages.is_empty() {
+                    "Reviewing...".to_string()
+                } else {
+                    let mut stages_with_turns: Vec<(u8, usize)> = p
+                        .active_stages
+                        .iter()
+                        .map(|&st| {
+                            let turn = p.active_stage_turns.get(&st).cloned().unwrap_or(0);
+                            (st, turn)
+                        })
+                        .collect();
+                    stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
+
+                    let (top_stage, top_turn) = stages_with_turns[0];
+                    let stage_name = stage_short_name(top_stage);
+                    let stage_str = if top_turn > 0 {
+                        format!("{} (turn {})", stage_name, top_turn)
+                    } else {
+                        stage_name.to_string()
+                    };
+
+                    if p.active_stages.len() > 1 {
+                        format!("{} (+{} stages)", stage_str, p.active_stages.len() - 1)
+                    } else {
+                        stage_str
+                    }
+                }
+            }
+            PatchStatus::Finished => "Finished".to_string(),
+        };
+
+        // Calculate available width for subject to guarantee status is never truncated
+        let fixed_overhead = 16 + 3; // "      [Patch X] " + " | "
+        let status_len = status_str.chars().count();
+        let available_for_subject = limit
+            .saturating_sub(fixed_overhead)
+            .saturating_sub(status_len);
+
+        let target_subject_width = 30;
+        let subject_width = std::cmp::min(target_subject_width, available_for_subject);
+
+        let mut subject_padded = if p.subject.chars().count() > subject_width {
+            if subject_width > 3 {
+                let taken: String = p.subject.chars().take(subject_width - 3).collect();
+                format!("{}...", taken.trim_end())
+            } else {
+                "...".to_string()
+            }
+        } else {
+            p.subject.clone()
+        };
+
+        let padding_chars = subject_width.saturating_sub(subject_padded.chars().count());
+        if padding_chars > 0 {
+            subject_padded.push_str(&" ".repeat(padding_chars));
+        }
+
+        let mut tw = TruncatingWriter::new(limit, state.color_choice);
+        let _ = tw.write_segment(&format!("      [Patch {}] ", idx), None, false);
+        let _ = tw.write_segment(&subject_padded, None, false);
+        let _ = tw.write_segment(" | ", None, false);
+
+        let (status_color, status_bold) = match &p.status {
+            PatchStatus::Queued => (None, false),
+            PatchStatus::PreScreening | PatchStatus::Planning => (Some(Color::Cyan), false),
+            PatchStatus::Reviewing => (Some(Color::Cyan), true),
+            PatchStatus::Finished => (Some(Color::Green), true),
+        };
+        let _ = tw.write_segment(&status_str, status_color, status_bold);
+
+        eprintln!();
+        lines_printed += 1;
+    }
+
+    let total_patches = state.patches.len();
+    if total_patches > 0 {
+        let total_stages: usize = state
+            .patches
+            .values()
+            .map(|p| {
+                if p.planned_stages.is_empty() {
+                    11
+                } else {
+                    p.planned_stages.len()
+                }
+            })
+            .sum();
+        let completed_stages: usize = state.patches.values().map(|p| p.completed_stages).sum();
+        let percent = if total_stages > 0 {
+            (completed_stages * 100) / total_stages
+        } else {
+            0
+        };
+        let width = 20;
+        let filled = if total_stages > 0 {
+            (completed_stages * width) / total_stages
+        } else {
+            0
+        };
+
+        let mut tw = TruncatingWriter::new(limit, state.color_choice);
+        let _ = tw.write_segment("Overall: [", None, true);
+
+        let filled_bar = "█".repeat(filled);
+        let _ = tw.write_segment(&filled_bar, Some(Color::Green), false);
+
+        let empty_bar = "░".repeat(width - filled);
+        let _ = tw.write_segment(&empty_bar, None, false);
+
+        let _ = tw.write_segment("] ", None, true);
+
+        let stats = format!(
+            "{}% | {}/{} stages | {} turns",
+            percent, completed_stages, total_stages, state.total_turns
+        );
+        let _ = tw.write_segment(&stats, None, false);
+
+        eprintln!();
+        lines_printed += 1;
+    }
+
+    state.printed_lines = lines_printed;
+    let _ = std::io::stderr().flush();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_review_command(
+    input: String,
+    baseline: Option<String>,
+    settings_path: Option<PathBuf>,
+    no_ai: bool,
+    custom_prompt: Option<String>,
+    ai_provider: Option<String>,
+    prompts: PathBuf,
+    format: OutputFormat,
+    color: ColorMode,
+    stages: Option<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let color_choice = match color {
+        ColorMode::Always => ColorChoice::Always,
+        ColorMode::Never => ColorChoice::Never,
+        ColorMode::Auto => {
+            if std::io::stdout().is_terminal() {
+                ColorChoice::Auto
+            } else {
+                ColorChoice::Never
+            }
+        }
+    };
+
+    let repo_path = current_git_toplevel()?;
+    eprintln!("Reviewing: {}", input);
+    eprintln!("Using prompts: {}", prompts.display());
+
+    if sashiko::git_ops::is_dirty(&repo_path)
+        .await
+        .unwrap_or(false)
+    {
+        eprint_colored(color_choice, Color::Yellow, "WARNING:")?;
+        eprintln!(
+            " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
+        );
+        if std::io::stdin().is_terminal() {
+            print!("Do you want to proceed? [y/N]: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim().to_lowercase();
+            if trimmed != "y" && trimmed != "yes" {
+                eprintln!("Aborted.");
+                return Ok(());
+            }
+        }
+    }
+
+    let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
+        patches: std::collections::BTreeMap::new(),
+        printed_lines: 0,
+        total_turns: 0,
+        terminal_width: get_terminal_width(),
+        color_choice,
+    }));
+
+    let progress_state_clone = progress_state.clone();
+    let progress = move |event: ProgressEvent| {
+        let mut s = progress_state_clone.lock().unwrap();
+        match event {
+            ProgressEvent::ResolvingInput { .. } => {}
+            ProgressEvent::ResolvedCommits { commits } => {
+                for commit in commits {
+                    s.patches.insert(
+                        commit.index,
+                        PatchState {
+                            index: commit.index,
+                            subject: commit.subject.clone(),
+                            status: PatchStatus::Queued,
+                            planned_stages: Vec::new(),
+                            active_stages: std::collections::BTreeSet::new(),
+                            completed_stages: 0,
+                            active_stage_turns: std::collections::HashMap::new(),
+                        },
+                    );
+                }
+            }
+            ProgressEvent::BaselineResolved { rev, sha } => {
+                eprintln!("Baseline: {} ({})", rev, sha);
+            }
+            ProgressEvent::CurrentTreeReady { .. } => {}
+            ProgressEvent::WorktreeCreated { path } => {
+                eprintln!("Created temporary worktree at {}", path.display());
+            }
+            ProgressEvent::ApplyingPatch {
+                index,
+                total,
+                subject,
+            } => {
+                eprintln!("   Applying patch {}/{}: {}", index, total, subject);
+            }
+            ProgressEvent::PatchApplied { index } => {
+                eprintln!("   Applied patch {}", index);
+            }
+            ProgressEvent::PatchFailed { index, error } => {
+                eprintln!("   Failed to apply patch {}: {}", index, error);
+            }
+            ProgressEvent::AiReviewStarted { patches } => {
+                eprintln!(
+                    "Running review for {} patch{}",
+                    patches,
+                    if patches == 1 { "" } else { "es" }
+                );
+            }
+            ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.status = PatchStatus::PreScreening;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::AiReviewPlanningStarted { patch_index } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.status = PatchStatus::Planning;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::AiReviewPlanReady {
+                patch_index,
+                planned_stages,
+            } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.status = PatchStatus::Reviewing;
+                    p.planned_stages = planned_stages;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::AiReviewStageStarted { patch_index, stage } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.status = PatchStatus::Reviewing;
+                    p.active_stages.insert(stage);
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::AiReviewStageTurn {
+                patch_index,
+                stage,
+                turn,
+                ..
+            } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.active_stage_turns.insert(stage, turn);
+                }
+                s.total_turns += 1;
+                render_progress(&mut s);
+            }
+            ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.active_stages.remove(&stage);
+                    p.active_stage_turns.remove(&stage);
+                    p.completed_stages += 1;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::AiReviewAttempt {
+                patch_index: _,
+                attempt,
+                max_attempts,
+            } => {
+                if attempt > 1 {
+                    // Let's just log this since we don't want stdout/stderr output to disrupt the rewrite loop
+                    info!("AI review retry (attempt {}/{})", attempt, max_attempts);
+                }
+            }
+            ProgressEvent::AiReviewFinished { patch_index } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.status = PatchStatus::Finished;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::ReviewComplete => {
+                // Ensure overall review is finished and printed lines cleared or kept
+                // Let's not call render_progress here, just print review complete
+                eprintln!("Review complete");
+            }
+        }
+    };
+
+    let result = run_git_review(
+        repo_path,
+        input.clone(),
+        ReviewOptions {
+            baseline,
+            settings_path,
+            prompts,
+            no_ai,
+            ai_provider,
+            custom_prompt,
+            stages,
+        },
+        Some(&progress),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutputFormat::Text => {
+            print_review_result(&result, &input, color_choice)?;
+        }
+    }
+
+    if result_has_error(&result) {
+        std::process::exit(3);
+    }
+    if result_has_high_or_critical_findings(&result) {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let output = std::process::Command::new("git")
+        .current_dir(&cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "current directory is not inside a git repository: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+
+    Ok(Path::new(String::from_utf8_lossy(&output.stdout).trim()).to_path_buf())
+}
+
+fn print_review_result(
+    result: &Value,
+    _input: &str,
+    color_choice: ColorChoice,
+) -> std::io::Result<()> {
+    if let Some(error) = result.get("error").and_then(|v| v.as_str())
+        && !error.is_empty()
+    {
+        println!();
+        print_colored(color_choice, Color::Red, "Error: ")?;
+        println!("{}", error);
+        return Ok(());
+    }
+
+    let Some(review) = result.get("review") else {
+        return Ok(());
+    };
+    let Some(findings) = review.get("findings").and_then(|v| v.as_array()) else {
+        print_colored(color_choice, Color::Green, "\nNo AI review was run.\n")?;
+        return Ok(());
+    };
+
+    let counts = count_findings(findings);
+    let total = counts.critical + counts.high + counts.medium + counts.low;
+    if total == 0 {
+        print_colored(color_choice, Color::Green, "\nNo issues found.\n")?;
+    } else {
+        println!("\nFindings:");
+        print!("  Critical: ");
+        print_colored(color_choice, Color::Red, &counts.critical.to_string())?;
+        print!("  High: ");
+        print_colored(color_choice, Color::Red, &counts.high.to_string())?;
+        print!("  Medium: ");
+        print_colored(color_choice, Color::Yellow, &counts.medium.to_string())?;
+        print!("  Low: ");
+        print_colored(color_choice, Color::Cyan, &counts.low.to_string())?;
+        println!("\n");
+
+        let mut grouped_findings: std::collections::BTreeMap<i64, Vec<&Value>> =
+            std::collections::BTreeMap::new();
+        let mut ungrouped_findings = Vec::new();
+
+        for finding in findings {
+            if let Some(p_idx) = finding.get("patch_index").and_then(|v| v.as_i64()) {
+                grouped_findings.entry(p_idx).or_default().push(finding);
+            } else {
+                ungrouped_findings.push(finding);
+            }
+        }
+
+        for (p_idx, patch_findings) in grouped_findings {
+            let subject = patch_findings
+                .first()
+                .and_then(|f| f.get("patch_subject"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            print!("  --- Patch [{}] ", p_idx);
+            if !subject.is_empty() {
+                print_colored(color_choice, Color::Cyan, subject)?;
+            }
+            println!(" ---");
+            for finding in patch_findings {
+                print_finding(finding, color_choice)?;
+            }
+            println!();
+        }
+
+        if !ungrouped_findings.is_empty() {
+            println!("  --- General Findings ---");
+            for finding in ungrouped_findings {
+                print_finding(finding, color_choice)?;
+            }
+        }
+    }
+
+    if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
+        && !inline.trim().is_empty()
+        && inline.trim() != "No issues found."
+    {
+        println!("\nInline Review:");
+        for line in inline.lines() {
+            if line.starts_with("diff ") || line.starts_with("+++") || line.starts_with("---") {
+                println!("{}", line);
+            } else if line.starts_with('+') {
+                print_colored(color_choice, Color::Green, line)?;
+                println!();
+            } else if line.starts_with('-') {
+                print_colored(color_choice, Color::Red, line)?;
+                println!();
+            } else if line.starts_with("@@") {
+                print_colored(color_choice, Color::Cyan, line)?;
+                println!();
+            } else {
+                println!("{}", line);
+            }
+        }
+    }
+
+    let tokens_in = result
+        .get("tokens_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let tokens_out = result
+        .get("tokens_out")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let tokens_cached = result
+        .get("tokens_cached")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if tokens_in > 0 || tokens_out > 0 || tokens_cached > 0 {
+        println!(
+            "\nTokens: {} in / {} out / {} cached",
+            tokens_in, tokens_out, tokens_cached
+        );
+    }
+
+    Ok(())
+}
+
+fn print_finding(finding: &Value, color_choice: ColorChoice) -> std::io::Result<()> {
+    let severity = finding
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let color = match severity.to_ascii_lowercase().as_str() {
+        "critical" | "high" => Color::Red,
+        "medium" => Color::Yellow,
+        "low" => Color::Cyan,
+        _ => Color::White,
+    };
+    let problem = finding
+        .get("problem")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    print!("  ");
+    print_colored(color_choice, color, &format!("[{}] ", severity))?;
+    println!("{}", problem);
+    Ok(())
+}
+
+#[derive(Default)]
+struct FindingCounts {
+    critical: usize,
+    high: usize,
+    medium: usize,
+    low: usize,
+}
+
+fn count_findings(findings: &[Value]) -> FindingCounts {
+    let mut counts = FindingCounts::default();
+    for finding in findings {
+        if finding
+            .get("preexisting")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        match finding
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "critical" => counts.critical += 1,
+            "high" => counts.high += 1,
+            "medium" => counts.medium += 1,
+            "low" => counts.low += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn print_colored(color_choice: ColorChoice, color: Color, text: &str) -> std::io::Result<()> {
+    let mut stdout = StandardStream::stdout(color_choice);
+    stdout.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    write!(&mut stdout, "{}", text)?;
+    stdout.reset()
+}
+
+fn eprint_colored(color_choice: ColorChoice, color: Color, text: &str) -> std::io::Result<()> {
+    let mut stderr = StandardStream::stderr(color_choice);
+    stderr.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    write!(&mut stderr, "{}", text)?;
+    stderr.reset()
 }
 
 enum ProcessStatus {
@@ -1335,6 +2300,123 @@ mod tests {
         let args = vec!["sashiko"];
         let cli = Cli::parse_from(args);
         assert_eq!(cli.port, None);
+    }
+
+    #[test]
+    fn test_cli_init() {
+        let args = vec!["sashiko", "init", "--path", "/tmp/sashiko.toml", "--force"];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Init {
+                path,
+                force,
+                print,
+                prompts,
+            }) => {
+                assert_eq!(path.as_deref(), Some(Path::new("/tmp/sashiko.toml")));
+                assert!(force);
+                assert!(!print);
+                assert!(!prompts);
+            }
+            _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_command_writes_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sashiko.toml");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", temp.path().join("data"));
+        }
+
+        handle_init_command(Some(path.clone()), false, false, false).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, DEFAULT_SETTINGS);
+
+        assert!(handle_init_command(Some(path.clone()), false, false, false).is_err());
+        handle_init_command(Some(path), true, false, false).unwrap();
+
+        unsafe {
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_review() {
+        let args = vec!["sashiko", "review"];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Review { input, .. }) => {
+                assert_eq!(input, "HEAD");
+            }
+            _ => panic!("expected review command"),
+        }
+
+        let args = vec![
+            "sashiko",
+            "review",
+            "HEAD~2..HEAD",
+            "--baseline",
+            "main",
+            "--no-ai",
+            "--format",
+            "json",
+            "--color",
+            "never",
+        ];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Review {
+                input,
+                baseline,
+                settings,
+                no_ai,
+                format,
+                color,
+                ..
+            }) => {
+                assert_eq!(input, "HEAD~2..HEAD");
+                assert_eq!(baseline.as_deref(), Some("main"));
+                assert!(settings.is_none());
+                assert!(no_ai);
+                assert!(matches!(format, OutputFormat::Json));
+                assert!(matches!(color, ColorMode::Never));
+            }
+            _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_worker_hidden_command() {
+        let args = vec![
+            "sashiko",
+            "worker",
+            "--baseline",
+            "HEAD~1",
+            "--review-patch-index",
+            "2",
+            "--no-ai",
+        ];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Worker {
+                baseline,
+                review_patch_index,
+                no_ai,
+                ..
+            }) => {
+                assert_eq!(baseline.as_deref(), Some("HEAD~1"));
+                assert_eq!(review_patch_index, Some(2));
+                assert!(no_ai);
+            }
+            _ => panic!("expected worker command"),
+        }
     }
 
     #[test]

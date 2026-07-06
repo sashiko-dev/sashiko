@@ -138,6 +138,7 @@ pub struct SessionRunner<'a> {
     max_validation_attempts: usize,
     max_transient_retries: usize,
     max_provider_error_retries: usize,
+    on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -149,6 +150,7 @@ impl<'a> SessionRunner<'a> {
             max_validation_attempts: 3,
             max_transient_retries: 5,
             max_provider_error_retries: 3,
+            on_turn: None,
         }
     }
 
@@ -173,6 +175,15 @@ impl<'a> SessionRunner<'a> {
     /// Configures the maximum provider error retries.
     pub fn with_max_provider_error_retries(mut self, retries: usize) -> Self {
         self.max_provider_error_retries = retries;
+        self
+    }
+
+    /// Configures a turn callback.
+    pub fn with_turn_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(usize, usize) + Send + Sync + 'a,
+    {
+        self.on_turn = Some(Box::new(cb));
         self
     }
 
@@ -211,6 +222,9 @@ impl<'a> SessionRunner<'a> {
             turns += 1;
             if turns > self.max_turns {
                 anyhow::bail!("Session exceeded max turns limit ({})", self.max_turns);
+            }
+            if let Some(ref cb) = self.on_turn {
+                cb(turns, self.max_turns);
             }
 
             let request = AiRequest {

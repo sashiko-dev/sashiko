@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::settings::Settings;
+use crate::settings::{AiSettings, Settings};
 
 /// Represents the role of a message in an AI conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -382,21 +382,21 @@ pub async fn create_provider_cached(
 
 /// Creates an AI provider based on the application settings.
 pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
-    match settings.ai.provider.to_lowercase().as_str() {
+    create_provider_from_ai(&settings.ai)
+}
+
+/// Creates an AI provider based on AI settings only.
+pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
+    match ai.provider.to_lowercase().as_str() {
         "gemini" => {
-            let model = settings.ai.model.clone();
+            let model = ai.model.clone();
             Ok(Arc::new(gemini::GeminiClient::new(model)))
         }
         "stdio-gemini" => Ok(Arc::new(gemini::StdioGeminiClient::new())),
         "claude" => {
-            let model = settings.ai.model.clone();
-            let enable_caching = settings
-                .ai
-                .claude
-                .as_ref()
-                .map(|c| c.prompt_caching)
-                .unwrap_or(true); // Default to enabled
-            let claude = settings.ai.claude.as_ref();
+            let model = ai.model.clone();
+            let enable_caching = ai.claude.as_ref().map(|c| c.prompt_caching).unwrap_or(true); // Default to enabled
+            let claude = ai.claude.as_ref();
             let max_tokens = claude.map(|c| c.max_tokens).unwrap_or(4096);
             let base_url = claude
                 .and_then(|c| c.base_url.clone())
@@ -415,8 +415,8 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
         #[cfg(feature = "bedrock")]
         "bedrock" => {
-            let model = settings.ai.model.clone();
-            let bedrock = settings.ai.bedrock.as_ref();
+            let model = ai.model.clone();
+            let bedrock = ai.bedrock.as_ref();
             let region = bedrock.and_then(|b| b.region.clone());
             let enable_caching = bedrock.map(|b| b.prompt_caching).unwrap_or(true);
             let max_tokens = bedrock.map(|b| b.max_tokens).unwrap_or(8192);
@@ -434,31 +434,28 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
         #[cfg(not(feature = "bedrock"))]
         "bedrock" => bail!("bedrock provider requires the 'bedrock' feature"),
         "openai" | "openai-compatible" => {
-            let provider_type = match settings.ai.provider.to_lowercase().as_str() {
+            let provider_type = match ai.provider.to_lowercase().as_str() {
                 "openai" => openai::OpenAiProviderType::OpenAi,
                 _ => openai::OpenAiProviderType::OpenAiCompatible,
             };
 
-            let base_url = settings
-                .ai
+            let base_url = ai
                 .openai_compat
                 .as_ref()
                 .and_then(|c| c.base_url.clone())
                 .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_base_url_for_model(&settings.ai.model)
+                    openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
                 });
 
-            let context_window = settings
-                .ai
+            let context_window = ai
                 .openai_compat
                 .as_ref()
                 .and_then(|c| c.context_window_size)
                 .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_context_window_for_model(&settings.ai.model)
+                    openai::OpenAiCompatClient::default_context_window_for_model(&ai.model)
                 });
 
-            let max_tokens = settings
-                .ai
+            let max_tokens = ai
                 .openai_compat
                 .as_ref()
                 .and_then(|c| c.max_tokens)
@@ -467,28 +464,28 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
             let provider = openai::OpenAiCompatClient::new(
                 base_url,
                 provider_type,
-                settings.ai.model.clone(),
+                ai.model.clone(),
                 context_window,
                 max_tokens,
-                settings.ai.api_timeout_secs,
+                ai.api_timeout_secs,
             )?;
 
             Ok(Arc::new(provider))
         }
         "claude-cli" => {
-            let cfg = settings.ai.claude_cli.as_ref();
+            let cfg = ai.claude_cli.as_ref();
             Ok(Arc::new(claude_cli::ClaudeCliProvider {
-                model: settings.ai.model.clone(),
+                model: ai.model.clone(),
                 effort: cfg.and_then(|c| c.effort.clone()),
             }))
         }
         "devin-cli" => {
-            let cfg = settings.ai.devin_cli.as_ref();
+            let cfg = ai.devin_cli.as_ref();
             // An empty model string in [ai] means "use the devin default".
-            let model = if settings.ai.model.is_empty() {
+            let model = if ai.model.is_empty() {
                 None
             } else {
-                Some(settings.ai.model.clone())
+                Some(ai.model.clone())
             };
             Ok(Arc::new(devin_cli::DevinCliProvider {
                 model,
@@ -497,27 +494,27 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
             }))
         }
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
-            model: settings.ai.model.clone(),
+            model: ai.model.clone(),
         })),
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
-            model: settings.ai.model.clone(),
+            model: ai.model.clone(),
         })),
         "kiro-cli" => {
-            let cfg = settings.ai.kiro_cli.as_ref();
+            let cfg = ai.kiro_cli.as_ref();
             Ok(Arc::new(kiro_cli::KiroCliProvider {
-                model: settings.ai.model.clone(),
+                model: ai.model.clone(),
                 binary: cfg
                     .map(|c| c.binary.clone())
                     .unwrap_or_else(|| "kiro-cli".to_string()),
                 agent: cfg.and_then(|c| c.agent.clone()),
                 context_window_size: cfg.map(|c| c.context_window_size).unwrap_or(200_000),
-                timeout_secs: settings.ai.api_timeout_secs,
+                timeout_secs: ai.api_timeout_secs,
             }))
         }
         #[cfg(feature = "vertex")]
         "vertex" => {
-            let model = settings.ai.model.clone();
-            let vertex = settings.ai.vertex.as_ref();
+            let model = ai.model.clone();
+            let vertex = ai.vertex.as_ref();
             let project_id = vertex
                 .and_then(|v| v.project_id.clone())
                 .or_else(|| std::env::var("ANTHROPIC_VERTEX_PROJECT_ID").ok())
