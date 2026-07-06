@@ -478,6 +478,22 @@
             vertical-align: middle;
         }
 
+        /* Version badge for v2+ patchsets */
+        .tag-version {
+            display: inline-block;
+            background-color: #fbbf24;
+            color: #000;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 0.75em;
+            font-weight: 600;
+            margin-right: 4px;
+            vertical-align: middle;
+        }
+        @media (prefers-color-scheme: dark) {
+            .tag-version { background-color: #d97706; color: #fff; }
+        }
+
         /* Pagination */
         .pagination {
             display: flex;
@@ -1981,9 +1997,16 @@
                     row.onclick = clickHandler;
                     row.onauxclick = clickHandler;
 
+                    let versionBadge = '';
+                    if (p.version && p.version > 1) {
+                        versionBadge = `<span class="tag-version">v${p.version}</span>`;
+                    }
+
                     let tagsHtml = '';
                     if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
-                        tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                        tagsHtml = '<div style="margin-top:2px">' + versionBadge + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                    } else if (versionBadge) {
+                        tagsHtml = '<div style="margin-top:2px">' + versionBadge + '</div>';
                     }
 
                     let statusLabel = p.status || 'Pending';

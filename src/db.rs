@@ -3473,7 +3473,7 @@ impl Database {
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
                     p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
+                    p.embargo_until, p.mr_url, p.slug, p.version, p.previous_version_id
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -3502,6 +3502,8 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            let version: i32 = row.get(20).unwrap_or(1);
+            let previous_version_id: Option<i64> = row.get(21).ok();
             // Fetch baseline details if needed
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
@@ -3718,7 +3720,9 @@ impl Database {
                 "provider": provider,
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
-                "slug": slug
+                "slug": slug,
+                "version": version,
+                "previous_version_id": previous_version_id
             })))
         } else {
             Ok(None)
@@ -3738,7 +3742,7 @@ impl Database {
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
                     p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
+                    p.embargo_until, p.mr_url, p.slug, p.version, p.previous_version_id
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -3767,6 +3771,8 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            let version: i32 = row.get(20).unwrap_or(1);
+            let previous_version_id: Option<i64> = row.get(21).ok();
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
                     .conn
@@ -3958,7 +3964,9 @@ impl Database {
                 "provider": provider,
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
-                "slug": slug
+                "slug": slug,
+                "version": version,
+                "previous_version_id": previous_version_id
             })))
         } else {
             Ok(None)
