@@ -62,6 +62,9 @@ pub struct PatchsetRow {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    pub version: i32,
+    pub previous_version_id: Option<i64>,
+    pub commit_range: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +700,26 @@ impl Database {
         let _ = self
             .try_add_column("patchsets", "mr_number", "INTEGER")
             .await;
+        let _ = self
+            .try_add_column("patchsets", "version", "INTEGER DEFAULT 1")
+            .await;
+        let _ = self
+            .try_add_column(
+                "patchsets",
+                "previous_version_id",
+                "INTEGER REFERENCES patchsets(id) ON DELETE SET NULL",
+            )
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "commit_range", "TEXT")
+            .await;
+        let _ = self
+            .conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_patchsets_version ON patchsets(version) WHERE version > 1",
+                (),
+            )
+            .await;
 
         let _ = self
             .conn
@@ -792,9 +815,6 @@ impl Database {
             .execute("ALTER TABLE findings DROP COLUMN line_number", ())
             .await;
 
-        let _ = self
-            .try_create_index("idx_patchsets_date", "patchsets", "date DESC")
-            .await;
         let _ = self
             .try_create_index(
                 "idx_reviews_patchset_status",
@@ -2904,9 +2924,9 @@ impl Database {
         // No match found, create new patchset
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters, version)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone(), version.unwrap_or(1) as i32],
             )
             .await?;
 
@@ -3125,7 +3145,7 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug
+             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug, p.version, p.previous_version_id, p.commit_range
              FROM (
                  SELECT id FROM patchsets p
                  {}
@@ -3229,6 +3249,9 @@ impl Database {
                         mr_title: row.get(21).ok(),
                         mr_number: row.get(22).ok(),
                         slug: row.get(23).ok(),
+                        version: row.get(24).unwrap_or(1),
+                        previous_version_id: row.get(25).ok(),
+                        commit_range: row.get(26).ok(),
                     });
                 }
                 Ok(None) => break,
@@ -4060,7 +4083,7 @@ impl Database {
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug
+            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, version, previous_version_id, commit_range
              FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
@@ -4096,6 +4119,9 @@ impl Database {
                 mr_title: None,
                 mr_number: None,
                 slug: row.get(15).ok(),
+                version: row.get(16).unwrap_or(1),
+                previous_version_id: row.get(17).ok(),
+                commit_range: row.get(18).ok(),
             });
         }
         Ok(patchsets)
@@ -4155,6 +4181,9 @@ impl Database {
                         mr_title: None,
                         mr_number: None,
                         slug: None,
+                        version: 1,
+                        previous_version_id: None,
+                        commit_range: None,
                     });
                 }
                 Ok(None) => break,
@@ -4521,6 +4550,8 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        version: Option<i32>,
+        commit_range: Option<&str>,
     ) -> Result<i64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -4568,9 +4599,9 @@ impl Database {
         // 3. Create the fetching patchset
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, version, commit_range)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, version.unwrap_or(1), commit_range],
             )
             .await?;
 
@@ -9289,6 +9320,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -9354,6 +9387,8 @@ mod tests {
         db.create_fetching_patchset(
             &synthetic_id,
             "Fetching placeholder",
+            None,
+            None,
             None,
             None,
             None,
@@ -9458,6 +9493,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -9478,6 +9515,8 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cancelled,
                 "Fetching cancelled placeholder",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -9732,6 +9771,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -9799,6 +9840,8 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cover,
                 "Fetching retry",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -10016,6 +10059,124 @@ mod tests {
         assert!(ps.is_some(), "create_patchset must succeed after migration");
     }
 
+    #[tokio::test]
+    async fn test_version_column_persisted() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root-v2", "Version Test", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "v2-msg1",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH v2 1/1] Fix bug",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps = db
+            .create_patchset(
+                thread_id,
+                None,
+                "v2-msg1",
+                "[PATCH v2 1/1] Fix bug",
+                "Author",
+                1000,
+                1,
+                2,
+                "",
+                "",
+                Some(2), // version = 2
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Verify version was persisted by querying directly
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT version FROM patchsets WHERE id = ?",
+                libsql::params![ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let version: i32 = row.get(0).unwrap();
+        assert_eq!(version, 2, "Version should be 2");
+    }
+
+    #[tokio::test]
+    async fn test_version_defaults_to_one() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root-v1", "Default Version Test", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "v1-msg1",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 1/1] Add feature",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps = db
+            .create_patchset(
+                thread_id,
+                None,
+                "v1-msg1",
+                "[PATCH 1/1] Add feature",
+                "Author",
+                2000,
+                1,
+                2,
+                "",
+                "",
+                None, // no version tag — should default to 1
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT version FROM patchsets WHERE id = ?",
+                libsql::params![ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let version: i32 = row.get(0).unwrap();
+        assert_eq!(version, 1, "Version should default to 1");
+    }
     #[tokio::test]
     async fn test_bug_crud_and_links() {
         let db_settings = crate::settings::DatabaseSettings {

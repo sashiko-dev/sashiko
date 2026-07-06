@@ -347,6 +347,23 @@ pub fn parse_subject_version(subject: &str) -> Option<u32> {
     None
 }
 
+/// Sanitize a message-ID by stripping null bytes and control characters
+/// (ASCII < 32 except tab). Logs a warning if any were removed.
+pub fn sanitize_message_id(msg_id: &str) -> String {
+    let cleaned: String = msg_id
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect();
+    if cleaned.len() != msg_id.len() {
+        tracing::warn!(
+            "Stripped control characters from message-ID: original len={}, cleaned len={}",
+            msg_id.len(),
+            cleaned.len()
+        );
+    }
+    cleaned
+}
+
 pub fn get_subject_prefixes(subject: &str) -> Vec<String> {
     static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
     let re = RE_BRACKETS.get_or_init(|| Regex::new(r"\[(.*?)\]").unwrap());
@@ -948,6 +965,39 @@ diff --git a/file.c b/file.c";
         assert_eq!(
             inject_changelog_into_git_show(git_show, changelog),
             expected
+        );
+    }
+
+    #[test]
+    fn test_sanitize_message_id_clean() {
+        assert_eq!(
+            sanitize_message_id("<20250706.12345-1-user@kernel.org>"),
+            "<20250706.12345-1-user@kernel.org>"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_message_id_strips_null_bytes() {
+        assert_eq!(
+            sanitize_message_id("<test\x00@kernel.org>"),
+            "<test@kernel.org>"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_message_id_strips_control_chars() {
+        assert_eq!(
+            sanitize_message_id("<test\x01\x02\x03@kernel.org>"),
+            "<test@kernel.org>"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_message_id_preserves_tab() {
+        // Tab is a control character but is valid in email headers
+        assert_eq!(
+            sanitize_message_id("<test\t@kernel.org>"),
+            "<test\t@kernel.org>"
         );
     }
 }
