@@ -1117,8 +1117,20 @@ async fn forge_webhook(
     if state.read_only {
         return Err(StatusCode::FORBIDDEN);
     }
-    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
-        info!("Refused {} webhook from non-localhost: {}", provider, addr);
+
+    let is_loopback = addr.ip().to_canonical().is_loopback();
+    let webhook_secret = state.settings.forge.webhook_secret.as_deref();
+    let has_secret = webhook_secret.is_some();
+
+    // When webhook_secret is configured, the signature check in
+    // validate_event is the access control — no need for
+    // --enable-unsafe-all-submit. Without a secret, fall back to the
+    // existing localhost-only or explicit flag behavior.
+    if !is_loopback && !has_secret && !state.allow_all_submit {
+        info!(
+            "Refused {} webhook from {}: configure webhook_secret or use --enable-unsafe-all-submit",
+            provider, addr
+        );
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1127,7 +1139,7 @@ async fn forge_webhook(
         StatusCode::NOT_FOUND
     })?;
 
-    forge.validate_event(&headers)?;
+    forge.validate_event(&headers, &body, webhook_secret)?;
 
     let (action, metadata) = forge.parse_payload(&body)?;
 

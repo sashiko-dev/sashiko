@@ -709,6 +709,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     });
 
+    // Warn about insecure forge webhook configurations
+    if settings.forge.enabled && settings.forge.webhook_secret.is_none() {
+        if cli.enable_unsafe_all_submit {
+            warn!(
+                "Accepting unauthenticated webhook requests from all addresses. \
+                 Configure forge.webhook_secret for production deployments."
+            );
+        } else {
+            warn!(
+                "Forge webhooks enabled without webhook_secret. \
+                 Non-localhost requests require --enable-unsafe-all-submit. \
+                 See docs/WEBHOOK_SECURITY.md"
+            );
+        }
+    }
+
     // Start Ingestor (feeds raw_tx)
     let ingestor_handle = if !(settings.forge.enabled && settings.forge.disable_nntp) {
         let ingestor = Ingestor::new(

@@ -14,11 +14,17 @@
 
 use anyhow::Result;
 use axum::http::{HeaderMap, StatusCode};
+use base64::Engine;
 use bytes::Bytes;
+use hmac::{Hmac, Mac, digest::KeyInit};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
-/// Validate a git commit SHA (40-char SHA-1 or 64-char SHA-256, lowercase hex).
+type HmacSha256 = Hmac<Sha256>;
+
+/// Validate a git commit SHA (40-char SHA-1 or 64-char SHA-256, hex digits).
 pub fn is_valid_git_sha(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -31,6 +37,10 @@ pub fn is_valid_repo_url(url: &str) -> bool {
 /// Check that a repository URL does not target known internal or metadata
 /// endpoints. Returns false for cloud metadata services, loopback addresses,
 /// and other destinations that should never be cloned.
+///
+/// This is a best-effort blocklist, not a complete SSRF mitigation. DNS
+/// rebinding and URL encoding can bypass string-based checks. The primary
+/// access control is webhook signature verification.
 pub fn is_safe_repo_url(url: &str) -> bool {
     if !is_valid_repo_url(url) {
         return false;
@@ -42,6 +52,81 @@ pub fn is_safe_repo_url(url: &str) -> bool {
         && !lower.contains("127.0.0.1")
         && !lower.contains("[::1]")
         && !lower.contains("0.0.0.0")
+}
+
+/// Decode a webhook secret. If prefixed with "whsec_", strip the prefix
+/// and base64-decode the remainder (Standard Webhooks convention). Otherwise
+/// return the raw string bytes.
+fn decode_webhook_secret(secret: &str) -> Vec<u8> {
+    if let Some(encoded) = secret.strip_prefix("whsec_") {
+        match base64::engine::general_purpose::STANDARD.decode(encoded) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!(
+                    "webhook_secret has whsec_ prefix but base64 decode failed: {}. \
+                     Check that the token was copied correctly from GitLab. \
+                     Falling back to raw string bytes.",
+                    e
+                );
+                secret.as_bytes().to_vec()
+            }
+        }
+    } else {
+        secret.as_bytes().to_vec()
+    }
+}
+
+/// Verify a Standard Webhooks HMAC-SHA256 signature (GitLab 19.0+ signing
+/// token). The signature header may contain multiple space-separated entries,
+/// each in the format "v1,{base64(hmac)}". The HMAC is computed over
+/// "{message_id}.{timestamp}.{body}".
+fn verify_standard_webhook_signature(
+    secret: &str,
+    msg_id: &str,
+    timestamp: &str,
+    body: &[u8],
+    signatures: &str,
+) -> bool {
+    let key = decode_webhook_secret(secret);
+    let mut mac = match HmacSha256::new_from_slice(&key) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let preamble = format!("{}.{}.", msg_id, timestamp);
+    mac.update(preamble.as_bytes());
+    mac.update(body);
+    let result = mac.finalize().into_bytes();
+    let expected = format!(
+        "v1,{}",
+        base64::engine::general_purpose::STANDARD.encode(result)
+    );
+    signatures
+        .split(' ')
+        .any(|sig| expected.as_bytes().ct_eq(sig.as_bytes()).into())
+}
+
+/// Verify a GitHub HMAC-SHA256 signature. The header value has the format
+/// "sha256={hex_digest}".
+fn verify_github_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
+    let hex_sig = match signature_header.strip_prefix("sha256=") {
+        Some(s) => s,
+        None => return false,
+    };
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let result = mac.finalize().into_bytes();
+    let computed: String = result.iter().map(|b| format!("{:02x}", b)).collect();
+    computed.as_bytes().ct_eq(hex_sig.as_bytes()).into()
+}
+
+/// Verify a legacy GitLab secret token via constant-time comparison.
+/// Note: ct_eq reveals whether the lengths differ (but not the content).
+/// This is acceptable for webhook secrets with sufficient entropy.
+fn verify_secret_token(secret: &str, token_header: &str) -> bool {
+    secret.as_bytes().ct_eq(token_header.as_bytes()).into()
 }
 
 /// Metadata extracted from forge webhook
@@ -60,8 +145,15 @@ pub trait ForgeProvider: Send + Sync {
     /// Provider name (e.g., "GitHub", "GitLab")
     fn name(&self) -> &str;
 
-    /// Validate webhook event from headers
-    fn validate_event(&self, headers: &HeaderMap) -> Result<(), StatusCode>;
+    /// Validate webhook event type and verify signature when a secret is
+    /// configured. Returns `UNAUTHORIZED` if the signature is missing or
+    /// invalid, `BAD_REQUEST` if the event type is wrong.
+    fn validate_event(
+        &self,
+        headers: &HeaderMap,
+        body: &Bytes,
+        secret: Option<&str>,
+    ) -> Result<(), StatusCode>;
 
     /// Parse webhook payload and extract metadata
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode>;
@@ -75,7 +167,12 @@ impl ForgeProvider for GitHubForge {
         "GitHub"
     }
 
-    fn validate_event(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+    fn validate_event(
+        &self,
+        headers: &HeaderMap,
+        body: &Bytes,
+        secret: Option<&str>,
+    ) -> Result<(), StatusCode> {
         let event = headers
             .get("x-github-event")
             .and_then(|v| v.to_str().ok())
@@ -83,6 +180,16 @@ impl ForgeProvider for GitHubForge {
 
         if event != "pull_request" {
             return Err(StatusCode::BAD_REQUEST);
+        }
+
+        if let Some(secret) = secret {
+            let sig = headers
+                .get("x-hub-signature-256")
+                .and_then(|v| v.to_str().ok())
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+            if !verify_github_signature(secret, body, sig) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         }
 
         Ok(())
@@ -156,7 +263,12 @@ impl ForgeProvider for GitLabForge {
         "GitLab"
     }
 
-    fn validate_event(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+    fn validate_event(
+        &self,
+        headers: &HeaderMap,
+        body: &Bytes,
+        secret: Option<&str>,
+    ) -> Result<(), StatusCode> {
         let event = headers
             .get("x-gitlab-event")
             .and_then(|v| v.to_str().ok())
@@ -164,6 +276,35 @@ impl ForgeProvider for GitLabForge {
 
         if event != "Merge Request Hook" {
             return Err(StatusCode::BAD_REQUEST);
+        }
+
+        if let Some(secret) = secret {
+            // Try Standard Webhooks signature first (GitLab 19.0+)
+            if let (Some(msg_id), Some(timestamp), Some(sig)) = (
+                headers.get("webhook-id").and_then(|v| v.to_str().ok()),
+                headers
+                    .get("webhook-timestamp")
+                    .and_then(|v| v.to_str().ok()),
+                headers
+                    .get("webhook-signature")
+                    .and_then(|v| v.to_str().ok()),
+            ) {
+                if !verify_standard_webhook_signature(secret, msg_id, timestamp, body, sig) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+                return Ok(());
+            }
+
+            // Fallback: legacy secret token (X-Gitlab-Token)
+            if let Some(token) = headers.get("x-gitlab-token").and_then(|v| v.to_str().ok()) {
+                if !verify_secret_token(secret, token) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+                return Ok(());
+            }
+
+            // Secret configured but no auth header present
+            return Err(StatusCode::UNAUTHORIZED);
         }
 
         Ok(())
@@ -506,5 +647,197 @@ mod tests {
         let (action, metadata) = forge.parse_payload(&body).unwrap();
         assert_eq!(action, "merge_request");
         assert_eq!(metadata.pr_number, 10);
+    }
+
+    // --- HMAC verification tests ---
+
+    #[test]
+    fn test_verify_github_signature_known_vector() {
+        // Test vector from GitHub docs:
+        // secret: "It's a Secret to Everybody"
+        // payload: "Hello, World!"
+        // expected: sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17
+        let secret = "It's a Secret to Everybody";
+        let payload = b"Hello, World!";
+        let sig = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+        assert!(verify_github_signature(secret, payload, sig));
+    }
+
+    #[test]
+    fn test_verify_github_signature_rejects_invalid() {
+        let secret = "my-secret";
+        let payload = b"test body";
+        let sig = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(!verify_github_signature(secret, payload, sig));
+    }
+
+    #[test]
+    fn test_verify_github_signature_rejects_missing_prefix() {
+        let secret = "my-secret";
+        let payload = b"test body";
+        let sig = "md5=abcdef";
+        assert!(!verify_github_signature(secret, payload, sig));
+    }
+
+    #[test]
+    fn test_verify_standard_webhook_signature() {
+        let secret = "test-secret-key";
+        let msg_id = "msg-123";
+        let timestamp = "1720000000";
+        let body = b"test body";
+
+        // Compute the expected signature manually
+        let key = decode_webhook_secret(secret);
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        let preamble = format!("{}.{}.", msg_id, timestamp);
+        mac.update(preamble.as_bytes());
+        mac.update(body);
+        let result = mac.finalize().into_bytes();
+        let sig = format!(
+            "v1,{}",
+            base64::engine::general_purpose::STANDARD.encode(result)
+        );
+
+        assert!(verify_standard_webhook_signature(
+            secret, msg_id, timestamp, body, &sig
+        ));
+    }
+
+    #[test]
+    fn test_verify_standard_webhook_signature_rejects_tampered() {
+        let secret = "test-secret";
+        let msg_id = "msg-456";
+        let timestamp = "1720000000";
+        let body = b"original body";
+        let sig = "v1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert!(!verify_standard_webhook_signature(
+            secret, msg_id, timestamp, body, sig
+        ));
+    }
+
+    #[test]
+    fn test_verify_standard_webhook_multiple_signatures() {
+        let secret = "multi-test";
+        let msg_id = "msg-789";
+        let timestamp = "1720000000";
+        let body = b"multi sig body";
+
+        let key = decode_webhook_secret(secret);
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(format!("{}.{}.", msg_id, timestamp).as_bytes());
+        mac.update(body);
+        let result = mac.finalize().into_bytes();
+        let valid_sig = format!(
+            "v1,{}",
+            base64::engine::general_purpose::STANDARD.encode(result)
+        );
+
+        // Multiple signatures separated by space — one valid, one garbage
+        let header = format!("v1,garbage_signature {}", valid_sig);
+        assert!(verify_standard_webhook_signature(
+            secret, msg_id, timestamp, body, &header
+        ));
+    }
+
+    #[test]
+    fn test_verify_secret_token() {
+        assert!(verify_secret_token("my-secret", "my-secret"));
+        assert!(!verify_secret_token("my-secret", "wrong-secret"));
+        assert!(!verify_secret_token("my-secret", "my-secre")); // length differs
+    }
+
+    #[test]
+    fn test_decode_webhook_secret_whsec_prefix() {
+        // "whsec_" + base64("test-key") = "whsec_dGVzdC1rZXk="
+        let decoded = decode_webhook_secret("whsec_dGVzdC1rZXk=");
+        assert_eq!(decoded, b"test-key");
+    }
+
+    #[test]
+    fn test_decode_webhook_secret_plain() {
+        let decoded = decode_webhook_secret("my-plain-secret");
+        assert_eq!(decoded, b"my-plain-secret");
+    }
+
+    #[test]
+    fn test_decode_webhook_secret_invalid_base64_falls_back() {
+        // Invalid base64 after whsec_ prefix — falls back to raw bytes
+        let decoded = decode_webhook_secret("whsec_!!!invalid!!!");
+        assert_eq!(decoded, b"whsec_!!!invalid!!!");
+    }
+
+    #[test]
+    fn test_github_validate_event_accepts_without_secret() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert!(forge.validate_event(&headers, &body, None).is_ok());
+    }
+
+    #[test]
+    fn test_github_validate_event_rejects_missing_signature() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge
+                .validate_event(&headers, &body, Some("my-secret"))
+                .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn test_gitlab_validate_event_accepts_legacy_token() {
+        let forge = GitLabForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "shared-secret".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert!(
+            forge
+                .validate_event(&headers, &body, Some("shared-secret"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_gitlab_validate_event_rejects_wrong_token() {
+        let forge = GitLabForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        headers.insert("x-gitlab-token", "wrong-token".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge
+                .validate_event(&headers, &body, Some("correct-token"))
+                .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn test_gitlab_validate_event_rejects_no_auth_headers() {
+        let forge = GitLabForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge
+                .validate_event(&headers, &body, Some("my-secret"))
+                .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn test_gitlab_validate_event_accepts_without_secret() {
+        let forge = GitLabForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert!(forge.validate_event(&headers, &body, None).is_ok());
     }
 }
