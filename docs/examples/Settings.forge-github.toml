@@ -1,0 +1,15 @@
+# GitHub webhook integration with HMAC-SHA256 verification.
+# See docs/WEBHOOK_SECURITY.md for full setup guide.
+
+[forge]
+enabled = true
+provider = "github"
+# GitHub webhook secret for HMAC-SHA256 verification.
+# Generate: openssl rand -hex 32
+# Enter the same value in GitHub: repo Settings > Webhooks > Secret.
+# Verifies both sender identity and payload integrity.
+webhook_secret = "YOUR_HEX_SECRET_HERE"
+
+[server]
+host = "127.0.0.1"
+port = 8080

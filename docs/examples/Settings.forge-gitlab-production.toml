@@ -1,0 +1,16 @@
+# GitLab webhook integration — production deployment with signing token.
+# Use with a reverse proxy (nginx/Caddy) that terminates TLS.
+# See docs/WEBHOOK_SECURITY.md for full setup guide.
+
+[forge]
+enabled = true
+provider = "gitlab"
+# GitLab 19.0+ signing token (recommended).
+# Generate in GitLab: Settings > Webhooks > Add new > Generate signing token.
+# Verifies both sender identity and payload integrity.
+webhook_secret = "whsec_YOUR_BASE64_SIGNING_TOKEN_HERE"
+# api_token = "glpat-..."  # Optional: for future API-based features
+
+[server]
+host = "127.0.0.1"   # Bind to localhost; reverse proxy handles public traffic
+port = 8080

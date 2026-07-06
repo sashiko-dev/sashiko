@@ -148,7 +148,9 @@ cargo run --release -- --enable-unsafe-all-submit
      - Replace `your-server` with your actual server address
      - Use port `8080` (or your configured server port)
    - **Content type:** `application/json`
-   - **Secret:** Leave empty (signature validation not yet implemented)
+   - **Secret:** Enter a strong random token (generate with `openssl rand -hex 32`).
+     Add the same value as `webhook_secret` in Sashiko's `Settings.toml`.
+     See the [Webhook Security Guide](WEBHOOK_SECURITY.md#github-hmac-setup) for details.
    - **Which events would you like to trigger this webhook?**
      - Select: **Let me select individual events**
      - Check: ✓ **Pull requests**
@@ -241,32 +243,13 @@ Check the web UI at `http://localhost:8080/` to see the review progress.
 
 ## Security Considerations
 
-**⚠️ IMPORTANT:** GitHub webhook signature validation is not yet implemented.
+Sashiko verifies GitHub webhook signatures using HMAC-SHA256 when
+`webhook_secret` is configured. This mitigates forged webhook requests that
+could trigger unauthorized reviews.
 
-For production deployments:
-
-1. **Use HTTPS:** Set up a reverse proxy with TLS
-   ```nginx
-   # Example nginx config
-   server {
-       listen 443 ssl;
-       server_name sashiko.example.com;
-
-       ssl_certificate /path/to/cert.pem;
-       ssl_certificate_key /path/to/key.pem;
-
-       location /api/webhook/ {
-           proxy_pass http://localhost:8080;
-           proxy_set_header X-Real-IP $remote_addr;
-       }
-   }
-   ```
-
-2. **Implement webhook secrets:** Future enhancement - see GitHub's [webhook security guide](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
-
-3. **Network isolation:** Run Sashiko on private network and use SSH tunneling or VPN
-
-4. **Rate limiting:** Configure reverse proxy or firewall to prevent abuse
+For production deployment instructions, reverse proxy examples, and a
+complete security checklist, see the
+[Webhook Security Guide](WEBHOOK_SECURITY.md).
 
 ## Advanced Configuration
 

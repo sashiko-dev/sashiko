@@ -1,0 +1,15 @@
+# GitLab webhook integration — simple setup for scripts and cronjobs.
+# Use when polling GitLab API and posting results to Sashiko via curl.
+# See docs/WEBHOOK_SECURITY.md for full setup guide.
+
+[forge]
+enabled = true
+provider = "gitlab"
+# Plain secret token for script-based setups.
+# Use the same value in your curl script: -H "X-Gitlab-Token: YOUR_SECRET"
+# Verifies sender identity. Combine with HTTPS for transport protection.
+webhook_secret = "YOUR_SECRET_HERE"
+
+[server]
+host = "127.0.0.1"
+port = 8080
