@@ -18,6 +18,32 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Validate a git commit SHA (40-char SHA-1 or 64-char SHA-256, lowercase hex).
+pub fn is_valid_git_sha(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Check that a URL uses an acceptable scheme for git operations.
+pub fn is_valid_repo_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://") || url.starts_with("git@")
+}
+
+/// Check that a repository URL does not target known internal or metadata
+/// endpoints. Returns false for cloud metadata services, loopback addresses,
+/// and other destinations that should never be cloned.
+pub fn is_safe_repo_url(url: &str) -> bool {
+    if !is_valid_repo_url(url) {
+        return false;
+    }
+    let lower = url.to_lowercase();
+    !lower.contains("169.254.")
+        && !lower.contains("metadata.google")
+        && !lower.contains("localhost")
+        && !lower.contains("127.0.0.1")
+        && !lower.contains("[::1]")
+        && !lower.contains("0.0.0.0")
+}
+
 /// Metadata extracted from forge webhook
 #[derive(Debug, Clone)]
 pub struct ForgeMetadata {
@@ -87,7 +113,14 @@ impl ForgeProvider for GitHubForge {
             .ok_or(StatusCode::BAD_REQUEST)?
             .to_string();
 
+        if !is_valid_git_sha(&head_sha) || !is_valid_git_sha(&base_sha) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
         let pr_number = pr["number"].as_i64().ok_or(StatusCode::BAD_REQUEST)?;
+        if pr_number <= 0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         let pr_title = pr["title"].as_str().map(|s| s.to_string());
         let pr_url = pr["html_url"].as_str().map(|s| s.to_string());
@@ -95,6 +128,12 @@ impl ForgeProvider for GitHubForge {
         let repo_url = payload["repository"]["clone_url"]
             .as_str()
             .map(|s| s.to_string());
+
+        if let Some(ref url) = repo_url
+            && !is_safe_repo_url(url)
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         let metadata = ForgeMetadata {
             repo_url,
@@ -155,7 +194,14 @@ impl ForgeProvider for GitLabForge {
             .map(|s| s.to_string())
             .unwrap_or_else(|| head_sha.clone());
 
+        if !is_valid_git_sha(&head_sha) || !is_valid_git_sha(&base_sha) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
         let pr_number = attrs["iid"].as_i64().ok_or(StatusCode::BAD_REQUEST)?;
+        if pr_number <= 0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         let pr_title = attrs["title"].as_str().map(|s| s.to_string());
         let pr_url = attrs["url"].as_str().map(|s| s.to_string());
@@ -163,6 +209,12 @@ impl ForgeProvider for GitLabForge {
         let repo_url = payload["project"]["git_http_url"]
             .as_str()
             .map(|s| s.to_string());
+
+        if let Some(ref url) = repo_url
+            && !is_safe_repo_url(url)
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         let metadata = ForgeMetadata {
             repo_url,
@@ -234,5 +286,225 @@ impl ForgeRegistry {
 impl Default for ForgeRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_git_sha_40_char() {
+        assert!(is_valid_git_sha("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"));
+        assert!(is_valid_git_sha("0000000000000000000000000000000000000000"));
+        assert!(is_valid_git_sha("abcdef0123456789abcdef0123456789abcdef01"));
+    }
+
+    #[test]
+    fn test_is_valid_git_sha_rejects_non_hex() {
+        assert!(!is_valid_git_sha(
+            "g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+        ));
+        assert!(!is_valid_git_sha("../../etc/passwd/../../../../etc/shadow"));
+        // Uppercase hex is valid — git accepts both cases
+        assert!(is_valid_git_sha("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn test_is_valid_git_sha_64_char() {
+        let sha256 = "a".repeat(64);
+        assert!(is_valid_git_sha(&sha256));
+    }
+
+    #[test]
+    fn test_is_valid_git_sha_rejects_wrong_length() {
+        assert!(!is_valid_git_sha("abc123"));
+        assert!(!is_valid_git_sha("a".repeat(39).as_str()));
+        assert!(!is_valid_git_sha("a".repeat(41).as_str()));
+        assert!(!is_valid_git_sha(""));
+    }
+
+    #[test]
+    fn test_is_valid_repo_url_accepts_valid_schemes() {
+        assert!(is_valid_repo_url("https://gitlab.com/org/repo.git"));
+        assert!(is_valid_repo_url("http://gitlab.internal/org/repo.git"));
+        assert!(is_valid_repo_url("git@github.com:org/repo.git"));
+    }
+
+    #[test]
+    fn test_is_valid_repo_url_rejects_invalid_schemes() {
+        assert!(!is_valid_repo_url("ftp://files.example.com/repo.tar"));
+        assert!(!is_valid_repo_url("file:///etc/passwd"));
+        assert!(!is_valid_repo_url("javascript:alert(1)"));
+        assert!(!is_valid_repo_url(""));
+    }
+
+    #[test]
+    fn test_is_safe_repo_url_blocks_ssrf() {
+        assert!(!is_safe_repo_url(
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        assert!(!is_safe_repo_url("http://metadata.google.internal/"));
+        assert!(!is_safe_repo_url("http://localhost:5432/"));
+        assert!(!is_safe_repo_url("http://127.0.0.1:8080/repo"));
+        assert!(!is_safe_repo_url("http://[::1]:8080/repo"));
+        assert!(!is_safe_repo_url("http://0.0.0.0/repo"));
+    }
+
+    #[test]
+    fn test_is_safe_repo_url_accepts_legitimate() {
+        assert!(is_safe_repo_url("https://gitlab.com/org/repo.git"));
+        assert!(is_safe_repo_url("https://github.com/org/repo.git"));
+        assert!(is_safe_repo_url("git@gitlab.example.com:org/repo.git"));
+        assert!(is_safe_repo_url(
+            "http://gitlab.internal:8929/group/project.git"
+        ));
+    }
+
+    #[test]
+    fn test_github_parse_payload_rejects_invalid_sha() {
+        let forge = GitHubForge;
+        let payload = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "head": {"sha": "not-a-valid-sha"},
+                "base": {"sha": "also-not-valid"},
+                "number": 1,
+                "title": "test"
+            },
+            "repository": {"clone_url": "https://github.com/org/repo.git"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        assert_eq!(
+            forge.parse_payload(&body).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_github_parse_payload_rejects_negative_pr() {
+        let forge = GitHubForge;
+        let valid_sha = "a".repeat(40);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "head": {"sha": &valid_sha},
+                "base": {"sha": &valid_sha},
+                "number": -1,
+                "title": "test"
+            },
+            "repository": {"clone_url": "https://github.com/org/repo.git"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        assert_eq!(
+            forge.parse_payload(&body).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_github_parse_payload_rejects_ssrf_url() {
+        let forge = GitHubForge;
+        let valid_sha = "a".repeat(40);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "head": {"sha": &valid_sha},
+                "base": {"sha": &valid_sha},
+                "number": 1,
+                "title": "test"
+            },
+            "repository": {"clone_url": "http://169.254.169.254/latest/meta-data/"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        assert_eq!(
+            forge.parse_payload(&body).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_github_parse_payload_accepts_valid() {
+        let forge = GitHubForge;
+        let valid_sha = "a".repeat(40);
+        let base_sha = "b".repeat(40);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "head": {"sha": &valid_sha},
+                "base": {"sha": &base_sha},
+                "number": 42,
+                "title": "Fix something",
+                "html_url": "https://github.com/org/repo/pull/42"
+            },
+            "repository": {"clone_url": "https://github.com/org/repo.git"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        let (action, metadata) = forge.parse_payload(&body).unwrap();
+        assert_eq!(action, "opened");
+        assert_eq!(metadata.pr_number, 42);
+        assert_eq!(metadata.head_sha, valid_sha);
+    }
+
+    #[test]
+    fn test_gitlab_parse_payload_rejects_invalid_sha() {
+        let forge = GitLabForge;
+        let payload = serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "last_commit": {"id": "../../etc/passwd"},
+                "diff_refs": {"base_sha": "invalid"},
+                "iid": 1,
+                "title": "test"
+            },
+            "project": {"git_http_url": "https://gitlab.com/org/repo.git"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        assert_eq!(
+            forge.parse_payload(&body).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_gitlab_parse_payload_rejects_zero_iid() {
+        let forge = GitLabForge;
+        let valid_sha = "a".repeat(40);
+        let payload = serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "last_commit": {"id": &valid_sha},
+                "diff_refs": {"base_sha": &valid_sha},
+                "iid": 0,
+                "title": "test"
+            },
+            "project": {"git_http_url": "https://gitlab.com/org/repo.git"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        assert_eq!(
+            forge.parse_payload(&body).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_gitlab_parse_payload_accepts_valid() {
+        let forge = GitLabForge;
+        let valid_sha = "c".repeat(40);
+        let payload = serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "last_commit": {"id": &valid_sha},
+                "diff_refs": {"base_sha": &valid_sha},
+                "iid": 10,
+                "title": "Fix bug",
+                "url": "https://gitlab.com/org/repo/-/merge_requests/10"
+            },
+            "project": {"git_http_url": "https://gitlab.com/org/repo.git"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        let (action, metadata) = forge.parse_payload(&body).unwrap();
+        assert_eq!(action, "merge_request");
+        assert_eq!(metadata.pr_number, 10);
     }
 }

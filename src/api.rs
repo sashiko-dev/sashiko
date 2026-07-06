@@ -309,6 +309,7 @@ pub fn build_router(
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
         .layer(middleware::from_fn(redirect_www))
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -472,6 +473,13 @@ async fn submit_patch(
         SubmitRequest::Thread { msgid } => {
             let id = generate_synthetic_id("thread");
             let clean_msgid = msgid.trim_matches(|c| c == '<' || c == '>').to_string();
+
+            // Reject message-IDs with path separators to prevent URL path traversal
+            // when constructing the lore.kernel.org fetch URL. Note: ".." is valid
+            // in RFC 5322 local-parts and is not rejected here.
+            if clean_msgid.contains('/') || clean_msgid.contains('\\') {
+                return Err(StatusCode::BAD_REQUEST);
+            }
             info!(
                 "Received thread fetch request: {} (msgid: {})",
                 id, clean_msgid
@@ -535,14 +543,26 @@ async fn fetch_and_inject_thread(
         .into());
     }
 
+    const MAX_MBOX_DOWNLOAD: usize = 10 * 1024 * 1024;
+    const MAX_MBOX_DECOMPRESSED: u64 = 50 * 1024 * 1024;
+
     let bytes = response.bytes().await?;
+    if bytes.len() > MAX_MBOX_DOWNLOAD {
+        return Err(format!(
+            "Mbox download {} bytes exceeds {} byte limit",
+            bytes.len(),
+            MAX_MBOX_DOWNLOAD
+        )
+        .into());
+    }
 
     // Decompress the gzip data using a blocking task to avoid blocking the async runtime
     let raw = tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut limited = decoder.take(MAX_MBOX_DECOMPRESSED);
         let mut raw = String::new();
-        decoder.read_to_string(&mut raw)?;
+        limited.read_to_string(&mut raw)?;
         Ok(raw)
     })
     .await??;
