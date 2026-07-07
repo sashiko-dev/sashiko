@@ -8,3 +8,8 @@
   device resources allocated with devres functions, and in the I2C subsystem
   probe function after a probe failure has been reported by the driver's probe
   function.
+
+## Initialization
+
+- Initialized arrays of type `struct i2c_device_id` must be declared const and
+  use named initializers.
