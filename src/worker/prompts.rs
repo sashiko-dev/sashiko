@@ -218,7 +218,8 @@ impl PromptRegistry {
         let cache_dir = PathBuf::from(".sashiko-cache/prompts");
         fs::create_dir_all(&cache_dir)?;
 
-        let hash = format!("{:x}", md5::compute(url));
+        let digest = Sha256::digest(url);
+        let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         let cache_path = cache_dir.join(&hash);
 
         if cache_path.exists() {
@@ -246,7 +247,8 @@ impl PromptRegistry {
         let cache_dir = PathBuf::from(".sashiko-cache/prompts");
         fs::create_dir_all(&cache_dir)?;
 
-        let hash = format!("{:x}", md5::compute(repo_url));
+        let digest = Sha256::digest(repo_url);
+        let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         let cache_path = cache_dir.join(&hash);
 
         if cache_path.exists() {
