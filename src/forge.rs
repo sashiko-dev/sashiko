@@ -35,23 +35,45 @@ pub fn is_valid_repo_url(url: &str) -> bool {
 }
 
 /// Check that a repository URL does not target known internal or metadata
-/// endpoints. Returns false for cloud metadata services, loopback addresses,
-/// and other destinations that should never be cloned.
+/// endpoints. Parses the URL and checks the host component only, avoiding
+/// false positives from blocklist patterns appearing in usernames or paths.
 ///
 /// This is a best-effort blocklist, not a complete SSRF mitigation. DNS
-/// rebinding and URL encoding can bypass string-based checks. The primary
-/// access control is webhook signature verification.
+/// rebinding can bypass host-based checks. The primary access control
+/// is webhook signature verification.
 pub fn is_safe_repo_url(url: &str) -> bool {
     if !is_valid_repo_url(url) {
         return false;
     }
-    let lower = url.to_lowercase();
-    !lower.contains("169.254.")
-        && !lower.contains("metadata.google")
-        && !lower.contains("localhost")
-        && !lower.contains("127.0.0.1")
-        && !lower.contains("[::1]")
-        && !lower.contains("0.0.0.0")
+    // For git@ URLs, extract the host portion. SSH interprets the LAST
+    // '@' as the user/host separator, so we must do the same to prevent
+    // injection via URLs like "git@github.com@127.0.0.1:repo.git".
+    let host = if let Some(rest) = url.strip_prefix("git@") {
+        let before_colon = rest.split(':').next().unwrap_or("");
+        // Use the portion after the last '@' — this is what SSH resolves
+        let ssh_host = before_colon.rsplit('@').next().unwrap_or(before_colon);
+        ssh_host.to_ascii_lowercase()
+    } else if let Ok(parsed) = url::Url::parse(url) {
+        parsed.host_str().unwrap_or("").to_ascii_lowercase()
+    } else {
+        return false;
+    };
+
+    // Blocklist applied to the host component only
+    !host.starts_with("169.254.")
+        && host != "metadata.google.internal"
+        && !host.starts_with("localhost")
+        && !host.starts_with("127.")
+        && host != "[::1]"
+        && host != "0.0.0.0"
+        // Decimal representations of loopback (127.0.0.0/8)
+        && !(2130706432..=2130706687).contains(&host.parse::<u64>().unwrap_or(0))
+        // Decimal representation of 169.254.169.254
+        && host != "2852039166"
+        // Hex and octal IP representations
+        && !host.starts_with("0x7f")
+        && !host.starts_with("0xa9fe")
+        && !host.starts_with("0177")
 }
 
 /// Decode a webhook secret. If prefixed with "whsec_", strip the prefix
@@ -106,10 +128,12 @@ fn verify_standard_webhook_signature(
 }
 
 /// Verify a GitHub HMAC-SHA256 signature. The header value has the format
-/// "sha256={hex_digest}".
+/// "sha256={hex_digest}". GitHub sends lowercase hex per their documentation.
+/// The received hex is normalized to lowercase before comparison for
+/// robustness against forges that may use uppercase.
 fn verify_github_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
     let hex_sig = match signature_header.strip_prefix("sha256=") {
-        Some(s) => s,
+        Some(s) => s.to_ascii_lowercase(),
         None => return false,
     };
     let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
@@ -118,7 +142,11 @@ fn verify_github_signature(secret: &str, body: &[u8], signature_header: &str) ->
     };
     mac.update(body);
     let result = mac.finalize().into_bytes();
-    let computed: String = result.iter().map(|b| format!("{:02x}", b)).collect();
+    let mut computed = String::with_capacity(64);
+    for b in result {
+        use std::fmt::Write;
+        let _ = write!(computed, "{:02x}", b);
+    }
     computed.as_bytes().ct_eq(hex_sig.as_bytes()).into()
 }
 
@@ -146,8 +174,11 @@ pub trait ForgeProvider: Send + Sync {
     fn name(&self) -> &str;
 
     /// Validate webhook event type and verify signature when a secret is
-    /// configured. Returns `UNAUTHORIZED` if the signature is missing or
-    /// invalid, `BAD_REQUEST` if the event type is wrong.
+    /// configured. When `secret` is `None`, only event-type validation is
+    /// performed and the request is treated as unauthenticated — callers
+    /// must enforce their own access control before calling this method.
+    /// Returns `UNAUTHORIZED` if the signature is missing or invalid,
+    /// `BAD_REQUEST` if the event type is wrong.
     fn validate_event(
         &self,
         headers: &HeaderMap,
@@ -487,9 +518,42 @@ mod tests {
         ));
         assert!(!is_safe_repo_url("http://metadata.google.internal/"));
         assert!(!is_safe_repo_url("http://localhost:5432/"));
+        assert!(!is_safe_repo_url("http://localhost.localdomain/repo"));
         assert!(!is_safe_repo_url("http://127.0.0.1:8080/repo"));
+        assert!(!is_safe_repo_url("http://127.1/repo"));
         assert!(!is_safe_repo_url("http://[::1]:8080/repo"));
         assert!(!is_safe_repo_url("http://0.0.0.0/repo"));
+        // Decimal and hex IP representations of 127.0.0.1
+        assert!(!is_safe_repo_url("http://2130706433/repo"));
+        assert!(!is_safe_repo_url("http://0x7f000001/repo"));
+        // Octal representation
+        assert!(!is_safe_repo_url("http://0177.0.0.1/repo"));
+        // Decimal representation of 169.254.169.254
+        assert!(!is_safe_repo_url("http://2852039166/latest/"));
+        // Hex representation of 169.254.x.x
+        assert!(!is_safe_repo_url("http://0xa9fea9fe/latest/"));
+        // Decimal for 127.0.0.2 (other loopback addresses in 127.0.0.0/8)
+        assert!(!is_safe_repo_url("http://2130706434/repo"));
+    }
+
+    #[test]
+    fn test_is_safe_repo_url_blocks_ssh_injection() {
+        // SSH resolves the LAST '@' as user/host separator
+        assert!(!is_safe_repo_url("git@github.com@127.0.0.1:repo.git"));
+        assert!(!is_safe_repo_url("git@github.com@localhost:repo.git"));
+        assert!(!is_safe_repo_url("git@legit.com@169.254.169.254:repo.git"));
+    }
+
+    #[test]
+    fn test_is_safe_repo_url_no_false_positives_on_path() {
+        // Blocklist patterns in username or path should NOT trigger rejection
+        assert!(is_safe_repo_url(
+            "https://github.com/user-127.0.0.1/repo.git"
+        ));
+        assert!(is_safe_repo_url(
+            "https://github.com/org/localhost-tools.git"
+        ));
+        assert!(is_safe_repo_url("git@github.com:0x7f-labs/project.git"));
     }
 
     #[test]

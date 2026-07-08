@@ -3410,6 +3410,7 @@ dependencies = [
  "lettre",
  "libsql",
  "mail-parser",
+ "percent-encoding",
  "regex",
  "reqwest",
  "serde",
@@ -3428,6 +3429,7 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-c",
+ "url",
 ]
 
 [[package]]

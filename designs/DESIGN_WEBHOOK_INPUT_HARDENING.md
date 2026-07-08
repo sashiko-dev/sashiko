@@ -66,8 +66,9 @@ if !is_loopback && !has_secret && !state.allow_all_submit {
 
 ### 3. Body Size Limits (`src/api.rs`)
 
-- Explicit `DefaultBodyLimit::max(2 MiB)` on the axum router (makes
-  the implicit axum 0.8 default auditable).
+- Explicit `DefaultBodyLimit::max(25 MiB)` on the axum router.
+  Sized to accommodate large CLI mbox submissions and GitHub
+  webhook payloads (up to 25 MB).
 - HTTP download cap (10 MiB) on `fetch_and_inject_thread` for
   lore.kernel.org mbox fetches.
 - Decompression cap (50 MiB) via `Read::take()` on the gzip decoder

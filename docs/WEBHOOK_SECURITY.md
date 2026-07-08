@@ -361,7 +361,7 @@ The webhook payload failed validation.
 
 ### 413 Payload Too Large
 
-The request body exceeds the 2 MiB limit.
+The request body exceeds the 25 MiB limit.
 
 ## FAQ
 
