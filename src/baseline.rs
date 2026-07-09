@@ -58,6 +58,7 @@ pub struct BaselineRegistry {
     remote_map: HashMap<String, String>, // URL -> Local Remote Name
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
     pub repo_path: std::path::PathBuf,
+    mainline_remote: Option<(String, String)>, // (URL, local remote name)
 }
 
 impl BaselineRegistry {
@@ -67,14 +68,29 @@ impl BaselineRegistry {
     ) -> Result<Self> {
         let remote_map = Self::load_git_remotes(repo_path).unwrap_or_default();
 
-        // Identify Linus's tree
-        let linus_remote = remote_map
+        // Identify Linus's tree by URL, falling back to whatever is named "origin".
+        let mainline_remote = remote_map
             .iter()
             .find(|(url, _)| url.contains("torvalds/linux.git"))
+            .or_else(|| {
+                remote_map
+                    .iter()
+                    .filter(|(_, name)| name.as_str() == "origin")
+                    .find(|(url, _)| url.ends_with(".git"))
+                    .or_else(|| {
+                        remote_map
+                            .iter()
+                            .find(|(_, name)| name.as_str() == "origin")
+                    })
+            })
+            .map(|(url, name)| (url.clone(), name.clone()));
+
+        let mainline_name = mainline_remote
+            .as_ref()
             .map(|(_, name)| name.as_str())
             .unwrap_or("origin");
 
-        let ref_name = format!("{}/master", linus_remote);
+        let ref_name = format!("{}/master", mainline_name);
         info!(
             "Attempting to load MAINTAINERS from {}:MAINTAINERS",
             ref_name
@@ -112,6 +128,7 @@ impl BaselineRegistry {
             remote_map,
             custom_remotes,
             repo_path: repo_path.to_path_buf(),
+            mainline_remote,
         })
     }
 
@@ -262,11 +279,20 @@ impl BaselineRegistry {
         let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
         candidates.push(self.resolve_url(linux_next_url, None));
 
-        // 4. Mainline (Local Origin/Master or HEAD)
-        // We assume 'origin' is mainline if available, or just HEAD.
-        // Or if we can find 'torvalds/linux.git' in remote map.
-        // For simplicity: HEAD.
-        candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
+        // 4. Mainline
+        // Use the identified mainline remote (Linus tree or origin) as a
+        // RemoteTarget so that ensure_remote fetches it before use. A bare
+        // LocalRef("HEAD") would resolve to the local checkout, which nothing
+        // in Sashiko ever advances after fetching.
+        if let Some((url, name)) = &self.mainline_remote {
+            candidates.push(BaselineResolution::RemoteTarget {
+                url: url.clone(),
+                name: name.clone(),
+                branch: Some("master".to_string()),
+            });
+        } else {
+            candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
+        }
 
         // 5. Custom Remotes
         if let Some(custom_remotes) = &self.custom_remotes {
@@ -574,6 +600,7 @@ mod tests {
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
         }
     }
 
@@ -598,6 +625,64 @@ mod tests {
             BaselineResolution::RemoteTarget { name, .. } => assert_eq!(name, "net-next"),
             _ => panic!("Expected RemoteTarget net-next"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_mainline_remote_used_instead_of_head() {
+        let mut remote_map = HashMap::new();
+        remote_map.insert(
+            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string(),
+            "origin".to_string(),
+        );
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            mainline_remote: Some((
+                "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string(),
+                "origin".to_string(),
+            )),
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+
+        // The last candidate before custom remotes should be a RemoteTarget
+        // for origin/master, not a LocalRef("HEAD").
+        let mainline = candidates.iter().find(|c| match c {
+            BaselineResolution::RemoteTarget { name, branch, .. } => {
+                name == "origin" && branch.as_deref() == Some("master")
+            }
+            _ => false,
+        });
+        assert!(mainline.is_some(), "Expected RemoteTarget origin/master");
+
+        // No LocalRef("HEAD") should be present.
+        let has_head = candidates
+            .iter()
+            .any(|c| matches!(c, BaselineResolution::LocalRef(r) if r == "HEAD"));
+        assert!(
+            !has_head,
+            "LocalRef(HEAD) should not be emitted when mainline_remote is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_head_fallback_without_mainline_remote() {
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+
+        let has_head = candidates
+            .iter()
+            .any(|c| matches!(c, BaselineResolution::LocalRef(r) if r == "HEAD"));
+        assert!(has_head, "LocalRef(HEAD) should be present as fallback");
     }
 
     #[test]
@@ -638,6 +723,7 @@ F: patterns/
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
         };
 
         let files = vec!["mm/memory.c".to_string()];
@@ -705,6 +791,7 @@ F: patterns/
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
         };
 
         let files = vec!["tools/perf/builtin-report.c".to_string()];
@@ -750,6 +837,7 @@ F: patterns/
             remote_map,
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
         };
 
         let files = vec!["net/core.c".to_string()];
@@ -816,6 +904,7 @@ F: patterns/
                 only_branches: Some(vec!["master".to_string()]),
             }]),
             repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
         };
 
         let candidates = registry.resolve_candidates(&[], "Subject", None).await;
