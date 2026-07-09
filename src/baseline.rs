@@ -132,6 +132,16 @@ impl BaselineRegistry {
         })
     }
 
+    /// Name of the identified mainline remote (Linus tree or origin), for
+    /// use as a git fetch target. Falls back to "origin" when none was
+    /// identified.
+    pub fn mainline_remote_name(&self) -> &str {
+        self.mainline_remote
+            .as_ref()
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("origin")
+    }
+
     fn read_file_from_git(repo_path: &Path, rev: &str, file_path: &str) -> Result<String> {
         use std::process::Command;
         let output = Command::new("git")

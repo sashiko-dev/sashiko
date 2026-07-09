@@ -747,6 +747,7 @@ impl Reviewer {
     ) {
         let mut attempts: Vec<BaselineAttempt> = Vec::new();
         let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
+        let mainline_remote = ctx.baseline_registry.mainline_remote_name();
         let mut tested_shas = std::collections::HashSet::new();
 
         for candidate in candidates {
@@ -783,18 +784,33 @@ impl Reviewer {
                         // Retry resolving
                         match get_commit_hash(&repo_path, &baseline_ref).await {
                             Ok(sha) => sha,
-                            Err(e2) => {
-                                let msg = format!(
-                                    "Failed to resolve baseline ref {}: {}\n",
-                                    baseline_ref, e2
-                                );
-                                current_log.push_str(&msg);
-                                attempts.push(BaselineAttempt {
-                                    baseline: baseline_ref.clone(),
-                                    status: current_status,
-                                    log: current_log,
-                                });
-                                continue;
+                            Err(_) => {
+                                // b4 can emit annotated tag object SHAs as
+                                // base-commit (e.g. the tag object for
+                                // v7.2-rc2). Those aren't fetchable by SHA,
+                                // so pull tags from the mainline remote and
+                                // retry.
+                                let _ = Command::new("git")
+                                    .current_dir(&repo_path)
+                                    .args(["fetch", mainline_remote, "--tags"])
+                                    .output()
+                                    .await;
+                                match get_commit_hash(&repo_path, &baseline_ref).await {
+                                    Ok(sha) => sha,
+                                    Err(e2) => {
+                                        let msg = format!(
+                                            "Failed to resolve baseline ref {}: {}\n",
+                                            baseline_ref, e2
+                                        );
+                                        current_log.push_str(&msg);
+                                        attempts.push(BaselineAttempt {
+                                            baseline: baseline_ref.clone(),
+                                            status: current_status,
+                                            log: current_log,
+                                        });
+                                        continue;
+                                    }
+                                }
                             }
                         }
                     } else {
