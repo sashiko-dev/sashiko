@@ -899,9 +899,11 @@ pub async fn get_git_log(params: GitLogParams) -> Result<String> {
 }
 
 pub async fn git_status(repo_path: &Path) -> Result<String> {
+    // Force --untracked-files=normal so the output does not depend on a
+    // user's global status.showUntrackedFiles setting.
     let output = Command::new("git")
         .current_dir(repo_path)
-        .args(["status"])
+        .args(["status", "--untracked-files=normal"])
         .output()
         .await?;
 
