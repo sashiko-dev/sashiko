@@ -775,10 +775,11 @@ impl Reviewer {
                 Ok(sha) => sha,
                 Err(e) => {
                     if let BaselineResolution::Commit(sha_str) = candidate {
-                        // Attempt to fetch the missing commit from origin
+                        // Attempt to fetch the missing commit from the
+                        // mainline remote.
                         let _ = Command::new("git")
                             .current_dir(&repo_path)
-                            .args(["fetch", "origin", sha_str])
+                            .args(["fetch", mainline_remote, sha_str])
                             .output()
                             .await;
                         // Retry resolving
