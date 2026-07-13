@@ -49,9 +49,7 @@ setup_kernel() {
         # Prune unreachable objects and run gc to keep the repo healthy
         echo "Pruning and garbage collecting..."
         git remote prune origin || true
-        git reflog expire --all --expire=now
         git gc --auto
-        git prune
         # Ensure we are on master and it's clean
         git pull origin master || echo "Warning: Failed to update kernel tree, continuing with existing version."
     fi
