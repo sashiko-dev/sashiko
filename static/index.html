@@ -1728,9 +1728,19 @@
             return full ? d.toLocaleString() : d.toISOString().split('T')[0];
         }
 
-        function copyToClipboard(text) {
+        function copyToClipboard(input) {
+            let text;
+            if (input instanceof HTMLElement) {
+                // If it's the div container, we want to preserve newlines from its child divs
+                // innerText usually does this, but sometimes it's inconsistent or lacks trailing newlines.
+                // For .log-inline-block which contains multiple <div> lines, we can join them.
+                const lines = Array.from(input.querySelectorAll('div')).map(d => d.innerText);
+                text = lines.length > 0 ? lines.join('\n') : input.innerText;
+            } else {
+                text = String(input);
+            }
             navigator.clipboard.writeText(text).then(() => {
-                console.log('Copied:', text);
+                console.log('Copied text');
             });
         }
 
@@ -2658,7 +2668,7 @@
                     <div style="margin-top:8px;">
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
                         <div id="inline-${uniqueId}" class="collapsible ${isOpen}" style="position: relative;">
-                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling.innerText)">Copy</button>
+                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
                             <div class="log-inline-block">${escapeHtml(r.inline_review, true, true)}</div>
                         </div>
                     </div>
