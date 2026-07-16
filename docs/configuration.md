@@ -154,6 +154,36 @@ Optional array of additional git remotes to track.
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
+### `[subsystems]`
+
+Controls how patches and emails are categorized into subsystems for targeted reviews and specific email policies. By default, this section is empty, meaning the system relies on fallback heuristics (like identifying `@vger.kernel.org` addresses) to determine subsystems.
+
+This feature is **globally active** and applies to both mailing list (NNTP) and Forge (Webhook) ingestion.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mapping` | list of objects | `[]` | A list of rules mapping a regular expression pattern to a subsystem name. |
+
+Each mapping object in the list requires two fields:
+* `pattern` (string): A regular expression used for matching.
+* `name` (string): The resulting subsystem name if the pattern matches.
+
+**How it works:**
+- **For Git Forges (Webhooks):** The system applies the `pattern` against the **file paths** modified by a pull request (e.g., matching `^drivers/net/.*`).
+- **For Mailing Lists (NNTP):** The system applies the `pattern` against the **To and Cc email addresses** of the incoming patch email.
+
+When a patch is tagged with a subsystem, it can trigger subsystem-specific AI review rules (context loading) and specific email/embargo policies defined in `email_policy.toml`.
+
+```toml
+[subsystems]
+mapping = [
+    { pattern = ".*drivers/.*", name = "Drivers" },
+    { pattern = ".*net/.*", name = "Networking" },
+    { pattern = ".*fs/.*", name = "Filesystems" },
+    { pattern = ".*mm/.*", name = "Memory Management" },
+]
+```
+
 ## email_policy.toml
 
 Controls how Sashiko sends (or suppresses) review emails. See

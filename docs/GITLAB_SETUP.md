@@ -68,7 +68,7 @@ Edit `Settings.toml`:
 enabled = true
 
 [subsystems]
-# Optional: Map file paths to subsystems
+# Global Config: Map file paths to subsystems for targeted reviews (Optional)
 mapping = [
     { pattern = ".*drivers/.*", name = "Drivers" },
     { pattern = ".*net/.*", name = "Networking" },

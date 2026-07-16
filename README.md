@@ -97,9 +97,9 @@ setting, see the [Configuration Reference](docs/configuration.md). The default `
 *   **Server**: API server host and port.
 *   **Git**: Path to the reference kernel repository.
 *   **Review**: Concurrency and worktree settings.
-    *   **Forge** *(Experimental)*: GitHub/GitLab webhook integration (optional, unsupported). See forge setup guides below.
+*   **Forge** *(Experimental)*: GitHub/GitLab webhook integration (optional, unsupported). See forge setup guides below.
         *   When enabling `[forge]`, the NNTP (mailing list) ingestor is disabled by default. If you need to monitor both, set `disable_nntp = false` in the `[forge]` section of your config.
-    *   **Subsystems**: Map file patterns to subsystems for targeted reviews (optional).
+*   **Subsystems**: Map file patterns to subsystems for targeted reviews (optional). Works with both mailing lists (recipient matching) and git forges (file path matching).
 
 #### Configuring the LLM Provider
 

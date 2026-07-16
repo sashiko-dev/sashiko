@@ -116,7 +116,7 @@ enabled = true
 # Set to 'false' if you need to monitor both mailing lists and forges.
 disable_nntp = true
 
-# Optional: Configure subsystem mapping for targeted reviews
+# Global Config: Map file paths to subsystems for targeted reviews (Optional)
 [subsystems]
 mapping = [
     { pattern = ".*drivers/.*", name = "Drivers" },
