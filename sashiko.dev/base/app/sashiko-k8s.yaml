@@ -90,7 +90,8 @@ spec:
                 batman,linux-s390,linux-devicetree,imx,linux-sunxi,linux-amlogic,
                 live-patching,openvpn-devel,platform-driver-x86,linux-arm-msm,
                 linux-modules,nouveau,nova-gpu,ntb,selinux,linux-raid,linux-rt,linux-rtc,
-                linux-can,linux-target,linux-hardening,linux-security-module,linux-unionfs,mfd,linux-leds,mhi
+                linux-can,linux-target,linux-hardening,linux-security-module,linux-unionfs,mfd,linux-leds,mhi,
+                linux-mtd
             - name: SASHIKO__REVIEW__CONCURRENCY
               value: "24"
             - name: SASHIKO__SMTP__SENDER_ADDRESS
