@@ -267,3 +267,11 @@ cc = ["linux-rtc@vger.kernel.org", "Alexandre Belloni <alexandre.belloni@bootlin
 lists = ["linux-media@vger.kernel.org"]
 cc = ["media-ci@linuxtv.org"]
 
+[subsystems.mtd]
+lists = ["linux-mtd@lists.infradead.org"]
+cc = ["Miquel Raynal <miquel.raynal@bootlin.com>",
+      "Richard Weinberger <richard@nod.at>",
+      "Vignesh Raghavendra <vigneshr@ti.com>",
+      "Pratyush Yadav <pratyush@kernel.org>",
+      "Michael Walle <mwalle@kernel.org>",
+      "Takahiro Kuwano <takahiro.kuwano@infineon.com>"]
