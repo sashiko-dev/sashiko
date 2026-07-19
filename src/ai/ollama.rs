@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// This code was based on openai.rs
+
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
@@ -25,124 +27,63 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-// ============================================================================
-// Request Types
-// ============================================================================
-
-/// Ollama API chat request.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OllamaRequest {
-    /// Model name (e.g., "llama3", "mistral")
     pub model: String,
-
-    /// Conversation messages
     pub messages: Vec<OllamaMessage>,
-
-    /// Disable streaming (Ollama defaults to streaming)
     #[serde(default)]
     pub stream: bool,
-
-    /// Generation parameters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<OllamaOptions>,
 }
 
-/// A single message in the conversation.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OllamaMessage {
-    /// Message role: "system", "user", or "assistant"
     pub role: String,
-
-    /// Message content
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-
-    /// Tool calls (for function calling)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
-/// A tool call made by the model.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OllamaToolCall {
-    /// The function being called
     pub function: OllamaToolCallFunction,
 }
 
-/// Function details within a tool call.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OllamaToolCallFunction {
-    /// Function name
     pub name: String,
-
-    /// Function arguments as JSON
     pub arguments: Value,
 }
 
-/// Generation options for Ollama.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OllamaOptions {
-    /// Temperature for sampling (0.0 to 1.0)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<usize>,
-
-    /// Maximum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<i32>,
-
-    /// Enforce JSON response format (Ollama 0.1.24+)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
 }
-
-// ============================================================================
-// Response Types
-// ============================================================================
-
-/// Ollama API chat response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OllamaResponse {
-    /// The assistant's message
     pub message: OllamaMessage,
-
-    /// Total time spent generating the response (nanoseconds)
     pub total_duration: u64,
-
-    /// Time spent loading the model (nanoseconds)
     pub load_duration: u64,
-
-    /// Number of tokens in the prompt
     pub prompt_eval_count: u32,
-
-    /// Time spent evaluating the prompt (nanoseconds)
     pub prompt_eval_duration: u64,
-
-    /// Number of tokens in the response
     pub eval_count: u32,
-
-    /// Time spent generating the response (nanoseconds)
     pub eval_duration: u64,
 }
-
-// ============================================================================
-// Error Types
-// ============================================================================
-
-/// Errors specific to Ollama API communication.
 #[derive(Debug, thiserror::Error)]
 pub enum OllamaError {
-    /// Connection or transport error
     #[error("Transient error: {1}, retry after {0:?}")]
     TransientError(Duration, String),
-
-    /// API returned an error
     #[error("API error: {0}")]
     ApiError(String),
-
-    /// Model not found on the server
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 }
@@ -159,41 +100,15 @@ impl ClassifyAiError for OllamaError {
     }
 }
 
-// ============================================================================
-// Client
-// ============================================================================
-
-/// Client for the Ollama API.
-///
-/// Connects to a local or remote Ollama instance and provides the
-/// [`AiProvider`](crate::ai::AiProvider) interface.
 pub struct OllamaClient {
-    /// Model name to use for requests
     model: String,
-
-    /// Base URL for the Ollama API
     base_url: String,
-
-    /// Context window size for the model
     context_window_size: usize,
-
-    /// Maximum tokens to generate
     max_tokens: u32,
-
-    /// HTTP client
     client: Client,
 }
 
 impl OllamaClient {
-    /// Create a new Ollama client.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_url` - Ollama server address (e.g., "http://localhost:11434")
-    /// * `model` - Model name (e.g., "llama3", "mistral:7b")
-    /// * `context_window_size` - Maximum context window for the model
-    /// * `max_tokens` - Maximum tokens to generate per response
-    /// * `api_timeout_secs` - Request timeout in seconds
     pub fn new(
         base_url: String,
         model: String,
@@ -235,15 +150,10 @@ impl OllamaClient {
         "http://localhost:11434".to_string()
     }
 
-    /// Default context window for Ollama models.
-    ///
-    /// Ollama doesn't expose context window information, so we use a
-    /// reasonable default that works for most models.
     pub fn default_context_window_for_model(_model: &str) -> usize {
         128_000
     }
 
-    /// Send a request to the Ollama API.
     async fn post_request(&self, body: &Value) -> Result<OllamaResponse, OllamaError> {
         let res = match self.client.post(&self.base_url).json(body).send().await {
             Ok(res) => res,
@@ -251,7 +161,8 @@ impl OllamaClient {
                 let err_str = redact_secret(&e.to_string());
                 tracing::error!("Ollama request failed (transport): {}", err_str);
                 return Err(OllamaError::TransientError(
-                    Duration::from_secs(30), err_str,
+                    Duration::from_secs(30),
+                    err_str,
                 ));
             }
         };
@@ -262,7 +173,6 @@ impl OllamaClient {
                 tracing::error!("Failed to read Ollama response body: {}", err_str);
                 OllamaError::TransientError(Duration::from_secs(0), err_str)
             })?;
-
             match serde_json::from_str::<OllamaResponse>(&body_text) {
                 Ok(response) => {
                     tracing::info!(
@@ -293,12 +203,11 @@ impl OllamaClient {
     }
 }
 
-// ============================================================================
-// Translation Functions
-// ============================================================================
-
-/// Translate an internal AiRequest to Ollama format.
-fn translate_ollama_request(request: AiRequest, context_window_size: usize, max_tokens: u32) -> Result<OllamaRequest> {
+fn translate_ollama_request(
+    request: AiRequest,
+    context_window_size: usize,
+    max_tokens: u32
+) -> Result<OllamaRequest> {
     let mut messages = Vec::new();
 
     // Add system message if present
@@ -310,7 +219,6 @@ fn translate_ollama_request(request: AiRequest, context_window_size: usize, max_
         });
     }
 
-    // Convert conversation messages
     for msg in request.messages {
         match msg.role {
             AiRole::System => {
@@ -377,7 +285,6 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
     let tool_calls = resp.message.tool_calls.map(|tc| {
         tc.into_iter()
             .map(|t| {
-                // Ollama doesn't provide tool call IDs, generate one
                 ToolCall {
                     id: format!("ollama_{}", uuid::Uuid::new_v4()),
                     function_name: t.function.name,
@@ -436,10 +343,6 @@ fn estimate_tokens(request: &AiRequest) -> usize {
     total
 }
 
-// ============================================================================
-// AiProvider Implementation
-// ============================================================================
-
 #[async_trait]
 impl AiProvider for OllamaClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -465,10 +368,6 @@ impl AiProvider for OllamaClient {
         }
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
