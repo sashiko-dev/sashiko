@@ -12,35 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Ollama API provider implementation.
-//!
-//! This module provides integration with [Ollama](https://ollama.ai/), a local
-//! LLM runner. Unlike OpenAI-compatible providers, Ollama uses a distinct API
-//! structure with different request/response formats and no authentication.
-//!
-//! # Key Differences from OpenAI
-//!
-//! - **Endpoint**: `/api/chat` instead of `/v1/chat/completions`
-//! - **Authentication**: No API key required
-//! - **Token limits**: Uses `num_predict` in options object
-//! - **Response format**: Single `message` field instead of `choices` array
-//! - **Token counts**: `prompt_eval_count` and `eval_count` instead of standard names
-//!
-//! # Example
-//!
-//! ```no_run
-//! use crate::ai::providers::ollama::OllamaClient;
-//!
-//! let client = OllamaClient::new(
-//!     "http://localhost:11434".to_string(),
-//!     "llama3".to_string(),
-//!     8192,
-//!     4096,
-//!     30,
-//! )?;
-//! # anyhow::Ok::<()>(())
-//! ```
-
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
