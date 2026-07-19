@@ -1132,17 +1132,9 @@ fn render_progress(state: &mut ProgressState) {
             })
             .sum();
         let completed_stages: usize = state.patches.values().map(|p| p.completed_stages).sum();
-        let percent = if total_stages > 0 {
-            (completed_stages * 100) / total_stages
-        } else {
-            0
-        };
         let width = 20;
-        let filled = if total_stages > 0 {
-            (completed_stages * width) / total_stages
-        } else {
-            0
-        };
+        let (display_completed_stages, percent, filled) =
+            calculate_progress_metrics(total_stages, completed_stages, width);
 
         let mut tw = TruncatingWriter::new(limit, state.color_choice);
         let _ = tw.write_segment("Overall: [", None, true);
@@ -1150,14 +1142,14 @@ fn render_progress(state: &mut ProgressState) {
         let filled_bar = "█".repeat(filled);
         let _ = tw.write_segment(&filled_bar, Some(Color::Green), false);
 
-        let empty_bar = "░".repeat(width - filled);
+        let empty_bar = "░".repeat(width.saturating_sub(filled));
         let _ = tw.write_segment(&empty_bar, None, false);
 
         let _ = tw.write_segment("] ", None, true);
 
         let stats = format!(
             "{}% | {}/{} stages | {} turns",
-            percent, completed_stages, total_stages, state.total_turns
+            percent, display_completed_stages, total_stages, state.total_turns
         );
         let _ = tw.write_segment(&stats, None, false);
 
@@ -1167,6 +1159,22 @@ fn render_progress(state: &mut ProgressState) {
 
     state.printed_lines = lines_printed;
     let _ = std::io::stderr().flush();
+}
+
+fn calculate_progress_metrics(
+    total_stages: usize,
+    completed_stages: usize,
+    width: usize,
+) -> (usize, usize, usize) {
+    if total_stages == 0 {
+        return (0, 0, 0);
+    }
+
+    let display_completed_stages = completed_stages.min(total_stages);
+    let percent = display_completed_stages.saturating_mul(100) / total_stages;
+    let filled = (display_completed_stages.saturating_mul(width) / total_stages).min(width);
+
+    (display_completed_stages, percent, filled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2264,6 +2272,13 @@ fn identify_subsystems_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_progress_metrics_clamp_completed_stages_to_total() {
+        assert_eq!(calculate_progress_metrics(1, 5, 20), (1, 100, 20));
+        assert_eq!(calculate_progress_metrics(5, 2, 20), (2, 40, 8));
+        assert_eq!(calculate_progress_metrics(0, 5, 20), (0, 0, 0));
+    }
 
     #[test]
     fn test_cli_parsing() {
