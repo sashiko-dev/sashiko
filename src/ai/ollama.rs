@@ -67,6 +67,8 @@ pub struct OllamaOptions {
     pub num_predict: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OllamaResponse {
@@ -121,6 +123,7 @@ pub struct OllamaClient {
     base_url: String,
     context_window_size: usize,
     max_tokens: u32,
+    think_mode: Option<String>,
     client: Client,
 }
 
@@ -131,6 +134,7 @@ impl OllamaClient {
         context_window_size: usize,
         max_tokens: u32,
         api_timeout_secs: u64,
+        think_mode: Option<String>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(api_timeout_secs))
@@ -144,6 +148,7 @@ impl OllamaClient {
             base_url,
             context_window_size,
             max_tokens,
+            think_mode,
             client,
         })
     }
@@ -226,7 +231,8 @@ impl OllamaClient {
 fn translate_ollama_request(
     request: AiRequest,
     context_window_size: usize,
-    max_tokens: u32
+    max_tokens: u32,
+    think_mode: Option<String>,
 ) -> Result<OllamaRequest> {
     let mut messages = Vec::new();
 
@@ -287,7 +293,8 @@ fn translate_ollama_request(
         temperature: request.temperature,
         num_ctx: Some(context_window_size as usize),
         num_predict: Some(max_tokens as i32),
-        format: Some("json".to_string()),  // Always enforce JSON for Ollama
+        format: Some("json".to_string()),
+        think: think_mode,
     };
 
     Ok(OllamaRequest {
@@ -368,7 +375,12 @@ impl AiProvider for OllamaClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         tracing::info!("Sending Ollama request to model: {}", self.model);
 
-        let mut ollama_req = translate_ollama_request(request, self.context_window_size, self.max_tokens)?;
+        let mut ollama_req = translate_ollama_request(
+            request,
+            self.context_window_size,
+            self.max_tokens,
+            self.think_mode.clone(),
+        )?;
         ollama_req.model = self.model.clone();
 
         let resp_body = serde_json::to_value(&ollama_req)?;

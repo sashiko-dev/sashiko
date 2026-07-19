@@ -484,8 +484,14 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .unwrap_or_else(ollama::OllamaClient::default_base_url);
             let context_window = ai.ollama.as_ref().and_then(|c| c.context_window_size).unwrap_or_else(|| ollama::OllamaClient::default_context_window_for_model(&model));
             let max_tokens = ai.ollama.as_ref().and_then(|c| c.max_tokens).unwrap_or(4096);
+            let think_mode = ai.ollama.as_ref().and_then(|c| c.think.clone());
             Ok(Arc::new(ollama::OllamaClient::new(
-                base_url, model, context_window, max_tokens, ai.api_timeout_secs,
+                base_url,
+                model,
+                context_window,
+                max_tokens,
+                ai.api_timeout_secs,
+                think_mode,
             )?))
         }
         "claude-cli" => {

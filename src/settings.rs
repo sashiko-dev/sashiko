@@ -238,6 +238,8 @@ pub struct OllamaSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub think: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
