@@ -118,6 +118,10 @@ pub struct OllamaOptions {
     /// Maximum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<i32>,
+
+    /// Enforce JSON response format (Ollama 0.1.24+)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 // ============================================================================
@@ -377,6 +381,7 @@ fn translate_ollama_request(request: AiRequest, max_tokens: u32) -> Result<Ollam
     let options = OllamaOptions {
         temperature: request.temperature,
         num_predict: Some(max_tokens as i32),
+        format: Some("json".to_string()),  // Always enforce JSON for Ollama
     };
 
     Ok(OllamaRequest {
