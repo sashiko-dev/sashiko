@@ -14,4 +14,5 @@ mod integration {
     mod singleton_root_overwrite;
     mod test_nested;
     mod test_pending;
+    mod v4l2_pipeline_test;
 }
