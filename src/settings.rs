@@ -231,6 +231,17 @@ pub struct OpenAiCompatSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct OllamaSettings {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub context_window_size: Option<usize>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct KiroCliSettings {
     #[serde(default = "default_kiro_cli_binary")]
     pub binary: String,
@@ -303,6 +314,7 @@ pub struct AiSettings {
     #[cfg(feature = "vertex")]
     pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
+    pub ollama: Option<OllamaSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,

@@ -289,6 +289,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
         return e.ai_error_class();
     }
+    if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
+        return e.ai_error_class();
+    }
     AiErrorClass::Fatal
 }
 
@@ -472,6 +475,19 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
 
             Ok(Arc::new(provider))
         }
+        "ollama" => {
+            let model = ai.model.clone();
+            let base_url = ai
+                .ollama
+                .as_ref()
+                .and_then(|c| c.base_url.clone())
+                .unwrap_or_else(ollama::OllamaClient::default_base_url);
+            let context_window = ai.ollama.as_ref().and_then(|c| c.context_window_size).unwrap_or_else(|| ollama::OllamaClient::default_context_window_for_model(&model));
+            let max_tokens = ai.ollama.as_ref().and_then(|c| c.max_tokens).unwrap_or(4096);
+            Ok(Arc::new(ollama::OllamaClient::new(
+                base_url, model, context_window, max_tokens, ai.api_timeout_secs,
+            )?))
+        }
         "claude-cli" => {
             let cfg = ai.claude_cli.as_ref();
             Ok(Arc::new(claude_cli::ClaudeCliProvider {
@@ -556,6 +572,7 @@ pub mod devin_cli;
 pub mod gemini;
 pub mod kiro_cli;
 pub mod openai;
+pub mod ollama;
 pub mod proxy;
 pub mod quota;
 pub mod session;

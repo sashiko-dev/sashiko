@@ -3425,6 +3425,7 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-c",
+ "uuid",
 ]
 
 [[package]]
