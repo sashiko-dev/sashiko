@@ -115,6 +115,9 @@ pub struct OllamaOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<usize>,
+
     /// Maximum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<i32>,
@@ -321,7 +324,7 @@ impl OllamaClient {
 // ============================================================================
 
 /// Translate an internal AiRequest to Ollama format.
-fn translate_ollama_request(request: AiRequest, max_tokens: u32) -> Result<OllamaRequest> {
+fn translate_ollama_request(request: AiRequest, context_window_size: usize, max_tokens: u32) -> Result<OllamaRequest> {
     let mut messages = Vec::new();
 
     // Add system message if present
@@ -380,6 +383,7 @@ fn translate_ollama_request(request: AiRequest, max_tokens: u32) -> Result<Ollam
     // Build options with temperature and token limit
     let options = OllamaOptions {
         temperature: request.temperature,
+        num_ctx: Some(context_window_size as usize),
         num_predict: Some(max_tokens as i32),
         format: Some("json".to_string()),  // Always enforce JSON for Ollama
     };
@@ -467,7 +471,7 @@ impl AiProvider for OllamaClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         tracing::info!("Sending Ollama request to model: {}", self.model);
 
-        let mut ollama_req = translate_ollama_request(request, self.max_tokens)?;
+        let mut ollama_req = translate_ollama_request(request, self.context_window_size, self.max_tokens)?;
         ollama_req.model = self.model.clone();
 
         let resp_body = serde_json::to_value(&ollama_req)?;
@@ -548,7 +552,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request, 4096)?;
+        let ollama_req = translate_ollama_request(request, 128_000, 4096)?;
 
         assert_eq!(ollama_req.messages.len(), 2);
         assert_eq!(ollama_req.messages[0].role, "system");
@@ -586,7 +590,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request, 4096)?;
+        let ollama_req = translate_ollama_request(request, 128_000, 4096)?;
 
         assert_eq!(ollama_req.messages.len(), 1);
         assert_eq!(ollama_req.messages[0].role, "assistant");
@@ -740,7 +744,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request, 2048)?;
+        let ollama_req = translate_ollama_request(request, 128_000, 2048)?;
         let options = ollama_req.options.unwrap();
 
         assert_eq!(options.temperature, Some(0.5));
@@ -767,7 +771,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request, 2048)?;
+        let ollama_req = translate_ollama_request(request,128_000, 2048)?;
         let options = ollama_req.options.unwrap();
 
         assert_eq!(options.temperature, None);
