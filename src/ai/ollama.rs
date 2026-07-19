@@ -17,7 +17,7 @@
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
-    ProviderCapabilities, ToolCall,
+    ProviderCapabilities, ToolCall, classify_status_code,
 };
 use crate::utils::redact_secret;
 use anyhow::Result;
@@ -80,22 +80,38 @@ pub struct OllamaResponse {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum OllamaError {
-    #[error("Transient error: {1}, retry after {0:?}")]
+    #[error("Bad request: {0}")]
+    BadRequest(String),
+    #[error("Not found: {0}")]
+    NotFound(String),
+    #[error("Server error: {0}")]
+    ServerError(String),
+    #[error("Bad Gateway: {0}")]
+    BadGateway(String),
+    #[error("Too Many requests: {1}, retry after {0:?}")]
     TransientError(Duration, String),
-    #[error("API error: {0}")]
-    ApiError(String),
-    #[error("Model not found: {0}")]
-    ModelNotFound(String),
+    #[error("Rate limit exceeded, retry after {0:?}")]
+    RateLimitExceeded(Duration, String),
+    #[error("API error {0}: {1}")]
+    ApiError(reqwest::StatusCode, String),
 }
 
 impl ClassifyAiError for OllamaError {
     fn ai_error_class(&self) -> AiErrorClass {
         match self {
+            OllamaError::BadRequest(_) => AiErrorClass::Fatal,
+            OllamaError::NotFound(_) => AiErrorClass::Fatal,
+            OllamaError::ServerError(_) => AiErrorClass::Fatal,
+            OllamaError::BadGateway(_) => AiErrorClass::Fatal,
             OllamaError::TransientError(retry_after, _) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
-            OllamaError::ApiError(_) => AiErrorClass::Fatal,
-            OllamaError::ModelNotFound(_) => AiErrorClass::Fatal,
+            OllamaError::RateLimitExceeded(retry_after, _) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            OllamaError::ApiError(status, _) => {
+                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
+            }
         }
     }
 }
@@ -184,7 +200,7 @@ impl OllamaClient {
                 }
                 Err(e) => {
                     tracing::error!("Failed to decode Ollama response: {}", e);
-                    return Err(OllamaError::ApiError(format!("Parse error: {}", e)));
+                    return Err(OllamaError::ServerError(format!("Parse error: {}", e)));
                 }
             }
         }
@@ -193,12 +209,16 @@ impl OllamaClient {
         let error_text = redact_secret(&res.text().await.unwrap_or_default());
         let retry_after = Duration::from_secs(11);
 
-        if status.as_u16() == 404 {
-            Err(OllamaError::ModelNotFound(error_text))?
-        } else if status.as_u16() >= 500 {
-            Err(OllamaError::TransientError(retry_after, error_text))?
-        } else {
-            Err(OllamaError::ApiError(error_text))?
+        match status.as_u16() {
+            429 => Err(OllamaError::RateLimitExceeded(
+                        retry_after,
+                        error_text,
+                   ))?,
+            400 => Err(OllamaError::BadRequest(error_text))?,
+            404 => Err(OllamaError::NotFound(error_text))?,
+            500 => Err(OllamaError::ServerError(error_text))?,
+            502 => Err(OllamaError::BadGateway(error_text))?,
+            _ => Err(OllamaError::ApiError(status, error_text))?,
         }
     }
 }
@@ -553,13 +573,13 @@ mod tests {
 
     #[test]
     fn test_error_classification_api() {
-        let err = OllamaError::ApiError("invalid request".to_string());
+        let err = OllamaError::ServerError("invalid request".to_string());
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
     }
 
     #[test]
     fn test_error_classification_model_not_found() {
-        let err = OllamaError::ModelNotFound("model xyz not found".to_string());
+        let err = OllamaError::NotFound("model xyz not found".to_string());
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
     }
 
