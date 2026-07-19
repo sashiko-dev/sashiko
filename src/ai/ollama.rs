@@ -135,8 +135,8 @@ pub struct OllamaResponse {
 #[derive(Debug, thiserror::Error)]
 pub enum OllamaError {
     /// Connection or transport error
-    #[error("Connection error: {0}")]
-    ConnectionError(String),
+    #[error("Transient error: {1}, retry after {0:?}")]
+    TransientError(Duration, String),
 
     /// API returned an error
     #[error("API error: {0}")]
@@ -150,8 +150,8 @@ pub enum OllamaError {
 impl ClassifyAiError for OllamaError {
     fn ai_error_class(&self) -> AiErrorClass {
         match self {
-            OllamaError::ConnectionError(_) => AiErrorClass::Transient {
-                retry_after: Duration::from_secs(30),
+            OllamaError::TransientError(retry_after, _) => AiErrorClass::Transient {
+                retry_after: *retry_after,
             },
             OllamaError::ApiError(_) => AiErrorClass::Fatal,
             OllamaError::ModelNotFound(_) => AiErrorClass::Fatal,
@@ -250,7 +250,9 @@ impl OllamaClient {
             Err(e) => {
                 let err_str = redact_secret(&e.to_string());
                 tracing::error!("Ollama request failed (transport): {}", err_str);
-                return Err(OllamaError::ConnectionError(err_str));
+                return Err(OllamaError::TransientError(
+                    Duration::from_secs(30), err_str,
+                ));
             }
         };
 
@@ -258,7 +260,7 @@ impl OllamaClient {
             let body_text = res.text().await.map_err(|e| {
                 let err_str = redact_secret(&e.to_string());
                 tracing::error!("Failed to read Ollama response body: {}", err_str);
-                OllamaError::ConnectionError(err_str)
+                OllamaError::TransientError(Duration::from_secs(0), err_str)
             })?;
 
             match serde_json::from_str::<OllamaResponse>(&body_text) {
@@ -279,11 +281,12 @@ impl OllamaClient {
 
         let status = res.status();
         let error_text = redact_secret(&res.text().await.unwrap_or_default());
+        let retry_after = Duration::from_secs(11);
 
         if status.as_u16() == 404 {
             Err(OllamaError::ModelNotFound(error_text))?
         } else if status.as_u16() >= 500 {
-            Err(OllamaError::ConnectionError(error_text))?
+            Err(OllamaError::TransientError(retry_after, error_text))?
         } else {
             Err(OllamaError::ApiError(error_text))?
         }
@@ -639,11 +642,12 @@ mod tests {
 
     #[test]
     fn test_error_classification_connection() {
-        let err = OllamaError::ConnectionError("timeout".to_string());
+         let retry_after = Duration::from_secs(11);
+        let err = OllamaError::TransientError(retry_after, "timeout".to_string());
         assert_eq!(
             err.ai_error_class(),
             AiErrorClass::Transient {
-                retry_after: Duration::from_secs(30),
+                retry_after: retry_after,
             }
         );
     }
