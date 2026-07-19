@@ -1143,6 +1143,7 @@ fn render_progress(state: &mut ProgressState) {
         } else {
             0
         };
+        let filled = filled.min(width);
 
         let mut tw = TruncatingWriter::new(limit, state.color_choice);
         let _ = tw.write_segment("Overall: [", None, true);
