@@ -14,7 +14,7 @@ jobs:
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Setup Python Toolchain
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.14.3'
       - name: Install yamllint
