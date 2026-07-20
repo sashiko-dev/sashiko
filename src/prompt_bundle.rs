@@ -85,15 +85,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_bundle_contains_media_guide() {
-        assert!(
-            PROMPT_BUNDLE_FILES
-                .iter()
-                .any(|(path, _)| *path == "kernel/subsystem/media.md")
-        );
-    }
-
-    #[test]
     fn test_prompt_bundle_root_uses_xdg_data_home() {
         let temp = tempfile::tempdir().unwrap();
         let old_xdg = std::env::var_os("XDG_DATA_HOME");

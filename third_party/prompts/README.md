@@ -3,13 +3,6 @@
 AI-assisted code review prompts for Linux kernel, systemd, and iproute development.
 Works with Claude Code and other AI tools.
 
-## Vendored Revision
-
-`REVISION` is Sashiko's prompt-bundle installation/cache key. Its first 40
-characters identify the upstream `masoncl/review-prompts` commit. A suffix
-identifies Sashiko-local prompt additions derived from that upstream revision;
-such a suffixed value is intentionally not itself an upstream Git commit ID.
-
 ## Quick Start
 
 ### Install Kernel Prompts Only
