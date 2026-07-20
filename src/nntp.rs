@@ -21,6 +21,12 @@ use tracing::{debug, info};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn strip_nntp_line_ending(line: &str) -> &str {
+    line.strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(line)
+}
+
 pub struct NntpClient {
     stream: BufReader<TcpStream>,
     timeout: Duration,
@@ -162,9 +168,9 @@ impl NntpClient {
                 break; // EOF
             }
 
-            // Convert to string (lossy)
+            // ARTICLE lines are payload, so remove only the protocol line ending.
             let line_raw = String::from_utf8_lossy(&buf);
-            let line = line_raw.trim_end(); // remove \r\n
+            let line = strip_nntp_line_ending(&line_raw);
 
             if line == "." {
                 break;
@@ -189,5 +195,87 @@ impl NntpClient {
             debug!("QUIT response was not 205: {}", response);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn strips_exactly_one_nntp_line_ending() {
+        assert_eq!(strip_nntp_line_ending("payload \t\r\n"), "payload \t");
+        assert_eq!(strip_nntp_line_ending("payload \t\n"), "payload \t");
+        assert_eq!(strip_nntp_line_ending("payload\r\r\n"), "payload\r");
+        assert_eq!(strip_nntp_line_ending("payload\n\n"), "payload\n");
+        assert_eq!(strip_nntp_line_ending("payload \t"), "payload \t");
+    }
+
+    #[tokio::test]
+    async fn article_preserves_payload_whitespace_and_framing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+
+            stream
+                .get_mut()
+                .write_all(b"200 mock server ready\r\n")
+                .await
+                .unwrap();
+
+            let mut command = Vec::new();
+            stream.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, b"ARTICLE <issue-320@example.test>\r\n");
+
+            stream
+                .get_mut()
+                .write_all(
+                    b"220 article follows\r\n\
+normal text\r\n\
+trailing space \r\n\
+trailing tab\t\r\n\
+\x20\r\n\
+\r\n\
+..payload\r\n\
++added \t\r\n\
+-removed \r\n\
+\x20context \t\r\n\
+lf-only \t\n\
+.\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut client = NntpClient::connect("127.0.0.1", address.port())
+            .await
+            .unwrap();
+        let article_result = client.article("<issue-320@example.test>").await;
+        server.await.unwrap();
+        let lines = article_result.unwrap();
+
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0].as_bytes(), b"normal text");
+        assert_eq!(lines[1].as_bytes(), b"trailing space ");
+        assert_eq!(lines[2].as_bytes(), b"trailing tab\t");
+        assert_eq!(lines[3].as_bytes(), b" ");
+        assert_eq!(lines[4].as_bytes(), b"");
+        assert_eq!(lines[5].as_bytes(), b".payload");
+        assert_eq!(lines[6].as_bytes(), b"+added \t");
+        assert_eq!(lines[7].as_bytes(), b"-removed ");
+        assert_eq!(lines[8].as_bytes(), b" context \t");
+        assert_eq!(lines[9].as_bytes(), b"lf-only \t");
+        assert!(!lines.iter().any(|line| line == "."));
+
+        let reconstructed = lines.join("\n");
+        assert_eq!(
+            reconstructed.as_bytes(),
+            b"normal text\ntrailing space \ntrailing tab\t\n \n\n.payload\n+added \t\n-removed \n context \t\nlf-only \t"
+        );
     }
 }
