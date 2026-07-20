@@ -80,7 +80,7 @@ spec:
             - name: SASHIKO__MAILING_LISTS__TRACK
               value: >-
                 bpf,cgroups,damon,dmaengine,dri-devel,driver-core,dwarves,fuse-devel,kvm,
-                linux-bluetooth,linux-cifs,linux-ext4,linux-hwmon,linux-input,
+                linux-bluetooth,linux-clk,linux-cifs,linux-ext4,linux-hwmon,linux-input,
                 linux-kernel,linux-media,linux-mm,linux-nfs,linux-pci,linux-perf-users,linux-phy,
                 linux-pwm,linux-rdma,linux-trace-kernel,linux-watchdog,mptcp,netdev,
                 rust-for-linux,kvmarm,linux-arm-kernel,linux-block,linux-scsi,
