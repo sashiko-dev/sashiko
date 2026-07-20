@@ -129,7 +129,11 @@ impl Reviewer {
         // On average, an active patch review consumes ~3 LLM slots over its execution lifetime.
         // Thus, the global LLM request semaphore is scaled to (concurrency * 3) to fully
         // saturate LLM capacity while gating local processes/worktrees strictly to `concurrency`.
-        let llm_concurrency = std::cmp::max(1, concurrency * 3);
+        let llm_concurrency = if concurrency < 2 {
+            1
+        } else {
+            std::cmp::max(1, concurrency * 3)
+        };
 
         Self {
             db,
