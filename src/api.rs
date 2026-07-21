@@ -1405,14 +1405,7 @@ async fn forge_webhook(
             })?;
 
         // Link to previous version
-        let _ = state
-            .db
-            .conn
-            .execute(
-                "UPDATE patchsets SET previous_version_id = ?1 WHERE id = ?2",
-                libsql::params![existing_id, new_id],
-            )
-            .await;
+        let _ = state.db.link_previous_version(existing_id, new_id).await;
 
         let req = FetchRequest {
             repo_url: metadata.repo_url,

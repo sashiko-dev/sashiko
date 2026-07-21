@@ -96,10 +96,11 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         .parse(raw_email)
         .ok_or_else(|| anyhow!("Failed to parse email"))?;
 
-    let message_id = message
-        .message_id()
-        .ok_or_else(|| anyhow!("No Message-ID header"))?
-        .to_string();
+    let message_id = sanitize_message_id(
+        message
+            .message_id()
+            .ok_or_else(|| anyhow!("No Message-ID header"))?,
+    );
 
     let subject = message.subject().unwrap_or("(no subject)").to_string();
 

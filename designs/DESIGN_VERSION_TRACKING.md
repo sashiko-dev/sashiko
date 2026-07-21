@@ -56,14 +56,20 @@ metadata-only update.
 - Patch reassignment between version-tracked patchsets is blocked
   in `create_patch()`
 
-## Prior Review Context Injection
-- `get_previous_version_findings()` follows `previous_version_id`
-  one hop, returns non-preexisting findings sorted by severity
-- Findings are formatted as structured context and capped at a
-  token limit (default 2000 tokens, severity-prioritized truncation)
-- Injected into `dynamic_context` in the review prompt so the AI
+## Prior Review Context Injection (deferred)
+
+**Status: not yet implemented.** The infrastructure (schema,
+version chain linkage, `previous_version_id` population) is in
+place. The following items are deferred to a follow-up PR:
+
+- `get_previous_version_findings()` — follow `previous_version_id`
+  one hop, return non-preexisting findings sorted by severity
+- `format_previous_findings()` — format as structured context,
+  cap at token limit (2000 tokens, severity-prioritized truncation)
+- Inject into `dynamic_context` in the review prompt so the AI
   reviewer can check whether prior issues were addressed
-- `ReviewInput` struct accepts `previous_context: Option<String>`
+- `ReviewInput` struct gains `previous_context: Option<String>`
+- Injection points in `reviewer.rs` and `worker/prompts.rs`
 
 ## Schema Changes
 ```sql
@@ -100,4 +106,5 @@ All migrations are idempotent via `try_add_column`.
   non-standard formats. Mitigation: default to v1.
 - Cross-series false linking: Mitigated by requiring author match
   AND cleaned subject match.
-- Prior context size: Capped with severity-sorted truncation.
+- Prior context size: Capped with severity-sorted truncation
+  (to be enforced when context injection is implemented).

@@ -2195,6 +2195,7 @@ impl Database {
         subject: &str,
         date: i64,
     ) -> Result<i64> {
+        let root_message_id = crate::patch::sanitize_message_id(root_message_id);
         let mut rows = self.conn
             .query(
                 "INSERT INTO threads (root_message_id, subject, last_updated) VALUES (?, ?, ?) RETURNING id",
@@ -2268,8 +2269,9 @@ impl Database {
         git_blob_hash: Option<&str>,
         mailing_list: Option<&str>,
     ) -> Result<()> {
+        let message_id = crate::patch::sanitize_message_id(message_id);
         self.create_message_with_references(
-            message_id,
+            &message_id,
             thread_id,
             in_reply_to,
             author,
@@ -2476,6 +2478,8 @@ impl Database {
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
     ) -> Result<Option<i64>> {
+        let message_id = crate::patch::sanitize_message_id(message_id);
+        let message_id = message_id.as_str();
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
@@ -2498,9 +2502,9 @@ impl Database {
             // When using the @sashiko.local fallback, scope the query
             // to the same thread to avoid cross-patchset contamination.
             let query = if scope_to_thread {
-                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ? AND thread_id = ?"
+                "SELECT id, date, author, subject, subject_index, total_parts, status, version FROM patchsets WHERE cover_letter_message_id = ? AND thread_id = ?"
             } else {
-                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?"
+                "SELECT id, date, author, subject, subject_index, total_parts, status, version FROM patchsets WHERE cover_letter_message_id = ?"
             };
             let mut rows = if scope_to_thread {
                 self.conn
@@ -2519,9 +2523,8 @@ impl Database {
                 let is_placeholder =
                     existing_subject == "(placeholder)" || existing_status == "Fetching";
 
-                let existing_version = crate::patch::parse_subject_version(&existing_subject);
                 let v_new = version.unwrap_or(1);
-                let v_old = existing_version.unwrap_or(1);
+                let v_old: u32 = row.get::<i32>(7).unwrap_or(1) as u32;
                 let versions_compatible = v_new == v_old;
 
                 let index_collision = if part_index == 0 {
@@ -2604,7 +2607,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index FROM patchsets
+                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index, version FROM patchsets
                  WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)",
                 libsql::params![thread_id, author, window_start, window_end],
             )
@@ -2652,8 +2655,8 @@ impl Database {
                 continue;
             }
 
-            // Parse version from existing subject
-            let existing_version = crate::patch::parse_subject_version(&existing_subject);
+            // Read persisted version from the database
+            let existing_version: Option<u32> = row.get::<i32>(11).ok().map(|v| v as u32);
 
             // Clean subjects for comparison
             let clean_new = crate::patch::clean_subject(subject);
@@ -2947,12 +2950,7 @@ impl Database {
                     .find_previous_version(thread_id, author, subject, v)
                     .await?
             {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET previous_version_id = ?1 WHERE id = ?2",
-                        libsql::params![prev_id, id],
-                    )
-                    .await?;
+                self.link_previous_version(prev_id, id).await?;
             }
 
             Ok(Some(id))
@@ -2970,6 +2968,8 @@ impl Database {
         part_index: u32,
         diff: &str,
     ) -> Result<i64> {
+        let message_id = crate::patch::sanitize_message_id(message_id);
+        let message_id = message_id.as_str();
         // Check if index collision occurs for this patchset
         let collision_exists: bool = {
             let mut rows = self
@@ -3026,33 +3026,30 @@ impl Database {
             let mut v_rows = self
                 .conn
                 .query(
-                    "SELECT version FROM patchsets WHERE id = ?",
-                    libsql::params![old_id],
+                    "SELECT a.version, b.version FROM patchsets a, patchsets b WHERE a.id = ?1 AND b.id = ?2",
+                    libsql::params![old_id, patchset_id],
                 )
                 .await?;
             if let Ok(Some(v_row)) = v_rows.next().await {
                 let old_version: i32 = v_row.get(0).unwrap_or(1);
-                let mut new_v_rows = self
-                    .conn
-                    .query(
-                        "SELECT version FROM patchsets WHERE id = ?",
-                        libsql::params![patchset_id],
-                    )
-                    .await?;
-                if let Ok(Some(new_v_row)) = new_v_rows.next().await {
-                    let new_version: i32 = new_v_row.get(0).unwrap_or(1);
-                    if old_version != new_version {
-                        // Patch belongs to a different version — skip reassignment
-                        let mut id_rows = self
-                            .conn
-                            .query(
-                                "SELECT id FROM patches WHERE message_id = ?",
-                                libsql::params![message_id],
-                            )
-                            .await?;
-                        if let Ok(Some(id_row)) = id_rows.next().await {
-                            return Ok(id_row.get(0)?);
-                        }
+                let new_version: i32 = v_row.get(1).unwrap_or(1);
+                if old_version != new_version {
+                    tracing::info!(
+                        "Blocking cross-version patch reassignment from patchset {} (v{}) to {} (v{})",
+                        old_id,
+                        old_version,
+                        patchset_id,
+                        new_version
+                    );
+                    let mut id_rows = self
+                        .conn
+                        .query(
+                            "SELECT id FROM patches WHERE message_id = ?",
+                            libsql::params![message_id],
+                        )
+                        .await?;
+                    if let Ok(Some(id_row)) = id_rows.next().await {
+                        return Ok(id_row.get(0)?);
                     }
                 }
             }
@@ -4730,6 +4727,17 @@ impl Database {
             .execute(
                 "UPDATE patchsets SET mr_title = COALESCE(?1, mr_title), mr_url = COALESCE(?2, mr_url) WHERE id = ?3",
                 libsql::params![title, url, patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Link a patchset to its predecessor in the version chain.
+    pub async fn link_previous_version(&self, previous_id: i64, new_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET previous_version_id = ?1 WHERE id = ?2",
+                libsql::params![previous_id, new_id],
             )
             .await?;
         Ok(())
