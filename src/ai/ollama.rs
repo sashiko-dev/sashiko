@@ -67,6 +67,12 @@ pub struct OllamaOptions {
     pub num_predict: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+
+    // TODO: on Ollama, think can either be string with
+    // 4 possible values (None, "medium", "high", or "max")
+    // or a boolean. If false, think mode is disabled (true is default).
+    // How the boolean support can be properly it be mapped here?
+    // one way would be to check if think_mode is equal to String "false" or "off"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub think: Option<String>,
 }
@@ -291,7 +297,7 @@ fn translate_ollama_request(
     // Build options with temperature and token limit
     let options = OllamaOptions {
         temperature: request.temperature,
-        num_ctx: Some(context_window_size as usize),
+        num_ctx: Some(context_window_size),
         num_predict: Some(max_tokens as i32),
         format: Some("json".to_string()),
         think: think_mode,
@@ -457,7 +463,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request, 128_000, 4096)?;
+        let ollama_req = translate_ollama_request(request, 128_000, 4096, None)?;
 
         assert_eq!(ollama_req.messages.len(), 2);
         assert_eq!(ollama_req.messages[0].role, "system");
@@ -495,7 +501,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request, 128_000, 4096)?;
+        let ollama_req = translate_ollama_request(request, 128_000, 4096, None)?;
 
         assert_eq!(ollama_req.messages.len(), 1);
         assert_eq!(ollama_req.messages[0].role, "assistant");
@@ -578,7 +584,7 @@ mod tests {
         assert_eq!(
             err.ai_error_class(),
             AiErrorClass::Transient {
-                retry_after: retry_after,
+                retry_after,
             }
         );
     }
@@ -650,7 +656,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request, 128_000, 2048)?;
+        let ollama_req = translate_ollama_request(request, 128_000, 2048, None)?;
         let options = ollama_req.options.unwrap();
 
         assert_eq!(options.temperature, Some(0.5));
@@ -677,7 +683,7 @@ mod tests {
             context_tag: None,
         };
 
-        let ollama_req = translate_ollama_request(request,128_000, 2048)?;
+        let ollama_req = translate_ollama_request(request,128_000, 2048, None)?;
         let options = ollama_req.options.unwrap();
 
         assert_eq!(options.temperature, None);
