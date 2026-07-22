@@ -159,6 +159,7 @@ Optional array of additional git remotes to track.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `concurrency` | integer | -- | Number of concurrent reviews. |
+| `max_concurrency` | integer | -- | Max number of concurrent review queue. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during review. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
 | `max_retries` | integer | `3` | Retry count on transient failures. |

@@ -367,6 +367,7 @@ pub struct GitSettings {
 #[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
+    pub max_concurrency: Option<usize>,
     pub worktree_dir: String,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
@@ -469,6 +470,7 @@ fn default_forge() -> ForgeSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewReviewSettings {
     pub concurrency: Option<usize>,
+    pub max_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
