@@ -180,6 +180,11 @@ cc = ["Danilo Krummrich <dakr@kernel.org>", "Alexandre Courbot <acourbot@nvidia.
 lists = ["linux-btrfs@vger.kernel.org"]
 cc = ["dsterba@suse.cz"]
 
+[subsystems.linux-clk]
+lists = ["linux-clk@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-clk@vger.kernel.org"]
+
 [subsystems.linux-cxl]
 lists = ["linux-cxl@vger.kernel.org"]
 reply_to_author = true
