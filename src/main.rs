@@ -2494,6 +2494,8 @@ mod tests {
         let custom_mapping = vec![sashiko::settings::SubsystemMapping {
             pattern: ".*custom-list@example.com.*".to_string(),
             name: "Custom".to_string(),
+            base_tree: None,
+            base_branch: None,
         }];
 
         // Test that a known default list is still identified even with custom mappings present.
@@ -2513,6 +2515,8 @@ mod tests {
         let mapping = vec![sashiko::settings::SubsystemMapping {
             pattern: "^drivers/usb/.*".to_string(),
             name: "usb".to_string(),
+            base_tree: None,
+            base_branch: None,
         }];
 
         let paths = vec![

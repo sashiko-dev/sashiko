@@ -179,13 +179,18 @@ This feature is **globally active** and applies to both mailing list (NNTP) and 
 |-----|------|---------|-------------|
 | `mapping` | list of objects | `[]` | A list of rules mapping a regular expression pattern to a subsystem name. |
 
-Each mapping object in the list requires two fields:
+Each mapping object requires two fields:
 * `pattern` (string): A regular expression used for matching.
 * `name` (string): The resulting subsystem name if the pattern matches.
+
+It also accepts two optional baseline fields:
+* `base_tree` (string): Git repository URL to try before MAINTAINERS-derived baselines when the pattern matches a changed file path.
+* `base_branch` (string): Branch in `base_tree` to use. When omitted, the remote's default HEAD is used.
 
 **How it works:**
 - **For Git Forges (Webhooks):** The system applies the `pattern` against the **file paths** modified by a pull request (e.g., matching `^drivers/net/.*`).
 - **For Mailing Lists (NNTP):** The system applies the `pattern` against the **To and Cc email addresses** of the incoming patch email.
+- **For Baseline Selection:** Mappings with `base_tree` are also matched against changed file paths. A matching tree and optional branch are tried before baselines inferred from `MAINTAINERS`, linux-next, and mainline.
 
 When a patch is tagged with a subsystem, it can trigger subsystem-specific AI review rules (context loading) and specific email/embargo policies defined in `email_policy.toml`.
 
@@ -196,6 +201,7 @@ mapping = [
     { pattern = ".*net/.*", name = "Networking" },
     { pattern = ".*fs/.*", name = "Filesystems" },
     { pattern = ".*mm/.*", name = "Memory Management" },
+    { pattern = "^fs/smb/server/.*", name = "ksmbd", base_tree = "git://git.samba.org/ksmbd.git", base_branch = "for-next" },
 ]
 ```
 
