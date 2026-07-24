@@ -1414,6 +1414,44 @@ async fn handle_cancel(
     Ok(())
 }
 
+async fn local_review_target(
+    repo_path: &std::path::Path,
+    first_sha: &str,
+    baseline: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    if let Some(baseline) = baseline {
+        return Ok((baseline.to_string(), None));
+    }
+
+    let output = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-list", "--parents", "-n", "1", first_sha])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "Failed to inspect parents of {}: {}",
+            first_sha,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let parents = String::from_utf8_lossy(&output.stdout);
+    let mut revisions = parents.split_whitespace();
+    revisions
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Git returned no commit for {}", first_sha))?;
+
+    if revisions.next().is_some() {
+        Ok((format!("{}^", first_sha), None))
+    } else {
+        // A root commit has no baseline to apply against. Check it out and
+        // review the commit directly instead.
+        Ok((first_sha.to_string(), Some(first_sha.to_string())))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_local(
     client: &Client,
@@ -1543,13 +1581,8 @@ async fn handle_local(
         let review_bin = find_review_binary()?;
 
         // Build subprocess args
-        let baseline_ref = if let Some(b) = &baseline {
-            b.clone()
-        } else {
-            // Default: parent of first commit
-            let first_sha = &shas[0];
-            format!("{}^", first_sha)
-        };
+        let (baseline_ref, direct_commit) =
+            local_review_target(&repo_path, &shas[0], baseline.as_deref()).await?;
 
         let mut args = vec![
             "--baseline".to_string(),
@@ -1558,6 +1591,12 @@ async fn handle_local(
             repo_path.to_string_lossy().to_string(),
         ];
 
+        if let Some(commit) = direct_commit {
+            args.push("--review-commit".to_string());
+            args.push(commit);
+            args.push("--review-patch-index".to_string());
+            args.push("1".to_string());
+        }
         if no_ai {
             args.push("--no-ai".to_string());
         }
