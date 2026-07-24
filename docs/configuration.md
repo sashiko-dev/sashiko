@@ -15,6 +15,21 @@ the [LLM Provider Configuration Guide](llm-providers.md).
 
 ## Settings.toml sections
 
+### `[forge]`
+
+Optional. Controls forge (GitHub/GitLab) webhook integration.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable forge webhook endpoint. |
+| `disable_nntp` | bool | `true` | Disable NNTP ingestion when forge is enabled. |
+| `provider` | string | -- | Forge provider: `"github"` or `"gitlab"`. |
+| `webhook_secret` | string | -- | Webhook signing token or shared secret for authenticating incoming requests. When configured, non-localhost requests are authenticated via signature verification. See the [Webhook Security Guide](WEBHOOK_SECURITY.md). |
+| `api_token` | string | -- | Forge API token (for future API-based features). |
+
+> **Security:** When `Settings.toml` contains secrets, restrict file
+> permissions: `chmod 600 Settings.toml`.
+
 ### `[database]`
 
 | Key | Type | Default | Description |
@@ -310,6 +325,7 @@ Downstream tools can parse this format with simple line splitting.
 | `CLOUD_ML_REGION` | GCP region for Vertex AI provider. |
 | `SASHIKO_SERVER` | Override daemon URL for CLI commands. |
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
+| `SASHIKO__FORGE__WEBHOOK_SECRET` | Override webhook secret from Settings.toml. Avoids storing the secret on disk. |
 | `SASHIKO_PATCHWORK_TOKEN` | Patchwork API token. Fills in `patchwork.token` for enabled subsystems that have `api_url` set but no explicit token in TOML. |
 | `NO_COLOR` | Disable ANSI color output. |
 | `SASHIKO_LOG_PLAIN` | Use plain log format (no level/target/timestamp). |

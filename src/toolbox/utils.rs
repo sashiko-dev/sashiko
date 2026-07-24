@@ -135,7 +135,51 @@ pub fn format_git_grep_output(stdout: &str, revision: &str, active_files: &[Stri
     let mut blocks: Vec<(String, Vec<String>)> = grouped.into_iter().collect();
     blocks.sort_by_key(|(path, _)| (get_priority_score(path, active_files), path.clone()));
 
+    let total_files = blocks.len();
+    let total_matches: usize = blocks
+        .iter()
+        .map(|(_, lines)| lines.iter().filter(|l| l.trim() != "--").count())
+        .sum();
+
+    const MAX_SUMMARY_FILES: usize = 10;
+    let file_summaries: Vec<String> = blocks
+        .iter()
+        .take(MAX_SUMMARY_FILES)
+        .map(|(path, lines)| {
+            let count = lines.iter().filter(|l| l.trim() != "--").count();
+            format!(
+                "{} ({} {})",
+                path,
+                count,
+                if count == 1 { "match" } else { "matches" }
+            )
+        })
+        .collect();
+
+    let mut summary = file_summaries.join(", ");
+    if total_files > MAX_SUMMARY_FILES {
+        summary.push_str(&format!(
+            ", ... and {} more files",
+            total_files - MAX_SUMMARY_FILES
+        ));
+    }
+
     let mut result = String::new();
+    if total_files > 0 {
+        result.push_str(&format!(
+            "Matches found across {} {} ({} total {}): {}\n\n",
+            total_files,
+            if total_files == 1 { "file" } else { "files" },
+            total_matches,
+            if total_matches == 1 {
+                "match"
+            } else {
+                "matches"
+            },
+            summary
+        ));
+    }
+
     for (path, lines) in blocks {
         result.push_str(&format!("[file: {}]\n", path));
         for l in lines {
@@ -182,4 +226,31 @@ fn get_priority_score(path: &str, active_files: &[String]) -> u32 {
 
     // 4. Default (lowest priority)
     4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_git_grep_output_summary_header() {
+        let stdout = "HEAD:fs/ext4/inline.c:1518:if (x)\nHEAD:fs/ext4/ext4.h:2489:static inline\nHEAD:fs/ext4/dir.c:91:if (y)\nHEAD:fs/ext4/dir.c:95:else";
+        let active_files = vec!["fs/ext4/inline.c".to_string()];
+        let formatted = format_git_grep_output(stdout, "HEAD", &active_files);
+        assert!(formatted.starts_with("Matches found across 3 files (4 total matches): fs/ext4/inline.c (1 match), fs/ext4/dir.c (2 matches), fs/ext4/ext4.h (1 match)"));
+        assert!(formatted.contains("[file: fs/ext4/inline.c]"));
+    }
+
+    #[test]
+    fn test_format_git_grep_output_summary_header_truncation() {
+        let mut lines = Vec::new();
+        for i in 1..=15 {
+            lines.push(format!("HEAD:file_{}.c:1:match", i));
+        }
+        let stdout = lines.join("\n");
+        let active_files = Vec::new();
+        let formatted = format_git_grep_output(&stdout, "HEAD", &active_files);
+        assert!(formatted.starts_with("Matches found across 15 files (15 total matches):"));
+        assert!(formatted.contains(", ... and 5 more files"));
+    }
 }

@@ -94,7 +94,14 @@ Restart Sashiko after changing the configuration.
    http://localhost:9080/api/webhook/gitlab
    ```
 
-   **Secret token:** (Optional - currently not validated, see security note below)
+   **Signing token** (GitLab 19.0+): Select **Generate signing token** and copy the
+   value. Add it as `webhook_secret` in Sashiko's `Settings.toml`.
+
+   **Secret token** (older GitLab versions): Enter a shared secret. Add the same
+   value as `webhook_secret` in Sashiko's `Settings.toml`.
+
+   See the [Webhook Security Guide](WEBHOOK_SECURITY.md#gitlab-signing-token-setup)
+   for detailed setup instructions.
 
    **Trigger:**
    - ✓ Merge request events
@@ -200,15 +207,14 @@ If GitLab cannot reach your server:
 
 ## Security Notes
 
-⚠️ **IMPORTANT:** The current implementation does NOT validate webhook signatures.
+Sashiko verifies GitLab webhook signatures using HMAC-SHA256 signing tokens
+(GitLab 19.0+) or legacy secret tokens when `webhook_secret` is configured.
+This mitigates forged webhook requests that could trigger unauthorized
+reviews.
 
-This means anyone who knows your webhook URL can trigger reviews.
-
-**Recommended for production:**
-1. Implement webhook signature validation (see issue in code review)
-2. Use HTTPS with valid certificates
-3. Restrict network access to known GitLab IPs
-4. Set a strong webhook secret token in GitLab
+For production deployment instructions, reverse proxy examples, and a
+complete security checklist, see the
+[Webhook Security Guide](WEBHOOK_SECURITY.md).
 
 ## Manual Testing
 

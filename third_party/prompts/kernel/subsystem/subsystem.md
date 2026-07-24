@@ -72,6 +72,8 @@ and symbols regexes.
 | I/O Accessors | writesl, readsl, writesw, readsw, writesb, readsb, __raw_writel, __raw_readl, FIFO | io-accessors.md |
 | Kconfig | Kconfig, `config `, `select `, `depends on `, `tristate `, `bool ` | kconfig.md |
 | Build System | Kbuild, Makefile, scripts/, tools/, `gnu11`, `-funsigned-char`, `-fno-strict-aliasing` | build.md |
+| I2C | drivers/i2c/, include/linux/i2c.h, i2c_transfer, i2c_master_send, i2c_master_recv, i2c_smbus_, i2c_get_dma_safe_msg_buf | i2c.md |
+| HID | drivers/hid/, include/linux/hid.h, hid_device, hid_driver, hid_register_driver, hid_hw_start, hid_hw_stop, hid_input_report, hid_safe_input_report | hid.md |
 | Input | drivers/input/, include/linux/input.h, include/linux/input/, input_dev, input_handler, input_register_, input_report_  | input.md |
 | Objtool | tools/objtool/, INSN_BUG, INSN_TRAP, decode.c | objtool.md |
 | KHO (Kexec Handover) | lib/test_kho.c, kho_, kho_is_enabled, kho_retrieve_subtree, kho_preserve_folio, kho_add_subtree, register_kho_notifier | kho.md |

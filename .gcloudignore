@@ -1,0 +1,26 @@
+.gcloudignore
+.dockerignore
+.git
+target/
+review_trees/
+archives/
+third_party/linux/
+benchmarks/smoke-repo/
+benchmark_results.json
+*.db
+*.db-shm
+*.db-wal
+*.db.bak
+*.db-journal
+.test_venv/
+.venv/
+.venv2/
+sashiko.log
+
+# Local credentials and environment files ignored by git:
+.cargo/config.toml
+.gemini/
+.claude/
+*.skill
+**/*.rs.bk
+

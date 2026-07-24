@@ -1,8 +1,1 @@
-target/
-review_trees/
-benchmark_results.json
-.git/
-*.db
-*.db-shm
-*.db-wal
-third_party/linux/
+.gcloudignore

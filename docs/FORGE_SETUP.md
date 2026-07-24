@@ -136,11 +136,12 @@ host = "127.0.0.1"  # Listen address
 port = 8080          # Port for webhook endpoint
 ```
 
-**Security considerations:**
-- By default, Sashiko only accepts webhooks from localhost
-- For production, use `--enable-unsafe-all-submit` flag (behind firewall/proxy)
-- Always use HTTPS in production with valid certificates
-- Implement webhook signature validation when available
+**Security:** Sashiko supports webhook signature verification via HMAC-SHA256
+(GitHub and GitLab 19.0+ signing tokens) and legacy secret tokens. When
+`webhook_secret` is configured, non-localhost requests are authenticated
+without requiring `--enable-unsafe-all-submit`. See the
+[Webhook Security Guide](WEBHOOK_SECURITY.md) for setup instructions and
+production deployment recommendations.
 
 ### Git Configuration
 
@@ -345,67 +346,9 @@ api_endpoint = "https://api.yourforge.com"
 
 ## Security Best Practices
 
-### Production Deployment
-
-1. **Use HTTPS with valid certificates**
-   - Set up reverse proxy (nginx, Apache, Caddy)
-   - Obtain SSL/TLS certificates (Let's Encrypt)
-   - Terminate TLS at proxy, forward to Sashiko
-
-2. **Implement authentication**
-   - Use webhook secrets when available
-   - Validate webhook signatures
-   - Restrict by source IP (if forge IPs are known)
-
-3. **Network isolation**
-   - Run Sashiko on private network
-   - Use VPN or SSH tunneling for access
-   - Firewall rules to limit exposure
-
-4. **Rate limiting**
-   - Configure at reverse proxy level
-   - Prevent abuse and DoS attempts
-   - Monitor webhook delivery rates
-
-5. **Audit logging**
-   - Log all webhook deliveries
-   - Track review queue metrics
-   - Monitor for unusual patterns
-
-### Example Nginx Configuration
-
-```nginx
-server {
-    listen 443 ssl http2;
-    server_name sashiko.example.com;
-
-    ssl_certificate /etc/letsencrypt/live/sashiko.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/sashiko.example.com/privkey.pem;
-
-    # Security headers
-    add_header Strict-Transport-Security "max-age=31536000" always;
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-
-    # Rate limiting
-    limit_req_zone $binary_remote_addr zone=webhook:10m rate=10r/m;
-    limit_req zone=webhook burst=5;
-
-    location /api/webhook/ {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
+Sashiko supports webhook signature verification. For complete setup
+instructions, deployment topologies, reverse proxy examples, and a
+production checklist, see the [Webhook Security Guide](WEBHOOK_SECURITY.md).
 
 ## Forge Comparison
 
@@ -414,8 +357,8 @@ server {
 | Webhook delivery | ✅ | ✅ | **Required** |
 | JSON payloads | ✅ | ✅ | **Required** |
 | Event filtering | ✅ | ✅ | **Required** |
-| Webhook secrets | ✅ | ✅ | Recommended |
-| Signature validation | ✅ | ✅ | Recommended |
+| Webhook secrets | ✅ | ✅ | ✅ Implemented |
+| Signature validation | ✅ | ✅ | ✅ Implemented |
 | Delivery logs | ✅ | ✅ | Recommended |
 | Public API | ✅ | ✅ | **Required** |
 | Token auth | ✅ | ✅ | **Required** |

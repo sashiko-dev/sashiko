@@ -29,6 +29,7 @@ send_positive_review = true
 lists = ["linux-perf-users@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-perf-users@vger.kernel.org"]
+send_positive_review = true
 
 [subsystems.batman]
 lists = ["b.a.t.m.a.n@lists.open-mesh.org"]

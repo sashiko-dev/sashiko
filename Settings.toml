@@ -7,8 +7,20 @@ description = ""
 [forge]
 enabled = false
 # provider = "github"
-# webhook_secret = "your-webhook-secret"
 # api_token = "your-api-token"
+
+# Webhook authentication (recommended for production).
+# When configured, Sashiko authenticates incoming webhook requests using
+# this token. Non-localhost requests are permitted without
+# --enable-unsafe-all-submit when a secret is set.
+#
+# For GitLab 19.0+ signing token (recommended):
+#   webhook_secret = "whsec_YOUR_BASE64_TOKEN"
+# For GitHub or plain secret token:
+#   webhook_secret = "YOUR_SECRET"
+# Generate a strong secret: openssl rand -hex 32
+# See docs/WEBHOOK_SECURITY.md for full setup guide.
+# webhook_secret = ""
 
 [subsystems]
 # Regex map: email address pattern -> subsystem name

@@ -22,6 +22,7 @@ In-depth coverage from the premier Linux news source.
 * [Exelbierd: What's actually in a Sashiko review?](https://lwn.net/Articles/1065971/)
 * [Reviewing kernel patches with LLMs](https://lwn.net/Articles/1073583/)
 * [Dirk and Linus discuss AI and kernel development](https://lwn.net/Articles/1073761/)
+* [Debating the role of large language models in the kernel community](https://lwn.net/Articles/1083275/)
 
 ## The Linux Foundation
 * [Linux Foundation on X](https://x.com/linuxfoundation/status/2036497032429305989)

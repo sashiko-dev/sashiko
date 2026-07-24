@@ -1,0 +1,14 @@
+# Self-hosted GitLab on the same LAN as Sashiko.
+# No reverse proxy needed if both are on a trusted private network.
+# See docs/WEBHOOK_SECURITY.md for full setup guide.
+
+[forge]
+enabled = true
+provider = "gitlab"
+# When webhook_secret is configured, Sashiko authenticates requests
+# from any address. No --enable-unsafe-all-submit needed.
+webhook_secret = "whsec_YOUR_BASE64_SIGNING_TOKEN_HERE"
+
+[server]
+host = "::"      # Bind to all interfaces (accessible from LAN)
+port = 8080

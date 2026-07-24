@@ -288,6 +288,7 @@ pub fn build_router(
     });
 
     Router::new()
+        .route("/health", get(health_check))
         .route("/api/config", get(get_config))
         .route("/api/lists", get(list_mailing_lists))
         .route("/api/patchsets", get(list_patchsets))
@@ -309,6 +310,7 @@ pub fn build_router(
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
         .layer(middleware::from_fn(redirect_www))
+        .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -471,7 +473,22 @@ async fn submit_patch(
         }
         SubmitRequest::Thread { msgid } => {
             let id = generate_synthetic_id("thread");
-            let clean_msgid = msgid.trim_matches(|c| c == '<' || c == '>').to_string();
+            // Percent-encode path-significant characters in the message-ID
+            // for safe inclusion in the lore.kernel.org fetch URL. This
+            // handles RFC 5322 message-IDs that contain `/` or other
+            // path-sensitive characters without rejecting them.
+            const PATH_SEGMENT_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+                .add(b'/')
+                .add(b'\\')
+                .add(b'?')
+                .add(b'#')
+                .add(b' ')
+                .add(b'%');
+            let clean_msgid = percent_encoding::utf8_percent_encode(
+                msgid.trim_matches(|c| c == '<' || c == '>'),
+                PATH_SEGMENT_ENCODE,
+            )
+            .to_string();
             info!(
                 "Received thread fetch request: {} (msgid: {})",
                 id, clean_msgid
@@ -535,15 +552,43 @@ async fn fetch_and_inject_thread(
         .into());
     }
 
-    let bytes = response.bytes().await?;
+    const MAX_MBOX_DOWNLOAD: usize = 10 * 1024 * 1024;
+    const MAX_MBOX_DECOMPRESSED: u64 = 50 * 1024 * 1024;
 
-    // Decompress the gzip data using a blocking task to avoid blocking the async runtime
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_MBOX_DOWNLOAD {
+        return Err(format!(
+            "Mbox download {} bytes exceeds {} byte limit",
+            bytes.len(),
+            MAX_MBOX_DOWNLOAD
+        )
+        .into());
+    }
+
+    // Decompress into bytes first, then convert to UTF-8. Reading directly
+    // into a String via read_to_string would produce an InvalidData error
+    // if the byte limit splits a multi-byte UTF-8 character.
     let raw = tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut raw = String::new();
-        decoder.read_to_string(&mut raw)?;
-        Ok(raw)
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut limited = decoder.take(MAX_MBOX_DECOMPRESSED);
+        let mut raw_bytes = Vec::new();
+        limited.read_to_end(&mut raw_bytes)?;
+
+        // If we read exactly the limit, check whether the stream had more
+        // data. This distinguishes a file that is exactly 50 MiB (accept)
+        // from one that was truncated at 50 MiB (reject).
+        if raw_bytes.len() as u64 == MAX_MBOX_DECOMPRESSED {
+            let mut probe = [0u8; 1];
+            if limited.into_inner().read(&mut probe).unwrap_or(0) > 0 {
+                return Err(std::io::Error::other(format!(
+                    "Decompressed mbox exceeds {} byte limit",
+                    MAX_MBOX_DECOMPRESSED
+                )));
+            }
+        }
+        String::from_utf8(raw_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })
     .await??;
 
@@ -1077,6 +1122,10 @@ async fn rerun_patch(
     Ok(Json(serde_json::json!({ "status": "accepted" })))
 }
 
+async fn health_check() -> StatusCode {
+    StatusCode::OK
+}
+
 async fn get_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1097,9 +1146,29 @@ async fn forge_webhook(
     if state.read_only {
         return Err(StatusCode::FORBIDDEN);
     }
-    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
-        info!("Refused {} webhook from non-localhost: {}", provider, addr);
-        return Err(StatusCode::FORBIDDEN);
+
+    let webhook_secret = state.settings.forge.webhook_secret.as_deref();
+    let has_secret = webhook_secret.is_some();
+
+    // Access control: when webhook_secret is configured, signature
+    // verification in validate_event is the sole access control for ALL
+    // requests. This is critical for reverse proxy deployments where all
+    // traffic arrives from loopback — the signature check cannot be
+    // bypassed by source IP.
+    //
+    // When no secret is configured, fall back to localhost-only or the
+    // explicit --enable-unsafe-all-submit flag. Note: this is insecure
+    // behind a reverse proxy; operators MUST configure webhook_secret
+    // for proxied deployments.
+    if !has_secret {
+        let is_loopback = addr.ip().to_canonical().is_loopback();
+        if !is_loopback && !state.allow_all_submit {
+            info!(
+                "Refused {} webhook from {}: configure webhook_secret or use --enable-unsafe-all-submit",
+                provider, addr
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
     }
 
     let forge = state.forge_registry.get(&provider).ok_or_else(|| {
@@ -1107,7 +1176,7 @@ async fn forge_webhook(
         StatusCode::NOT_FOUND
     })?;
 
-    forge.validate_event(&headers)?;
+    forge.validate_event(&headers, &body, webhook_secret)?;
 
     let (action, metadata) = forge.parse_payload(&body)?;
 

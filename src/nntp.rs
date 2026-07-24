@@ -21,12 +21,6 @@ use tracing::{debug, info};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn strip_nntp_line_ending(line: &str) -> &str {
-    line.strip_suffix("\r\n")
-        .or_else(|| line.strip_suffix('\n'))
-        .unwrap_or(line)
-}
-
 pub struct NntpClient {
     stream: BufReader<TcpStream>,
     timeout: Duration,
@@ -113,7 +107,7 @@ impl NntpClient {
             }
 
             let line_raw = String::from_utf8_lossy(&buf);
-            let line = line_raw.trim_end(); // remove \r\n
+            let line = line_raw.trim_end_matches(['\r', '\n']);
 
             if line == "." {
                 break;
@@ -168,9 +162,9 @@ impl NntpClient {
                 break; // EOF
             }
 
-            // ARTICLE lines are payload, so remove only the protocol line ending.
+            // Convert to string (lossy)
             let line_raw = String::from_utf8_lossy(&buf);
-            let line = strip_nntp_line_ending(&line_raw);
+            let line = line_raw.trim_end_matches(['\r', '\n']);
 
             if line == "." {
                 break;
@@ -203,15 +197,6 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
-
-    #[test]
-    fn strips_exactly_one_nntp_line_ending() {
-        assert_eq!(strip_nntp_line_ending("payload \t\r\n"), "payload \t");
-        assert_eq!(strip_nntp_line_ending("payload \t\n"), "payload \t");
-        assert_eq!(strip_nntp_line_ending("payload\r\r\n"), "payload\r");
-        assert_eq!(strip_nntp_line_ending("payload\n\n"), "payload\n");
-        assert_eq!(strip_nntp_line_ending("payload \t"), "payload \t");
-    }
 
     #[tokio::test]
     async fn article_preserves_payload_whitespace_and_framing() {
