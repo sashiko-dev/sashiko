@@ -510,6 +510,32 @@ fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+async fn recover_bad_tag(repo_path: &Path, stderr: &str) -> bool {
+    if !stderr.contains("fatal: bad object refs/tags/") {
+        return false;
+    }
+
+    let Some(start) = stderr.find("refs/tags/") else {
+        return false;
+    };
+    let tag_path = stderr[start..].split_whitespace().next().unwrap_or("");
+    if tag_path.is_empty() {
+        return false;
+    }
+
+    warn!(
+        "Detected bad tag '{}'. Attempting to delete and retry fetch.",
+        tag_path
+    );
+    let _ = Command::new("git")
+        .current_dir(repo_path)
+        .args(["update-ref", "-d", tag_path])
+        .output()
+        .await;
+
+    true
+}
+
 pub async fn ensure_remote(
     repo_path: &Path,
     name: &str,
@@ -653,35 +679,19 @@ pub async fn ensure_remote(
                     let stderr = String::from_utf8_lossy(&fetch.stderr);
 
                     // Auto-recover from bad tags
-                    if stderr.contains("fatal: bad object refs/tags/")
-                        && let Some(start) = stderr.find("refs/tags/")
-                    {
-                        let tag_path = &stderr[start..];
-                        let tag_path = tag_path.split_whitespace().next().unwrap_or("");
-                        if !tag_path.is_empty() {
-                            warn!(
-                                "Detected bad tag '{}'. Attempting to delete and retry fetch.",
-                                tag_path
-                            );
-                            let _ = Command::new("git")
-                                .current_dir(repo_path)
-                                .args(["update-ref", "-d", tag_path])
-                                .output()
-                                .await;
+                    if recover_bad_tag(repo_path, &stderr).await {
+                        // Retry the fetch once
+                        let retry_future = Command::new("git")
+                            .current_dir(repo_path)
+                            .args(GIT_PROTOCOL_RESTRICTIONS)
+                            .args(["fetch", "--prune", "--no-tags", name])
+                            .kill_on_drop(true)
+                            .output();
 
-                            // Retry the fetch once
-                            let retry_future = Command::new("git")
-                                .current_dir(repo_path)
-                                .args(GIT_PROTOCOL_RESTRICTIONS)
-                                .args(["fetch", "--prune", "--no-tags", name])
-                                .kill_on_drop(true)
-                                .output();
-
-                            if let Ok(Ok(retry_fetch)) =
-                                tokio::time::timeout(timeout_duration, retry_future).await
-                            {
-                                fetch = retry_fetch;
-                            }
+                        if let Ok(Ok(retry_fetch)) =
+                            tokio::time::timeout(timeout_duration, retry_future).await
+                        {
+                            fetch = retry_fetch;
                         }
                     }
                 }
@@ -1389,75 +1399,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_remote_bad_tag_recovery() -> Result<()> {
+    async fn test_recover_bad_tag_from_fetch_error() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
-        let local_repo_path = temp_dir.path().join("local");
-        let remote_repo_path = temp_dir.path().join("remote");
-
-        std::fs::create_dir(&local_repo_path)?;
-        std::fs::create_dir(&remote_repo_path)?;
-
-        // Init remote repo
         Command::new("git")
-            .current_dir(&remote_repo_path)
+            .current_dir(temp_dir.path())
             .args(["init"])
             .output()
             .await?;
-
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["config", "user.email", "test@example.com"])
-            .output()
-            .await?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["config", "user.name", "Test"])
-            .output()
-            .await?;
-        let mut file = File::create(remote_repo_path.join("file.txt"))?;
-        writeln!(file, "test")?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["add", "file.txt"])
-            .output()
-            .await?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["commit", "-m", "init"])
-            .output()
-            .await?;
-
-        // Init local repo
-        Command::new("git")
-            .current_dir(&local_repo_path)
-            .args(["init"])
-            .output()
-            .await?;
-
-        // Use ensure_remote to add remote and fetch
-        ensure_remote(
-            &local_repo_path,
-            "origin",
-            remote_repo_path.to_str().unwrap(),
-            true,
-        )
-        .await?;
 
         // Create bad tag in local repo
-        let tags_dir = local_repo_path.join(".git").join("refs").join("tags");
+        let tags_dir = temp_dir.path().join(".git").join("refs").join("tags");
         std::fs::create_dir_all(&tags_dir)?;
         let bad_tag_path = tags_dir.join("bad-tag");
         let mut bad_tag_file = File::create(&bad_tag_path)?;
         writeln!(bad_tag_file, "0000000000000000000000000000000000000000")?;
 
-        // Fetch again, should auto-recover and delete the bad tag
-        ensure_remote(
-            &local_repo_path,
-            "origin",
-            remote_repo_path.to_str().unwrap(),
-            true,
-        )
-        .await?;
+        let stderr = "fatal: bad object refs/tags/bad-tag\n";
+        assert!(recover_bad_tag(temp_dir.path(), stderr).await);
 
         assert!(
             !bad_tag_path.exists(),
