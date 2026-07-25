@@ -214,7 +214,7 @@ annotated example.
 | `defaults.cc` | list | `[]` | Static CC addresses. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses to ignore entirely. |
 | `defaults.subject_prefixes` | list | `[]` | Subject prefix patterns to match for this scope. |
-| `defaults.embargo_hours` | integer | -- | Hours to wait before sending a review. When a patch matches multiple subsystems, the shortest configured embargo wins. |
+| `defaults.embargo_hours` | integer | -- | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. When a patch matches multiple subsystems, the shortest configured embargo wins. |
 | `defaults.send_positive_review` | bool | `false` | Send email even when no issues are found. |
 
 The email policy also supports per-subsystem overrides via
