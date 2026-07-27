@@ -390,22 +390,70 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
 }
 
 /// Extract JSON from text that may be wrapped in markdown fences.
-/// Returns the content inside the first fenced block, or the original text trimmed.
+/// Returns the content of the first fenced block that parses as JSON, else the
+/// first json-tagged block, else the first block, else the original text trimmed.
 /// Does NOT try to find outermost braces — that can silently produce invalid JSON
 /// when the text contains multiple objects (e.g. JSONL), which the JSONL fallback
 /// in parse_inner_response handles better.
 fn extract_json(text: &str) -> String {
-    // Strip markdown fences — handle both LF and CRLF, and optional language tag
+    // A reasoning summary or a quoted hunk often arrives fenced ahead of the
+    // JSON, so no single fence is the answer. The json tag breaks the tie for
+    // a JSONL body, which parses only line by line and so never wins outright.
     let normalized = text.replace("\r\n", "\n");
-    for fence_start in &["```json\n", "```JSON\n", "```\n"] {
-        if let Some(start) = normalized.find(fence_start) {
-            let after = &normalized[start + fence_start.len()..];
-            if let Some(end) = after.find("\n```") {
-                return after[..end].trim().to_string();
-            }
+    let mut json_tagged: Option<&str> = None;
+    let mut untagged: Option<&str> = None;
+    let mut rest = normalized.as_str();
+    while let Some(start) = find_fence_opener(rest) {
+        let after_ticks = &rest[start + 3..];
+        let Some(nl) = after_ticks.find('\n') else {
+            break;
+        };
+        let tag = after_ticks[..nl].trim();
+        let body = &after_ticks[nl + 1..];
+        // A fence tag is one word; anything else is prose that happened to
+        // start with a backtick run, so keep looking from the next line.
+        if tag.contains(char::is_whitespace) {
+            rest = body;
+            continue;
         }
+        let Some(end) = body.find("\n```") else { break };
+        let inner = body[..end].trim();
+        // Only an object or an array can be the answer. A fence holding a
+        // bare number or literal is prose quoting a value, and taking it
+        // would hide the answer that follows.
+        if serde_json::from_str::<Value>(inner).is_ok_and(|v| v.is_object() || v.is_array()) {
+            return inner.to_string();
+        }
+        if tag.get(..4).is_some_and(|t| t.eq_ignore_ascii_case("json")) {
+            json_tagged.get_or_insert(inner);
+        } else if tag.is_empty() && inner.starts_with(['{', '[']) {
+            untagged.get_or_insert(inner);
+        }
+        rest = &body[end + 4..];
     }
-    normalized.trim().to_string()
+    // A fence tagged as some other language holds a hunk, not the answer.
+    // Returning it would hide JSON the model left unfenced after it, so the
+    // whole text goes back instead and the line-by-line parse scans it.
+    json_tagged
+        .or(untagged)
+        .unwrap_or(normalized.trim())
+        .to_string()
+}
+
+/// Returns the offset of the first backtick run that starts a line.
+///
+/// A fence opener sits at the start of its line. A run inside prose, which
+/// a model uses to quote a fence it is about to emit, is not one.
+fn find_fence_opener(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(off) = text[from..].find("```") {
+        let start = from + off;
+        if start == 0 || text.as_bytes()[start - 1] == b'\n' {
+            return Some(start);
+        }
+        from = start + 3;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -627,6 +675,102 @@ mod tests {
             .unwrap();
         assert_eq!(calls[0].id, "call_a");
         assert_eq!(calls[1].id, "call_b");
+    }
+
+    #[test]
+    fn test_extract_json_unwraps_any_fence_tag() {
+        for tag in ["json", "JSON", "jsonc", "json5", ""] {
+            let text = format!("```{tag}\n{{\"content\":\"ok\"}}\n```");
+            let resp = parse_inner_response("test-cli", &text, None).unwrap();
+            assert_eq!(resp.content.as_deref(), Some("ok"), "tag {tag:?}");
+        }
+    }
+
+    #[test]
+    fn test_extract_json_skips_a_leading_non_json_fence() {
+        // Reasoning summaries and quoted hunks arrive fenced ahead of the
+        // answer, so the JSON block is not always the first fence.
+        let text = "Here is the offending hunk:\n\
+                    ```c\n\
+                    int x = 1;\n\
+                    ```\n\n\
+                    ```json\n\
+                    {\"tool_calls\":[{\"id\":\"c1\",\"function_name\":\"read_file\",\"arguments\":{}}]}\n\
+                    ```";
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+    }
+
+    #[test]
+    fn test_extract_json_prefers_a_json_tagged_fence() {
+        // A JSONL body does not parse as a single value, so the tag is what
+        // picks it over the reasoning block ahead of it.
+        let text = "```text\n\
+                    thinking out loud\n\
+                    ```\n\n\
+                    ```json\n\
+                    {\"tool_calls\":[{\"id\":\"c1\",\"function_name\":\"git_log\",\"arguments\":{}}]}\n\
+                    {\"tool_calls\":[{\"id\":\"c2\",\"function_name\":\"read_file\",\"arguments\":{}}]}\n\
+                    ```";
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_json_ignores_backticks_inside_prose() {
+        // A model that quotes the fence it is about to emit puts a backtick
+        // run mid-line. Reading that as the opener would take the real
+        // opening fence as the closer and return the prose between them.
+        let text = "I will reply inside a ```json\n\
+                    fence as asked:\n\
+                    ```json\n\
+                    {\"tool_calls\":[{\"id\":\"c1\",\"function_name\":\"git_log\",\"arguments\":{}}]}\n\
+                    ```";
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function_name, "git_log");
+    }
+
+    #[test]
+    fn test_extract_json_keeps_unfenced_json_after_a_hunk() {
+        // The prompt asks for bare JSON, so the answer may follow a fenced
+        // hunk unfenced. The hunk must not be returned in its place.
+        let text = "```c\n\
+                    int x = 1;\n\
+                    ```\n\
+                    {\"tool_calls\":[{\"id\":\"c1\",\"function_name\":\"read_file\",\"arguments\":{}}]}";
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function_name, "read_file");
+    }
+
+    #[test]
+    fn test_extract_json_skips_a_fenced_scalar() {
+        // A bare value parses as JSON but is not a report; the answer that
+        // follows it must still be found.
+        let text = "The call returns:\n\
+                    ```\n\
+                    0\n\
+                    ```\n\
+                    {\"tool_calls\":[{\"id\":\"c1\",\"function_name\":\"read_file\",\"arguments\":{}}]}";
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 1);
     }
 
     #[test]
