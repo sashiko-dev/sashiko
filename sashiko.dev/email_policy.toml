@@ -276,3 +276,11 @@ cc = ["Miquel Raynal <miquel.raynal@bootlin.com>",
       "Pratyush Yadav <pratyush@kernel.org>",
       "Michael Walle <mwalle@kernel.org>",
       "Takahiro Kuwano <takahiro.kuwano@infineon.com>"]
+
+[subsystems.audit]
+lists = ["audit@vger.kernel.org"]
+send_positive_review = true
+reply_all = false
+reply_to_author = false
+cc_individuals = false
+cc = ["audit@vger.kernel.org"]
