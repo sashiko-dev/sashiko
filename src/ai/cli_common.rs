@@ -26,6 +26,8 @@
 //! Functions that log take the caller's provider name, since the message
 //! otherwise names whichever provider the code happens to live next to.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -246,6 +248,10 @@ pub fn parse_inner_response(
         }
     }
 
+    // Across the whole merge, not per line, so that a model restarting its
+    // numbering in each line does not repeat an id
+    assign_unique_ids(&mut merged_tool_calls);
+
     if !merged_tool_calls.is_empty() {
         debug!(
             target: "sashiko::ai::cli_provider",
@@ -291,8 +297,11 @@ pub fn parse_inner_response(
     })
 }
 
+/// Convert one entry of a `tool_calls` array into a `ToolCall`.
+///
+/// A missing "id" leaves the field empty for `assign_unique_ids` to fill in.
 fn parse_tool_call(c: &Value) -> Option<ToolCall> {
-    let id = c["id"].as_str().unwrap_or("c1").to_string();
+    let id = c["id"].as_str().unwrap_or_default().to_string();
     let name = c["function_name"].as_str()?.to_string();
     let args = c["arguments"].clone();
     Some(ToolCall {
@@ -303,10 +312,47 @@ fn parse_tool_call(c: &Value) -> Option<ToolCall> {
     })
 }
 
+/// Give every call in a batch a distinct id, keeping the ones the model
+/// supplied.
+///
+/// SessionRunner records one AiMessage per tool result and carries the call's
+/// id over as tool_call_id, which build_prompt renders as the `id` of a
+/// `<tool_result>` block. Two calls sharing an id leave the model unable to
+/// tell which output came from which call, so it can read a file's contents as
+/// the git log it also asked for. Models drop the "id" the prompt asks for, and
+/// one that splits its batch across several JSON objects tends to number each
+/// object from c1 again, so neither the supplied ids nor their absence can be
+/// relied on.
+///
+/// A call keeps its supplied id unless an earlier call in the batch already
+/// claimed it. Every other call takes the lowest cN not claimed by any of them.
+fn assign_unique_ids(calls: &mut [ToolCall]) {
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut unnamed: Vec<usize> = Vec::new();
+
+    for (i, call) in calls.iter().enumerate() {
+        if call.id.is_empty() || !taken.insert(call.id.clone()) {
+            unnamed.push(i);
+        }
+    }
+
+    let mut next = 1;
+    for i in unnamed {
+        calls[i].id = loop {
+            let candidate = format!("c{next}");
+            next += 1;
+            if taken.insert(candidate.clone()) {
+                break candidate;
+            }
+        };
+    }
+}
+
 fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Result<AiResponse> {
     // Tool calls?
     if let Some(calls) = v["tool_calls"].as_array() {
-        let tool_calls: Vec<ToolCall> = calls.iter().filter_map(parse_tool_call).collect();
+        let mut tool_calls: Vec<ToolCall> = calls.iter().filter_map(parse_tool_call).collect();
+        assign_unique_ids(&mut tool_calls);
 
         if !tool_calls.is_empty() {
             return Ok(AiResponse {
@@ -519,6 +565,68 @@ mod tests {
             .expect("EPIPE on a failed run must not discard the diagnostics");
         assert!(!output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_without_ids_get_distinct_ids() {
+        let text = r#"{"tool_calls":[{"function_name":"git_log","arguments":{}},{"function_name":"read_file","arguments":{"path":"a"}}]}"#;
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn test_parse_jsonl_tool_calls_get_distinct_ids() {
+        let text = "{\"tool_calls\":[{\"function_name\":\"git_log\",\"arguments\":{}}]}\n\
+                    {\"tool_calls\":[{\"function_name\":\"read_file\",\"arguments\":{}}]}";
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn test_parse_tool_calls_mixed_ids_stay_distinct() {
+        // The supplied id collides with the position-derived fallback the
+        // second call would otherwise get.
+        let text = r#"{"tool_calls":[{"id":"c2","function_name":"git_log","arguments":{}},{"function_name":"read_file","arguments":{"path":"a"}}]}"#;
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "c2");
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn test_parse_jsonl_repeated_supplied_ids_stay_distinct() {
+        // A model that splits its batch across lines tends to restart its
+        // numbering in each one.
+        let text = "{\"tool_calls\":[{\"id\":\"c1\",\"function_name\":\"git_log\",\"arguments\":{}}]}\n\
+                    {\"tool_calls\":[{\"id\":\"c1\",\"function_name\":\"read_file\",\"arguments\":{}}]}";
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn test_parse_tool_calls_keep_supplied_ids() {
+        let text = r#"{"tool_calls":[{"id":"call_a","function_name":"git_log","arguments":{}},{"id":"call_b","function_name":"read_file","arguments":{}}]}"#;
+        let calls = parse_inner_response("test-cli", text, None)
+            .unwrap()
+            .tool_calls
+            .unwrap();
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[1].id, "call_b");
     }
 
     #[test]
