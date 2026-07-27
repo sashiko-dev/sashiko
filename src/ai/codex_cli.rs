@@ -20,13 +20,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use super::claude_cli::log_and_redact_stderr;
-use super::cli_common::{build_prompt, parse_inner_response};
+use super::cli_common::{build_prompt, parse_inner_response, write_prompt_and_wait};
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, cache_identity_with,
 };
@@ -65,7 +64,7 @@ impl AiProvider for CodexCliProvider {
             args.push(format!("model_reasoning_effort={effort}"));
         }
 
-        let mut child = Command::new("codex")
+        let child = Command::new("codex")
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -74,15 +73,13 @@ impl AiProvider for CodexCliProvider {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn codex CLI: {}. Is it installed?", e))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.flush().await?;
-        }
-
-        let output = timeout(Duration::from_secs(600), child.wait_with_output())
-            .await
-            .map_err(|_| anyhow::anyhow!("codex CLI timed out after 10 minutes"))?
-            .map_err(|e| anyhow::anyhow!("codex CLI wait error: {}", e))?;
+        let output = timeout(
+            Duration::from_secs(600),
+            write_prompt_and_wait("codex-cli", child, prompt),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("codex CLI timed out after 10 minutes"))?
+        .map_err(|e| anyhow::anyhow!("codex CLI {}", e))?;
 
         let stderr = log_and_redact_stderr("codex-cli", &output.stderr);
 

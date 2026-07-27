@@ -15,14 +15,13 @@
 //! Prompt construction and response parsing shared by the CLI-backed providers
 //! (claude-cli, codex-cli, copilot-cli, devin-cli, kiro-cli).
 //!
-//! What these providers share is the wire format, not the transport: each one
-//! hands the subprocess the prompt `build_prompt()` renders and feeds the
-//! model's reply back through `parse_inner_response()`. How the prompt gets in
-//! and the reply gets out differs per provider — claude-cli writes stdin and
-//! reads one JSON document from stdout, codex-cli and copilot-cli read a JSONL
-//! event stream, devin-cli passes the prompt as a temp-file path with stdin
-//! closed, and kiro-cli speaks ACP over a session. Changing the prompt or the
-//! parser affects all five; changing the transport affects only one.
+//! What these providers share is the wire format: each one hands the
+//! subprocess the prompt `build_prompt()` renders and feeds the model's reply
+//! back through `parse_inner_response()`. The three that take the prompt on
+//! stdin also share `write_prompt_and_wait()`. What differs is how the reply
+//! comes out — claude-cli reads one JSON document from stdout, codex-cli and
+//! copilot-cli read a JSONL event stream, devin-cli passes the prompt as a
+//! temp-file path with stdin closed, and kiro-cli speaks ACP over a session.
 //!
 //! Functions that log take the caller's provider name, since the message
 //! otherwise names whichever provider the code happens to live next to.
@@ -139,6 +138,75 @@ pub fn build_prompt(request: &AiRequest) -> String {
     }
 
     out
+}
+
+/// Names the half of a CLI call that failed, so the caller can label it.
+#[derive(Debug)]
+pub enum CliIoError {
+    /// The prompt could not be written to the child's stdin.
+    Write(std::io::Error),
+    /// The child could not be waited on.
+    Wait(std::io::Error),
+}
+
+impl std::fmt::Display for CliIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliIoError::Write(e) => write!(f, "stdin write failed: {e}"),
+            CliIoError::Wait(e) => write!(f, "wait error: {e}"),
+        }
+    }
+}
+
+/// Feed `prompt` to a spawned CLI while draining its output, and return what
+/// the child produced.
+///
+/// The write runs concurrently with the wait rather than before it.  A patch
+/// review prompt runs to hundreds of KB, and a child that emits more than a
+/// pipe buffer of output before consuming all of stdin blocks on its own full
+/// stdout while the writer blocks on its full stdin.  `wait_with_output()`
+/// drains both output pipes, so the child keeps making progress as the prompt
+/// goes in.  Closing stdin afterwards is what puts these CLIs into
+/// non-interactive mode, so the handle is taken here and dropped when the
+/// write finishes.
+///
+/// A child that rejects the invocation stops reading early and closes the
+/// pipe, and the write then fails with EPIPE.  Its output holds the reason it
+/// quit, so when it exited non-zero that output is handed back and the EPIPE
+/// only logged.  A child that exits 0 without taking the whole prompt is a
+/// different matter: its answer was produced from a truncated prompt, so the
+/// write error is reported rather than letting the exit status mask it.
+///
+/// `provider` names the caller for the log message, as it does for
+/// `parse_inner_response()`.
+pub async fn write_prompt_and_wait(
+    provider: &str,
+    mut child: tokio::process::Child,
+    prompt: String,
+) -> std::result::Result<std::process::Output, CliIoError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut stdin = child.stdin.take();
+    let prompt_bytes = prompt.into_bytes();
+
+    let write = async {
+        if let Some(mut stdin) = stdin.take() {
+            stdin.write_all(&prompt_bytes).await?;
+            stdin.flush().await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    let (written, output) = tokio::join!(write, child.wait_with_output());
+    let output = output.map_err(CliIoError::Wait)?;
+
+    match written {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe && !output.status.success() => {
+            debug!("{provider} closed stdin before the prompt finished: {e}");
+            Ok(output)
+        }
+        Err(e) => Err(CliIoError::Write(e)),
+        Ok(()) => Ok(output),
+    }
 }
 
 /// Parse a provider's response body into an AiResponse.
@@ -430,6 +498,27 @@ mod tests {
             Some("No issues found in this patch.")
         );
         assert!(resp.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_prompt_and_wait_keeps_the_diagnostics_of_a_child_that_quits_early() {
+        // The child exits non-zero without draining stdin, so a prompt too
+        // large for the pipe buffer ends in EPIPE; its output says why it quit.
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo done; exit 1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let output = write_prompt_and_wait("test-cli", child, "x".repeat(4 * 1024 * 1024))
+            .await
+            .expect("EPIPE on a failed run must not discard the diagnostics");
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
     }
 
     #[test]

@@ -31,12 +31,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::debug;
 
-use super::cli_common::{build_prompt, parse_inner_response};
+use super::cli_common::{CliIoError, build_prompt, parse_inner_response, write_prompt_and_wait};
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiUsage, ClassifyAiError,
     ProviderCapabilities, cache_identity_with,
@@ -53,6 +52,8 @@ pub enum ClaudeCliError {
     Timeout,
     #[error("claude CLI wait error: {0}")]
     Wait(String),
+    #[error("claude CLI stdin write failed: {0}")]
+    Stdin(String),
     #[error("claude CLI error: {0}")]
     Cli(String),
     #[error("Failed to parse claude CLI JSON output: {0}")]
@@ -86,6 +87,9 @@ impl ClassifyAiError for ClaudeCliError {
                 retry_after: Duration::from_secs(30),
             },
             ClaudeCliError::Wait(_) => AiErrorClass::Transient {
+                retry_after: Duration::from_secs(30),
+            },
+            ClaudeCliError::Stdin(_) => AiErrorClass::Transient {
                 retry_after: Duration::from_secs(30),
             },
             ClaudeCliError::Cli(_) => AiErrorClass::Fatal,
@@ -198,10 +202,18 @@ impl ClaudeCliProvider {
             .spawn()
             .map_err(|e| ClaudeCliError::Spawn(e.to_string()))?;
 
-        // Bound both prompt transfer and output collection by the same deadline.
-        let output = timeout(call_timeout, collect_cli_output(child, &prompt))
-            .await
-            .map_err(|_| ClaudeCliError::Timeout)??;
+        // The write is inside the timeout, so a prompt that cannot be
+        // delivered is bounded the same way as a hung CLI.
+        let output = timeout(
+            call_timeout,
+            write_prompt_and_wait("claude-cli", child, prompt),
+        )
+        .await
+        .map_err(|_| ClaudeCliError::Timeout)?
+        .map_err(|e| match e {
+            CliIoError::Write(e) => ClaudeCliError::Stdin(e.to_string()),
+            CliIoError::Wait(e) => ClaudeCliError::Wait(e.to_string()),
+        })?;
 
         let stderr = log_and_redact_stderr("claude-cli", &output.stderr);
         let raw = String::from_utf8_lossy(&output.stdout);
@@ -249,29 +261,6 @@ impl AiProvider for ClaudeCliProvider {
             ],
         )
     }
-}
-
-async fn collect_cli_output(
-    mut child: tokio::process::Child,
-    prompt: &str,
-) -> Result<std::process::Output, ClaudeCliError> {
-    let stdin = child.stdin.take();
-    let write_prompt = async move {
-        if let Some(mut stdin) = stdin {
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.flush().await?;
-        }
-        Ok::<(), std::io::Error>(())
-    };
-    // Drain output while feeding stdin; the CLI may emit startup errors first.
-    let (written, output) = tokio::join!(write_prompt, child.wait_with_output());
-    let output = output.map_err(|error| ClaudeCliError::Wait(error.to_string()))?;
-    // Preserve CLI diagnostics on failure, even when it closed stdin early.
-    if output.status.success() {
-        written
-            .map_err(|error| ClaudeCliError::Wait(format!("failed to write prompt: {error}")))?;
-    }
-    Ok(output)
 }
 
 fn parse_cli_output(raw: &str) -> Result<Value, ClaudeCliError> {

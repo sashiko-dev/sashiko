@@ -165,8 +165,7 @@ exit 0
         .await
         .expect_err("a successful exit cannot mask an undelivered prompt");
     let error = error.downcast_ref::<ClaudeCliError>().unwrap();
-    assert!(matches!(error, ClaudeCliError::Wait(message)
-        if message.starts_with("failed to write prompt:")));
+    assert!(matches!(error, ClaudeCliError::Stdin(_)));
     assert!(matches!(
         error.ai_error_class(),
         AiErrorClass::Transient { retry_after }
