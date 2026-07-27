@@ -124,11 +124,16 @@ effort = "high"                    # Sent as output_config.effort: "low", "mediu
 
 ## Testing
 
-Tests are in `src/ai/claude.rs` and `src/ai/claude_cli.rs`:
+Tests are in `src/ai/claude.rs`:
 - Thinking and effort serialization (each omitted when unset, effort at the top level)
 - Request translation (system, user, assistant, tool calls, tool results)
 - Response translation (text, tool calls, thinking, usage with cache)
 - Cache control (applied when enabled, absent when disabled)
-- `build_prompt()` format instructions (with/without tools, with/without JSON format)
 - Subprocess restrictions, prompt transport and scratch-directory cleanup
   on success and failure (`src/ai/claude_cli/process_tests.rs`)
+
+The prompt builder and response parser the CLI provider uses live in
+`src/ai/cli_common.rs`, shared with the other CLI-backed providers, and are
+tested there:
+- `build_prompt()` format instructions (with/without tools, with/without JSON format)
+- `parse_inner_response()` tool calls, plain content, raw-text fallback

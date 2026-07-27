@@ -6,10 +6,10 @@ Sashiko supports API-backed and CLI-backed providers through the generic
 `AiProvider` trait in `src/ai/mod.rs`. The existing `claude-cli` and
 `codex-cli` providers are the closest local patterns:
 
-- `src/ai/claude_cli.rs` converts an `AiRequest` into a text prompt, shells out
-  to a local CLI, and parses either final content or a synthetic JSON tool-call
-  envelope.
-- `src/ai/codex_cli.rs` reuses the Claude CLI prompt and response parser, then
+- `src/ai/cli_common.rs` converts an `AiRequest` into a text prompt and parses
+  the reply as either final content or a synthetic JSON tool-call envelope.
+- `src/ai/claude_cli.rs` shells out to a local CLI around those two helpers.
+- `src/ai/codex_cli.rs` reuses the same prompt and response parser, then
   adapts Codex JSONL events into plain text.
 - `src/reviewer.rs` maps API/CLI providers used by the parent process to a
   `stdio-*` provider in the child review binary, so the child asks the parent
@@ -36,7 +36,7 @@ require approvals that cannot be granted in non-interactive mode.
 | Client architecture | New `KiroCliProvider` in `src/ai/kiro_cli.rs`, matching the existing CLI-backed provider pattern |
 | Kiro mode | `kiro-cli acp` |
 | Prompt transport | Full Sashiko prompt sent as ACP `session/prompt` text content |
-| Response parsing | Reuse `claude_cli::parse_inner_response()` for final content and Sashiko JSON `tool_calls` |
+| Response parsing | Reuse `cli_common::parse_inner_response()` for final content and Sashiko JSON `tool_calls` |
 | Native Kiro tools | Disabled by default through an isolated generated Kiro agent |
 | Safety backstop | Generated deny-all `preToolUse` hook in the temporary Kiro workspace |
 | Custom agent override | Optional `[ai.kiro_cli].agent`; treated as an advanced escape hatch |
@@ -133,7 +133,7 @@ pub struct KiroCliProvider {
 
 Implement `AiProvider`:
 
-1. Build the full Sashiko prompt with `claude_cli::build_prompt(&request)`.
+1. Build the full Sashiko prompt with `cli_common::build_prompt(&request)`.
 2. If `agent` is unset, create a temporary directory with:
 
    ```text
@@ -210,7 +210,7 @@ Implement `AiProvider`:
 8. On JSON-RPC error, timeout, missing session ID, or subprocess failure,
    fail with a concise sanitized error.
 9. Parse the collected completion text with
-   `claude_cli::parse_inner_response`.
+   `cli_common::parse_inner_response`.
 10. Since Kiro does not expose ACP token usage, synthesize approximate
     usage:
 

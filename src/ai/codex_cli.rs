@@ -25,7 +25,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
+use super::claude_cli::log_and_redact_stderr;
+use super::cli_common::{build_prompt, parse_inner_response};
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, cache_identity_with,
 };
@@ -151,10 +152,10 @@ impl AiProvider for CodexCliProvider {
         if response_text.is_empty() {
             // Fall back to raw output if no events parsed
             warn!("codex-cli: no item.completed events found, using raw output");
-            return parse_inner_response(&raw, usage);
+            return parse_inner_response("codex-cli", &raw, usage);
         }
 
-        parse_inner_response(&response_text, usage)
+        parse_inner_response("codex-cli", &response_text, usage)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {

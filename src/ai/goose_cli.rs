@@ -46,7 +46,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use super::acp::AcpProcess;
-use super::claude_cli::{build_prompt, parse_inner_response};
+use super::cli_common::{build_prompt, parse_inner_response};
 use super::token_budget::TokenBudget;
 use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities};
 
@@ -229,7 +229,7 @@ impl AiProvider for GooseCliProvider {
             })
         });
 
-        parse_inner_response(&text, usage)
+        parse_inner_response("goose-cli", &text, usage)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {

@@ -33,7 +33,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
+use super::claude_cli::log_and_redact_stderr;
+use super::cli_common::{build_prompt, parse_inner_response};
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, token_budget::TokenBudget,
 };
@@ -148,7 +149,7 @@ impl AiProvider for DevinCliProvider {
             cached_tokens: None,
         });
 
-        parse_inner_response(&raw, usage)
+        parse_inner_response("devin-cli", &raw, usage)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
