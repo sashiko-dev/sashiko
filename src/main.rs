@@ -553,6 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         baseline,
                         skip_subjects,
                         only_subjects,
+                        submitted_at,
                     } => {
                         let messages = sashiko::ingestor::split_mbox(raw.as_bytes());
                         let count = messages.len();
@@ -591,7 +592,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             group: effective_group,
                                             article_id: submission_id.clone(),
                                             source,
-                                            metadata: Some(metadata),
+                                            metadata: {
+                                                let mut m = metadata;
+                                                if submitted_at.is_some() {
+                                                    m.received_date = submitted_at;
+                                                }
+                                                Some(m)
+                                            },
                                             patch: patch_opt,
                                             baseline: baseline_clone,
                                             failed_error: None,
@@ -1993,7 +2000,10 @@ async fn process_parsed_article(
                 metadata.message_id.as_str(),
                 &subject,
                 &author,
-                metadata.date,
+                // Use server-side timestamp (received_date) when available,
+                // falling back to the email's Date: header. This prevents
+                // stale mbox timestamps from skewing queue ordering.
+                metadata.received_date.unwrap_or(metadata.date),
                 total_parts,
                 PARSER_VERSION,
                 &metadata.to,

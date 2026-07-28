@@ -58,6 +58,10 @@ pub enum Event {
         baseline: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
+        /// Server-side timestamp for when the submission was received.
+        /// Used instead of the email's Date: header for patchset ordering
+        /// to prevent stale mbox timestamps from skewing the queue.
+        submitted_at: Option<i64>,
     },
     IngestionFailed {
         article_id: String,

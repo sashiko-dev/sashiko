@@ -397,6 +397,11 @@ async fn submit_patch(
             let id = generate_synthetic_id("inject");
             info!("Received raw mbox injection: {} (len: {})", id, raw.len());
 
+            let submitted_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .ok();
+
             let event = Event::RawMboxSubmitted {
                 raw,
                 submission_id: id.clone(),
@@ -405,6 +410,7 @@ async fn submit_patch(
                 baseline: base_commit,
                 skip_subjects,
                 only_subjects,
+                submitted_at,
             };
 
             if let Err(e) = state.sender.send(event).await {
@@ -614,6 +620,11 @@ async fn fetch_and_inject_thread(
     })
     .await??;
 
+    let submitted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .ok();
+
     let event = Event::RawMboxSubmitted {
         raw,
         submission_id: msgid.to_string(),
@@ -622,6 +633,7 @@ async fn fetch_and_inject_thread(
         baseline: None,
         skip_subjects: None,
         only_subjects: None,
+        submitted_at,
     };
 
     sender.send(event).await?;
