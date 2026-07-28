@@ -491,6 +491,26 @@ impl PriorityRule {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct BatchTier {
+    pub min_size: i64,
+    pub priority: i32,
+}
+
+impl BatchTier {
+    pub fn normalized(&self) -> (i64, i32) {
+        (
+            self.min_size.max(1),
+            self.priority.clamp(MIN_PRIORITY, MAX_PRIORITY),
+        )
+    }
+}
+
+fn default_batch_window_secs() -> i64 {
+    30
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
     pub worktree_dir: String,
@@ -506,6 +526,10 @@ pub struct ReviewSettings {
     pub ignore_files: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_indexed_vec")]
     pub priority_rules: Vec<PriorityRule>,
+    #[serde(default, deserialize_with = "deserialize_indexed_vec")]
+    pub batch_tiers: Vec<BatchTier>,
+    #[serde(default = "default_batch_window_secs")]
+    pub batch_window_secs: i64,
     #[serde(default = "default_email_policy_path")]
     pub email_policy_path: String,
     /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
@@ -808,5 +832,31 @@ worktree_dir = "/tmp/test"
         "#;
         let settings: ReviewSettings = toml::from_str(toml).expect("parse review settings");
         assert!(settings.priority_rules.is_empty());
+        assert!(settings.batch_tiers.is_empty());
+        assert_eq!(settings.batch_window_secs, 30);
+    }
+
+    #[test]
+    fn test_batch_tiers_deserialize_toml() {
+        let toml = r#"
+            concurrency = 2
+            worktree_dir = "/tmp/test"
+            batch_window_secs = 60
+
+            [[batch_tiers]]
+            min_size = 5
+            priority = 200
+
+            [[batch_tiers]]
+            min_size = 10
+            priority = 100
+        "#;
+        let settings: ReviewSettings = toml::from_str(toml).expect("parse review settings");
+        assert_eq!(settings.batch_window_secs, 60);
+        assert_eq!(settings.batch_tiers.len(), 2);
+        assert_eq!(settings.batch_tiers[0].min_size, 5);
+        assert_eq!(settings.batch_tiers[0].priority, 200);
+        assert_eq!(settings.batch_tiers[1].min_size, 10);
+        assert_eq!(settings.batch_tiers[1].priority, 100);
     }
 }
