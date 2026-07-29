@@ -403,7 +403,68 @@ pub struct CustomRemoteSettings {
     pub name: String,
     pub url: String,
     pub check_all_branches: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
     pub only_branches: Option<Vec<String>>,
+    /// Glob patterns for branch filtering (e.g., "*/6.18", "14*").
+    /// When set, ensure_remote fetches only matching refs and
+    /// check_all_branches filters to matching branches.
+    #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
+    pub branch_patterns: Option<Vec<String>>,
+}
+
+/// Deserializes an `Option<Vec<String>>` that may arrive as a JSON array
+/// (from TOML) or as a map with numeric string keys (from env vars via
+/// the `config` crate, e.g. `BRANCH_PATTERNS__0=...`).
+fn deserialize_optional_string_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptVecVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptVecVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a sequence of strings or a map of indices to strings")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<S: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: S,
+        ) -> Result<Self::Value, S::Error> {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                vec.push(elem);
+            }
+            Ok(Some(vec))
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut entries = Vec::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                let idx: usize = key.parse().map_err(serde::de::Error::custom)?;
+                entries.push((idx, value));
+            }
+            entries.sort_by_key(|(idx, _)| *idx);
+            Ok(Some(entries.into_iter().map(|(_, v)| v).collect()))
+        }
+    }
+
+    deserializer.deserialize_option(OptVecVisitor)
 }
 
 fn deserialize_custom_remotes<'de, D>(

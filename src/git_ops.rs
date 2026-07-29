@@ -510,11 +510,70 @@ fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+/// Checks whether a branch name matches any of the given glob patterns.
+/// Supports simple globs: "*" matches any sequence of characters,
+/// "?" matches any single character. Matching is case-sensitive.
+pub fn matches_branch_pattern(branch: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        if glob_match(pattern, branch) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Simple glob matching: "*" matches any substring (including path
+/// separators), "?" matches exactly one character.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let (plen, tlen) = (pat.len(), txt.len());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+
+    while ti < tlen {
+        if pi < plen && pat[pi] == '?' {
+            pi += 1;
+            ti += 1;
+        } else if pi < plen && pat[pi] == '*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if pi < plen && pat[pi] == txt[ti] {
+            pi += 1;
+            ti += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < plen && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == plen
+}
+
 pub async fn ensure_remote(
     repo_path: &Path,
     name: &str,
     url: &str,
     force_fetch: bool,
+) -> Result<()> {
+    ensure_remote_with_refspecs(repo_path, name, url, force_fetch, None).await
+}
+
+/// Like ensure_remote, but optionally limits the fetch to specific
+/// refspecs. When refspecs is Some, only the listed refs are fetched
+/// instead of all remote branches.
+pub async fn ensure_remote_with_refspecs(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    force_fetch: bool,
+    refspecs: Option<&[String]>,
 ) -> Result<()> {
     // 1. Validate repo_path to prevent git from traversing up to parent repos
     if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
@@ -658,6 +717,11 @@ pub async fn ensure_remote(
             fetch_args.push("--no-tags");
         }
         fetch_args.push(name);
+        if let Some(specs) = refspecs {
+            for spec in specs {
+                fetch_args.push(spec);
+            }
+        }
 
         let fetch_future = Command::new("git")
             .current_dir(repo_path)
@@ -690,7 +754,7 @@ pub async fn ensure_remote(
             }
             Err(_) => {
                 error_msg = format!(
-                    "Git fetch for {} timed out after {} seconds",
+                    "Timed out fetching remote {} after {}s",
                     name,
                     timeout_duration.as_secs()
                 );
@@ -1479,5 +1543,48 @@ mod tests {
         assert!(res2.unwrap_err().to_string().contains("backing off"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(super::glob_match("*/6.18", "core/6.18"));
+        assert!(super::glob_match("*/6.18", "net/tcp/6.18"));
+        assert!(super::glob_match("*/6.18", "ovss/platforms/arm64/6.18"));
+        assert!(!super::glob_match("*/6.18", "core/6.12"));
+        assert!(!super::glob_match("*/6.18", "core/6.189"));
+
+        assert!(super::glob_match("14*", "1400"));
+        assert!(super::glob_match("14*", "1400_136"));
+        assert!(super::glob_match("14*", "1404_881"));
+        assert!(!super::glob_match("14*", "1500"));
+
+        assert!(super::glob_match("15*", "1500"));
+        assert!(super::glob_match("15*", "1501_159"));
+        assert!(!super::glob_match("15*", "1400"));
+
+        assert!(super::glob_match("linux/master", "linux/master"));
+        assert!(!super::glob_match("linux/master", "linux/stable"));
+
+        assert!(super::glob_match("linux/stable/*", "linux/stable/6.12"));
+        assert!(super::glob_match("linux/stable/*", "linux/stable/6.18"));
+    }
+
+    #[test]
+    fn test_matches_branch_pattern() {
+        let patterns = vec![
+            "*/6.18".to_string(),
+            "*/6.12".to_string(),
+            "14*".to_string(),
+            "15*".to_string(),
+            "linux/master".to_string(),
+        ];
+        assert!(super::matches_branch_pattern("core/6.18", &patterns));
+        assert!(super::matches_branch_pattern("kvm/mmu/6.12", &patterns));
+        assert!(super::matches_branch_pattern("1400_136", &patterns));
+        assert!(super::matches_branch_pattern("1500", &patterns));
+        assert!(super::matches_branch_pattern("linux/master", &patterns));
+        assert!(!super::matches_branch_pattern("core/6.6", &patterns));
+        assert!(!super::matches_branch_pattern("1300_448", &patterns));
+        assert!(!super::matches_branch_pattern("sched/ghost/6.1", &patterns));
     }
 }
