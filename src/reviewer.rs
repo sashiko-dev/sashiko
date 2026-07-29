@@ -1610,6 +1610,19 @@ async fn run_review_tool(
         cmd.arg("--review-commit").arg(commit);
     }
 
+    // Forward the alternate-pipeline selector (e.g. cherry-pick review) if the
+    // patchset was submitted with one; absent selects the default pipeline.
+    match db.get_review_context(patchset_id).await {
+        Ok(Some(rc)) => {
+            cmd.arg("--review-context").arg(rc);
+        }
+        Ok(None) => {}
+        Err(e) => warn!(
+            "Failed to load review_context for patchset {}: {}",
+            patchset_id, e
+        ),
+    }
+
     if settings.ai.no_ai {
         cmd.arg("--no-ai");
     }
