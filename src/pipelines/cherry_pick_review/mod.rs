@@ -21,6 +21,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Stage 1 (analysis): semantic-intent preservation of the resolution.
+pub const SEMANTIC_INTENT: &str = include_str!("prompts/semantic_intent.md");
+/// Stage 2 (analysis): detection of changes dropped during resolution.
+pub const DROPPED_CHANGES: &str = include_str!("prompts/dropped_changes.md");
+/// Stage 3 (analysis): structural merge-correctness verification.
+pub const MERGE_CORRECTNESS: &str = include_str!("prompts/merge_correctness.md");
+/// Origin classification: label each finding resolution_introduced /
+/// original_patch_preexisting / base_preexisting before filtering.
+pub const ORIGIN_CLASSIFICATION: &str = include_str!("prompts/origin_classification.md");
+/// Stage 10 (synthesis): verification and severity estimation.
+pub const VERIFICATION: &str = include_str!("prompts/verification.md");
+/// Stage 12 (synthesis): final cherry-pick review report.
+pub const CONFLICT_REPORT: &str = include_str!("prompts/conflict_report.md");
+
 /// Hydrated context for a cherry-pick / merge-conflict resolution review.
 ///
 /// Semantics of the three commits involved:
