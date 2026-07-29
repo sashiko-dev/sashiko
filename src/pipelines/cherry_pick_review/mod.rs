@@ -21,6 +21,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod pipeline;
+pub mod synthesis;
+
+pub use pipeline::CherryPickReviewPipeline;
+
 /// Stage 1 (analysis): semantic-intent preservation of the resolution.
 pub const SEMANTIC_INTENT: &str = include_str!("prompts/semantic_intent.md");
 /// Stage 2 (analysis): detection of changes dropped during resolution.
@@ -66,14 +71,16 @@ pub struct CherryPickContext {
     pub original_diff: Option<String>,
 }
 
-/// Filter raw cherry-pick findings down to the ones worth surfacing.
+/// Filter cherry-pick findings: keep only high/critical
+/// resolution-introduced findings for the inline review.
 ///
-/// Rules (by `severity` and `origin`):
-/// - DROP all `low` severity.
-/// - DROP everything `base_preexisting` (already in the target branch).
-/// - DROP `original_patch_preexisting` unless `critical`.
-/// - KEEP `resolution_introduced` at medium+ severity.
+/// Rules (V1 parity with `filter_conflict_findings`):
+/// - KEEP only `origin == "resolution_introduced"` AND
+///   `severity in ["high", "critical"]`.
+/// - DROP everything else regardless of origin or severity.
 ///
+/// Missing `severity` defaults to `"low"` (dropped).
+/// Missing `origin` defaults to `"resolution_introduced"` (kept if sev ok).
 /// Non-array input yields an empty array.
 pub fn filter_cherry_pick_findings(findings: &serde_json::Value) -> serde_json::Value {
     let arr = match findings.as_array() {
@@ -95,35 +102,17 @@ pub fn filter_cherry_pick_findings(findings: &serde_json::Value) -> serde_json::
                 .unwrap_or("resolution_introduced")
                 .to_lowercase();
 
-            // Drop all low severity.
-            if severity == "low" {
+            let keep =
+                origin == "resolution_introduced" && (severity == "high" || severity == "critical");
+            if !keep {
                 tracing::info!(
-                    "Filtering out low-severity finding: {}",
-                    f.get("description").and_then(|v| v.as_str()).unwrap_or("?")
-                );
-                return false;
-            }
-
-            // Drop all findings pre-existing in the target base branch.
-            if origin == "base_preexisting" {
-                tracing::info!(
-                    "Filtering out base-preexisting finding: {}",
-                    f.get("description").and_then(|v| v.as_str()).unwrap_or("?")
-                );
-                return false;
-            }
-
-            // Drop findings pre-existing in the original patch unless critical.
-            if origin == "original_patch_preexisting" && severity != "critical" {
-                tracing::info!(
-                    "Filtering out original-patch-preexisting ({}) finding: {}",
+                    "Filtering out non-actionable finding (origin={}, severity={}): {}",
+                    origin,
                     severity,
                     f.get("description").and_then(|v| v.as_str()).unwrap_or("?")
                 );
-                return false;
             }
-
-            true
+            keep
         })
         .cloned()
         .collect();
@@ -145,17 +134,18 @@ mod tests {
     }
 
     #[test]
-    fn keeps_resolution_introduced_medium_plus() {
+    fn keeps_resolution_introduced_high_critical() {
         let findings = json!([
-            {"description": "keep-me", "severity": "high", "origin": "resolution_introduced"},
-            {"description": "keep-me-2", "severity": "medium", "origin": "resolution_introduced"},
+            {"description": "keep-high", "severity": "high", "origin": "resolution_introduced"},
+            {"description": "keep-crit", "severity": "critical", "origin": "resolution_introduced"},
+            {"description": "drop-med", "severity": "medium", "origin": "resolution_introduced"},
         ]);
         let out = filter_cherry_pick_findings(&findings);
-        assert_eq!(descriptions(&out), vec!["keep-me", "keep-me-2"]);
+        assert_eq!(descriptions(&out), vec!["keep-high", "keep-crit"]);
     }
 
     #[test]
-    fn drops_low_severity_regardless_of_origin() {
+    fn drops_low_severity() {
         let findings = json!([
             {"description": "low", "severity": "low", "origin": "resolution_introduced"},
         ]);
@@ -183,14 +173,18 @@ mod tests {
     }
 
     #[test]
-    fn drops_original_preexisting_unless_critical() {
+    fn drops_original_preexisting_even_when_critical() {
         let findings = json!([
             {"description": "orig-high", "severity": "high", "origin": "original_patch_preexisting"},
             {"description": "orig-crit", "severity": "critical", "origin": "original_patch_preexisting"},
         ]);
+        // V1 parity: only resolution_introduced kept
         assert_eq!(
-            descriptions(&filter_cherry_pick_findings(&findings)),
-            vec!["orig-crit"]
+            filter_cherry_pick_findings(&findings)
+                .as_array()
+                .unwrap()
+                .len(),
+            0
         );
     }
 

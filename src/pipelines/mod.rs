@@ -446,6 +446,78 @@ fn fold(state: &mut PipelineState, spec: &StageSpec, outcome: StageOutcome) {
     }
 }
 
+/// V1-parity: simple JSON request with one retry (mirrors Worker::json_request).
+///
+/// Sends a request to the provider, parses JSON from the response,
+/// validates it, and retries once on failure. Returns None if both
+/// attempts fail.
+pub(crate) async fn json_request(
+    provider: &dyn AiProvider,
+    request: crate::ai::AiRequest,
+    validate: impl Fn(&serde_json::Value) -> Result<(), String>,
+) -> Option<serde_json::Value> {
+    use crate::ai::{AiMessage, AiRole};
+
+    // First attempt
+    let resp = provider.generate_content(request.clone()).await.ok()?;
+    let text = resp.content.as_deref().unwrap_or("");
+    if let Some(val) = try_parse_json(text)
+        && validate(&val).is_ok()
+    {
+        return Some(val);
+    }
+
+    // Retry with correction
+    let mut retry_messages = request.messages.clone();
+    retry_messages.push(AiMessage {
+        role: AiRole::Assistant,
+        content: resp.content.clone(),
+        thought: None,
+        thought_signature: None,
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    retry_messages.push(AiMessage {
+        role: AiRole::User,
+        content: Some(
+            "Your previous response was not valid JSON or did not match the required schema.              Please try again with ONLY a valid JSON object."
+                .to_string(),
+        ),
+        thought: None,
+        thought_signature: None,
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    let retry_req = crate::ai::AiRequest {
+        messages: retry_messages,
+        ..request
+    };
+    let resp2 = provider.generate_content(retry_req).await.ok()?;
+    let text2 = resp2.content.as_deref().unwrap_or("");
+    if let Some(val) = try_parse_json(text2)
+        && validate(&val).is_ok()
+    {
+        return Some(val);
+    }
+    None
+}
+
+/// Try to parse JSON from text, stripping markdown code fences if present.
+fn try_parse_json(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    // Strip code fence
+    let cleaned = if trimmed.starts_with("```") {
+        let inner = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .unwrap_or(trimmed);
+        inner.strip_suffix("```").unwrap_or(inner).trim()
+    } else {
+        trimmed
+    };
+    serde_json::from_str(cleaned).ok()
+}
+
 /// Inject `source_stage` into a concern (mirrors V1's
 /// `normalize_stage_item`).
 ///
