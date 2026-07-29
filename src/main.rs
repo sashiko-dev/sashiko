@@ -1553,6 +1553,9 @@ async fn run_daemon(
         );
     }
 
+    // Each CLI runs in a process group of its own, so the terminal's signal
+    // never reached it, and exit() runs no destructor that would.
+    sashiko::ai::cli_common::kill_live_groups();
     info!("Shutdown complete.");
     std::process::exit(0);
 }
@@ -2032,13 +2035,17 @@ fn release_region_on_panic() {
     }));
 }
 
-/// Gives the screen back when the review is interrupted.
+/// Stops the CLIs a review spawned, and gives the screen back, when the review
+/// is interrupted.
 ///
-/// Ctrl-C kills the process where it stands, reaching neither the release above
-/// nor the panic hook, and the scroll region outlives it: the shell that comes
-/// back is confined to the top of the screen until something resets it. So the
-/// signals that end a review are taken, the reset written, and the process left
-/// to exit with the status that signal would have given it.
+/// Ctrl-C kills the process where it stands, running no destructor. Each CLI
+/// runs in a process group of its own, so the terminal's signal does not reach
+/// it either, and a review nobody will read runs on and bills for it. With a
+/// reserved region the scroll region outlives the process as well: the shell
+/// that comes back is confined to the top of the screen until something resets
+/// it. So the signals that end a review are taken, the CLIs killed, the reset
+/// written when `release_region` is set, and the process left to exit with the
+/// status that signal would have given it.
 ///
 /// Saves and restores the cursor around the reset, as the panic hook does, or a
 /// review interrupted mid-frame reports from the top of the screen.
@@ -2047,22 +2054,25 @@ fn release_region_on_panic() {
 /// hand: the shell that started the review still sees it die of the signal it
 /// sent. The reset is four bytes and the exit follows it, so the window where a
 /// second interrupt would find nothing listening is not one worth covering.
-fn release_region_on_interrupt() {
+fn exit_on_interrupt(release_region: bool) {
     for kind in [
         SignalKind::interrupt(),
         SignalKind::terminate(),
         SignalKind::hangup(),
     ] {
         let Ok(mut signalled) = signal(kind) else {
-            warn!("Progress display cannot give the screen back if interrupted");
+            warn!("An interrupted review cannot stop the CLIs it spawned");
             continue;
         };
 
         tokio::spawn(async move {
             if signalled.recv().await.is_some() {
-                // Scrolling back to the whole screen, leaving the cursor where
-                // the output had reached, and a line to report from.
-                let _ = std::io::stderr().write_all(b"\x1b7\x1b[r\x1b8\n");
+                sashiko::ai::cli_common::kill_live_groups();
+                if release_region {
+                    // Scrolling back to the whole screen, leaving the cursor
+                    // where the output had reached, and a line to report from.
+                    let _ = std::io::stderr().write_all(b"\x1b7\x1b[r\x1b8\n");
+                }
                 std::process::exit(128 + kind.as_raw_value());
             }
         });
@@ -2680,8 +2690,8 @@ async fn handle_review_command(
 
     if display.reservation_capable {
         release_region_on_panic();
-        release_region_on_interrupt();
     }
+    exit_on_interrupt(display.reservation_capable);
 
     // Only a display that draws again has a size to be wrong about: appended
     // lines are never drawn twice.

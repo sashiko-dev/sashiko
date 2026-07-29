@@ -4111,6 +4111,7 @@ dependencies = [
  "hmac 0.13.0",
  "jsonwebtoken",
  "lettre",
+ "libc",
  "libsql",
  "mail-parser",
  "rcgen",

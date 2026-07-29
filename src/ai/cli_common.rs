@@ -27,6 +27,7 @@
 //! otherwise names whichever provider the code happens to live next to.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -199,14 +200,94 @@ impl std::fmt::Display for CliIoError {
     }
 }
 
-/// Spawn a CLI with the pipes and drop behaviour `write_prompt_and_wait()`
-/// expects.
+/// Spawn a CLI in a process group of its own, so a timeout can take down the
+/// whole tree.
+///
+/// `codex` and `copilot` install as node wrappers that run the real binary as
+/// a grandchild.  Killing the child alone leaves that grandchild attached to
+/// the same pipes and billing against the same subscription until it notices
+/// they are gone, which measured at over a minute past the kill.  A group of
+/// its own also keeps the CLI off this process's group, so a signal aimed at
+/// the daemon's terminal does not reach a review mid-flight.
+///
+/// `write_prompt_and_wait()` signals the group this establishes; a child
+/// spawned any other way must not be passed to it.
 pub fn spawn_cli(cmd: &mut Command) -> std::io::Result<Child> {
-    cmd.kill_on_drop(true).spawn()
+    cmd.process_group(0).kill_on_drop(true).spawn()
+}
+
+/// Signal the whole group, having spawned its leader with `process_group(0)`
+/// so that the group holds the CLI and its descendants and nothing else.
+fn kill_group(pgid: i32) {
+    // SAFETY: kill(2) touches no memory of this process.  A negative pid
+    // addresses the group led by `pgid`, which `spawn_cli` created for the
+    // child alone, so the signal cannot reach the daemon or its siblings.
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+}
+
+/// The groups of every CLI still running, for a shutdown that never unwinds.
+static LIVE_GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Kill every CLI group still running.
+///
+/// For a signal handler that exits the process without dropping the futures
+/// holding the children.  `spawn_cli` puts the CLI in a group of its own, so
+/// a Ctrl-C aimed at the terminal no longer reaches it, and the drop path of
+/// `write_prompt_and_wait()` never runs on `std::process::exit`.
+pub fn kill_live_groups() {
+    let groups = std::mem::take(&mut *LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()));
+    for pgid in groups {
+        kill_group(pgid);
+    }
+}
+
+/// Kills the group on drop unless the child was reaped first.
+///
+/// The group must not be signalled once its leader has been reaped, because
+/// the pid is then free for reuse, so `disarm` follows the wait and `kill`
+/// precedes it.
+struct GroupGuard(Option<i32>);
+
+impl GroupGuard {
+    fn new(pgid: Option<i32>) -> Self {
+        if let Some(pgid) = pgid {
+            LIVE_GROUPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(pgid);
+        }
+        Self(pgid)
+    }
+
+    fn disarm(&mut self) -> Option<i32> {
+        let pgid = self.0.take()?;
+        LIVE_GROUPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|g| *g != pgid);
+        Some(pgid)
+    }
+
+    fn kill(&mut self) {
+        if let Some(pgid) = self.disarm() {
+            kill_group(pgid);
+        }
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// End a child the drain has given up on, and reap it.
-async fn kill_and_reap(child: &mut Child) {
+///
+/// The group signal reaches the child too, but only where the child leads
+/// that group.  Signal it directly as well, so the wait cannot block on a
+/// child the group kill did not cover.
+async fn kill_and_reap(child: &mut Child, group: &mut GroupGuard) {
+    group.kill();
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -275,11 +356,16 @@ where
 ///
 /// `idle_timeout` bounds silence rather than runtime, so a CLI that keeps
 /// reporting progress runs as long as the work takes while one that has
-/// wedged is cut off.  Reaching the deadline kills the child and returns what
-/// it had produced up to that point.  Killing rather than dropping is what
-/// releases a write still blocked on the child's stdin.  A failed read ends
-/// the child the same way: the drain that bounded it is over, and the write
-/// would otherwise block on a full stdin until the child exited on its own.
+/// wedged is cut off.  Reaching the deadline kills the child's process group
+/// -- `spawn_cli` must have established it -- and returns what the CLI had
+/// produced up to that point.  Killing rather than dropping is what releases
+/// a write still blocked on the child's stdin.  A failed read ends the group
+/// the same way: the drain that bounded it is over, and the write would
+/// otherwise block on a full stdin until the child exited on its own.
+///
+/// Dropping the returned future before it completes kills the group as well.
+/// A review aborted at its deadline, or a daemon shutting down, drops the
+/// child, and `kill_on_drop` reaches only the wrapper.
 ///
 /// `provider` names the caller for the log messages, as it does for
 /// `parse_inner_response()`.
@@ -291,6 +377,7 @@ pub async fn write_prompt_and_wait(
 ) -> std::result::Result<std::process::Output, CliIoError> {
     use tokio::io::AsyncWriteExt;
 
+    let mut group = GroupGuard::new(child.id().map(|id| id as i32));
     let mut stdin = child.stdin.take();
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -326,7 +413,7 @@ pub async fn write_prompt_and_wait(
             let (is_stdout, read) = match step {
                 Ok(step) => step,
                 Err(_) => {
-                    kill_and_reap(&mut child).await;
+                    kill_and_reap(&mut child, &mut group).await;
                     return Err(idle(provider, idle_timeout, out, err));
                 }
             };
@@ -334,7 +421,7 @@ pub async fn write_prompt_and_wait(
             let n = match read {
                 Ok(n) => n,
                 Err(e) => {
-                    kill_and_reap(&mut child).await;
+                    kill_and_reap(&mut child, &mut group).await;
                     return Err(CliIoError::Read(e));
                 }
             };
@@ -352,10 +439,13 @@ pub async fn write_prompt_and_wait(
         let status = match tokio::time::timeout(idle_timeout, child.wait()).await {
             Ok(status) => status.map_err(CliIoError::Wait)?,
             Err(_) => {
-                kill_and_reap(&mut child).await;
+                kill_and_reap(&mut child, &mut group).await;
                 return Err(idle(provider, idle_timeout, out, err));
             }
         };
+        // Reaped, so its pid is free for reuse: nothing must signal the
+        // group again.  A wait that failed leaves the guard armed.
+        group.disarm();
         Ok(std::process::Output {
             status,
             stdout: out,
@@ -825,6 +915,91 @@ mod tests {
                 .expect_err("silence past the deadline must not wait out the child");
         assert!(matches!(err, CliIoError::Idle(_)), "got {err:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The pids of the processes in group `pgid`, read from /proc.
+    fn group_members(pgid: i32) -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+                // The command name in parentheses may hold spaces, so the
+                // fixed fields start after the last one: state, ppid, pgrp.
+                let after_comm = &stat[stat.rfind(')')? + 1..];
+                let pgrp = after_comm.split_whitespace().nth(2)?.parse::<i32>().ok()?;
+                (pgrp == pgid).then(|| entry.file_name().to_string_lossy().parse().ok())?
+            })
+            .collect()
+    }
+
+    /// Fails the test if any member of `pgid` is still alive, killing the
+    /// survivors first so a failure does not leave them running.
+    async fn assert_group_gone(pgid: i32) {
+        for _ in 0..50 {
+            if group_members(pgid).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let survivors = group_members(pgid);
+        kill_group(pgid);
+        panic!("processes {survivors:?} survived the process-group kill");
+    }
+
+    // `codex` and `copilot` are node wrappers that run the real binary as a
+    // grandchild.  Killing the wrapper alone leaves that grandchild billing
+    // against the same subscription.  Both sleeps in the script outlast the
+    // test by far, so nothing ends on its own: the group is empty at the end
+    // only if the kill reached the grandchild.
+    const WRAPPER_AND_GRANDCHILD: &str = "sleep 600 & sleep 600";
+
+    #[tokio::test]
+    async fn the_idle_kill_reaches_a_grandchild() {
+        let child = spawn_sh(WRAPPER_AND_GRANDCHILD);
+        let pgid = child.id().unwrap() as i32;
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            write_prompt_and_wait("test-cli", child, String::new(), Duration::from_millis(300)),
+        )
+        .await
+        .expect("the deadline must kill the child, not wait it out")
+        .expect_err("silence past the deadline must fail");
+        assert!(matches!(err, CliIoError::Idle(_)), "got {err:?}");
+
+        assert_group_gone(pgid).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_call_kills_the_grandchild() {
+        // A review aborted at its deadline drops the future mid-call rather
+        // than waiting for the idle deadline to fire.
+        let child = spawn_sh(WRAPPER_AND_GRANDCHILD);
+        let pgid = child.id().unwrap() as i32;
+
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            write_prompt_and_wait("test-cli", child, String::new(), Duration::from_secs(600)),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the call must still be running when dropped"
+        );
+
+        assert_group_gone(pgid).await;
+    }
+
+    #[tokio::test]
+    async fn a_reaped_child_leaves_no_live_group_behind() {
+        // The registry must not carry a pid that a later process may reuse.
+        let child = spawn_sh("exit 0");
+        let pgid = child.id().unwrap() as i32;
+        write_prompt_and_wait("test-cli", child, String::new(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(!LIVE_GROUPS.lock().unwrap().contains(&pgid));
     }
 
     #[test]
