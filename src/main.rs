@@ -324,6 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages: stages.clone(),
                     scratch_clone: false,
                     current_tree: false,
+                    review_context: None,
                 })
                 .await
                 .unwrap_or_else(|e| {
