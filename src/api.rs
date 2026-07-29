@@ -14,6 +14,7 @@
 
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
+use crate::review_kind::ReviewKind;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -219,6 +220,15 @@ pub enum SubmitRequest {
     #[serde(rename = "remote-range")]
     RemoteRange {
         sha: String,
+        repo: Option<String>,
+        skip_subjects: Option<Vec<String>>,
+        only_subjects: Option<Vec<String>>,
+    },
+    #[serde(rename = "cherry-pick")]
+    CherryPick {
+        sha: String,
+        original_sha: String,
+        base_sha: Option<String>,
         repo: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
@@ -492,6 +502,104 @@ async fn submit_patch(
                     None,
                     None,
                     500,
+                )
+                .await
+            {
+                error!("Failed to enqueue fetch request: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+
+            Ok(Json(SubmitResponse {
+                status: "accepted".to_string(),
+                id,
+            }))
+        }
+        SubmitRequest::CherryPick {
+            sha,
+            original_sha,
+            base_sha,
+            repo,
+            skip_subjects,
+            only_subjects,
+        } => {
+            let id = sha.clone();
+            let repo_display = repo.as_deref().unwrap_or("local");
+            info!(
+                "Received cherry-pick review request: {} (original {}) from {}",
+                sha, original_sha, repo_display
+            );
+
+            // Create a placeholder record so the user can track status.
+            let cover_id = format!("{}@sashiko.local", id);
+            let patchset_id = match state
+                .db
+                .create_fetching_patchset(
+                    &cover_id,
+                    &format!("Fetching cherry-pick {} from {}...", &sha, repo_display),
+                    skip_subjects.as_ref(),
+                    only_subjects.as_ref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    repo.as_deref(),
+                    None,
+                )
+                .await
+            {
+                Ok(pid) => pid,
+                Err(e) => {
+                    error!("Failed to create placeholder patchset: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+
+            // The original (and base) commits live on divergent history and are
+            // not reachable from the resolution commit, so git will not pull
+            // them transitively. Fetch them explicitly as supporting commits so
+            // the pipeline can hydrate the full three-commit context at review
+            // time; they are fetched but never ingested as separate patches.
+            let mut supporting_commits: Vec<String> = vec![original_sha.clone()];
+            if let Some(ref base) = base_sha {
+                supporting_commits.push(base.clone());
+            }
+
+            // Persist the minimal cherry-pick selector; the reviewer forwards it
+            // to the pipeline, which hydrates the rest of the context from git.
+            let review_context = ReviewKind::CherryPick {
+                original_sha,
+                base_sha,
+            };
+            match serde_json::to_string(&review_context) {
+                Ok(json) => {
+                    if let Err(e) = state.db.set_review_context(patchset_id, &json).await {
+                        error!(
+                            "Failed to persist review_context for {}: {}",
+                            patchset_id, e
+                        );
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize review_context: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+
+            // Persist the fetch durably; the FetchWorker will pick it up and
+            // ensure the resolution plus its supporting commits are present.
+            if let Err(e) = state
+                .db
+                .enqueue_fetch_with_support(
+                    Some(patchset_id),
+                    Some(&cover_id),
+                    repo.as_deref(),
+                    &sha,
+                    None,
+                    None,
+                    None,
+                    500,
+                    &supporting_commits,
                 )
                 .await
             {
