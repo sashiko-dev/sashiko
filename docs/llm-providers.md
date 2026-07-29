@@ -267,6 +267,25 @@ Copy `examples/Settings.devin-cli.toml` to your `Settings.toml` and adjust as ne
 - Each review may spawn many `devin` processes. Lower `review.concurrency`
   if you hit subscription rate limits.
 
+## Ollama
+
+[Ollama](https://ollama.com/) allows running LLMs locally.
+
+**Prerequisites:** Install Ollama and pull your desired model (e.g., `ollama pull deepseek-v3`).
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.ollama.toml Settings.toml
+```
+
+**What you get:**
+
+- Private, local execution of LLMs
+- Support for reasoning models via the `think` setting
+- No API key or subscription required
+- `context_window_size` maps to Ollama's `num_ctx`
+
 ## OpenAI-Compatible Providers
 
 Sashiko includes an OpenAI-compatible provider for endpoints that
