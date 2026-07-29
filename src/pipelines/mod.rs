@@ -24,6 +24,8 @@
 //! the exact tool loop, validation, and recitation handling as the patch-review
 //! path, so behavior stays equivalent.
 
+pub mod cherry_pick_review;
+
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
