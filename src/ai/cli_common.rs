@@ -27,9 +27,11 @@
 //! otherwise names whichever provider the code happens to live next to.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::Value;
+use tokio::process::{Child, Command};
 use tracing::{debug, warn};
 
 use crate::ai::{AiRequest, AiResponse, AiRole, AiUsage, ToolCall};
@@ -57,6 +59,20 @@ fn escape_frames(content: &str) -> String {
     }
     out
 }
+
+/// How long a CLI may produce nothing at all before it counts as hung.
+///
+/// This bounds silence, not runtime.  A review at high reasoning effort runs
+/// the CLI's own agent loop, which reads files and reasons for as long as the
+/// patch demands, so runtime says nothing about health: measured runs against
+/// `codex exec` span from seconds to past eleven minutes, and the longest were
+/// the ones doing the most work.  A run that is reading files reports each
+/// step as it finishes and goes quiet for a minute at most, but one that
+/// spends a whole turn reasoning emits nothing until the turn ends, and 350
+/// seconds is the longest such silence measured across 79 runs.  The value
+/// clears that with room to spare, because killing a live review costs the
+/// whole review while a hung one costs only the wait.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Build the full text prompt from the AiRequest.
 /// Embeds system prompt, conversation history, tool definitions, and instructions.
@@ -142,21 +158,99 @@ pub fn build_prompt(request: &AiRequest) -> String {
     out
 }
 
+/// What a CLI had produced when the idle deadline cut it off.
+///
+/// A killed run is the one case where the output is worth keeping even though
+/// the call failed: for a JSONL provider it names the last step the CLI
+/// finished, which is the only account of what it was doing when it stopped.
+#[derive(Debug)]
+pub struct IdleOutput {
+    pub after: Duration,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 /// Names the half of a CLI call that failed, so the caller can label it.
 #[derive(Debug)]
 pub enum CliIoError {
     /// The prompt could not be written to the child's stdin.
     Write(std::io::Error),
+    /// An output pipe could not be read.
+    Read(std::io::Error),
     /// The child could not be waited on.
     Wait(std::io::Error),
+    /// The child went quiet for longer than the idle deadline and was killed.
+    Idle(IdleOutput),
 }
 
 impl std::fmt::Display for CliIoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CliIoError::Write(e) => write!(f, "stdin write failed: {e}"),
+            CliIoError::Read(e) => write!(f, "output read failed: {e}"),
             CliIoError::Wait(e) => write!(f, "wait error: {e}"),
+            CliIoError::Idle(idle) => write!(
+                f,
+                "produced no output for {}s and was killed after {} bytes",
+                idle.after.as_secs(),
+                idle.stdout.len() + idle.stderr.len()
+            ),
         }
+    }
+}
+
+/// Spawn a CLI with the pipes and drop behaviour `write_prompt_and_wait()`
+/// expects.
+pub fn spawn_cli(cmd: &mut Command) -> std::io::Result<Child> {
+    cmd.kill_on_drop(true).spawn()
+}
+
+/// End a child the drain has given up on, and reap it.
+async fn kill_and_reap(child: &mut Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Build the idle error, logging the tail of what the child had produced.
+///
+/// The call failed, so the caller reports the error and not the output,
+/// yet the output is the only record of the step the CLI was on when it
+/// went quiet.  The tail is enough to name that step without flooding the
+/// log with a review's worth of JSONL.
+fn idle(provider: &str, after: Duration, stdout: Vec<u8>, stderr: Vec<u8>) -> CliIoError {
+    const TAIL: usize = 4096;
+    // The tail may hold a URL with credentials or an echoed key, as any CLI
+    // error text may, so it is redacted like the stderr a finished run logs.
+    let tail = |bytes: &[u8]| {
+        crate::utils::redact_secret(&String::from_utf8_lossy(
+            &bytes[bytes.len().saturating_sub(TAIL)..],
+        ))
+    };
+    warn!(
+        "{provider} produced no output for {}s and was killed; stdout tail: {}; stderr tail: {}",
+        after.as_secs(),
+        tail(&stdout),
+        tail(&stderr)
+    );
+    CliIoError::Idle(IdleOutput {
+        after,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read from a pipe that may already have reached EOF, in a form `select!` can
+/// poll.  A half that is done never completes again, leaving the other half to
+/// drive the loop.
+async fn read_open<R>(pipe: &mut Option<R>, buf: &mut [u8]) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    match pipe {
+        Some(pipe) => pipe.read(buf).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -179,16 +273,27 @@ impl std::fmt::Display for CliIoError {
 /// different matter: its answer was produced from a truncated prompt, so the
 /// write error is reported rather than letting the exit status mask it.
 ///
-/// `provider` names the caller for the log message, as it does for
+/// `idle_timeout` bounds silence rather than runtime, so a CLI that keeps
+/// reporting progress runs as long as the work takes while one that has
+/// wedged is cut off.  Reaching the deadline kills the child and returns what
+/// it had produced up to that point.  Killing rather than dropping is what
+/// releases a write still blocked on the child's stdin.  A failed read ends
+/// the child the same way: the drain that bounded it is over, and the write
+/// would otherwise block on a full stdin until the child exited on its own.
+///
+/// `provider` names the caller for the log messages, as it does for
 /// `parse_inner_response()`.
 pub async fn write_prompt_and_wait(
     provider: &str,
-    mut child: tokio::process::Child,
+    mut child: Child,
     prompt: String,
+    idle_timeout: Duration,
 ) -> std::result::Result<std::process::Output, CliIoError> {
     use tokio::io::AsyncWriteExt;
 
     let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
     let prompt_bytes = prompt.into_bytes();
 
     let write = async {
@@ -198,8 +303,84 @@ pub async fn write_prompt_and_wait(
         }
         Ok::<(), std::io::Error>(())
     };
-    let (written, output) = tokio::join!(write, child.wait_with_output());
-    let output = output.map_err(CliIoError::Wait)?;
+
+    // Draining both pipes here is what lets the write run concurrently: a
+    // child that fills its stdout before consuming all of stdin would
+    // otherwise block on its own full pipe while the writer blocks on the
+    // child's.
+    let drain = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut out_buf = [0u8; 8192];
+        let mut err_buf = [0u8; 8192];
+
+        while stdout.is_some() || stderr.is_some() {
+            let step = tokio::time::timeout(idle_timeout, async {
+                tokio::select! {
+                    n = read_open(&mut stdout, &mut out_buf) => (true, n),
+                    n = read_open(&mut stderr, &mut err_buf) => (false, n),
+                }
+            })
+            .await;
+
+            let (is_stdout, read) = match step {
+                Ok(step) => step,
+                Err(_) => {
+                    kill_and_reap(&mut child).await;
+                    return Err(idle(provider, idle_timeout, out, err));
+                }
+            };
+
+            let n = match read {
+                Ok(n) => n,
+                Err(e) => {
+                    kill_and_reap(&mut child).await;
+                    return Err(CliIoError::Read(e));
+                }
+            };
+
+            match n {
+                0 if is_stdout => stdout = None,
+                0 => stderr = None,
+                n if is_stdout => out.extend_from_slice(&out_buf[..n]),
+                n => err.extend_from_slice(&err_buf[..n]),
+            }
+        }
+
+        // Both pipes are closed, so silence is all the child can offer from
+        // here, and the same deadline bounds the exit that should follow.
+        let status = match tokio::time::timeout(idle_timeout, child.wait()).await {
+            Ok(status) => status.map_err(CliIoError::Wait)?,
+            Err(_) => {
+                kill_and_reap(&mut child).await;
+                return Err(idle(provider, idle_timeout, out, err));
+            }
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    };
+
+    // The drain ending first means the child is gone, killed or exited, with
+    // the prompt not yet delivered.  The write is dropped rather than awaited:
+    // a process outside the group that inherited the stdin pipe could hold
+    // it open, and the deadline bounds the call only if nothing waits on it.
+    tokio::pin!(write);
+    tokio::pin!(drain);
+    let (written, output) = tokio::select! {
+        biased;
+        written = &mut write => (written, drain.await),
+        output = &mut drain => (
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "child ended before the prompt was written",
+            )),
+            output,
+        ),
+    };
+    let output = output?;
 
     match written {
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe && !output.status.success() => {
@@ -594,25 +775,56 @@ mod tests {
         assert!(resp.tool_calls.is_none());
     }
 
+    fn spawn_sh(script: &str) -> tokio::process::Child {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        spawn_cli(&mut cmd).unwrap()
+    }
+
     #[tokio::test]
     async fn write_prompt_and_wait_keeps_the_diagnostics_of_a_child_that_quits_early() {
         // The child exits non-zero without draining stdin, so a prompt too
         // large for the pipe buffer ends in EPIPE; its output says why it quit.
-        let child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("echo done; exit 1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+        let child = spawn_sh("echo done; exit 1");
 
-        let output = write_prompt_and_wait("test-cli", child, "x".repeat(4 * 1024 * 1024))
-            .await
-            .expect("EPIPE on a failed run must not discard the diagnostics");
+        let output =
+            write_prompt_and_wait("test-cli", child, "x".repeat(4 * 1024 * 1024), IDLE_TIMEOUT)
+                .await
+                .expect("EPIPE on a failed run must not discard the diagnostics");
         assert!(!output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+    }
+
+    #[tokio::test]
+    async fn a_child_that_keeps_emitting_outlives_the_idle_window() {
+        // Total runtime is over twice the idle window; every gap within it
+        // is a fifth of it, which a loaded runner can stretch without harm.  This is the shape of a review at high reasoning effort,
+        // and the wall-clock cap this replaces killed exactly these runs.
+        let child = spawn_sh("for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo tick; sleep 0.2; done");
+
+        let output =
+            write_prompt_and_wait("test-cli", child, String::new(), Duration::from_secs(1))
+                .await
+                .expect("steady output must hold the deadline open");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.split(|b| *b == b'\n').count() - 1, 12);
+    }
+
+    #[tokio::test]
+    async fn a_silent_child_is_killed_at_the_idle_deadline() {
+        let child = spawn_sh("sleep 60");
+
+        let started = tokio::time::Instant::now();
+        let err =
+            write_prompt_and_wait("test-cli", child, String::new(), Duration::from_millis(300))
+                .await
+                .expect_err("silence past the deadline must not wait out the child");
+        assert!(matches!(err, CliIoError::Idle(_)), "got {err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

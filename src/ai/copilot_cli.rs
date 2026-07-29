@@ -29,13 +29,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
-use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use super::claude_cli::log_and_redact_stderr;
-use super::cli_common::{build_prompt, parse_inner_response, write_prompt_and_wait};
+use super::cli_common::{
+    IDLE_TIMEOUT, build_prompt, parse_inner_response, spawn_cli, write_prompt_and_wait,
+};
 use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities};
 
 pub struct CopilotCliProvider {
@@ -70,24 +70,21 @@ impl AiProvider for CopilotCliProvider {
         // prompts (subsystem guides + diff + tool definitions) routinely
         // exceed that and cause spawn() to fail with E2BIG. Stdin has no such
         // limit and the timing is equivalent in copilot's non-interactive mode.
-        let child = Command::new("copilot")
+        let mut command = Command::new("copilot");
+        command
             .args(build_copilot_args(&self.model))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .stderr(Stdio::piped());
+
+        let child = spawn_cli(&mut command)
             .map_err(|e| anyhow::anyhow!("Failed to spawn copilot CLI: {}. Is it installed?", e))?;
 
         // Closing stdin is what puts copilot in non-interactive (--print-like)
         // mode; write_prompt_and_wait() drops the handle once the prompt is in.
-        let output = timeout(
-            Duration::from_secs(600),
-            write_prompt_and_wait("copilot-cli", child, prompt),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("copilot CLI timed out after 10 minutes"))?
-        .map_err(|e| anyhow::anyhow!("copilot CLI {}", e))?;
+        let output = write_prompt_and_wait("copilot-cli", child, prompt, IDLE_TIMEOUT)
+            .await
+            .map_err(|e| anyhow::anyhow!("copilot CLI {}", e))?;
 
         let stderr = log_and_redact_stderr("copilot-cli", &output.stderr);
 

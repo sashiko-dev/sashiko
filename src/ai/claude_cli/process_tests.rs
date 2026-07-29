@@ -15,6 +15,7 @@
 use super::*;
 use crate::ai::{AiMessage, AiRole};
 use std::path::PathBuf;
+use tokio::time::timeout;
 
 fn fake_cli(response: &str, status: u8) -> tempfile::TempDir {
     let fixture = tempfile::tempdir().unwrap();
@@ -223,7 +224,7 @@ async fn cli_timeout_covers_a_stalled_stdin_write() {
     .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<ClaudeCliError>(),
-        Some(ClaudeCliError::Timeout)
+        Some(ClaudeCliError::Timeout(_))
     ));
 }
 
