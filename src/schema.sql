@@ -133,6 +133,32 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE INDEX IF NOT EXISTS idx_findings_review_id ON findings(review_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 
+CREATE TABLE IF NOT EXISTS candidate_fixups (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER NOT NULL,
+    patchset_id INTEGER NOT NULL,
+    patch_id INTEGER,
+    finding_id INTEGER,
+    suggestion_id INTEGER,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    patch TEXT NOT NULL,
+    files_touched TEXT NOT NULL,
+    validation_status TEXT NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(review_id) REFERENCES reviews(id),
+    FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+    FOREIGN KEY(patch_id) REFERENCES patches(id),
+    FOREIGN KEY(finding_id) REFERENCES findings(id)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_fixups_review_id ON candidate_fixups(review_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_fixups_patchset_id ON candidate_fixups(patchset_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_fixups_patch_id ON candidate_fixups(patch_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_fixups_validation_status ON candidate_fixups(validation_status);
+
 CREATE TABLE IF NOT EXISTS ai_interactions (
     id TEXT PRIMARY KEY,
     parent_interaction_id TEXT,
