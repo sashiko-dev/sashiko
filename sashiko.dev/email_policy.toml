@@ -57,6 +57,16 @@ lists = ["dri-devel@lists.freedesktop.org"]
 reply_to_author = true
 cc = ["dri-devel@lists.freedesktop.org"]
 
+[subsystems.intel-gfx]
+cc = ["intel-gfx@lists.freedesktop.org"]
+reply_to_author = true
+cc = ["intel-gfx@lists.freedesktop.org"]
+
+[subsystems.intel-xe]
+lists = ["intel-xe@lists.freedesktop.org"]
+reply_to_author = true
+cc = ["intel-xe@lists.freedesktop.org"]
+
 [subsystems.ext4]
 lists = ["linux-ext4@vger.kernel.org"]
 reply_to_author = true
