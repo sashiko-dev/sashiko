@@ -282,6 +282,7 @@ async fn main() -> Result<()> {
 
                         // Use stdio-gemini for the binary as it expects to communicate with parent
                         let provider = sashiko::ai::create_provider(&settings).expect("Failed to create AI provider");
+                        let fixup_provider = provider.clone();
 
                         // Enable read_prompt tool only if explicit caching is NOT used.
                         let prompts_dir = PathBuf::from("third_party/prompts/kernel");
@@ -371,11 +372,42 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
+                                let candidate_fixups = match sashiko::fixups::FixupGenerationConfig::from_review_settings(&settings.review) {
+                                    Ok(config) if config.enabled => {
+                                        info!("Generating candidate fixup patches...");
+                                        match sashiko::fixup_generator::generate_candidate_fixups(
+                                            fixup_provider,
+                                            &config,
+                                            sashiko::fixup_generator::FixupGenerationRequest {
+                                                patchset: &patchset_val,
+                                                review: result.output.as_ref(),
+                                                worktree: Some(&worktree.path),
+                                                temperature: Some(settings.ai.temperature),
+                                                context_tag: Some(format!("[ps:{} fixups]", patchset_id)),
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            Ok(fixups) => fixups,
+                                            Err(e) => {
+                                                error!("Candidate fixup generation failed: {}", e);
+                                                Vec::new()
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => Vec::new(),
+                                    Err(e) => {
+                                        error!("Invalid generated fixup configuration: {}", e);
+                                        Vec::new()
+                                    }
+                                };
+
                                 review_result_to_print = Some(json!({
                                     "patchset_id": patchset_id,
                                     "baseline": baseline_arg,
                                     "patches": patch_results,
                                     "review": result.output,
+                                    "candidate_fixups": candidate_fixups,
                                     "error": result.error,
                                     "inline_review": inline_content,
                                     "input_context": result.input_context,

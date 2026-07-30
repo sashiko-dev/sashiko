@@ -21,6 +21,7 @@ pub mod email_policy;
 pub mod email_router;
 pub mod events;
 pub mod fetcher;
+pub mod fixup_generator;
 pub mod fixups;
 pub mod git_ops;
 pub mod ingestor;
