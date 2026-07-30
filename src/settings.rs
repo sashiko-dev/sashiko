@@ -326,6 +326,18 @@ pub struct ReviewSettings {
     pub ignore_files: Vec<String>,
     #[serde(default = "default_email_policy_path")]
     pub email_policy_path: String,
+    #[serde(default)]
+    pub generate_fixups: bool,
+    #[serde(default = "default_fixup_mode")]
+    pub fixup_mode: String,
+    #[serde(default = "default_max_fixups_per_patchset")]
+    pub max_fixups_per_patchset: usize,
+    #[serde(default = "default_max_fixup_lines")]
+    pub max_fixup_lines: usize,
+    #[serde(default = "default_min_fixup_confidence")]
+    pub min_fixup_confidence: String,
+    #[serde(default = "default_max_fixup_risk")]
+    pub max_fixup_risk: String,
     /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
     /// single review. Cached input tokens are excluded because they cost ~10x less and don't
     /// reflect runaway model behaviour. At Sonnet 4.6 pricing ($3/M uncached input, $15/M
@@ -343,6 +355,26 @@ pub struct ReviewSettings {
     pub review_tool_override: Option<std::path::PathBuf>,
     #[serde(skip)]
     pub stages: Option<Vec<u8>>,
+}
+
+fn default_fixup_mode() -> String {
+    "off".to_string()
+}
+
+fn default_max_fixups_per_patchset() -> usize {
+    3
+}
+
+fn default_max_fixup_lines() -> usize {
+    50
+}
+
+fn default_min_fixup_confidence() -> String {
+    "high".to_string()
+}
+
+fn default_max_fixup_risk() -> String {
+    "low".to_string()
 }
 
 fn default_max_total_tokens() -> usize {

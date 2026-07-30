@@ -103,3 +103,13 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+
+# Generated candidate fixup patches are disabled by default. When enabled,
+# keep the initial policy conservative and expose only small, high-confidence
+# trivial or low-risk patches.
+generate_fixups = false
+fixup_mode = "off"
+max_fixups_per_patchset = 3
+max_fixup_lines = 50
+min_fixup_confidence = "high"
+max_fixup_risk = "low"

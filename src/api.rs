@@ -178,6 +178,12 @@ pub struct ReviewQuery {
 }
 
 #[derive(Deserialize)]
+pub struct FixupsQuery {
+    pub review_id: Option<i64>,
+    pub patchset_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
 pub struct RerunPatchQuery {
     pub patchset_id: i64,
     pub patch_id: i64,
@@ -290,6 +296,7 @@ pub fn build_router(
         .route("/api/message", get(get_message))
         .route("/api/review", get(get_review))
         .route("/api/review_log", get(get_review_log))
+        .route("/api/fixups", get(get_fixups))
         .route("/api/stats", get(get_stats))
         .route("/api/stats/timeline", get(stats_timeline))
         .route("/api/stats/reviews", get(stats_reviews))
@@ -753,6 +760,28 @@ async fn get_review(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+async fn get_fixups(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FixupsQuery>,
+) -> Result<Json<Vec<crate::fixups::CandidateFixupRecord>>, StatusCode> {
+    let result = match (query.review_id, query.patchset_id) {
+        (Some(review_id), None) => {
+            info!("Fetching candidate fixups for review id: {}", review_id);
+            state.db.get_candidate_fixups_by_review(review_id).await
+        }
+        (None, Some(patchset_id)) => {
+            info!("Fetching candidate fixups for patchset id: {}", patchset_id);
+            state.db.get_candidate_fixups_by_patchset(patchset_id).await
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    result.map(Json).map_err(|e| {
+        info!("Database error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn get_patchset_summary(
