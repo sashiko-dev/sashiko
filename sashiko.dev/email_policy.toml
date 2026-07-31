@@ -236,7 +236,11 @@ cc = ["linux-target@vger.kernel.org"]
 lists = ["linux-s390@vger.kernel.org"]
 reply_to_author = true
 send_positive_review = true
-cc = ["linux-s390@vger.kernel.org", "Heiko Carstens <hca@linux.ibm.com>", "Vasily Gorbik <gor@linux.ibm.com>", "Alexander Gordeev <agordeev@linux.ibm.com>"]
+cc = ["linux-s390@vger.kernel.org",
+      "Heiko Carstens <hca@linux.ibm.com>",
+      "Vasily Gorbik <gor@linux.ibm.com>",
+      "Alexander Gordeev <agordeev@linux.ibm.com>",
+      "Christian Borntraeger <borntraeger@linux.ibm.vom>"]
 
 [subsystems.kvmarm]
 lists = ["kvmarm@lists.linux.dev"]
