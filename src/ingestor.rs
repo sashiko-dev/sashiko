@@ -14,6 +14,7 @@
 
 use crate::db::Database;
 use crate::events::Event;
+pub use crate::mbox::{is_mbox_separator, split_mbox};
 use crate::nntp::NntpClient;
 use crate::settings::Settings;
 use anyhow::{Result, anyhow};
@@ -587,39 +588,6 @@ pub fn resolve_tracked_group(entry: &str, available_groups: Option<&[String]>) -
         (entry.to_string(), group)
     }
 }
-
-pub fn split_mbox(raw: &[u8]) -> Vec<Vec<u8>> {
-    let mut emails = Vec::new();
-    let mut current_email = Vec::new();
-
-    for line in raw.split_inclusive(|&b| b == b'\n') {
-        if is_mbox_separator(line) {
-            if !current_email.is_empty() {
-                emails.push(std::mem::take(&mut current_email));
-            }
-            // Skip the "From " line
-        } else {
-            current_email.extend_from_slice(line);
-        }
-    }
-
-    if !current_email.is_empty() {
-        emails.push(current_email);
-    }
-
-    emails
-}
-
-pub fn is_mbox_separator(line: &[u8]) -> bool {
-    if !line.starts_with(b"From ") {
-        return false;
-    }
-    // Heuristic: Mbox separator lines (From_ lines) usually contain a timestamp.
-    // We look for at least two colons (HH:MM:SS) to distinguish from
-    // "From " starting a sentence in the body.
-    line.iter().filter(|&&b| b == b':').count() >= 2
-}
-
 pub fn extract_message_id(raw_bytes: &[u8]) -> String {
     let raw_str = String::from_utf8_lossy(raw_bytes);
     for line in raw_str.lines() {

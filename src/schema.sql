@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS patches (
     diff TEXT,
     status TEXT,
     apply_error TEXT,
+    git_patch_id TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(message_id) REFERENCES messages(message_id),
     UNIQUE(patchset_id, message_id)
@@ -192,6 +193,7 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_cover_message_id ON patchsets(cover_let
 
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);
+CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id ON patches(git_patch_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
 
 CREATE INDEX IF NOT EXISTS idx_messages_day ON messages(strftime('%Y-%m-%d', date, 'unixepoch'));

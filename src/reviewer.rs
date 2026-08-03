@@ -23,10 +23,13 @@ use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
+use crate::prerequisites::{
+    PrerequisitePatch, parse_prerequisite_patch_ids, resolve_prerequisite_patches_from_lore,
+};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -79,6 +82,16 @@ fn generate_interaction_id() -> String {
 fn generate_interaction_id_at(epoch_millis: u128) -> String {
     let sequence = INTERACTION_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("rev_{}_{}", epoch_millis, sequence)
+}
+
+fn git_am_message(author: &str, date: i64, subject: &str, diff: &str) -> Result<String> {
+    let date = chrono::DateTime::from_timestamp(date, 0)
+        .ok_or_else(|| anyhow!("timestamp {date} is outside chrono's supported range"))?
+        .with_timezone(&chrono::Local)
+        .to_rfc2822();
+    Ok(format!(
+        "From: {author}\nDate: {date}\nSubject: {subject}\n\n{diff}\n"
+    ))
 }
 
 /// The `Reviewer` service orchestrates the review process for patchsets.
@@ -429,6 +442,10 @@ impl Reviewer {
         } else {
             None
         };
+        let prerequisite_patch_ids = body
+            .as_deref()
+            .map(parse_prerequisite_patch_ids)
+            .unwrap_or_default();
 
         let subject = patchset.subject.clone().unwrap_or("Unknown".to_string());
         let candidates = if let Some(bid) = patchset.baseline_id {
@@ -450,13 +467,19 @@ impl Reviewer {
         };
 
         // 1. Find a working baseline (apply series)
-        let (found_baseline, patch_commits, logs) =
-            Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
+        let (found_baseline, patch_commits, logs) = Self::prepare_baseline_worktree(
+            &ctx,
+            patchset_id,
+            &candidates,
+            &diffs,
+            &prerequisite_patch_ids,
+        )
+        .await;
 
         let prompts_hash = Some(env!("GIT_HASH"));
 
         // Save findings to patchset
-        if let Some((resolution, baseline_id, worktree)) = found_baseline {
+        if let Some((baseline_id, worktree, review_baseline)) = found_baseline {
             let _ = ctx
                 .db
                 .update_patchset_baseline_info(
@@ -626,7 +649,7 @@ impl Reviewer {
             let total_valid = valid_jobs.len();
             let valid_jobs_queue = Arc::new(tokio::sync::Mutex::new(valid_jobs));
             let mut handles = Vec::new();
-            let baseline_ref_str = resolution.as_str();
+            let baseline_ref_str = review_baseline;
 
             // Try concurrent processing using extra available permits in the semaphore
             if total_valid > 1 {
@@ -806,17 +829,87 @@ impl Reviewer {
         }
     }
 
+    async fn apply_prerequisites(
+        worktree: &GitWorktree,
+        prerequisites: &[PrerequisitePatch],
+        baseline_sha: &str,
+        logs: &mut String,
+    ) -> Result<String> {
+        let mut review_baseline_sha = baseline_sha.to_string();
+
+        for prerequisite in prerequisites {
+            let mbox = git_am_message(
+                &prerequisite.author,
+                prerequisite.date,
+                &prerequisite.subject,
+                &prerequisite.diff,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to format prerequisite {} ({})",
+                    prerequisite.git_patch_id, prerequisite.message_id
+                )
+            })?;
+            worktree.apply_patch(&mbox).await.map_err(|e| {
+                anyhow!(
+                    "Prerequisite {} ({}) failed to apply: {}",
+                    prerequisite.git_patch_id,
+                    prerequisite.message_id,
+                    e
+                )
+            })?;
+
+            let sha = get_commit_hash(&worktree.path, "HEAD").await.map_err(|e| {
+                anyhow!(
+                    "Failed to resolve HEAD after prerequisite {} ({}): {}",
+                    prerequisite.git_patch_id,
+                    prerequisite.message_id,
+                    e
+                )
+            })?;
+            logs.push_str(&format!(
+                "Applied prerequisite {} ({}) as {}.\n",
+                prerequisite.git_patch_id, prerequisite.message_id, sha
+            ));
+            review_baseline_sha = sha;
+        }
+
+        Ok(review_baseline_sha)
+    }
+
     async fn prepare_baseline_worktree(
         ctx: &ReviewContext,
         patchset_id: i64,
         candidates: &[BaselineResolution],
         diffs: &[(i64, i64, String, String, String, i64, String)],
+        prerequisite_patch_ids: &[String],
     ) -> (
-        Option<(BaselineResolution, i64, GitWorktree)>,
+        Option<(i64, GitWorktree, String)>,
         HashMap<i64, String>,
         String,
     ) {
         let mut attempts: Vec<BaselineAttempt> = Vec::new();
+        let prerequisites = if prerequisite_patch_ids.is_empty() {
+            Vec::new()
+        } else {
+            match resolve_prerequisite_patches_from_lore(&ctx.db, prerequisite_patch_ids).await {
+                Ok(patches) => patches,
+                Err(e) => {
+                    let message = format!("Failed to resolve b4 prerequisites: {e}\n");
+                    error!("{}", message.trim());
+                    attempts.push(BaselineAttempt {
+                        baseline: "b4 prerequisites".to_string(),
+                        status: "Failed".to_string(),
+                        log: message,
+                    });
+                    return (
+                        None,
+                        HashMap::new(),
+                        serde_json::to_string(&attempts).unwrap_or_default(),
+                    );
+                }
+            }
+        };
         let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
         let mainline_remote = ctx.baseline_registry.mainline_remote_name();
         let mut tested_shas = std::collections::HashSet::new();
@@ -932,25 +1025,29 @@ impl Reviewer {
             let mut patch_commits = HashMap::new();
             let mut application_failed = false;
             let mut apply_logs = String::new();
+            let mut review_baseline_sha = baseline_sha.clone();
+
+            match Self::apply_prerequisites(
+                &worktree,
+                &prerequisites,
+                &baseline_sha,
+                &mut apply_logs,
+            )
+            .await
+            {
+                Ok(sha) => review_baseline_sha = sha,
+                Err(e) => {
+                    apply_logs.push_str(&format!("{e}\n"));
+                    application_failed = true;
+                }
+            }
 
             for (i, (patch_id, index, diff, subject, author, date_ts, msg_id)) in
                 diffs.iter().enumerate()
             {
-                let date_str = std::process::Command::new("date")
-                    .arg("-R")
-                    .arg("-d")
-                    .arg(format!("@{}", date_ts))
-                    .output()
-                    .ok()
-                    .and_then(|o| {
-                        if o.status.success() {
-                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-
+                if application_failed {
+                    break;
+                }
                 let mut applied = false;
                 let mut fast_path_taken = false;
 
@@ -989,10 +1086,17 @@ impl Reviewer {
                 }
 
                 if !applied {
-                    let mbox = format!(
-                        "From: {}\nDate: {}\nSubject: {}\n\n{}\n",
-                        author, date_str, subject, diff
-                    );
+                    let mbox = match git_am_message(author, *date_ts, subject, diff) {
+                        Ok(mbox) => mbox,
+                        Err(e) => {
+                            apply_logs.push_str(&format!(
+                                "Patch {}/{} (ID: {}) has an invalid date: {}\n",
+                                patchset_id, index, patch_id, e
+                            ));
+                            application_failed = true;
+                            break;
+                        }
+                    };
 
                     // Try git am
                     if (worktree.apply_patch(&mbox).await).is_ok() {
@@ -1018,6 +1122,7 @@ impl Reviewer {
             }
 
             if !application_failed {
+                current_log.push_str(&apply_logs);
                 current_log.push_str("Application successful.\n");
                 current_status = "Applied".to_string();
 
@@ -1052,7 +1157,7 @@ impl Reviewer {
                         attempts.len()
                     );
                     return (
-                        Some((candidate.clone(), bid, worktree)),
+                        Some((bid, worktree, review_baseline_sha)),
                         patch_commits,
                         logs_json,
                     );
@@ -2528,6 +2633,42 @@ mod tests {
         assert!(ids.iter().all(|id| id.starts_with("rev_1234_")));
     }
 
+    fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn git_am_message_formats_epoch_timestamp() -> Result<()> {
+        let message = git_am_message("Author", 0, "Subject", "diff")?;
+
+        assert!(message.contains("Date: "));
+        assert!(!message.contains("Date: \n"));
+        Ok(())
+    }
+
+    #[test]
+    fn git_am_message_rejects_out_of_range_timestamp() {
+        let error = git_am_message("Author", i64::MAX, "Subject", "diff")
+            .expect_err("out-of-range timestamp should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("outside chrono's supported range")
+        );
+    }
+
     struct MockProvider;
     #[async_trait]
     impl AiProvider for MockProvider {
@@ -2575,6 +2716,133 @@ mod tests {
 
     struct RateLimitThenSuccessProvider {
         calls: AtomicUsize,
+    }
+
+    #[tokio::test]
+    async fn test_prepare_baseline_applies_b4_prerequisite() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let repo = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo)?;
+        run_git(&repo, &["init", "-q"])?;
+        run_git(&repo, &["config", "user.name", "Test Author"])?;
+        run_git(&repo, &["config", "user.email", "author@example.com"])?;
+
+        let file = repo.join("value.txt");
+        std::fs::write(&file, "one\n")?;
+        run_git(&repo, &["add", "value.txt"])?;
+        run_git(&repo, &["commit", "-q", "-m", "base"])?;
+        let base_sha = run_git(&repo, &["rev-parse", "HEAD"])?;
+
+        std::fs::write(&file, "one\ntwo\n")?;
+        run_git(&repo, &["commit", "-q", "-am", "prerequisite"])?;
+        let prerequisite_diff = run_git(&repo, &["show", "--format=", "--patch", "HEAD"])?;
+        let prerequisite_id = crate::prerequisites::calculate_git_patch_id(&prerequisite_diff)
+            .await?
+            .expect("prerequisite diff should have a stable patch ID");
+
+        std::fs::write(&file, "one\ntwo changed\n")?;
+        run_git(&repo, &["commit", "-q", "-am", "target"])?;
+        let target_diff = run_git(&repo, &["show", "--format=", "--patch", "HEAD"])?;
+        run_git(&repo, &["reset", "--hard", &base_sha])?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.git.repository_path = repo.to_string_lossy().into_owned();
+        settings.review.worktree_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .to_string_lossy()
+            .into_owned();
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let thread_id = db.create_thread("root", "prerequisite", 1).await?;
+        db.create_message(
+            "prerequisite@example.com",
+            thread_id,
+            None,
+            "Test Author <author@example.com>",
+            "[PATCH] prerequisite",
+            1_700_000_000,
+            &prerequisite_diff,
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let prerequisite_patchset_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "root",
+                "prerequisite",
+                "Test Author <author@example.com>",
+                1_700_000_000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch_with_git_patch_id(
+            prerequisite_patchset_id,
+            "prerequisite@example.com",
+            1,
+            &prerequisite_diff,
+            Some(&prerequisite_id),
+        )
+        .await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings: settings.clone(),
+            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+        let candidate = BaselineResolution::Commit(base_sha.clone());
+        let diffs = vec![(
+            99,
+            1,
+            target_diff,
+            "[PATCH] target".to_string(),
+            "Test Author <author@example.com>".to_string(),
+            1_700_000_001,
+            "target@example.com".to_string(),
+        )];
+
+        let (found, patch_commits, logs) =
+            Reviewer::prepare_baseline_worktree(&ctx, 99, &[candidate], &diffs, &[prerequisite_id])
+                .await;
+        let (_, worktree, review_baseline) =
+            found.ok_or_else(|| anyhow::anyhow!("baseline preparation failed: {logs}"))?;
+
+        assert_ne!(review_baseline, base_sha);
+        let target_sha = patch_commits
+            .get(&1)
+            .expect("target patch commit should be recorded");
+        assert_eq!(
+            run_git(&worktree.path, &["rev-parse", &format!("{target_sha}^")])?,
+            review_baseline
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("value.txt"))?,
+            "one\ntwo changed\n"
+        );
+        assert!(logs.contains("Applied prerequisite"));
+        worktree.remove().await?;
+        Ok(())
     }
 
     #[async_trait]
