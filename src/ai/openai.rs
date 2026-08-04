@@ -203,6 +203,16 @@ impl OpenAiCompatClient {
             None => return Err(anyhow::anyhow!("Invalid url scheme in OpenAI url {}", url)),
         };
 
+        // If the caller supplied a full URL that already targets a chat
+        // completions endpoint, accept it verbatim. This allows any
+        // OpenAI-compatible provider to be configured via `base_url` alone,
+        // including endpoints whose path is not otherwise recognised such as
+        // z.ai's coding-plan gateway
+        // (https://api.z.ai/api/coding/paas/v4/chat/completions).
+        if path.ends_with("/chat/completions") {
+            return Ok(format!("{base}{path}"));
+        }
+
         let path = match path.as_str() {
             "" => "/chat/completions",
             "/v1" | "/v1/chat/completions" => "/v1/chat/completions",
@@ -1242,6 +1252,32 @@ mod tests {
                 .unwrap(),
             "https://openrouter.ai/api/v1/chat/completions"
         );
+        // z.ai / Zhipu endpoints: full URLs ending in /chat/completions are
+        // accepted verbatim, so providers with otherwise-unrecognised paths
+        // (direct API and coding-plan gateway) can be used via base_url only.
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("https://api.z.ai/api/paas/v4/chat/completions")
+                .unwrap(),
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url(
+                "https://api.z.ai/api/coding/paas/v4/chat/completions"
+            )
+            .unwrap(),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+        // Trailing slash on a full endpoint URL is trimmed
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url(
+                "https://api.z.ai/api/coding/paas/v4/chat/completions/"
+            )
+            .unwrap(),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+        // Paths that are not full chat/completions URLs and are not a known
+        // shorthand are still rejected.
+        assert!(OpenAiCompatClient::normalize_base_url("https://api.z.ai/api/paas/v4").is_err());
         // Test arbitrary deep nested paths that shouldn't be accepted
         assert!(
             OpenAiCompatClient::normalize_base_url(
