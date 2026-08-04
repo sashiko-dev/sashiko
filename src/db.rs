@@ -460,11 +460,13 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
-        let current_version: u32 = if let Some(row) = rows.next().await? {
-            row.get(0).unwrap_or(0)
-        } else {
-            0
+        let current_version: u32 = {
+            let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
+            if let Some(row) = rows.next().await? {
+                row.get(0).unwrap_or(0)
+            } else {
+                0
+            }
         };
 
         if current_version == 0 {
@@ -491,6 +493,8 @@ impl Database {
         } else {
             info!("Database version is {}", current_version);
         }
+
+        self.migrate_patches_unique_constraint_if_needed().await?;
 
         Ok(())
     }
@@ -703,6 +707,69 @@ impl Database {
                 "strftime('%Y-%m-%d', created_at, 'unixepoch'), status",
             )
             .await;
+
+        Ok(())
+    }
+
+    async fn migrate_patches_unique_constraint_if_needed(&self) -> Result<()> {
+        // Migrate patches table if it has the legacy UNIQUE(message_id) constraint
+        let mut unique_indices = Vec::new();
+        if let Ok(mut rows) = self.conn.query("PRAGMA index_list(patches)", ()).await {
+            while let Ok(Some(row)) = rows.next().await {
+                let is_unique: i64 = row.get(2).unwrap_or(0);
+                let idx_name: String = row.get(1).unwrap_or_default();
+                if is_unique == 1 {
+                    unique_indices.push(idx_name);
+                }
+            }
+        }
+
+        let mut has_old_unique_msgid = false;
+        for idx_name in unique_indices {
+            let mut cols = Vec::new();
+            if let Ok(mut info_rows) = self
+                .conn
+                .query(&format!("PRAGMA index_info(\"{}\")", idx_name), ())
+                .await
+            {
+                while let Ok(Some(irow)) = info_rows.next().await {
+                    let col_name: String = irow.get(2).unwrap_or_default();
+                    cols.push(col_name);
+                }
+            }
+            if cols == vec!["message_id"] {
+                has_old_unique_msgid = true;
+                break;
+            }
+        }
+
+        if has_old_unique_msgid {
+            info!("Migrating patches table to composite UNIQUE(patchset_id, message_id)...");
+            let _ = self.conn.execute("PRAGMA foreign_keys = OFF", ()).await;
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS patches_new (
+                        id INTEGER PRIMARY KEY,
+                        patchset_id INTEGER NOT NULL,
+                        message_id TEXT NOT NULL,
+                        part_index INTEGER,
+                        diff TEXT,
+                        status TEXT,
+                        apply_error TEXT,
+                        FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+                        FOREIGN KEY(message_id) REFERENCES messages(message_id),
+                        UNIQUE(patchset_id, message_id)
+                    );
+                    INSERT OR IGNORE INTO patches_new (id, patchset_id, message_id, part_index, diff, status, apply_error)
+                    SELECT id, patchset_id, message_id, part_index, diff, status, apply_error FROM patches;
+                    DROP TABLE patches;
+                    ALTER TABLE patches_new RENAME TO patches;
+                    CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);",
+                )
+                .await?;
+            let _ = self.conn.execute("PRAGMA foreign_keys = ON", ()).await;
+        }
+
         Ok(())
     }
 
@@ -2220,65 +2287,59 @@ impl Database {
             ));
         }
 
-        // Check if patch exists and get old patchset_id to fix counts if we steal it
-        let old_patchset_id: Option<i64> = {
+        // Check if patch with same message_id already exists in this patchset
+        let existing_in_patchset: bool = {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT patchset_id FROM patches WHERE message_id = ?",
-                    libsql::params![message_id],
+                    "SELECT 1 FROM patches WHERE patchset_id = ? AND message_id = ?",
+                    libsql::params![patchset_id, message_id],
                 )
                 .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                Some(row.get(0)?)
-            } else {
-                None
-            }
+            rows.next().await.ok().flatten().is_some()
         };
 
-        // Insert or Update (Move patch to new patchset if duplicate)
-        self.conn.execute(
-            "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
-             ON CONFLICT(message_id) DO UPDATE SET
-                patchset_id=excluded.patchset_id,
-                part_index=excluded.part_index,
-                diff=excluded.diff",
-            libsql::params![patchset_id, message_id, part_index, crate::compression::compress_string_if_needed(diff)]
-        ).await?;
-
-        // Update received_parts for the NEW patchset
+        // Insert or update within THIS patchset.
         self.conn
             .execute(
-                "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
-                libsql::params![patchset_id, patchset_id],
+                "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(patchset_id, message_id) DO UPDATE SET
+                    part_index=excluded.part_index,
+                    diff=excluded.diff",
+                libsql::params![
+                    patchset_id,
+                    message_id,
+                    part_index,
+                    crate::compression::compress_string_if_needed(diff)
+                ],
             )
             .await?;
 
-        // Update received_parts for the OLD patchset (if we moved it)
-        if let Some(old_id) = old_patchset_id
-            && old_id != patchset_id
-        {
+        // Update received_parts to match the physical patch count in this patchset
+        if !existing_in_patchset {
             self.conn
-                        .execute(
-                            "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
-                            libsql::params![old_id, old_id],
-                        )
-                        .await?;
+                .execute(
+                    "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
+                    libsql::params![patchset_id, patchset_id],
+                )
+                .await?;
         }
 
         // Check if complete and update status
         // We transition from 'Incomplete' OR 'Fetching' to 'Pending' (ready for review)
-        self.conn.execute(
-            "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-            libsql::params![patchset_id],
-        ).await?;
+        self.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+                libsql::params![patchset_id],
+            )
+            .await?;
 
-        // Get the patch ID
+        // Get the patch ID for this patch in this patchset
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patches WHERE message_id = ?",
-                libsql::params![message_id],
+                "SELECT id FROM patches WHERE patchset_id = ? AND message_id = ?",
+                libsql::params![patchset_id, message_id],
             )
             .await?;
 
@@ -6921,6 +6982,1326 @@ mod tests {
         assert_eq!(
             single_det["received_parts"], 1,
             "Singleton patchset should still have exactly 1 patch"
+        );
+    }
+
+    /// Count the actual patch rows owned by a patchset.
+    async fn count_patches(db: &Database, patchset_id: i64) -> i64 {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await
+            .unwrap();
+        if let Ok(Some(row)) = rows.next().await {
+            row.get(0).unwrap()
+        } else {
+            0
+        }
+    }
+
+    /// Verify that create_patch does not steal a patch from one patchset
+    /// to give it to another when both share the same message_id (SHA).
+    ///
+    /// Reproduces the bug where submitting a single commit then a range
+    /// containing the same commit causes the singleton to drop to 0/1.
+    #[tokio::test]
+    async fn test_create_patch_no_cross_patchset_steal() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "abcdef1234567890abcdef1234567890abcdef12";
+
+        // Thread 1: singleton submission
+        let t1 = db
+            .create_thread("single_root", "Single", 80000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Fix something",
+            80000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Fix something",
+                author,
+                80000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-singleton")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1, "Singleton should have 1 patch");
+
+        // Thread 2: range submission that includes the same SHA
+        let t2 = db
+            .create_thread("range_root", "Range", 80010)
+            .await
+            .unwrap();
+        db.create_message(
+            "range_root",
+            t2,
+            None,
+            author,
+            "Range cover",
+            80010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "sha_other",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 1/2] Other fix",
+            80011,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_other",
+                "[PATCH 1/2] Other fix",
+                author,
+                80011,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "sha_other", 1, "diff-other")
+            .await
+            .unwrap();
+
+        // Patch 2/2 uses the SAME message_id as the singleton.
+        db.create_message(
+            shared_sha,
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 2/2] Fix something",
+            80012,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // This should NOT steal the patch from ps_single.
+        db.create_patch(ps_range, shared_sha, 2, "diff-range-copy")
+            .await
+            .unwrap();
+
+        // Singleton must keep its patch
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton must keep its patch (was stolen by range)"
+        );
+        // Verify the actual patch row still belongs to the singleton
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+
+        // Range should have both patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range should have both patches"
+        );
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own both patch rows"
+        );
+
+        // Resubmit the same range patch again (idempotent guard)
+        db.create_patch(ps_range, shared_sha, 2, "diff-range-copy")
+            .await
+            .unwrap();
+
+        // received_parts must not exceed total_parts
+        let range_det2 = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det2["received_parts"], 2,
+            "Resubmission must not over-count received_parts"
+        );
+    }
+
+    /// Same singleton submitted twice: create_patch should be idempotent
+    /// via ON CONFLICT within the same patchset.
+    #[tokio::test]
+    async fn test_create_patch_same_singleton_twice() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+
+        let t1 = db.create_thread("root_dup", "Dup", 70000).await.unwrap();
+        db.create_message(
+            "sha_dup",
+            t1,
+            None,
+            author,
+            "Fix duplicate",
+            70000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                t1,
+                Some("sha_dup"),
+                "sha_dup",
+                "Fix duplicate",
+                author,
+                70000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First insert
+        db.create_patch(ps, "sha_dup", 1, "diff-v1").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1);
+
+        // Second insert (same patchset, same message_id) -- idempotent
+        db.create_patch(ps, "sha_dup", 1, "diff-v2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 1,
+            "Duplicate insert in same patchset must stay at 1"
+        );
+    }
+
+    /// Same range submitted twice: each patch in the range should be
+    /// idempotent via ON CONFLICT within the same patchset.
+    #[tokio::test]
+    async fn test_create_patch_same_range_twice() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+
+        let t1 = db
+            .create_thread("range_dup_root", "Range dup", 71000)
+            .await
+            .unwrap();
+        db.create_message(
+            "range_dup_root",
+            t1,
+            None,
+            author,
+            "Range cover",
+            71000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for sha in ["sha_r1", "sha_r2"] {
+            db.create_message(
+                sha,
+                t1,
+                Some("range_dup_root"),
+                author,
+                &format!("[PATCH] {}", sha),
+                71001,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ps = db
+            .create_patchset(
+                t1,
+                Some("range_dup_root"),
+                "sha_r1",
+                "[PATCH 1/2] sha_r1",
+                author,
+                71001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First round
+        db.create_patch(ps, "sha_r1", 1, "diff-r1").await.unwrap();
+        db.create_patch(ps, "sha_r2", 2, "diff-r2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 2);
+
+        // Second round (duplicate range submission)
+        db.create_patch(ps, "sha_r1", 1, "diff-r1").await.unwrap();
+        db.create_patch(ps, "sha_r2", 2, "diff-r2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 2,
+            "Duplicate range in same patchset must stay at 2"
+        );
+    }
+
+    /// Range submitted first, then singleton with shared SHA: neither
+    /// should lose its patch.
+    #[tokio::test]
+    async fn test_create_patch_range_then_singleton() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "shared_range_then_single";
+
+        // Thread 1: range first
+        let t1 = db
+            .create_thread("rts_range_root", "Range first", 72000)
+            .await
+            .unwrap();
+        db.create_message(
+            "rts_range_root",
+            t1,
+            None,
+            author,
+            "Range cover",
+            72000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "rts_other",
+            t1,
+            Some("rts_range_root"),
+            author,
+            "[PATCH 1/2] Other",
+            72001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            Some("rts_range_root"),
+            author,
+            "[PATCH 2/2] Shared",
+            72002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t1,
+                Some("rts_range_root"),
+                "rts_other",
+                "[PATCH 1/2] Other",
+                author,
+                72001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "rts_other", 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared")
+            .await
+            .unwrap();
+
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range should have 2 patches"
+        );
+
+        // Thread 2: singleton with the shared SHA
+        let t2 = db
+            .create_thread("rts_single", "Single after", 72010)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            None,
+            author,
+            "Shared commit alone",
+            72010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t2,
+                Some(shared_sha),
+                shared_sha,
+                "Shared commit alone",
+                author,
+                72010,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // This should NOT steal from the range
+        db.create_patch(ps_single, shared_sha, 1, "diff-single")
+            .await
+            .unwrap();
+
+        // Range must still have 2 patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range must keep both patches after singleton submission"
+        );
+        // Verify the range physically owns both patch rows
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own both patch rows"
+        );
+
+        // Singleton should have 1
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton should have 1 patch"
+        );
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+    }
+
+    /// 4-patch range where a shared commit is in the middle (not last):
+    /// ensures that all 4 patches are inserted physically and received_parts is 4.
+    #[tokio::test]
+    async fn test_create_patch_range_shared_mid_sequence() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "sha_mid_shared";
+
+        // Thread 1: singleton with the shared SHA
+        let t1 = db
+            .create_thread("mid_single_root", "Single", 90000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Shared commit",
+            90000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Shared commit",
+                author,
+                90000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-single")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1, "Singleton should have 1 patch");
+
+        // Thread 2: 4-patch range where shared_sha is patch 2 of 4
+        let t2 = db
+            .create_thread("mid_range_root", "Range", 90010)
+            .await
+            .unwrap();
+        db.create_message(
+            "mid_range_root",
+            t2,
+            None,
+            author,
+            "Range cover",
+            90010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for sha in ["sha_p1", shared_sha, "sha_p3", "sha_p4"] {
+            db.create_message(
+                sha,
+                t2,
+                Some("mid_range_root"),
+                author,
+                &format!("[PATCH] {}", sha),
+                90011,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .ok(); // shared_sha message already exists, ignore dup
+        }
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("mid_range_root"),
+                "sha_p1",
+                "[PATCH 1/4] sha_p1",
+                author,
+                90011,
+                4,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Insert patches in order: p1, shared (cross-patchset), p3, p4
+        db.create_patch(ps_range, "sha_p1", 1, "diff-p1")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 1,
+            "After p1: received_parts should be 1"
+        );
+
+        // Patch 2: shared SHA — cross-patchset, bumps received_parts
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 2,
+            "After shared: received_parts should be 2"
+        );
+
+        // Patch 3: normal insert — must NOT overwrite the bump
+        db.create_patch(ps_range, "sha_p3", 3, "diff-p3")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 3,
+            "After p3: received_parts should be 3 (COUNT bug would give 2)"
+        );
+
+        // Patch 4: normal insert — completes the range
+        db.create_patch(ps_range, "sha_p4", 4, "diff-p4")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 4,
+            "After p4: range must be complete with 4/4"
+        );
+
+        // Verify physical patch ownership: range has all 4 physical patches
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            4,
+            "Range should physically own all 4 patches"
+        );
+
+        // Singleton must still have its patch
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton must keep its patch"
+        );
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+
+        // Status check: range should be Pending (complete)
+        assert!(
+            det["status"] == "Pending" || det["status"] == "In Review",
+            "Range status should transition to Pending/In Review, got: {}",
+            det["status"]
+        );
+    }
+
+    /// Verify that when a commit SHA is shared across multiple patchsets
+    /// (e.g. submitted as a singleton and then in a range resubmission),
+    /// both patchsets physically own their patch rows in the database,
+    /// so that get_patch_diffs and get_patchset_details return all patches
+    /// for both patchsets.
+    #[tokio::test]
+    async fn test_cross_patchset_shared_commit_physical_rows_and_diffs() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let shared_sha = "shared_commit_sha_1234567890";
+        let other_sha = "other_commit_sha_0987654321";
+
+        // 1. Thread 1: Singleton patchset with shared_sha
+        let t1 = db
+            .create_thread("t1_singleton", "Singleton Subject", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Singleton commit",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Singleton commit",
+                author,
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-shared-v1")
+            .await
+            .unwrap();
+
+        // 2. Thread 2: 2-patch range containing other_sha (part 1) and shared_sha (part 2)
+        let t2 = db
+            .create_thread("t2_range_cover", "Range Subject", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "t2_range_cover",
+            t2,
+            None,
+            author,
+            "Range Cover Letter",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            other_sha,
+            t2,
+            Some("t2_range_cover"),
+            author,
+            "[PATCH 1/2] Other commit",
+            2001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            Some("t2_range_cover"),
+            author,
+            "[PATCH 2/2] Shared commit",
+            2002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("t2_range_cover"),
+                other_sha,
+                "[PATCH 1/2] Other commit",
+                author,
+                2001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, other_sha, 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared-v2")
+            .await
+            .unwrap();
+
+        // Check singleton: must have 1 physical patch row and 1 diff
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own 1 patch row"
+        );
+        let single_diffs = db.get_patch_diffs(ps_single).await.unwrap();
+        assert_eq!(
+            single_diffs.len(),
+            1,
+            "Singleton must have 1 patch diff returned by get_patch_diffs"
+        );
+        assert_eq!(single_diffs[0].6, shared_sha);
+
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["patches"].as_array().unwrap().len(),
+            1,
+            "Singleton details must contain 1 patch"
+        );
+
+        // Check range: must have 2 physical patch rows and 2 diffs
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own 2 patch rows"
+        );
+        let range_diffs = db.get_patch_diffs(ps_range).await.unwrap();
+        assert_eq!(
+            range_diffs.len(),
+            2,
+            "Range must have 2 patch diffs returned by get_patch_diffs (including shared SHA)"
+        );
+        assert_eq!(range_diffs[0].6, other_sha);
+        assert_eq!(range_diffs[1].6, shared_sha);
+
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["patches"].as_array().unwrap().len(),
+            2,
+            "Range details must contain 2 patches"
+        );
+    }
+
+    /// Verify the reverse ingestion order: range first, then singleton with
+    /// the shared commit. The singleton must physically own its patch row
+    /// and return its diff.
+    #[tokio::test]
+    async fn test_cross_patchset_shared_commit_range_then_singleton() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let shared_sha = "shared_commit_rev_1234567890";
+        let other_sha = "other_commit_rev_0987654321";
+
+        // 1. Thread 1: 2-patch range containing other_sha (part 1) and shared_sha (part 2)
+        let t1 = db
+            .create_thread("t1_range_cover", "Range Subject", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "t1_range_cover",
+            t1,
+            None,
+            author,
+            "Range Cover Letter",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            other_sha,
+            t1,
+            Some("t1_range_cover"),
+            author,
+            "[PATCH 1/2] Other commit",
+            1001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            Some("t1_range_cover"),
+            author,
+            "[PATCH 2/2] Shared commit",
+            1002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t1,
+                Some("t1_range_cover"),
+                other_sha,
+                "[PATCH 1/2] Other commit",
+                author,
+                1001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, other_sha, 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared-v1")
+            .await
+            .unwrap();
+
+        // 2. Thread 2: Singleton patchset with shared_sha
+        let t2 = db
+            .create_thread("t2_singleton", "Singleton Subject", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            None,
+            author,
+            "Singleton commit",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t2,
+                Some(shared_sha),
+                shared_sha,
+                "Singleton commit",
+                author,
+                2000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-shared-v2")
+            .await
+            .unwrap();
+
+        // Check range: must have 2 physical patch rows and 2 diffs
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own 2 patch rows"
+        );
+        let range_diffs = db.get_patch_diffs(ps_range).await.unwrap();
+        assert_eq!(
+            range_diffs.len(),
+            2,
+            "Range must have 2 patch diffs returned by get_patch_diffs"
+        );
+
+        // Check singleton: must have 1 physical patch row and 1 diff
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own 1 patch row"
+        );
+        let single_diffs = db.get_patch_diffs(ps_single).await.unwrap();
+        assert_eq!(
+            single_diffs.len(),
+            1,
+            "Singleton must have 1 patch diff returned by get_patch_diffs"
+        );
+        assert_eq!(single_diffs[0].6, shared_sha);
+
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["patches"].as_array().unwrap().len(),
+            1,
+            "Singleton details must contain 1 patch"
+        );
+    }
+<<<<<<< HEAD
+=======
+
+    /// Verify that get_patchset_details_by_msgid and get_patchset_summary_by_msgid
+    /// resolve synthetic IDs when queried by bare SHA.
+    #[tokio::test]
+    async fn test_get_patchset_details_by_synthetic_msgid() {
+        let db = setup_db().await;
+        let sha = "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4";
+        let synthetic_id = format!("{}@sashiko.local", sha);
+
+        // Create a fetching patchset with the synthetic cover_letter_message_id
+        let ps_id = db
+            .create_fetching_patchset(
+                &synthetic_id,
+                "Fetching patchset subject",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. Querying with the bare SHA must find the patchset details
+        let details = db
+            .get_patchset_details_by_msgid(sha, None, None)
+            .await
+            .unwrap();
+        assert!(
+            details.is_some(),
+            "get_patchset_details_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
+        );
+        assert_eq!(details.unwrap()["id"], ps_id);
+
+        // 2. Querying with bracketed SHA must also find the patchset details
+        let details_bracketed = db
+            .get_patchset_details_by_msgid(&format!("<{}>", sha), None, None)
+            .await
+            .unwrap();
+        assert_eq!(details_bracketed.unwrap()["id"], ps_id);
+
+        // 3. Querying with full synthetic ID must also find the patchset details
+        let details_full = db
+            .get_patchset_details_by_msgid(&synthetic_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(details_full.unwrap()["id"], ps_id);
+
+        // 4. Querying with the bare SHA must also find the patchset summary
+        let summary = db
+            .get_patchset_summary_by_msgid(sha, None, None)
+            .await
+            .unwrap();
+        assert!(
+            summary.is_some(),
+            "get_patchset_summary_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
+        );
+        assert_eq!(summary.unwrap()["id"], ps_id);
+
+        // 5. update_patchset_error with bare SHA updates the synthetic patchset
+        db.update_patchset_error(sha, "Fetch failed: timeout")
+            .await
+            .unwrap();
+        let updated = db
+            .get_patchset_details_by_msgid(sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["status"], "Failed");
+        assert_eq!(updated["failed_reason"], "Fetch failed: timeout");
+    }
+
+    /// Verify that an existing database at user_version = 1 with the legacy
+    /// UNIQUE(message_id) constraint is automatically migrated by db.migrate()
+    /// without requiring a user_version bump.
+    #[tokio::test]
+    async fn test_migrate_patches_table_from_version_1_legacy_constraint() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+
+        // 1. Manually set up a schema matching version 1 with the old UNIQUE(message_id)
+        db.conn
+            .execute_batch(
+                "CREATE TABLE threads (id INTEGER PRIMARY KEY, root_message_id TEXT, subject TEXT, last_updated INTEGER);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, thread_id INTEGER, in_reply_to TEXT, author TEXT, subject TEXT, date INTEGER, body TEXT, to_recipients TEXT, cc_recipients TEXT, git_blob_hash TEXT, mailing_list TEXT, references_hdr TEXT);
+                 CREATE TABLE patchsets (id INTEGER PRIMARY KEY, thread_id INTEGER, cover_letter_message_id TEXT, subject TEXT, author TEXT, date INTEGER, total_parts INTEGER, received_parts INTEGER, status TEXT, parser_version INTEGER, to_recipients TEXT, cc_recipients TEXT, subject_index INTEGER, baseline_id INTEGER, skip_filters TEXT, only_filters TEXT, model_name TEXT, prompts_git_hash TEXT, baseline_logs TEXT, mr_url TEXT, mr_title TEXT, mr_number TEXT, slug TEXT, provider TEXT, embargo_until INTEGER);
+                 CREATE TABLE patches (
+                     id INTEGER PRIMARY KEY,
+                     patchset_id INTEGER NOT NULL,
+                     message_id TEXT NOT NULL UNIQUE,
+                     part_index INTEGER,
+                     diff TEXT,
+                     status TEXT,
+                     apply_error TEXT,
+                     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+                     FOREIGN KEY(message_id) REFERENCES messages(message_id)
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .await
+            .unwrap();
+
+        // 2. Run migrate() on this existing version 1 database
+        db.migrate().await.unwrap();
+
+        // 3. Verify that create_patch works for multiple patchsets sharing the same message_id
+        let author = "Dev <dev@example.com>";
+        let t = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+        db.create_message(
+            "shared_sha",
+            t,
+            None,
+            author,
+            "Shared",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps1 = db
+            .create_patchset(
+                t,
+                Some("shared_sha"),
+                "shared_sha",
+                "P1",
+                author,
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let ps2 = db
+            .create_patchset(
+                t,
+                Some("ps2_cover"),
+                "shared_sha",
+                "P2",
+                author,
+                1001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let patch1 = db.create_patch(ps1, "shared_sha", 1, "diff1").await;
+        assert!(patch1.is_ok(), "First patch insertion should succeed");
+
+        let patch2 = db.create_patch(ps2, "shared_sha", 1, "diff2").await;
+        assert!(
+            patch2.is_ok(),
+            "Second patch with same SHA in different patchset must succeed after migration"
         );
     }
 }
