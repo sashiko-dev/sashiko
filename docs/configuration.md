@@ -149,10 +149,34 @@ Optional array of additional git remotes to track.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `name` | string | -- | Remote name. |
-| `url` | string | -- | Remote URL. |
-| `check_all_branches` | bool | -- | Try all branches as baselines. |
-| `only_branches` | list | -- | Restrict to specific branches (optional). |
+| `name` | string | -- | Remote name. Required. |
+| `url` | string | -- | Remote URL. Required. |
+| `check_all_branches` | bool | -- | Try all branches as baselines. Required -- omitting it is a parse error, not a default of `false`. |
+| `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` is also true, these are appended to the full branch list rather than replacing it. |
+
+Baselines are tried in order and the first one the series applies to wins.
+Custom remotes are tried after any `base-commit:` trailer and the MAINTAINERS
+subsystem heuristic, but **before** linux-next and mainline. A subsystem topic
+branch is where a series was actually developed, whereas linux-next carries a
+snapshot of that branch which lags by at least one daily build -- and shares no
+SHAs with it once the maintainer rebases.
+
+Use this to reach topic branches that the MAINTAINERS `T:` entry doesn't name.
+For example, the NFSD entry lists a tree but no branch, so the only candidate it
+yields is `cel/HEAD` (a symref to `cel/master`):
+
+```toml
+[[git.custom_remotes]]
+name = "cel"
+url = "git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+check_all_branches = false
+only_branches = ["nfsd-next", "nfsd-testing"]
+```
+
+Match `name` and `url` to a remote already in the repository when one exists.
+`ensure_remote` rewrites the URL whenever the configured one differs, so an
+`https://` URL here against a `git://` remote flips it back and forth on every
+pass.
 
 ### `[review]`
 
