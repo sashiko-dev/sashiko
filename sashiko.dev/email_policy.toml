@@ -46,6 +46,7 @@ subject_prefixes = ["bpf", "bpf-next"]
 lists = ["damon@lists.linux.dev"]
 reply_to_author = true
 cc = ["damon@lists.linux.dev"]
+send_positive_review = true
 
 [subsystems.devicetree]
 lists = ["devicetree@vger.kernel.org"]
