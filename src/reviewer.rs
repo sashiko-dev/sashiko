@@ -928,8 +928,13 @@ impl Reviewer {
                     );
 
                     // Try git am
-                    if (worktree.apply_patch(&mbox).await).is_ok() {
-                        applied = true;
+                    match worktree.apply_patch(&mbox).await {
+                        Ok(_) => applied = true,
+                        Err(e) => {
+                            let msg = format!("git am error: {}\n", e);
+                            info!("{}", msg);
+                            apply_logs.push_str(&msg);
+                        }
                     }
                 }
 
