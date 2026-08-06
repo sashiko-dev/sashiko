@@ -313,11 +313,15 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
 
-CRITICAL RULE: If a finding is flagged as pre-existing (`\"preexisting\": true`), you MUST explicitly state in your inline comment that this issue is pre-existing and was not introduced by the patch under review. Use phrasing like \"This isn't a bug introduced by this patch, but...\" or \"This is a pre-existing issue, but...\" to start the comment.
+CRITICAL RULE: Findings flagged as pre-existing (`\"preexisting\": true`) were NOT introduced by the patch under review and MUST NOT be emitted as inline comments on the diff, as that adds noise for contributors and maintainers. Instead, collect every pre-existing finding and list it in a single, clearly-delimited section at the very top of the report. Open that section with exactly this header line (plain text, not a markdown header):
+
+Pre-existing issues (not introduced by this patch):
+
+Then list each pre-existing finding as a bullet on its own line, using the exact marker syntax `[Severity: <level>]` followed by the problem, e.g. `- [Severity: High] <problem>`. Do not annotate any pre-existing finding on the diff itself. Reserve inline comments on the code strictly for newly-introduced findings.
 
 Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
 
-SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition."
+SPECIFICITY REQUIREMENT: Each inline comment (for a newly-introduced finding) MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition. Pre-existing findings listed in the header should include the same level of specificity in their problem description, but never as code annotations."
             }
             _ => "",
         };
