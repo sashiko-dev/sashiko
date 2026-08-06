@@ -231,6 +231,29 @@ fields as `[defaults]`, plus:
 | `patchwork.min_severity` | string | -- | Minimum finding severity to include in patchwork checks. Findings below this threshold are excluded. Accepts: `Low`, `Medium`, `High`, `Critical` (case-insensitive). Default: all findings included. |
 | `patchwork.fail_severity` | string | `High` | Minimum severity of NEW findings that triggers the `fail` check state instead of `warning`. New findings at or above this threshold produce `fail`; below it produce `warning`. Pre-existing findings never affect the check state. |
 
+### Author-only delivery
+
+A subsystem can **track** a mailing list (its patches are ingested and
+reviewed) while **not pinging** that list with the review email — sending
+only to the patch author instead. This is useful for silent /
+dashboard-only lists where individual contributors want direct reviews of
+their own patches without spamming the whole list.
+
+It is achieved with the existing flags, no extra key needed:
+
+```toml
+[subsystems.drm-intel]
+lists = ["intel-xe@lists.freedesktop.org"]
+reply_all = false          # never send to the public list
+reply_to_author = true     # send the review to the patch author
+cc_individuals = false     # drop non-list individual recipients
+```
+
+The list address is still matched via `lists` (so reviews happen), but
+`reply_all = false` strips it from the outgoing recipients, leaving only
+the author. Because each review targets exactly one author, this delivers
+reviews to individual developers without pinging the list.
+
 ### Patchwork integration
 
 Sashiko can report review results as

@@ -39,4 +39,18 @@ Sashiko provides flexible delivery mechanisms that can be configured per mailing
 *   **`embargo_hours`:** The number of hours to wait before sending out a review, providing a delay period. When a patch is sent to multiple mailing lists, the shortest explicitly configured embargo period among the matched subsystems will be used. If no matched subsystems explicitly configure this value, it falls back to the default policy.
 *   **`send_positive_review`**: Determines whether to send a review email even when no issues are found. If set to `true`, Sashiko will send a reply indicating that the review was positive. Defaults to `false`.
 
+**Author-only delivery:** To *track* a subsystem's list (so its patches are
+ingested and reviewed) without *pinging* the list, send the review only to
+the patch author. No extra flag is needed — combine `reply_all = false`
+(strips the list from recipients), `reply_to_author = true`, and
+`cc_individuals = false`:
+
+```toml
+[subsystems.drm-intel]
+lists = ["intel-xe@lists.freedesktop.org"]
+reply_all = false
+reply_to_author = true
+cc_individuals = false
+```
+
 **Configuration:** The email policies and delivery preferences are defined in the [`sashiko.dev/email_policy.toml`](sashiko.dev/email_policy.toml) file. To request a change to your configuration, please open a GitHub Issue or email the development mailing list (`sashiko@lists.linux.dev`).

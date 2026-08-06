@@ -23,3 +23,15 @@ ignored_emails = []
 # If true, Sashiko will send a reply indicating that the review was positive.
 send_positive_review = false
 
+# --- Author-only delivery ---
+# To TRACK a subsystem's list (so its patches are reviewed) but NOT ping the
+# list with the review email, send only to the patch author. No extra flag is
+# needed; combine reply_all=false (strips the list) with reply_to_author=true
+# and cc_individuals=false.
+#
+# [subsystems.drm-intel]
+# lists = ["intel-xe@lists.freedesktop.org"]
+# reply_all = false
+# reply_to_author = true
+# cc_individuals = false
+
