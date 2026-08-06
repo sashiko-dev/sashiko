@@ -735,6 +735,38 @@
             border-left-color: var(--sev-low) !important;
         }
 
+        /* Pre-existing issue block (not introduced by this patch) */
+        .preexisting-block {
+            background: var(--code-bg);
+            border-left: 3px solid var(--thought-color);
+            padding-left: 12px;
+            margin: 6px 0;
+        }
+
+        .preexisting-header {
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        .preexisting-flag {
+            display: inline-block;
+            font-size: 0.7em;
+            font-weight: bold;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            color: var(--thought-color);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 0 4px;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        .preexisting-item {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
         /* Thread tree */
         .thread-tree {
             font-size: 0.95em;
@@ -1564,6 +1596,7 @@
                 let inDiffBlock = false;
                 let currentBlockIsQuoted = false;
                 let seenDiffOrQuote = false;
+                let inPreexisting = false;
                 
                 // Pass 1: Classify
                 const classified = lines.map(line => {
@@ -1628,6 +1661,24 @@
                         type = 'EMPTY';
                     }
 
+                    // Detect the pre-existing issues header section and keep its
+                    // lines grouped into a distinct block instead of inline comments.
+                    const isPreexistingHeader = type === 'TEXT' && !isQuoted &&
+                        /^pre-existing issues[^:]*:/i.test(content);
+                    let preexistingHeader = false;
+                    if (isPreexistingHeader) {
+                        inPreexisting = true;
+                    }
+                    if (inPreexisting) {
+                        const isListOrMarker = /^\s*[-*]\s/.test(content) || /^\[Severity/i.test(content);
+                        if (isPreexistingHeader || isListOrMarker || type === 'EMPTY') {
+                            preexistingHeader = isPreexistingHeader;
+                            type = 'PREEXISTING';
+                        } else {
+                            inPreexisting = false;
+                        }
+                    }
+
                     // Parse severity if this is a potential comment candidate
                     let severity = null;
                     let displayLine = line;
@@ -1647,7 +1698,7 @@
                          else if (content.startsWith('-') && !content.startsWith('---') && content.trim() !== '--') cls += ' diff-removed';
                     }
 
-                    return { line: displayLine, type, cls, severity };
+                    return { line: displayLine, type, cls, severity, preexistingHeader };
                 });
 
                 // Pass 2: Group into logical blocks and propagate severity
@@ -1668,7 +1719,7 @@
                 for (let i = 0; i < classified.length; i++) {
                     const item = classified[i];
                     if (item.type === 'TEXT') {
-                        if (item.severity) {
+                        if (item.severity || (currentBlock && currentBlock.type !== 'COMMENT')) {
                             flushCurrentBlock();
                         }
                         if (!currentBlock) {
@@ -1685,6 +1736,13 @@
                         } else {
                             blocks.push({ type: 'EMPTY', item: item });
                         }
+                    } else if (item.type === 'PREEXISTING') {
+                        if (!currentBlock || currentBlock.type !== 'PREEXISTING') {
+                            flushCurrentBlock();
+                            currentBlock = { type: 'PREEXISTING', items: [], severity: null };
+                            blocks.push(currentBlock);
+                        }
+                        currentBlock.items.push(item);
                     } else { // DIFF
                         flushCurrentBlock();
                         blocks.push({ type: 'DIFF', item: item });
@@ -1715,6 +1773,16 @@
                         resultHtml += `<div class="${block.item.cls}">${block.item.line}</div>`;
                     } else if (block.type === 'DIFF') {
                         resultHtml += `<div class="${block.item.cls}">${block.item.line}</div>`;
+                    } else if (block.type === 'PREEXISTING') {
+                        block.items.forEach(item => {
+                            if (item.preexistingHeader) {
+                                resultHtml += `<div class="preexisting-header"><span class="preexisting-flag">Pre-existing</span>${item.line}</div>`;
+                            } else if (item.line.trim() === '') {
+                                resultHtml += `<div class="preexisting-item">&nbsp;</div>`;
+                            } else {
+                                resultHtml += `<div class="preexisting-item ${item.cls}">${item.line}</div>`;
+                            }
+                        });
                     }
                 });
                 
