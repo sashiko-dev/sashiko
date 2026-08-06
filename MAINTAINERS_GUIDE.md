@@ -26,6 +26,25 @@ If you'd like to customize the review criteria or focus areas for your subsystem
 
 > **Note:** Please keep your prompts small and focused. Avoid adding trivial facts or generic programming advice, as this only wastes the AI's context window and can degrade review quality.
 
+## How Sashiko Detects the Baseline for Your Patch
+
+Before reviewing, Sashiko must determine which kernel tree and commit your patch is based on (the "baseline"). It builds an ordered list of candidate baselines and uses the first one the series applies cleanly against:
+
+1.  **Explicit base commit** — the `base-commit:` trailer in the patch body.
+2.  **Version tag** — e.g. `[PATCH 5.15.y]` maps to the `linux-5.15.y` stable branch or the local `v5.15` tag.
+3.  **Subsystem tree** — the subsystem matched from `MAINTAINERS` (via its `F:` path patterns), using that entry's `T:` trees.
+4.  **linux-next** — the aggregate `linux/linux-next` tree.
+5.  **Mainline** — Linus/origin `master`.
+6.  **Custom remotes** — trees you configure under `[git.custom_remotes]`.
+
+### How `{subsystem}-next` trees are chosen
+
+A subsystem's `T:` entries in `MAINTAINERS` point to the tree(s) Sashiko uses as baselines. Many subsystems maintain a `-next` tree (e.g. `net-next`, `perf-tools-next`) that carries in-flight work. Sashiko prefers the `-next` variant when the patch subject carries a `-next` prefix (e.g. `[PATCH net-next] ...`), since that signals the patch targets the `-next` branch.
+
+If the subject does not carry `-next` and the subsystem lists both a stable and a `-next` tree, the stable tree is preferred. When the `-next` tree is the *only* `T:` entry for the subsystem, it is used regardless of the subject.
+
+You can add additional baseline trees (and restrict to specific branches) with `[[git.custom_remotes]]` in your Sashiko config; see [`docs/configuration.md`](docs/configuration.md) for the schema.
+
 ## Configuring Email Delivery Options
 
 Sashiko provides flexible delivery mechanisms that can be configured per mailing list or per individual maintainer.
