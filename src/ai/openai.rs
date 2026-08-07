@@ -39,6 +39,8 @@ pub struct OpenAiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
 }
 
@@ -208,6 +210,7 @@ pub struct OpenAiCompatClient {
     context_window_size: usize,
     max_tokens: u32,
     provider_type: OpenAiProviderType,
+    effort: Option<String>,
     client: Client,
     temperature_unsupported: AtomicBool,
 }
@@ -220,6 +223,7 @@ impl OpenAiCompatClient {
         context_window_size: usize,
         max_tokens: u32,
         api_timeout_secs: u64,
+        effort: Option<String>,
     ) -> Result<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
@@ -247,6 +251,7 @@ impl OpenAiCompatClient {
             context_window_size,
             max_tokens,
             provider_type,
+            effort,
             client,
             temperature_unsupported: AtomicBool::new(false),
         })
@@ -258,6 +263,9 @@ impl OpenAiCompatClient {
         if self.temperature_unsupported.load(Ordering::Relaxed) {
             openai_req.temperature = None;
         }
+        // Omitted unless configured: some endpoints that do not implement
+        // reasoning_effort reject the whole request over an unknown field.
+        openai_req.reasoning_effort = self.effort.clone();
         Ok(openai_req)
     }
 
@@ -526,6 +534,9 @@ fn translate_ai_request(
         temperature: request.temperature,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
+        // Set by the caller, which holds the configured level; the translation
+        // has no view of it.
+        reasoning_effort: None,
         response_format,
     })
 }
@@ -636,7 +647,9 @@ impl AiProvider for OpenAiCompatClient {
         // finish_reason "length"; raising max_tokens has to miss that entry
         // rather than replay it. base_url separates two endpoints serving
         // the same model name, and provider_type decides whether the request
-        // carries max_tokens or max_completion_tokens.
+        // carries max_tokens or max_completion_tokens.  The effort level is
+        // the same case: it shapes the reply, and a run raised to "high" has
+        // to miss the entry the "medium" run wrote rather than replay it.
         let max_tokens = self.max_tokens.to_string();
         let provider_type = match self.provider_type {
             OpenAiProviderType::OpenAi => "openai",
@@ -648,6 +661,7 @@ impl AiProvider for OpenAiCompatClient {
                 ("max_tokens", Some(max_tokens.as_str())),
                 ("base_url", Some(self.base_url.as_str())),
                 ("provider_type", Some(provider_type)),
+                ("effort", self.effort.as_deref()),
             ],
         )
     }
@@ -1408,7 +1422,7 @@ mod tests {
         assert!(OpenAiCompatClient::normalize_base_url("completely-broken-input-string").is_err());
     }
 
-    fn test_client(base_url: &str, max_tokens: u32) -> OpenAiCompatClient {
+    fn test_client(base_url: &str, max_tokens: u32, effort: Option<&str>) -> OpenAiCompatClient {
         OpenAiCompatClient::new(
             base_url.to_string(),
             OpenAiProviderType::OpenAi,
@@ -1416,23 +1430,24 @@ mod tests {
             400_000,
             max_tokens,
             60,
+            effort.map(str::to_string),
         )
         .unwrap()
     }
 
     #[test]
     fn cache_identity_tracks_max_tokens_and_base_url() {
-        let capped = test_client("https://api.openai.com/v1", 4096);
-        let raised = test_client("https://api.openai.com/v1", 65536);
+        let capped = test_client("https://api.openai.com/v1", 4096, None);
+        let raised = test_client("https://api.openai.com/v1", 65536, None);
         assert_ne!(capped.cache_identity(), raised.cache_identity());
 
-        let elsewhere = test_client("http://localhost:1234/v1", 4096);
+        let elsewhere = test_client("http://localhost:1234/v1", 4096, None);
         assert_ne!(capped.cache_identity(), elsewhere.cache_identity());
     }
 
     #[test]
     fn cache_identity_preserves_existing_format() {
-        let client = test_client("https://api.openai.com/v1", 4096);
+        let client = test_client("https://api.openai.com/v1", 4096, None);
         assert_eq!(
             client.cache_identity(),
             "gpt-5.1|max_tokens=4096|base_url=https://api.openai.com/v1/chat/completions|provider_type=openai"
@@ -1506,6 +1521,7 @@ mod tests {
             8192,
             128,
             5,
+            None,
         )?;
         let request = AiRequest {
             system: None,
@@ -1562,6 +1578,7 @@ mod tests {
                 8192,
                 128,
                 5,
+                None,
             )?;
             let request = AiRequest {
                 system: None,
@@ -1582,5 +1599,59 @@ mod tests {
         check("Unsupported parameter: 'max_tokens'", Some(0.0)).await?;
         check("Unsupported parameter: 'temperature'", None).await?;
         Ok(())
+    }
+
+    #[test]
+    fn cache_identity_tracks_effort() {
+        let unset = test_client("https://api.openai.com/v1", 65536, None);
+        let medium = test_client("https://api.openai.com/v1", 65536, Some("medium"));
+        let high = test_client("https://api.openai.com/v1", 65536, Some("high"));
+
+        assert_ne!(unset.cache_identity(), medium.cache_identity());
+        assert_ne!(medium.cache_identity(), high.cache_identity());
+    }
+
+    fn sample_request() -> AiRequest {
+        AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("hi".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn configured_effort_reaches_the_request() {
+        let client = test_client("https://api.openai.com/v1", 65536, Some("high"));
+
+        let built = client.prepare_request(sample_request()).unwrap();
+        assert_eq!(built.reasoning_effort.as_deref(), Some("high"));
+
+        let json = serde_json::to_value(&built).unwrap();
+        assert_eq!(json["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn reasoning_effort_omitted_unless_configured() {
+        let unset = test_client("https://api.openai.com/v1", 65536, None);
+        let built = unset.prepare_request(sample_request()).unwrap();
+        assert_eq!(built.reasoning_effort, None);
+
+        let translated =
+            translate_ai_request(sample_request(), 4096, OpenAiProviderType::OpenAi).unwrap();
+        assert_eq!(translated.reasoning_effort, None);
+
+        let json = serde_json::to_value(&translated).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
     }
 }

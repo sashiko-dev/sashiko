@@ -13,7 +13,14 @@ model = "gpt-5.6-sol"      # the "gpt-5.6" alias resolves here; "gpt-5.6-terra" 
 # which on a reasoning model covers reasoning tokens as well as the reply, and
 # it falls back to 4096 when this table is absent. That leaves a reasoning
 # model little room for a reply once it has spent part of the budget thinking.
+#
+# Both settings below are pitched at the reasoning model named above. A
+# gpt-5.6 chat completion that carries function tools, which a review does,
+# accepts only "none"; a higher level fails those requests with a 400. Comment
+# out effort if you switch to a non-reasoning model such as gpt-4o: those
+# reject reasoning_effort outright rather than ignoring it.
 [ai.openai_compat]
 max_tokens = 65536             # output cap, sent as max_completion_tokens
+effort = "none"                # reasoning_effort; the valid set is model-dependent
 # base_url = "https://api.openai.com/v1/chat/completions"  # auto-derived from model; set only to override
 # context_window_size = 128000   # generic fallback for gpt-5.x; raise to the model's real window

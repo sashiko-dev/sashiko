@@ -462,6 +462,16 @@ pub struct OpenAiCompatSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Reasoning effort, sent as the `reasoning_effort` request field. The
+    /// valid set belongs to the model rather than to the API: "none" is
+    /// legal, and is what a gpt-5.6 chat completion carrying function tools
+    /// requires, while gpt-5.4-pro takes only "medium" and "high". A level
+    /// the model rejects comes back as a 400, which classifies fatal and
+    /// ends the review. Leave unset for the model default; the field is
+    /// then omitted entirely, which is what a compatible endpoint that does
+    /// not implement it needs.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

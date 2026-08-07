@@ -489,3 +489,15 @@ set `provider = "openai"`, `model = "gpt-5.6-sol"`, and export
 Some compatible gateways reject the `temperature` field for reasoning
 models. Sashiko retries an explicit unsupported-temperature error without
 the field and omits it on later requests to the same endpoint.
+
+`effort` in `[ai.openai_compat]` sets reasoning effort on a reasoning
+model, sent as the `reasoning_effort` request field. It is omitted
+when unset, so a compatible endpoint that does not implement the
+field is unaffected until you set it; one that does not recognize it
+may reject the request outright rather than ignore it.
+
+The valid levels belong to the model, not to the API. `"none"` is
+legal, and is what a gpt-5.6 chat completion carrying function tools
+requires; gpt-5.4-pro rejects `"low"` and takes only `"medium"` and
+`"high"`. The value is passed through as configured, so a level the
+model does not accept fails every request with a 400.
