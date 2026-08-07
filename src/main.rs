@@ -406,17 +406,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(1000);
     let (parsed_tx, mut parsed_rx) = mpsc::channel::<ParsedArticle>(1000);
 
-    // Initialize FetchAgent
+    // Initialize the durable FetchWorker (DB-backed queue).
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-    let (fetch_agent, fetch_tx) = sashiko::fetcher::FetchAgent::new(
+    let fetch_worker = sashiko::fetcher::FetchWorker::new(
         repo_path,
+        db.clone(),
         raw_tx.clone(),
         settings.forge.api_token.clone(),
     );
 
-    // Spawn FetchAgent
+    // Recover fetches orphaned before the durable queue existed or by a crash:
+    // re-enqueue any patchset stuck in 'Fetching' with no active queue row.
+    match db.get_stuck_fetch_placeholders().await {
+        Ok(stuck) => {
+            if !stuck.is_empty() {
+                info!(
+                    "Backfilling {} orphaned fetch(es) into fetch_queue",
+                    stuck.len()
+                );
+            }
+            for p in stuck {
+                let Some(cover) = p.cover_letter_message_id.as_deref() else {
+                    continue;
+                };
+                let commit = sashiko::fetcher::commit_hash_from_placeholder(cover);
+                if let Err(e) = db
+                    .enqueue_fetch(
+                        Some(p.patchset_id),
+                        Some(cover),
+                        p.repo_url.as_deref(),
+                        &commit,
+                        p.mr_url.as_deref(),
+                        p.mr_title.as_deref(),
+                        p.mr_number,
+                        p.priority as i32,
+                    )
+                    .await
+                {
+                    error!(
+                        "Failed to backfill fetch for patchset {}: {}",
+                        p.patchset_id, e
+                    );
+                }
+            }
+        }
+        Err(e) => error!("Failed to query stuck fetch placeholders: {}", e),
+    }
+
+    // Spawn the FetchWorker.
     tokio::spawn(async move {
-        fetch_agent.run().await;
+        fetch_worker.run().await;
     });
 
     // Parser Dispatcher
@@ -799,7 +838,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_settings = Arc::new(settings.clone());
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
-    let api_fetch_tx = fetch_tx.clone();
     let allow_all_submit = cli.enable_unsafe_all_submit;
     let smtp_enabled = settings.smtp.is_some();
     let dry_run = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false);
@@ -808,7 +846,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             api_settings,
             api_db,
             api_tx,
-            api_fetch_tx,
             allow_all_submit,
             smtp_enabled,
             dry_run,
