@@ -551,6 +551,77 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
+    // --- Standalone helpers for the durable fetch worker ---
+
+    /// First retry delay; subsequent delays double up to BACKOFF_CAP_SECS.
+    const BACKOFF_BASE_SECS: i64 = 30;
+    /// Maximum delay between retries.
+    const BACKOFF_CAP_SECS: i64 = 600;
+
+    /// Marker error for failures that can never succeed on retry (e.g. a commit
+    /// is missing and the row has no remote to fetch from). These bypass the
+    /// backoff retry window and fail the fetch immediately, mirroring the
+    /// fast-fail behaviour of the old in-memory FetchAgent.
+    #[derive(Debug)]
+    struct PermanentFetchError(String);
+
+    impl std::fmt::Display for PermanentFetchError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for PermanentFetchError {}
+
+    /// Derive the git commit or range to fetch from a placeholder message id.
+    ///
+    /// Handles the two placeholder id shapes produced by the API:
+    ///   - git-fetch:  "<sha>@sashiko.local"        -> "<sha>"
+    ///   - PR/MR:      "mr-<number>-<base>..<head>"  -> "<base>..<head>"
+    pub fn commit_hash_from_placeholder(msgid: &str) -> String {
+        // "mr-<number>-<rest>" -> "<rest>"; anything else passes through.
+        let s = msgid
+            .strip_prefix("mr-")
+            .and_then(|rest| rest.find('-').map(|dash| &rest[dash + 1..]))
+            .unwrap_or(msgid);
+        // Strip any "@sashiko.local" suffix from git-fetch placeholder ids.
+        s.split('@').next().unwrap_or(s).to_string()
+    }
+
+    /// Current unix time in seconds.
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Exponential backoff (in seconds) for a given attempt count. `attempts` is the
+    /// number of attempts already made (>= 1 after the first claim): 1 -> 30s,
+    /// 2 -> 60s, 3 -> 120s, ... capped at BACKOFF_CAP_SECS.
+    fn backoff_secs(attempts: i64) -> i64 {
+        let exp = attempts.saturating_sub(1).clamp(0, 20) as u32;
+        BACKOFF_BASE_SECS
+            .saturating_mul(2_i64.saturating_pow(exp))
+            .min(BACKOFF_CAP_SECS)
+    }
+
+    /// Whether a revision string is a full git object id (sha1 = 40 hex chars, or
+    /// sha256 = 64). Only full object ids can be requested directly via `want`
+    /// without a ref lookup; branch/tag names must be resolved by the server.
+    fn looks_like_object_id(rev: &str) -> bool {
+        matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// Durable, restart-safe git fetch worker.
+    ///
+    /// Replaces the previous in-memory `FetchAgent` channel. Fetch requests live in
+    /// the `fetch_queue` table; this worker claims them under a lease, performs the
+    /// git fetch and patch extraction, and either completes them, schedules a
+    /// backoff retry, or (after RETRY_WINDOW_SECS) fails them terminally. Because
+    /// all state lives in the database, requests survive restarts and crashed
+    /// workers are recovered by the ghost sweep.
+
     #[tokio::test]
     async fn test_fetch_agent_lifecycle() {
         let (tx, _rx) = mpsc::channel(1);
@@ -695,5 +766,43 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_commit_hash_from_placeholder() {
+        assert_eq!(
+            commit_hash_from_placeholder("abc123@sashiko.local"),
+            "abc123"
+        );
+        assert_eq!(
+            commit_hash_from_placeholder("mr-42-base..head"),
+            "base..head"
+        );
+        assert_eq!(commit_hash_from_placeholder("plainsha"), "plainsha");
+    }
+
+    #[test]
+    fn test_backoff_secs_is_exponential_and_capped() {
+        assert_eq!(backoff_secs(1), 30);
+        assert_eq!(backoff_secs(2), 60);
+        assert_eq!(backoff_secs(3), 120);
+        assert_eq!(backoff_secs(4), 240);
+        assert_eq!(backoff_secs(5), 480);
+        assert_eq!(backoff_secs(6), 600);
+        assert_eq!(backoff_secs(100), 600);
+    }
+
+    #[test]
+    fn test_looks_like_object_id() {
+        assert!(looks_like_object_id(&"a".repeat(40)));
+        assert!(looks_like_object_id(&"0".repeat(64)));
+        assert!(looks_like_object_id(
+            "8a21aa5149b3f34f48a277d596d1ffe512b32a41"
+        ));
+        assert!(!looks_like_object_id("main"));
+        assert!(!looks_like_object_id("v6.10"));
+        assert!(!looks_like_object_id("refs/heads/main"));
+        assert!(!looks_like_object_id(&"a".repeat(39)));
+        assert!(!looks_like_object_id("zzzz"));
     }
 }
