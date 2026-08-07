@@ -349,8 +349,9 @@ impl Reviewer {
 
         let body = if let Some(mid) = &patchset.message_id {
             ctx.db.get_message_body(mid).await.unwrap_or(None)
-        } else if let Some(first_patch_msg_id) =
-            diffs.first().map(|(_, _, _, _, _, _, msg_id)| msg_id.as_str())
+        } else if let Some(first_patch_msg_id) = diffs
+            .first()
+            .map(|(_, _, _, _, _, _, msg_id)| msg_id.as_str())
         {
             ctx.db
                 .get_message_body(first_patch_msg_id)

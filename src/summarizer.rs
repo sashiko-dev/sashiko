@@ -82,9 +82,7 @@ fn build_diff_context(cover_letter: Option<&str>, diffs: &[&str]) -> String {
     for (i, diff) in diffs.iter().enumerate() {
         let header = format!("--- PATCH {} ---\n", i + 1);
         if content.len() + header.len() > MAX_TOTAL_CHARS {
-            content.push_str(
-                "\n... (remaining patches omitted: token budget exhausted)\n",
-            );
+            content.push_str("\n... (remaining patches omitted: token budget exhausted)\n");
             break;
         }
         content.push_str(&header);
@@ -139,7 +137,7 @@ pub async fn generate_patchset_summary(
     patchset_id: i64,
     cover_letter: Option<&str>,
     diffs: &[&str],
-) -> Result<String> {
+) -> Result<()> {
     let user_content = build_diff_context(cover_letter, diffs);
 
     let request = AiRequest {
@@ -158,13 +156,10 @@ pub async fn generate_patchset_summary(
         context_tag: Some(format!("[ps:{} summary]", patchset_id)),
     };
 
-    let response = provider
-        .generate_content(request)
-        .await
-        .context(format!(
-            "Failed to generate summary for patchset {}",
-            patchset_id
-        ))?;
+    let response = provider.generate_content(request).await.context(format!(
+        "Failed to generate summary for patchset {}",
+        patchset_id
+    ))?;
 
     if let Some(text) = response.content {
         let summary = text.trim().to_string();
@@ -175,11 +170,11 @@ pub async fn generate_patchset_summary(
                 patchset_id,
                 summary.len()
             );
-            return Ok(summary);
+            return Ok(());
         }
     }
 
-    Ok("No summary generated.".to_string())
+    anyhow::bail!("Patchset summary generation returned empty content")
 }
 
 #[cfg(test)]

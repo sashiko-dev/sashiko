@@ -2776,65 +2776,13 @@ impl Database {
         }))
     }
 
-    pub async fn get_patchset_details(
-        &self,
-        id: i64,
-        page: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<Option<serde_json::Value>> {
-        let base = match self.load_patchset_base(id, page, limit).await? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-
-        let limit_val = limit.unwrap_or(50);
-        let page_val = page.unwrap_or(1);
-
-        let mut reviews = Vec::new();
-        let mut in_clause = base.patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        if in_clause.is_empty() {
-            in_clause = "-1".to_string();
-        }
-        let query_str = format!(
-            "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw,
-                    r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
-             FROM reviews r
-             LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-             WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
-             ORDER BY r.created_at ASC", in_clause);
-
-        let mut params = vec![libsql::Value::Integer(base.pid)];
-        for &pid_val in &base.patch_ids {
-            params.push(libsql::Value::Integer(pid_val));
-        }
-
-        let mut rev_rows = self.conn.query(&query_str, params).await?;
-
-        while let Ok(Some(r)) = rev_rows.next().await {
-            reviews.push(serde_json::json!({
-                "summary": r.get::<Option<String>>(0).ok(),
-                "created_at": r.get::<Option<i64>>(1).ok(),
-                "input_context": r.get::<Option<String>>(2).ok(),
-                "output": r.get::<Option<String>>(3).ok(),
-                "result": r.get::<Option<String>>(4).ok(),
-                "status": r.get::<Option<String>>(5).ok(),
-                "inline_review": r.get::<Option<String>>(6).ok(),
-                "logs": r.get::<Option<String>>(7).ok(),
-                "tokens_in": r.get::<Option<u32>>(8).ok(),
-                "tokens_out": r.get::<Option<u32>>(9).ok(),
-                "patch_id": r.get::<Option<i64>>(10).ok(),
-                "id": r.get::<i64>(11).ok(),
-                "tokens_cached": r.get::<Option<u32>>(12).ok(),
-                "model": base.model_name.clone(),
-                "provider": base.provider.clone(),
-                "prompts_hash": base.prompts_git_hash.clone(),
-                "baseline": base.baseline.clone()
-            }));
-        }
-
-        let reviews = if base.is_embargoed { Vec::new() } else { reviews };
-
-        Ok(Some(serde_json::json!({
+    fn build_patchset_response(
+        base: &PatchsetBaseData,
+        reviews: Vec<serde_json::Value>,
+        page_val: u32,
+        limit_val: u32,
+    ) -> serde_json::Value {
+        serde_json::json!({
             "id": base.pid,
             "message_id": base.mid,
             "subject": base.subject,
@@ -2862,7 +2810,78 @@ impl Database {
             "mr_url": base.mr_url,
             "slug": base.slug,
             "summary": base.patchset_summary
-        })))
+        })
+    }
+
+    pub async fn get_patchset_details(
+        &self,
+        id: i64,
+        page: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Option<serde_json::Value>> {
+        let base = match self.load_patchset_base(id, page, limit).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+
+        let limit_val = limit.unwrap_or(50);
+        let page_val = page.unwrap_or(1);
+
+        let mut reviews = Vec::new();
+        let mut in_clause = base
+            .patch_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        if in_clause.is_empty() {
+            in_clause = "-1".to_string();
+        }
+        let query_str = format!(
+            "SELECT r.summary, r.created_at, ai.output_raw,
+                    r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+             FROM reviews r
+             LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
+             WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
+             ORDER BY r.created_at ASC", in_clause);
+
+        let mut params = vec![libsql::Value::Integer(base.pid)];
+        for &pid_val in &base.patch_ids {
+            params.push(libsql::Value::Integer(pid_val));
+        }
+
+        let mut rev_rows = self.conn.query(&query_str, params).await?;
+
+        while let Ok(Some(r)) = rev_rows.next().await {
+            reviews.push(serde_json::json!({
+                "summary": r.get::<Option<String>>(0).ok(),
+                "created_at": r.get::<Option<i64>>(1).ok(),
+                "output": r.get::<Option<String>>(2).ok(),
+                "result": r.get::<Option<String>>(3).ok(),
+                "status": r.get::<Option<String>>(4).ok(),
+                "inline_review": r.get::<Option<String>>(5).ok(),
+                "logs": r.get::<Option<String>>(6).ok(),
+                "tokens_in": r.get::<Option<u32>>(7).ok(),
+                "tokens_out": r.get::<Option<u32>>(8).ok(),
+                "patch_id": r.get::<Option<i64>>(9).ok(),
+                "id": Some(r.get::<i64>(10)?),
+                "tokens_cached": r.get::<Option<u32>>(11).ok(),
+                "model": base.model_name.clone(),
+                "provider": base.provider.clone(),
+                "prompts_hash": base.prompts_git_hash.clone(),
+                "baseline": base.baseline.clone()
+            }));
+        }
+
+        let reviews = if base.is_embargoed {
+            Vec::new()
+        } else {
+            reviews
+        };
+
+        Ok(Some(Self::build_patchset_response(
+            &base, reviews, page_val, limit_val,
+        )))
     }
 
     pub async fn get_patchset_summary(
@@ -2880,7 +2899,12 @@ impl Database {
         let page_val = page.unwrap_or(1);
 
         let mut reviews = Vec::new();
-        let mut in_clause = base.patch_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut in_clause = base
+            .patch_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         if in_clause.is_empty() {
             in_clause = "-1".to_string();
         }
@@ -2910,7 +2934,7 @@ impl Database {
                 "tokens_in": r.get::<Option<u32>>(6).ok(),
                 "tokens_out": r.get::<Option<u32>>(7).ok(),
                 "patch_id": r.get::<Option<i64>>(8).ok(),
-                "id": r.get::<i64>(9).ok(),
+                "id": Some(r.get::<i64>(9)?),
                 "tokens_cached": r.get::<Option<u32>>(10).ok(),
                 "model": base.model_name.clone(),
                 "provider": base.provider.clone(),
@@ -2919,37 +2943,15 @@ impl Database {
             }));
         }
 
-        let reviews = if base.is_embargoed { Vec::new() } else { reviews };
+        let reviews = if base.is_embargoed {
+            Vec::new()
+        } else {
+            reviews
+        };
 
-        Ok(Some(serde_json::json!({
-            "id": base.pid,
-            "message_id": base.mid,
-            "subject": base.subject,
-            "author": base.author,
-            "date": base.date,
-            "status": base.final_status,
-            "failed_reason": base.failed_reason,
-            "to": base.to,
-            "cc": base.cc,
-            "total_parts": base.total_parts,
-            "total_patches_in_db": base.total_patches,
-            "page": page_val,
-            "limit": limit_val,
-            "received_parts": base.received_parts,
-            "reviews": reviews,
-            "patches": base.patches,
-            "thread": base.messages,
-            "subsystems": base.subsystems,
-            "model_name": base.model_name,
-            "prompts_git_hash": base.prompts_git_hash,
-            "baseline_logs": base.baseline_logs,
-            "baseline": base.baseline,
-            "provider": base.provider,
-            "embargo_until": base.embargo_until,
-            "mr_url": base.mr_url,
-            "slug": base.slug,
-            "summary": base.patchset_summary
-        })))
+        Ok(Some(Self::build_patchset_response(
+            &base, reviews, page_val, limit_val,
+        )))
     }
 
     pub async fn get_patchset_summary_by_msgid(

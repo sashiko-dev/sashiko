@@ -514,7 +514,7 @@ impl Worker {
         let p_id = patchset["patch_index"]
             .as_i64()
             .map(|id| id.to_string())
-            .unwrap_or_else(|| "multi".to_string());
+            .unwrap_or_else(|| "all".to_string());
         self.context_tag = Some(format!("[ps:{} p:{}] ", ps_id, p_id));
 
         let mut baseline_sha = "unknown".to_string();
@@ -1695,7 +1695,7 @@ fn build_series_context(patchset: &Value, patch_id: &str) -> String {
         };
         if !map_json.is_empty() {
             ctx.push_str(&format!(
-            "\n\n<series_map>\n\
+                "\n\n<series_map>\n\
             You are reviewing Patch {patch_id}. You have access to the following Series Map \
             which maps dependencies across the entire patchset.\n\
             SUPPRESSION RULES — consult this map before flagging any concern:\n\
@@ -1713,8 +1713,8 @@ fn build_series_context(patchset: &Value, patch_id: &str) -> String {
             Do not flag the series as incomplete if the fixes are present as later patches.\n\
             {}\n\
             </series_map>\n",
-            map_json
-        ));
+                map_json
+            ));
         }
     }
 

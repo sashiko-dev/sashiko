@@ -40,6 +40,10 @@ struct Args {
     #[arg(long)]
     baseline: Option<String>,
 
+    /// Path to the git repository. Overrides settings.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
     /// Parent directory for creating worktrees.
     #[arg(long)]
     worktree_dir: Option<PathBuf>,
@@ -85,23 +89,7 @@ async fn main() -> Result<()> {
         eprintln!("CRITICAL ERROR: Panic detected: {}", info);
     }));
 
-    let no_color = std::env::var("NO_COLOR").is_ok();
-    let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
-    let use_ansi = !no_color && std::io::stderr().is_terminal();
-
-    let builder = tracing_subscriber::fmt()
-        .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stderr))
-        .with_ansi(use_ansi);
-
-    if plain_logs {
-        builder
-            .with_level(false)
-            .with_target(false)
-            .without_time()
-            .init();
-    } else {
-        builder.init();
-    }
+    init_logging();
 
     let args = Args::parse();
     let mut settings = Settings::new().context("Failed to load settings")?;
@@ -124,7 +112,9 @@ async fn main() -> Result<()> {
     let (patchset_id, subject, patches, series_map) =
         (input.id, input.subject, input.patches, input.series_map);
     let baseline_arg = args.baseline.clone().unwrap_or_else(|| "HEAD".to_string());
-    let repo_path = PathBuf::from(&settings.git.repository_path);
+    let repo_path = args
+        .repo
+        .unwrap_or_else(|| PathBuf::from(&settings.git.repository_path));
 
     let run_logic = async {
         info!("Resolving baseline: {}", baseline_arg);
@@ -508,6 +498,26 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&error_json)?);
     }
     Ok(())
+}
+
+fn init_logging() {
+    let no_color = std::env::var("NO_COLOR").is_ok();
+    let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
+    let use_ansi = !no_color && std::io::stderr().is_terminal();
+
+    let builder = tracing_subscriber::fmt()
+        .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stderr))
+        .with_ansi(use_ansi);
+
+    if plain_logs {
+        builder
+            .with_level(false)
+            .with_target(false)
+            .without_time()
+            .init();
+    } else {
+        builder.init();
+    }
 }
 
 async fn apply_single_patch(
