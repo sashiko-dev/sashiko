@@ -1732,11 +1732,11 @@ fn build_series_context(patchset: &Value, patch_id: &str) -> String {
         ctx.push_str(&format!(
             "\n\n<series_context>\n\
             You are reviewing Patch {patch_id} of a {}-patch series. \
-            ALL patches in this merge request:\n{}\n\
+            ALL patches in this series:\n{}\n\
             CRITICAL RULES:\n\
-            1. SERIES COMPLETENESS: Before flagging an upstream series as incomplete or \
-            missing patches, check this list. If the supposedly missing upstream patches \
-            correspond to other patches in this merge request (by subject or content), \
+            1. SERIES COMPLETENESS: Before flagging this series as incomplete or \
+            missing prerequisite patches, check this list. If the supposedly missing patches \
+            correspond to other patches in this series (by subject or content), \
             they are NOT missing — they will be applied as part of this series. \
             Do NOT flag them.\n\
             2. CROSS-PATCH FIXES: Issues introduced in this patch (bugs, errant changes, \
