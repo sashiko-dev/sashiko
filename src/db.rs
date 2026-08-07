@@ -219,6 +219,94 @@ pub struct PatchworkOutboxRow {
     pub created_at: i64,
 }
 
+/// Status of an entry in the fetch queue.
+///
+/// Stored as TEXT in SQLite with a CHECK constraint limiting values
+/// to the three valid states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStatus {
+    Pending,
+    Fetching,
+    Failed,
+}
+
+impl FetchStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Fetching => "Fetching",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+impl std::fmt::Display for FetchStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FetchStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Pending" => Ok(Self::Pending),
+            "Fetching" => Ok(Self::Fetching),
+            "Failed" => Ok(Self::Failed),
+            other => Err(anyhow::anyhow!("unknown FetchStatus: {}", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchQueueRow {
+    pub id: i64,
+    pub patchset_id: Option<i64>,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub commit_hash: String,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub status: FetchStatus,
+    pub attempts: i64,
+    pub first_attempt_at: Option<i64>,
+    pub next_retry_at: Option<i64>,
+    pub locked_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub priority: i64,
+    pub created_at: i64,
+    /// Extra commit SHAs that must be present locally for the review to hydrate
+    /// its context, but are never ingested as patches. Loaded from the
+    /// `fetch_supporting_commits` table. Used by cherry-pick reviews to carry
+    /// the original and base commits.
+    pub supporting_commits: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StuckFetchPlaceholder {
+    pub patchset_id: i64,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub priority: i64,
+}
+
+/// Recover a fetch source URL from a placeholder subject of the form
+/// "Fetching <rev> from <url>...". Returns None when the subject carries no URL
+/// source (e.g. a local fetch, or a thread/PR placeholder).
+fn repo_url_from_subject(subject: &str) -> Option<String> {
+    let after = subject.split_once(" from ")?.1;
+    let url = after.strip_suffix("...").unwrap_or(after).trim();
+    if url.is_empty() || url == "local" {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
 impl Database {
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
@@ -532,6 +620,7 @@ impl Database {
 
         self.migrate_patches_unique_constraint_if_needed().await?;
         self.migrate_priority_columns_if_needed().await?;
+        self.migrate_fetch_queue_if_needed().await?;
 
         Ok(())
     }
@@ -551,6 +640,10 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("patchsets", "priority", "INTEGER DEFAULT 500")
+            .await;
+        let _ = self.try_add_column("patchsets", "repo_url", "TEXT").await;
+        let _ = self
+            .try_add_column("patchsets", "review_context", "TEXT")
             .await;
         let _ = self
             .try_create_index(
@@ -844,6 +937,49 @@ impl Database {
                 "status, priority DESC, date ASC",
             )
             .await;
+        Ok(())
+    }
+
+    async fn migrate_fetch_queue_if_needed(&self) -> Result<()> {
+        let _ = self.try_add_column("patchsets", "repo_url", "TEXT").await;
+        let _ = self
+            .try_add_column("patchsets", "review_context", "TEXT")
+            .await;
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS fetch_queue (
+                    id INTEGER PRIMARY KEY,
+                    patchset_id INTEGER,
+                    cover_letter_message_id TEXT,
+                    repo_url TEXT,
+                    commit_hash TEXT NOT NULL,
+                    mr_url TEXT,
+                    mr_title TEXT,
+                    mr_number INTEGER,
+                    status TEXT NOT NULL DEFAULT 'Pending' CHECK(status IN ('Pending', 'Fetching', 'Failed')),
+                    attempts INTEGER DEFAULT 0,
+                    first_attempt_at INTEGER,
+                    next_retry_at INTEGER,
+                    locked_at INTEGER,
+                    last_error TEXT,
+                    priority INTEGER DEFAULT 500,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(patchset_id) REFERENCES patchsets(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fetch_queue_claim
+                    ON fetch_queue(status, next_retry_at, priority, created_at);
+                CREATE INDEX IF NOT EXISTS idx_fetch_queue_commit ON fetch_queue(commit_hash);
+
+                CREATE TABLE IF NOT EXISTS fetch_supporting_commits (
+                    id INTEGER PRIMARY KEY,
+                    fetch_id INTEGER NOT NULL,
+                    commit_hash TEXT NOT NULL,
+                    FOREIGN KEY(fetch_id) REFERENCES fetch_queue(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_fetch_supporting_fetch_id
+                    ON fetch_supporting_commits(fetch_id);",
+            )
+            .await?;
         Ok(())
     }
 
@@ -1959,7 +2095,9 @@ impl Database {
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
-            clid_candidates.push((clid.to_string(), false));
+            for c in Self::get_msgid_candidates(clid) {
+                clid_candidates.push((c, false));
+            }
         }
         // Fallback for single-patch git imports where placeholder is
         // sha@sashiko.local but the actual cover letter becomes the sha
@@ -1969,8 +2107,12 @@ impl Database {
         // and the fallback would incorrectly match patchsets from
         // unrelated submissions that happen to share a commit SHA.
         if cover_letter_message_id.is_none() || total_parts == 1 {
-            clid_candidates.push((format!("{}@sashiko.local", message_id), true));
+            for c in Self::get_msgid_candidates(&format!("{}@sashiko.local", message_id)) {
+                clid_candidates.push((c, true));
+            }
         }
+        let mut seen = std::collections::HashSet::new();
+        clid_candidates.retain(|(c, _)| seen.insert(c.clone()));
 
         for (clid, scope_to_thread) in clid_candidates {
             // When using the @sashiko.local fallback, scope the query
@@ -3907,6 +4049,36 @@ impl Database {
         }
     }
 
+    /// Fetch the serialized alternate-pipeline selector for a patchset, if any.
+    ///
+    /// A `NULL` column (the default) yields `None`, selecting the standard
+    /// patch-review pipeline.
+    pub async fn get_review_context(&self, id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT review_context FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get::<Option<String>>(0).ok().flatten())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persist the serialized alternate-pipeline selector for a patchset.
+    pub async fn set_review_context(&self, id: i64, review_context: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET review_context = ? WHERE id = ?",
+                libsql::params![review_context, id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
         let query = if force {
             "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete', 'In Review')"
@@ -3990,6 +4162,310 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    // --- Durable fetch queue -------------------------------------------------
+    //
+    // These operations back the FetchWorker. They mirror the patchwork_outbox
+    // pattern: work is claimed under a lease (locked_at), retried with backoff
+    // (next_retry_at), completed, terminally failed, or reclaimed by a ghost
+    // sweep when a worker dies mid-flight.
+
+    /// Enqueue a git fetch. Idempotent: an active (Pending/Fetching) row for the
+    /// same commit and repo is left untouched so duplicate submissions collapse.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+    ) -> Result<()> {
+        self.enqueue_fetch_with_support(
+            patchset_id,
+            cover_letter_message_id,
+            repo_url,
+            commit_hash,
+            mr_url,
+            mr_title,
+            mr_number,
+            priority,
+            &[],
+        )
+        .await
+    }
+
+    /// Like `enqueue_fetch`, but also records `supporting_commits`: extra commit
+    /// SHAs the worker must ensure are present locally (e.g. the original and
+    /// base commits of a cherry-pick) without ingesting them as patches. Only
+    /// `commit_hash` is ingested; the supporting commits are fetched purely so
+    /// downstream reviews (like the cherry-pick pipeline) can hydrate their full
+    /// context from git.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch_with_support(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+        supporting_commits: &[String],
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let mut existing = self
+            .conn
+            .query(
+                "SELECT 1 FROM fetch_queue \
+                 WHERE commit_hash = ? \
+                   AND IFNULL(repo_url, '') = IFNULL(?, '') \
+                   AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
+                   AND status IN ('Pending', 'Fetching') LIMIT 1",
+                libsql::params![commit_hash, repo_url, cover_letter_message_id],
+            )
+            .await?;
+        if existing.next().await.ok().flatten().is_some() {
+            return Ok(());
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO fetch_queue \
+                 (patchset_id, cover_letter_message_id, repo_url, commit_hash, \
+                  mr_url, mr_title, mr_number, status, attempts, priority, \
+                  created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', 0, ?, ?) RETURNING id",
+                libsql::params![
+                    patchset_id,
+                    cover_letter_message_id,
+                    repo_url,
+                    commit_hash,
+                    mr_url,
+                    mr_title,
+                    mr_number,
+                    priority,
+                    now
+                ],
+            )
+            .await?;
+        let fetch_id: i64 = match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => return Err(anyhow::anyhow!("INSERT into fetch_queue returned no id")),
+        };
+
+        // Record each supporting commit as its own row (1-to-N) so an arbitrary
+        // number can be stored without packing them into a single column.
+        for sha in supporting_commits {
+            self.conn
+                .execute(
+                    "INSERT INTO fetch_supporting_commits (fetch_id, commit_hash) \
+                     VALUES (?, ?)",
+                    libsql::params![fetch_id, sha.as_str()],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Atomically claim the highest-priority due fetch, leasing it to the caller
+    /// and bumping its attempt count. Returns None if nothing is due.
+    pub async fn lock_pending_fetch(&self) -> Result<Option<FetchQueueRow>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE fetch_queue \
+                 SET status = 'Fetching', locked_at = ?, attempts = attempts + 1, \
+                     first_attempt_at = COALESCE(first_attempt_at, ?) \
+                 WHERE id = ( \
+                     SELECT id FROM fetch_queue \
+                     WHERE status = 'Pending' \
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?) \
+                     ORDER BY priority DESC, created_at ASC LIMIT 1 \
+                 ) \
+                 RETURNING id, patchset_id, cover_letter_message_id, repo_url, \
+                     commit_hash, mr_url, mr_title, mr_number, status, attempts, \
+                     first_attempt_at, next_retry_at, locked_at, last_error, \
+                     priority, created_at",
+                libsql::params![now, now, now],
+            )
+            .await?;
+
+        match rows.next().await {
+            Ok(Some(row)) => {
+                let mut row = Self::row_to_fetch_queue(&row)?;
+                row.supporting_commits = self.load_supporting_commits(row.id).await?;
+                Ok(Some(row))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Load the supporting commit SHAs recorded for a claimed fetch, in
+    /// insertion order.
+    async fn load_supporting_commits(&self, fetch_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT commit_hash FROM fetch_supporting_commits \
+                 WHERE fetch_id = ? ORDER BY id ASC",
+                libsql::params![fetch_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    /// Remove a fetch from the queue once it has been successfully processed.
+    ///
+    /// Completed fetches serve no further purpose: idempotency is guaranteed by
+    /// the local git repository (`is_present`), not by queue history, and no code
+    /// path reads `Done` rows (dedup and stuck-placeholder recovery only consider
+    /// `Pending`/`Fetching`). Deleting the row instead of marking it `Done` keeps
+    /// the queue table bounded to in-flight work.
+    pub async fn mark_fetch_done(&self, id: i64) -> Result<()> {
+        // Foreign-key cascade is not enabled on this connection, so remove the
+        // child supporting-commit rows explicitly before the parent.
+        self.conn
+            .execute(
+                "DELETE FROM fetch_supporting_commits WHERE fetch_id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        self.conn
+            .execute("DELETE FROM fetch_queue WHERE id = ?", libsql::params![id])
+            .await?;
+        Ok(())
+    }
+
+    /// Release a fetch back to Pending with a future retry time and record the
+    /// last error. Used for transient failures within the retry window.
+    pub async fn set_fetch_retry_at(&self, id: i64, next_retry_at: i64, error: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE fetch_queue \
+                 SET status = 'Pending', next_retry_at = ?, last_error = ?, \
+                     locked_at = NULL WHERE id = ?",
+                libsql::params![next_retry_at, error, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Terminally fail a fetch after its retry window is exhausted.
+    pub async fn mark_fetch_failed(&self, id: i64, error: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE fetch_queue SET status = 'Failed', last_error = ?, \
+                 locked_at = NULL WHERE id = ?",
+                libsql::params![error, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reclaim fetches whose lease has expired because their worker died
+    /// mid-flight. Returns the number of rows reset to Pending.
+    pub async fn sweep_ghost_fetches(&self, lease_secs: i64) -> Result<u64> {
+        let cutoff = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64)
+            - lease_secs;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE fetch_queue SET status = 'Pending', locked_at = NULL \
+                 WHERE status = 'Fetching' AND locked_at IS NOT NULL \
+                   AND locked_at < ?",
+                libsql::params![cutoff],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Return patchsets stuck in 'Fetching' that have no active fetch_queue row.
+    /// Used at startup to recover placeholders created before the durable queue
+    /// existed, or orphaned by a crash.
+    pub async fn get_stuck_fetch_placeholders(&self) -> Result<Vec<StuckFetchPlaceholder>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id, p.cover_letter_message_id, \
+                        COALESCE(p.repo_url, b.repo_url), p.mr_url, \
+                        p.mr_title, p.mr_number, IFNULL(p.priority, 500), \
+                        p.subject \
+                 FROM patchsets p \
+                 LEFT JOIN baselines b ON p.baseline_id = b.id \
+                 WHERE p.status = 'Fetching' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM fetch_queue fq \
+                       WHERE fq.patchset_id = p.id \
+                         AND fq.status IN ('Pending', 'Fetching') \
+                   )",
+                (),
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            // Prefer persisted patchsets.repo_url / baseline url; for old
+            // placeholders that predate the column and have no baseline, recover
+            // the source URL from the subject ("Fetching <rev> from <url>...").
+            let subject = row.get::<Option<String>>(7)?.unwrap_or_default();
+            let repo_url = row
+                .get::<Option<String>>(2)?
+                .or_else(|| repo_url_from_subject(&subject));
+            out.push(StuckFetchPlaceholder {
+                patchset_id: row.get(0)?,
+                cover_letter_message_id: row.get::<Option<String>>(1)?,
+                repo_url,
+                mr_url: row.get::<Option<String>>(3)?,
+                mr_title: row.get::<Option<String>>(4)?,
+                mr_number: row.get::<Option<i64>>(5)?,
+                priority: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
+        Ok(FetchQueueRow {
+            id: row.get(0)?,
+            patchset_id: row.get::<Option<i64>>(1)?,
+            cover_letter_message_id: row.get::<Option<String>>(2)?,
+            repo_url: row.get::<Option<String>>(3)?,
+            commit_hash: row.get(4)?,
+            mr_url: row.get::<Option<String>>(5)?,
+            mr_title: row.get::<Option<String>>(6)?,
+            mr_number: row.get::<Option<i64>>(7)?,
+            status: row.get::<String>(8)?.parse()?,
+            attempts: row.get(9)?,
+            first_attempt_at: row.get::<Option<i64>>(10)?,
+            next_retry_at: row.get::<Option<i64>>(11)?,
+            locked_at: row.get::<Option<i64>>(12)?,
+            last_error: row.get::<Option<String>>(13)?,
+            priority: row.get(14)?,
+            created_at: row.get(15)?,
+            // Populated separately from fetch_supporting_commits after the row
+            // is claimed; see lock_pending_fetch.
+            supporting_commits: Vec::new(),
+        })
+    }
+
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
@@ -4029,6 +4505,7 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        repo_url: Option<&str>,
         priority: Option<i32>,
     ) -> Result<i64> {
         let now = std::time::SystemTime::now()
@@ -4064,13 +4541,13 @@ impl Database {
                 {
                     if let Some(prio) = priority {
                         self.conn.execute(
-                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, base_priority = ?, priority = ? WHERE id = ?",
-                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, prio, prio, id]
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, repo_url = ?, base_priority = ?, priority = ? WHERE id = ?",
+                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, repo_url, prio, prio, id]
                         ).await?;
                     } else {
                         self.conn.execute(
-                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, repo_url = ? WHERE id = ?",
+                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, repo_url, id]
                         ).await?;
                     }
                 }
@@ -4085,9 +4562,9 @@ impl Database {
         let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, base_priority, priority)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, eff_priority, eff_priority],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, repo_url, base_priority, priority)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, repo_url, eff_priority, eff_priority],
             )
             .await?;
 
@@ -4534,6 +5011,370 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_claim_is_exclusive_and_ordered() {
+        let db = setup_db().await;
+        db.enqueue_fetch(
+            None,
+            Some("a@x"),
+            Some("repo"),
+            "sha_low",
+            None,
+            None,
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("b@x"),
+            Some("repo"),
+            "sha_high",
+            None,
+            None,
+            None,
+            900,
+        )
+        .await
+        .unwrap();
+
+        // Higher priority is claimed first.
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(first.commit_hash, "sha_high");
+        assert_eq!(first.status, FetchStatus::Fetching);
+        assert_eq!(first.attempts, 1);
+        assert!(first.first_attempt_at.is_some());
+        assert!(first.locked_at.is_some());
+
+        // A claimed row is not handed out again.
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(second.commit_hash, "sha_low");
+
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_is_idempotent() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let _ = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_distinct_cover_ids_not_dropped() {
+        let db = setup_db().await;
+        // Two distinct MRs for the same commit range and repo must both be enqueued
+        db.enqueue_fetch(
+            None,
+            Some("mr-1-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr1"),
+            Some("MR 1"),
+            Some(1),
+            500,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("mr-2-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr2"),
+            Some("MR 2"),
+            Some(2),
+            500,
+        )
+        .await
+        .unwrap();
+
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            first.cover_letter_message_id.as_deref(),
+            Some("mr-1-base..head@sashiko.local")
+        );
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            second.cover_letter_message_id.as_deref(),
+            Some("mr-2-base..head@sashiko.local")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_fetch_queue_on_version_1_db() {
+        let settings = DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        // Simulate a legacy DB already at user_version 1 without fetch_queue
+        db.conn
+            .execute("PRAGMA user_version = 1", ())
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "CREATE TABLE patchsets (id INTEGER PRIMARY KEY, cover_letter_message_id TEXT, status TEXT)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // migrate() must create fetch_queue and patchsets columns even though user_version == 1
+        db.migrate().await.unwrap();
+
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(row.commit_hash, "sha");
+    }
+
+    #[tokio::test]
+    async fn test_create_patchset_matches_placeholder_without_suffix() {
+        let db = setup_db().await;
+        // Create a placeholder with unsuffixed ID (as might exist from older webhooks)
+        let placeholder_id = "mr-99-base..head";
+        let pid = db
+            .create_fetching_patchset(
+                placeholder_id,
+                "Fetching MR 99",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Ingestion passes suffixed root_msg_id as cover_letter_id
+        let suffixed_id = "mr-99-base..head@sashiko.local";
+        let thread_id = db
+            .ensure_thread_for_message(suffixed_id, 1000)
+            .await
+            .unwrap();
+        let matched_id = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some(suffixed_id),
+                "commit_sha_1",
+                "MR 99 Subject",
+                "Author",
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(matched_id, Some(pid));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_retry_gating() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A retry scheduled in the far future must not be claimable now.
+        db.set_fetch_retry_at(row.id, 4_000_000_000, "transient")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A retry scheduled in the past becomes claimable again.
+        db.set_fetch_retry_at(row.id, 1, "transient").await.unwrap();
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.attempts, 2);
+        assert_eq!(again.commit_hash, "sha");
+        assert_eq!(again.last_error.as_deref(), Some("transient"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_done_and_failed_are_terminal() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "done_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("r"), "fail_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let a = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_done(a.id).await.unwrap();
+        let b = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_failed(b.id, "boom").await.unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    async fn count_supporting(db: &Database) -> i64 {
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM fetch_supporting_commits", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_fetch_supporting_commits_roundtrip() {
+        let db = setup_db().await;
+        let supporting = vec!["original_sha".to_string(), "base_sha".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            Some("cover@x"),
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        // Only the resolution commit is ingested; the original and base commits
+        // ride along as supporting commits, preserved in insertion order.
+        assert_eq!(row.commit_hash, "resolution_sha");
+        assert_eq!(row.supporting_commits, supporting);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_without_support_has_no_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(row.supporting_commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mark_fetch_done_removes_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &["original_sha".to_string(), "base_sha".to_string()],
+        )
+        .await
+        .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(count_supporting(&db).await, 2);
+
+        db.mark_fetch_done(row.id).await.unwrap();
+        // Completing a fetch removes its supporting-commit child rows so the
+        // table stays bounded to in-flight work.
+        assert_eq!(count_supporting(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_ghost_fetches_reclaims_expired_lease() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A generous lease keeps the in-flight row locked (nothing reclaimed).
+        assert_eq!(db.sweep_ghost_fetches(1_000_000_000).await.unwrap(), 0);
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A negative lease treats every lease as already expired, so the
+        // ghosted row is reclaimed and becomes claimable again.
+        assert_eq!(db.sweep_ghost_fetches(-100_000).await.unwrap(), 1);
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.id, row.id);
+    }
+
+    #[test]
+    fn test_repo_url_from_subject() {
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from sso://prodkernel/kernel/icebreaker..."),
+            Some("sso://prodkernel/kernel/icebreaker".to_string())
+        );
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from https://example.com/repo.git..."),
+            Some("https://example.com/repo.git".to_string())
+        );
+        assert_eq!(repo_url_from_subject("Fetching abc123 from local..."), None);
+        assert_eq!(repo_url_from_subject("Fetching thread <m@id>..."), None);
+        assert_eq!(repo_url_from_subject("some unrelated subject"), None);
+    }
+
+    #[tokio::test]
+    async fn test_get_stuck_fetch_placeholders_finds_orphans() {
+        let db = setup_db().await;
+        // A patchset stuck in 'Fetching' with no queue row is an orphan.
+        db.create_fetching_patchset(
+            "orphan@sashiko.local",
+            "Fetching x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stuck = db.get_stuck_fetch_placeholders().await.unwrap();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(
+            stuck[0].cover_letter_message_id.as_deref(),
+            Some("orphan@sashiko.local")
+        );
+
+        // Once an active queue row exists, it is no longer reported.
+        let pid = stuck[0].patchset_id;
+        db.enqueue_fetch(
+            Some(pid),
+            Some("orphan@sashiko.local"),
+            None,
+            "orphan",
+            None,
+            None,
+            None,
+            500,
+        )
+        .await
+        .unwrap();
+        assert!(db.get_stuck_fetch_placeholders().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -9437,6 +10278,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -9502,6 +10344,7 @@ mod tests {
         db.create_fetching_patchset(
             &synthetic_id,
             "Fetching placeholder",
+            None,
             None,
             None,
             None,
@@ -9616,6 +10459,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -9636,6 +10480,7 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cancelled,
                 "Fetching cancelled placeholder",
+                None,
                 None,
                 None,
                 None,
@@ -9892,6 +10737,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -9959,6 +10805,7 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cover,
                 "Fetching retry",
+                None,
                 None,
                 None,
                 None,
