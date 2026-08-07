@@ -12,331 +12,403 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::db::{Database, FetchQueueRow};
 use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FetchRequest {
-    pub repo_url: Option<String>,
-    pub commit_hash: String,
-    pub mr_url: Option<String>,
-    pub mr_title: Option<String>,
-    pub mr_number: Option<i64>,
+/// How often the worker polls the durable queue for due work.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often expired leases from dead workers are reclaimed.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// A claimed fetch whose worker stops updating it for this long is treated as a
+/// ghost and reclaimed by the sweep.
+const GHOST_LEASE_SECS: i64 = 600;
+/// Total wall-clock window a fetch keeps retrying before it is failed.
+const RETRY_WINDOW_SECS: i64 = 24 * 60 * 60;
+/// First retry delay; subsequent delays double up to BACKOFF_CAP_SECS.
+const BACKOFF_BASE_SECS: i64 = 30;
+/// Maximum delay between retries.
+const BACKOFF_CAP_SECS: i64 = 600;
+
+/// Maximum number of fetch_queue rows to claim and pre-fetch in a single
+/// `git fetch` call. Batching improves server-side pack negotiation.
+const BATCH_SIZE: usize = 20;
+
+/// Marker error for failures that can never succeed on retry (e.g. a commit
+/// is missing and the row has no remote to fetch from). These bypass the
+/// backoff retry window and fail the fetch immediately, mirroring the
+/// fast-fail behaviour of the old in-memory FetchAgent.
+#[derive(Debug)]
+struct PermanentFetchError(String);
+
+impl std::fmt::Display for PermanentFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
-pub struct FetchAgent {
+impl std::error::Error for PermanentFetchError {}
+
+/// Derive the git commit or range to fetch from a placeholder message id.
+///
+/// Handles the two placeholder id shapes produced by the API:
+///   - git-fetch:  "<sha>@sashiko.local"        -> "<sha>"
+///   - PR/MR:      "mr-<number>-<base>..<head>"  -> "<base>..<head>"
+pub fn commit_hash_from_placeholder(msgid: &str) -> String {
+    // "mr-<number>-<rest>" -> "<rest>"; anything else passes through.
+    let s = msgid
+        .strip_prefix("mr-")
+        .and_then(|rest| rest.find('-').map(|dash| &rest[dash + 1..]))
+        .unwrap_or(msgid);
+    // Strip any "@sashiko.local" suffix from git-fetch placeholder ids.
+    s.split('@').next().unwrap_or(s).to_string()
+}
+
+/// Current unix time in seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Exponential backoff (in seconds) for a given attempt count. `attempts` is the
+/// number of attempts already made (>= 1 after the first claim): 1 -> 30s,
+/// 2 -> 60s, 3 -> 120s, ... capped at BACKOFF_CAP_SECS.
+fn backoff_secs(attempts: i64) -> i64 {
+    let exp = attempts.saturating_sub(1).clamp(0, 20) as u32;
+    BACKOFF_BASE_SECS
+        .saturating_mul(2_i64.saturating_pow(exp))
+        .min(BACKOFF_CAP_SECS)
+}
+
+/// Whether a revision string is a full git object id (sha1 = 40 hex chars, or
+/// sha256 = 64). Only full object ids can be requested directly via `want`
+/// without a ref lookup; branch/tag names must be resolved by the server.
+fn looks_like_object_id(rev: &str) -> bool {
+    matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Durable, restart-safe git fetch worker.
+///
+/// Replaces the previous in-memory `FetchAgent` channel. Fetch requests live in
+/// the `fetch_queue` table; this worker claims them under a lease, performs the
+/// git fetch and patch extraction, and either completes them, schedules a
+/// backoff retry, or (after RETRY_WINDOW_SECS) fails them terminally. Because
+/// all state lives in the database, requests survive restarts and crashed
+/// workers are recovered by the ghost sweep.
+pub struct FetchWorker {
     repo_path: PathBuf,
-    rx: mpsc::Receiver<FetchRequest>,
+    db: Arc<Database>,
     main_tx: mpsc::Sender<Event>,
-    #[allow(clippy::type_complexity)]
-    mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
     gitlab_token: Option<String>,
 }
 
-impl FetchAgent {
+impl FetchWorker {
     pub fn new(
         repo_path: PathBuf,
+        db: Arc<Database>,
         main_tx: mpsc::Sender<Event>,
         gitlab_token: Option<String>,
-    ) -> (Self, mpsc::Sender<FetchRequest>) {
-        let (tx, rx) = mpsc::channel(100);
-        (
-            Self {
-                repo_path,
-                rx,
-                main_tx,
-                mr_metadata: HashMap::new(),
-                gitlab_token,
-            },
-            tx,
-        )
+    ) -> Self {
+        Self {
+            repo_path,
+            db,
+            main_tx,
+            gitlab_token,
+        }
     }
 
-    pub async fn run(mut self) {
-        info!("FetchAgent started");
-        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
-        let mut ticker = interval(Duration::from_secs(10));
+    pub async fn run(self) {
+        info!("FetchWorker started");
 
+        // Reclaim ghost leases on an independent task so that a long-running (or
+        // stuck) fetch on the main loop can never prevent dead-worker recovery.
+        {
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let mut sweep = interval(SWEEP_INTERVAL);
+                loop {
+                    sweep.tick().await;
+                    match db.sweep_ghost_fetches(GHOST_LEASE_SECS).await {
+                        Ok(n) if n > 0 => {
+                            warn!("Reclaimed {} ghost fetch(es) from dead workers", n);
+                        }
+                        Ok(_) => {}
+                        Err(e) => error!("Ghost fetch sweep failed: {}", e),
+                    }
+                }
+            });
+        }
+
+        let mut poll = interval(POLL_INTERVAL);
         loop {
-            tokio::select! {
-                Some(req) = self.rx.recv() => {
-                    if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
-                        self.mr_metadata.insert(
-                            req.commit_hash.clone(),
-                            (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
-                        );
-                    }
-                    queue.entry(req.repo_url)
-                        .or_default()
-                        .insert(req.commit_hash);
+            poll.tick().await;
+            // Claim up to BATCH_SIZE rows and pre-fetch their objects in a
+            // single `git fetch` call. Batching lets the server compute one
+            // optimal pack for many wants, avoiding the pathological 11M-object
+            // downloads that happen when unreachable SHAs are fetched one at a
+            // time with poor negotiation.
+            let mut batch = Vec::new();
+            loop {
+                if batch.len() >= BATCH_SIZE {
+                    break;
                 }
-                _ = ticker.tick() => {
-                    if !queue.is_empty() {
-                        self.process_queue(&mut queue).await;
+                match self.db.lock_pending_fetch().await {
+                    Ok(Some(row)) => batch.push(row),
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("Failed to claim pending fetch: {}", e);
+                        break;
                     }
                 }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+
+            // Pre-fetch all missing objects in one batch call.
+            self.batch_prefetch(&batch).await;
+
+            // Process each row individually for ingestion.
+            for row in batch {
+                self.process_row(row).await;
             }
         }
     }
 
-    async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
-        info!("Processing fetch queue with {} repos", queue.len());
+    /// Process a single claimed fetch: ensure the commits are present locally
+    /// (fetching from the remote if needed), extract the patch(es), and emit the
+    /// corresponding events. On any failure the row is retried with backoff, or
+    /// failed terminally once the retry window is exhausted.
+    async fn process_row(&self, row: FetchQueueRow) {
+        info!(
+            "Processing fetch {} (commit {}, attempt {})",
+            row.id, row.commit_hash, row.attempts
+        );
 
-        for (url_opt, commits) in queue.drain() {
-            if commits.is_empty() {
-                continue;
-            }
+        if let Err(e) = self.ensure_present(&row).await {
+            self.handle_failure(&row, e.context("fetch failed")).await;
+            return;
+        }
 
-            let commit_list: Vec<String> = commits.into_iter().collect();
-            let url_display = url_opt.as_deref().unwrap_or("local");
-
-            info!(
-                "Processing {} commits for remote {}",
-                commit_list.len(),
-                url_display
-            );
-
-            // For ranges (base..head), we need to check both endpoints individually
-            let mut commits_to_check = Vec::new();
-            for commit_or_range in &commit_list {
-                if commit_or_range.contains("..") {
-                    let parts: Vec<&str> = commit_or_range.split("..").collect();
-                    if parts.len() == 2 {
-                        commits_to_check.push(parts[0].to_string());
-                        commits_to_check.push(parts[1].to_string());
-                    }
+        match self.ingest(&row).await {
+            Ok(()) => {
+                if let Err(e) = self.db.mark_fetch_done(row.id).await {
+                    error!("Failed to mark fetch {} done: {}", row.id, e);
                 } else {
-                    commits_to_check.push(commit_or_range.clone());
+                    info!("Fetch complete for {}", row.commit_hash);
                 }
             }
-
-            let mut missing_commits = Vec::new();
-            for commit in &commits_to_check {
-                if !self.is_present(commit).await {
-                    missing_commits.push(commit.clone());
-                }
+            Err(e) => {
+                self.handle_failure(&row, e.context("extract failed")).await;
             }
+        }
+    }
 
-            if missing_commits.is_empty() {
-                info!(
-                    "All commits present locally, skipping fetch for {}",
-                    url_display
-                );
-            } else if let Some(url) = url_opt {
-                // Remote fetch logic
-                let remote_name = self.get_remote_name(&url);
-
-                // Check if repo is local (same as self.repo_path)
-                let is_local = {
-                    let url_path = PathBuf::from(&url);
-                    if let (Ok(canon_url), Ok(canon_repo)) = (
-                        std::fs::canonicalize(&url_path),
-                        std::fs::canonicalize(&self.repo_path),
-                    ) {
-                        canon_url == canon_repo
-                    } else {
-                        false
-                    }
-                };
-
-                if is_local {
-                    warn!(
-                        "Repository is local but commits are missing: {:?}. Cannot fetch.",
-                        missing_commits
-                    );
-                    // Do not continue here; let it fall through to Step 3 where it will fail individually
-                } else {
-                    if let Err(e) = self.ensure_remote(&remote_name, &url).await {
-                        error!("Failed to ensure remote {}: {}", url, e);
-                        for commit in &missing_commits {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit.clone(),
-                                    error: format!("Failed to set up remote {}: {}", url, e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                        }
-                        continue;
-                    }
-
-                    // 1. Try optimistic fetch (fetch specific commits)
-                    if let Err(e) = self.fetch_commits(&remote_name, &missing_commits).await {
-                        warn!(
-                            "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
-                            url, e
-                        );
-                        // 2. Fallback: Fetch everything (heads)
-                        if let Err(e) = self.fetch_all(&remote_name).await {
-                            error!("Full fetch failed for {}: {}", url, e);
-                            for commit in &missing_commits {
-                                let _ = self
-                                    .main_tx
-                                    .send(Event::IngestionFailed {
-                                        article_id: commit.clone(),
-                                        error: format!("Failed to fetch from {}: {}", url, e),
-                                        source: MessageSource::GitFetch,
-                                    })
-                                    .await;
-                            }
-                            continue;
-                        }
-                    }
-                }
+    /// Ensure every commit referenced by the row exists locally, fetching from
+    /// the remote when necessary.
+    async fn ensure_present(&self, row: &FetchQueueRow) -> Result<()> {
+        // For ranges (base..head), both endpoints must be checked individually.
+        let mut to_check = Vec::new();
+        if let Some((start, end)) = row.commit_hash.split_once("..") {
+            to_check.push(start.to_string());
+            to_check.push(end.to_string());
+        } else {
+            to_check.push(row.commit_hash.clone());
+        }
+        for sha in &row.supporting_commits {
+            if let Some((start, end)) = sha.split_once("..") {
+                to_check.push(start.to_string());
+                to_check.push(end.to_string());
             } else {
-                // Local repo, but commits are missing
-                warn!(
-                    "Local repository missing commits: {:?}. Cannot fetch.",
-                    missing_commits
-                );
+                to_check.push(sha.clone());
             }
+        }
 
-            // 3. Process each commit or range
-            for commit_or_range in commit_list {
-                if commit_or_range.contains("..") {
-                    // It's a range
-                    let range = &commit_or_range;
+        let mut missing = Vec::new();
+        for commit in &to_check {
+            if !self.is_present(commit).await {
+                missing.push(commit.clone());
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
 
-                    let shas = match crate::git_ops::resolve_git_range(&self.repo_path, range).await
-                    {
-                        Ok(shas) => shas,
-                        Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: range.clone(),
-                                    error: format!("Failed to resolve git range: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let count = shas.len() as u32;
+        let url = match row.repo_url.as_deref().map(str::trim) {
+            Some(u) if !u.is_empty() => u,
+            _ => {
+                return Err(PermanentFetchError(format!(
+                    "commits {:?} missing and no remote is configured",
+                    missing
+                ))
+                .into());
+            }
+        };
 
-                    // Process each SHA
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
+        // A local repository cannot be fetched from; the commits simply are not
+        // there.
+        let is_local = {
+            let url_path = PathBuf::from(url);
+            match (
+                std::fs::canonicalize(&url_path),
+                std::fs::canonicalize(&self.repo_path),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        };
+        if is_local {
+            return Err(PermanentFetchError(format!(
+                "repository is local but commits are missing: {:?}",
+                missing
+            ))
+            .into());
+        }
 
-                    let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, range)
-                    } else {
-                        range.to_string()
-                    };
+        let remote_name = self.get_remote_name(url);
 
-                    for (i, sha) in shas.iter().enumerate() {
-                        match self
-                            .extract_patch(
-                                sha,
-                                &article_id,
-                                (i + 1) as u32,
-                                count,
-                                mr_url.as_ref(),
-                                mr_title.as_ref(),
-                                mr_number,
-                            )
-                            .await
-                        {
-                            Ok(mut event) => {
-                                if let Event::PatchSubmitted {
-                                    ref mut message_id, ..
-                                } = event
-                                {
-                                    *message_id = sha.clone();
-                                }
-                                if let Err(e) = self.main_tx.send(event).await {
-                                    error!("Failed to send PatchSubmitted event: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to extract patch {} from range {}: {}",
-                                    sha, range, e
-                                );
-                            }
-                        }
-                    }
-                    info!("Successfully submitted remote range {}", range);
-                } else {
-                    // Single commit
-                    let full_sha = match self.resolve_sha(&commit_or_range).await {
-                        Ok(sha) => sha,
-                        Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range.clone(),
-                                    error: format!("Failed to resolve SHA: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
+        // Acquire the per-remote lock so we never run concurrent fetches
+        // against the same remote (shared with ensure_remote_with_refspecs
+        // and batch_prefetch).
+        let lock = crate::git_ops::get_remote_lock(&remote_name);
+        let _guard = lock.lock().await;
 
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(&commit_or_range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
+        self.ensure_remote(&remote_name, url).await?;
 
-                    let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, &commit_or_range)
-                    } else {
-                        commit_or_range.clone()
-                    };
+        // Fetch exactly the missing revisions. We deliberately do NOT fall
+        // back to a full `git fetch` of all refs: large mirrors (e.g. the kernel
+        // repo with hundreds of thousands of refs) make that pathologically
+        // slow, and it is unnecessary -- a still-missing object here is
+        // genuinely unfetchable and should surface as an error.
+        self.fetch_commits(&remote_name, &missing).await?;
+        Ok(())
+    }
 
-                    match self
-                        .extract_patch(
-                            &full_sha,
-                            &article_id,
-                            1,
-                            1,
-                            mr_url.as_ref(),
-                            mr_title.as_ref(),
-                            mr_number,
-                        )
-                        .await
-                    {
-                        Ok(mut event) => {
-                            if let Event::PatchSubmitted {
-                                ref mut message_id, ..
-                            } = event
-                            {
-                                *message_id = full_sha.clone();
-                            }
-                            if let Err(e) = self.main_tx.send(event).await {
-                                error!("Failed to send PatchSubmitted event: {}", e);
-                            } else {
-                                info!("Successfully submitted remote patch {}", commit_or_range);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to extract patch {}: {}", commit_or_range, e);
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range,
-                                    error: format!("Failed to extract patch: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                        }
-                    }
+    /// Extract patch(es) for the row and emit PatchSubmitted events.
+    async fn ingest(&self, row: &FetchQueueRow) -> Result<()> {
+        let article_id = Self::article_id_for(row);
+        let mr_url = row.mr_url.clone();
+        let mr_title = row.mr_title.clone();
+
+        if row.commit_hash.contains("..") {
+            let shas = crate::git_ops::resolve_git_range(&self.repo_path, &row.commit_hash).await?;
+            let count = shas.len() as u32;
+            for (i, sha) in shas.iter().enumerate() {
+                let mut event = self
+                    .extract_patch(
+                        sha,
+                        &article_id,
+                        (i + 1) as u32,
+                        count,
+                        mr_url.as_ref(),
+                        mr_title.as_ref(),
+                        row.mr_number,
+                    )
+                    .await?;
+                if let Event::PatchSubmitted {
+                    ref mut message_id, ..
+                } = event
+                {
+                    *message_id = sha.clone();
                 }
+                self.main_tx
+                    .send(event)
+                    .await
+                    .map_err(|e| anyhow!("failed to send event: {}", e))?;
             }
+            info!("Submitted range {}", row.commit_hash);
+        } else {
+            let full_sha = self.resolve_sha(&row.commit_hash).await?;
+            let mut event = self
+                .extract_patch(
+                    &full_sha,
+                    &article_id,
+                    1,
+                    1,
+                    mr_url.as_ref(),
+                    mr_title.as_ref(),
+                    row.mr_number,
+                )
+                .await?;
+            if let Event::PatchSubmitted {
+                ref mut message_id, ..
+            } = event
+            {
+                *message_id = full_sha.clone();
+            }
+            self.main_tx
+                .send(event)
+                .await
+                .map_err(|e| anyhow!("failed to send event: {}", e))?;
+            info!("Submitted patch {}", row.commit_hash);
+        }
+        Ok(())
+    }
+
+    /// Decide whether to retry (with backoff) or terminally fail a fetch.
+    async fn handle_failure(&self, row: &FetchQueueRow, error: anyhow::Error) {
+        let now = now_secs();
+        let first = row.first_attempt_at.unwrap_or(now);
+        let permanent = error.downcast_ref::<PermanentFetchError>().is_some();
+        let msg = format!("{:#}", error);
+        if permanent {
+            error!(
+                "Fetch {} for {} failed permanently (not retrying): {}",
+                row.id, row.commit_hash, msg
+            );
+        } else if now - first >= RETRY_WINDOW_SECS {
+            error!(
+                "Fetch {} for {} exhausted its {}h retry window: {}",
+                row.id,
+                row.commit_hash,
+                RETRY_WINDOW_SECS / 3600,
+                msg
+            );
+        }
+        if permanent || now - first >= RETRY_WINDOW_SECS {
+            if let Err(e) = self.db.mark_fetch_failed(row.id, &msg).await {
+                error!("Failed to mark fetch {} failed: {}", row.id, e);
+            }
+            // Surface the terminal failure so the placeholder patchset moves out
+            // of 'Fetching' into 'Failed'.
+            let _ = self
+                .main_tx
+                .send(Event::IngestionFailed {
+                    article_id: Self::article_id_for(row),
+                    error: msg.clone(),
+                    source: MessageSource::GitFetch,
+                })
+                .await;
+        } else {
+            let backoff = backoff_secs(row.attempts);
+            warn!(
+                "Fetch {} for {} failed (attempt {}), retrying in {}s: {}",
+                row.id, row.commit_hash, row.attempts, backoff, msg
+            );
+            if let Err(e) = self
+                .db
+                .set_fetch_retry_at(row.id, now + backoff, &msg)
+                .await
+            {
+                error!("Failed to schedule retry for fetch {}: {}", row.id, e);
+            }
+        }
+    }
+
+    fn article_id_for(row: &FetchQueueRow) -> String {
+        match row.mr_number {
+            Some(number) => format!("mr-{}-{}", number, row.commit_hash),
+            None => row.commit_hash.clone(),
         }
     }
 
@@ -351,6 +423,9 @@ impl FetchAgent {
     }
 
     async fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
+        let global_lock = crate::git_ops::get_global_config_lock();
+        let _global_guard = global_lock.lock().await;
+
         // Inject GitLab token if available
         let authenticated_url = if let Some(token) = &self.gitlab_token {
             if url.contains("gitlab.com") && url.starts_with("https://") {
@@ -418,42 +493,139 @@ impl FetchAgent {
         Ok(())
     }
 
+    /// Fetch the given revisions from `remote`, tuned for a very large remote.
+    ///
+    /// Full object ids are fetched directly (`want <oid>`) in a single batched
+    /// call with no ref advertisement. Branch/tag names are resolved server-side
+    /// via a protocol-v2, prefix-filtered `ls-refs` (cheap even against a remote
+    /// with hundreds of thousands of refs) and fetched individually so one bad
+    /// name does not fail the whole batch.
     async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&self.repo_path)
-            .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-            .arg("fetch")
-            .arg(remote);
-
-        for commit in commits {
-            cmd.arg(commit);
+        let mut object_ids: Vec<&str> = Vec::new();
+        let mut ref_names: Vec<&str> = Vec::new();
+        for c in commits {
+            if looks_like_object_id(c) {
+                object_ids.push(c.as_str());
+            } else {
+                ref_names.push(c.as_str());
+            }
         }
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Fetch failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+        if !object_ids.is_empty() {
+            let mut cmd = self.fetch_base_cmd();
+            // Objects are resolvable by id regardless of refs, so skip tag
+            // following and don't serialize on FETCH_HEAD.
+            cmd.arg("--no-tags")
+                .arg("--no-write-fetch-head")
+                .arg(remote);
+            for oid in &object_ids {
+                cmd.arg(oid);
+            }
+            let output = cmd.output().await?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "fetch of {} object(s) failed: {}",
+                    object_ids.len(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+
+        for name in ref_names {
+            let mut cmd = self.fetch_base_cmd();
+            // Keep default refspec/FETCH_HEAD behaviour so the name stays
+            // resolvable locally after the fetch.
+            cmd.arg(remote).arg(name);
+            let output = cmd.output().await?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "fetch of ref {} failed: {}",
+                    name,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
         }
         Ok(())
     }
 
-    async fn fetch_all(&self, remote: &str) -> Result<()> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
+    /// Base `git fetch` command shared by all fetches: no interactive prompt,
+    /// the standard protocol restrictions, and `kill_on_drop` so a cancelled
+    /// fetch is reaped. Callers append fetch flags, the remote, and revisions.
+    ///
+    /// Note: protocol v2 is deliberately NOT forced here. Protocol v1 sends
+    /// all remote refs upfront, giving the client rich negotiation data that
+    /// avoids pathological full-repo downloads for unreachable SHAs.
+    fn fetch_base_cmd(&self) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-            .args(["fetch", remote])
-            .output()
-            .await?;
+            .arg("fetch")
+            .kill_on_drop(true);
+        cmd
+    }
 
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Fetch all failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+    /// Pre-fetch objects for a batch of rows in a single `git fetch` call.
+    /// Groups rows by remote URL and fetches all missing SHAs together so
+    /// the server can compute one optimal pack.
+    async fn batch_prefetch(&self, rows: &[FetchQueueRow]) {
+        // Group SHAs by remote URL.
+        let mut by_remote: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let mut commits = if let Some((start, end)) = row.commit_hash.split_once("..") {
+                vec![start.to_string(), end.to_string()]
+            } else {
+                vec![row.commit_hash.clone()]
+            };
+            for sha in &row.supporting_commits {
+                if let Some((start, end)) = sha.split_once("..") {
+                    commits.push(start.to_string());
+                    commits.push(end.to_string());
+                } else {
+                    commits.push(sha.clone());
+                }
+            }
+            let url = row.repo_url.clone().unwrap_or_default();
+            by_remote.entry(url).or_default().extend(commits);
         }
-        Ok(())
+
+        for (url, commits) in &by_remote {
+            if url.is_empty() {
+                continue;
+            }
+            // Filter to only missing objects.
+            let mut missing = Vec::new();
+            for c in commits {
+                if !self.is_present(c).await {
+                    missing.push(c.clone());
+                }
+            }
+            if missing.is_empty() {
+                continue;
+            }
+
+            let remote_name = self.get_remote_name(url);
+            if let Err(e) = self.ensure_remote(&remote_name, url).await {
+                warn!("batch_prefetch: failed to ensure remote {}: {}", url, e);
+                continue;
+            }
+            info!(
+                "batch_prefetch: fetching {} SHAs from {} in one call",
+                missing.len(),
+                url
+            );
+            // Acquire the per-remote lock so we never run concurrent
+            // fetches against the same remote (which causes duplicate
+            // 11M-object downloads).
+            let lock = crate::git_ops::get_remote_lock(&remote_name);
+            let _guard = lock.lock().await;
+            if let Err(e) = self.fetch_commits(&remote_name, &missing).await {
+                warn!("batch_prefetch: batch fetch failed: {}", e);
+                // Individual process_row calls will retry on their own.
+            }
+        }
     }
 
     async fn is_present(&self, commit_or_range: &str) -> bool {
@@ -551,82 +723,62 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
-    // --- Standalone helpers for the durable fetch worker ---
-
-    /// First retry delay; subsequent delays double up to BACKOFF_CAP_SECS.
-    const BACKOFF_BASE_SECS: i64 = 30;
-    /// Maximum delay between retries.
-    const BACKOFF_CAP_SECS: i64 = 600;
-
-    /// Marker error for failures that can never succeed on retry (e.g. a commit
-    /// is missing and the row has no remote to fetch from). These bypass the
-    /// backoff retry window and fail the fetch immediately, mirroring the
-    /// fast-fail behaviour of the old in-memory FetchAgent.
-    #[derive(Debug)]
-    struct PermanentFetchError(String);
-
-    impl std::fmt::Display for PermanentFetchError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", self.0)
-        }
+    async fn test_worker(repo_path: PathBuf) -> FetchWorker {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&settings).await.unwrap());
+        db.migrate().await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        FetchWorker::new(repo_path, db, tx, None)
     }
 
-    impl std::error::Error for PermanentFetchError {}
-
-    /// Derive the git commit or range to fetch from a placeholder message id.
-    ///
-    /// Handles the two placeholder id shapes produced by the API:
-    ///   - git-fetch:  "<sha>@sashiko.local"        -> "<sha>"
-    ///   - PR/MR:      "mr-<number>-<base>..<head>"  -> "<base>..<head>"
-    pub fn commit_hash_from_placeholder(msgid: &str) -> String {
-        // "mr-<number>-<rest>" -> "<rest>"; anything else passes through.
-        let s = msgid
-            .strip_prefix("mr-")
-            .and_then(|rest| rest.find('-').map(|dash| &rest[dash + 1..]))
-            .unwrap_or(msgid);
-        // Strip any "@sashiko.local" suffix from git-fetch placeholder ids.
-        s.split('@').next().unwrap_or(s).to_string()
+    #[test]
+    fn test_commit_hash_from_placeholder() {
+        assert_eq!(
+            commit_hash_from_placeholder("abc123@sashiko.local"),
+            "abc123"
+        );
+        assert_eq!(
+            commit_hash_from_placeholder("mr-42-base..head"),
+            "base..head"
+        );
+        assert_eq!(
+            commit_hash_from_placeholder("mr-42-base..head@sashiko.local"),
+            "base..head"
+        );
+        assert_eq!(commit_hash_from_placeholder("plainsha"), "plainsha");
     }
 
-    /// Current unix time in seconds.
-    fn now_secs() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+    #[test]
+    fn test_backoff_secs_is_exponential_and_capped() {
+        assert_eq!(backoff_secs(1), 30);
+        assert_eq!(backoff_secs(2), 60);
+        assert_eq!(backoff_secs(3), 120);
+        assert_eq!(backoff_secs(4), 240);
+        assert_eq!(backoff_secs(5), 480);
+        assert_eq!(backoff_secs(6), 600);
+        assert_eq!(backoff_secs(100), 600);
     }
 
-    /// Exponential backoff (in seconds) for a given attempt count. `attempts` is the
-    /// number of attempts already made (>= 1 after the first claim): 1 -> 30s,
-    /// 2 -> 60s, 3 -> 120s, ... capped at BACKOFF_CAP_SECS.
-    fn backoff_secs(attempts: i64) -> i64 {
-        let exp = attempts.saturating_sub(1).clamp(0, 20) as u32;
-        BACKOFF_BASE_SECS
-            .saturating_mul(2_i64.saturating_pow(exp))
-            .min(BACKOFF_CAP_SECS)
+    #[test]
+    fn test_looks_like_object_id() {
+        assert!(looks_like_object_id(&"a".repeat(40)));
+        assert!(looks_like_object_id(&"0".repeat(64)));
+        assert!(looks_like_object_id(
+            "8a21aa5149b3f34f48a277d596d1ffe512b32a41"
+        ));
+        assert!(!looks_like_object_id("main"));
+        assert!(!looks_like_object_id("v6.10"));
+        assert!(!looks_like_object_id("refs/heads/main"));
+        assert!(!looks_like_object_id(&"a".repeat(39)));
+        assert!(!looks_like_object_id("zzzz"));
     }
-
-    /// Whether a revision string is a full git object id (sha1 = 40 hex chars, or
-    /// sha256 = 64). Only full object ids can be requested directly via `want`
-    /// without a ref lookup; branch/tag names must be resolved by the server.
-    fn looks_like_object_id(rev: &str) -> bool {
-        matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
-    }
-
-    /// Durable, restart-safe git fetch worker.
-    ///
-    /// Replaces the previous in-memory `FetchAgent` channel. Fetch requests live in
-    /// the `fetch_queue` table; this worker claims them under a lease, performs the
-    /// git fetch and patch extraction, and either completes them, schedules a
-    /// backoff retry, or (after RETRY_WINDOW_SECS) fails them terminally. Because
-    /// all state lives in the database, requests survive restarts and crashed
-    /// workers are recovered by the ghost sweep.
 
     #[tokio::test]
-    async fn test_fetch_agent_lifecycle() {
-        let (tx, _rx) = mpsc::channel(1);
-        let repo_path = PathBuf::from("/tmp");
-        let (_agent, _sender) = FetchAgent::new(repo_path, tx, None);
+    async fn test_fetch_worker_construction() {
+        let _worker = test_worker(PathBuf::from("/tmp")).await;
     }
 
     #[tokio::test]
@@ -666,8 +818,7 @@ mod tests {
             .output()
             .await?;
 
-        let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let agent = test_worker(repo_path.clone()).await;
 
         let output = Command::new("git")
             .current_dir(&repo_path)
@@ -738,8 +889,7 @@ mod tests {
             .output()
             .await?;
 
-        let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let agent = test_worker(repo_path.clone()).await;
 
         let output = Command::new("git")
             .current_dir(&repo_path)
@@ -768,41 +918,80 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_commit_hash_from_placeholder() {
-        assert_eq!(
-            commit_hash_from_placeholder("abc123@sashiko.local"),
-            "abc123"
-        );
-        assert_eq!(
-            commit_hash_from_placeholder("mr-42-base..head"),
-            "base..head"
-        );
-        assert_eq!(commit_hash_from_placeholder("plainsha"), "plainsha");
-    }
+    #[tokio::test]
+    async fn test_ensure_present_checks_supporting_commits() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
 
-    #[test]
-    fn test_backoff_secs_is_exponential_and_capped() {
-        assert_eq!(backoff_secs(1), 30);
-        assert_eq!(backoff_secs(2), 60);
-        assert_eq!(backoff_secs(3), 120);
-        assert_eq!(backoff_secs(4), 240);
-        assert_eq!(backoff_secs(5), 480);
-        assert_eq!(backoff_secs(6), 600);
-        assert_eq!(backoff_secs(100), 600);
-    }
+        Command::new("git")
+            .current_dir(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
 
-    #[test]
-    fn test_looks_like_object_id() {
-        assert!(looks_like_object_id(&"a".repeat(40)));
-        assert!(looks_like_object_id(&"0".repeat(64)));
-        assert!(looks_like_object_id(
-            "8a21aa5149b3f34f48a277d596d1ffe512b32a41"
-        ));
-        assert!(!looks_like_object_id("main"));
-        assert!(!looks_like_object_id("v6.10"));
-        assert!(!looks_like_object_id("refs/heads/main"));
-        assert!(!looks_like_object_id(&"a".repeat(39)));
-        assert!(!looks_like_object_id("zzzz"));
+        let file_path = repo_path.join("file.txt");
+        let mut file = File::create(&file_path)?;
+        writeln!(file, "content")?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "-m", "Commit 1"])
+            .output()
+            .await?;
+
+        let output = Command::new("git")
+            .current_dir(&repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await?;
+        let commit1 = String::from_utf8(output.stdout)?.trim().to_string();
+
+        let agent = test_worker(repo_path.clone()).await;
+
+        let row = FetchQueueRow {
+            id: 1,
+            patchset_id: None,
+            cover_letter_message_id: None,
+            repo_url: None,
+            commit_hash: commit1.clone(),
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            status: crate::db::FetchStatus::Pending,
+            attempts: 0,
+            first_attempt_at: None,
+            next_retry_at: None,
+            locked_at: None,
+            last_error: None,
+            priority: 500,
+            created_at: 0,
+            supporting_commits: vec!["missing_sha_1234567890".to_string()],
+        };
+
+        // ensure_present must fail because supporting_commits contains a missing SHA
+        assert!(agent.ensure_present(&row).await.is_err());
+
+        // When supporting_commits is present locally, ensure_present must succeed
+        let row_valid = FetchQueueRow {
+            supporting_commits: vec![commit1.clone()],
+            ..row
+        };
+        assert!(agent.ensure_present(&row_valid).await.is_ok());
+
+        Ok(())
     }
 }
