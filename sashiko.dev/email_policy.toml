@@ -69,8 +69,10 @@ subject_prefixes = ["net", "net-next"]
 
 [subsystems.mptcp]
 lists = ["mptcp@lists.linux.dev"]
-mute_all = true
-subject_prefixes = ["mptcp", "mptcp-next"]
+reply_to_author = true
+cc = ["mptcp@lists.linux.dev"]
+embargo_hours = 0
+subject_prefixes = ["mptcp", "mptcp-net", "mptcp-next"]
 
 [subsystems.mptcp.patchwork]
 enabled = true
