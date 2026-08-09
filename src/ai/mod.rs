@@ -526,6 +526,9 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: ai.model.clone(),
         })),
+        "traecli" => Ok(Arc::new(trae_cli::TraeCliProvider {
+            model: ai.model.clone(),
+        })),
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
             model: ai.model.clone(),
         })),
@@ -591,6 +594,7 @@ pub mod proxy;
 pub mod quota;
 pub mod session;
 pub mod token_budget;
+pub mod trae_cli;
 pub mod truncator;
 #[cfg(feature = "vertex")]
 pub mod vertex;

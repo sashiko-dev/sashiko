@@ -1,0 +1,3 @@
+[ai]
+provider = "traecli"
+model = "GPT-5.5"
