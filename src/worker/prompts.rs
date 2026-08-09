@@ -93,6 +93,7 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub skip_report_stage: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +452,7 @@ pub struct Worker {
     series_range: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    skip_report_stage: bool,
 }
 
 impl Worker {
@@ -470,6 +472,7 @@ impl Worker {
             series_range: config.series_range,
             context_tag: None,
             stages: config.stages,
+            skip_report_stage: config.skip_report_stage,
         }
     }
 
@@ -1327,6 +1330,31 @@ Example Output:
             });
         }
 
+        if self.skip_report_stage {
+            tracing::info!("Skipping Stage 11 report generation");
+            let final_output = serde_json::json!({
+                "findings": findings_json,
+                "dismissed_concerns": deduplicated_dismissed_concerns,
+                "review_inline": "",
+                "fixes": "",
+                "concerns_count": all_concerns.len(),
+                "dismissed_concerns_count": deduplicated_dismissed_concerns
+                    .as_array()
+                    .map_or(0, Vec::len)
+            });
+            return Ok(WorkerResult {
+                output: Some(final_output),
+                error: None,
+                input_context: "Multi-stage execution completed".to_string(),
+                history: self.global_history.clone(),
+                history_before_pruning: self.global_history.clone(),
+                history_after_pruning: self.global_history.clone(),
+                tokens_in: total_tokens_in,
+                tokens_out: total_tokens_out,
+                tokens_cached: total_tokens_cached,
+            });
+        }
+
         // Stage 11
         if let Some(progress_cb) = progress {
             progress_cb(WorkerProgressEvent::StageStarted { stage: 11 });
@@ -2119,6 +2147,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: None,
+            skip_report_stage: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -2466,6 +2495,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: Some(vec![1]),
+            skip_report_stage: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

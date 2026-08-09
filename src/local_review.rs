@@ -42,6 +42,7 @@ pub struct WorkerOptions {
     pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub skip_report_stage: bool,
     pub scratch_clone: bool,
     pub current_tree: bool,
 }
@@ -61,6 +62,7 @@ impl Default for WorkerOptions {
             ai_provider: None,
             custom_prompt: None,
             stages: None,
+            skip_report_stage: false,
             scratch_clone: false,
             current_tree: false,
         }
@@ -490,6 +492,7 @@ async fn review_single_patch(
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
                 stages: options.stages.clone(),
+                skip_report_stage: options.skip_report_stage,
             },
         );
 

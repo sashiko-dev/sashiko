@@ -322,6 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ai_provider: ai_provider.clone(),
                     custom_prompt: custom_prompt.clone(),
                     stages: stages.clone(),
+                    skip_report_stage: false,
                     scratch_clone: false,
                     current_tree: false,
                 })
