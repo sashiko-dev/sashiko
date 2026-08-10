@@ -901,7 +901,15 @@ fn handle_init_command(
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(&path, DEFAULT_SETTINGS)?;
+    // Prefer a local Settings.toml in the current directory if it exists,
+    // otherwise fall back to the embedded default settings.
+    let settings_content = if Path::new("Settings.toml").exists() {
+        std::fs::read_to_string("Settings.toml")?
+    } else {
+        DEFAULT_SETTINGS.to_string()
+    };
+
+    std::fs::write(&path, &settings_content)?;
     println!("Wrote {}", path.display());
 
     let prompts_root = prompt_bundle::install_prompt_bundle(reinstall_prompts)?;
