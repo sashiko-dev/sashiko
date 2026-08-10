@@ -116,6 +116,7 @@ cc = ["antonio@mandelbit.com", "ralf@mandelbit.com", "sd@queasysnail.net"]
 [subsystems.live-patching]
 lists = ["live-patching@vger.kernel.org"]
 reply_all = true
+reply_to_author = true
 
 [subsystems.pci]
 lists = ["linux-pci@vger.kernel.org"]
