@@ -65,7 +65,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tree-sitter = "0.26.9"
 tree-sitter-c = "0.24.2"
 hmac = "0.13"
-base64 = "0.22"
+base64 = "0.23"
 subtle = "2"
 url = "2.5.8"
 percent-encoding = "2.3.2"

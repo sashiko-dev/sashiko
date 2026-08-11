@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS patchsets (
     target_review_count INTEGER DEFAULT 1,
     provider TEXT,
     embargo_until INTEGER,
+    embargo_release_started_at INTEGER,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
@@ -269,5 +270,4 @@ CREATE TABLE IF NOT EXISTS patchwork_outbox (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(status);
-
 

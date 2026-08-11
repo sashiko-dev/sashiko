@@ -149,10 +149,34 @@ Optional array of additional git remotes to track.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `name` | string | -- | Remote name. |
-| `url` | string | -- | Remote URL. |
-| `check_all_branches` | bool | -- | Try all branches as baselines. |
-| `only_branches` | list | -- | Restrict to specific branches (optional). |
+| `name` | string | -- | Remote name. Required. |
+| `url` | string | -- | Remote URL. Required. |
+| `check_all_branches` | bool | -- | Try all branches as baselines. Required -- omitting it is a parse error, not a default of `false`. |
+| `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` is also true, these are appended to the full branch list rather than replacing it. |
+
+Baselines are tried in order and the first one the series applies to wins.
+Custom remotes are tried after any `base-commit:` trailer and the MAINTAINERS
+subsystem heuristic, but **before** linux-next and mainline. A subsystem topic
+branch is where a series was actually developed, whereas linux-next carries a
+snapshot of that branch which lags by at least one daily build -- and shares no
+SHAs with it once the maintainer rebases.
+
+Use this to reach topic branches that the MAINTAINERS `T:` entry doesn't name.
+For example, the NFSD entry lists a tree but no branch, so the only candidate it
+yields is `cel/HEAD` (a symref to `cel/master`):
+
+```toml
+[[git.custom_remotes]]
+name = "cel"
+url = "git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+check_all_branches = false
+only_branches = ["nfsd-next", "nfsd-testing"]
+```
+
+Match `name` and `url` to a remote already in the repository when one exists.
+`ensure_remote` rewrites the URL whenever the configured one differs, so an
+`https://` URL here against a `git://` remote flips it back and forth on every
+pass.
 
 ### `[review]`
 
@@ -220,7 +244,7 @@ annotated example.
 | `defaults.cc` | list | `[]` | Static CC addresses. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses to ignore entirely. |
 | `defaults.subject_prefixes` | list | `[]` | Subject prefix patterns to match for this scope. |
-| `defaults.embargo_hours` | integer | -- | Hours to wait before sending a review. When a patch matches multiple subsystems, the shortest configured embargo wins. |
+| `defaults.embargo_hours` | integer | -- | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. When a patch matches multiple subsystems, the shortest configured embargo wins. |
 | `defaults.send_positive_review` | bool | `false` | Send email even when no issues are found. |
 
 The email policy also supports per-subsystem overrides via
@@ -236,6 +260,29 @@ fields as `[defaults]`, plus:
 | `patchwork.email` | string | -- | Email address for email-based Patchwork notifications. |
 | `patchwork.min_severity` | string | -- | Minimum finding severity to include in patchwork checks. Findings below this threshold are excluded. Accepts: `Low`, `Medium`, `High`, `Critical` (case-insensitive). Default: all findings included. |
 | `patchwork.fail_severity` | string | `High` | Minimum severity of NEW findings that triggers the `fail` check state instead of `warning`. New findings at or above this threshold produce `fail`; below it produce `warning`. Pre-existing findings never affect the check state. |
+
+### Author-only delivery
+
+A subsystem can **track** a mailing list (its patches are ingested and
+reviewed) while **not pinging** that list with the review email — sending
+only to the patch author instead. This is useful for silent /
+dashboard-only lists where individual contributors want direct reviews of
+their own patches without spamming the whole list.
+
+It is achieved with the existing flags, no extra key needed:
+
+```toml
+[subsystems.drm-intel]
+lists = ["intel-xe@lists.freedesktop.org"]
+reply_all = false          # never send to the public list
+reply_to_author = true     # send the review to the patch author
+cc_individuals = false     # drop non-list individual recipients
+```
+
+The list address is still matched via `lists` (so reviews happen), but
+`reply_all = false` strips it from the outgoing recipients, leaving only
+the author. Because each review targets exactly one author, this delivers
+reviews to individual developers without pinging the list.
 
 ### Patchwork integration
 

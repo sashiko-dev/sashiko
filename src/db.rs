@@ -74,6 +74,45 @@ pub struct ReleaseReview {
     pub findings: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchsetReviewOutcome {
+    Clean,
+    HasFindings,
+    Incomplete,
+}
+
+const CLEAN_PATCHSET_PREDICATE: &str = "
+    EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Skipped'
+          AND r.result_description = 'Skipped AI review via --no-ai'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM patches pa
+        WHERE pa.patchset_id = p.id
+          AND COALESCE(pa.status, '') != 'Skipped'
+          AND NOT EXISTS (
+              SELECT 1 FROM reviews skipped
+              WHERE skipped.patch_id = pa.id
+                AND skipped.status = 'Skipped'
+                AND skipped.result_description = 'Skipped: touches only ignored files'
+          )
+          AND (
+              SELECT COUNT(*) FROM reviews completed
+              WHERE completed.patch_id = pa.id
+                AND completed.status = 'Reviewed'
+          ) < COALESCE(p.target_review_count, 1)
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        JOIN findings f ON f.review_id = r.id
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MessageRow {
     pub id: i64,
@@ -475,6 +514,9 @@ impl Database {
         let _ = self.try_add_column("reviews", "logs", "TEXT").await;
         let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
         let _ = self
+            .try_create_index("idx_reviews_patch_status", "reviews", "patch_id, status")
+            .await;
+        let _ = self
             .try_add_column("reviews", "inline_review", "TEXT")
             .await;
         let _ = self
@@ -502,6 +544,9 @@ impl Database {
         let _ = self.try_add_column("patchsets", "provider", "TEXT").await;
         let _ = self
             .try_add_column("patchsets", "embargo_until", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "embargo_release_started_at", "INTEGER")
             .await;
         let _ = self.try_add_column("patchsets", "slug", "TEXT").await;
         let _ = self
@@ -2290,7 +2335,9 @@ impl Database {
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE patchsets SET embargo_until = NULL WHERE id = ?",
+                "UPDATE patchsets
+                 SET embargo_until = NULL, embargo_release_started_at = NULL
+                 WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -3242,23 +3289,26 @@ impl Database {
         Ok(patchsets)
     }
 
-    pub async fn get_expired_embargoed_patchsets(
+    pub async fn get_releasable_embargoed_patchsets(
         &self,
         now: i64,
         limit: usize,
     ) -> Result<Vec<PatchsetRow>> {
-        let mut rows = self.conn.query(
+        let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until
              FROM patchsets p
-             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL AND p.embargo_until <= ? 
-             AND NOT EXISTS (
-                 SELECT 1 FROM email_outbox eo 
-                 JOIN patches pa ON eo.patch_id = pa.id 
-                 WHERE pa.patchset_id = p.id
-             ) 
-             ORDER BY p.date ASC LIMIT ?",
-            libsql::params![now, limit as i64],
-        ).await?;
+             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+             AND (
+                 p.embargo_until <= ?
+                 OR ({CLEAN_PATCHSET_PREDICATE})
+             )
+             ORDER BY CASE WHEN p.embargo_until <= ? THEN 0 ELSE 1 END, p.date ASC LIMIT ?"
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, libsql::params![now - 600, now, now, limit as i64])
+            .await?;
 
         let mut patchsets = Vec::new();
         loop {
@@ -3303,6 +3353,117 @@ impl Database {
             }
         }
         Ok(patchsets)
+    }
+
+    pub async fn get_patchset_review_outcome(
+        &self,
+        patchset_id: i64,
+    ) -> Result<PatchsetReviewOutcome> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status, COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        };
+        let status: String = row.get(0).unwrap_or_default();
+        let target_review_count: i64 = row.get(1).unwrap_or(1);
+        if status != ReviewStatus::Reviewed.as_str() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut no_ai_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews
+                 WHERE patchset_id = ? AND status = 'Skipped'
+                   AND result_description = 'Skipped AI review via --no-ai'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if no_ai_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut incomplete_rows = self
+            .conn
+            .query(
+                "SELECT 1
+                 FROM patches p
+                 WHERE p.patchset_id = ?
+                   AND COALESCE(p.status, '') != 'Skipped'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews skipped
+                       WHERE skipped.patch_id = p.id
+                         AND skipped.status = 'Skipped'
+                         AND skipped.result_description = 'Skipped: touches only ignored files'
+                   )
+                   AND (
+                       SELECT COUNT(*) FROM reviews r
+                       WHERE r.patch_id = p.id AND r.status = 'Reviewed'
+                   ) < ?
+                 LIMIT 1",
+                libsql::params![patchset_id, target_review_count],
+            )
+            .await?;
+        if incomplete_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut reviewed_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews WHERE patchset_id = ? AND status = 'Reviewed' LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if reviewed_rows.next().await?.is_none() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut finding_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM findings f
+                 JOIN reviews r ON r.id = f.review_id
+                 WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if finding_rows.next().await?.is_some() {
+            Ok(PatchsetReviewOutcome::HasFindings)
+        } else {
+            Ok(PatchsetReviewOutcome::Clean)
+        }
+    }
+
+    pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
+        let sql = format!(
+            "UPDATE patchsets AS p SET embargo_release_started_at = ?
+             WHERE p.id = ? AND p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+               AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+               AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
+        );
+        let updated = self
+            .conn
+            .execute(&sql, libsql::params![now, id, now - 600, now])
+            .await?;
+        Ok(updated == 1)
+    }
+
+    pub async fn clear_patchset_embargo_release_claim(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET embargo_release_started_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn get_completed_reviews_for_release(
@@ -3799,6 +3960,18 @@ impl Database {
         target_url: &str,
         context: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchwork_outbox
+                 WHERE patch_msg_id = ? AND api_url = ? AND context = ?",
+                libsql::params![patch_msg_id, api_url, context],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -3929,6 +4102,23 @@ impl Database {
         references_hdr: &str,
         body: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM email_outbox
+                 WHERE patch_id IS NULL AND to_addresses = ? AND subject = ? AND in_reply_to = ?",
+                libsql::params![
+                    serde_json::to_string(&[to_address])
+                        .map_err(|e| libsql::Error::Misuse(e.to_string()))?,
+                    subject,
+                    in_reply_to
+                ],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         let to_json = serde_json::to_string(&[to_address])
             .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
@@ -4506,6 +4696,205 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_clean_patchset_is_releasable_before_embargo_expiry() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_clean_embargo", "Clean Embargo", 70000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_clean_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Clean Embargo",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_clean_embargo",
+                "Clean Embargo",
+                "Author <author@example.com>",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_clean_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Review completed successfully.",
+            Some("clean"),
+            None,
+            Some("No issues found."),
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(releasable.iter().any(|patchset| patchset.id == ps_id));
+
+        assert!(db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(!db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(
+            db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.clear_patchset_embargo_release_claim(ps_id)
+            .await
+            .unwrap();
+
+        db.update_patchset_status(ps_id, "Pending").await.unwrap();
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "Pre-existing issue".to_string(),
+            preexisting: Some(true),
+            locations: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::HasFindings
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    #[tokio::test]
+    async fn test_no_ai_review_is_not_clean() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_no_ai_embargo", "No AI Embargo", 71000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_no_ai_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "No AI Embargo",
+            71000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_no_ai_embargo",
+                "No AI Embargo",
+                "Author <author@example.com>",
+                71000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_no_ai_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Skipped",
+            "Skipped AI review via --no-ai",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        let releasable = db.get_releasable_embargoed_patchsets(now, 1).await.unwrap();
+        assert!(releasable.iter().all(|patchset| patchset.id != ps_id));
     }
 
     #[tokio::test]

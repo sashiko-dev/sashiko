@@ -267,6 +267,25 @@ Copy `examples/Settings.devin-cli.toml` to your `Settings.toml` and adjust as ne
 - Each review may spawn many `devin` processes. Lower `review.concurrency`
   if you hit subscription rate limits.
 
+## Ollama
+
+[Ollama](https://ollama.com/) allows running LLMs locally.
+
+**Prerequisites:** Install Ollama and pull your desired model (e.g., `ollama pull deepseek-v3`).
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.ollama.toml Settings.toml
+```
+
+**What you get:**
+
+- Private, local execution of LLMs
+- Support for reasoning models via the `think` setting
+- No API key or subscription required
+- `context_window_size` maps to Ollama's `num_ctx`
+
 ## OpenAI-Compatible Providers
 
 Sashiko includes an OpenAI-compatible provider for endpoints that
@@ -279,3 +298,30 @@ cp docs/examples/Settings.openai-compat.toml Settings.toml
 ```
 
 Adjust `base_url` to point to your provider's endpoint.
+
+`base_url` may be either:
+
+- a shorthand such as `http://localhost:8080/v1` (the `/chat/completions`
+  suffix is appended automatically), or
+- the full chat completions URL, e.g.
+  `https://api.z.ai/api/coding/paas/v4/chat/completions`. Use this form for
+  providers whose path is not a recognised shorthand.
+
+**z.ai / Zhipu (glm-*) example:**
+
+z.ai exposes two OpenAI-compatible gateways with **separate billing**: a
+direct API (`…/api/paas/v4/…`, billed to the API resource package) and a
+coding-plan gateway (`…/api/coding/paas/v4/…`, billed to the coding-plan
+subscription). To review against the coding-plan quota, point `base_url` at
+the full coding endpoint and set `LLM_API_KEY` (or `OPENAI_API_KEY`):
+
+```toml
+[ai]
+provider = "openai-compatible"
+model = "glm-5.2"
+
+[ai.openai_compat]
+base_url = "https://api.z.ai/api/coding/paas/v4/chat/completions"
+context_window_size = 128000
+max_tokens = 16384
+```
