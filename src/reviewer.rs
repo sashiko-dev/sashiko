@@ -76,10 +76,8 @@ fn is_xfstests_patch(diff: &str) -> bool {
 
     !files.is_empty()
         && files.iter().all(|file| {
-            let mut components = file.split('/');
-            components.next() == Some("tests")
-                && components.next().is_some_and(|part| !part.is_empty())
-                && components.next().is_some_and(|part| !part.is_empty())
+            let mut components = file.split('/').filter(|part| !part.is_empty());
+            components.next() == Some("tests") && components.count() >= 2
         })
 }
 
