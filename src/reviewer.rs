@@ -32,7 +32,10 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -62,13 +65,20 @@ struct BaselineAttempt {
     log: String,
 }
 
-fn generate_id() -> String {
+static INTERACTION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn generate_interaction_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let start = SystemTime::now();
-    let since_the_epoch = start
+    let epoch_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    format!("rev_{}", since_the_epoch.as_millis())
+        .unwrap_or_default()
+        .as_millis();
+    generate_interaction_id_at(epoch_millis)
+}
+
+fn generate_interaction_id_at(epoch_millis: u128) -> String {
+    let sequence = INTERACTION_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("rev_{}_{}", epoch_millis, sequence)
 }
 
 /// The `Reviewer` service orchestrates the review process for patchsets.
@@ -1225,7 +1235,7 @@ impl Reviewer {
 
                     let interaction_id = if let Some(tokens_in) = json_output["tokens_in"].as_u64()
                     {
-                        let i_id = generate_id();
+                        let i_id = generate_interaction_id();
                         let input_ctx = json_output["input_context"].as_str().unwrap_or("");
                         let output_raw = if let Some(r) = json_output.get("review") {
                             r.to_string()
@@ -2462,6 +2472,7 @@ mod tests {
     use crate::db::Database;
     use crate::settings::Settings;
     use async_trait::async_trait;
+    use std::collections::HashSet;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{
@@ -2469,6 +2480,16 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn interaction_ids_are_unique_with_the_same_timestamp() {
+        let ids: HashSet<_> = (0..1_000)
+            .map(|_| generate_interaction_id_at(1_234))
+            .collect();
+
+        assert_eq!(ids.len(), 1_000);
+        assert!(ids.iter().all(|id| id.starts_with("rev_1234_")));
+    }
 
     struct MockProvider;
     #[async_trait]
