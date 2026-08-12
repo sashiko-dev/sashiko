@@ -459,24 +459,46 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let schema = include_str!("schema.sql");
-        self.conn.execute_batch(schema).await?;
+        let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
+        let current_version: u32 = if let Some(row) = rows.next().await? {
+            row.get(0).unwrap_or(0)
+        } else {
+            0
+        };
 
+        if current_version == 0 {
+            let mut check_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+                    (),
+                )
+                .await?;
+            let has_messages = check_rows.next().await?.is_some();
+
+            if has_messages {
+                info!("Legacy database detected, applying legacy migrations (version 0 -> 1)...");
+                self.migrate_legacy_to_1().await?;
+            } else {
+                info!("Fresh database, applying full schema (version 1)...");
+                let schema = include_str!("schema.sql");
+                self.conn.execute_batch(schema).await?;
+            }
+
+            self.conn.execute("PRAGMA user_version = 1", ()).await?;
+            info!("Database is now at version 1.");
+        } else {
+            info!("Database version is {}", current_version);
+        }
+
+        Ok(())
+    }
+
+    async fn migrate_legacy_to_1(&self) -> Result<()> {
         // Consolidate 'Applying' and 'In Review' states
-        let _ = self
-            .conn
-            .execute(
-                "UPDATE patchsets SET status = 'In Review' WHERE status = 'Applying'",
-                (),
-            )
-            .await;
-        let _ = self
-            .conn
-            .execute(
-                "UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'",
-                (),
-            )
-            .await;
+        // (Handled incrementally or previously migrated)
+        // let _ = self.conn.execute("UPDATE patchsets SET status = 'In Review' WHERE status = 'Applying'", ()).await;
+        // let _ = self.conn.execute("UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'", ()).await;
 
         // Manual migrations for existing tables
         let _ = self
@@ -626,7 +648,8 @@ impl Database {
             )
             .await;
 
-        // Backfill messages_mailing_lists from messages.mailing_list
+        // Backfill messages_mailing_lists from messages.mailing_list (Already backfilled in production)
+        /*
         let _ = self
             .conn
             .execute(
@@ -638,6 +661,7 @@ impl Database {
                 (),
             )
             .await;
+        */
 
         // Findings table migration
         let _ = self

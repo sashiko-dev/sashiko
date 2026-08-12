@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS patchsets (
     cc_recipients TEXT,
     baseline_id INTEGER,
     model_name TEXT,
+    mr_url TEXT,
+    mr_title TEXT,
+    mr_number INTEGER,
     prompts_git_hash TEXT,
     baseline_logs TEXT,
     failed_reason TEXT,
@@ -96,6 +99,8 @@ CREATE TABLE IF NOT EXISTS patches (
     message_id TEXT NOT NULL UNIQUE,
     part_index INTEGER,
     diff TEXT,
+    status TEXT,
+    apply_error TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(message_id) REFERENCES messages(message_id)
 );
@@ -271,3 +276,6 @@ CREATE TABLE IF NOT EXISTS patchwork_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(status);
 
+
+CREATE INDEX IF NOT EXISTS idx_reviews_patch_status ON reviews(patch_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL;

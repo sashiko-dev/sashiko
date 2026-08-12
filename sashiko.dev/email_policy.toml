@@ -59,7 +59,7 @@ reply_to_author = true
 cc = ["dri-devel@lists.freedesktop.org"]
 
 [subsystems.intel-gfx]
-cc = ["intel-gfx@lists.freedesktop.org"]
+lists = ["intel-gfx@lists.freedesktop.org"]
 reply_to_author = true
 cc = ["intel-gfx@lists.freedesktop.org"]
 

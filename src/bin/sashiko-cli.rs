@@ -225,16 +225,21 @@ async fn main() -> Result<()> {
         .unwrap();
 
     // Load settings, falling back to defaults if file missing/invalid
-    let base_url = cli.server.unwrap_or_else(|| {
-        Settings::new()
-            .map(|s| {
-                if s.server.host.contains(':') {
-                    format!("http://[::1]:{}", s.server.port)
-                } else {
-                    format!("http://{}:{}", s.server.host, s.server.port)
-                }
-            })
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+    let base_url = cli.server.unwrap_or_else(|| match Settings::new() {
+        Ok(s) => {
+            if s.server.host.contains(':') {
+                format!("http://[::1]:{}", s.server.port)
+            } else {
+                format!("http://{}:{}", s.server.host, s.server.port)
+            }
+        }
+        Err(e) => {
+            if e.to_string().contains("not found") {
+                "http://127.0.0.1:8080".to_string()
+            } else {
+                panic!("Failed to parse Settings.toml: {}", e);
+            }
+        }
     });
 
     let client = Client::new();

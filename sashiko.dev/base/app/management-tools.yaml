@@ -16,7 +16,7 @@ data:
     DB_PATH="/data/db/sashiko.db"
     BUCKET="${BACKUP_BUCKET:-gs://BACKUP_BUCKET}"
     TIMESTAMP=$(date '+%Y-%m-%d_%Hh-%Mm-%Ss-%Z')
-    TEMP_BACKUP="/tmp/sashiko_backup.db"
+    TEMP_BACKUP="/data/sashiko_backup.db"
 
     echo "--- Starting Backup at $(date) ---"
 

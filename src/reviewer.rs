@@ -2137,10 +2137,7 @@ impl Reviewer {
         };
 
         let policy = EmailPolicyConfig::load(&ctx.settings.review.email_policy_path)
-            .unwrap_or_else(|_| EmailPolicyConfig {
-                defaults: Default::default(),
-                subsystems: Default::default(),
-            });
+            .map_err(|e| anyhow::anyhow!("Failed to parse email policy: {}", e))?;
 
         let to_list: Vec<String> = msg_details
             .to
