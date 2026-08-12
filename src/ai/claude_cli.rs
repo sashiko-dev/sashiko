@@ -37,6 +37,7 @@ use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall,
 };
+use crate::utils::utf8_prefix;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaudeCliError {
@@ -144,9 +145,7 @@ impl AiProvider for ClaudeCliProvider {
             ))
             .into());
         }
-        let outer: Value = serde_json::from_str(&raw).map_err(|e| {
-            ClaudeCliError::Parse(format!("{}\nRaw: {}", e, &raw[..raw.len().min(200)]))
-        })?;
+        let outer = parse_cli_output(&raw)?;
 
         if outer["is_error"].as_bool().unwrap_or(false) {
             return Err(ClaudeCliError::Cli(
@@ -183,6 +182,11 @@ impl AiProvider for ClaudeCliProvider {
             context_window_size: context_window_for_model(&self.model),
         }
     }
+}
+
+fn parse_cli_output(raw: &str) -> Result<Value, ClaudeCliError> {
+    serde_json::from_str(raw)
+        .map_err(|e| ClaudeCliError::Parse(format!("{}\nRaw: {}", e, utf8_prefix(raw, 200))))
 }
 
 /// Pick the context window to advertise for a given model name. The value is
@@ -442,6 +446,16 @@ mod tests {
     use super::*;
     use crate::ai::{AiMessage, AiRequest, AiResponseFormat, AiRole, AiTool};
     use serde_json::json;
+
+    #[test]
+    fn test_parse_error_preview_handles_multibyte_cutoff() {
+        let raw = format!("{}🙂not-json", "a".repeat(199));
+
+        let error = parse_cli_output(&raw).unwrap_err();
+
+        assert!(matches!(&error, ClaudeCliError::Parse(_)));
+        assert!(error.to_string().contains(&"a".repeat(199)));
+    }
 
     fn make_request(messages: Vec<AiMessage>) -> AiRequest {
         AiRequest {
