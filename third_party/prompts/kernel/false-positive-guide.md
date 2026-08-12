@@ -166,6 +166,35 @@ the code behaves a certain way, you MUST verify against the actual implementatio
 - Understand subsystem ownership models
   - Output: quote subsystem convention or "no documented model"
 
+### 6.1. Cross-Function Cleanup Verification (MANDATORY)
+
+A resource is not leaked merely because the current function does not release
+it directly. Before retaining a leak concern, inspect every cleanup, unwind,
+destroy, unregister, or release helper reached by the candidate exit path.
+Open the helper body and follow its relevant callees far enough to determine
+what happens to the exact resource. Do not infer behavior from the helper's
+name alone.
+
+For a cleanup helper called conditionally, prove whether the condition is true
+for the path under review. Track the same object, field, reference, descriptor,
+or registration from acquisition through the helper. Account for nested
+cleanup helpers, managed-resource APIs, ownership transfer, and subsystem
+unregister functions that release resources internally.
+
+Retain the concern when concrete code shows that:
+
+- the condition can bypass cleanup on the failing path;
+- the helper releases a different resource or only performs partial cleanup;
+- ownership was never transferred to the component expected to release it; or
+- the relevant helper implementation is unavailable, making the release an
+  unverified assumption rather than proven cleanup.
+
+**Output Verification**:
+- Acquisition: [resource and location]
+- Cleanup call and condition: [helper, location, and evaluated condition]
+- Release or ownership transfer: [exact statement and location, or "not found"]
+- Verdict: [cleanup proven / leak proven / insufficient source context]
+
 ### 7. Order Changes
 **Don't report** order changes unless you can prove:
 - A race condition is introduced
