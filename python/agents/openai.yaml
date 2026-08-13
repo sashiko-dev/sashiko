@@ -1,0 +1,6 @@
+interface:
+  display_name: "GPU Driver Code Scan"
+  short_description: "Run programmatic local GPU driver scans"
+  default_prompt: "Use $gpu-driver-code-scan to scan an existing local GPU driver source directory and return the generated artifact paths."
+policy:
+  allow_implicit_invocation: true

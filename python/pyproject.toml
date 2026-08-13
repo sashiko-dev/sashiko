@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-driver-code-scan"
+version = "0.1.0"
+description = "Local Linux GPU driver source scanner powered by Sashiko"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "FFizzZZ" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+gpu-driver-code-scan = "gpu_driver_code_scan.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gpu_driver_code_scan = ["templates/*.md"]

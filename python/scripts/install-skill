@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+from __future__ import print_function
+
+import argparse
+import os
+import shutil
+import sys
+
+
+SKILL_NAME = "gpu-driver-code-scan"
+COPY_ENTRIES = [
+    "SKILL.md",
+    "agents",
+    "src",
+]
+SASHIKO_SETTINGS_SOURCE = os.path.join("config", "sashiko.toml")
+SASHIKO_SETTINGS_TARGET = os.path.join("sashiko", "Settings.toml")
+PROMPTS_SOURCE = os.path.join("sashiko", "third_party", "prompts", "kernel")
+PROMPTS_TARGET = PROMPTS_SOURCE
+REVIEW_BINARY_SOURCE = os.path.join("sashiko", "target", "release", "review")
+REVIEW_BINARY_TARGET = os.path.join("bin", "review")
+EXCLUDED_DIRS = {
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+}
+EXCLUDED_SUFFIXES = (
+    ".pyc",
+    ".pyo",
+)
+
+
+def repo_root():
+    return os.path.realpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    )
+
+
+def sashiko_root(root):
+    return os.path.realpath(os.path.join(root, ".."))
+
+
+def remove_path(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path) or os.path.islink(path):
+        os.remove(path)
+
+
+def ignore_names(_directory, names):
+    ignored = []
+    for name in names:
+        if name in EXCLUDED_DIRS or name.endswith(EXCLUDED_SUFFIXES):
+            ignored.append(name)
+    return ignored
+
+
+def copy_entry(source, target):
+    if os.path.isdir(source) and not os.path.islink(source):
+        shutil.copytree(source, target, ignore=ignore_names)
+    else:
+        parent = os.path.dirname(target)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
+        shutil.copy2(source, target)
+
+
+def required_sources(root):
+    sashiko = sashiko_root(root)
+    entries = list(COPY_ENTRIES)
+    entries.extend([
+        os.path.join(root, SASHIKO_SETTINGS_SOURCE),
+        os.path.join(sashiko, "third_party", "prompts", "kernel"),
+        os.path.join(sashiko, "target", "release", "review"),
+    ])
+    return entries
+
+
+def validate_sources(root):
+    missing = [
+        entry for entry in required_sources(root)
+        if not os.path.exists(entry)
+    ]
+    if missing:
+        raise RuntimeError("missing required entries: %s" % ", ".join(missing))
+    review_binary = os.path.join(sashiko_root(root), "target", "release", "review")
+    if not os.path.isfile(review_binary):
+        raise RuntimeError("Sashiko review binary is not a file: %s" % review_binary)
+    if not os.access(review_binary, os.X_OK):
+        raise RuntimeError(
+            "Sashiko review binary is not executable: %s" % review_binary
+        )
+
+
+def install(target_root, dry_run=False):
+    root = repo_root()
+    sashiko = sashiko_root(root)
+    validate_sources(root)
+    skills_dir = os.path.join(
+        os.path.realpath(os.path.expanduser(target_root)), "skills"
+    )
+    target = os.path.join(skills_dir, SKILL_NAME)
+
+    print("install %s -> %s" % (root, target))
+    operations = [
+        (os.path.join(root, entry), entry) for entry in COPY_ENTRIES
+    ]
+    operations.extend([
+        (os.path.join(root, SASHIKO_SETTINGS_SOURCE), SASHIKO_SETTINGS_TARGET),
+        (os.path.join(sashiko, "third_party", "prompts", "kernel"), PROMPTS_TARGET),
+        (os.path.join(sashiko, "target", "release", "review"), REVIEW_BINARY_TARGET),
+    ])
+    if dry_run:
+        for _source, destination in operations:
+            print("  copy %s" % destination)
+        return
+
+    if not os.path.isdir(skills_dir):
+        os.makedirs(skills_dir)
+    temporary = target + ".tmp"
+    if os.path.exists(temporary):
+        remove_path(temporary)
+    os.makedirs(temporary)
+    try:
+        for source_relative, target_relative in operations:
+            copy_entry(
+                source_relative,
+                os.path.join(temporary, target_relative),
+            )
+        if os.path.exists(target):
+            remove_path(target)
+        os.rename(temporary, target)
+    except Exception:
+        if os.path.exists(temporary):
+            remove_path(temporary)
+        raise
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        description="Install gpu-driver-code-scan into an Agent runtime."
+    )
+    parser.add_argument(
+        "--target",
+        required=True,
+        help="runtime root; installer writes <target>/skills/gpu-driver-code-scan",
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    install(args.target, args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
