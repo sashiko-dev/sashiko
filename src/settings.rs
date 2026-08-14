@@ -17,6 +17,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct SubsystemMapping {
     pub pattern: String,
@@ -24,6 +25,7 @@ pub struct SubsystemMapping {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct SubsystemsSettings {
     #[serde(default)]
@@ -31,6 +33,7 @@ pub struct SubsystemsSettings {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ProjectSettings {
     #[serde(default)]
@@ -40,6 +43,7 @@ pub struct ProjectSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ForgeSettings {
     #[serde(default)]
@@ -56,6 +60,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct DatabaseSettings {
     pub url: String,
@@ -63,6 +68,7 @@ pub struct DatabaseSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct NntpSettings {
     pub server: String,
@@ -70,6 +76,7 @@ pub struct NntpSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct SmtpSettings {
     pub server: String,
@@ -87,6 +94,7 @@ fn default_dry_run() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct MailingListsSettings {
     #[serde(deserialize_with = "deserialize_string_or_vec")]
@@ -137,6 +145,7 @@ fn default_max_input_tokens() -> usize {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ClaudeSettings {
     #[serde(default = "default_prompt_caching")]
@@ -156,6 +165,7 @@ fn default_claude_max_tokens() -> u32 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GeminiSettings {
     #[serde(default)]
@@ -164,6 +174,7 @@ pub struct GeminiSettings {
 
 #[cfg(feature = "bedrock")]
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct BedrockSettings {
     /// AWS region for Bedrock API calls (e.g. "us-east-1").
@@ -195,6 +206,7 @@ fn default_prompt_caching() -> bool {
 
 #[cfg(feature = "vertex")]
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct VertexSettings {
     /// GCP project ID. Falls back to ANTHROPIC_VERTEX_PROJECT_ID env var.
@@ -219,6 +231,7 @@ fn default_vertex_max_tokens() -> u32 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct OpenAiCompatSettings {
     #[serde(default)]
@@ -230,6 +243,7 @@ pub struct OpenAiCompatSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct OllamaSettings {
     #[serde(default)]
@@ -243,6 +257,7 @@ pub struct OllamaSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct KiroCliSettings {
     #[serde(default = "default_kiro_cli_binary")]
@@ -262,6 +277,7 @@ fn default_kiro_cli_context_window() -> usize {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ClaudeCliSettings {
     /// Effort level passed to `claude --effort`. Valid values per Claude Code:
@@ -271,6 +287,7 @@ pub struct ClaudeCliSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct DevinCliSettings {
     /// Path to a Devin declarative agent config file (JSON or YAML) passed via
@@ -286,6 +303,7 @@ pub struct DevinCliSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct AiSettings {
     pub provider: String,
@@ -339,6 +357,7 @@ fn default_max_interactions() -> usize {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ServerSettings {
     pub host: String,
@@ -348,6 +367,7 @@ pub struct ServerSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct CustomRemoteSettings {
     pub name: String,
@@ -357,6 +377,7 @@ pub struct CustomRemoteSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GitSettings {
     pub repository_path: String,
@@ -364,6 +385,7 @@ pub struct GitSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
@@ -432,6 +454,7 @@ fn default_log_level() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct Settings {
     #[serde(default = "default_log_level")]
@@ -555,6 +578,15 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_production_settings_is_valid() {
+        let path = "Settings.toml";
+        if Path::new(path).exists() {
+            let _ = Settings::from_file("Settings")
+                .expect("Production 'Settings.toml' failed to parse");
+        }
+    }
 
     #[test]
     fn test_local_review_path_prefers_current_directory() {

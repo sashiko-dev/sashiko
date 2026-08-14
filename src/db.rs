@@ -74,6 +74,45 @@ pub struct ReleaseReview {
     pub findings: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchsetReviewOutcome {
+    Clean,
+    HasFindings,
+    Incomplete,
+}
+
+const CLEAN_PATCHSET_PREDICATE: &str = "
+    EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Skipped'
+          AND r.result_description = 'Skipped AI review via --no-ai'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM patches pa
+        WHERE pa.patchset_id = p.id
+          AND COALESCE(pa.status, '') != 'Skipped'
+          AND NOT EXISTS (
+              SELECT 1 FROM reviews skipped
+              WHERE skipped.patch_id = pa.id
+                AND skipped.status = 'Skipped'
+                AND skipped.result_description = 'Skipped: touches only ignored files'
+          )
+          AND (
+              SELECT COUNT(*) FROM reviews completed
+              WHERE completed.patch_id = pa.id
+                AND completed.status = 'Reviewed'
+          ) < COALESCE(p.target_review_count, 1)
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        JOIN findings f ON f.review_id = r.id
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MessageRow {
     pub id: i64,
@@ -212,12 +251,12 @@ impl Database {
                 row.get::<Option<String>>(4).ok().flatten(),
                 row.get::<Option<String>>(5).ok().flatten(),
                 row.get::<Option<i64>>(6).ok().flatten(),
-                row.get::<Option<String>>(7).ok().flatten(),
+                crate::compression::get_compressed_string_opt(&row, 7).unwrap_or(None),
                 row.get::<Option<String>>(8).ok().flatten(),
                 row.get::<Option<String>>(9).ok().flatten(),
                 row.get::<Option<String>>(10).ok().flatten(),
                 row.get::<Option<String>>(11).ok().flatten(),
-                row.get::<Option<String>>(12).ok().flatten(),
+                crate::compression::get_compressed_string_opt(&row, 12).unwrap_or(None),
                 row.get::<Option<String>>(13).ok().flatten(),
             ))
         } else {
@@ -358,7 +397,8 @@ impl Database {
             .await?;
 
         if let Ok(Some(row)) = rows.next().await {
-            let body: Option<String> = row.get(0).ok();
+            let body: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 0).unwrap_or(None);
             if let Some(b) = body
                 && !b.is_empty()
             {
@@ -420,24 +460,46 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let schema = include_str!("schema.sql");
-        self.conn.execute_batch(schema).await?;
+        let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
+        let current_version: u32 = if let Some(row) = rows.next().await? {
+            row.get(0).unwrap_or(0)
+        } else {
+            0
+        };
 
+        if current_version == 0 {
+            let mut check_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+                    (),
+                )
+                .await?;
+            let has_messages = check_rows.next().await?.is_some();
+
+            if has_messages {
+                info!("Legacy database detected, applying legacy migrations (version 0 -> 1)...");
+                self.migrate_legacy_to_1().await?;
+            } else {
+                info!("Fresh database, applying full schema (version 1)...");
+                let schema = include_str!("schema.sql");
+                self.conn.execute_batch(schema).await?;
+            }
+
+            self.conn.execute("PRAGMA user_version = 1", ()).await?;
+            info!("Database is now at version 1.");
+        } else {
+            info!("Database version is {}", current_version);
+        }
+
+        Ok(())
+    }
+
+    async fn migrate_legacy_to_1(&self) -> Result<()> {
         // Consolidate 'Applying' and 'In Review' states
-        let _ = self
-            .conn
-            .execute(
-                "UPDATE patchsets SET status = 'In Review' WHERE status = 'Applying'",
-                (),
-            )
-            .await;
-        let _ = self
-            .conn
-            .execute(
-                "UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'",
-                (),
-            )
-            .await;
+        // (Handled incrementally or previously migrated)
+        // let _ = self.conn.execute("UPDATE patchsets SET status = 'In Review' WHERE status = 'Applying'", ()).await;
+        // let _ = self.conn.execute("UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'", ()).await;
 
         // Manual migrations for existing tables
         let _ = self
@@ -475,6 +537,9 @@ impl Database {
         let _ = self.try_add_column("reviews", "logs", "TEXT").await;
         let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
         let _ = self
+            .try_create_index("idx_reviews_patch_status", "reviews", "patch_id, status")
+            .await;
+        let _ = self
             .try_add_column("reviews", "inline_review", "TEXT")
             .await;
         let _ = self
@@ -502,6 +567,9 @@ impl Database {
         let _ = self.try_add_column("patchsets", "provider", "TEXT").await;
         let _ = self
             .try_add_column("patchsets", "embargo_until", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "embargo_release_started_at", "INTEGER")
             .await;
         let _ = self.try_add_column("patchsets", "slug", "TEXT").await;
         let _ = self
@@ -581,7 +649,8 @@ impl Database {
             )
             .await;
 
-        // Backfill messages_mailing_lists from messages.mailing_list
+        // Backfill messages_mailing_lists from messages.mailing_list (Already backfilled in production)
+        /*
         let _ = self
             .conn
             .execute(
@@ -593,6 +662,7 @@ impl Database {
                 (),
             )
             .await;
+        */
 
         // Findings table migration
         let _ = self
@@ -791,7 +861,11 @@ impl Database {
             self.conn
                 .execute(
                     "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                    libsql::params![status, l, review_id],
+                    libsql::params![
+                        status,
+                        crate::compression::compress_string_if_needed(l),
+                        review_id
+                    ],
                 )
                 .await?;
         } else {
@@ -819,7 +893,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
+                libsql::params![status, result, summary, interaction_id, inline_review.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), review_id],
             )
             .await?;
         Ok(())
@@ -835,8 +909,8 @@ impl Database {
                 params.workflow_id,
                 params.provider,
                 params.model,
-                params.input,
-                params.output,
+                crate::compression::compress_string_if_needed(params.input),
+                crate::compression::compress_string_if_needed(params.output),
                 params.tokens_in,
                 params.tokens_out,
                 params.tokens_cached,
@@ -1592,7 +1666,7 @@ impl Database {
                 git_blob_hash=excluded.git_blob_hash,
                 mailing_list=excluded.mailing_list,
                 references_hdr=excluded.references_hdr",
-            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, body, to, cc, git_blob_hash, mailing_list, references_hdr],
+            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, crate::compression::compress_string_if_needed(body), to, cc, git_blob_hash, mailing_list, references_hdr],
         ).await?;
         Ok(())
     }
@@ -2153,7 +2227,7 @@ impl Database {
                 patchset_id=excluded.patchset_id,
                 part_index=excluded.part_index,
                 diff=excluded.diff",
-            libsql::params![patchset_id, message_id, part_index, diff]
+            libsql::params![patchset_id, message_id, part_index, crate::compression::compress_string_if_needed(diff)]
         ).await?;
 
         // Update received_parts for the NEW patchset
@@ -2290,7 +2364,9 @@ impl Database {
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE patchsets SET embargo_until = NULL WHERE id = ?",
+                "UPDATE patchsets
+                 SET embargo_until = NULL, embargo_release_started_at = NULL
+                 WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -2459,7 +2535,7 @@ impl Database {
                 author: row.get(4).ok(),
                 subject: row.get(5).ok(),
                 date: row.get(6).ok(),
-                body: row.get(7).ok(),
+                body: crate::compression::get_compressed_string_opt(&row, 7).unwrap_or(None),
                 to: row.get(8).ok(),
                 cc: row.get(9).ok(),
                 git_blob_hash: row.get(10).ok(),
@@ -2580,7 +2656,8 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 14).unwrap_or(None);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -2714,11 +2791,11 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(3).ok(),
+                    "output": crate::compression::get_compressed_string_opt(&r, 3).unwrap_or(None),
                     "result": r.get::<Option<String>>(4).ok(),
                     "status": r.get::<Option<String>>(5).ok(),
-                    "inline_review": r.get::<Option<String>>(6).ok(),
-                    "logs": r.get::<Option<String>>(7).ok(),
+                    "inline_review": crate::compression::get_compressed_string_opt(&r, 6).unwrap_or(None),
+                    "logs": crate::compression::get_compressed_string_opt(&r, 7).unwrap_or(None),
                     "tokens_in": r.get::<Option<u32>>(8).ok(),
                     "tokens_out": r.get::<Option<u32>>(9).ok(),
                     "patch_id": r.get::<Option<i64>>(10).ok(),
@@ -2825,7 +2902,8 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 14).unwrap_or(None);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -2955,10 +3033,10 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(2).ok(),
+                    "output": crate::compression::get_compressed_string_opt(&r, 2).unwrap_or(None),
                     "result": r.get::<Option<String>>(3).ok(),
                     "status": r.get::<Option<String>>(4).ok(),
-                    "inline_review": r.get::<Option<String>>(5).ok(),
+                    "inline_review": crate::compression::get_compressed_string_opt(&r, 5).unwrap_or(None),
                     "tokens_in": r.get::<Option<u32>>(6).ok(),
                     "tokens_out": r.get::<Option<u32>>(7).ok(),
                     "patch_id": r.get::<Option<i64>>(8).ok(),
@@ -3126,8 +3204,8 @@ impl Database {
                 "model": r.get::<Option<String>>(1).ok(),
                 "summary": r.get::<Option<String>>(2).ok(),
                 "created_at": r.get::<Option<i64>>(3).ok(),
-                "input": r.get::<Option<String>>(4).ok(),
-                "output": r.get::<Option<String>>(5).ok(),
+                "input": crate::compression::get_compressed_string_opt(&r, 4).unwrap_or(None),
+                "output": crate::compression::get_compressed_string_opt(&r, 5).unwrap_or(None),
                 "baseline": {
                     "repo_url": r.get::<Option<String>>(6).ok(),
                     "branch": r.get::<Option<String>>(7).ok(),
@@ -3137,8 +3215,8 @@ impl Database {
                 "prompts_hash": r.get::<Option<String>>(10).ok(),
                 "result": r.get::<Option<String>>(11).ok(),
                 "status": r.get::<Option<String>>(12).ok(),
-                "inline_review": r.get::<Option<String>>(13).ok(),
-                "logs": r.get::<Option<String>>(14).ok(),
+                "inline_review": crate::compression::get_compressed_string_opt(&r, 13).unwrap_or(None),
+                "logs": crate::compression::get_compressed_string_opt(&r, 14).unwrap_or(None),
                 "tokens_in": r.get::<Option<u32>>(15).ok(),
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
@@ -3189,7 +3267,7 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             let index: i64 = row.get(1).unwrap_or(0);
-            let diff: String = row.get(2)?;
+            let diff: String = crate::compression::get_compressed_string(&row, 2)?;
             let subject: String = row.get(3).unwrap_or_default();
             let author: String = row.get(4).unwrap_or_default();
             let date: i64 = row.get(5).unwrap_or(0);
@@ -3242,23 +3320,26 @@ impl Database {
         Ok(patchsets)
     }
 
-    pub async fn get_expired_embargoed_patchsets(
+    pub async fn get_releasable_embargoed_patchsets(
         &self,
         now: i64,
         limit: usize,
     ) -> Result<Vec<PatchsetRow>> {
-        let mut rows = self.conn.query(
+        let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until
              FROM patchsets p
-             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL AND p.embargo_until <= ? 
-             AND NOT EXISTS (
-                 SELECT 1 FROM email_outbox eo 
-                 JOIN patches pa ON eo.patch_id = pa.id 
-                 WHERE pa.patchset_id = p.id
-             ) 
-             ORDER BY p.date ASC LIMIT ?",
-            libsql::params![now, limit as i64],
-        ).await?;
+             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+             AND (
+                 p.embargo_until <= ?
+                 OR ({CLEAN_PATCHSET_PREDICATE})
+             )
+             ORDER BY CASE WHEN p.embargo_until <= ? THEN 0 ELSE 1 END, p.date ASC LIMIT ?"
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, libsql::params![now - 600, now, now, limit as i64])
+            .await?;
 
         let mut patchsets = Vec::new();
         loop {
@@ -3305,6 +3386,117 @@ impl Database {
         Ok(patchsets)
     }
 
+    pub async fn get_patchset_review_outcome(
+        &self,
+        patchset_id: i64,
+    ) -> Result<PatchsetReviewOutcome> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status, COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        };
+        let status: String = row.get(0).unwrap_or_default();
+        let target_review_count: i64 = row.get(1).unwrap_or(1);
+        if status != ReviewStatus::Reviewed.as_str() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut no_ai_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews
+                 WHERE patchset_id = ? AND status = 'Skipped'
+                   AND result_description = 'Skipped AI review via --no-ai'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if no_ai_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut incomplete_rows = self
+            .conn
+            .query(
+                "SELECT 1
+                 FROM patches p
+                 WHERE p.patchset_id = ?
+                   AND COALESCE(p.status, '') != 'Skipped'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews skipped
+                       WHERE skipped.patch_id = p.id
+                         AND skipped.status = 'Skipped'
+                         AND skipped.result_description = 'Skipped: touches only ignored files'
+                   )
+                   AND (
+                       SELECT COUNT(*) FROM reviews r
+                       WHERE r.patch_id = p.id AND r.status = 'Reviewed'
+                   ) < ?
+                 LIMIT 1",
+                libsql::params![patchset_id, target_review_count],
+            )
+            .await?;
+        if incomplete_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut reviewed_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews WHERE patchset_id = ? AND status = 'Reviewed' LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if reviewed_rows.next().await?.is_none() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut finding_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM findings f
+                 JOIN reviews r ON r.id = f.review_id
+                 WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if finding_rows.next().await?.is_some() {
+            Ok(PatchsetReviewOutcome::HasFindings)
+        } else {
+            Ok(PatchsetReviewOutcome::Clean)
+        }
+    }
+
+    pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
+        let sql = format!(
+            "UPDATE patchsets AS p SET embargo_release_started_at = ?
+             WHERE p.id = ? AND p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+               AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+               AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
+        );
+        let updated = self
+            .conn
+            .execute(&sql, libsql::params![now, id, now - 600, now])
+            .await?;
+        Ok(updated == 1)
+    }
+
+    pub async fn clear_patchset_embargo_release_claim(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET embargo_release_started_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_completed_reviews_for_release(
         &self,
         patchset_id: i64,
@@ -3325,8 +3517,12 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let patch_id: i64 = row.get(1)?;
-            let inline_review: String = row.get(2).unwrap_or_default();
-            let summary: String = row.get(3).unwrap_or_default();
+            let inline_review: String = crate::compression::get_compressed_string_opt(&row, 2)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let summary: String = crate::compression::get_compressed_string_opt(&row, 3)
+                .unwrap_or(None)
+                .unwrap_or_default();
             let patch_message_id: String = row.get(4).unwrap_or_default();
             let index: i64 = row.get(5).unwrap_or_default();
             temp_reviews.push((
@@ -3602,7 +3798,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
-                libsql::params![baseline_id, model_name, prompts_hash, logs, provider, id],
+                libsql::params![baseline_id, model_name, prompts_hash, logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), provider, id],
             )
             .await?;
         Ok(())
@@ -3799,6 +3995,18 @@ impl Database {
         target_url: &str,
         context: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchwork_outbox
+                 WHERE patch_msg_id = ? AND api_url = ? AND context = ?",
+                libsql::params![patch_msg_id, api_url, context],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -3929,6 +4137,23 @@ impl Database {
         references_hdr: &str,
         body: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM email_outbox
+                 WHERE patch_id IS NULL AND to_addresses = ? AND subject = ? AND in_reply_to = ?",
+                libsql::params![
+                    serde_json::to_string(&[to_address])
+                        .map_err(|e| libsql::Error::Misuse(e.to_string()))?,
+                    subject,
+                    in_reply_to
+                ],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         let to_json = serde_json::to_string(&[to_address])
             .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
@@ -4506,6 +4731,205 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_clean_patchset_is_releasable_before_embargo_expiry() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_clean_embargo", "Clean Embargo", 70000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_clean_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Clean Embargo",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_clean_embargo",
+                "Clean Embargo",
+                "Author <author@example.com>",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_clean_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Review completed successfully.",
+            Some("clean"),
+            None,
+            Some("No issues found."),
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(releasable.iter().any(|patchset| patchset.id == ps_id));
+
+        assert!(db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(!db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(
+            db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.clear_patchset_embargo_release_claim(ps_id)
+            .await
+            .unwrap();
+
+        db.update_patchset_status(ps_id, "Pending").await.unwrap();
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "Pre-existing issue".to_string(),
+            preexisting: Some(true),
+            locations: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::HasFindings
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    #[tokio::test]
+    async fn test_no_ai_review_is_not_clean() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_no_ai_embargo", "No AI Embargo", 71000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_no_ai_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "No AI Embargo",
+            71000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_no_ai_embargo",
+                "No AI Embargo",
+                "Author <author@example.com>",
+                71000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_no_ai_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Skipped",
+            "Skipped AI review via --no-ai",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        let releasable = db.get_releasable_embargoed_patchsets(now, 1).await.unwrap();
+        assert!(releasable.iter().all(|patchset| patchset.id != ps_id));
     }
 
     #[tokio::test]

@@ -284,27 +284,11 @@ impl BaselineRegistry {
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
         candidates.extend(heuristic_candidates);
 
-        // 3. Linux Next
-        // Hardcoded linux-next URL
-        let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
-        candidates.push(self.resolve_url(linux_next_url, None));
-
-        // 4. Mainline
-        // Use the identified mainline remote (Linus tree or origin) as a
-        // RemoteTarget so that ensure_remote fetches it before use. A bare
-        // LocalRef("HEAD") would resolve to the local checkout, which nothing
-        // in Sashiko ever advances after fetching.
-        if let Some((url, name)) = &self.mainline_remote {
-            candidates.push(BaselineResolution::RemoteTarget {
-                url: url.clone(),
-                name: name.clone(),
-                branch: Some("master".to_string()),
-            });
-        } else {
-            candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
-        }
-
-        // 5. Custom Remotes
+        // 3. Custom Remotes
+        // Ahead of linux-next because the first candidate that applies wins,
+        // and a topic-branch series usually applies to linux-next too -- but
+        // against a stale snapshot: a daily build behind, and sharing no SHAs
+        // with the topic branch once the maintainer rebases.
         if let Some(custom_remotes) = &self.custom_remotes {
             for remote in custom_remotes {
                 // Fetch to ensure we have the latest branches (Issue 1)
@@ -349,6 +333,25 @@ impl BaselineRegistry {
                     }
                 }
             }
+        }
+
+        // 4. Linux Next
+        let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
+        candidates.push(self.resolve_url(linux_next_url, None));
+
+        // 5. Mainline
+        // Use the identified mainline remote (Linus tree or origin) as a
+        // RemoteTarget so that ensure_remote fetches it before use. A bare
+        // LocalRef("HEAD") would resolve to the local checkout, which nothing
+        // in Sashiko ever advances after fetching.
+        if let Some((url, name)) = &self.mainline_remote {
+            candidates.push(BaselineResolution::RemoteTarget {
+                url: url.clone(),
+                name: name.clone(),
+                branch: Some("master".to_string()),
+            });
+        } else {
+            candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
         }
 
         // Deduplicate
@@ -657,8 +660,8 @@ mod tests {
 
         let candidates = registry.resolve_candidates(&[], "Subject", None).await;
 
-        // The last candidate before custom remotes should be a RemoteTarget
-        // for origin/master, not a LocalRef("HEAD").
+        // The mainline candidate should be a RemoteTarget for origin/master,
+        // not a LocalRef("HEAD").
         let mainline = candidates.iter().find(|c| match c {
             BaselineResolution::RemoteTarget { name, branch, .. } => {
                 name == "origin" && branch.as_deref() == Some("master")
@@ -928,5 +931,51 @@ F: patterns/
             .collect();
 
         assert!(candidate_names.contains(&"dummy-repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_custom_remotes_precede_linux_next() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        std::process::Command::new("git")
+            .current_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+
+        let dummy_url = repo_path.join("dummy_remote").to_str().unwrap().to_string();
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "topic-tree".to_string(),
+                url: dummy_url,
+                check_all_branches: false,
+                only_branches: Some(vec!["topic-next".to_string()]),
+            }]),
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let names: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let pos_custom = names.iter().position(|n| n == "topic-tree").unwrap();
+        let pos_next = names.iter().position(|n| n == "linux-next").unwrap();
+        assert!(
+            pos_custom < pos_next,
+            "custom remote at {} should precede linux-next at {}: {:?}",
+            pos_custom,
+            pos_next,
+            names
+        );
     }
 }

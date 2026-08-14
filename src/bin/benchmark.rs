@@ -451,7 +451,7 @@ async fn process_entry(
             tokens_out = row.get::<i64>(1).unwrap_or(0) as u32;
             let int_created_at = row.get::<i64>(2).unwrap_or(0);
 
-            if let Ok(Some(output_raw)) = row.get::<Option<String>>(3)
+            if let Ok(Some(output_raw)) = sashiko::compression::get_compressed_string_opt(&row, 3)
                 && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output_raw)
                 && let Some(count) = parsed.get("concerns_count").and_then(|v| v.as_u64())
             {

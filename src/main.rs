@@ -677,8 +677,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total_ingested = 0;
         let mut total_errors = 0;
 
-        let policy =
-            sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml").unwrap_or_default();
+        let policy = sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml")
+            .expect("Failed to parse email_policy.toml");
 
         loop {
             let count = parsed_rx.recv_many(&mut buffer, 100).await;
@@ -793,6 +793,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize custom remotes
+    // Start Background Compressor Worker
+    tokio::spawn(sashiko::worker::compressor::run_compressor(db.clone()));
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 
     // Clean up stale worktree directories on disk first
@@ -860,6 +862,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Keep the main thread running
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 

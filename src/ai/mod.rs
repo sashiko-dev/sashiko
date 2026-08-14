@@ -627,6 +627,12 @@ pub(crate) struct IpcEnvelope {
 
 pub(crate) struct IpcRegistry {
     next_tx_id: std::sync::atomic::AtomicU64,
+    // Set by abort_all() when the reader stops.  Both the store and the load
+    // in register() happen under the pending lock, so a registration racing
+    // the shutdown either lands before the drain and is aborted by it, or
+    // observes the flag and fails instead of waiting for a reply that can no
+    // longer arrive.
+    closed: std::sync::atomic::AtomicBool,
     pending: tokio::sync::Mutex<
         std::collections::HashMap<
             u64,
@@ -639,8 +645,15 @@ impl IpcRegistry {
     pub fn new() -> Self {
         Self {
             next_tx_id: std::sync::atomic::AtomicU64::new(1),
+            closed: std::sync::atomic::AtomicBool::new(false),
             pending: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Advisory check for callers that want to skip work on a dead channel.
+    /// register() makes the authoritative decision under the pending lock.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn next_id(&self) -> u64 {
@@ -652,8 +665,14 @@ impl IpcRegistry {
         &self,
         tx_id: u64,
         tx: tokio::sync::oneshot::Sender<Result<AiResponse, RemoteAiError>>,
-    ) {
+    ) -> Result<(), RemoteAiError> {
         let mut map = self.pending.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            });
+        }
         if map.insert(tx_id, tx).is_some() {
             eprintln!(
                 "CRITICAL PROTOCOL ERROR: Duplicate transaction ID {} registered!",
@@ -661,6 +680,7 @@ impl IpcRegistry {
             );
             std::process::exit(1);
         }
+        Ok(())
     }
 
     pub async fn dispatch(&self, tx_id: u64, result: Result<AiResponse, RemoteAiError>) {
@@ -678,6 +698,7 @@ impl IpcRegistry {
 
     pub async fn abort_all(&self, err: RemoteAiError) {
         let mut map = self.pending.lock().await;
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         for (_tx_id, sender) in map.drain() {
             let _ = sender.send(Err(err.clone()));
         }
@@ -717,7 +738,49 @@ impl Default for AtomicWriter {
     }
 }
 
-pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
+// Concurrent reviews each build a fresh provider.  A registry per provider
+// would restart tx_ids at 1 and add a second reader on the shared stdin, so
+// a response could land in a registry that never issued that id.
+static IPC_REGISTRY: std::sync::OnceLock<Arc<IpcRegistry>> = std::sync::OnceLock::new();
+static IPC_WRITER: std::sync::OnceLock<Arc<AtomicWriter>> = std::sync::OnceLock::new();
+// Holding the join handle rather than a "started" flag lets
+// ensure_stdin_reader() tell a running reader from one that has stopped --
+// stdin EOF, a read error, or the runtime it was spawned on being dropped --
+// and replace it, so a later request never waits on a reply that nothing is
+// left to deliver.
+static IPC_READER: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn ipc_registry() -> Arc<IpcRegistry> {
+    IPC_REGISTRY
+        .get_or_init(|| Arc::new(IpcRegistry::new()))
+        .clone()
+}
+
+pub(crate) fn ipc_writer() -> Arc<AtomicWriter> {
+    IPC_WRITER
+        .get_or_init(|| Arc::new(AtomicWriter::new()))
+        .clone()
+}
+
+/// Spawns the stdin reader unless one is already running on this runtime.
+pub(crate) fn ensure_stdin_reader() {
+    let registry = ipc_registry();
+
+    // Once the channel has closed it stays closed, so a replacement reader
+    // would do nothing but hit EOF again.  register() reports the failure.
+    if registry.is_closed() {
+        return;
+    }
+
+    let mut reader = IPC_READER.lock().unwrap();
+    if matches!(reader.as_ref(), Some(handle) if !handle.is_finished()) {
+        return;
+    }
+    *reader = Some(start_stdin_reader(registry));
+}
+
+pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let stdin = tokio::io::stdin();
@@ -725,20 +788,12 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
         let mut lines = reader.lines();
 
         while let Ok(Some(line)) = lines.next_line().await {
-            let active_registry = match registry.upgrade() {
-                Some(r) => r,
-                None => {
-                    tracing::info!("IPC Registry dropped, shutting down stdin reader task.");
-                    break;
-                }
-            };
-
             if let Ok(envelope) = serde_json::from_str::<IpcEnvelope>(&line) {
                 match envelope.msg_type.as_str() {
                     "ai_response" => {
                         if let Ok(payload) = serde_json::from_value::<AiResponse>(envelope.payload)
                         {
-                            active_registry.dispatch(envelope.tx_id, Ok(payload)).await;
+                            registry.dispatch(envelope.tx_id, Ok(payload)).await;
                         } else {
                             eprintln!(
                                 "CRITICAL PROTOCOL ERROR: Failed to parse payload as AiResponse for tx_id {}",
@@ -751,7 +806,7 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
                         if let Ok(payload) =
                             serde_json::from_value::<RemoteAiErrorPayload>(envelope.payload)
                         {
-                            active_registry
+                            registry
                                 .dispatch(envelope.tx_id, Err(payload.into_error()))
                                 .await;
                         } else {
@@ -776,15 +831,13 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
             }
         }
 
-        if let Some(active_registry) = registry.upgrade() {
-            active_registry
-                .abort_all(RemoteAiError {
-                    message: "IPC channel disconnected (stdin closed)".to_string(),
-                    class: AiErrorClass::Fatal,
-                })
-                .await;
-        }
-    });
+        registry
+            .abort_all(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            })
+            .await;
+    })
 }
 
 #[cfg(test)]
@@ -1158,5 +1211,43 @@ mod tests {
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    // Providers built for concurrent reviews share one tx_id namespace.
+    // next_id() is deliberately not called here: the counter is process-wide,
+    // and advancing it would make any test that asserts a concrete tx_id
+    // depend on the order the test threads happen to run in.
+    #[test]
+    fn test_ipc_singletons_are_shared() {
+        assert!(Arc::ptr_eq(&ipc_registry(), &ipc_registry()));
+        assert!(Arc::ptr_eq(&ipc_writer(), &ipc_writer()));
+    }
+
+    // A request issued after the reader stopped fails instead of waiting for
+    // a reply that can no longer arrive.  Uses its own registry so the
+    // process-wide one is not closed for every other test in the binary.
+    #[tokio::test]
+    async fn test_register_after_disconnect_fails() {
+        let registry = IpcRegistry::new();
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        registry
+            .register(1, tx)
+            .await
+            .expect("an open registry accepts a registration");
+
+        registry
+            .abort_all(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            })
+            .await;
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = registry
+            .register(2, tx)
+            .await
+            .expect_err("a closed registry rejects a registration");
+        assert!(matches!(err.class, AiErrorClass::Fatal));
     }
 }

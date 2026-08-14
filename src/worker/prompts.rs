@@ -359,6 +359,46 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
         Ok((content, clean))
     }
 
+    /// Append the same per-stage guide files that [`Self::get_stage_prompt`]
+    /// appends, for pipelines that supply their own instruction text via
+    /// `StagePrompt::Override` (which bypasses `get_stage_prompt`).
+    pub async fn append_stage_guides(
+        &self,
+        stage: u8,
+        content: &mut String,
+        clean: &mut String,
+    ) -> Result<()> {
+        let mut clean_files = Vec::new();
+        match stage {
+            3 => {
+                self.append_file(content, &mut clean_files, "callstack.md")
+                    .await?;
+                self.append_file(content, &mut clean_files, "technical-patterns.md")
+                    .await?;
+            }
+            5 => {
+                self.append_file(content, &mut clean_files, "subsystem/locking.md")
+                    .await?;
+            }
+            10 => {
+                self.append_file(content, &mut clean_files, "false-positive-guide.md")
+                    .await?;
+                self.append_file(content, &mut clean_files, "severity.md")
+                    .await?;
+            }
+            11 => {
+                self.append_file(content, &mut clean_files, "inline-template.md")
+                    .await?;
+            }
+            _ => {}
+        }
+        if !clean_files.is_empty() {
+            clean.push_str(&clean_files.join(", "));
+            clean.push_str("\n\n");
+        }
+        Ok(())
+    }
+
     async fn append_file(
         &self,
         buffer: &mut String,
@@ -1634,6 +1674,51 @@ Example:
             history: result.history,
         })
     }
+}
+
+/// Run a single review stage through the shared `SessionRunner` machinery.
+///
+/// Additive helper used by the general pipeline executor (`crate::pipelines`).
+/// It constructs the module-private `ReviewStageSession` exactly like
+/// `Worker::execute_stage`, so alternate pipelines reuse the identical tool
+/// loop, validation, and recitation handling. The default patch-review path
+/// (`Worker::run` / `Worker::execute_stage`) is untouched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_review_stage(
+    provider: &dyn AiProvider,
+    tools: std::sync::Arc<ToolBox>,
+    temperature: f32,
+    max_interactions: usize,
+    context_tag: Option<&str>,
+    stage: Box<dyn ReviewStage>,
+    system_prompt: String,
+    user_prompt: String,
+    clean_user_prompt: String,
+    progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+) -> Result<crate::ai::session::SessionResult<serde_json::Value>> {
+    let stage_num = stage.number();
+    let mut session = ReviewStageSession::new(
+        stage,
+        system_prompt,
+        user_prompt,
+        clean_user_prompt,
+        tools,
+        temperature,
+        context_tag,
+    );
+    let runner = SessionRunner::new(provider)
+        .with_max_validation_attempts(3)
+        .with_max_turns(max_interactions)
+        .with_turn_callback(move |turn, max_turns| {
+            if let Some(cb) = progress {
+                cb(WorkerProgressEvent::StageTurn {
+                    stage: stage_num,
+                    turn,
+                    max_turns,
+                });
+            }
+        });
+    runner.run(&mut session).await
 }
 
 struct StageExecutionResult {
