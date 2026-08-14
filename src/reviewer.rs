@@ -1516,6 +1516,14 @@ impl Reviewer {
     }
 }
 
+fn child_ai_provider(provider: &str) -> &'static str {
+    match provider {
+        "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "traecli" | "copilot-cli"
+        | "kiro-cli" => "stdio-claude",
+        _ => "stdio-gemini",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_review_tool(
     patchset_id: i64,
@@ -1559,12 +1567,7 @@ async fn run_review_tool(
         "--worktree-dir",
         &settings.review.worktree_dir,
         "--ai-provider",
-        match settings.ai.provider.as_str() {
-            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli" => {
-                "stdio-claude"
-            }
-            _ => "stdio-gemini",
-        },
+        child_ai_provider(&settings.ai.provider),
     ]);
 
     cmd.env_clear();
@@ -2493,6 +2496,22 @@ mod tests {
 
         assert_eq!(ids.len(), 1_000);
         assert!(ids.iter().all(|id| id.starts_with("rev_1234_")));
+    }
+
+    #[test]
+    fn cli_providers_use_the_stdio_claude_child_protocol() {
+        for provider in [
+            "claude",
+            "stdio-claude",
+            "claude-cli",
+            "codex-cli",
+            "traecli",
+            "copilot-cli",
+            "kiro-cli",
+        ] {
+            assert_eq!(child_ai_provider(provider), "stdio-claude");
+        }
+        assert_eq!(child_ai_provider("gemini"), "stdio-gemini");
     }
 
     struct MockProvider;
