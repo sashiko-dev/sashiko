@@ -23,6 +23,8 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 
 - **Automated Ingestion**: Monitors mailing lists (`lore.kernel.org`), GitHub PRs, and GitLab MRs for new patch submissions.
 - **Manual Ingestion**: Can ingest patches from local git repositories or specific PRs/MRs.
+- **Codebase Scan** *(Experimental)*: Audits an existing source tree without
+  requiring a commit or patch boundary.
 - **Forge Integration** *(Experimental)*: Automatic PR/MR review via GitHub and GitLab webhooks. This feature is unofficial and unsupported — use at your own risk.
 - **Self-contained**: Doesn't depend on 3rd-party tools and works with multiple LLM providers (Gemini, Claude, and GitHub Copilot CLI are currently supported).
 - **Web interface and CLI**: Provides a web interface for monitoring and a CLI tool for local development. Email support will be added soon.
@@ -160,6 +162,14 @@ This mode:
 * Uses a temporary scratch clone for patch application, leaving your source checkout and its git metadata untouched.
 
 For local review, Sashiko loads settings from `./Settings.toml` if it exists in the current directory, otherwise from `~/.config/sashiko.toml`. Use `--settings <path>` to point to a specific settings file.
+
+#### Codebase Scan (Experimental)
+
+To review an existing source tree without a useful commit boundary, use the
+optional [Codebase Scan tool](tools/codebase-scan/README.md). It inventories
+the source, submits bounded synthetic diffs to Sashiko, and produces versioned
+artifacts plus a Markdown report. The tool remains separate from the core
+review engine and daemon.
 
 ### 2. Daemon Mode
 

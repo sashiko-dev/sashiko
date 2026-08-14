@@ -44,6 +44,9 @@ lint:
 # Run unit tests
 test:
 	@cargo test --release
+	@cargo build --release --bin review
+	@PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/codebase-scan/src \
+		python3 -m unittest discover -s tools/codebase-scan/tests -p 'test_*.py'
 
 # Remove build artifacts
 clean:

@@ -13,5 +13,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
+      - name: Setup Python Toolchain
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
       - name: Run cargo-test via Makefile
         run: make test

@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="500" viewBox="0 0 1440 500" role="img" aria-labelledby="title desc">
+  <title id="title">Codebase Scan strategy</title>
+  <desc id="desc">A left-to-right flow from local source inventory through grouping, risk sorting, synthetic diff creation, Sashiko review, and artifact validation.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#5b8ff9"/>
+    </marker>
+  </defs>
+  <rect x="1" y="1" width="1438" height="498" rx="24" fill="#f7f8fa" stroke="#98a2b3"/>
+  <text x="720" y="58" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#1f2329">Local Scan Strategy</text>
+  <text x="720" y="88" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">Full source context, bounded review scope, deterministic coverage</text>
+
+  <g data-role="flow-step">
+    <rect x="55" y="160" width="190" height="150" rx="18" fill="#ffffff" stroke="#98a2b3"/>
+    <text x="150" y="205" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#1f2329">1. Inventory</text>
+    <text x="150" y="237" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Enumerate C, headers,</text>
+    <text x="150" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Rust and assembly</text>
+    <text x="150" y="288" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">Exclude generated/tests</text>
+  </g>
+
+  <g data-role="flow-step">
+    <rect x="285" y="160" width="190" height="150" rx="18" fill="#ffffff" stroke="#98a2b3"/>
+    <text x="380" y="205" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#1f2329">2. Group</text>
+    <text x="380" y="237" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Family by directory</text>
+    <text x="380" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Split into line regions</text>
+    <text x="380" y="288" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">File / line / byte budgets</text>
+  </g>
+
+  <g data-role="flow-step">
+    <rect x="515" y="160" width="190" height="150" rx="18" fill="#ffffff" stroke="#5b8ff9"/>
+    <text x="610" y="205" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#1f2329">3. Risk Sort</text>
+    <text x="610" y="237" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">UVM, faults, DMA,</text>
+    <text x="610" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">userspace, lifetime</text>
+    <text x="610" y="288" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">Highest score first</text>
+  </g>
+
+  <g data-role="flow-step">
+    <rect x="745" y="145" width="220" height="180" rx="18" fill="#f3f1eb" stroke="#8e877a"/>
+    <text x="855" y="190" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#1f2329">4. Synthetic Diff</text>
+    <text x="855" y="225" text-anchor="middle" font-family="monospace" font-size="14" fill="#1f2329">Baseline = T - G</text>
+    <text x="855" y="252" text-anchor="middle" font-family="monospace" font-size="14" fill="#1f2329">Target = T</text>
+    <text x="855" y="282" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Diff focuses group G</text>
+    <text x="855" y="305" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">Target keeps full tree context</text>
+  </g>
+
+  <g data-role="flow-step">
+    <rect x="1005" y="160" width="190" height="150" rx="18" fill="#ffffff" stroke="#5b8ff9"/>
+    <text x="1100" y="205" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#1f2329">5. Sashiko</text>
+    <text x="1100" y="237" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Review Stage 3–7</text>
+    <text x="1100" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Verify and normalize</text>
+    <text x="1100" y="288" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">Concurrent groups</text>
+  </g>
+
+  <g data-role="flow-step">
+    <rect x="1235" y="160" width="150" height="150" rx="18" fill="#ffffff" stroke="#98a2b3"/>
+    <text x="1310" y="205" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#1f2329">6. Artifacts</text>
+    <text x="1310" y="237" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Validate coverage</text>
+    <text x="1310" y="260" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Findings + report</text>
+    <text x="1310" y="288" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">result/v1 contract</text>
+  </g>
+
+  <g data-role="flow-connector" fill="none" stroke="#5b8ff9" stroke-width="2" marker-end="url(#arrow)">
+    <path d="M245 235 H275"/>
+    <path d="M475 235 H505"/>
+    <path d="M705 235 H735"/>
+    <path d="M965 235 H995"/>
+    <path d="M1195 235 H1225"/>
+  </g>
+
+  <text x="720" y="390" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#1f2329">Stop rule</text>
+  <text x="720" y="418" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#1f2329">Stop submitting new groups after the finding threshold or first failure; finish already-started groups.</text>
+  <text x="720" y="447" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#86909c">The finding threshold is not a report truncation limit.</text>
+</svg>

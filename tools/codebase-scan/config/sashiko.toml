@@ -1,0 +1,6 @@
+[ai]
+provider = "codex-cli"
+model = "gpt-5.5-2026-04-24"
+
+[review]
+concurrency = 3

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codebase Scan"
+  short_description: "Run programmatic codebase scans"
+  default_prompt: "Use $codebase-scan to scan an existing local codebase and return the generated artifact paths."
+policy:
+  allow_implicit_invocation: true
