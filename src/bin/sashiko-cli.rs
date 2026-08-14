@@ -1931,16 +1931,9 @@ fn print_findings_summary(
             .get("severity")
             .and_then(|s| s.as_str())
             .unwrap_or("Unknown");
-        let file = f.get("file").and_then(|s| s.as_str()).unwrap_or("");
-        let line = f.get("line").and_then(|l| l.as_i64()).unwrap_or(0);
-        let desc = f
-            .get("problem_description")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        let fix = f
-            .get("recommended_fix")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
+        let (file, line) = finding_location(f);
+        let desc = finding_text(f, "problem_description", "problem");
+        let fix = finding_text(f, "recommended_fix", "suggested_fix");
 
         let color = match sev.to_lowercase().as_str() {
             "critical" | "high" => Color::Red,
@@ -1949,8 +1942,10 @@ fn print_findings_summary(
             _ => Color::White,
         };
 
-        let location = if !file.is_empty() {
-            format!("{}:{}: ", file, line)
+        let location = if !file.is_empty() && line.is_some() {
+            format!("{}:{}: ", file, line.unwrap_or_default())
+        } else if !file.is_empty() {
+            format!("{}: ", file)
         } else {
             "".to_string()
         };
@@ -1971,6 +1966,38 @@ fn print_findings_summary(
     }
     println!();
     true
+}
+
+fn finding_text<'a>(finding: &'a Value, preferred: &str, fallback: &str) -> &'a str {
+    finding
+        .get(preferred)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            finding
+                .get(fallback)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("")
+}
+
+fn finding_location(finding: &Value) -> (&str, Option<i64>) {
+    let nested = finding
+        .get("locations")
+        .and_then(Value::as_array)
+        .and_then(|locations| locations.first());
+    let file = finding
+        .get("file")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| nested.and_then(|location| location.get("file")?.as_str()))
+        .unwrap_or("");
+    let line = finding
+        .get("line")
+        .and_then(Value::as_i64)
+        .or_else(|| nested.and_then(|location| location.get("line")?.as_i64()));
+    (file, line)
 }
 
 fn print_colored(color: Color, text: &str) {
@@ -2038,6 +2065,73 @@ mod tests {
         let counts = count_severities(&findings);
         assert_eq!(counts.high.new, 1);
         assert_eq!(counts.high.preexisting, 0);
+    }
+
+    #[test]
+    fn test_structured_finding_text_fallbacks() {
+        let finding = json!({
+            "problem": "Bounds are not checked.",
+            "suggested_fix": "Validate the length first.",
+            "locations": [{
+                "file": "driver.c",
+                "line": 42
+            }]
+        });
+
+        assert_eq!(
+            finding_text(&finding, "problem_description", "problem"),
+            "Bounds are not checked."
+        );
+        assert_eq!(
+            finding_text(&finding, "recommended_fix", "suggested_fix"),
+            "Validate the length first."
+        );
+        assert_eq!(finding_location(&finding), ("driver.c", Some(42)));
+    }
+
+    #[test]
+    fn test_structured_finding_location_preserves_unknown_line() {
+        let finding = json!({
+            "locations": [{
+                "file": "driver.c",
+                "line": null
+            }]
+        });
+
+        assert_eq!(finding_location(&finding), ("driver.c", None));
+    }
+
+    #[test]
+    fn test_structured_finding_location_ignores_empty_legacy_file() {
+        let finding = json!({
+            "file": "",
+            "line": null,
+            "locations": [{
+                "file": "driver.c",
+                "line": 42
+            }]
+        });
+
+        assert_eq!(finding_location(&finding), ("driver.c", Some(42)));
+    }
+
+    #[test]
+    fn test_structured_finding_text_ignores_empty_legacy_fields() {
+        let finding = json!({
+            "problem_description": null,
+            "problem": "Bounds are not checked.",
+            "recommended_fix": "",
+            "suggested_fix": "Validate the length first."
+        });
+
+        assert_eq!(
+            finding_text(&finding, "problem_description", "problem"),
+            "Bounds are not checked."
+        );
+        assert_eq!(
+            finding_text(&finding, "recommended_fix", "suggested_fix"),
+            "Validate the length first."
+        );
     }
 
     #[test]

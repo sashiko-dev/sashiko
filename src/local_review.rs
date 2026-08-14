@@ -42,6 +42,7 @@ pub struct WorkerOptions {
     pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub skip_report_stage: bool,
     pub scratch_clone: bool,
     pub current_tree: bool,
 }
@@ -61,6 +62,7 @@ impl Default for WorkerOptions {
             ai_provider: None,
             custom_prompt: None,
             stages: None,
+            skip_report_stage: false,
             scratch_clone: false,
             current_tree: false,
         }
@@ -490,6 +492,7 @@ async fn review_single_patch(
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
                 stages: options.stages.clone(),
+                skip_report_stage: options.skip_report_stage,
             },
         );
 
@@ -907,12 +910,13 @@ async fn run_worker_in_worktree(
         "dismissed_concerns_count": total_dismissed_concerns_count
     });
 
+    let inline_review = combined_inline_review(combined_inline, !combined_findings.is_empty());
     let combined_result = json!({
         "patchset_id": patchset_id,
         "baseline": baseline_arg,
         "patches": patch_results,
         "review": review_output,
-        "inline_review": if combined_inline.is_empty() { "No issues found.".to_string() } else { combined_inline },
+        "inline_review": inline_review,
         "history": combined_history,
         "input_context": combined_input_context,
         "tokens_in": total_tokens_in,
@@ -962,6 +966,14 @@ pub fn result_has_high_or_critical_findings(result: &Value) -> bool {
             .to_ascii_lowercase();
         is_new && matches!(severity.as_str(), "critical" | "high")
     })
+}
+
+fn combined_inline_review(combined_inline: String, has_findings: bool) -> String {
+    if combined_inline.is_empty() && !has_findings {
+        "No issues found.".to_string()
+    } else {
+        combined_inline
+    }
 }
 
 async fn apply_single_patch(
@@ -1133,6 +1145,15 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
+
+    #[test]
+    fn structured_findings_do_not_claim_no_issues() {
+        assert_eq!(combined_inline_review(String::new(), true), "");
+        assert_eq!(
+            combined_inline_review(String::new(), false),
+            "No issues found."
+        );
+    }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
         let output = Command::new("git")
