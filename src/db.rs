@@ -352,36 +352,71 @@ impl Database {
         }
     }
 
+    pub fn get_msgid_candidates(msg_id: &str) -> Vec<String> {
+        let trimmed = msg_id.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut candidates = vec![trimmed.to_string()];
+
+        let clean = trimmed.trim_matches(['<', '>']);
+        if clean != trimmed {
+            candidates.push(clean.to_string());
+        } else {
+            candidates.push(format!("<{}>", clean));
+        }
+
+        if let Some(stripped) = clean.strip_suffix("@sashiko.local") {
+            if !stripped.is_empty() {
+                candidates.push(stripped.to_string());
+                candidates.push(format!("<{}>", stripped));
+            }
+        } else {
+            candidates.push(format!("{}@sashiko.local", clean));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|c| seen.insert(c.clone()));
+        candidates
+    }
+
     pub async fn get_patchset_details_by_msgid(
         &self,
         msg_id: &str,
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
+        let candidates = Self::get_msgid_candidates(msg_id);
+
         // 1. Try to find a patchset where this is the cover letter
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_details(id, page, limit).await;
+            }
         }
 
         // 2. Fallback: Find a patchset that contains this message as a patch
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_details(id, page, limit).await;
+            }
         }
 
         Ok(None)
@@ -3190,28 +3225,34 @@ impl Database {
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+        let candidates = Self::get_msgid_candidates(msg_id);
+
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_summary(id, page, limit).await;
+            }
         }
 
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_summary(id, page, limit).await;
+            }
         }
 
         Ok(None)
@@ -3793,10 +3834,7 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        let mut clid_candidates = vec![root_msg_id.to_string()];
-        if let Some(sha) = root_msg_id.strip_suffix("@sashiko.local") {
-            clid_candidates.push(sha.to_string());
-        }
+        let clid_candidates = Self::get_msgid_candidates(root_msg_id);
 
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
@@ -3846,12 +3884,19 @@ impl Database {
         }
     }
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
-                libsql::params![error, root_msg_id],
-            )
-            .await?;
+        let candidates = Self::get_msgid_candidates(root_msg_id);
+        for clid in candidates {
+            let res = self
+                .conn
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
+                    libsql::params![error, clid],
+                )
+                .await?;
+            if res > 0 {
+                return Ok(());
+            }
+        }
         Ok(())
     }
 
@@ -8120,8 +8165,6 @@ mod tests {
             "Singleton details must contain 1 patch"
         );
     }
-<<<<<<< HEAD
-=======
 
     /// Verify that get_patchset_details_by_msgid and get_patchset_summary_by_msgid
     /// resolve synthetic IDs when queried by bare SHA.
