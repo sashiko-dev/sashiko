@@ -19,7 +19,11 @@ RISK_PATTERNS = (
     (-80, r"drm|modeset|display|connector|encoder|crtc|fbdev|backlight|headsurface", "display/graphics"),
 )
 GENERATED_HEADER = re.compile(
-    r"(^|/)(cl[a-z0-9_]*|ctrl[0-9a-z_]*|g_[a-z0-9_]*|hwref/.*)\.h$",
+    r"(^|/)(cl[a-z0-9_]*|ctrl[0-9a-z_]*|g_[a-z0-9_]*|hwref/.*|.*_(offset|sh_mask|default))\.h$",
+    re.I,
+)
+REGISTER_HEADER_PATH = re.compile(
+    r"(^|/)(asic_reg|asic_reg_ext|registers|reg|regs)(/|$)",
     re.I,
 )
 
@@ -29,7 +33,7 @@ def read_source(path):
 
 
 def source_kind(relative):
-    if GENERATED_HEADER.search(relative):
+    if GENERATED_HEADER.search(relative) or REGISTER_HEADER_PATH.search(relative):
         return "generated_header"
     suffix = Path(relative).suffix
     if suffix == ".c":
@@ -52,12 +56,19 @@ def file_detail(source_dir, relative):
     }[kind]
     reasons = collections.Counter({"kind:%s" % kind: 1})
     scoring_text = (relative + "\n" + text).lower()
-    for points, pattern, reason in RISK_PATTERNS:
-        matches = re.findall(pattern, scoring_text, re.I)
-        if matches:
-            count = max(1, len(matches))
-            score += points * count
-            reasons[reason] += count
+    if kind == "generated_header":
+        path_text = relative.lower()
+        for points, pattern, reason in RISK_PATTERNS:
+            if re.search(pattern, path_text, re.I):
+                score += points
+                reasons[reason] += 1
+    else:
+        for points, pattern, reason in RISK_PATTERNS:
+            matches = re.findall(pattern, scoring_text, re.I)
+            if matches:
+                count = max(1, len(matches))
+                score += points * count
+                reasons[reason] += count
     return {
         "path": relative,
         "bytes": path.stat().st_size,

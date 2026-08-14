@@ -13,7 +13,7 @@
 ![GPU 驱动扫描策略](docs/scan-strategy.svg)
 
 1. **建立清单**：枚举可审查源码文件，排除生成目录和测试输出。
-2. **代码分组**：优先按目录组织；超大文件按连续行区间切分，并同时满足文件数、代码行数和字节数限制。
+2. **代码分组**：优先按目录组织；超大文件按连续行区间切分，并同时满足文件数、代码行数和内容大小限制。
 3. **风险排序**：优先扫描 UVM/HMM、缺页处理、DMA/IOMMU、用户态接口、计算队列、锁和对象生命周期等高风险路径。
 4. 对完整源码树 `T` 中的每个分组 `G` 构造一组 Synthetic Diff：
 
@@ -67,7 +67,7 @@ gpu-driver-code-scan scan /path/to/driver \
 | `--max-findings` | 停止提交新分组的 finding 阈值 | `10` |
 | `--max-files-per-group` | 单个分组的最大文件数 | `30` |
 | `--max-lines-per-group` | 单个分组的最大目标代码行数 | `1000` |
-| `--max-bytes-per-group` | 单个分组的最大目标字节数 | `100000` |
+| `--max-bytes-per-group` | 单个分组的最大目标内容大小 | `100000` |
 | `--max-review-seconds` | 整次扫描审查预算；`0` 表示不限制 | `7200` |
 | `--review-timeout-seconds` | 单个 Sashiko 分组的超时时间 | `3600` |
 | `--stages` | Sashiko Review Stages | `3,4,5,6,7` |

@@ -39,6 +39,35 @@ class GroupingTest(unittest.TestCase):
             self.assertEqual([], plan["coverage"]["unassigned_files"])
             self.assertEqual([], plan["coverage"]["duplicate_primary_assignments"])
 
+    def test_register_headers_do_not_dominate_implementation_priority(self):
+        with tempfile.TemporaryDirectory(prefix="gpu_scan_register_headers_") as temporary:
+            source = Path(temporary)
+            (source / "gpu" / "drm" / "amd" / "include" / "asic_reg" / "nbio").mkdir(parents=True)
+            (source / "gpu" / "drm" / "amd" / "amdgpu").mkdir(parents=True)
+            (source / "gpu" / "drm" / "amd" / "include" / "asic_reg" / "nbio" / "nbio_7_0_default.h").write_text(
+                "\n".join("#define mmBIF_DOORBELL_FAULT_DMA_%05d 0x%x" % (index, index) for index in range(3000)),
+                encoding="utf-8",
+            )
+            (source / "gpu" / "drm" / "amd" / "amdgpu" / "amdgpu_vm.c").write_text(
+                "void amdgpu_vm_fault(void) { dma_map_page(); mutex_lock(0); }\n",
+                encoding="utf-8",
+            )
+
+            files = enumerate_files(source)
+            plan = plan_groups(source, files, max_files=1, max_lines=1000)
+
+            self.assertEqual(
+                "gpu/drm/amd/amdgpu/amdgpu_vm.c",
+                plan["groups"][0]["files"][0],
+            )
+            generated_groups = [
+                group
+                for group in plan["groups"]
+                if group["files"][0].endswith("nbio_7_0_default.h")
+            ]
+            self.assertTrue(generated_groups)
+            self.assertEqual({"generated_header": 1}, generated_groups[0]["source_kinds"])
+
     def test_oversized_file_is_split_into_bounded_complete_regions(self):
         with tempfile.TemporaryDirectory(prefix="gpu_scan_regions_") as temporary:
             root = Path(temporary)
@@ -81,6 +110,10 @@ class GroupingTest(unittest.TestCase):
             patches = build_patches(repo, output, full_commit, plan["groups"])
 
             self.assertEqual(plan["group_count"], len(patches))
+            self.assertEqual(
+                [],
+                list((output / ".indexes").glob("*.index")),
+            )
             for patch in patches:
                 self.assertIn("diff --git a/large.c b/large.c", patch["diff"])
                 self.assertLess(len(patch["diff"].encode("utf-8")), 130000)

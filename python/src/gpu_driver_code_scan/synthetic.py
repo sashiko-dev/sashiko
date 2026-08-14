@@ -59,8 +59,21 @@ def removed_line_indexes(regions):
     return removed
 
 
+def temporary_index_path(output_dir, index):
+    return Path(output_dir) / ".indexes" / ("%06d.index" % index)
+
+
+def remove_temporary_index(index_path):
+    for path in (Path(index_path), Path(str(index_path) + ".lock")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def baseline_commit(repo_dir, output_dir, full_commit, group, index):
-    index_path = Path(output_dir) / ".indexes" / ("%06d.index" % index)
+    index_path = temporary_index_path(output_dir, index)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment["GIT_INDEX_FILE"] = str(index_path)
     run(["git", "read-tree", full_commit], cwd=repo_dir, env=environment)
@@ -93,13 +106,10 @@ def baseline_commit(repo_dir, output_dir, full_commit, group, index):
     )
 
 
-def build_patches(repo_dir, output_dir, full_commit, groups):
+def build_patch(repo_dir, output_dir, full_commit, full_tree, group, index):
     repo_dir = Path(repo_dir)
-    temporary_indexes = Path(output_dir) / ".indexes"
-    temporary_indexes.mkdir(parents=True, exist_ok=True)
-    full_tree = git(repo_dir, "rev-parse", "%s^{tree}" % full_commit)
-    patches = []
-    for index, group in enumerate(groups, 1):
+    index_path = temporary_index_path(output_dir, index)
+    try:
         baseline = baseline_commit(
             repo_dir, output_dir, full_commit, group, index
         )
@@ -120,22 +130,30 @@ def build_patches(repo_dir, output_dir, full_commit, groups):
             "--no-ext-diff",
             target,
         )
-        patches.append(
-            {
-                "index": index,
-                "group_id": group["group_id"],
-                "target_files": group["files"],
-                "target_regions": group["target_regions"],
-                "priority_rank": group["priority_rank"],
-                "score": group["score"],
-                "lines": group["lines"],
-                "bytes": group["bytes"],
-                "baseline_commit": baseline,
-                "target_commit": target,
-                "subject": "snapshot: add %s" % group["group_id"],
-                "diff": diff,
-            }
-        )
+    finally:
+        remove_temporary_index(index_path)
+    return {
+        "index": index,
+        "group_id": group["group_id"],
+        "target_files": group["files"],
+        "target_regions": group["target_regions"],
+        "priority_rank": group["priority_rank"],
+        "score": group["score"],
+        "lines": group["lines"],
+        "bytes": group["bytes"],
+        "baseline_commit": baseline,
+        "target_commit": target,
+        "subject": "snapshot: add %s" % group["group_id"],
+        "diff": diff,
+    }
+
+
+def build_patches(repo_dir, output_dir, full_commit, groups):
+    repo_dir = Path(repo_dir)
+    full_tree = git(repo_dir, "rev-parse", "%s^{tree}" % full_commit)
+    patches = []
+    for index, group in enumerate(groups, 1):
+        patches.append(build_patch(repo_dir, output_dir, full_commit, full_tree, group, index))
     return patches
 
 

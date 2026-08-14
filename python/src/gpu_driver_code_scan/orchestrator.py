@@ -26,7 +26,7 @@ from .models import (
 )
 from .report import render
 from .sashiko import resolve_dependency, run_review
-from .synthetic import build_patches, initialize_repository, public_patch, review_input
+from .synthetic import build_patch, initialize_repository, public_patch, review_input
 
 
 def ensure_output_directory(path, allow_existing=False):
@@ -101,7 +101,7 @@ def completion_reason(config, total_groups, reviewed_groups, failed_groups, stop
     return stopped or "incomplete"
 
 
-def run_scans(config, repo_dir, output_dir, patches, dependency):
+def run_scans(config, repo_dir, output_dir, patch_iterator, dependency):
     sashiko_dir, review_bin, prompts_dir = dependency
     reviews_dir = output_dir / "reviews"
     inputs_dir = output_dir / "review-inputs"
@@ -156,7 +156,6 @@ def run_scans(config, repo_dir, output_dir, patches, dependency):
     if config.plan_only:
         return [], "", 0
 
-    patch_iterator = iter(patches)
     executor = ThreadPoolExecutor(max_workers=max(1, config.concurrency))
     futures = {}
 
@@ -214,6 +213,12 @@ def run_scans(config, repo_dir, output_dir, patches, dependency):
 
     results.sort(key=lambda item: item["patch"]["index"])
     return results, stopped, finding_count
+
+
+def patch_iterator(repo_dir, output_dir, full_commit, groups):
+    full_tree = git(repo_dir, "rev-parse", "%s^{tree}" % full_commit)
+    for index, group in enumerate(groups, 1):
+        yield build_patch(repo_dir, output_dir, full_commit, full_tree, group, index)
 
 
 def build_result(config, project, source_dir, output_dir, group_plan, reviews, stopped):
@@ -287,9 +292,6 @@ def run_scan(config):
     snapshot_dir = output_dir / "snapshot-repository"
     copy_snapshot(source_dir, snapshot_dir)
     full_commit = initialize_repository(snapshot_dir)
-    patches = build_patches(
-        snapshot_dir, output_dir, full_commit, plan["groups"]
-    )
 
     write_json(
         output_dir / INVENTORY_FILE,
@@ -300,14 +302,6 @@ def run_scan(config):
         },
     )
     write_json(output_dir / GROUP_PLAN_FILE, plan)
-    write_json(
-        output_dir / PATCH_MAP_FILE,
-        {
-            "mode": "grouped-snapshot",
-            "full_snapshot_commit": full_commit,
-            "patches": [public_patch(patch) for patch in patches],
-        },
-    )
 
     dependency = None
     if not config.plan_only:
@@ -315,9 +309,26 @@ def run_scan(config):
             config.sashiko_dir, config.review_bin, config.prompts_dir
         )
     reviews, stopped, _raw_count = (
-        run_scans(config, snapshot_dir, output_dir, patches, dependency)
+        run_scans(
+            config,
+            snapshot_dir,
+            output_dir,
+            patch_iterator(snapshot_dir, output_dir, full_commit, plan["groups"]),
+            dependency,
+        )
         if dependency
         else ([], "", 0)
+    )
+    reviewed_patches = [item["patch"] for item in reviews]
+    write_json(
+        output_dir / PATCH_MAP_FILE,
+        {
+            "mode": "grouped-snapshot",
+            "full_snapshot_commit": full_commit,
+            "patches": reviewed_patches,
+            "reviewed_patch_count": len(reviewed_patches),
+            "total_group_count": plan["group_count"],
+        },
     )
     result, findings, excluded, metrics = build_result(
         config, project, source_dir, output_dir, plan, reviews, stopped
