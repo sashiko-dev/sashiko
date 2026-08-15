@@ -251,6 +251,7 @@ fields as `[defaults]`, plus:
 | `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this subsystem. |
 | `patchwork.api_url` | string | -- | Patchwork REST API URL (e.g. `https://patchwork.kernel.org/api/1.3`). Trailing slashes are stripped automatically. Invalid schemes are rejected with a warning. |
 | `patchwork.token` | string | -- | Patchwork API token. Can also be set via `SASHIKO_PATCHWORK_TOKEN` env var (fills in where token is omitted in TOML). |
+| `patchwork.user_agent` | string | -- | HTTP User-Agent sent with Patchwork API lookup and check requests. Set this when the instance requires an identifiable client. |
 | `patchwork.email` | string | -- | Email address for email-based Patchwork notifications. |
 | `patchwork.min_severity` | string | -- | Minimum finding severity to include in patchwork checks. Findings below this threshold are excluded. Accepts: `Low`, `Medium`, `High`, `Critical` (case-insensitive). Default: all findings included. |
 | `patchwork.fail_severity` | string | `High` | Minimum severity of NEW findings that triggers the `fail` check state instead of `warning`. New findings at or above this threshold produce `fail`; below it produce `warning`. Pre-existing findings never affect the check state. |
@@ -295,6 +296,7 @@ permissions (state changes, delegation, etc.), not just check access.
 enabled = true
 api_url = "https://patchwork.kernel.org/api/1.3"
 token = "your-api-token"   # or set SASHIKO_PATCHWORK_TOKEN env var
+user_agent = "your-service/1.0 (contact@example.org)"
 ```
 
 **Email mode** sends a structured notification email to a bot address.
