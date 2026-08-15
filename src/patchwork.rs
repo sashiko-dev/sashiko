@@ -158,6 +158,13 @@ struct PatchworkCheckRequest {
     context: String,
 }
 
+/// Headers that identify Sashiko to a Patchwork API instance.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PatchworkApiIdentity<'a> {
+    pub token: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
 /// Post a check result to the Patchwork REST API for a given patch.
 ///
 /// Looks up the patch by message-ID, then POSTs the check. Returns Ok
@@ -166,8 +173,7 @@ struct PatchworkCheckRequest {
 pub async fn post_patchwork_check(
     client: &Client,
     api_url: &str,
-    token: Option<&str>,
-    user_agent: Option<&str>,
+    identity: PatchworkApiIdentity<'_>,
     msgid: &str,
     status: &str,
     description: &str,
@@ -185,10 +191,10 @@ pub async fn post_patchwork_check(
     debug!("Fetching Patchwork patch by msgid: {}", clean_msgid);
 
     let mut get_req = client.get(patches_url);
-    if let Some(token) = token {
+    if let Some(token) = identity.token {
         get_req = get_req.header(header::AUTHORIZATION, format!("Token {}", token));
     }
-    if let Some(user_agent) = user_agent {
+    if let Some(user_agent) = identity.user_agent {
         get_req = get_req.header(header::USER_AGENT, user_agent);
     }
 
@@ -235,10 +241,10 @@ pub async fn post_patchwork_check(
     debug!("Posting check to Patchwork: {} {:?}", check_url, payload);
 
     let mut post_req = client.post(&check_url).json(&payload);
-    if let Some(token) = token {
+    if let Some(token) = identity.token {
         post_req = post_req.header(header::AUTHORIZATION, format!("Token {}", token));
     }
-    if let Some(user_agent) = user_agent {
+    if let Some(user_agent) = identity.user_agent {
         post_req = post_req.header(header::USER_AGENT, user_agent);
     }
 
@@ -526,8 +532,10 @@ mod tests {
         post_patchwork_check(
             &Client::new(),
             &api_url,
-            Some("test-token"),
-            Some("sashiko-test/1.0 (test@example.org)"),
+            PatchworkApiIdentity {
+                token: Some("test-token"),
+                user_agent: Some("sashiko-test/1.0 (test@example.org)"),
+            },
             "<patch@example.org>",
             "success",
             "No regressions",

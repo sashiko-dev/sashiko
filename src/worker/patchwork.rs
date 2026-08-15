@@ -95,8 +95,7 @@ impl PatchworkWorker {
                     match crate::patchwork::post_patchwork_check(
                         &client,
                         &entry.api_url,
-                        token,
-                        user_agent,
+                        crate::patchwork::PatchworkApiIdentity { token, user_agent },
                         &entry.patch_msg_id,
                         &entry.check_state,
                         &entry.description,
