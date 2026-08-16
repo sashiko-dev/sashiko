@@ -478,6 +478,78 @@ pub async fn ensure_gc_disabled(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Locates the directory holding the commit-graph.  It follows the
+/// object directory rather than $GIT_DIR, which is why git resolves
+/// it instead of this function joining the two.
+async fn object_info_dir(repo_path: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-parse", "--git-path", "objects/info"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --git-path objects/info failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(repo_path.join(path))
+    }
+}
+
+/// Removes the commit-graph, whole or chained.  The graph is built
+/// from the object database and holds nothing else, so removing it
+/// costs slower revision walks and loses no history.
+pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
+    let info_dir = object_info_dir(repo_path).await?;
+
+    let graph = info_dir.join("commit-graph");
+    match tokio::fs::remove_file(&graph).await {
+        Ok(()) => info!("Removed commit-graph {:?}", graph),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to remove {:?}: {}", graph, e)),
+    }
+
+    let chain = info_dir.join("commit-graphs");
+    match tokio::fs::remove_dir_all(&chain).await {
+        Ok(()) => info!("Removed commit-graph chain {:?}", chain),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to remove {:?}: {}", chain, e)),
+    }
+
+    Ok(())
+}
+
+/// Drops a commit-graph that names commits the object database no
+/// longer holds.  Git reports such a graph as repository corruption
+/// and refuses to fetch, so leaving it in place wedges every remote
+/// until someone removes it by hand.
+pub async fn repair_commit_graph(repo_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["commit-graph", "verify"])
+        .output()
+        .await?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    warn!(
+        "Commit-graph in {:?} does not match the object database: {}",
+        repo_path,
+        stderr.lines().next().unwrap_or("").trim()
+    );
+    drop_commit_graph(repo_path).await
+}
+
 #[allow(dead_code)]
 pub async fn cleanup_worktree_dir(worktree_dir: &Path) -> Result<()> {
     if !worktree_dir.exists() {

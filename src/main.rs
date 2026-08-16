@@ -839,6 +839,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to disable git auto-maintenance: {}", e);
     }
 
+    // Recover the object store the way the worktrees above are
+    // recovered.  A commit-graph that outlived the objects it names
+    // fails every fetch until it is removed.
+    if let Err(e) = sashiko::git_ops::repair_commit_graph(&repo_path).await {
+        error!("Failed to check the commit-graph: {}", e);
+    }
+
     if let Some(custom_remotes) = &settings.git.custom_remotes {
         for remote in custom_remotes {
             info!(
