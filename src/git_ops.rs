@@ -627,6 +627,70 @@ fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+/// Git's two wordings for a commit-graph that names a commit the
+/// object database does not hold.  Fetch-pack's negotiation emits
+/// the first.  The second comes from the generic commit parse, which
+/// ref negotiation, a pruning fetch, and the connectivity check all
+/// reach instead.
+const STALE_COMMIT_GRAPH: &[&str] = &[
+    "in the commit graph file but not in the object database",
+    "exists in commit-graph but not in the object database",
+];
+
+/// True when git turned an operation away over a commit-graph that
+/// outlived the objects it names.  Every path that reads the graph
+/// fails this way until the graph is dropped, so a caller that
+/// fetches has a retry worth making.
+pub fn is_stale_commit_graph(message: &str) -> bool {
+    STALE_COMMIT_GRAPH
+        .iter()
+        .any(|wording| message.contains(wording))
+}
+
+/// The least the retry after a graph drop is given, whatever the
+/// first attempt spent.  Fetch-pack rejects the graph before it opens
+/// a connection, but the wording the commit parse emits can arrive
+/// after a long transfer, which leaves nothing of the shared budget.
+/// A retry handed that reports a timeout instead of the recovery it
+/// was, and the graph outlives the cycle.
+const GRAPH_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Runs one fetch, returning git's complaint rather than an error
+/// value, since the caller decides which failures are worth a retry.
+async fn fetch_remote(
+    repo_path: &Path,
+    name: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    let fetch_future = Command::new("git")
+        .current_dir(repo_path)
+        .args(GIT_PROTOCOL_RESTRICTIONS)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
+
+    match tokio::time::timeout(timeout, fetch_future).await {
+        Ok(Ok(fetch)) => {
+            if fetch.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Failed to fetch remote {}: {}",
+                    name,
+                    String::from_utf8_lossy(&fetch.stderr).trim()
+                ))
+            }
+        }
+        Ok(Err(e)) => Err(format!("Failed to execute git fetch for {}: {}", name, e)),
+        Err(_) => Err(format!(
+            "Git fetch for {} timed out after {} seconds",
+            name,
+            timeout.as_secs()
+        )),
+    }
+}
+
 pub async fn ensure_remote(
     repo_path: &Path,
     name: &str,
@@ -776,13 +840,6 @@ pub async fn ensure_remote(
         }
         fetch_args.push(name);
 
-        let fetch_future = Command::new("git")
-            .current_dir(repo_path)
-            .args(GIT_PROTOCOL_RESTRICTIONS)
-            .args(fetch_args)
-            .kill_on_drop(true)
-            .output();
-
         // Dynamically scale timeout: 30 minutes for heavy initial fetches, 5 minutes for routine updates
         let timeout_duration = if just_added || !head_exists {
             std::time::Duration::from_secs(1800)
@@ -790,28 +847,38 @@ pub async fn ensure_remote(
             std::time::Duration::from_secs(300)
         };
 
-        match tokio::time::timeout(timeout_duration, fetch_future).await {
-            Ok(Ok(fetch)) => {
-                if fetch.status.success() {
-                    fetch_ok = true;
-                } else {
-                    error_msg = format!(
-                        "Failed to fetch remote {}: {}",
-                        name,
-                        String::from_utf8_lossy(&fetch.stderr).trim()
-                    );
+        let started = std::time::Instant::now();
+        let mut attempt = fetch_remote(repo_path, name, &fetch_args, timeout_duration).await;
+
+        // Git reads the commit-graph before it opens a connection, so
+        // a graph naming lost objects fails every remote in the same
+        // way.  Drop it and let this fetch rebuild the answer from the
+        // object database.
+        let stale_graph = attempt
+            .as_ref()
+            .err()
+            .is_some_and(|message| is_stale_commit_graph(message));
+        if stale_graph {
+            warn!("Fetch for {} found a stale commit-graph; dropping it", name);
+            match drop_commit_graph(repo_path).await {
+                Ok(()) => {
+                    // Both attempts come out of the one budget.  This
+                    // holds the remote's lock, and the sync cycle
+                    // walks the remotes one at a time.  The floor is
+                    // what a first attempt that spent the budget
+                    // before it tripped leaves the retry.
+                    let remaining = timeout_duration
+                        .saturating_sub(started.elapsed())
+                        .max(GRAPH_RETRY_FLOOR);
+                    attempt = fetch_remote(repo_path, name, &fetch_args, remaining).await;
                 }
+                Err(e) => warn!("Failed to drop the commit-graph: {}", e),
             }
-            Ok(Err(e)) => {
-                error_msg = format!("Failed to execute git fetch for {}: {}", name, e);
-            }
-            Err(_) => {
-                error_msg = format!(
-                    "Git fetch for {} timed out after {} seconds",
-                    name,
-                    timeout_duration.as_secs()
-                );
-            }
+        }
+
+        match attempt {
+            Ok(()) => fetch_ok = true,
+            Err(message) => error_msg = message,
         }
 
         if !fetch_ok {
@@ -1197,6 +1264,19 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+
+    #[test]
+    fn test_is_stale_commit_graph_matches_both_wordings() {
+        assert!(is_stale_commit_graph(
+            "error: You are attempting to fetch 1a2b3c, which is in the \
+             commit graph file but not in the object database."
+        ));
+        assert!(is_stale_commit_graph(
+            "fatal: commit 1a2b3c exists in commit-graph but not in the \
+             object database"
+        ));
+        assert!(!is_stale_commit_graph("fatal: couldn't find remote ref"));
+    }
 
     #[tokio::test]
     async fn test_git_ops_extensions() -> Result<()> {

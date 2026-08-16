@@ -17,7 +17,7 @@ use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
@@ -418,18 +418,47 @@ impl FetchAgent {
         Ok(())
     }
 
-    async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&self.repo_path)
-            .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-            .arg("fetch")
-            .arg(remote);
+    /// Runs one `git fetch`, dropping a stale commit-graph and trying
+    /// again when that is what turned the fetch away.  Fetch-pack
+    /// rejects the graph before it opens a connection, so that retry
+    /// repeats no transfer; the wording the commit parse emits can
+    /// come after one, and then the retry pays for it again.  Returns
+    /// git's own output either way; the caller words the failure.
+    async fn fetch_with_graph_retry(&self, args: &[&str]) -> Result<Output> {
+        let mut dropped_graph = false;
 
-        for commit in commits {
-            cmd.arg(commit);
+        loop {
+            let output = Command::new("git")
+                .current_dir(&self.repo_path)
+                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+                .arg("fetch")
+                .args(args)
+                .output()
+                .await?;
+
+            if output.status.success() || dropped_graph {
+                return Ok(output);
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if !crate::git_ops::is_stale_commit_graph(&stderr) {
+                return Ok(output);
+            }
+
+            warn!("Fetch found a stale commit-graph; dropping it");
+            if let Err(e) = crate::git_ops::drop_commit_graph(&self.repo_path).await {
+                warn!("Failed to drop the commit-graph: {}", e);
+                return Ok(output);
+            }
+            dropped_graph = true;
         }
+    }
 
-        let output = cmd.output().await?;
+    async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
+        let mut args = vec![remote];
+        args.extend(commits.iter().map(String::as_str));
+
+        let output = self.fetch_with_graph_retry(&args).await?;
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch failed: {}",
@@ -440,12 +469,7 @@ impl FetchAgent {
     }
 
     async fn fetch_all(&self, remote: &str) -> Result<()> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-            .args(["fetch", remote])
-            .output()
-            .await?;
+        let output = self.fetch_with_graph_retry(&[remote]).await?;
 
         if !output.status.success() {
             return Err(anyhow!(
