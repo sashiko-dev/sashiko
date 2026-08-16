@@ -1005,6 +1005,7 @@ pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
 pub mod openai_common;
+pub mod openai_responses;
 #[cfg(feature = "server")]
 pub mod proxy;
 pub mod quota;

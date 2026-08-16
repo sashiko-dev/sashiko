@@ -40,6 +40,10 @@ pub enum OpenAiCompatError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+    /// A failure the endpoint reports inside a 200 reply rather than as an
+    /// HTTP status.  Only /v1/responses does this.
+    #[error("Response failed: {0}")]
+    ResponseFailed(String),
 }
 
 impl ClassifyAiError for OpenAiCompatError {
@@ -55,6 +59,7 @@ impl ClassifyAiError for OpenAiCompatError {
             OpenAiCompatError::ApiError(status, _) => {
                 classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
             }
+            OpenAiCompatError::ResponseFailed(_) => AiErrorClass::Fatal,
         }
     }
 }
