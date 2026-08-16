@@ -849,12 +849,51 @@ async fn fetch_remote(
     }
 }
 
+/// What a remote's refs rest on once ensure_remote() returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// The remote answered.
+    Fetched,
+    /// The fetch interval had not elapsed, so nothing was asked of
+    /// the remote and the refs are the ones already on disk.
+    Skipped,
+    /// A fetch failed within the last hour, so nothing was asked of
+    /// the remote and the refs are the ones the previous fetch
+    /// wrote.  A remote whose refs are missing or older than the
+    /// fallback window returns a BackoffError instead.
+    BackedOff,
+    /// The fetch failed and the refs left behind are the ones the
+    /// previous fetch wrote.  Carries what git said about the
+    /// failure.
+    StaleLocalRef(String),
+}
+
+/// A fetch failed within the last hour and the local refs cannot
+/// stand in for it, so backing off leaves the caller nothing to
+/// use.  Nothing was asked of the remote.
+#[derive(Debug)]
+pub struct BackoffError {
+    name: String,
+}
+
+impl std::fmt::Display for BackoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Remote {} failed recently and has no usable local ref, backing off",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for BackoffError {}
+
 pub async fn ensure_remote(
     repo_path: &Path,
     name: &str,
     url: &str,
     force_fetch: bool,
-) -> Result<()> {
+) -> Result<FetchOutcome> {
     // 1. Validate repo_path to prevent git from traversing up to parent repos
     if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
         return Err(anyhow::anyhow!(
@@ -942,15 +981,6 @@ pub async fn ensure_remote(
         None => false,
     };
 
-    if failed_recently && !force_fetch {
-        let reason = "failed recently, backing off";
-        info!("Skipping fetch for {} ({})", name, reason);
-        return Err(anyhow::anyhow!(
-            "Remote {} failed recently, backing off",
-            name
-        ));
-    }
-
     // Check if HEAD exists
     let head_ref = format!("refs/remotes/{}/HEAD", name);
     let head_exists = Command::new("git")
@@ -960,6 +990,27 @@ pub async fn ensure_remote(
         .await
         .map(|s| s.success())
         .unwrap_or(false);
+
+    // The local ref stands in for a fetch that fails, or is backed
+    // off, only while it is recent enough.
+    let max_stale_age = std::time::Duration::from_secs(86400); // 24 hours
+    let can_fallback = head_exists
+        && match age {
+            Some(a) => a < max_stale_age,
+            None => false,
+        };
+
+    if failed_recently && !force_fetch {
+        if !can_fallback {
+            return Err(BackoffError {
+                name: name.to_string(),
+            }
+            .into());
+        }
+        let reason = "failed recently, backing off";
+        info!("Skipping fetch for {} ({})", name, reason);
+        return Ok(FetchOutcome::BackedOff);
+    }
 
     let should_fetch = if just_added || !head_exists || force_fetch {
         true
@@ -982,7 +1033,7 @@ pub async fn ensure_remote(
             "fresh"
         };
         info!("Skipping fetch for {} ({})", name, reason);
-        return Ok(());
+        return Ok(FetchOutcome::Skipped);
     }
 
     let mut fetch_ok = false;
@@ -1056,13 +1107,6 @@ pub async fn ensure_remote(
                 let _ = file.set_len(0);
             }
 
-            let max_stale_age = std::time::Duration::from_secs(86400); // 24 hours
-            let can_fallback = head_exists
-                && match age {
-                    Some(a) => a < max_stale_age,
-                    None => false,
-                };
-
             if can_fallback {
                 warn!(
                     "Fetch failed for {} ({}), but local ref exists and is fresh enough (age: {:?}). Falling back to local ref.",
@@ -1132,7 +1176,11 @@ pub async fn ensure_remote(
         }
     }
 
-    Ok(())
+    if fetch_ok {
+        Ok(FetchOutcome::Fetched)
+    } else {
+        Ok(FetchOutcome::StaleLocalRef(error_msg))
+    }
 }
 
 pub async fn get_remote_branches(repo_path: &Path, remote_name: &str) -> Result<Vec<String>> {
@@ -1833,9 +1881,11 @@ mod tests {
 
         let url = format!("ext::{}", script_path.to_str().unwrap());
 
-        // ensure_remote might return Ok(()) even if fetch fails because it ignores fetch failures.
-        // However, the key security guarantee is that the command in the ext:: URL is NOT executed.
-        let _ = ensure_remote(&repo_path, "malicious", &url, true).await;
+        // The refused fetch has no local ref to fall back on, so it
+        // surfaces as an error.  The guarantee under test is that the
+        // command in the ext:: URL never runs.
+        let res = ensure_remote(&repo_path, "malicious", &url, true).await;
+        assert!(res.is_err());
 
         assert!(
             !proof_file.exists(),
@@ -1866,10 +1916,103 @@ mod tests {
         let fail_file = repo_path.join(".sashiko/fetch_timestamps/invalid.fail");
         assert!(fail_file.exists(), "Failure timestamp file should exist");
 
-        // Subsequent non-forced fetch should skip and back off
+        // Subsequent non-forced fetch backs off, and with no local
+        // ref to fall back on that is an error
         let res2 = ensure_remote(&repo_path, "invalid", url, false).await;
         assert!(res2.is_err());
         assert!(res2.unwrap_err().to_string().contains("backing off"));
+
+        Ok(())
+    }
+
+    /// Ages a fetch timestamp so the next ensure_remote() sees the
+    /// interval as elapsed or not.
+    fn set_fetch_age(repo_path: &Path, remote: &str, age: std::time::Duration) -> Result<()> {
+        let dir = repo_path.join(".sashiko/fetch_timestamps");
+        std::fs::create_dir_all(&dir)?;
+        let file = std::fs::File::create(dir.join(remote))?;
+        file.set_modified(std::time::SystemTime::now() - age)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_reports_local_ref_outcomes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "--allow-empty", "-m", "base"])
+            .output()
+            .await?;
+
+        // Stand in for a previous successful fetch: the remote's HEAD
+        // exists locally and a timestamp records when it was written.
+        let remote = "unreachable";
+        let url = "https://127.0.0.1:9/invalid-repo.git";
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["remote", "add", remote, url])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args([
+                "update-ref",
+                &format!("refs/remotes/{}/HEAD", remote),
+                "HEAD",
+            ])
+            .output()
+            .await?;
+
+        // Within the interval: nothing goes out.
+        set_fetch_age(&repo_path, remote, std::time::Duration::from_secs(60))?;
+        let res = ensure_remote(&repo_path, remote, url, false).await?;
+        assert_eq!(res, FetchOutcome::Skipped);
+
+        // Past the interval but within the fallback window: the fetch
+        // fails and the local ref is what remains.
+        set_fetch_age(&repo_path, remote, std::time::Duration::from_secs(2 * 3600))?;
+        let res = ensure_remote(&repo_path, remote, url, false).await?;
+        assert!(
+            matches!(res, FetchOutcome::StaleLocalRef(ref msg) if !msg.is_empty()),
+            "expected StaleLocalRef, got {:?}",
+            res
+        );
+
+        // The failure is now backed off.
+        let res = ensure_remote(&repo_path, remote, url, false).await?;
+        assert_eq!(res, FetchOutcome::BackedOff);
+
+        // Backed off, but the local ref is past the fallback window.
+        set_fetch_age(
+            &repo_path,
+            remote,
+            std::time::Duration::from_secs(30 * 3600),
+        )?;
+        let err = ensure_remote(&repo_path, remote, url, false)
+            .await
+            .expect_err("expected a backoff error");
+        assert!(
+            err.downcast_ref::<BackoffError>().is_some(),
+            "expected BackoffError, got {:?}",
+            err
+        );
 
         Ok(())
     }
