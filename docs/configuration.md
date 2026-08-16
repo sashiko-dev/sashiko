@@ -213,6 +213,7 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `send_empty_tool_call_content` | bool | `false` | Send `content: ""` in messages that carry only tool calls instead of omitting the field. Enable it for endpoints that reject such messages or whose chat templates render the missing field as `None`. |
 | `extra_headers` | table | empty | HTTP headers added to every request, as `"Header-Name" = "ENV_VAR"` pairs: each value is read from the named environment variable, never from the settings file, since these can be extra authorization headers. A header named here replaces the one Sashiko would send, `Authorization` included. An unset or empty variable, an invalid name or value, or the same header named twice in different case fails at startup. Header names, never values, join the response cache identity, so a header must not change the reply. |
 | `extra_body` | table | empty | Top-level JSON fields added to every request body. Fields Sashiko sets itself (`model`, `messages`, `tools`, `temperature`, `max_tokens`, `max_completion_tokens`, `response_format`, `reasoning_effort`) are rejected at startup; set reasoning effort with `effort` instead. |
+| `api` | string | `"chat"` | Which OpenAI endpoint to speak: `"chat"` for `/v1/chat/completions`, or `"responses"` for `/v1/responses`. Only OpenAI's own API serves the latter, and it is the only endpoint that accepts function tools and a reasoning effort in the same request. |
 
 #### `[ai.ollama]`
 

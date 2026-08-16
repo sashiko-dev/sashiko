@@ -1,0 +1,26 @@
+# Direct OpenAI API over /v1/responses rather than /v1/chat/completions.
+# Same key and same settings table as Settings.openai-api.toml; only the
+# endpoint differs.
+#
+# The key comes from the environment; there is no TOML field for it:
+#   export OPENAI_API_KEY=sk-...     # LLM_API_KEY is also accepted
+#
+# Two things need this endpoint. A gpt-5.6 model rejects any chat completion
+# carrying function tools unless effort is "none", which costs reasoning on
+# the review stages that explore the code; here tools and an effort travel
+# together. And model access is granted per endpoint, so the gpt-5.4 family
+# can answer here while chat completions reports no access to it.
+[ai]
+provider = "openai"
+model = "gpt-5.4"          # "gpt-5.4-mini" and "gpt-5.4-nano" are cheaper
+
+[ai.openai_compat]
+api = "responses"              # "chat" (the default) speaks /v1/chat/completions
+max_tokens = 65536             # output cap, sent as max_output_tokens
+effort = "medium"              # the valid set is model-dependent; gpt-5.4-pro
+                               # takes only "medium" and "high"
+# base_url = "https://api.openai.com/v1/responses"  # set only to override
+# context_window_size = 128000   # generic fallback; raise to the model's real window
+
+[review]
+concurrency = 4

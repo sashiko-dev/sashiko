@@ -771,65 +771,99 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         #[cfg(not(feature = "bedrock"))]
         "bedrock" => bail!("bedrock provider requires the 'bedrock' feature"),
         "openai" | "openai-compatible" => {
-            let provider_type = match ai.provider.to_lowercase().as_str() {
-                "openai" => openai::OpenAiProviderType::OpenAi,
-                _ => openai::OpenAiProviderType::OpenAiCompatible,
-            };
+            let compat = ai.openai_compat.as_ref();
 
-            let base_url = ai
-                .openai_compat
-                .as_ref()
-                .and_then(|c| c.base_url.clone())
-                .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
-                });
-
-            let context_window = ai
-                .openai_compat
-                .as_ref()
+            let context_window = compat
                 .and_then(|c| c.context_window_size)
                 .unwrap_or_else(|| {
                     openai::OpenAiCompatClient::default_context_window_for_model(&ai.model)
                 });
 
-            let max_tokens = ai
-                .openai_compat
-                .as_ref()
-                .and_then(|c| c.max_tokens)
-                .unwrap_or(4096);
+            let max_tokens = compat.and_then(|c| c.max_tokens).unwrap_or(4096);
 
-            let effort = ai.openai_compat.as_ref().and_then(|c| c.effort.clone());
-            let send_empty_tool_call_content = ai
-                .openai_compat
-                .as_ref()
-                .is_some_and(|c| c.send_empty_tool_call_content);
+            let effort = compat.and_then(|c| c.effort.clone());
 
-            let provider = openai::OpenAiCompatClient::new(
-                base_url,
-                provider_type,
-                ai.model.clone(),
-                context_window,
-                max_tokens,
-                ai.api_timeout_secs,
-                effort,
-            )?
-            .with_reasoning_content(
-                ai.openai_compat
-                    .as_ref()
-                    .is_some_and(|c| c.send_reasoning_content),
-            )
-            .with_empty_tool_call_content(send_empty_tool_call_content);
-            let provider = match ai.openai_compat.as_ref() {
-                Some(c) => provider
-                    .with_extra_headers(&openai::extra_headers_from_env(
-                        &c.extra_headers,
-                        |var| std::env::var(var).ok(),
-                    )?)?
-                    .with_extra_body(c.extra_body.clone())?,
-                None => provider,
-            };
+            // The endpoint the settings name, rather than the provider name,
+            // decides the transport: both provider values reach the same
+            // vendor and read the same settings block.
+            let api = compat
+                .and_then(|c| c.api.as_deref())
+                .unwrap_or("chat")
+                .to_lowercase();
 
-            Ok(Arc::new(provider))
+            match api.as_str() {
+                "chat" => {
+                    let provider_type = match ai.provider.to_lowercase().as_str() {
+                        "openai" => openai::OpenAiProviderType::OpenAi,
+                        _ => openai::OpenAiProviderType::OpenAiCompatible,
+                    };
+
+                    let base_url = compat.and_then(|c| c.base_url.clone()).unwrap_or_else(|| {
+                        openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
+                    });
+
+                    let provider = openai::OpenAiCompatClient::new(
+                        base_url,
+                        provider_type,
+                        ai.model.clone(),
+                        context_window,
+                        max_tokens,
+                        ai.api_timeout_secs,
+                        effort,
+                    )?
+                    .with_reasoning_content(compat.is_some_and(|c| c.send_reasoning_content))
+                    .with_empty_tool_call_content(
+                        compat.is_some_and(|c| c.send_empty_tool_call_content),
+                    );
+                    let provider = match compat {
+                        Some(c) => provider
+                            .with_extra_headers(&openai::extra_headers_from_env(
+                                &c.extra_headers,
+                                |var| std::env::var(var).ok(),
+                            )?)?
+                            .with_extra_body(c.extra_body.clone())?,
+                        None => provider,
+                    };
+
+                    Ok(Arc::new(provider))
+                }
+                "responses" => {
+                    // These shape a chat completion only. Refusing them beats
+                    // dropping them: a configured Authorization override that
+                    // never went out would leave the bearer token in use with
+                    // nothing in the log to say so.
+                    if let Some(c) = compat {
+                        let ignored = [
+                            ("send_reasoning_content", c.send_reasoning_content),
+                            (
+                                "send_empty_tool_call_content",
+                                c.send_empty_tool_call_content,
+                            ),
+                            ("extra_headers", !c.extra_headers.is_empty()),
+                            ("extra_body", !c.extra_body.is_empty()),
+                        ];
+                        if let Some((name, _)) = ignored.iter().find(|(_, set)| *set) {
+                            bail!(
+                                "{name} applies to the chat endpoint only; unset it or set api = \"chat\""
+                            );
+                        }
+                    }
+
+                    let base_url = compat
+                        .and_then(|c| c.base_url.clone())
+                        .unwrap_or_else(openai_responses::OpenAiResponsesClient::default_base_url);
+
+                    Ok(Arc::new(openai_responses::OpenAiResponsesClient::new(
+                        base_url,
+                        ai.model.clone(),
+                        context_window,
+                        max_tokens,
+                        ai.api_timeout_secs,
+                        effort,
+                    )?))
+                }
+                other => bail!("Unsupported openai api: {}", other),
+            }
         }
         "ollama" => {
             let model = ai.model.clone();
@@ -1648,6 +1682,99 @@ mod tests {
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    /// Both transports report the model they were configured with, so the
+    /// cache identity is what says which one the settings selected.
+    #[test]
+    fn test_openai_api_selects_the_transport() -> Result<()> {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "openai".to_string();
+        settings.ai.model = "gpt-5.4".to_string();
+
+        let compat = |api: Option<&str>| crate::settings::OpenAiCompatSettings {
+            base_url: None,
+            context_window_size: None,
+            max_tokens: None,
+            effort: None,
+            send_reasoning_content: false,
+            extra_headers: Default::default(),
+            extra_body: Default::default(),
+            send_empty_tool_call_content: false,
+            api: api.map(str::to_string),
+        };
+
+        settings.ai.openai_compat = Some(compat(None));
+        let chat = create_provider(&settings)?.cache_identity();
+        assert!(!chat.contains("api="));
+
+        settings.ai.openai_compat = Some(compat(Some("responses")));
+        let responses = create_provider(&settings)?.cache_identity();
+        assert!(responses.contains("api=responses"));
+
+        settings.ai.openai_compat = Some(compat(Some("assistants")));
+        assert!(create_provider(&settings).is_err());
+
+        Ok(())
+    }
+
+    /// A chat-only setting on the responses endpoint is refused rather
+    /// than ignored, since a dropped Authorization override would leave the
+    /// bearer token in use with nothing in the log to say so.
+    #[test]
+    fn test_responses_api_refuses_chat_only_settings() -> Result<()> {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "openai".to_string();
+        settings.ai.model = "gpt-5.4".to_string();
+
+        let compat = crate::settings::OpenAiCompatSettings {
+            base_url: None,
+            context_window_size: None,
+            max_tokens: None,
+            effort: None,
+            send_reasoning_content: false,
+            extra_headers: Default::default(),
+            extra_body: Default::default(),
+            send_empty_tool_call_content: false,
+            api: Some("responses".to_string()),
+        };
+
+        let mut with_headers = compat.clone();
+        with_headers
+            .extra_headers
+            .insert("Authorization".to_string(), "GATEWAY_TOKEN".to_string());
+        let error = create_provider(&settings.with_compat(with_headers))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("extra_headers"), "{error}");
+
+        let mut with_body = compat.clone();
+        with_body
+            .extra_body
+            .insert("extraData".to_string(), serde_json::json!({}));
+        assert!(create_provider(&settings.with_compat(with_body)).is_err());
+
+        let mut with_empty = compat.clone();
+        with_empty.send_empty_tool_call_content = true;
+        assert!(create_provider(&settings.with_compat(with_empty)).is_err());
+
+        let mut with_reasoning = compat.clone();
+        with_reasoning.send_reasoning_content = true;
+        assert!(create_provider(&settings.with_compat(with_reasoning)).is_err());
+
+        assert!(create_provider(&settings.with_compat(compat)).is_ok());
+        Ok(())
+    }
+
+    impl Settings {
+        /// A copy with the given openai_compat section, for tests that
+        /// vary one field at a time.
+        fn with_compat(&self, compat: crate::settings::OpenAiCompatSettings) -> Settings {
+            let mut settings = self.clone();
+            settings.ai.openai_compat = Some(compat);
+            settings
+        }
     }
 
     // Providers built for concurrent reviews share one tx_id namespace.
