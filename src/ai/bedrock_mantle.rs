@@ -21,7 +21,7 @@
 //! replays and which the response cache and review logs already scrub.
 
 use crate::ai::bedrock_token::{BedrockToken, generate_token};
-use crate::ai::openai::OpenAiCompatError;
+use crate::ai::openai_common::OpenAiCompatError;
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
     ToolCall,

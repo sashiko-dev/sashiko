@@ -4123,6 +4123,7 @@ impl Reviewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::openai_common::OpenAiCompatError;
     use crate::ai::quota::QuotaManager;
     use crate::ai::{AiRequest, AiResponse, ProviderCapabilities};
     use crate::db::Database;
@@ -4498,10 +4499,8 @@ mod tests {
     impl AiProvider for RateLimitThenSuccessProvider {
         async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(crate::ai::openai::OpenAiCompatError::RateLimitExceeded(
-                    std::time::Duration::from_millis(1),
-                )
-                .into());
+                let retry_after = std::time::Duration::from_millis(1);
+                return Err(OpenAiCompatError::RateLimitExceeded(retry_after).into());
             }
 
             Ok(AiResponse {
