@@ -12,19 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
-    ClassifyAiError, ProviderCapabilities, ToolCall, classify_status_code,
+use crate::ai::openai_common::{
+    OpenAiCompatError, build_http_client, lenient_option, normalize_base_url, post_json,
 };
-use crate::utils::redact_secret;
+use crate::ai::{
+    AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
+    ToolCall,
+};
 use anyhow::Result;
 use async_trait::async_trait;
-use regex::Regex;
 use reqwest::Client;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
+
+/// Path this transport speaks, appended to a `base_url` that names only the
+/// API root.
+const ENDPOINT_PATH: &str = "/chat/completions";
 
 /// Top-level request fields Sashiko sets itself. Extra body fields may
 /// not name them: overriding the model or the messages from configuration
@@ -138,7 +142,7 @@ pub struct OpenAiUsage {
     /// rather than failing the response.
     #[serde(
         default,
-        deserialize_with = "lenient_prompt_tokens_details",
+        deserialize_with = "lenient_option",
         skip_serializing_if = "Option::is_none"
     )]
     pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
@@ -148,76 +152,6 @@ pub struct OpenAiUsage {
 pub struct OpenAiPromptTokensDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
-}
-
-fn lenient_prompt_tokens_details<'de, D>(
-    deserializer: D,
-) -> Result<Option<OpenAiPromptTokensDetails>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).unwrap_or_default())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum OpenAiCompatError {
-    #[error("Rate limit exceeded, retry after {0:?}")]
-    RateLimitExceeded(Duration),
-    #[error("Transient error: {1}, retry after {0:?}")]
-    TransientError(Duration, String),
-    #[error("Authentication error: {0}")]
-    AuthenticationError(String),
-    #[error("API error {0}: {1}")]
-    ApiError(reqwest::StatusCode, String),
-}
-
-impl ClassifyAiError for OpenAiCompatError {
-    fn ai_error_class(&self) -> AiErrorClass {
-        match self {
-            OpenAiCompatError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
-                retry_after: *retry_after,
-            },
-            OpenAiCompatError::TransientError(retry_after, _) => AiErrorClass::Transient {
-                retry_after: *retry_after,
-            },
-            OpenAiCompatError::AuthenticationError(_) => AiErrorClass::Fatal,
-            OpenAiCompatError::ApiError(status, _) => {
-                classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
-            }
-        }
-    }
-}
-
-fn rejects_temperature_parameter(error: &OpenAiCompatError) -> bool {
-    let OpenAiCompatError::ApiError(status, body) = error else {
-        return false;
-    };
-    if !matches!(
-        *status,
-        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
-    ) {
-        return false;
-    }
-
-    let parsed = serde_json::from_str::<Value>(body).ok();
-    let detail = parsed.as_ref().map(|value| &value["error"]);
-    let param = detail.and_then(|value| value["param"].as_str());
-    let code = detail.and_then(|value| value["code"].as_str());
-    if param == Some("temperature") && code == Some("unsupported_parameter") {
-        return true;
-    }
-
-    let message = detail
-        .and_then(|value| value["message"].as_str())
-        .unwrap_or(body)
-        .to_ascii_lowercase();
-    message.contains("unsupported parameter: 'temperature'")
-        || message.contains("unsupported parameter: \"temperature\"")
-        || message.contains("unsupported parameter: temperature")
-        || message.contains("temperature is not supported")
-        || message.contains("'temperature' is not supported")
-        || message.contains("does not support temperature") // LiteLLM
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,11 +170,12 @@ pub struct OpenAiCompatClient {
     provider_type: OpenAiProviderType,
     effort: Option<String>,
     send_reasoning_content: bool,
-    client: Client,
     extra_headers: reqwest::header::HeaderMap,
     extra_body: serde_json::Map<String, Value>,
-    temperature_unsupported: AtomicBool,
     send_empty_tool_call_content: bool,
+    /// Learned by post_json; see there.
+    temperature_unsupported: AtomicBool,
+    client: Client,
 }
 
 impl OpenAiCompatClient {
@@ -253,25 +188,8 @@ impl OpenAiCompatClient {
         api_timeout_secs: u64,
         effort: Option<String>,
     ) -> Result<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
-            .unwrap_or_default();
-
-        let mut headers = reqwest::header::HeaderMap::new();
-        if !api_key.is_empty()
-            && let Ok(value) =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key))
-        {
-            headers.insert("Authorization", value);
-        }
-
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(api_timeout_secs))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
-        let base_url = Self::normalize_base_url(&base_url)?;
+        let client = build_http_client(api_timeout_secs);
+        let base_url = normalize_base_url(&base_url, ENDPOINT_PATH)?;
 
         Ok(Self {
             model,
@@ -342,63 +260,6 @@ impl OpenAiCompatClient {
         self
     }
 
-    fn prepare_request(&self, request: AiRequest) -> Result<OpenAiRequest> {
-        let mut openai_req = translate_ai_request(
-            request,
-            self.max_tokens,
-            self.provider_type,
-            self.send_reasoning_content,
-        )?;
-        openai_req.model = self.model.clone();
-        if self.send_empty_tool_call_content {
-            fill_empty_tool_call_content(&mut openai_req.messages);
-        }
-        if self.temperature_unsupported.load(Ordering::Relaxed) {
-            openai_req.temperature = None;
-        }
-        // Omitted unless configured: some endpoints that do not implement
-        // reasoning_effort reject the whole request over an unknown field.
-        openai_req.reasoning_effort = self.effort.clone();
-        Ok(openai_req)
-    }
-
-    /// Normalize a base URL so it always ends with `/chat/completions`.
-    ///
-    /// LM Studio and other OpenAI-compatible servers document the base URL as
-    /// `http://localhost:1234/v1`, expecting the client to append the endpoint
-    /// path.  Our `post_request` POSTs directly to `self.base_url`, so we
-    /// ensure the full path is present.
-    fn normalize_base_url(url: &str) -> Result<String> {
-        let trimmed = url.trim_end_matches('/');
-
-        let (base, path) = match trimmed.split_once("://") {
-            Some((scheme, rest)) => match rest.split_once('/') {
-                Some((host, path)) => (format!("{scheme}://{host}"), format!("/{}", path)),
-                None => (trimmed.to_string(), String::new()),
-            },
-            None => return Err(anyhow::anyhow!("Invalid url scheme in OpenAI url {}", url)),
-        };
-
-        // If the caller supplied a full URL that already targets a chat
-        // completions endpoint, accept it verbatim. This allows any
-        // OpenAI-compatible provider to be configured via `base_url` alone,
-        // including endpoints whose path is not otherwise recognised such as
-        // z.ai's coding-plan gateway
-        // (https://api.z.ai/api/coding/paas/v4/chat/completions).
-        if path.ends_with("/chat/completions") {
-            return Ok(format!("{base}{path}"));
-        }
-
-        let path = match path.as_str() {
-            "" => "/chat/completions",
-            "/v1" | "/v1/chat/completions" => "/v1/chat/completions",
-            "/api/v1" | "/api/v1/chat/completions" => "/api/v1/chat/completions",
-            _ => return Err(anyhow::anyhow!("Invalid OpenAI url {}", url)),
-        };
-
-        Ok(format!("{base}{path}"))
-    }
-
     pub fn default_base_url_for_model(model: &str) -> String {
         if model.starts_with("glm-") {
             "https://open.bigmodel.cn/api/paas/v4/chat/completions".to_string()
@@ -425,90 +286,38 @@ impl OpenAiCompatClient {
         }
     }
 
-    async fn post_request(&self, body: &Value) -> Result<OpenAiResponse, OpenAiCompatError> {
-        let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
-
-        // Request headers replace default headers of the same name,
-        // so an extra authorization header overrides the bearer token.
-        let request = self
-            .client
-            .post(&self.base_url)
-            .headers(self.extra_headers.clone())
-            .json(body);
-        let res = match request.send().await {
-            Ok(res) => res,
-            Err(e) => {
-                let err_str = redact_secret(&e.to_string());
-                tracing::error!("OpenAI request failed (transport): {}", err_str);
-                return Err(OpenAiCompatError::TransientError(
-                    Duration::from_secs(30),
-                    err_str,
-                ));
-            }
-        };
-
-        if res.status().is_success() {
-            let status = res.status();
-            let body_text = res.text().await.map_err(|e| {
-                let err_str = redact_secret(&e.to_string());
-                tracing::error!("Failed to read OpenAI response body: {}", err_str);
-                OpenAiCompatError::TransientError(Duration::from_secs(30), err_str)
-            })?;
-            match serde_json::from_str::<OpenAiResponse>(&body_text) {
-                Ok(response) => {
-                    tracing::info!(
-                        "OpenAI response received. Tokens: in={}, out={}",
-                        response.usage.prompt_tokens,
-                        response.usage.completion_tokens
-                    );
-                    return Ok(response);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to decode OpenAI response: {}", e);
-                    return Err(OpenAiCompatError::ApiError(
-                        status,
-                        format!("Parse error: {}", e),
-                    ));
-                }
-            }
+    fn build_request(&self, request: AiRequest) -> Result<OpenAiRequest> {
+        let mut openai_req = translate_ai_request(
+            request,
+            self.max_tokens,
+            self.provider_type,
+            self.send_reasoning_content,
+        )?;
+        openai_req.model = self.model.clone();
+        if self.send_empty_tool_call_content {
+            fill_empty_tool_call_content(&mut openai_req.messages);
         }
+        // Omitted unless configured: some endpoints that do not implement
+        // reasoning_effort reject the whole request over an unknown field.
+        openai_req.reasoning_effort = self.effort.clone();
+        Ok(openai_req)
+    }
 
-        let status = res.status();
-        let status_code = status.as_u16();
-
-        let retry_after_duration = res
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs);
-
-        let error_text = redact_secret(&res.text().await.unwrap_or_default());
-
-        match status_code {
-            429 => {
-                let default_retry = retry_after_duration.unwrap_or(Duration::from_secs(60));
-                let retry_duration = re
-                    .captures(&error_text)
-                    .and_then(|caps| caps[1].parse::<f64>().ok())
-                    .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
-                    .unwrap_or(default_retry);
-                tracing::warn!(
-                    "OpenAI 429 Rate Limit. Retry in {}s",
-                    retry_duration.as_secs_f64()
-                );
-                Err(OpenAiCompatError::RateLimitExceeded(retry_duration))?
-            }
-            401 | 403 => Err(OpenAiCompatError::AuthenticationError(error_text))?,
-            500..=599 => {
-                tracing::warn!("OpenAI Server Error {}: {}", status, error_text);
-                Err(OpenAiCompatError::TransientError(
-                    retry_after_duration.unwrap_or(Duration::from_secs(0)),
-                    error_text,
-                ))?
-            }
-            _ => Err(OpenAiCompatError::ApiError(status, error_text))?,
-        }
+    async fn post_request(&self, body: &mut Value) -> Result<OpenAiResponse, OpenAiCompatError> {
+        let response: OpenAiResponse = post_json(
+            &self.client,
+            &self.base_url,
+            &self.extra_headers,
+            body,
+            &self.temperature_unsupported,
+        )
+        .await?;
+        tracing::info!(
+            "OpenAI response received. Tokens: in={}, out={}",
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens
+        );
+        Ok(response)
     }
 }
 
@@ -776,24 +585,10 @@ impl AiProvider for OpenAiCompatClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         tracing::info!("Sending OpenAI request...");
 
-        let mut openai_req = self.prepare_request(request)?;
-        let resp_body = self.request_body(&openai_req)?;
-        let resp = match self.post_request(&resp_body).await {
-            Ok(resp) => resp,
-            Err(error)
-                if openai_req.temperature.is_some() && rejects_temperature_parameter(&error) =>
-            {
-                self.temperature_unsupported.store(true, Ordering::Relaxed);
-                tracing::warn!(
-                    "{}OpenAI endpoint rejected temperature; retrying without it",
-                    crate::ai::get_log_prefix()
-                );
-                openai_req.temperature = None;
-                let retry_body = self.request_body(&openai_req)?;
-                self.post_request(&retry_body).await?
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let openai_req = self.build_request(request)?;
+
+        let mut resp_body = self.request_body(&openai_req)?;
+        let resp = self.post_request(&mut resp_body).await?;
         translate_ai_response(resp)
     }
 
@@ -863,50 +658,9 @@ impl AiProvider for OpenAiCompatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiErrorClass, AiMessage, AiTool, ClassifyAiError, DEFAULT_RETRY_AFTER};
+    use crate::ai::{AiMessage, AiTool};
     use serde_json::json;
-
-    #[test]
-    fn test_openai_compat_error_classification() {
-        let cases = [
-            (
-                OpenAiCompatError::RateLimitExceeded(Duration::from_secs(7)),
-                AiErrorClass::RateLimit {
-                    retry_after: Duration::from_secs(7),
-                },
-            ),
-            (
-                OpenAiCompatError::TransientError(Duration::from_secs(11), "busy".to_string()),
-                AiErrorClass::Transient {
-                    retry_after: Duration::from_secs(11),
-                },
-            ),
-            (
-                OpenAiCompatError::AuthenticationError("bad key".to_string()),
-                AiErrorClass::Fatal,
-            ),
-            (
-                OpenAiCompatError::ApiError(
-                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                    "unavailable".to_string(),
-                ),
-                AiErrorClass::Transient {
-                    retry_after: DEFAULT_RETRY_AFTER,
-                },
-            ),
-            (
-                OpenAiCompatError::ApiError(
-                    reqwest::StatusCode::BAD_REQUEST,
-                    "bad request".to_string(),
-                ),
-                AiErrorClass::Fatal,
-            ),
-        ];
-
-        for (err, expected) in cases {
-            assert_eq!(err.ai_error_class(), expected);
-        }
-    }
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_translate_request_system_and_user() -> Result<()> {
@@ -1629,96 +1383,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_normalize_base_url_appends_chat_completions() {
-        // LM Studio style: just /v1
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1").unwrap(),
-            "http://localhost:1234/v1/chat/completions"
-        );
-        // Trailing slash
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/").unwrap(),
-            "http://localhost:1234/v1/chat/completions"
-        );
-        // Already has full path
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://api.openai.com/v1/chat/completions")
-                .unwrap(),
-            "https://api.openai.com/v1/chat/completions"
-        );
-        // Full path with trailing slash
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/chat/completions/")
-                .unwrap(),
-            "http://localhost:1234/v1/chat/completions"
-        );
-        // Bare host
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234").unwrap(),
-            "http://localhost:1234/chat/completions"
-        );
-        // Test the specific nested bogus path scenario we analyzed
-        assert!(
-            OpenAiCompatClient::normalize_base_url("http://localhost:1234/v1/text/completions")
-                .is_err()
-        );
-        // Bare host with different host
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://openai.com").unwrap(),
-            "https://openai.com/chat/completions"
-        );
-        // OpenRouter /api/v1 style paths
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://openrouter.ai/api/v1").unwrap(),
-            "https://openrouter.ai/api/v1/chat/completions"
-        );
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://openrouter.ai/api/v1/").unwrap(),
-            "https://openrouter.ai/api/v1/chat/completions"
-        );
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://openrouter.ai/api/v1/chat/completions")
-                .unwrap(),
-            "https://openrouter.ai/api/v1/chat/completions"
-        );
-        // z.ai / Zhipu endpoints: full URLs ending in /chat/completions are
-        // accepted verbatim, so providers with otherwise-unrecognised paths
-        // (direct API and coding-plan gateway) can be used via base_url only.
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url("https://api.z.ai/api/paas/v4/chat/completions")
-                .unwrap(),
-            "https://api.z.ai/api/paas/v4/chat/completions"
-        );
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url(
-                "https://api.z.ai/api/coding/paas/v4/chat/completions"
-            )
-            .unwrap(),
-            "https://api.z.ai/api/coding/paas/v4/chat/completions"
-        );
-        // Trailing slash on a full endpoint URL is trimmed
-        assert_eq!(
-            OpenAiCompatClient::normalize_base_url(
-                "https://api.z.ai/api/coding/paas/v4/chat/completions/"
-            )
-            .unwrap(),
-            "https://api.z.ai/api/coding/paas/v4/chat/completions"
-        );
-        // Paths that are not full chat/completions URLs and are not a known
-        // shorthand are still rejected.
-        assert!(OpenAiCompatClient::normalize_base_url("https://api.z.ai/api/paas/v4").is_err());
-        // Test arbitrary deep nested paths that shouldn't be accepted
-        assert!(
-            OpenAiCompatClient::normalize_base_url(
-                "http://localhost:1234/v1/v1v1/text/completions"
-            )
-            .is_err()
-        );
-        // Test strings completely lacking a valid protocol scheme format
-        assert!(OpenAiCompatClient::normalize_base_url("completely-broken-input-string").is_err());
-    }
-
     fn test_client(base_url: &str, max_tokens: u32, effort: Option<&str>) -> OpenAiCompatClient {
         OpenAiCompatClient::new(
             base_url.to_string(),
@@ -1810,7 +1474,7 @@ mod tests {
     #[test]
     fn tool_call_content_is_omitted_by_default() -> Result<()> {
         let client = test_client("https://api.openai.com/v1", 4096, None);
-        let body = serde_json::to_value(client.prepare_request(tool_call_request(None))?)?;
+        let body = serde_json::to_value(client.build_request(tool_call_request(None))?)?;
         assert!(body["messages"][0].get("content").is_none());
         Ok(())
     }
@@ -1819,13 +1483,13 @@ mod tests {
     fn tool_call_content_is_filled_when_enabled() -> Result<()> {
         let client =
             test_client("https://api.openai.com/v1", 4096, None).with_empty_tool_call_content(true);
-        let body = serde_json::to_value(client.prepare_request(tool_call_request(None))?)?;
+        let body = serde_json::to_value(client.build_request(tool_call_request(None))?)?;
         assert_eq!(body["messages"][0]["content"], "");
         // A message without tool calls keeps its missing content.
         assert!(body["messages"][1].get("content").is_none());
 
         let body =
-            serde_json::to_value(client.prepare_request(tool_call_request(Some("Reading.")))?)?;
+            serde_json::to_value(client.build_request(tool_call_request(Some("Reading.")))?)?;
         assert_eq!(body["messages"][0]["content"], "Reading.");
         Ok(())
     }
@@ -1837,33 +1501,6 @@ mod tests {
             client.cache_identity(),
             "gpt-5.1|max_tokens=4096|base_url=https://api.openai.com/v1/chat/completions|provider_type=openai"
         );
-    }
-
-    #[test]
-    fn temperature_fallback_matches_only_explicit_unsupported_errors() {
-        let error = |status, message: &str| {
-            OpenAiCompatError::ApiError(status, json!({"error": {"message": message}}).to_string())
-        };
-        assert!(rejects_temperature_parameter(&error(
-            reqwest::StatusCode::BAD_REQUEST,
-            "Unsupported parameter: 'temperature' is not supported with this model."
-        )));
-        assert!(rejects_temperature_parameter(&OpenAiCompatError::ApiError(
-            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-            json!({"error": {"param": "temperature", "code": "unsupported_parameter"}}).to_string(),
-        )));
-        assert!(!rejects_temperature_parameter(&error(
-            reqwest::StatusCode::BAD_REQUEST,
-            "Temperature must be between 0 and 1"
-        )));
-        assert!(!rejects_temperature_parameter(&error(
-            reqwest::StatusCode::BAD_REQUEST,
-            "Unsupported parameter: 'max_tokens'"
-        )));
-        assert!(!rejects_temperature_parameter(&error(
-            reqwest::StatusCode::UNAUTHORIZED,
-            "Unsupported parameter: 'temperature'"
-        )));
     }
 
     /// Requests captured by a stub chat completions server.
@@ -2240,17 +1877,66 @@ mod tests {
     fn configured_effort_reaches_the_request() {
         let client = test_client("https://api.openai.com/v1", 65536, Some("high"));
 
-        let built = client.prepare_request(sample_request()).unwrap();
+        let built = client.build_request(sample_request()).unwrap();
         assert_eq!(built.reasoning_effort.as_deref(), Some("high"));
 
         let json = serde_json::to_value(&built).unwrap();
         assert_eq!(json["reasoning_effort"], "high");
     }
 
+    fn request_at_zero_temperature() -> AiRequest {
+        let mut request = sample_request();
+        request.temperature = Some(0.0);
+        request
+    }
+
+    use crate::ai::openai_common::tests::{TEMPERATURE_REFUSED, serve_replies};
+
+    const COMPLETION: &str = r#"{"id":"x","object":"chat.completion","created":0,"model":"gpt-6-luna","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+
+    #[tokio::test]
+    async fn temperature_refusal_resends_without_the_field() {
+        let (base_url, seen) = serve_replies(vec![
+            (400, TEMPERATURE_REFUSED.to_string()),
+            (200, COMPLETION.to_string()),
+        ])
+        .await;
+        let client = test_client(&base_url, 65536, None);
+
+        let response = client
+            .generate_content(request_at_zero_temperature())
+            .await
+            .unwrap();
+        assert_eq!(response.content.as_deref(), Some("ok"));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["temperature"], 0.0);
+        assert!(seen[1].get("temperature").is_none());
+        assert!(client.temperature_unsupported.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn other_bad_request_is_not_resent() {
+        let refused_top_p =
+            TEMPERATURE_REFUSED.replace(r#""param": "temperature""#, r#""param": "top_p""#);
+        let (base_url, seen) = serve_replies(vec![(400, refused_top_p)]).await;
+        let client = test_client(&base_url, 65536, None);
+
+        assert!(
+            client
+                .generate_content(request_at_zero_temperature())
+                .await
+                .is_err()
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(!client.temperature_unsupported.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn reasoning_effort_omitted_unless_configured() {
         let unset = test_client("https://api.openai.com/v1", 65536, None);
-        let built = unset.prepare_request(sample_request()).unwrap();
+        let built = unset.build_request(sample_request()).unwrap();
         assert_eq!(built.reasoning_effort, None);
 
         let translated =
