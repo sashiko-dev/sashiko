@@ -886,6 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let metrics_db = db.clone();
+    let metrics_repo_path = repo_path.clone();
     tokio::spawn(async move {
         loop {
             if let Ok(pending) = metrics_db.count_pending_patches().await {
@@ -899,6 +900,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
                 sashiko::metrics::set_patchsets(patchsets);
+            }
+            match sashiko::git_ops::pack_stats(&metrics_repo_path).await {
+                Ok((packs, bytes)) => sashiko::metrics::set_repo_packs(packs, bytes),
+                Err(e) => warn!("Failed to count packs in the review repository: {}", e),
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }

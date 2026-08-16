@@ -478,19 +478,21 @@ pub async fn ensure_gc_disabled(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Locates the directory holding the commit-graph.  It follows the
-/// object directory rather than $GIT_DIR, which is why git resolves
-/// it instead of this function joining the two.
-async fn object_info_dir(repo_path: &Path) -> Result<PathBuf> {
+/// Locates a directory under the object store.  It follows the object
+/// directory rather than $GIT_DIR, which is why git resolves it
+/// instead of this function joining the two.
+async fn object_dir(repo_path: &Path, name: &str) -> Result<PathBuf> {
+    let relative = format!("objects/{}", name);
     let output = Command::new("git")
         .current_dir(repo_path)
-        .args(["rev-parse", "--git-path", "objects/info"])
+        .args(["rev-parse", "--git-path", &relative])
         .output()
         .await?;
 
     if !output.status.success() {
         return Err(anyhow!(
-            "git rev-parse --git-path objects/info failed: {}",
+            "git rev-parse --git-path {} failed: {}",
+            relative,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -515,7 +517,7 @@ async fn object_info_dir(repo_path: &Path) -> Result<PathBuf> {
 /// does.  Callers already holding the lock, such as
 /// write_commit_graph, depend on this staying out.
 pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
-    let info_dir = object_info_dir(repo_path).await?;
+    let info_dir = object_dir(repo_path, "info").await?;
 
     let graph = info_dir.join("commit-graph");
     match tokio::fs::remove_file(&graph).await {
@@ -541,6 +543,33 @@ async fn run_commit_graph_write(repo_path: &Path) -> Result<std::process::Output
         .args(["commit-graph", "write", "--reachable"])
         .output()
         .await?)
+}
+
+/// Counts the pack files in the object store and the bytes they take
+/// up.  Reads the pack directory rather than asking git, so the cost
+/// does not follow the number of loose objects.
+pub async fn pack_stats(repo_path: &Path) -> Result<(usize, u64)> {
+    let pack_dir = object_dir(repo_path, "pack").await?;
+
+    let mut entries = match tokio::fs::read_dir(&pack_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(anyhow!("Failed to read {:?}: {}", pack_dir, e)),
+    };
+
+    let mut packs = 0usize;
+    let mut bytes = 0u64;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            packs += 1;
+            if let Ok(meta) = entry.metadata().await {
+                bytes += meta.len();
+            }
+        }
+    }
+
+    Ok((packs, bytes))
 }
 
 /// Rebuilds the commit-graph from the current object database,
@@ -1373,6 +1402,33 @@ mod tests {
              object database"
         ));
         assert!(!is_stale_commit_graph("fatal: couldn't find remote ref"));
+    }
+
+    #[tokio::test]
+    async fn test_pack_stats_counts_only_packs() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+
+        // A repository that has never packed reports nothing.
+        assert_eq!(pack_stats(&repo_path).await?, (0, 0));
+
+        let pack_dir = object_dir(&repo_path, "pack").await?;
+        std::fs::create_dir_all(&pack_dir)?;
+        let mut pack = File::create(pack_dir.join("pack-abc.pack"))?;
+        pack.write_all(b"0123456789")?;
+        File::create(pack_dir.join("pack-abc.idx"))?;
+
+        let (packs, bytes) = pack_stats(&repo_path).await?;
+        assert_eq!(packs, 1);
+        assert_eq!(bytes, 10);
+
+        Ok(())
     }
 
     #[tokio::test]

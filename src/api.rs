@@ -1005,6 +1005,8 @@ async fn get_stats(
     let reviewing = crate::metrics::get_reviewing_patches();
     let messages = crate::metrics::get_messages();
     let patchsets = crate::metrics::get_patchsets();
+    let repo_packs = crate::metrics::get_repo_packs();
+    let repo_pack_bytes = crate::metrics::get_repo_pack_bytes();
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -1012,7 +1014,9 @@ async fn get_stats(
         "pending": pending,
         "reviewing": reviewing,
         "messages": messages,
-        "patchsets": patchsets
+        "patchsets": patchsets,
+        "repo_packs": repo_packs,
+        "repo_pack_bytes": repo_pack_bytes
     })))
 }
 
