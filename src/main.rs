@@ -847,8 +847,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The walk visits every reachable commit, which runs to minutes
     // on a tree the size of Linux.  Awaiting it here held the sync
     // worker and the reviewer off for that long on every restart.
-    // Run it beside those workers instead.  Auto-maintenance is off,
-    // so nothing repacks underneath the walk.
+    // Run it beside those workers instead.  The repack worker
+    // rewrites the pack directory.  Both passes take the object-store
+    // lock, so it cannot run underneath the walk.
     let graph_repo_path = repo_path.clone();
     tokio::spawn(async move {
         if let Err(e) = sashiko::git_ops::write_commit_graph(&graph_repo_path).await {
@@ -876,6 +877,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sync_worker = sashiko::worker::sync::GitSyncWorker::new(repo_path.clone());
         tokio::spawn(async move {
             sync_worker.run().await;
+        });
+    }
+
+    // Start Repack Worker
+    {
+        let repack_worker = sashiko::worker::repack::RepackWorker::new(repo_path.clone());
+        tokio::spawn(async move {
+            repack_worker.run().await;
         });
     }
 

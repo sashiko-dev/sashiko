@@ -578,7 +578,8 @@ pub async fn pack_stats(repo_path: &Path) -> Result<(usize, u64)> {
 /// The graph records what the object database holds at the moment of
 /// the walk.  A fetch running beside it costs the graph only the
 /// commits that fetch installs.  A repack is what leaves an entry
-/// with no object behind it, so do not call this where one can run.
+/// with no object behind it, and the object-store lock this takes is
+/// what keeps one out.
 ///
 /// The walk consults the graph already in place, so one naming lost
 /// objects fails the write the way it fails a fetch.  Nothing else
@@ -647,6 +648,46 @@ pub fn schedule_commit_graph_rebuild(repo_path: &Path) {
             error!("Failed to rebuild the commit-graph: {}", e);
         }
     });
+}
+
+/// Rolls the pack directory up into a geometric progression and
+/// writes a multi-pack index over the result.
+///
+/// Loose objects join the rollup.  A fetch carrying fewer objects
+/// than transfer.unpackLimit writes them loose rather than as a pack,
+/// so they are most of what accumulates here.
+///
+/// The pass takes no reachability walk, so it removes no object.  A
+/// commit-graph entry, a worktree, or a scratch clone borrowing from
+/// this store still finds what it named.  Disk goes unreclaimed for
+/// the same reason: an object no ref can reach is rolled up with the
+/// rest.
+pub async fn repack_repository(repo_path: &Path) -> Result<()> {
+    let lock = get_object_store_lock();
+    let _guard = lock.lock().await;
+
+    info!("Repacking {:?}", repo_path);
+    let started = std::time::Instant::now();
+
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["repack", "--geometric=2", "-d", "--write-midx"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git repack failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    info!(
+        "Repacked {:?} in {:.1}s",
+        repo_path,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -726,11 +767,13 @@ fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
-/// The lock every pass that walks the shared object store takes: the
-/// commit-graph verify and the commit-graph write.  Two writes
-/// collide on objects/info/commit-graph.lock and one of them dies.
-/// A verify beside a write reads a graph the write is halfway
-/// through replacing.
+/// The lock every pass that walks or rewrites the shared object
+/// store takes: the commit-graph verify, the commit-graph write, and
+/// the repack.  Two writes collide on
+/// objects/info/commit-graph.lock and one of them dies.  A verify
+/// beside a write reads a graph the write is halfway through
+/// replacing.  A walk beside a repack reads the pack directory the
+/// repack is replacing.
 ///
 /// Each pass runs to minutes on a tree the size of Linux, so a
 /// caller can wait that long for the lock.  None of them holds a
