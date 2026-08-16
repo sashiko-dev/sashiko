@@ -506,6 +506,14 @@ async fn object_info_dir(repo_path: &Path) -> Result<PathBuf> {
 /// Removes the commit-graph, whole or chained.  The graph is built
 /// from the object database and holds nothing else, so removing it
 /// costs slower revision walks and loses no history.
+///
+/// This takes no object-store lock.  A write ends in a rename, so a
+/// removal racing one leaves either a fresh graph or none, and both
+/// are states the repository is already prepared for.  A fetch
+/// recovering from a stale graph calls here holding a remote lock,
+/// and waiting out a walk under that lock costs more than the race
+/// does.  Callers already holding the lock, such as
+/// write_commit_graph, depend on this staying out.
 pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
     let info_dir = object_info_dir(repo_path).await?;
 
@@ -526,28 +534,84 @@ pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Drops a commit-graph that names commits the object database no
-/// longer holds.  Git reports such a graph as repository corruption
-/// and refuses to fetch, so leaving it in place wedges every remote
-/// until someone removes it by hand.
-pub async fn repair_commit_graph(repo_path: &Path) -> Result<()> {
-    let output = Command::new("git")
+/// Runs one `git commit-graph write`, returning git's own output.
+async fn run_commit_graph_write(repo_path: &Path) -> Result<std::process::Output> {
+    Ok(Command::new("git")
         .current_dir(repo_path)
-        .args(["commit-graph", "verify"])
+        .args(["commit-graph", "write", "--reachable"])
         .output()
-        .await?;
+        .await?)
+}
 
-    if output.status.success() {
-        return Ok(());
+/// Rebuilds the commit-graph from the current object database,
+/// dropping a graph that turns the write away and walking again.
+///
+/// The graph records what the object database holds at the moment of
+/// the walk.  A fetch running beside it costs the graph only the
+/// commits that fetch installs.  A repack is what leaves an entry
+/// with no object behind it, so do not call this where one can run.
+///
+/// The walk consults the graph already in place, so one naming lost
+/// objects fails the write the way it fails a fetch.  Nothing else
+/// here needs that graph, so drop it and rebuild from the object
+/// database alone.  This is the only pass that writes a graph, and
+/// git's verify passes a graph that is merely behind the refs, so
+/// the write cannot be made conditional on one.
+pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
+    let lock = get_object_store_lock();
+    let _guard = lock.lock().await;
+
+    info!("Writing commit-graph for {:?}", repo_path);
+
+    let mut output = run_commit_graph_write(repo_path).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if is_stale_commit_graph(&stderr) {
+            warn!(
+                "Commit-graph in {:?} outlived the objects it names; dropping it",
+                repo_path
+            );
+            drop_commit_graph(repo_path).await?;
+            output = run_commit_graph_write(repo_path).await?;
+        }
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    warn!(
-        "Commit-graph in {:?} does not match the object database: {}",
-        repo_path,
-        stderr.lines().next().unwrap_or("").trim()
-    );
-    drop_commit_graph(repo_path).await
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git commit-graph write failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Rebuilds the commit-graph in the background once a recovery has
+/// removed it.
+///
+/// A recovery leaves the repository walking history with no graph
+/// until something writes one back.  The walk takes minutes and every
+/// caller holds a fetch lock, so none of them can wait for it.  A
+/// rebuild already under way stands in for a later one, since it
+/// reads the object database as it finds it.  Call from a tokio
+/// runtime.
+pub fn schedule_commit_graph_rebuild(repo_path: &Path) {
+    static REBUILD_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    let lock = REBUILD_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone();
+    let repo_path = repo_path.to_path_buf();
+
+    tokio::spawn(async move {
+        let Ok(_guard) = lock.try_lock() else {
+            info!("A commit-graph rebuild is already running; skipping this one");
+            return;
+        };
+        if let Err(e) = write_commit_graph(&repo_path).await {
+            error!("Failed to rebuild the commit-graph: {}", e);
+        }
+    });
 }
 
 #[allow(dead_code)]
@@ -623,6 +687,22 @@ fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
 fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
     static WORKTREE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
     WORKTREE_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// The lock every pass that walks the shared object store takes: the
+/// commit-graph verify and the commit-graph write.  Two writes
+/// collide on objects/info/commit-graph.lock and one of them dies.
+/// A verify beside a write reads a graph the write is halfway
+/// through replacing.
+///
+/// Each pass runs to minutes on a tree the size of Linux, so a
+/// caller can wait that long for the lock.  None of them holds a
+/// fetch lock.
+fn get_object_store_lock() -> Arc<AsyncMutex<()>> {
+    static OBJECT_STORE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    OBJECT_STORE_LOCK
         .get_or_init(|| Arc::new(AsyncMutex::new(())))
         .clone()
 }
@@ -871,6 +951,7 @@ pub async fn ensure_remote(
                         .saturating_sub(started.elapsed())
                         .max(GRAPH_RETRY_FLOOR);
                     attempt = fetch_remote(repo_path, name, &fetch_args, remaining).await;
+                    schedule_commit_graph_rebuild(repo_path);
                 }
                 Err(e) => warn!("Failed to drop the commit-graph: {}", e),
             }

@@ -437,6 +437,9 @@ impl FetchAgent {
                 .await?;
 
             if output.status.success() || dropped_graph {
+                if dropped_graph {
+                    crate::git_ops::schedule_commit_graph_rebuild(&self.repo_path);
+                }
                 return Ok(output);
             }
 

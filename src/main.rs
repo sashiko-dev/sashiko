@@ -840,11 +840,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Recover the object store the way the worktrees above are
-    // recovered.  A commit-graph that outlived the objects it names
-    // fails every fetch until it is removed.
-    if let Err(e) = sashiko::git_ops::repair_commit_graph(&repo_path).await {
-        error!("Failed to check the commit-graph: {}", e);
-    }
+    // recovered.  The write brings the graph up to the refs the last
+    // run left behind, and drops a graph that outlived the objects it
+    // names rather than reporting it.
+    //
+    // The walk visits every reachable commit, which runs to minutes
+    // on a tree the size of Linux.  Awaiting it here held the sync
+    // worker and the reviewer off for that long on every restart.
+    // Run it beside those workers instead.  Auto-maintenance is off,
+    // so nothing repacks underneath the walk.
+    let graph_repo_path = repo_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) = sashiko::git_ops::write_commit_graph(&graph_repo_path).await {
+            error!("Failed to write the commit-graph: {}", e);
+        }
+    });
 
     if let Some(custom_remotes) = &settings.git.custom_remotes {
         for remote in custom_remotes {
