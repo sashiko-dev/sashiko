@@ -433,6 +433,51 @@ pub async fn ensure_submodule_config_compat(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Turns off git's own maintenance of the shared repository.
+///
+/// Auto-maintenance detaches from the fetch that triggers it and
+/// repacks while the sync worker keeps fetching, so it can discard
+/// objects a later fetch still names.  Nothing runs gc in its place,
+/// so the packs the repository accumulates are the cost of this.
+///
+/// Every key is attempted whatever the ones before it did, since a
+/// key left at its default is a piece of maintenance still running,
+/// and the error names all of them.  The caller logs and carries on
+/// either way, so the rest of the daemon runs whether or not this
+/// took.
+pub async fn ensure_gc_disabled(repo_path: &Path) -> Result<()> {
+    const KEYS: &[(&str, &str)] = &[
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+        ("gc.writeCommitGraph", "false"),
+        ("fetch.writeCommitGraph", "false"),
+    ];
+
+    let mut failures = Vec::new();
+    for (key, value) in KEYS {
+        let output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["config", key, value])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            failures.push(format!(
+                "{} {}: {}",
+                key,
+                value,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(anyhow!("git config failed for {}", failures.join("; ")));
+    }
+
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub async fn cleanup_worktree_dir(worktree_dir: &Path) -> Result<()> {
     if !worktree_dir.exists() {

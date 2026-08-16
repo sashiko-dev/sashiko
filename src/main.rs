@@ -832,6 +832,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to ensure submodule config compatibility: {}", e);
     }
 
+    // Auto-maintenance repacks in the background while the sync worker
+    // keeps fetching, which can leave a commit-graph naming objects the
+    // repack removed.
+    if let Err(e) = sashiko::git_ops::ensure_gc_disabled(&repo_path).await {
+        error!("Failed to disable git auto-maintenance: {}", e);
+    }
+
     if let Some(custom_remotes) = &settings.git.custom_remotes {
         for remote in custom_remotes {
             info!(
