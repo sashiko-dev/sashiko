@@ -32,6 +32,8 @@ effort = "none"
 # base_url = "https://api.openai.com/v1/chat/completions"
 # Generic fallback for gpt-5.x; raise to the model's real window.
 # context_window_size = 128000
+# Set api = "responses" for the other endpoint; see
+# Settings.openai-responses.toml.
 
 [review]
 concurrency = 4
