@@ -562,6 +562,7 @@ pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
     let _guard = lock.lock().await;
 
     info!("Writing commit-graph for {:?}", repo_path);
+    let started = std::time::Instant::now();
 
     let mut output = run_commit_graph_write(repo_path).await?;
 
@@ -584,6 +585,11 @@ pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
         ));
     }
 
+    info!(
+        "Wrote commit-graph for {:?} in {:.1}s",
+        repo_path,
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -951,6 +957,16 @@ pub async fn ensure_remote(
                         .saturating_sub(started.elapsed())
                         .max(GRAPH_RETRY_FLOOR);
                     attempt = fetch_remote(repo_path, name, &fetch_args, remaining).await;
+                    match &attempt {
+                        Ok(()) => info!(
+                            "Fetch for {} succeeded once the commit-graph was gone",
+                            name
+                        ),
+                        Err(message) => warn!(
+                            "Fetch for {} fails with no commit-graph in the way: {}",
+                            name, message
+                        ),
+                    }
                     schedule_commit_graph_rebuild(repo_path);
                 }
                 Err(e) => warn!("Failed to drop the commit-graph: {}", e),
