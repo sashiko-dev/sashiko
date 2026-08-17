@@ -35,6 +35,10 @@ use std::time::Duration;
 pub enum OpenAiCompatError {
     #[error("Rate limit exceeded, retry after {0:?}")]
     RateLimitExceeded(Duration),
+    /// A 429 the endpoint will keep returning until the account is funded.
+    /// It shares a status with the rate limit but not a remedy.
+    #[error("Quota exhausted: {0}")]
+    QuotaExhausted(String),
     #[error("Transient error: {1}, retry after {0:?}")]
     TransientError(Duration, String),
     #[error("Authentication error: {0}")]
@@ -53,6 +57,7 @@ impl ClassifyAiError for OpenAiCompatError {
             OpenAiCompatError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
                 retry_after: *retry_after,
             },
+            OpenAiCompatError::QuotaExhausted(_) => AiErrorClass::Fatal,
             OpenAiCompatError::TransientError(retry_after, _) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
@@ -184,6 +189,19 @@ fn strip_temperature(body: &mut Value) -> bool {
         .is_some()
 }
 
+/// Whether a 429 body reports an exhausted account rather than a rate
+/// limit.  Both arrive as 429; only the body separates them.  Match on
+/// `error.type`, which has named this condition across several wordings
+/// of the message and of `error.code`.  A body that will not parse falls
+/// back to a substring search: mistaking a rate limit for exhaustion
+/// ends one review, while the reverse retries forever.
+fn is_insufficient_quota(error_text: &str) -> bool {
+    match serde_json::from_str::<Value>(error_text) {
+        Ok(body) => body["error"]["type"] == "insufficient_quota",
+        Err(_) => error_text.contains("insufficient_quota"),
+    }
+}
+
 /// POSTs `body` to `url` and decodes the reply, mapping every failure to the
 /// class the retry path acts on.  The endpoint decides the shape of `T`; the
 /// status handling above it does not depend on which endpoint answered.
@@ -280,6 +298,10 @@ async fn post_json_once<T: DeserializeOwned>(
     let error_text = redact_secret(&res.text().await.unwrap_or_default());
 
     match status_code {
+        429 if is_insufficient_quota(&error_text) => {
+            tracing::error!("OpenAI quota exhausted: {}", error_text);
+            Err(OpenAiCompatError::QuotaExhausted(error_text))
+        }
         429 => {
             let default_retry = retry_after_duration.unwrap_or(Duration::from_secs(60));
             let retry_duration = retry_in_regex()
@@ -460,6 +482,10 @@ pub(crate) mod tests {
                 AiErrorClass::Fatal,
             ),
             (
+                OpenAiCompatError::QuotaExhausted("no credits".to_string()),
+                AiErrorClass::Fatal,
+            ),
+            (
                 OpenAiCompatError::ApiError(
                     reqwest::StatusCode::SERVICE_UNAVAILABLE,
                     "unavailable".to_string(),
@@ -480,6 +506,23 @@ pub(crate) mod tests {
         for (err, expected) in cases {
             assert_eq!(err.ai_error_class(), expected);
         }
+    }
+
+    /// The live body an exhausted account returns, and the one a genuine
+    /// rate limit returns.  Both are 429; only `error.type` separates them.
+    #[test]
+    fn test_insufficient_quota_is_told_from_a_rate_limit() {
+        let exhausted = r#"{"error":{"message":"You have no credits remaining.",
+            "type":"insufficient_quota","param":null,
+            "code":"credit_balance_exhausted"}}"#;
+        let throttled = r#"{"error":{"message":"Rate limit reached. Please retry in 1.2s",
+            "type":"requests","param":null,"code":"rate_limit_exceeded"}}"#;
+
+        assert!(is_insufficient_quota(exhausted));
+        assert!(!is_insufficient_quota(throttled));
+        // An unparseable body still has to be told apart.
+        assert!(is_insufficient_quota("502 Bad Gateway: insufficient_quota"));
+        assert!(!is_insufficient_quota("502 Bad Gateway"));
     }
 
     #[test]
