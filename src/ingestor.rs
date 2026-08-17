@@ -91,7 +91,7 @@ impl Ingestor {
                 match NntpClient::connect(
                     &self.settings.nntp.server,
                     self.settings.nntp.port,
-                    false,
+                    self.settings.nntp.tls,
                 )
                 .await
                 {
@@ -363,8 +363,12 @@ impl Ingestor {
     }
 
     async fn process_nntp_cycle(&self) -> Result<()> {
-        let mut client =
-            NntpClient::connect(&self.settings.nntp.server, self.settings.nntp.port, false).await?;
+        let mut client = NntpClient::connect(
+            &self.settings.nntp.server,
+            self.settings.nntp.port,
+            self.settings.nntp.tls,
+        )
+        .await?;
 
         'groups: for (name, group_name) in self.get_tracked_groups().await? {
             let group_name = &group_name;
@@ -377,7 +381,7 @@ impl Ingestor {
                     if let Ok(new_client) = NntpClient::connect(
                         &self.settings.nntp.server,
                         self.settings.nntp.port,
-                        false,
+                        self.settings.nntp.tls,
                     )
                     .await
                     {
@@ -488,7 +492,7 @@ impl Ingestor {
                             if let Ok(new_client) = NntpClient::connect(
                                 &self.settings.nntp.server,
                                 self.settings.nntp.port,
-                                false,
+                                self.settings.nntp.tls,
                             )
                             .await
                             {

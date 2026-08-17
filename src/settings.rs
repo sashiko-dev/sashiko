@@ -138,6 +138,10 @@ pub struct NntpSettings {
     pub server: String,
     #[serde(default = "default_nntp_port")]
     pub port: u16,
+    /// Implicit NNTPS. The server port is set separately, so an
+    /// operator turning this on also moves `port` to 563.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 fn default_nntp_port() -> u16 {
@@ -149,6 +153,7 @@ impl Default for NntpSettings {
         Self {
             server: String::new(),
             port: default_nntp_port(),
+            tls: false,
         }
     }
 }
@@ -1078,6 +1083,20 @@ mod tests {
             Settings::local_review_path_in(temp.path()),
             temp.path().join("Settings.toml")
         );
+    }
+
+    #[test]
+    fn test_nntp_tls_defaults_to_off() {
+        let nntp: NntpSettings =
+            toml::from_str("server = \"nntp.lore.kernel.org\"\nport = 119\n").unwrap();
+        assert!(!nntp.tls);
+    }
+
+    #[test]
+    fn test_nntp_tls_is_configurable() {
+        let nntp: NntpSettings =
+            toml::from_str("server = \"news.internal.example\"\nport = 563\ntls = true\n").unwrap();
+        assert!(nntp.tls);
     }
 
     #[test]
