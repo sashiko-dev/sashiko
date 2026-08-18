@@ -68,6 +68,10 @@ struct Args {
     /// Select which stages from 1-7 to run.
     #[arg(long, hide = true, value_delimiter = ',')]
     stages: Option<Vec<u8>>,
+
+    /// Return structured findings without generating an inline review report.
+    #[arg(long, hide = true)]
+    skip_report_stage: bool,
 }
 
 #[tokio::main]
@@ -94,6 +98,7 @@ async fn main() -> Result<()> {
         ai_provider: args.ai_provider,
         custom_prompt: args.custom_prompt,
         stages: args.stages,
+        skip_report_stage: args.skip_report_stage,
         scratch_clone: false,
         current_tree: false,
     })

@@ -246,6 +246,33 @@ cp docs/examples/Settings.codex-cli.toml Settings.toml
 - Prompt sent via stdin to avoid `ARG_MAX` issues
 - No tool access -- sandbox is read-only
 
+## TraeCLI
+
+Uses a local TraeCLI installation as the completion backend.
+
+**Prerequisites:** Install `traecli`, authenticate it, and verify that
+`traecli exec --help` is available.
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.traecli.toml Settings.toml
+```
+
+**What you get:**
+
+- Runs `traecli exec --json` as a stateless completion backend
+- Ignores user configuration and does not persist sessions
+- Blocks native shell, patch, search, and plan tools
+- Runs in an empty temporary workspace, so other native tools cannot inspect
+  the review checkout; Sashiko's own tool protocol supplies bounded context
+- Uses a read-only sandbox as a defense-in-depth filesystem restriction
+- Preserves input, output, and cached token usage from TraeCLI JSONL events
+
+The prompt is sent via stdin. Each request starts a separate process, so lower
+`review.concurrency` if the configured model or account has a concurrency
+limit.
+
 #### Devin CLI Setup
 
 Sashiko can use a local [Devin for Terminal](https://cli.devin.ai/) install as

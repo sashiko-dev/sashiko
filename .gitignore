@@ -6,6 +6,8 @@
 *.db.bak
 .cargo/config.toml
 target/
+__pycache__/
+*.py[cod]
 archives/
 third_party/linux/
 benchmarks/smoke-repo/
