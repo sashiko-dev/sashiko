@@ -245,6 +245,35 @@ pub struct OpenAiCompatSettings {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
+pub struct VllmSettings {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Should match the server-side `--max-model-len`.
+    #[serde(default)]
+    pub context_window_size: Option<usize>,
+    /// Completion token limit. Leave unset to let vLLM generate up to the
+    /// remaining context (`max_model_len - prompt_tokens`).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Enable or disable thinking for reasoning models (e.g. Qwen3) via
+    /// `chat_template_kwargs`. Leave unset for the model default.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Enforce JSON responses with guided decoding (`response_format`).
+    /// Disabled by default because not every vLLM backend supports it;
+    /// without it the JSON requirement is injected into the system prompt.
+    #[serde(default)]
+    pub guided_json: bool,
+    /// Forward tool definitions to the server. Disabled by default because a
+    /// server started without `--enable-auto-tool-choice` and
+    /// `--tool-call-parser` rejects requests carrying tools with HTTP 400.
+    #[serde(default)]
+    pub enable_tools: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
 pub struct OllamaSettings {
     #[serde(default)]
     pub base_url: Option<String>,
@@ -335,6 +364,7 @@ pub struct AiSettings {
     pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
     pub ollama: Option<OllamaSettings>,
+    pub vllm: Option<VllmSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,

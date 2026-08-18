@@ -292,6 +292,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
         return e.ai_error_class();
     }
+    if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
+        return e.ai_error_class();
+    }
     AiErrorClass::Fatal
 }
 
@@ -506,6 +509,30 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 think_mode,
             )?))
         }
+        "vllm" => {
+            let model = ai.model.clone();
+            let cfg = ai.vllm.as_ref();
+            let base_url = cfg
+                .and_then(|c| c.base_url.clone())
+                .unwrap_or_else(vllm::VllmClient::default_base_url);
+            let context_window = cfg
+                .and_then(|c| c.context_window_size)
+                .unwrap_or_else(|| vllm::VllmClient::default_context_window_for_model(&model));
+            let max_tokens = cfg.and_then(|c| c.max_tokens);
+            let enable_thinking = cfg.and_then(|c| c.enable_thinking);
+            let guided_json = cfg.map(|c| c.guided_json).unwrap_or(false);
+            let enable_tools = cfg.map(|c| c.enable_tools).unwrap_or(false);
+            Ok(Arc::new(vllm::VllmClient::new(
+                base_url,
+                model,
+                context_window,
+                max_tokens,
+                ai.api_timeout_secs,
+                enable_thinking,
+                guided_json,
+                enable_tools,
+            )?))
+        }
         "claude-cli" => {
             let cfg = ai.claude_cli.as_ref();
             Ok(Arc::new(claude_cli::ClaudeCliProvider {
@@ -598,6 +625,7 @@ pub mod token_budget;
 pub mod truncator;
 #[cfg(feature = "vertex")]
 pub mod vertex;
+pub mod vllm;
 pub use session::{ErrorAction, LlmSession, SessionRunner, ValidationError};
 
 /// Recursively removes `thought_signature` and `thoughtSignature` fields from a JSON value.
