@@ -6,6 +6,7 @@ description = ""
 
 [forge]
 enabled = false
+# review_each_push = true
 # provider = "github"
 # api_token = "your-api-token"
 

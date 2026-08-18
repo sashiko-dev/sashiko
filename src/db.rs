@@ -3711,6 +3711,7 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        thread_key: Option<&str>,
     ) -> Result<i64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -3753,8 +3754,33 @@ impl Database {
             }
         }
 
-        // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
-        let thread_id = self.ensure_thread_for_message(&root_msg_id, now).await?;
+        // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints.
+        // The thread is anchored on thread_key (per-PR) when grouping pushes, but the
+        // patchset cover_letter_message_id FK still references the per-push root_msg_id,
+        // so that message row must exist under the resolved thread.
+        let thread_anchor = thread_key.unwrap_or(root_msg_id.as_str());
+        let thread_id = self.ensure_thread_for_message(thread_anchor, now).await?;
+
+        if self
+            .get_thread_id_for_message(&root_msg_id)
+            .await?
+            .is_none()
+        {
+            self.create_message(
+                &root_msg_id,
+                thread_id,
+                None,
+                "unknown",
+                "(placeholder)",
+                now,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await?;
+        }
 
         // 3. Create the fetching patchset
         let mut rows = self.conn

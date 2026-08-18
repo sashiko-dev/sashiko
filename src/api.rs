@@ -446,6 +446,7 @@ async fn submit_patch(
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             {
@@ -500,6 +501,7 @@ async fn submit_patch(
                 .create_fetching_patchset(
                     &clean_msgid,
                     &format!("Fetching thread {}...", clean_msgid),
+                    None,
                     None,
                     None,
                     None,
@@ -1196,8 +1198,19 @@ async fn forge_webhook(
 
     let slug = metadata.pr_url.as_ref().map(|url| {
         let repo = crate::forge::extract_repo_name_from_url(url);
-        format!("{}-{}", repo, metadata.pr_number)
+        if state.settings.forge.review_each_push {
+            let short_head = &metadata.head_sha[..metadata.head_sha.len().min(12)];
+            format!("{}-{}-{}", repo, metadata.pr_number, short_head)
+        } else {
+            format!("{}-{}", repo, metadata.pr_number)
+        }
     });
+
+    let thread_key = if state.settings.forge.review_each_push {
+        Some(format!("mr-{}@sashiko.local", metadata.pr_number))
+    } else {
+        None
+    };
 
     state
         .db
@@ -1210,6 +1223,7 @@ async fn forge_webhook(
             Some(subject),
             Some(metadata.pr_number),
             slug.as_deref(),
+            thread_key.as_deref(),
         )
         .await
         .map_err(|e| {
