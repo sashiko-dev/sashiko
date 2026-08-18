@@ -1236,7 +1236,7 @@ async fn forge_webhook(
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
     let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
 
-    let slug = metadata.pr_url.as_ref().map(|url| {
+    let slug = metadata.repo_url.as_ref().map(|url| {
         let repo = crate::forge::extract_repo_name_from_url(url);
         format!("{}-{}", repo, metadata.pr_number)
     });
