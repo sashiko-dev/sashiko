@@ -286,6 +286,40 @@ cp docs/examples/Settings.ollama.toml Settings.toml
 - No API key or subscription required
 - `context_window_size` maps to Ollama's `num_ctx`
 
+## vLLM
+
+[vLLM](https://docs.vllm.ai/) serves local models behind an
+OpenAI-compatible API.
+
+**Prerequisites:** Start a vLLM server, e.g.:
+
+```bash
+vllm serve Qwen/Qwen3-8B --max-model-len 32768 --host 0.0.0.0 --port 8000
+```
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.vllm.toml Settings.toml
+```
+
+**What you get:**
+
+- Private, local execution of LLMs
+- Reasoning model support: `<think>` blocks and `reasoning_content` are
+  separated from the answer automatically, and thinking can be toggled via
+  the `enable_thinking` setting
+- Leaving `max_tokens` unset lets vLLM generate up to the remaining context,
+  which is useful for servers running with a small `--max-model-len`
+- Optional `guided_json` setting to enforce JSON responses through guided
+  decoding on backends that support it
+- Optional `enable_tools` setting to forward tool definitions; requires a
+  server started with `--enable-auto-tool-choice` and `--tool-call-parser`
+- If the server was started with `--api-key`, export it as `VLLM_API_KEY`
+  (or `LLM_API_KEY`)
+
+Set `context_window_size` to match the server's `--max-model-len`.
+
 ## OpenAI-Compatible Providers
 
 Sashiko includes an OpenAI-compatible provider for endpoints that

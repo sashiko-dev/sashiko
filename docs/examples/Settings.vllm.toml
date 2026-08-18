@@ -1,0 +1,18 @@
+[ai]
+provider = "vllm"
+model = "Qwen/Qwen3-8B"
+max_input_tokens = 32768
+
+[ai.vllm]
+base_url = "http://localhost:8000"
+# Should match the vLLM server's --max-model-len
+context_window_size = 32768
+# Leave max_tokens unset to let vLLM use the remaining context
+#max_tokens = 4096
+# Disable thinking for reasoning models such as Qwen3
+enable_thinking = false
+# Enforce JSON via guided decoding; leave disabled unless the backend supports it
+#guided_json = true
+# Forward tool definitions; requires a server started with
+# --enable-auto-tool-choice and --tool-call-parser
+#enable_tools = true
