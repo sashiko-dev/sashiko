@@ -872,11 +872,23 @@ async fn get_patchset_summary(
             .get_patchset_summary(id_val, query.page, query.per_page)
             .await
     } else {
-        info!("Fetching summary for patchset msgid: {}", query.id);
-        state
+        match state
             .db
             .get_patchset_summary_by_msgid(&query.id, query.page, query.per_page)
             .await
+        {
+            Ok(None) => {
+                info!("Fetching summary for patchset slug: {}", query.id);
+                state
+                    .db
+                    .get_patchset_summary_by_slug(&query.id, query.page, query.per_page)
+                    .await
+            }
+            other => {
+                info!("Fetching summary for patchset msgid: {}", query.id);
+                other
+            }
+        }
     };
 
     match result {
