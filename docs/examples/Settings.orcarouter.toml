@@ -1,0 +1,9 @@
+[ai]
+# Can be "openai" or "openai-compatible"
+provider = "openai-compatible"
+model = "openai/gpt-4o-mini"
+
+[ai.openai_compat]
+base_url = "https://api.orcarouter.ai/v1"
+context_window_size = 128000
+max_tokens = 16384

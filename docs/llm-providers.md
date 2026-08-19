@@ -325,3 +325,21 @@ base_url = "https://api.z.ai/api/coding/paas/v4/chat/completions"
 context_window_size = 128000
 max_tokens = 16384
 ```
+
+**OrcaRouter example:**
+
+[OrcaRouter](https://www.orcarouter.ai) is an OpenAI-compatible gateway to
+models from OpenAI, Anthropic, Google, and other providers behind a single
+endpoint and API key. Point `base_url` at `https://api.orcarouter.ai/v1` and
+use a namespaced model id such as `openai/gpt-4o-mini`:
+
+```toml
+[ai]
+provider = "openai-compatible"
+model = "openai/gpt-4o-mini"
+
+[ai.openai_compat]
+base_url = "https://api.orcarouter.ai/v1"
+context_window_size = 128000
+max_tokens = 16384
+```
