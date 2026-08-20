@@ -473,6 +473,7 @@ async fn submit_patch(
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             {
@@ -527,6 +528,7 @@ async fn submit_patch(
                 .create_fetching_patchset(
                     &clean_msgid,
                     &format!("Fetching thread {}...", clean_msgid),
+                    None,
                     None,
                     None,
                     None,
@@ -1248,6 +1250,7 @@ async fn forge_webhook(
             Some(subject),
             Some(metadata.pr_number),
             slug.as_deref(),
+            None,
         )
         .await
         .map_err(|e| {
