@@ -24,7 +24,7 @@ pub fn default_kernel_prompts_path() -> Result<PathBuf> {
     Ok(root.join("kernel"))
 }
 
-pub fn resolve_review_prompts_path(configured: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn resolve_review_prompts_path(configured: Option<&Path>) -> Result<PathBuf> {
     resolve_review_prompts_path_with(configured, default_kernel_prompts_path)
 }
 

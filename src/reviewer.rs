@@ -2725,7 +2725,9 @@ mod tests {
     #[tokio::test]
     async fn test_configured_prompts_reach_review_subprocess() -> Result<()> {
         let prompts_root = tempdir()?;
-        let prompts_path = prompts_root.path().join("sashiko");
+        let prompts_path = prompts_root
+            .path()
+            .join("profile; $(not-a-command) with spaces");
         std::fs::create_dir(&prompts_path)?;
         std::fs::write(prompts_path.join("review-core.md"), "# Sashiko review\n")?;
 
@@ -2748,6 +2750,30 @@ printf '{"patchset_id":1,"prompts":"%s","patches":[{"index":1,"status":"applied"
                 .await?;
 
         assert_eq!(result["prompts"], prompts_path.to_string_lossy().as_ref());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_invalid_prompts_do_not_spawn_review_subprocess() -> Result<()> {
+        let temp = tempdir()?;
+        let missing = temp.path().join("missing-profile");
+        let sentinel = temp.path().join("subprocess-was-spawned");
+        let mock_script = format!(
+            "#!/bin/bash\ntouch '{}'\nprintf '{{\"patchset_id\":1,\"patches\":[]}}\\n'\n",
+            sentinel.display()
+        );
+
+        let error =
+            run_single_ai_request_mock(&mock_script, Arc::new(MockProvider), Some(&missing))
+                .await
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured prompts path is not a directory")
+        );
+        assert!(!sentinel.exists());
         Ok(())
     }
 
