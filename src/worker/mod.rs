@@ -15,10 +15,15 @@
 pub mod compressor;
 pub mod email;
 pub mod kernel_workflow;
+pub mod linux_prompt_workflow;
 pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;
 pub mod stage;
 pub mod sync;
 
+pub use linux_prompt_workflow::{
+    LinuxPromptReviewState, build_linux_prompt_review_workflow,
+    build_linux_prompt_review_workflow_with_options,
+};
 pub use prompts::*;

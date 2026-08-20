@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=third_party/prompts");
+    println!("cargo:rerun-if-changed=prompts");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let git_dir = manifest_dir.join(".git");
@@ -49,15 +50,23 @@ fn main() {
 
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
 
-    let prompts_dir = manifest_dir.join("third_party/prompts");
+    let third_party_prompts = manifest_dir.join("third_party/prompts");
+    let prompts_dir = manifest_dir.join("prompts");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let generated = out_dir.join("prompts_generated.rs");
 
     let mut files = Vec::new();
-    collect_files(&prompts_dir, &prompts_dir, &mut files).unwrap();
+    if third_party_prompts.exists() {
+        collect_files(&third_party_prompts, &third_party_prompts, &mut files).unwrap();
+    }
+    if prompts_dir.exists() {
+        collect_files(&prompts_dir, &prompts_dir, &mut files).unwrap();
+    }
     files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.dedup_by(|a, b| a.0 == b.0);
 
     let revision = fs::read_to_string(prompts_dir.join("REVISION"))
+        .or_else(|_| fs::read_to_string(third_party_prompts.join("REVISION")))
         .unwrap_or_else(|_| "unknown".to_string())
         .trim()
         .to_string();

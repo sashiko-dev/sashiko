@@ -24,6 +24,11 @@ pub fn default_kernel_prompts_path() -> Result<PathBuf> {
     Ok(root.join("kernel"))
 }
 
+pub fn default_linux_prompts_review_path() -> Result<PathBuf> {
+    let root = install_prompt_bundle(false)?;
+    Ok(root.join("linux_prompts"))
+}
+
 pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
     let root = prompt_bundle_root()?;
     let marker = root.join(COMPLETE_MARKER);
@@ -81,6 +86,11 @@ mod tests {
             PROMPT_BUNDLE_FILES
                 .iter()
                 .any(|(path, _)| *path == "kernel/review-core.md")
+        );
+        assert!(
+            PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(path, _)| *path == "linux_prompts/stage1_factual_constraints.md")
         );
     }
 
