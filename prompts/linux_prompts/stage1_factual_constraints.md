@@ -19,8 +19,12 @@ Analyze the prompt diff and identify any violations of Sashiko's prompt design c
    - If a prompt instructs the model to perform any such unavailable action, raise a concern and suggest rephrasing to static inspection or invariant checking.
 
 3. **No Trivial Facts or Basic Language Explanations**:
-   - The prompt MUST NOT waste prompt context on basic C language syntax explanations or elementary programming concepts (e.g., explaining how `if` statements work, what a pointer is, how `struct` fields are accessed, or basic arithmetic).
-   - The prompt is consumed by expert LLMs operating as senior kernel maintainers. Only include domain-specific Linux kernel invariants, subsystem architectural rules, kernel-specific APIs, and specialized bug patterns.
+   - The prompt MUST NOT waste prompt context on basic C language syntax explanations or elementary programming concepts. Examples of unacceptable trivial filler that MUST be flagged as concerns:
+     - Explaining pointer dereferencing mechanics (e.g., explaining that `ptr = foo->bar` dereferences `foo` to read `bar`, or that `*ptr` dereferences `ptr`).
+     - Explaining basic boolean short-circuit evaluation (e.g., explaining how `if (foo && foo->bar)` protects against null dereference).
+     - Explaining loop semantics (e.g., explaining that `for(init; condition; step)` checks condition before the body).
+     - Explaining basic struct layout, pointer size equality, or elementary C operators.
+   - The prompt is consumed by LLMs operating as senior kernel maintainers. Only include domain-specific Linux kernel invariants, subsystem architectural rules, kernel-specific APIs (e.g. `ERR_PTR`, `IS_ERR`, `RCU`, `cleanup.h`), and specialized bug patterns.
 
 ## Output Format
 

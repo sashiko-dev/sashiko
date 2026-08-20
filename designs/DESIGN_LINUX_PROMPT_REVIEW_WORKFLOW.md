@@ -47,28 +47,24 @@ graph TD
 - **Output:** JSON schema with `concerns` and `dismissed_concerns`.
 
 ### Stage 3: Index & Placement Verification (`stage_3_index_placement`)
-- **Objective:** Verify that prompt changes are placed in the appropriate directory (`api/`, `subsystems/`, `generic/`) and registered in root `index.md`.
+- **Objective:** Verify that prompt changes are placed in the appropriate directory (`api/`, `subsystems/`, `generic/`) and registered in root `index.md` if necessary.
 - **Placement Rules:**
   - `api/`: Guidelines and rules on how callers properly use widely used kernel APIs and primitives (locking primitives, memory allocation, RCU, workqueues, cleanup attributes).
   - `subsystems/`: Internal implementation details and mechanics of kernel subsystems (e.g. how locking primitives or scheduler internals are implemented).
   - `generic/`: High-level prompts describing output formatting, severity assessment, false-positive handling, and core review workflow.
 - **Index Rules:**
-  - All conditionally loaded prompts in `api/` and `subsystems/` must have matching trigger rules in `index.md`.
-  - When new prompts are added or triggers change, `index.md` must be updated accordingly.
+  - Conditionally loaded prompts in `api/` and `subsystems/` must have matching trigger rules in `index.md`.
+  - Prompts in `generic/` are often loaded directly by specific review workflow stages, so `index.md` registration is not required for `generic/` files.
 - **Tools:** `ToolScope::None`.
 - **Output:** JSON schema with `concerns` and `dismissed_concerns`.
 
 ### Stage 4: Concern Aggregation & Report Generation (`stage_4_report_generation`)
-- **Objective:** Aggregate concerns from Stages 1-3 and generate a constructive review report formatted in Sashiko's LKML-inspired review style.
+- **Objective:** Aggregate concerns from Stages 1-3 and generate a constructive review report formatted in Sashiko's LKML-inspired inline review style.
 - **Format:**
   - Concise summary of the prompt change.
   - Clean status if no concerns were found across all 3 analysis stages.
-  - Interspersed technical questions/observations grouped by category:
-    1. Factual & Actionability Issues (Stage 1)
-    2. Codebase Discrepancies (Stage 2)
-    3. Index & Placement Inconsistencies (`api/`, `subsystems/`, `generic/`, `index.md`) (Stage 3)
-  - Concrete suggestions and proposed diff replacements.
-  - Plain-text formatted with 78-character line wrapping.
+  - Interspersed comments quoting diff hunks with `> +...` followed directly by constructive explanations and questions.
+  - Plain-text formatted without Markdown headers, with 78-character line wrapping.
 - **Tools:** `ToolScope::None`.
 - **Output:** Validated plain-text report.
 

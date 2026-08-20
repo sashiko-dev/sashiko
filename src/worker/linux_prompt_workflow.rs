@@ -82,8 +82,8 @@ You are an expert prompt engineer and Linux kernel maintainer evaluating propose
 Your task is to review proposed prompt changes to ensure they are:
 1. Factually accurate and free from impossible action instructions (like compiling code or searching the web) and free from trivial C syntax explanations.
 2. Verified against the Linux kernel source code (Linus tree HEAD) where applicable.
-3. Placed into the appropriate directory (api/ for API caller rules, subsystems/ for subsystem internals, generic/ for formats and policies) and registered in index.md if necessary.
-4. Synthesized into a polite, constructive, plain-text review report.
+3. Placed into the appropriate directory (api/ for API caller rules, subsystems/ for subsystem internals, generic/ for formats and policies) and registered in index.md if necessary (prompts in generic/ are stage-loaded and do not require index.md registration).
+4. Synthesized into an LKML-style plain-text review report with inline quotes of the original patch and concise replies.
 
 TOOL USAGE: When you need to gather information using tools (e.g. verifying kernel symbols in the source tree), actively batch parallel or independent tool calls into a single response to minimize conversation turns.
 
@@ -197,6 +197,22 @@ fn validate_prompt_review_report(
             "Report contains a JSON code block. Please return raw plain text following report-template.md."
                 .to_string(),
         );
+    }
+    for line in content.lines() {
+        if line.len() > 75 {
+            return Err(format!(
+                "Line exceeds 75 characters limit (length {}): '{}'. All lines must be strictly hard-wrapped at 75 characters or fewer.",
+                line.len(),
+                line
+            ));
+        }
+        let lower = line.trim().to_lowercase();
+        if lower.starts_with("on ") && lower.ends_with("wrote:") {
+            return Err("Report contains an email greeting header ('On ... wrote:'). Do not include greetings.".to_string());
+        }
+        if lower == "thanks," || lower == "best regards," || lower.contains("sashiko review team") {
+            return Err("Report contains a sign-off or signature ('Thanks, ...' / 'Sashiko Review Team'). Do not include sign-offs or signatures.".to_string());
+        }
     }
     let lower = trimmed.to_lowercase();
     if !lower.contains("summary")
@@ -407,7 +423,7 @@ Aggregated Concerns:
 Aggregated Dismissed Concerns:
 {{all_dismissed_concerns}}
 
-Generate the final plain-text review report following Sashiko's review style. Return raw text output, not JSON."#,
+Generate the final plain-text review report following Sashiko's review style. All lines must be strictly hard-wrapped at 75 characters or fewer. Do NOT include greetings (e.g. 'On ... wrote:') or sign-off signatures (e.g. 'Thanks, ...'). Return raw text output, not JSON."#,
             )
             .include_file("stage4_report_generation.md")
             .include_file("linux_prompts/stage4_report_generation.md")
@@ -464,6 +480,58 @@ pub fn build_linux_prompt_review_workflow_with_options(
         )
         .stage(stage_4_report_generation(max_turns, temperature))
         .build()
+}
+
+/// Executes the Linux prompt review workflow on a given prompt diff string.
+pub async fn run_linux_prompt_review(
+    diff: &str,
+    repo_path: Option<&std::path::Path>,
+    prompts_dir: Option<&std::path::Path>,
+    ai_settings: Option<&crate::settings::AiSettings>,
+) -> anyhow::Result<LinuxPromptReviewState> {
+    use anyhow::Context;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let settings = crate::settings::Settings::new().ok();
+    let default_ai = settings.as_ref().map(|s| &s.ai);
+    let effective_ai = ai_settings.or(default_ai).context("No AI settings found")?;
+
+    let provider = crate::ai::create_provider_from_ai(effective_ai)?;
+    let default_repo = PathBuf::from(
+        settings
+            .as_ref()
+            .map(|s| s.git.repository_path.clone())
+            .unwrap_or_else(|| "third_party/linux".to_string()),
+    );
+    let effective_repo = repo_path.unwrap_or(&default_repo);
+    let tools = Arc::new(crate::toolbox::ToolBox::new(
+        effective_repo.to_path_buf(),
+        None,
+    ));
+
+    let default_prompts_dir = crate::prompt_bundle::default_linux_prompts_review_path()
+        .unwrap_or_else(|_| PathBuf::from("prompts/linux_prompts"));
+    let effective_prompts_dir = prompts_dir.unwrap_or(&default_prompts_dir);
+
+    let mut state = LinuxPromptReviewState {
+        target_prompt_diff: diff.to_string(),
+        ..Default::default()
+    };
+
+    let workflow = build_linux_prompt_review_workflow_with_options(
+        effective_ai.max_interactions,
+        effective_ai.temperature,
+    );
+    let env = crate::workflow::stage::WorkflowEnv {
+        provider,
+        tools,
+        base_dir: effective_prompts_dir,
+        context_tag: Some("[prompt-review] ".to_string()),
+    };
+
+    crate::workflow::WorkflowEngine::execute(&workflow, &env, &mut state, None).await?;
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -558,25 +626,26 @@ mod tests {
             {
                 r##"Review Summary:
 Reviewed proposed prompt changes in subsystems/locking.md.
-Found 3 issues across actionability, codebase verification, and folder placement.
+Found 3 issues across actionability, codebase verification, and
+folder placement.
 
 > +compile the code with make -j32
 
-Can this action instruction be executed by Sashiko? Sashiko is a static review
-workflow with read-only git tools and cannot compile or build kernel code.
-Please rephrase into static code inspection guidance.
+Can this action instruction be executed by Sashiko? Sashiko is a
+static review workflow with read-only git tools and cannot compile or
+build kernel code. Please rephrase into static code inspection guidance.
 
 > +foo_bar_helper()
 
-Does foo_bar_helper exist in upstream Linux? A search in Linus's tree returned
-no occurrences.
+Does foo_bar_helper exist in upstream Linux? A search in Linus's tree
+returned no occurrences.
 
 > [subsystems/locking.md]
 
-This file describes caller usage rules for locking primitives. Caller API rules
-belong under 'api/locking.md', while 'subsystems/' is reserved for internal
-subsystem implementation details. Please move to 'api/locking.md' and register
-it in 'index.md'.
+This file describes caller usage rules for locking primitives. Caller API
+rules belong under 'api/locking.md', while 'subsystems/' is reserved for
+internal subsystem implementation details. Please move to 'api/locking.md'
+and register it in 'index.md'.
 "##
                 .to_string()
             } else {

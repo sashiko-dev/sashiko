@@ -37,20 +37,24 @@ Sashiko organizes kernel review prompts into three distinct top-level directorie
 
 ## Index Reflection Requirements (`index.md`)
 
-1. **Root `index.md` Registration**:
-   - Every prompt file in `api/` or `subsystems/` that should be conditionally loaded based on patch contents MUST be registered in `index.md`.
+1. **Root `index.md` Registration for `api/` and `subsystems/`**:
+   - Prompt files in `api/` and `subsystems/` that should be conditionally loaded based on patch contents MUST be registered in `index.md`.
    - Each entry in `index.md` must specify:
-     - Category / Name
+     - Category / Subsystem name
      - Trigger patterns (directory paths, function prefixes, macro names, regexes)
      - Relative prompt file path (e.g. `api/locking.md` or `subsystems/locking.md`)
 
-2. **New Prompt Files**:
+2. **`generic/` Prompts Do Not Require `index.md` Registration**:
+   - Prompts in `generic/` (such as `generic/technical-patterns.md`, `generic/callstack.md`, `generic/severity.md`, `generic/false-positive-guide.md`, `generic/inline-template.md`) are typically included directly by specific workflow stages in the review engine rather than dynamically triggered during pre-screening.
+   - Therefore, `index.md` registration is NOT mandatory for files in `generic/`. Do NOT flag missing `index.md` registration for `generic/` prompt files.
+
+3. **New Prompt Files in `api/` or `subsystems/`**:
    - If a prompt change introduces a new file in `api/` or `subsystems/`, it MUST include an update to `index.md` adding a corresponding trigger row.
 
-3. **Trigger Updates for Modified Prompts**:
+4. **Trigger Updates for Modified Prompts**:
    - If a prompt modification introduces rules for new APIs or symbols, verify whether `index.md` requires updated trigger keywords to ensure the prompt is loaded when relevant kernel patches are reviewed.
 
-4. **No Misplacement**:
+5. **No Misplacement**:
    - Raise a concern if API caller rules are placed in `subsystems/`, if subsystem internal details are placed in `api/`, or if formatting/severity policies are placed outside `generic/`.
 
 ## Output Format
