@@ -97,18 +97,74 @@ pub struct NntpSettings {
     pub port: u16,
 }
 
+/// How a completed message reaches the outside world.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MailTransport {
+    /// Connect to a remote submission service over implicit TLS.
+    #[default]
+    Smtp,
+    /// Pipe the message to a local sendmail binary and let the host
+    /// MTA relay it.
+    Sendmail,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct SmtpSettings {
-    pub server: String,
-    pub port: u16,
+    #[serde(default)]
+    pub transport: MailTransport,
+    pub server: Option<String>,
+    pub port: Option<u16>,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Path to the sendmail binary. Defaults to DEFAULT_SENDMAIL_PATH
+    /// rather than to a PATH lookup, since a service unit rarely
+    /// inherits an operator's PATH.
+    pub sendmail_path: Option<String>,
     pub sender_address: String,
     pub reply_to: Option<String>,
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+}
+
+pub const DEFAULT_SENDMAIL_PATH: &str = "/usr/sbin/sendmail";
+
+impl SmtpSettings {
+    /// The binary the sendmail transport spawns. Callers that check
+    /// the path and callers that run it must agree on the fallback,
+    /// or the check reports on a file the transport never opens.
+    pub fn sendmail_command(&self) -> &str {
+        self.sendmail_path
+            .as_deref()
+            .unwrap_or(DEFAULT_SENDMAIL_PATH)
+    }
+
+    /// Rejects a configuration whose transport and its operands
+    /// disagree. Both transports share this section, so serde cannot
+    /// tell a missing key from an inapplicable one.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.transport {
+            MailTransport::Smtp => {
+                if self.server.is_none() || self.port.is_none() {
+                    return Err(
+                        "smtp.server and smtp.port are required when smtp.transport is \"smtp\""
+                            .to_string(),
+                    );
+                }
+            }
+            MailTransport::Sendmail => {
+                if self.username.is_some() || self.password.is_some() {
+                    return Err(
+                        "smtp.username and smtp.password have no effect when smtp.transport is \"sendmail\""
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_dry_run() -> bool {
@@ -838,7 +894,12 @@ impl Settings {
             .add_source(Environment::with_prefix("SASHIKO").separator("__"))
             .build()?;
 
-        s.try_deserialize()
+        let settings: Self = s.try_deserialize()?;
+        if let Some(smtp) = &settings.smtp {
+            smtp.validate().map_err(ConfigError::Message)?;
+        }
+
+        Ok(settings)
     }
 
     pub fn local_review_path() -> PathBuf {
@@ -994,6 +1055,43 @@ mod tests {
             Settings::local_review_path_in(temp.path()),
             temp.path().join("Settings.toml")
         );
+    }
+
+    #[test]
+    fn test_smtp_transport_defaults_to_smtp() {
+        let smtp: SmtpSettings = toml::from_str(
+            "server = \"smtp.example.com\"\nport = 587\nsender_address = \"bot@example.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(smtp.transport, MailTransport::Smtp);
+        assert!(smtp.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sendmail_transport_needs_no_server() {
+        let smtp: SmtpSettings = toml::from_str(
+            "transport = \"sendmail\"\nsender_address = \"bot@example.com\"\ndry_run = false\n",
+        )
+        .unwrap();
+        assert_eq!(smtp.transport, MailTransport::Sendmail);
+        assert!(smtp.sendmail_path.is_none());
+        assert!(smtp.validate().is_ok());
+    }
+
+    #[test]
+    fn test_smtp_transport_requires_server_and_port() {
+        let smtp: SmtpSettings =
+            toml::from_str("port = 587\nsender_address = \"bot@example.com\"\n").unwrap();
+        assert!(smtp.validate().is_err());
+    }
+
+    #[test]
+    fn test_sendmail_transport_rejects_credentials() {
+        let smtp: SmtpSettings = toml::from_str(
+            "transport = \"sendmail\"\nusername = \"bot\"\nsender_address = \"bot@example.com\"\n",
+        )
+        .unwrap();
+        assert!(smtp.validate().is_err());
     }
 
     #[test]
@@ -1250,10 +1348,12 @@ mod tests {
         assert!(settings.validate_sign_in_delivery().is_ok());
 
         settings.smtp = Some(SmtpSettings {
-            server: "smtp.example.org".to_string(),
-            port: 587,
+            transport: MailTransport::Smtp,
+            server: Some("smtp.example.org".to_string()),
+            port: Some(587),
             username: None,
             password: None,
+            sendmail_path: None,
             sender_address: "sashiko@example.org".to_string(),
             reply_to: None,
             dry_run: true,
