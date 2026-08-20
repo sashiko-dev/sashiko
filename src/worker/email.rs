@@ -73,26 +73,7 @@ impl EmailWorker {
         }
     }
 
-    async fn send_email(&self, email_row: &crate::db::EmailOutboxRow) -> anyhow::Result<()> {
-        if self.settings.dry_run {
-            info!(
-                "DRY RUN: Would have sent email to {}, cc {}, subject '{}'",
-                email_row.to_addresses, email_row.cc_addresses, email_row.subject
-            );
-            // The body of a sign-in mail carries the link, which is a bearer
-            // credential and so is withheld from the log by default. Every
-            // other kind of mail is safe to show in full.
-            if email_row.kind == crate::db::EmailKind::SignInLink && !self.log_sign_in_links {
-                info!(
-                    "DRY RUN Body withheld because it contains a sign-in link. Set \
-                     server.log_sign_in_links to print it."
-                );
-            } else {
-                info!("DRY RUN Body:\n{}", email_row.body);
-            }
-            return Ok(());
-        }
-
+    fn build_message(&self, email_row: &crate::db::EmailOutboxRow) -> anyhow::Result<Message> {
         let from = parse_lenient(&self.settings.sender_address)?;
         let mut builder = Message::builder()
             .from(from.clone())
@@ -145,9 +126,32 @@ impl EmailWorker {
             builder = builder.references(refs.join(" "));
         }
 
-        let msg = builder
+        Ok(builder
             .header(ContentType::TEXT_PLAIN)
-            .body(email_row.body.clone())?;
+            .body(email_row.body.clone())?)
+    }
+
+    async fn send_email(&self, email_row: &crate::db::EmailOutboxRow) -> anyhow::Result<()> {
+        if self.settings.dry_run {
+            info!(
+                "DRY RUN: Would have sent email to {}, cc {}, subject '{}'",
+                email_row.to_addresses, email_row.cc_addresses, email_row.subject
+            );
+            // The body of a sign-in mail carries the link, which is a bearer
+            // credential and so is withheld from the log by default. Every
+            // other kind of mail is safe to show in full.
+            if email_row.kind == crate::db::EmailKind::SignInLink && !self.log_sign_in_links {
+                info!(
+                    "DRY RUN Body withheld because it contains a sign-in link. Set \
+                     server.log_sign_in_links to print it."
+                );
+            } else {
+                info!("DRY RUN Body:\n{}", email_row.body);
+            }
+            return Ok(());
+        }
+
+        let msg = self.build_message(email_row)?;
 
         let mut mailer_builder =
             AsyncSmtpTransport::<Tokio1Executor>::relay(&self.settings.server)?
