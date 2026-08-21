@@ -2908,30 +2908,31 @@ impl Database {
         // build_search returns "WHERE author ...".
 
         let sql = format!(
-            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
-             COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug
-             FROM (
-                 SELECT id FROM patchsets p
+            "WITH p_lim AS (
+                 SELECT p.id FROM patchsets p
                  {}
                  ORDER BY p.date DESC LIMIT ? OFFSET ?
-             ) p_lim
-             JOIN patchsets p ON p_lim.id = p.id
-             LEFT JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
-             LEFT JOIN subsystems s ON ps.subsystem_id = s.id
-             LEFT JOIN (
-                SELECT r.patchset_id,
-                    SUM(CASE WHEN f.severity = 1 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as low,
-                    SUM(CASE WHEN f.severity = 2 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as medium,
-                    SUM(CASE WHEN f.severity = 3 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as high,
-                    SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as critical
-                FROM reviews r
-                JOIN findings f ON r.id = f.review_id
-                WHERE r.status = 'Reviewed'
-                GROUP BY r.patchset_id
-             ) f ON p.id = f.patchset_id
-             GROUP BY p.id
-             ORDER BY p.date DESC",
+             )
+             SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
+              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
+              p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug
+              FROM p_lim
+              JOIN patchsets p ON p_lim.id = p.id
+              LEFT JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
+              LEFT JOIN subsystems s ON ps.subsystem_id = s.id
+              LEFT JOIN (
+                 SELECT r.patchset_id,
+                     SUM(CASE WHEN f.severity = 1 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as low,
+                     SUM(CASE WHEN f.severity = 2 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as medium,
+                     SUM(CASE WHEN f.severity = 3 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as high,
+                     SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as critical
+                 FROM reviews r
+                 JOIN findings f ON r.id = f.review_id
+                 WHERE r.status = 'Reviewed' AND r.patchset_id IN (SELECT id FROM p_lim)
+                 GROUP BY r.patchset_id
+              ) f ON p.id = f.patchset_id
+              GROUP BY p.id
+              ORDER BY p.date DESC",
             where_clause
         );
 
@@ -11628,5 +11629,125 @@ mod tests {
         // spawn_wal_flusher should run without panic
         db.spawn_wal_flusher(std::time::Duration::from_millis(50));
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_patchsets_scoped_findings_and_pagination() {
+        let db_settings = crate::settings::DatabaseSettings::memory();
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let t = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+        db.create_message(
+            "cover1",
+            t,
+            None,
+            "Author 1",
+            "Subject 1",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "cover2",
+            t,
+            None,
+            "Author 2",
+            "Subject 2",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps1 = db
+            .create_patchset(
+                t,
+                Some("cover1"),
+                "cover1",
+                "Subject 1",
+                "Author 1",
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let ps2 = db
+            .create_patchset(
+                t,
+                Some("cover2"),
+                "cover2",
+                "Subject 2",
+                "Author 2",
+                2000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Create reviews and findings for ps2
+        db.conn
+            .execute(
+                "INSERT INTO reviews (id, patchset_id, status, created_at) VALUES (10, ?, 'Reviewed', 2000)",
+                libsql::params![ps2],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO findings (review_id, severity, preexisting) VALUES (10, 3, 0), (10, 4, 0)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // Query with limit 1, offset 0 (should return ps2 since date 2000 > 1000)
+        let page1 = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].id, ps2);
+        assert_eq!(page1[0].findings_high, Some(1));
+        assert_eq!(page1[0].findings_critical, Some(1));
+        assert_eq!(page1[0].findings_low, Some(0));
+
+        // Query with limit 1, offset 1 (should return ps1 with 0 findings)
+        let page2 = db.get_patchsets(1, 1, None, None).await.unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].id, ps1);
+        assert_eq!(page2[0].findings_high, Some(0));
+        assert_eq!(page2[0].findings_critical, Some(0));
+
+        // Query with offset beyond available (should return empty vec)
+        let page3 = db.get_patchsets(10, 100, None, None).await.unwrap();
+        assert!(page3.is_empty());
     }
 }
