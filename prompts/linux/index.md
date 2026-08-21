@@ -74,6 +74,7 @@ review prompts categorized under `api/`, `subsystems/`, and `generic/`.
 | Subsystem | Input | `drivers/input/`, `input_*` | subsystems/input.md |
 | Subsystem | Hardware Monitoring | `drivers/hwmon/`, `hwmon_*` | subsystems/hwmon.md |
 | Subsystem | LEDs | `drivers/leds/`, `led_classdev_*` | subsystems/leds.md |
+| Subsystem | Media/V4L2 | `drivers/media/`, `include/media/`, `v4l2_subdev_*`, `MEDIA_BUS_FMT_*` | subsystems/media.md |
 | Subsystem | MFD | `drivers/mfd/`, `mfd_*` | subsystems/mfd.md |
 | Subsystem | Power Management | `drivers/base/power/`, `pm_runtime_*` | subsystems/pm.md |
 | Subsystem | Power Domains | `drivers/pmdomain/`, `pm_genpd_*` | subsystems/pmdomain.md |
