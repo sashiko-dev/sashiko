@@ -10,7 +10,6 @@ use std::sync::Arc;
 use sashiko::api::build_router;
 use sashiko::db::Database;
 use sashiko::events::Event;
-use sashiko::fetcher::FetchRequest;
 use sashiko::settings::{DatabaseSettings, Settings};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -83,14 +82,12 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
     db.migrate().await.unwrap();
 
     let (event_tx, event_rx) = mpsc::channel::<Event>(100);
-    let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(100);
 
     let settings = Arc::new(test_settings(read_only));
     let app = build_router(
         settings,
         Arc::clone(&db),
         event_tx,
-        fetch_tx,
         /* allow_all_submit */ true,
         /* smtp_enabled */ false,
         /* dry_run */ true,

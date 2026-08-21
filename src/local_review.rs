@@ -14,6 +14,7 @@
 
 use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
+    review_kind::ReviewKind,
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
     worker::{
@@ -47,6 +48,8 @@ pub struct WorkerOptions {
     pub stages: Option<Vec<u8>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
+    /// Alternate review pipeline selector. `None` = default patch review.
+    pub review_context: Option<ReviewKind>,
 }
 
 impl Default for WorkerOptions {
@@ -66,6 +69,7 @@ impl Default for WorkerOptions {
             stages: None,
             scratch_clone: false,
             current_tree: false,
+            review_context: None,
         }
     }
 }
@@ -486,21 +490,6 @@ async fn review_single_patch(
             baseline_sha,
         );
 
-        let mut worker = Worker::new(
-            provider,
-            std::sync::Arc::new(tools),
-            prompts,
-            WorkerConfig {
-                max_input_tokens: ai.max_input_tokens,
-                max_interactions: ai.max_interactions,
-                temperature: ai.temperature,
-                custom_prompt: options.custom_prompt.clone(),
-                series_range,
-                baseline_sha: Some(baseline_sha.to_string()),
-                stages: options.stages.clone(),
-            },
-        );
-
         let p_index = p.index;
         let progress_cb = progress.map(|cb| {
             move |event| match event {
@@ -555,15 +544,52 @@ async fn review_single_patch(
             "baseline": baseline_sha
         });
 
-        match worker
-            .run(
-                patchset_val,
-                progress_cb
-                    .as_ref()
-                    .map(|f| f as &(dyn Fn(_) + Send + Sync)),
-            )
-            .await
-        {
+        let progress_dyn = progress_cb
+            .as_ref()
+            .map(|f| f as &(dyn Fn(crate::worker::WorkerProgressEvent) + Send + Sync));
+        let run_result = if let Some(review_kind) = &options.review_context {
+            // Alternate review pipeline (e.g. cherry-pick / conflict resolution).
+            let env = crate::pipelines::PipelineEnv {
+                provider,
+                tools: std::sync::Arc::new(tools),
+                prompts: &prompts,
+                temperature: ai.temperature,
+                max_interactions: ai.max_interactions,
+                context_tag: Some(format!("[ps:{} p:{}] ", patchset_id, p.index)),
+                stages: None,
+                series_range: None,
+            };
+            match review_kind {
+                ReviewKind::CherryPick { .. } => {
+                    let resolution_sha = patch_shas.get(&p.index).cloned().unwrap_or_default();
+                    let pipeline =
+                        crate::pipelines::cherry_pick_review::CherryPickReviewPipeline::from_review_kind(
+                            review_kind,
+                            resolution_sha,
+                        );
+                    crate::pipelines::execute_pipeline(&pipeline, &env, patchset_val, progress_dyn)
+                        .await
+                }
+            }
+        } else {
+            let mut worker = Worker::new(
+                provider,
+                std::sync::Arc::new(tools),
+                prompts,
+                WorkerConfig {
+                    max_input_tokens: ai.max_input_tokens,
+                    max_interactions: ai.max_interactions,
+                    temperature: ai.temperature,
+                    custom_prompt: options.custom_prompt.clone(),
+                    series_range,
+                    baseline_sha: Some(baseline_sha.to_string()),
+                    stages: options.stages.clone(),
+                },
+            );
+            worker.run(patchset_val, progress_dyn).await
+        };
+
+        match run_result {
             Ok(result) => {
                 info!("AI review completed for patch {}.", p.index);
                 emit(

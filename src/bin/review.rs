@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use sashiko::local_review::{WorkerOptions, print_worker_json, run_worker_from_stdin};
 use sashiko::prompt_bundle;
+use sashiko::review_kind::ReviewKind;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -68,6 +69,11 @@ struct Args {
     /// Select which stages from 1-7 to run.
     #[arg(long, hide = true, value_delimiter = ',')]
     stages: Option<Vec<u8>>,
+
+    /// Alternate review pipeline selector as JSON (e.g. the cherry-pick review
+    /// context). Absent selects the default patch-review pipeline.
+    #[arg(long)]
+    review_context: Option<String>,
 }
 
 #[tokio::main]
@@ -96,6 +102,11 @@ async fn main() -> Result<()> {
         stages: args.stages,
         scratch_clone: false,
         current_tree: false,
+        review_context: args
+            .review_context
+            .map(|s| serde_json::from_str::<ReviewKind>(&s))
+            .transpose()
+            .context("parsing --review-context JSON")?,
     })
     .await?;
 

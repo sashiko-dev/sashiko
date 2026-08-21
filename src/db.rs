@@ -219,6 +219,94 @@ pub struct PatchworkOutboxRow {
     pub created_at: i64,
 }
 
+/// Status of an entry in the fetch queue.
+///
+/// Stored as TEXT in SQLite with a CHECK constraint limiting values
+/// to the three valid states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStatus {
+    Pending,
+    Fetching,
+    Failed,
+}
+
+impl FetchStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Fetching => "Fetching",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+impl std::fmt::Display for FetchStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FetchStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Pending" => Ok(Self::Pending),
+            "Fetching" => Ok(Self::Fetching),
+            "Failed" => Ok(Self::Failed),
+            other => Err(anyhow::anyhow!("unknown FetchStatus: {}", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchQueueRow {
+    pub id: i64,
+    pub patchset_id: Option<i64>,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub commit_hash: String,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub status: FetchStatus,
+    pub attempts: i64,
+    pub first_attempt_at: Option<i64>,
+    pub next_retry_at: Option<i64>,
+    pub locked_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub priority: i64,
+    pub created_at: i64,
+    /// Extra commit SHAs that must be present locally for the review to hydrate
+    /// its context, but are never ingested as patches. Loaded from the
+    /// `fetch_supporting_commits` table. Used by cherry-pick reviews to carry
+    /// the original and base commits.
+    pub supporting_commits: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StuckFetchPlaceholder {
+    pub patchset_id: i64,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub priority: i64,
+}
+
+/// Recover a fetch source URL from a placeholder subject of the form
+/// "Fetching <rev> from <url>...". Returns None when the subject carries no URL
+/// source (e.g. a local fetch, or a thread/PR placeholder).
+fn repo_url_from_subject(subject: &str) -> Option<String> {
+    let after = subject.split_once(" from ")?.1;
+    let url = after.strip_suffix("...").unwrap_or(after).trim();
+    if url.is_empty() || url == "local" {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
 impl Database {
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
@@ -531,6 +619,8 @@ impl Database {
         }
 
         self.migrate_patches_unique_constraint_if_needed().await?;
+        self.migrate_priority_columns_if_needed().await?;
+        self.migrate_fetch_queue_if_needed().await?;
 
         Ok(())
     }
@@ -542,6 +632,26 @@ impl Database {
         // let _ = self.conn.execute("UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'", ()).await;
 
         // Manual migrations for existing tables
+        let _ = self
+            .try_add_column("patchsets", "base_priority", "INTEGER DEFAULT 500")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority_cap", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority", "INTEGER DEFAULT 500")
+            .await;
+        let _ = self.try_add_column("patchsets", "repo_url", "TEXT").await;
+        let _ = self
+            .try_add_column("patchsets", "review_context", "TEXT")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_patchsets_status_priority_date",
+                "patchsets",
+                "status, priority DESC, date ASC",
+            )
+            .await;
         let _ = self
             .try_add_column("messages", "to_recipients", "TEXT")
             .await;
@@ -807,6 +917,69 @@ impl Database {
             let _ = self.conn.execute("PRAGMA foreign_keys = ON", ()).await;
         }
 
+        Ok(())
+    }
+
+    async fn migrate_priority_columns_if_needed(&self) -> Result<()> {
+        let _ = self
+            .try_add_column("patchsets", "base_priority", "INTEGER DEFAULT 500")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority_cap", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority", "INTEGER DEFAULT 500")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_patchsets_status_priority_date",
+                "patchsets",
+                "status, priority DESC, date ASC",
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn migrate_fetch_queue_if_needed(&self) -> Result<()> {
+        let _ = self.try_add_column("patchsets", "repo_url", "TEXT").await;
+        let _ = self
+            .try_add_column("patchsets", "review_context", "TEXT")
+            .await;
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS fetch_queue (
+                    id INTEGER PRIMARY KEY,
+                    patchset_id INTEGER,
+                    cover_letter_message_id TEXT,
+                    repo_url TEXT,
+                    commit_hash TEXT NOT NULL,
+                    mr_url TEXT,
+                    mr_title TEXT,
+                    mr_number INTEGER,
+                    status TEXT NOT NULL DEFAULT 'Pending' CHECK(status IN ('Pending', 'Fetching', 'Failed')),
+                    attempts INTEGER DEFAULT 0,
+                    first_attempt_at INTEGER,
+                    next_retry_at INTEGER,
+                    locked_at INTEGER,
+                    last_error TEXT,
+                    priority INTEGER DEFAULT 500,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(patchset_id) REFERENCES patchsets(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fetch_queue_claim
+                    ON fetch_queue(status, next_retry_at, priority, created_at);
+                CREATE INDEX IF NOT EXISTS idx_fetch_queue_commit ON fetch_queue(commit_hash);
+
+                CREATE TABLE IF NOT EXISTS fetch_supporting_commits (
+                    id INTEGER PRIMARY KEY,
+                    fetch_id INTEGER NOT NULL,
+                    commit_hash TEXT NOT NULL,
+                    FOREIGN KEY(fetch_id) REFERENCES fetch_queue(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_fetch_supporting_fetch_id
+                    ON fetch_supporting_commits(fetch_id);",
+            )
+            .await?;
         Ok(())
     }
 
@@ -1874,12 +2047,57 @@ impl Database {
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
     ) -> Result<Option<i64>> {
+        self.create_patchset_with_priority(
+            thread_id,
+            cover_letter_message_id,
+            message_id,
+            subject,
+            author,
+            date,
+            total_parts,
+            parser_version,
+            to,
+            cc,
+            version,
+            part_index,
+            baseline_id,
+            strict_author,
+            skip_filters,
+            only_filters,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_patchset_with_priority(
+        &self,
+        thread_id: i64,
+        cover_letter_message_id: Option<&str>,
+        message_id: &str,
+        subject: &str,
+        author: &str,
+        date: i64,
+        total_parts: u32,
+        parser_version: i32,
+        to: &str,
+        cc: &str,
+        version: Option<u32>,
+        part_index: u32,
+        baseline_id: Option<i64>,
+        strict_author: bool,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+        priority: Option<i32>,
+    ) -> Result<Option<i64>> {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
-            clid_candidates.push((clid.to_string(), false));
+            for c in Self::get_msgid_candidates(clid) {
+                clid_candidates.push((c, false));
+            }
         }
         // Fallback for single-patch git imports where placeholder is
         // sha@sashiko.local but the actual cover letter becomes the sha
@@ -1889,8 +2107,12 @@ impl Database {
         // and the fallback would incorrectly match patchsets from
         // unrelated submissions that happen to share a commit SHA.
         if cover_letter_message_id.is_none() || total_parts == 1 {
-            clid_candidates.push((format!("{}@sashiko.local", message_id), true));
+            for c in Self::get_msgid_candidates(&format!("{}@sashiko.local", message_id)) {
+                clid_candidates.push((c, true));
+            }
         }
+        let mut seen = std::collections::HashSet::new();
+        clid_candidates.retain(|(c, _)| seen.insert(c.clone()));
 
         for (clid, scope_to_thread) in clid_candidates {
             // When using the @sashiko.local fallback, scope the query
@@ -1971,12 +2193,49 @@ impl Database {
                         .await?;
                 }
 
-                // Update subject if this is a better index (e.g. going from placeholder to real subject)
                 if part_index < subject_index {
+                    if is_placeholder {
+                        // A fetch/API placeholder is created at default priority (500)
+                        // before its real subject is known. Apply the rule-based priority
+                        // authoritatively here if provided, or leave at default.
+                        if let Some(prio) = priority {
+                            self.conn
+                                .execute(
+                                    "UPDATE patchsets SET subject = ?, subject_index = ?, base_priority = ?, priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, ?) ELSE ? END WHERE id = ?",
+                                    libsql::params![subject, part_index, prio, prio, prio, id],
+                                )
+                                .await?;
+                        } else {
+                            self.conn
+                                .execute(
+                                    "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                                    libsql::params![subject, part_index, id],
+                                )
+                                .await?;
+                        }
+                    } else if let Some(prio) = priority {
+                        // Back-filling an earlier part of an existing series:
+                        // Update subject/subject_index and elevate base_priority.
+                        self.conn
+                            .execute(
+                                "UPDATE patchsets SET subject = ?, subject_index = ?, base_priority = MAX(base_priority, ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, MAX(base_priority, ?)) ELSE MAX(base_priority, ?) END WHERE id = ?",
+                                libsql::params![subject, part_index, prio, prio, prio, id],
+                            )
+                            .await?;
+                    } else {
+                        self.conn
+                            .execute(
+                                "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                                libsql::params![subject, part_index, id],
+                            )
+                            .await?;
+                    }
+                } else if let Some(prio) = priority {
+                    // Even if part_index >= subject_index, elevate base_priority if this part has a higher rule priority.
                     self.conn
                         .execute(
-                            "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
-                            libsql::params![subject, part_index, id],
+                            "UPDATE patchsets SET base_priority = MAX(base_priority, ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, MAX(base_priority, ?)) ELSE MAX(base_priority, ?) END WHERE id = ?",
+                            libsql::params![prio, prio, prio, id],
                         )
                         .await?;
                 }
@@ -2196,6 +2455,14 @@ impl Database {
                 let merge_from_id = *merge_from_id;
                 info!("Merging patchset {} into {}", merge_from_id, target_id);
 
+                // Inherit higher base_priority from merged patchset
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET base_priority = MAX(base_priority, (SELECT COALESCE(base_priority, 500) FROM patchsets WHERE id = ?)), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, MAX(base_priority, (SELECT COALESCE(base_priority, 500) FROM patchsets WHERE id = ?))) ELSE MAX(base_priority, (SELECT COALESCE(base_priority, 500) FROM patchsets WHERE id = ?)) END WHERE id = ?",
+                        libsql::params![merge_from_id, merge_from_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
                 // Reassign patches
                 self.conn
                     .execute(
@@ -2267,26 +2534,29 @@ impl Database {
                     .await?;
             }
 
-            // Conditionally update subject
-            // Note: We check against the best index found among all merged sets OR the new part_index
             if part_index < current_subject_index {
+                if let Some(prio) = priority {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET subject = ?, subject_index = ?, base_priority = MAX(base_priority, ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, MAX(base_priority, ?)) ELSE MAX(base_priority, ?) END WHERE id = ?",
+                            libsql::params![subject, part_index, prio, prio, prio, target_id],
+                        )
+                        .await?;
+                } else {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                            libsql::params![subject, part_index, target_id],
+                        )
+                        .await?;
+                }
+            } else if let Some(prio) = priority {
                 self.conn
                     .execute(
-                        "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
-                        libsql::params![subject, part_index, target_id],
+                        "UPDATE patchsets SET base_priority = MAX(base_priority, ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, MAX(base_priority, ?)) ELSE MAX(base_priority, ?) END WHERE id = ?",
+                        libsql::params![prio, prio, prio, target_id],
                     )
                     .await?;
-            } else if matches.len() > 1 {
-                // If we merged, we might need to update the subject index of the target to the best one we found.
-                // But we don't have the subject string from the merged one easily available here.
-                // However, the existing target subject is likely fine unless part_index is better.
-                // Update subject_index to be correct if a better one was merged.
-                // Actually, if matches[i].1 was better, we should have used its subject.
-                // But that's complicated. Assuming the target (oldest) usually has the cover letter or we eventually find it.
-                // Simplification: We only update if CURRENT patch is better.
-                // If we merged a patchset that HAD the cover letter, we ideally want that subject.
-                // But we lost it.
-                // TODO: Optimize merge subject selection. For now, this is better than duplicates.
             }
 
             if let Some(clid) = cover_letter_message_id {
@@ -2320,11 +2590,12 @@ impl Database {
         }
 
         // No match found, create new patchset
+        let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters, base_priority, priority)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone(), eff_priority, eff_priority],
             )
             .await?;
 
@@ -3441,7 +3712,7 @@ impl Database {
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
             "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug
-             FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
+             FROM patchsets WHERE status = 'Pending' ORDER BY priority DESC, date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
 
@@ -3778,6 +4049,36 @@ impl Database {
         }
     }
 
+    /// Fetch the serialized alternate-pipeline selector for a patchset, if any.
+    ///
+    /// A `NULL` column (the default) yields `None`, selecting the standard
+    /// patch-review pipeline.
+    pub async fn get_review_context(&self, id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT review_context FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get::<Option<String>>(0).ok().flatten())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persist the serialized alternate-pipeline selector for a patchset.
+    pub async fn set_review_context(&self, id: i64, review_context: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET review_context = ? WHERE id = ?",
+                libsql::params![review_context, id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
         let query = if force {
             "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete', 'In Review')"
@@ -3861,6 +4162,310 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    // --- Durable fetch queue -------------------------------------------------
+    //
+    // These operations back the FetchWorker. They mirror the patchwork_outbox
+    // pattern: work is claimed under a lease (locked_at), retried with backoff
+    // (next_retry_at), completed, terminally failed, or reclaimed by a ghost
+    // sweep when a worker dies mid-flight.
+
+    /// Enqueue a git fetch. Idempotent: an active (Pending/Fetching) row for the
+    /// same commit and repo is left untouched so duplicate submissions collapse.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+    ) -> Result<()> {
+        self.enqueue_fetch_with_support(
+            patchset_id,
+            cover_letter_message_id,
+            repo_url,
+            commit_hash,
+            mr_url,
+            mr_title,
+            mr_number,
+            priority,
+            &[],
+        )
+        .await
+    }
+
+    /// Like `enqueue_fetch`, but also records `supporting_commits`: extra commit
+    /// SHAs the worker must ensure are present locally (e.g. the original and
+    /// base commits of a cherry-pick) without ingesting them as patches. Only
+    /// `commit_hash` is ingested; the supporting commits are fetched purely so
+    /// downstream reviews (like the cherry-pick pipeline) can hydrate their full
+    /// context from git.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch_with_support(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+        supporting_commits: &[String],
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let mut existing = self
+            .conn
+            .query(
+                "SELECT 1 FROM fetch_queue \
+                 WHERE commit_hash = ? \
+                   AND IFNULL(repo_url, '') = IFNULL(?, '') \
+                   AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
+                   AND status IN ('Pending', 'Fetching') LIMIT 1",
+                libsql::params![commit_hash, repo_url, cover_letter_message_id],
+            )
+            .await?;
+        if existing.next().await.ok().flatten().is_some() {
+            return Ok(());
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO fetch_queue \
+                 (patchset_id, cover_letter_message_id, repo_url, commit_hash, \
+                  mr_url, mr_title, mr_number, status, attempts, priority, \
+                  created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', 0, ?, ?) RETURNING id",
+                libsql::params![
+                    patchset_id,
+                    cover_letter_message_id,
+                    repo_url,
+                    commit_hash,
+                    mr_url,
+                    mr_title,
+                    mr_number,
+                    priority,
+                    now
+                ],
+            )
+            .await?;
+        let fetch_id: i64 = match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => return Err(anyhow::anyhow!("INSERT into fetch_queue returned no id")),
+        };
+
+        // Record each supporting commit as its own row (1-to-N) so an arbitrary
+        // number can be stored without packing them into a single column.
+        for sha in supporting_commits {
+            self.conn
+                .execute(
+                    "INSERT INTO fetch_supporting_commits (fetch_id, commit_hash) \
+                     VALUES (?, ?)",
+                    libsql::params![fetch_id, sha.as_str()],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Atomically claim the highest-priority due fetch, leasing it to the caller
+    /// and bumping its attempt count. Returns None if nothing is due.
+    pub async fn lock_pending_fetch(&self) -> Result<Option<FetchQueueRow>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE fetch_queue \
+                 SET status = 'Fetching', locked_at = ?, attempts = attempts + 1, \
+                     first_attempt_at = COALESCE(first_attempt_at, ?) \
+                 WHERE id = ( \
+                     SELECT id FROM fetch_queue \
+                     WHERE status = 'Pending' \
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?) \
+                     ORDER BY priority DESC, created_at ASC LIMIT 1 \
+                 ) \
+                 RETURNING id, patchset_id, cover_letter_message_id, repo_url, \
+                     commit_hash, mr_url, mr_title, mr_number, status, attempts, \
+                     first_attempt_at, next_retry_at, locked_at, last_error, \
+                     priority, created_at",
+                libsql::params![now, now, now],
+            )
+            .await?;
+
+        match rows.next().await {
+            Ok(Some(row)) => {
+                let mut row = Self::row_to_fetch_queue(&row)?;
+                row.supporting_commits = self.load_supporting_commits(row.id).await?;
+                Ok(Some(row))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Load the supporting commit SHAs recorded for a claimed fetch, in
+    /// insertion order.
+    async fn load_supporting_commits(&self, fetch_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT commit_hash FROM fetch_supporting_commits \
+                 WHERE fetch_id = ? ORDER BY id ASC",
+                libsql::params![fetch_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    /// Remove a fetch from the queue once it has been successfully processed.
+    ///
+    /// Completed fetches serve no further purpose: idempotency is guaranteed by
+    /// the local git repository (`is_present`), not by queue history, and no code
+    /// path reads `Done` rows (dedup and stuck-placeholder recovery only consider
+    /// `Pending`/`Fetching`). Deleting the row instead of marking it `Done` keeps
+    /// the queue table bounded to in-flight work.
+    pub async fn mark_fetch_done(&self, id: i64) -> Result<()> {
+        // Foreign-key cascade is not enabled on this connection, so remove the
+        // child supporting-commit rows explicitly before the parent.
+        self.conn
+            .execute(
+                "DELETE FROM fetch_supporting_commits WHERE fetch_id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        self.conn
+            .execute("DELETE FROM fetch_queue WHERE id = ?", libsql::params![id])
+            .await?;
+        Ok(())
+    }
+
+    /// Release a fetch back to Pending with a future retry time and record the
+    /// last error. Used for transient failures within the retry window.
+    pub async fn set_fetch_retry_at(&self, id: i64, next_retry_at: i64, error: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE fetch_queue \
+                 SET status = 'Pending', next_retry_at = ?, last_error = ?, \
+                     locked_at = NULL WHERE id = ?",
+                libsql::params![next_retry_at, error, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Terminally fail a fetch after its retry window is exhausted.
+    pub async fn mark_fetch_failed(&self, id: i64, error: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE fetch_queue SET status = 'Failed', last_error = ?, \
+                 locked_at = NULL WHERE id = ?",
+                libsql::params![error, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reclaim fetches whose lease has expired because their worker died
+    /// mid-flight. Returns the number of rows reset to Pending.
+    pub async fn sweep_ghost_fetches(&self, lease_secs: i64) -> Result<u64> {
+        let cutoff = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64)
+            - lease_secs;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE fetch_queue SET status = 'Pending', locked_at = NULL \
+                 WHERE status = 'Fetching' AND locked_at IS NOT NULL \
+                   AND locked_at < ?",
+                libsql::params![cutoff],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Return patchsets stuck in 'Fetching' that have no active fetch_queue row.
+    /// Used at startup to recover placeholders created before the durable queue
+    /// existed, or orphaned by a crash.
+    pub async fn get_stuck_fetch_placeholders(&self) -> Result<Vec<StuckFetchPlaceholder>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id, p.cover_letter_message_id, \
+                        COALESCE(p.repo_url, b.repo_url), p.mr_url, \
+                        p.mr_title, p.mr_number, IFNULL(p.priority, 500), \
+                        p.subject \
+                 FROM patchsets p \
+                 LEFT JOIN baselines b ON p.baseline_id = b.id \
+                 WHERE p.status = 'Fetching' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM fetch_queue fq \
+                       WHERE fq.patchset_id = p.id \
+                         AND fq.status IN ('Pending', 'Fetching') \
+                   )",
+                (),
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            // Prefer persisted patchsets.repo_url / baseline url; for old
+            // placeholders that predate the column and have no baseline, recover
+            // the source URL from the subject ("Fetching <rev> from <url>...").
+            let subject = row.get::<Option<String>>(7)?.unwrap_or_default();
+            let repo_url = row
+                .get::<Option<String>>(2)?
+                .or_else(|| repo_url_from_subject(&subject));
+            out.push(StuckFetchPlaceholder {
+                patchset_id: row.get(0)?,
+                cover_letter_message_id: row.get::<Option<String>>(1)?,
+                repo_url,
+                mr_url: row.get::<Option<String>>(3)?,
+                mr_title: row.get::<Option<String>>(4)?,
+                mr_number: row.get::<Option<i64>>(5)?,
+                priority: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
+        Ok(FetchQueueRow {
+            id: row.get(0)?,
+            patchset_id: row.get::<Option<i64>>(1)?,
+            cover_letter_message_id: row.get::<Option<String>>(2)?,
+            repo_url: row.get::<Option<String>>(3)?,
+            commit_hash: row.get(4)?,
+            mr_url: row.get::<Option<String>>(5)?,
+            mr_title: row.get::<Option<String>>(6)?,
+            mr_number: row.get::<Option<i64>>(7)?,
+            status: row.get::<String>(8)?.parse()?,
+            attempts: row.get(9)?,
+            first_attempt_at: row.get::<Option<i64>>(10)?,
+            next_retry_at: row.get::<Option<i64>>(11)?,
+            locked_at: row.get::<Option<i64>>(12)?,
+            last_error: row.get::<Option<String>>(13)?,
+            priority: row.get(14)?,
+            created_at: row.get(15)?,
+            // Populated separately from fetch_supporting_commits after the row
+            // is claimed; see lock_pending_fetch.
+            supporting_commits: Vec::new(),
+        })
+    }
+
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
@@ -3900,6 +4505,8 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        repo_url: Option<&str>,
+        priority: Option<i32>,
     ) -> Result<i64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -3932,10 +4539,17 @@ impl Database {
                     || status == "Failed To Apply"
                     || status == "FailedToApply"
                 {
-                    self.conn.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                        libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
-                    ).await?;
+                    if let Some(prio) = priority {
+                        self.conn.execute(
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, repo_url = ?, base_priority = ?, priority = ? WHERE id = ?",
+                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, repo_url, prio, prio, id]
+                        ).await?;
+                    } else {
+                        self.conn.execute(
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, repo_url = ? WHERE id = ?",
+                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, repo_url, id]
+                        ).await?;
+                    }
                 }
                 return Ok(id);
             }
@@ -3945,11 +4559,12 @@ impl Database {
         let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
 
         // 3. Create the fetching patchset
+        let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, repo_url, base_priority, priority)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, repo_url, eff_priority, eff_priority],
             )
             .await?;
 
@@ -3974,6 +4589,22 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    pub fn calculate_priority(
+        subject: &str,
+        rules: &[crate::settings::CompiledPriorityRule],
+    ) -> Option<i32> {
+        let mut priority = None;
+        for rule in rules {
+            if rule.regex.is_match(subject) {
+                priority = Some(
+                    rule.priority
+                        .clamp(crate::settings::MIN_PRIORITY, crate::settings::MAX_PRIORITY),
+                );
+            }
+        }
+        priority
     }
 
     pub async fn update_patchset_baseline_info(
@@ -4380,6 +5011,984 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_claim_is_exclusive_and_ordered() {
+        let db = setup_db().await;
+        db.enqueue_fetch(
+            None,
+            Some("a@x"),
+            Some("repo"),
+            "sha_low",
+            None,
+            None,
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("b@x"),
+            Some("repo"),
+            "sha_high",
+            None,
+            None,
+            None,
+            900,
+        )
+        .await
+        .unwrap();
+
+        // Higher priority is claimed first.
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(first.commit_hash, "sha_high");
+        assert_eq!(first.status, FetchStatus::Fetching);
+        assert_eq!(first.attempts, 1);
+        assert!(first.first_attempt_at.is_some());
+        assert!(first.locked_at.is_some());
+
+        // A claimed row is not handed out again.
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(second.commit_hash, "sha_low");
+
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_is_idempotent() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let _ = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_distinct_cover_ids_not_dropped() {
+        let db = setup_db().await;
+        // Two distinct MRs for the same commit range and repo must both be enqueued
+        db.enqueue_fetch(
+            None,
+            Some("mr-1-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr1"),
+            Some("MR 1"),
+            Some(1),
+            500,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("mr-2-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr2"),
+            Some("MR 2"),
+            Some(2),
+            500,
+        )
+        .await
+        .unwrap();
+
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            first.cover_letter_message_id.as_deref(),
+            Some("mr-1-base..head@sashiko.local")
+        );
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            second.cover_letter_message_id.as_deref(),
+            Some("mr-2-base..head@sashiko.local")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_fetch_queue_on_version_1_db() {
+        let settings = DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        // Simulate a legacy DB already at user_version 1 without fetch_queue
+        db.conn
+            .execute("PRAGMA user_version = 1", ())
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "CREATE TABLE patchsets (id INTEGER PRIMARY KEY, cover_letter_message_id TEXT, status TEXT)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // migrate() must create fetch_queue and patchsets columns even though user_version == 1
+        db.migrate().await.unwrap();
+
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(row.commit_hash, "sha");
+    }
+
+    #[tokio::test]
+    async fn test_create_patchset_matches_placeholder_without_suffix() {
+        let db = setup_db().await;
+        // Create a placeholder with unsuffixed ID (as might exist from older webhooks)
+        let placeholder_id = "mr-99-base..head";
+        let pid = db
+            .create_fetching_patchset(
+                placeholder_id,
+                "Fetching MR 99",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Ingestion passes suffixed root_msg_id as cover_letter_id
+        let suffixed_id = "mr-99-base..head@sashiko.local";
+        let thread_id = db
+            .ensure_thread_for_message(suffixed_id, 1000)
+            .await
+            .unwrap();
+        let matched_id = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some(suffixed_id),
+                "commit_sha_1",
+                "MR 99 Subject",
+                "Author",
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(matched_id, Some(pid));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_retry_gating() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A retry scheduled in the far future must not be claimable now.
+        db.set_fetch_retry_at(row.id, 4_000_000_000, "transient")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A retry scheduled in the past becomes claimable again.
+        db.set_fetch_retry_at(row.id, 1, "transient").await.unwrap();
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.attempts, 2);
+        assert_eq!(again.commit_hash, "sha");
+        assert_eq!(again.last_error.as_deref(), Some("transient"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_done_and_failed_are_terminal() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "done_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("r"), "fail_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let a = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_done(a.id).await.unwrap();
+        let b = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_failed(b.id, "boom").await.unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    async fn count_supporting(db: &Database) -> i64 {
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM fetch_supporting_commits", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_fetch_supporting_commits_roundtrip() {
+        let db = setup_db().await;
+        let supporting = vec!["original_sha".to_string(), "base_sha".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            Some("cover@x"),
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        // Only the resolution commit is ingested; the original and base commits
+        // ride along as supporting commits, preserved in insertion order.
+        assert_eq!(row.commit_hash, "resolution_sha");
+        assert_eq!(row.supporting_commits, supporting);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_without_support_has_no_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(row.supporting_commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mark_fetch_done_removes_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &["original_sha".to_string(), "base_sha".to_string()],
+        )
+        .await
+        .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(count_supporting(&db).await, 2);
+
+        db.mark_fetch_done(row.id).await.unwrap();
+        // Completing a fetch removes its supporting-commit child rows so the
+        // table stays bounded to in-flight work.
+        assert_eq!(count_supporting(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_ghost_fetches_reclaims_expired_lease() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A generous lease keeps the in-flight row locked (nothing reclaimed).
+        assert_eq!(db.sweep_ghost_fetches(1_000_000_000).await.unwrap(), 0);
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A negative lease treats every lease as already expired, so the
+        // ghosted row is reclaimed and becomes claimable again.
+        assert_eq!(db.sweep_ghost_fetches(-100_000).await.unwrap(), 1);
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.id, row.id);
+    }
+
+    #[test]
+    fn test_repo_url_from_subject() {
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from sso://prodkernel/kernel/icebreaker..."),
+            Some("sso://prodkernel/kernel/icebreaker".to_string())
+        );
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from https://example.com/repo.git..."),
+            Some("https://example.com/repo.git".to_string())
+        );
+        assert_eq!(repo_url_from_subject("Fetching abc123 from local..."), None);
+        assert_eq!(repo_url_from_subject("Fetching thread <m@id>..."), None);
+        assert_eq!(repo_url_from_subject("some unrelated subject"), None);
+    }
+
+    #[tokio::test]
+    async fn test_get_stuck_fetch_placeholders_finds_orphans() {
+        let db = setup_db().await;
+        // A patchset stuck in 'Fetching' with no queue row is an orphan.
+        db.create_fetching_patchset(
+            "orphan@sashiko.local",
+            "Fetching x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stuck = db.get_stuck_fetch_placeholders().await.unwrap();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(
+            stuck[0].cover_letter_message_id.as_deref(),
+            Some("orphan@sashiko.local")
+        );
+
+        // Once an active queue row exists, it is no longer reported.
+        let pid = stuck[0].patchset_id;
+        db.enqueue_fetch(
+            Some(pid),
+            Some("orphan@sashiko.local"),
+            None,
+            "orphan",
+            None,
+            None,
+            None,
+            500,
+        )
+        .await
+        .unwrap();
+        assert!(db.get_stuck_fetch_placeholders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_routing() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        let rules_config = [
+            crate::settings::PriorityRule {
+                regex: "(?i)^PRODKERNEL:".to_string(),
+                priority: 750,
+            },
+            crate::settings::PriorityRule {
+                regex: "security".to_string(),
+                priority: 999,
+            },
+        ];
+        let compiled_rules: Vec<_> = rules_config.iter().map(|r| r.compile().unwrap()).collect();
+
+        assert_eq!(
+            Database::calculate_priority("PRODKERNEL: perf updates", &compiled_rules),
+            Some(750)
+        );
+        assert_eq!(
+            Database::calculate_priority("PRODKERNEL: security leak fix", &compiled_rules),
+            Some(999)
+        );
+        assert_eq!(
+            Database::calculate_priority("staging: standard driver change", &compiled_rules),
+            None
+        );
+
+        let ps_low = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_low",
+                "staging: driver update",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let ps_high = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_high",
+                "PRODKERNEL: fix memory corruption",
+                "Author",
+                2000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                Some(750),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending', received_parts = 1 WHERE id IN (?, ?)",
+                libsql::params![ps_low, ps_high],
+            )
+            .await
+            .unwrap();
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, ps_high);
+        assert_eq!(pending[1].id, ps_low);
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_two_column_and_series_elevation() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        db.create_message(
+            "msg_part1",
+            thread_id,
+            None,
+            "Author",
+            "PRODKERNEL: memory fix",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_cover",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 0/2] series cover",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_part2",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 2/2] minor tweak",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Scenario 1: Patch 1 arrives first (PRODKERNEL: -> 750), Cover 0 arrives second (None)
+        let ps1 = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_part1",
+                "PRODKERNEL: memory fix",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                Some(750),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Cover letter arrives second (unmatched -> None)
+        let ps_cover = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some("msg_cover"),
+                "msg_cover",
+                "[PATCH 0/2] series cover",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps1, ps_cover);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        let prio_cap: Option<i32> = row.get(2).ok();
+        assert_eq!(base_prio, 750);
+        assert_eq!(eff_prio, 750);
+        assert!(prio_cap.is_none());
+
+        // Test priority_cap (e.g. from batch deprioritization)
+        db.conn
+            .execute(
+                "UPDATE patchsets SET priority_cap = 200, priority = 200 WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+
+        // Patch 2 arrives (unmatched -> None). base_priority must remain 750, priority remains capped at 200.
+        db.create_patchset_with_priority(
+            thread_id,
+            Some("msg_cover"),
+            "msg_part2",
+            "[PATCH 2/2] minor tweak",
+            "Author",
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            2,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        let prio_cap: Option<i32> = row.get(2).ok();
+        assert_eq!(base_prio, 750);
+        assert_eq!(eff_prio, 200);
+        assert_eq!(prio_cap, Some(200));
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_series_deprioritization() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        db.create_message(
+            "msg_doc_cover",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 0/2] doc updates",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_doc_part1",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 1/2] doc: fix spelling",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_doc_part2",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 2/2] minor grammar",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Cover letter matches low-priority rule (100)
+        let ps = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some("msg_doc_cover"),
+                "msg_doc_cover",
+                "[PATCH 0/2] doc updates",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Patch 1 arrives (also matches 100)
+        db.create_patchset_with_priority(
+            thread_id,
+            Some("msg_doc_cover"),
+            "msg_doc_part1",
+            "[PATCH 1/2] doc: fix spelling",
+            "Author",
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            1,
+            None,
+            true,
+            None,
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Patch 2 arrives (unmatched -> None). Must NOT elevate series back to 500!
+        db.create_patchset_with_priority(
+            thread_id,
+            Some("msg_doc_cover"),
+            "msg_doc_part2",
+            "[PATCH 2/2] minor grammar",
+            "Author",
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            2,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority FROM patchsets WHERE id = ?",
+                libsql::params![ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        assert_eq!(base_prio, 100, "Deprioritized series must stay at 100");
+        assert_eq!(eff_prio, 100, "Effective priority must stay at 100");
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_merge_elevation() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        db.create_message(
+            "msg_part1",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 1/2] minor tweak",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_part2",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 2/2] security fix",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_cover",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 0/2] series cover",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Patch 1 arrives first (standard priority 500)
+        let ps1 = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_part1",
+                "[PATCH 1/2] minor tweak",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Patch 2 exists as an independent patchset in the same thread (elevated priority 999)
+        let mut rows = db
+            .conn
+            .query(
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, base_priority, priority)
+                 VALUES (?, NULL, '[PATCH 2/2] security fix', 'Author', 1000, 2, 0, 'Incomplete', 1, '', '', 2, 999, 999) RETURNING id",
+                libsql::params![thread_id],
+            )
+            .await
+            .unwrap();
+        let ps2: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_ne!(ps1, ps2);
+
+        // Cover letter arrives (unmatched -> None) in thread_id, merging both patchsets
+        let ps_merged = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some("msg_cover"),
+                "msg_cover",
+                "[PATCH 0/2] series cover",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ps_merged, ps1);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        assert_eq!(
+            base_prio, 999,
+            "Merged patchset must inherit elevated base_priority from merged series"
+        );
+        assert_eq!(
+            eff_prio, 999,
+            "Merged patchset must inherit elevated effective priority from merged series"
+        );
+
+        // Verify that ps2 was deleted during merge
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT count(*) FROM patchsets WHERE id = ?",
+                libsql::params![ps2],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 0, "ps2 must be deleted after merge");
+    }
+
+    #[tokio::test]
+    async fn test_migration_v1_to_priority_columns() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+
+        // Manually set up schema version 1 WITHOUT priority columns
+        db.conn
+            .execute_batch(
+                "CREATE TABLE threads (id INTEGER PRIMARY KEY, root_message_id TEXT, subject TEXT, last_updated INTEGER);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, thread_id INTEGER, in_reply_to TEXT, author TEXT, subject TEXT, date INTEGER, body TEXT, to_recipients TEXT, cc_recipients TEXT, git_blob_hash TEXT, mailing_list TEXT, references_hdr TEXT);
+                 CREATE TABLE patchsets (id INTEGER PRIMARY KEY, thread_id INTEGER, cover_letter_message_id TEXT, subject TEXT, author TEXT, date INTEGER, total_parts INTEGER, received_parts INTEGER, status TEXT, parser_version INTEGER, to_recipients TEXT, cc_recipients TEXT, subject_index INTEGER, baseline_id INTEGER, failed_reason TEXT, skip_filters TEXT, only_filters TEXT, target_review_count INTEGER DEFAULT 1, model_name TEXT, prompts_git_hash TEXT, baseline_logs TEXT, mr_url TEXT, mr_title TEXT, mr_number TEXT, slug TEXT, provider TEXT, embargo_until INTEGER, embargo_release_started_at INTEGER);
+                 CREATE TABLE patches (id INTEGER PRIMARY KEY, patchset_id INTEGER NOT NULL, message_id TEXT NOT NULL, part_index INTEGER, diff TEXT, status TEXT, apply_error TEXT, FOREIGN KEY(patchset_id) REFERENCES patchsets(id), FOREIGN KEY(message_id) REFERENCES messages(message_id), UNIQUE(patchset_id, message_id));
+                 PRAGMA user_version = 1;",
+            )
+            .await
+            .unwrap();
+
+        // Run migrate() on existing version 1 DB
+        db.migrate().await.unwrap();
+
+        // Must now be able to query and insert priority-aware patchsets without column errors
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+        let ps_id = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_m",
+                "Migrated Patch",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                Some(750),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 0);
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending', received_parts = 1 WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, ps_id);
     }
 
     #[tokio::test]
@@ -8668,6 +10277,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -8733,6 +10344,8 @@ mod tests {
         db.create_fetching_patchset(
             &synthetic_id,
             "Fetching placeholder",
+            None,
+            None,
             None,
             None,
             None,
@@ -8816,12 +10429,20 @@ mod tests {
             db.has_patchset_by_msgid(sha_patch).await.unwrap(),
             "has_patchset_by_msgid should return true for SHA existing in patches table"
         );
+
+        // 3. Non-existent SHA must return false
+        assert!(
+            !db.has_patchset_by_msgid("0000000000000000000000000000000000000000")
+                .await
+                .unwrap(),
+            "has_patchset_by_msgid should return false for unknown SHA"
+        );
     }
 
     /// Verify that has_patchset_by_msgid returns false for Failed and Cancelled
     /// patchsets so that retry submissions can be re-fetched.
     #[tokio::test]
-    async fn test_has_patchset_by_msgid_excludes_failed_and_cancelled() {
+    async fn test_has_patchset_by_msgid_ignores_failed_and_cancelled() {
         let db = setup_db().await;
         let sha_failed = "f00f00f001234567890abcdef1234567890abcdef";
         let synthetic_failed = format!("{}@sashiko.local", sha_failed);
@@ -8831,6 +10452,8 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_failed,
                 "Fetching failed placeholder",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -8857,6 +10480,8 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cancelled,
                 "Fetching cancelled placeholder",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -9111,6 +10736,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -9178,6 +10805,8 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cover,
                 "Fetching retry",
+                None,
+                None,
                 None,
                 None,
                 None,

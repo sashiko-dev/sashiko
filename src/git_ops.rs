@@ -487,7 +487,7 @@ impl Drop for GitWorktree {
     }
 }
 
-fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
+pub fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
     let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = map_mutex.lock().unwrap();
@@ -496,7 +496,7 @@ fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
-fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
+pub fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
     static GLOBAL_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
     GLOBAL_LOCK
         .get_or_init(|| Arc::new(AsyncMutex::new(())))
