@@ -724,10 +724,7 @@ mod tests {
     use std::io::Write;
 
     async fn test_worker(repo_path: PathBuf) -> FetchWorker {
-        let settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&settings).await.unwrap());
         db.migrate().await.unwrap();
         let (tx, _rx) = mpsc::channel(1);

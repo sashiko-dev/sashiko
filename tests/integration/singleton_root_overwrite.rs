@@ -17,10 +17,7 @@ use sashiko::settings::DatabaseSettings;
 use std::sync::Arc;
 
 async fn setup_db() -> Arc<Database> {
-    let settings = DatabaseSettings {
-        url: ":memory:".to_string(),
-        token: String::new(),
-    };
+    let settings = DatabaseSettings::memory();
     let db = Database::new(&settings).await.unwrap();
     db.migrate().await.unwrap();
     Arc::new(db)

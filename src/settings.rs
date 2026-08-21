@@ -65,6 +65,44 @@ fn default_true() -> bool {
 pub struct DatabaseSettings {
     pub url: String,
     pub token: String,
+    #[serde(default)]
+    pub mmap_size_mb: Option<usize>,
+    #[serde(default)]
+    pub cache_size_kb: Option<i64>,
+    #[serde(default)]
+    pub synchronous: Option<String>,
+    #[serde(default)]
+    pub wal_flush_interval_secs: Option<u64>,
+}
+
+impl Default for DatabaseSettings {
+    fn default() -> Self {
+        Self {
+            url: ":memory:".to_string(),
+            token: String::new(),
+            mmap_size_mb: None,
+            cache_size_kb: None,
+            synchronous: None,
+            wal_flush_interval_secs: None,
+        }
+    }
+}
+
+impl DatabaseSettings {
+    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            token: token.into(),
+            mmap_size_mb: None,
+            cache_size_kb: None,
+            synchronous: None,
+            wal_flush_interval_secs: None,
+        }
+    }
+
+    pub fn memory() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1057,5 +1095,41 @@ worktree_dir = "/tmp/test"
         assert_eq!(remotes[0].name, "prodkernel");
         assert_eq!(remotes[0].url, "sso://prodkernel/kernel/icebreaker");
         assert!(remotes[0].check_all_branches);
+    }
+
+    #[test]
+    fn test_database_settings_defaults() {
+        let toml_str = r#"
+            url = "sashiko.db"
+            token = ""
+        "#;
+        let db_settings: DatabaseSettings =
+            toml::from_str(toml_str).expect("deserialize db settings");
+        assert_eq!(db_settings.url, "sashiko.db");
+        assert_eq!(db_settings.token, "");
+        assert_eq!(db_settings.mmap_size_mb, None);
+        assert_eq!(db_settings.cache_size_kb, None);
+        assert_eq!(db_settings.synchronous, None);
+        assert_eq!(db_settings.wal_flush_interval_secs, None);
+    }
+
+    #[test]
+    fn test_database_settings_custom_options() {
+        let toml_str = r#"
+            url = "sashiko.db"
+            token = "secret"
+            mmap_size_mb = 512
+            cache_size_kb = 131072
+            synchronous = "normal"
+            wal_flush_interval_secs = 30
+        "#;
+        let db_settings: DatabaseSettings =
+            toml::from_str(toml_str).expect("deserialize db settings");
+        assert_eq!(db_settings.url, "sashiko.db");
+        assert_eq!(db_settings.token, "secret");
+        assert_eq!(db_settings.mmap_size_mb, Some(512));
+        assert_eq!(db_settings.cache_size_kb, Some(131072));
+        assert_eq!(db_settings.synchronous.as_deref(), Some("normal"));
+        assert_eq!(db_settings.wal_flush_interval_secs, Some(30));
     }
 }

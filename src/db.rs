@@ -5163,10 +5163,7 @@ mod tests {
     use std::sync::Arc;
 
     async fn setup_db() -> Arc<Database> {
-        let settings = DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let settings = DatabaseSettings::memory();
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
@@ -5271,10 +5268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_fetch_queue_on_version_1_db() {
-        let settings = DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let settings = DatabaseSettings::memory();
         let db = Database::new(&settings).await.unwrap();
         // Simulate a legacy DB already at user_version 1 without fetch_queue
         db.conn
@@ -6415,10 +6409,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migration_v1_to_priority_columns() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
 
         // Manually set up schema version 1 WITHOUT priority columns
@@ -11353,10 +11344,7 @@ mod tests {
     /// without requiring a user_version bump.
     #[tokio::test]
     async fn test_migrate_patches_table_from_version_1_legacy_constraint() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
 
         // 1. Manually set up a schema matching version 1 with the old UNIQUE(message_id)
@@ -11460,10 +11448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_adds_missing_columns_to_version_1_db() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
 
         // 1. Set up a version 1 database that lacks baseline_part_index in patchsets

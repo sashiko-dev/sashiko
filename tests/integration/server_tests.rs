@@ -74,10 +74,7 @@ struct TestServer {
 /// [`TestServer`] goes out of scope (the task is detached, so cleanup is
 /// automatic when the tokio runtime shuts down).
 async fn spawn_test_server(read_only: bool) -> TestServer {
-    let db_settings = DatabaseSettings {
-        url: ":memory:".to_string(),
-        token: String::new(),
-    };
+    let db_settings = DatabaseSettings::new(":memory:", "");
     let db = Arc::new(Database::new(&db_settings).await.unwrap());
     db.migrate().await.unwrap();
 

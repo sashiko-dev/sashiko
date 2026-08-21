@@ -1,15 +1,16 @@
 use sashiko::db::Database;
 use sashiko::settings::DatabaseSettings;
 
-#[tokio::test]
-async fn test_get_completed_reviews_for_release_nested() {
-    let settings = DatabaseSettings {
-        url: "file:test_nested.db?mode=rwc".to_string(),
-        token: "".to_string(),
-    };
-    let _ = std::fs::remove_file("test_nested.db");
+async fn setup_db() -> Database {
+    let settings = DatabaseSettings::memory();
     let db = Database::new(&settings).await.unwrap();
     db.migrate().await.unwrap();
+    db
+}
+
+#[tokio::test]
+async fn test_get_completed_reviews_for_release_nested() {
+    let db = setup_db().await;
 
     db.conn
         .execute(

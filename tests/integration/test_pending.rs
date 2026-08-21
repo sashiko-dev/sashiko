@@ -3,10 +3,7 @@ use sashiko::settings::DatabaseSettings;
 
 #[tokio::test]
 async fn test_get_message_details_by_msgid() {
-    let settings = DatabaseSettings {
-        url: ":memory:".to_string(),
-        token: "".to_string(),
-    };
+    let settings = DatabaseSettings::memory();
     let db = Database::new(&settings).await.unwrap();
     db.migrate().await.unwrap();
 
@@ -24,10 +21,7 @@ async fn test_get_message_details_by_msgid() {
 
 #[tokio::test]
 async fn test_get_completed_reviews_for_release() {
-    let settings = DatabaseSettings {
-        url: ":memory:".to_string(),
-        token: "".to_string(),
-    };
+    let settings = DatabaseSettings::memory();
     let db = Database::new(&settings).await.unwrap();
     db.migrate().await.unwrap();
 
