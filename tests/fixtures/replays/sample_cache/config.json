@@ -1,0 +1,16 @@
+{
+  "name": "sample_cache",
+  "description": "Synthetic cherry-pick conflict resolution for sample buffer cache",
+  "repo": {
+    "type": "synthetic",
+    "source_dir": "repo"
+  },
+  "patchset": {
+    "id": 99999,
+    "subject": "fs: sample_cache: implement buffer cache pool and purge"
+  },
+  "options": {
+    "max_interactions": 50,
+    "temperature": 0.0
+  }
+}
