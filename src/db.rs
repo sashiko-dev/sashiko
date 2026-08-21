@@ -717,6 +717,7 @@ impl Database {
         self.migrate_patches_unique_constraint_if_needed().await?;
         self.migrate_priority_columns_if_needed().await?;
         self.migrate_fetch_queue_if_needed().await?;
+        self.migrate_perf_indexes_if_needed().await?;
 
         Ok(())
     }
@@ -1076,6 +1077,23 @@ impl Database {
                     ON fetch_supporting_commits(fetch_id);",
             )
             .await?;
+        Ok(())
+    }
+
+    async fn migrate_perf_indexes_if_needed(&self) -> Result<()> {
+        let _ = self
+            .try_create_index("idx_reviews_created_at", "reviews", "created_at DESC")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_findings_review_severity",
+                "findings",
+                "review_id, severity, preexisting",
+            )
+            .await;
+        let _ = self
+            .try_create_index("idx_patches_message_id", "patches", "message_id")
+            .await;
         Ok(())
     }
 
@@ -11749,5 +11767,42 @@ mod tests {
         // Query with offset beyond available (should return empty vec)
         let page3 = db.get_patchsets(10, 100, None, None).await.unwrap();
         assert!(page3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_perf_indexes_on_version_1_db() {
+        let db_settings = crate::settings::DatabaseSettings::memory();
+        let db = Database::new(&db_settings).await.unwrap();
+
+        db.conn
+            .execute_batch(
+                "CREATE TABLE reviews (id INTEGER PRIMARY KEY, patchset_id INTEGER, status TEXT, created_at INTEGER);
+                 CREATE TABLE findings (id INTEGER PRIMARY KEY, review_id INTEGER, severity INTEGER, preexisting INTEGER);
+                 CREATE TABLE patches (id INTEGER PRIMARY KEY, patchset_id INTEGER, message_id TEXT);
+                 PRAGMA user_version = 1;",
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_reviews_created_at', 'idx_findings_review_severity', 'idx_patches_message_id')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut found_indexes = std::collections::HashSet::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let name: String = row.get(0).unwrap();
+            found_indexes.insert(name);
+        }
+
+        assert!(found_indexes.contains("idx_reviews_created_at"));
+        assert!(found_indexes.contains("idx_findings_review_severity"));
+        assert!(found_indexes.contains("idx_patches_message_id"));
     }
 }

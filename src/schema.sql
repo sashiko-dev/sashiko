@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 CREATE INDEX IF NOT EXISTS idx_findings_review_id ON findings(review_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
+CREATE INDEX IF NOT EXISTS idx_findings_review_severity ON findings(review_id, severity, preexisting);
 
 CREATE TABLE IF NOT EXISTS ai_interactions (
     id TEXT PRIMARY KEY,
@@ -198,6 +199,7 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_cover_message_id ON patchsets(cover_let
 
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);
+CREATE INDEX IF NOT EXISTS idx_patches_message_id ON patches(message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
 
 CREATE INDEX IF NOT EXISTS idx_messages_day ON messages(strftime('%Y-%m-%d', date, 'unixepoch'));
@@ -265,6 +267,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_usages_stats ON tool_usages(provider, model,
 CREATE INDEX IF NOT EXISTS idx_patchsets_date ON patchsets(date DESC);
 CREATE INDEX IF NOT EXISTS idx_reviews_patchset_status ON reviews(patchset_id, status);
 CREATE INDEX IF NOT EXISTS idx_reviews_day ON reviews(strftime('%Y-%m-%d', created_at, 'unixepoch'), status);
+CREATE INDEX IF NOT EXISTS idx_reviews_created_at ON reviews(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_email_outbox_patch_id ON email_outbox(patch_id);
 
 CREATE TABLE IF NOT EXISTS patchwork_outbox (
