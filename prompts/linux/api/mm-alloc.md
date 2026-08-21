@@ -109,6 +109,21 @@ untracked. Calling `kmemleak_not_leak()`, `kmemleak_ignore()`, or
 allocation path can drop kmemleak registration under pressure, be cautious
 when unconditionally mutating kmemleak object state.
 
+## struct_size() and array_size() Overflow Semantics
+
+Checking `if (sz > SIZE_MAX)` after assigning the result of `struct_size()` or
+`array_size()` to a variable is dead code that provides no protection. The check
+can never trigger because these macros saturate and return `SIZE_MAX` on overflow,
+not a value exceeding it.
+
+- `struct_size(ptr, member, count)` and `array_size(a, b)` return `SIZE_MAX` on overflow.
+- The return type is `size_t`, which saturates at `SIZE_MAX`.
+
+**Correct patterns:**
+- Option 1: Check for equality: `if (sz == SIZE_MAX) return -ENOMEM;`
+- Option 2: Let `kzalloc()` fail gracefully: `kzalloc(sz, GFP_KERNEL)` fails safely
+  when passed `SIZE_MAX`.
+
 ## Quick Checks for Callers
 
 - **NUMA node ID validation before `NODE_DATA()`**: `NODE_DATA(nid)` has no

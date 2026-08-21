@@ -20,7 +20,8 @@ top memory page `(-4095UL .. -1UL)` (defined in `include/linux/err.h`).
    - Functions returning `NULL` on error (e.g. `kmalloc()`, `dma_alloc_coherent()`)
      MUST be checked with `!ptr` or `ptr == NULL`, NEVER with `IS_ERR()`.
    - Functions returning `ERR_PTR` on error (e.g. `kthread_run()`, `device_create()`,
-     `clk_get()`) MUST be checked with `IS_ERR()`, NEVER with `!ptr`.
+     `clk_get()`, `fwnode_create_software_node()`) MUST be checked with `IS_ERR()`,
+     NEVER with `!ptr`.
    - Functions returning optional objects (valid pointer on success, `NULL` when
      disabled/optional, `ERR_PTR` on failure) MUST use `IS_ERR_OR_NULL()` or check
      `IS_ERR()` first before checking `NULL`.
