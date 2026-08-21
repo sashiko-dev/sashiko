@@ -402,6 +402,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
 
+    let wal_flush_interval = settings.database.wal_flush_interval_secs.unwrap_or(60);
+    if wal_flush_interval > 0 {
+        db.spawn_wal_flusher(std::time::Duration::from_secs(wal_flush_interval));
+    }
+
     // Create internal task queues
     // raw_tx -> Parser -> parsed_tx -> DB Worker
     let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(1000);

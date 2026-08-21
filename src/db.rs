@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
 
+#[derive(Clone)]
 pub struct Database {
     pub conn: libsql::Connection,
 }
@@ -623,6 +624,58 @@ impl Database {
         }
 
         Ok(Self { conn })
+    }
+
+    /// Executes a PASSIVE checkpoint on the WAL, returning (busy, log_frames, checkpointed_frames).
+    pub async fn checkpoint_wal_passive(&self) -> Result<(i64, i64, i64)> {
+        let mut rows = self
+            .conn
+            .query("PRAGMA wal_checkpoint(PASSIVE);", ())
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let busy: i64 = row.get(0).unwrap_or(0);
+            let log_frames: i64 = row.get(1).unwrap_or(0);
+            let checkpointed: i64 = row.get(2).unwrap_or(0);
+            Ok((busy, log_frames, checkpointed))
+        } else {
+            Ok((0, 0, 0))
+        }
+    }
+
+    /// Spawns a background task that periodically runs a PASSIVE checkpoint on the WAL,
+    /// ensuring dirty WAL pages are written to the database file and flushed to disk.
+    pub fn spawn_wal_flusher(&self, interval: std::time::Duration) {
+        if interval.is_zero() {
+            return;
+        }
+
+        let db = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                match db.checkpoint_wal_passive().await {
+                    Ok((busy, log_frames, checkpointed)) => {
+                        tracing::debug!(
+                            busy = busy,
+                            log_frames = log_frames,
+                            checkpointed_frames = checkpointed,
+                            "Executed periodic WAL PASSIVE checkpoint"
+                        );
+                        if log_frames > 25000 {
+                            tracing::warn!(
+                                log_frames = log_frames,
+                                checkpointed_frames = checkpointed,
+                                "WAL size is elevated (>100MB); checkpoint may be delayed by concurrent readers"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("WAL flusher failed to execute checkpoint: {}", e);
+                    }
+                }
+            }
+        });
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -11554,5 +11607,26 @@ mod tests {
             // 2 corresponds to MEMORY
             assert_eq!(temp_store, 2);
         }
+    }
+
+    #[tokio::test]
+    async fn test_wal_flusher_and_checkpoint() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_wal.db");
+        let mut db_settings = crate::settings::DatabaseSettings::new(db_path.to_str().unwrap(), "");
+        db_settings.wal_flush_interval_secs = Some(1);
+
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // Direct passive checkpoint on WAL database should succeed
+        let (busy, log_frames, checkpointed) = db.checkpoint_wal_passive().await.unwrap();
+        assert_eq!(busy, 0);
+        assert!(log_frames >= 0);
+        assert!(checkpointed >= 0);
+
+        // spawn_wal_flusher should run without panic
+        db.spawn_wal_flusher(std::time::Duration::from_millis(50));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 }
