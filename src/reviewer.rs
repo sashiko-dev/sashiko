@@ -24,7 +24,6 @@ use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
 use crate::settings::Settings;
-use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
 use anyhow::Result;
 use serde::Serialize;
@@ -822,19 +821,35 @@ impl Reviewer {
             let mut current_log = format!("Trying baseline: {}\n", baseline_ref);
             let mut current_status = "Failed".to_string();
 
-            // Check remote
-            if let BaselineResolution::RemoteTarget { url, name, .. } = candidate
-                && let Err(e) = ensure_remote(&repo_path, name, url, false).await
-            {
-                let msg = format!("Failed to fetch remote {}: {}\n", redact_secret(url), e);
-                current_log.push_str(&msg);
-                error!("{}", msg.trim());
-                attempts.push(BaselineAttempt {
-                    baseline: baseline_ref.clone(),
-                    status: current_status,
-                    log: current_log,
-                });
-                continue;
+            // Only block on ensure_remote when the remote does not exist
+            // yet (first boot). Once configured, the GitSyncWorker keeps
+            // it fresh hourly so we never stall reviews on a fetch.
+            if let BaselineResolution::RemoteTarget { url, name, .. } = candidate {
+                let exists = tokio::process::Command::new("git")
+                    .current_dir(&repo_path)
+                    .args(["remote", "get-url", name])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !exists {
+                    // First time: add the remote and fetch (blocking is OK
+                    // because we literally have zero branches otherwise).
+                    if let Err(e) = ensure_remote(&repo_path, name, url, false).await {
+                        let msg = format!("Failed to set up remote {}: {}\n", name, e);
+                        current_log.push_str(&msg);
+                        error!("{}", msg.trim());
+                        attempts.push(BaselineAttempt {
+                            baseline: baseline_ref.clone(),
+                            status: current_status,
+                            log: current_log,
+                        });
+                        continue;
+                    }
+                }
+                // Remote exists: proceed with whatever branches are available.
             }
 
             // Resolve SHA

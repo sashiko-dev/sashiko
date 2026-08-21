@@ -403,7 +403,134 @@ pub struct CustomRemoteSettings {
     pub name: String,
     pub url: String,
     pub check_all_branches: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
     pub only_branches: Option<Vec<String>>,
+    /// Glob patterns for branch filtering (e.g., "*/6.18", "14*").
+    /// When set, ensure_remote fetches only matching refs and
+    /// check_all_branches filters to matching branches.
+    #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
+    pub branch_patterns: Option<Vec<String>>,
+}
+
+/// Deserializes an `Option<Vec<String>>` that may arrive as a JSON array
+/// (from TOML) or as a map with numeric string keys (from env vars via
+/// the `config` crate, e.g. `BRANCH_PATTERNS__0=...`).
+fn deserialize_optional_string_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptVecVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptVecVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a sequence of strings or a map of indices to strings")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<S: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: S,
+        ) -> Result<Self::Value, S::Error> {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                vec.push(elem);
+            }
+            Ok(Some(vec))
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut entries = Vec::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                let idx: usize = key.parse().map_err(serde::de::Error::custom)?;
+                entries.push((idx, value));
+            }
+            entries.sort_by_key(|(idx, _)| *idx);
+            Ok(Some(entries.into_iter().map(|(_, v)| v).collect()))
+        }
+    }
+
+    deserializer.deserialize_option(OptVecVisitor)
+}
+
+fn deserialize_custom_remotes<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<CustomRemoteSettings>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CustomRemotesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CustomRemotesVisitor {
+        type Value = Option<Vec<CustomRemoteSettings>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str(
+                "a sequence of CustomRemoteSettings or a map of indices to CustomRemoteSettings",
+            )
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: serde::de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                vec.push(elem);
+            }
+            Ok(Some(vec))
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            use std::collections::BTreeMap;
+            let mut btree = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let value = map.next_value::<CustomRemoteSettings>()?;
+                if let Ok(idx) = key.parse::<usize>() {
+                    btree.insert(idx, value);
+                } else {
+                    return Err(serde::de::Error::custom(format!(
+                        "invalid index in custom_remotes map: {}",
+                        key
+                    )));
+                }
+            }
+            Ok(Some(btree.into_values().collect()))
+        }
+    }
+
+    deserializer.deserialize_option(CustomRemotesVisitor)
 }
 
 /// Deserialize a `Vec<T>` that may arrive as a sequence (from TOML `[[...]]`)
@@ -458,6 +585,7 @@ where
 #[allow(unused)]
 pub struct GitSettings {
     pub repository_path: String,
+    #[serde(default, deserialize_with = "deserialize_custom_remotes")]
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
 }
 
@@ -491,6 +619,26 @@ impl PriorityRule {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct BatchTier {
+    pub min_size: i64,
+    pub priority: i32,
+}
+
+impl BatchTier {
+    pub fn normalized(&self) -> (i64, i32) {
+        (
+            self.min_size.max(1),
+            self.priority.clamp(MIN_PRIORITY, MAX_PRIORITY),
+        )
+    }
+}
+
+fn default_batch_window_secs() -> i64 {
+    30
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
     pub worktree_dir: String,
@@ -506,6 +654,10 @@ pub struct ReviewSettings {
     pub ignore_files: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_indexed_vec")]
     pub priority_rules: Vec<PriorityRule>,
+    #[serde(default, deserialize_with = "deserialize_indexed_vec")]
+    pub batch_tiers: Vec<BatchTier>,
+    #[serde(default = "default_batch_window_secs")]
+    pub batch_window_secs: i64,
     #[serde(default = "default_email_policy_path")]
     pub email_policy_path: String,
     /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
@@ -812,5 +964,98 @@ worktree_dir = "/tmp/test"
         "#;
         let settings: ReviewSettings = toml::from_str(toml).expect("parse review settings");
         assert!(settings.priority_rules.is_empty());
+        assert!(settings.batch_tiers.is_empty());
+        assert_eq!(settings.batch_window_secs, 30);
+    }
+
+    #[test]
+    fn test_batch_tiers_deserialize_toml() {
+        let toml = r#"
+            concurrency = 2
+            worktree_dir = "/tmp/test"
+            batch_window_secs = 60
+
+            [[batch_tiers]]
+            min_size = 5
+            priority = 200
+
+            [[batch_tiers]]
+            min_size = 10
+            priority = 100
+        "#;
+        let settings: ReviewSettings = toml::from_str(toml).expect("parse review settings");
+        assert_eq!(settings.batch_window_secs, 60);
+        assert_eq!(settings.batch_tiers.len(), 2);
+        assert_eq!(settings.batch_tiers[0].min_size, 5);
+        assert_eq!(settings.batch_tiers[0].priority, 200);
+        assert_eq!(settings.batch_tiers[1].min_size, 10);
+        assert_eq!(settings.batch_tiers[1].priority, 100);
+    }
+
+    #[test]
+    fn test_deserialize_custom_remotes_seq() {
+        let toml_str = r#"
+            repository_path = "path/to/repo"
+            [[custom_remotes]]
+            name = "remote1"
+            url = "url1"
+            check_all_branches = true
+        "#;
+        let settings: GitSettings = toml::from_str(toml_str).unwrap();
+        let remotes = settings.custom_remotes.unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "remote1");
+        assert_eq!(remotes[0].url, "url1");
+        assert!(remotes[0].check_all_branches);
+    }
+
+    #[test]
+    fn test_deserialize_custom_remotes_map() {
+        let json_str = r#"{
+            "repository_path": "path/to/repo",
+            "custom_remotes": {
+                "1": {
+                    "name": "remote1",
+                    "url": "url1",
+                    "check_all_branches": false
+                },
+                "0": {
+                    "name": "remote0",
+                    "url": "url0",
+                    "check_all_branches": true
+                }
+            }
+        }"#;
+        let settings: GitSettings = serde_json::from_str(json_str).unwrap();
+        let remotes = settings.custom_remotes.unwrap();
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(remotes[0].name, "remote0");
+        assert_eq!(remotes[0].url, "url0");
+        assert!(remotes[0].check_all_branches);
+        assert_eq!(remotes[1].name, "remote1");
+        assert_eq!(remotes[1].url, "url1");
+        assert!(!remotes[1].check_all_branches);
+    }
+
+    #[test]
+    fn test_deserialize_custom_remotes_config_rs() {
+        let s = Config::builder()
+            .set_default("repository_path", "path/to/repo")
+            .unwrap()
+            .set_default("custom_remotes.0.name", "prodkernel")
+            .unwrap()
+            .set_default("custom_remotes.0.url", "sso://prodkernel/kernel/icebreaker")
+            .unwrap()
+            .set_default("custom_remotes.0.check_all_branches", "true")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let settings: GitSettings = s.try_deserialize().unwrap();
+        let remotes = settings.custom_remotes.unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "prodkernel");
+        assert_eq!(remotes[0].url, "sso://prodkernel/kernel/icebreaker");
+        assert!(remotes[0].check_all_branches);
     }
 }
