@@ -30,6 +30,7 @@ review prompts categorized under `api/`, `subsystems/`, and `generic/`.
 | API | Pointer Guards | `IS_ERR`, `PTR_ERR`, `ERR_PTR`, `IS_ERR_OR_NULL` | api/pointer-guards.md |
 | API | Open Firmware (DT) | `drivers/of/`, `of_node`, `of_find_*`, `of_get_*`, `of_parse_*`, `of_node_put`, `of_node_get` | api/of.md |
 | API | DT Bindings | `Documentation/devicetree/bindings/`, `*.yaml` in devicetree bindings | api/dt-bindings.md |
+| API | PCI | `drivers/pci/`, `pci_*` | api/pci.md |
 | Subsystem | Networking Core | `net/`, `skb_`, `sockets`, `xfrm`, `dst_`, `sock_put`, `release_sock`, `pskb_may_pull` | subsystems/networking-core.md |
 | Subsystem | Networking Drivers | `drivers/net/`, `ethtool_ops`, `net_device_ops`, `napi_*` | subsystems/networking-drivers.md |
 | Subsystem | Netlink | `genl_`, `nla_`, `NLA_`, `NLM_F_`, `nlmsg_`, `netlink_callback`, `Documentation/netlink/specs/` | subsystems/netlink.md |
@@ -67,7 +68,6 @@ review prompts categorized under `api/`, `subsystems/`, and `generic/`.
 | Subsystem | Build System | `Kbuild`, `Makefile`, `scripts/` | subsystems/build.md |
 | Subsystem | Kconfig | `Kconfig`, `config `, `depends on ` | subsystems/kconfig.md |
 | Subsystem | Rust | Kernel Rust code | subsystems/rust.md |
-| Subsystem | PCI | `drivers/pci/`, `pci_*` | subsystems/pci.md |
 | Subsystem | DRM/GPU | `drivers/gpu/drm/`, `drm_*` | subsystems/drm.md |
 | Subsystem | I2C | `drivers/i2c/`, `i2c_*` | subsystems/i2c.md |
 | Subsystem | HID | `drivers/hid/`, `hid_*` | subsystems/hid.md |
