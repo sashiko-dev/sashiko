@@ -32,6 +32,10 @@ enabled = false
 [database]
 url = "sashiko.db"
 token = ""
+# synchronous = "normal"      # SQLite sync mode: "normal" (fast, safe with WAL), "full", "off"
+# cache_size_kb = 65536       # SQLite page cache size in KiB (default: 64MB)
+# mmap_size_mb = 256          # Memory-mapped I/O size in MB (default: 256MB)
+# wal_flush_interval_secs = 60 # Periodic background WAL checkpoint interval in seconds
 
 [mailing_lists]
 track = ["linux-kernel"]
