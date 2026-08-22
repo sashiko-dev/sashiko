@@ -172,6 +172,12 @@ impl PromptRegistry {
         clean.push_str("<global_review_guidelines>\n");
         clean.push_str("The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.\n\n");
 
+        // Project-specific identity and review boundaries must be present even
+        // when subsystem guidance is selected dynamically. Existing profiles
+        // do not provide this optional file, preserving their current context.
+        self.append_file(&mut content, &mut clean_files, "project-context.md")
+            .await?;
+
         // Subsystem Guidelines
         let subsystem_dir = self.base_dir.join("subsystem");
 
@@ -1151,6 +1157,90 @@ mod tests {
     use super::*;
     use crate::ai::AiRole;
     use crate::worker::stage::create_stage;
+
+    fn materialize_embedded_profile(root: &Path, profile: &str) -> PathBuf {
+        let profile_prefix = format!("{profile}/");
+        let profile_path = root.join(profile);
+
+        for &(relative, content) in crate::prompt_bundle::PROMPT_BUNDLE_FILES {
+            let Some(profile_relative) = relative.strip_prefix(&profile_prefix) else {
+                continue;
+            };
+            let destination = profile_path.join(profile_relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(destination, content).unwrap();
+        }
+
+        profile_path
+    }
+
+    #[tokio::test]
+    async fn test_build_context_preserves_profiles_without_project_context() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts = PromptRegistry::new(temp_dir.path().to_path_buf());
+
+        let (content, clean) = prompts.build_context(None).await.unwrap();
+
+        assert!(!content.contains("# project-context.md"));
+        assert!(!clean.contains("@project-context.md"));
+    }
+
+    #[tokio::test]
+    async fn test_build_context_loads_optional_project_context() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("project-context.md"),
+            "Sashiko project identity marker\n",
+        )
+        .unwrap();
+        let prompts = PromptRegistry::new(temp_dir.path().to_path_buf());
+
+        let (content, clean) = prompts.build_context(None).await.unwrap();
+
+        assert!(content.contains("# project-context.md"));
+        assert!(content.contains("Sashiko project identity marker"));
+        assert!(clean.contains("@project-context.md"));
+    }
+
+    #[tokio::test]
+    async fn test_bundled_sashiko_profile_loads_project_guidance() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let profile_path = materialize_embedded_profile(temp_dir.path(), "sashiko");
+        let prompts = PromptRegistry::new(profile_path.clone());
+
+        assert!(profile_path.join("review-core.md").is_file());
+        assert!(!profile_path.join("subsystem/subsystem.md").exists());
+
+        let (context, clean) = prompts.build_context(None).await.unwrap();
+
+        assert!(context.contains("The project under review is Sashiko"));
+        assert!(context.contains("Async and Concurrency Boundaries"));
+        assert!(context.contains("Webhook and Repository Security Boundaries"));
+        assert!(context.contains("Persistence, Retry, and Recovery Boundaries"));
+        assert!(context.contains("AI Provider and Cost Boundaries"));
+        assert!(clean.contains("@project-context.md"));
+        assert!(clean.contains("@async-concurrency.md"));
+    }
+
+    #[tokio::test]
+    async fn test_bundled_sashiko_profile_loads_stage_guides() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let profile_path = materialize_embedded_profile(temp_dir.path(), "sashiko");
+        let prompts = PromptRegistry::new(profile_path);
+
+        let (execution, _) = prompts.get_stage_prompt(3).await.unwrap();
+        assert!(execution.contains("Sashiko Call-Path Analysis"));
+        assert!(execution.contains("Sashiko Technical Review Patterns"));
+
+        let (verification, _) = prompts.get_stage_prompt(10).await.unwrap();
+        assert!(verification.contains("Sashiko False-Positive Guide"));
+        assert!(verification.contains("Sashiko Severity Levels"));
+
+        let (report, _) = prompts.get_stage_prompt(11).await.unwrap();
+        assert!(report.contains("Sashiko Inline Review Format"));
+    }
 
     #[test]
     fn test_append_stage_dismissed_concerns_preserves_category_type() {
