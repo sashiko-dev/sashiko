@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -362,7 +362,30 @@ pub async fn run_server(
         .collect();
     info!("Web API listening on {:?}", addrs);
 
-    let listener = TcpListener::bind(addrs.as_slice()).await?;
+    let addr = addrs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no valid address resolved for {}", bind_addr))?;
+
+    let socket = socket2::Socket::new(
+        if addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&(*addr).into())?;
+    let backlog = settings.server.tcp_backlog as i32;
+    socket.listen(backlog)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    let listener = TcpListener::from_std(std_listener)?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -924,19 +947,19 @@ async fn get_patchset(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching details for patchset id: {}", id_val);
+        debug!("Fetching details for patchset id: {}", id_val);
         state
             .db
             .get_patchset_details(id_val, query.page, query.per_page)
             .await
     } else if query.id.contains('-') && !query.id.contains('@') {
-        info!("Fetching details for patchset slug: {}", query.id);
+        debug!("Fetching details for patchset slug: {}", query.id);
         state
             .db
             .get_patchset_details_by_slug(&query.id, query.page, query.per_page)
             .await
     } else {
-        info!("Fetching details for patchset msgid: {}", query.id);
+        debug!("Fetching details for patchset msgid: {}", query.id);
         state
             .db
             .get_patchset_details_by_msgid(&query.id, query.page, query.per_page)
@@ -958,7 +981,7 @@ async fn get_patchset(
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Patchset not found: {}", query.id);
+            debug!("Patchset not found: {}", query.id);
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
@@ -973,10 +996,10 @@ async fn get_review(
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
-        info!("Fetching latest review for patchset id: {}", ps_id);
+        debug!("Fetching latest review for patchset id: {}", ps_id);
         state.db.get_latest_review_for_patchset(ps_id).await
     } else if let Some(id) = query.id {
-        info!("Fetching details for review id: {}", id);
+        debug!("Fetching details for review id: {}", id);
         state.db.get_review_details(id).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
@@ -985,7 +1008,7 @@ async fn get_review(
     match result {
         Ok(Some(details)) => Ok(Json(details)),
         Ok(None) => {
-            info!("Review not found");
+            debug!("Review not found");
             Err(StatusCode::NOT_FOUND)
         }
         Err(e) => {
@@ -1000,13 +1023,13 @@ async fn get_patchset_summary(
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching summary for patchset id: {}", id_val);
+        debug!("Fetching summary for patchset id: {}", id_val);
         state
             .db
             .get_patchset_summary(id_val, query.page, query.per_page)
             .await
     } else {
-        info!("Fetching summary for patchset msgid: {}", query.id);
+        debug!("Fetching summary for patchset msgid: {}", query.id);
         state
             .db
             .get_patchset_summary_by_msgid(&query.id, query.page, query.per_page)

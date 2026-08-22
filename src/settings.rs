@@ -432,6 +432,12 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default = "default_tcp_backlog")]
+    pub tcp_backlog: u32,
+}
+
+fn default_tcp_backlog() -> u32 {
+    1024
 }
 
 #[derive(Debug, Deserialize, Clone)]

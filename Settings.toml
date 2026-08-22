@@ -135,6 +135,7 @@ prompt_caching = true
 [server]
 host = "::"
 port = 8080
+# tcp_backlog = 1024 # TCP listen backlog queue size (default: 1024)
 
 [git]
 repository_path = "third_party/linux"
