@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod compressor;
-pub mod email;
-pub mod kernel_workflow;
-pub mod patchwork;
-pub mod prefetch;
-pub mod prompts;
-pub mod stage;
-pub mod sync;
+//! A generic, composable, and declarative AI workflow framework in Rust.
 
-pub use prompts::*;
+pub mod engine;
+pub mod events;
+pub mod graph;
+pub mod output;
+pub mod policy;
+pub mod prompt;
+pub mod stage;
+
+pub use engine::{WorkflowEngine, WorkflowOutcome};
+pub use events::WorkflowEvent;
+pub use graph::{Workflow, WorkflowBuilder, WorkflowStep};
+pub use output::OutputFormat;
+pub use policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
+pub use prompt::{InclusionDirective, PromptTemplate};
+pub use stage::{ExecutableStage, Stage, StageBuilder, StageOutcome, StateMutation, WorkflowEnv};

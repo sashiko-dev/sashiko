@@ -292,12 +292,21 @@ fn parse_usage(outer: &Value) -> Option<AiUsage> {
     }
     let input = u["input_tokens"].as_u64().unwrap_or(0) as usize;
     let output = u["output_tokens"].as_u64().unwrap_or(0) as usize;
-    let cached = u["cache_read_input_tokens"].as_u64().unwrap_or(0) as usize;
+    let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0) as usize;
+    let cache_write = u["cache_creation_input_tokens"].as_u64().unwrap_or(0) as usize;
+    // input_tokens arrives without the cached prefix, so the two cache
+    // counts fold back in here.  cached_tokens is a breakdown of
+    // prompt_tokens, and a consumer subtracts it to get uncached input.
+    let total_input = input + cache_read + cache_write;
     Some(AiUsage {
-        prompt_tokens: input,
+        prompt_tokens: total_input,
         completion_tokens: output,
-        total_tokens: input + output,
-        cached_tokens: Some(cached),
+        total_tokens: total_input + output,
+        cached_tokens: if cache_read > 0 {
+            Some(cache_read)
+        } else {
+            None
+        },
     })
 }
 
@@ -535,5 +544,40 @@ mod tests {
 
         let prompt = build_prompt(&req);
         assert!(!prompt.contains("RESPONSE FORMAT"));
+    }
+
+    #[test]
+    fn test_parse_usage_folds_cache_counts_into_prompt_tokens() {
+        let outer = serde_json::json!({
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 19500,
+                "cache_creation_input_tokens": 1000,
+            }
+        });
+
+        let usage = parse_usage(&outer).unwrap();
+
+        // Uncached input is prompt_tokens less the cached breakdown, so it
+        // covers the fresh input and the prefix the model had to write.
+        assert_eq!(usage.prompt_tokens, 21000);
+        assert_eq!(usage.cached_tokens, Some(19500));
+        assert_eq!(usage.total_tokens, 21020);
+    }
+
+    #[test]
+    fn test_parse_usage_without_a_cache_read_reports_no_cached_tokens() {
+        let outer = serde_json::json!({
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 20,
+            }
+        });
+
+        let usage = parse_usage(&outer).unwrap();
+
+        assert_eq!(usage.prompt_tokens, 500);
+        assert_eq!(usage.cached_tokens, None);
     }
 }

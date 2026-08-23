@@ -22,7 +22,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -84,6 +84,7 @@ pub struct OpenAiFunction {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAiResponse {
     pub choices: Vec<OpenAiChoice>,
+    #[serde(default)]
     pub usage: OpenAiUsage,
 }
 
@@ -94,11 +95,43 @@ pub struct OpenAiChoice {
     pub finish_reason: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Every field defaults, and the object itself defaults on the response.
+/// A compatible endpoint reports whichever counts it keeps, and some
+/// report none at all.  The counts are accounting, and losing them costs
+/// less than losing a completion that arrived intact.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct OpenAiUsage {
+    #[serde(default)]
     pub prompt_tokens: u32,
+    #[serde(default)]
     pub completion_tokens: u32,
+    #[serde(default)]
     pub total_tokens: u32,
+    /// Absent on the many compatible endpoints that do not report cache
+    /// hits.  A value that does not fit the documented shape is dropped
+    /// rather than failing the response.
+    #[serde(
+        default,
+        deserialize_with = "lenient_prompt_tokens_details",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct OpenAiPromptTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+}
+
+fn lenient_prompt_tokens_details<'de, D>(
+    deserializer: D,
+) -> Result<Option<OpenAiPromptTokensDetails>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -493,11 +526,28 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         );
     }
 
+    // prompt_tokens already counts the cached prefix, so cached_tokens is a
+    // breakdown of it rather than an addend the way Anthropic reports it.
+    // A larger count means the endpoint reports the prefix alongside the
+    // prompt instead.  Clamping to prompt_tokens leaves the two equal, so a
+    // consumer subtracting for uncached input still gets zero and the token
+    // budget still never trips.  Drop the count instead.
+    let cached = resp
+        .usage
+        .prompt_tokens_details
+        .and_then(|d| d.cached_tokens)
+        .filter(|&c| c <= resp.usage.prompt_tokens)
+        .unwrap_or(0);
+
     let usage = Some(AiUsage {
         prompt_tokens: resp.usage.prompt_tokens as usize,
         completion_tokens: resp.usage.completion_tokens as usize,
         total_tokens: resp.usage.total_tokens as usize,
-        cached_tokens: None,
+        cached_tokens: if cached > 0 {
+            Some(cached as usize)
+        } else {
+            None
+        },
     });
 
     Ok(AiResponse {
@@ -990,6 +1040,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                prompt_tokens_details: None,
             },
         };
 
@@ -1003,6 +1054,156 @@ mod tests {
         assert_eq!(usage.completion_tokens, 20);
         assert_eq!(usage.total_tokens, 30);
         assert_eq!(usage.cached_tokens, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_cached_tokens() -> Result<()> {
+        let openai_resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Hello!".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: OpenAiUsage {
+                prompt_tokens: 2048,
+                completion_tokens: 20,
+                total_tokens: 2068,
+                prompt_tokens_details: Some(OpenAiPromptTokensDetails {
+                    cached_tokens: Some(1920),
+                }),
+            },
+        };
+
+        let usage = translate_ai_response(openai_resp)?.usage.unwrap();
+
+        // prompt_tokens stays whole: the cached count is a breakdown of it,
+        // so uncached input is the difference.
+        assert_eq!(usage.prompt_tokens, 2048);
+        assert_eq!(usage.cached_tokens, Some(1920));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_zero_cached_tokens_is_none() -> Result<()> {
+        let openai_resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Hello!".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: OpenAiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                prompt_tokens_details: Some(OpenAiPromptTokensDetails {
+                    cached_tokens: Some(0),
+                }),
+            },
+        };
+
+        let usage = translate_ai_response(openai_resp)?.usage.unwrap();
+        assert_eq!(usage.cached_tokens, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_usage_deserializes_without_prompt_tokens_details() -> Result<()> {
+        let usage: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}"#,
+        )?;
+        assert!(usage.prompt_tokens_details.is_none());
+
+        let usage: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens": 2048, "completion_tokens": 20, "total_tokens": 2068,
+                "prompt_tokens_details": {"cached_tokens": 1920, "audio_tokens": 0}}"#,
+        )?;
+        assert_eq!(
+            usage.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            Some(1920)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_usage_tolerates_malformed_prompt_tokens_details() -> Result<()> {
+        for details in [r#"{"cached_tokens": 1920.5}"#, r#""1920""#, "[]", "null"] {
+            let body = format!(
+                r#"{{"prompt_tokens": 2048, "completion_tokens": 20,
+                     "total_tokens": 2068, "prompt_tokens_details": {details}}}"#
+            );
+            let usage: OpenAiUsage = serde_json::from_str(&body)?;
+            let cached = usage.prompt_tokens_details.and_then(|d| d.cached_tokens);
+            assert_eq!(cached, None, "{details}");
+            assert_eq!(usage.prompt_tokens, 2048);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_response_deserializes_with_usage_missing_or_partial() -> Result<()> {
+        let resp: OpenAiResponse = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "finish_reason": "stop",
+                 "message": {"role": "assistant", "content": "Hello!"}}]}"#,
+        )?;
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"));
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+
+        let resp: OpenAiResponse = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "finish_reason": "stop",
+                 "message": {"role": "assistant", "content": "Hello!"}}],
+                 "usage": {"prompt_tokens": 10}}"#,
+        )?;
+        assert_eq!(resp.usage.prompt_tokens, 10);
+        assert_eq!(resp.usage.completion_tokens, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_drops_cached_over_prompt_tokens() -> Result<()> {
+        let openai_resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Hello!".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: OpenAiUsage {
+                prompt_tokens: 2048,
+                completion_tokens: 20,
+                total_tokens: 2068,
+                prompt_tokens_details: Some(OpenAiPromptTokensDetails {
+                    cached_tokens: Some(3000),
+                }),
+            },
+        };
+
+        // An endpoint reporting the prefix alongside prompt_tokens offers no
+        // usable breakdown, so the whole prompt stays uncached input.
+        let usage = translate_ai_response(openai_resp)?.usage.unwrap();
+        assert_eq!(usage.cached_tokens, None);
+        assert_eq!(usage.prompt_tokens, 2048);
 
         Ok(())
     }
@@ -1031,6 +1232,7 @@ mod tests {
                 prompt_tokens: 15,
                 completion_tokens: 25,
                 total_tokens: 40,
+                prompt_tokens_details: None,
             },
         };
 
@@ -1056,6 +1258,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 0,
                 total_tokens: 10,
+                prompt_tokens_details: None,
             },
         };
 

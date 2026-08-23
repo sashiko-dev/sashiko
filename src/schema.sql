@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS patchsets (
     to_recipients TEXT,
     cc_recipients TEXT,
     baseline_id INTEGER,
+    baseline_part_index INTEGER, -- part that supplied baseline_id; NULL if unknown
     model_name TEXT,
     mr_url TEXT,
     mr_title TEXT,
@@ -96,13 +97,14 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
 CREATE TABLE IF NOT EXISTS patches (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER NOT NULL,
-    message_id TEXT NOT NULL UNIQUE,
+    message_id TEXT NOT NULL,
     part_index INTEGER,
     diff TEXT,
     status TEXT,
     apply_error TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
-    FOREIGN KEY(message_id) REFERENCES messages(message_id)
+    FOREIGN KEY(message_id) REFERENCES messages(message_id),
+    UNIQUE(patchset_id, message_id)
 );
 
 CREATE TABLE IF NOT EXISTS reviews (

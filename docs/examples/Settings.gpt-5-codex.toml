@@ -1,0 +1,5 @@
+# Codex CLI backend using OpenAI's coding-optimized gpt-5-codex model.
+# Requires the `codex` CLI installed, on $PATH, and authenticated.
+[ai]
+provider = "codex-cli"
+model = "gpt-5-codex"

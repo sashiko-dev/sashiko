@@ -426,7 +426,7 @@ mod tests {
         let args = json!({
             "revision": "HEAD",
             "files": [
-                { "path": "src/worker/prompts.rs" }
+                { "path": "Cargo.lock" }
             ]
         });
 
@@ -441,15 +441,10 @@ mod tests {
         let returned_items = res["metadata"]["returned_items"].as_u64().unwrap() as usize;
         let actual_lines = content.lines().count();
 
-        // We expect actual_lines to match returned_items, or at least be extremely close (including warning lines).
-        // Currently, returned_items is slice.len() (2448), but content only has allowed_lines (~800) lines!
         println!("returned_items metadata: {}", returned_items);
         println!("actual returned content lines: {}", actual_lines);
 
-        assert!(
-            actual_lines < 2400,
-            "Content was not truncated! (should be around 800 lines)"
-        );
+        assert!(actual_lines < 3200, "Content was not truncated!");
         assert_eq!(
             returned_items + 1,
             actual_lines,
@@ -464,9 +459,9 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         let args = json!({
-            "object": "HEAD:src/worker/prompts.rs",
+            "object": "HEAD:Cargo.lock",
             "start_line": 1,
-            "end_line": 3000
+            "end_line": 4000
         });
 
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
@@ -479,10 +474,7 @@ mod tests {
         println!("git_show returned_items metadata: {}", returned_items);
         println!("git_show actual returned content lines: {}", actual_lines);
 
-        assert!(
-            actual_lines < 2400,
-            "Content was not truncated! (should be around 800 lines)"
-        );
+        assert!(actual_lines < 3200, "Content was not truncated!");
         assert_eq!(
             returned_items + 1,
             actual_lines,

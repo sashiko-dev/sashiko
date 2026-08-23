@@ -56,64 +56,26 @@ impl Ingestor {
         let mut available_groups: Option<Vec<String>> = None;
 
         for entry in &self.settings.mailing_lists.track {
-            if let Some((name, group)) = entry.split_once(':') {
-                groups.push((name.to_string(), group.to_string()));
-            } else if entry.contains('.') {
-                groups.push((entry.clone(), entry.clone()));
-            } else {
-                // Heuristics for common lists
-                let mut resolved_group = None;
-
-                // Special case hardcoded mapping
-                if entry == "linux-mm" {
-                    resolved_group = Some("org.kvack.linux-mm".to_string());
-                } else {
-                    // Fetch available groups if we haven't already
-                    if available_groups.is_none() {
-                        match NntpClient::connect(
-                            &self.settings.nntp.server,
-                            self.settings.nntp.port,
-                        )
-                        .await
-                        {
-                            Ok(mut client) => match client.list().await {
-                                Ok(list) => available_groups = Some(list),
-                                Err(e) => warn!(
-                                    "Failed to fetch NNTP group list for dynamic resolution: {}",
-                                    e
-                                ),
-                            },
-                            Err(e) => {
-                                warn!("Failed to connect to NNTP for dynamic resolution: {}", e)
-                            }
+            if !entry.contains(':') && !entry.contains('.') && available_groups.is_none() {
+                match NntpClient::connect(&self.settings.nntp.server, self.settings.nntp.port).await
+                {
+                    Ok(mut client) => match client.list().await {
+                        Ok(list) => available_groups = Some(list),
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch NNTP group list for dynamic resolution: {}",
+                                e
+                            )
                         }
-                    }
-
-                    // Try to find a group that ends with .entry
-                    if let Some(list) = &available_groups {
-                        let suffix = format!(".{}", entry);
-                        if let Some(found) = list.iter().find(|g| g.ends_with(&suffix)) {
-                            info!(
-                                "Dynamically resolved short name '{}' to NNTP group '{}'",
-                                entry, found
-                            );
-                            resolved_group = Some(found.clone());
-                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to connect to NNTP for dynamic resolution: {}", e)
                     }
                 }
-
-                // Fallback to old vger default if resolution failed
-                let group = resolved_group.unwrap_or_else(|| {
-                    let fallback = format!("org.kernel.vger.{}", entry);
-                    warn!(
-                        "Could not dynamically resolve NNTP group for '{}', falling back to '{}'",
-                        entry, fallback
-                    );
-                    fallback
-                });
-
-                groups.push((entry.clone(), group));
             }
+
+            let (name, group) = resolve_tracked_group(entry, available_groups.as_deref());
+            groups.push((name, group));
         }
         Ok(groups)
     }
@@ -580,6 +542,52 @@ impl Ingestor {
     }
 }
 
+pub fn resolve_tracked_group(entry: &str, available_groups: Option<&[String]>) -> (String, String) {
+    if let Some((name, group)) = entry.split_once(':') {
+        (name.to_string(), group.to_string())
+    } else if entry.contains('.') {
+        (entry.to_string(), entry.to_string())
+    } else {
+        // Alias normalization before resolution
+        let normalized_entry = match entry {
+            "linux-rt" => "linux-rt-devel",
+            "linux-target" => "target-devel",
+            other => other,
+        };
+
+        let mut resolved_group = None;
+
+        // Special case hardcoded mapping
+        if normalized_entry == "linux-mm" {
+            resolved_group = Some("org.kvack.linux-mm".to_string());
+        } else if let Some(list) = available_groups {
+            let suffix = format!(".{}", normalized_entry);
+            if let Some(found) = list
+                .iter()
+                .find(|g| g.as_str() == normalized_entry || g.ends_with(&suffix))
+            {
+                info!(
+                    "Dynamically resolved short name '{}' to NNTP group '{}'",
+                    entry, found
+                );
+                resolved_group = Some(found.clone());
+            }
+        }
+
+        // Fallback to old vger default if resolution failed
+        let group = resolved_group.unwrap_or_else(|| {
+            let fallback = format!("org.kernel.vger.{}", normalized_entry);
+            warn!(
+                "Could not dynamically resolve NNTP group for '{}', falling back to '{}'",
+                entry, fallback
+            );
+            fallback
+        });
+
+        (entry.to_string(), group)
+    }
+}
+
 pub fn split_mbox(raw: &[u8]) -> Vec<Vec<u8>> {
     let mut emails = Vec::new();
     let mut current_email = Vec::new();
@@ -1007,5 +1015,88 @@ index bbc440c93e08..1123ef3ccf90 100644
     fn test_extract_message_id_regression_no_brackets() {
         let raw = b"From: user\nMessage-ID: 12345@example.com\nSubject: Hi";
         assert_eq!(extract_message_id(raw), "12345@example.com");
+    }
+
+    #[test]
+    fn test_resolve_tracked_group() {
+        let groups = vec![
+            "org.kernel.vger.bpf".to_string(),
+            "org.kernel.vger.linux-kernel".to_string(),
+            "dev.linux.lists.linux-rt-devel".to_string(),
+            "org.kernel.vger.target-devel".to_string(),
+            "org.kvack.linux-mm".to_string(),
+        ];
+
+        // Explicit name:group
+        assert_eq!(
+            resolve_tracked_group("custom:org.custom.group", Some(&groups)),
+            ("custom".to_string(), "org.custom.group".to_string())
+        );
+
+        // Explicit full group name with dot
+        assert_eq!(
+            resolve_tracked_group("org.kernel.vger.bpf", Some(&groups)),
+            (
+                "org.kernel.vger.bpf".to_string(),
+                "org.kernel.vger.bpf".to_string()
+            )
+        );
+
+        // Dynamic resolution for standard list
+        assert_eq!(
+            resolve_tracked_group("bpf", Some(&groups)),
+            ("bpf".to_string(), "org.kernel.vger.bpf".to_string())
+        );
+
+        // Hardcoded linux-mm
+        assert_eq!(
+            resolve_tracked_group("linux-mm", Some(&groups)),
+            ("linux-mm".to_string(), "org.kvack.linux-mm".to_string())
+        );
+
+        // Canonical target-devel
+        assert_eq!(
+            resolve_tracked_group("target-devel", Some(&groups)),
+            (
+                "target-devel".to_string(),
+                "org.kernel.vger.target-devel".to_string()
+            )
+        );
+
+        // Legacy/alias linux-target
+        assert_eq!(
+            resolve_tracked_group("linux-target", Some(&groups)),
+            (
+                "linux-target".to_string(),
+                "org.kernel.vger.target-devel".to_string()
+            )
+        );
+
+        // Canonical linux-rt-devel
+        assert_eq!(
+            resolve_tracked_group("linux-rt-devel", Some(&groups)),
+            (
+                "linux-rt-devel".to_string(),
+                "dev.linux.lists.linux-rt-devel".to_string()
+            )
+        );
+
+        // Legacy/alias linux-rt
+        assert_eq!(
+            resolve_tracked_group("linux-rt", Some(&groups)),
+            (
+                "linux-rt".to_string(),
+                "dev.linux.lists.linux-rt-devel".to_string()
+            )
+        );
+
+        // Fallback when not in available groups
+        assert_eq!(
+            resolve_tracked_group("unknown-list", Some(&groups)),
+            (
+                "unknown-list".to_string(),
+                "org.kernel.vger.unknown-list".to_string()
+            )
+        );
     }
 }

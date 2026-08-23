@@ -219,9 +219,23 @@ impl Reviewer {
 
         info!("Found {} pending patchsets for review", patchsets.len());
 
-        for patchset in patchsets {
+        for mut patchset in patchsets {
             let permit = self.semaphore.clone().acquire_owned().await?;
             let target_review_count = patchset.target_review_count.unwrap_or(1) as usize;
+
+            // Mark status as 'In Review' in the DB immediately to prevent double-fetching
+            if let Err(e) = self
+                .db
+                .update_patchset_status(patchset.id, ReviewStatus::InReview.as_str())
+                .await
+            {
+                error!(
+                    "Failed to update status to In Review for {}: {}",
+                    patchset.id, e
+                );
+                continue;
+            }
+            patchset.status = Some(ReviewStatus::InReview.as_str().to_string());
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
@@ -438,7 +452,7 @@ impl Reviewer {
         let (found_baseline, patch_commits, logs) =
             Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
 
-        let prompts_hash = get_commit_hash(Path::new("."), "HEAD").await.ok();
+        let prompts_hash = Some(env!("GIT_HASH"));
 
         // Save findings to patchset
         if let Some((resolution, baseline_id, worktree)) = found_baseline {
@@ -448,7 +462,7 @@ impl Reviewer {
                     patchset_id,
                     Some(baseline_id),
                     Some(ctx.settings.ai.model.as_str()),
-                    prompts_hash.as_deref(),
+                    prompts_hash,
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )
@@ -617,7 +631,7 @@ impl Reviewer {
                     let queue = valid_jobs_queue.clone();
                     let ctx_clone = ctx.clone();
                     let input_payload_clone = input_payload.clone();
-                    let prompts_hash_clone = prompts_hash.clone().map(|s| s.to_string());
+                    let prompts_hash_clone = prompts_hash.map(|s| s.to_string());
                     let baseline_ref_clone = baseline_ref_str.to_string();
                     let baseline_id_clone = baseline_id;
                     let embargo_until_clone = patchset.embargo_until;
@@ -687,7 +701,7 @@ impl Reviewer {
                         Some(baseline_id),
                         &input_payload,
                         job.commit_sha,
-                        prompts_hash.as_deref(),
+                        prompts_hash,
                         Some(&worktree.path),
                         &job.diff,
                         patchset.embargo_until,
@@ -757,7 +771,7 @@ impl Reviewer {
                     patchset_id,
                     None,
                     Some(ctx.settings.ai.model.as_str()),
-                    prompts_hash.as_deref(),
+                    prompts_hash,
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )

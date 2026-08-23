@@ -167,7 +167,7 @@ pub enum OpenAiCompatError {
 | `usage.prompt_tokens` | `prompt_tokens` |
 | `usage.completion_tokens` | `completion_tokens` |
 | `usage.total_tokens` | `total_tokens` |
-| (no cached tokens in standard OpenAI) | `cached_tokens: None` |
+| `usage.prompt_tokens_details.cached_tokens` | `cached_tokens` — a breakdown of `prompt_tokens`, which passes through unchanged. A missing or malformed `prompt_tokens_details` is dropped rather than failing the response; zero, or a count larger than `prompt_tokens`, yields `None`. |
 
 #### `impl AiProvider for OpenAiCompatClient`
 
