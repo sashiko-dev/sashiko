@@ -289,18 +289,20 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     async fn call_tools(&mut self, calls: Vec<ToolCall>) -> Result<Vec<(String, Value)>> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            // A rejected call is the model's to read and correct. The trait
-            // default propagates the error instead, which ends the stage and
-            // with it the review.
-            let res = match self.tools.call(&call.function_name, call.arguments).await {
-                Ok(v) => v,
-                Err(e) => json!({ "error": e.to_string() }),
-            };
-            results.push((call.id, res));
-        }
-        Ok(results)
+        let futures = calls.into_iter().map(|call| {
+            let tools = self.tools.clone();
+            async move {
+                // A rejected call is the model's to read and correct. The
+                // trait default propagates the error instead, which ends the
+                // stage and with it the review.
+                let res = match tools.call(&call.function_name, call.arguments).await {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e.to_string() }),
+                };
+                (call.id, res)
+            }
+        });
+        Ok(futures::future::join_all(futures).await)
     }
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
@@ -450,6 +452,46 @@ mod tests {
     struct ToolCallingProvider {
         turn: Mutex<usize>,
         seen: Mutex<Vec<AiRequest>>,
+        calls: Vec<ToolCall>,
+    }
+
+    impl ToolCallingProvider {
+        /// One call to git_read_files per path, each missing the required
+        /// revision argument, so every one of them is rejected.
+        fn rejecting(paths: &[&str]) -> Self {
+            Self {
+                turn: Mutex::new(0),
+                seen: Mutex::new(Vec::new()),
+                calls: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| ToolCall {
+                        id: format!("call_{i}"),
+                        function_name: "git_read_files".to_string(),
+                        arguments: json!({ "files": [{ "path": path }] }),
+                        thought_signature: None,
+                    })
+                    .collect(),
+            }
+        }
+
+        /// One call to the concurrency probe per index, so the batch carries
+        /// distinct arguments and neither the cache nor the duplicate guard
+        /// collapses it.
+        fn probing(count: usize) -> Self {
+            Self {
+                turn: Mutex::new(0),
+                seen: Mutex::new(Vec::new()),
+                calls: (0..count)
+                    .map(|i| ToolCall {
+                        id: format!("call_{i}"),
+                        function_name: "concurrency_probe".to_string(),
+                        arguments: json!({ "n": i }),
+                        thought_signature: None,
+                    })
+                    .collect(),
+            }
+        }
     }
 
     #[async_trait]
@@ -459,17 +501,11 @@ mod tests {
             let mut turn = self.turn.lock().unwrap();
             *turn += 1;
             if *turn == 1 {
-                // git_read_files without the required "revision" argument.
                 return Ok(AiResponse {
                     content: None,
                     thought: None,
                     thought_signature: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: "call_0".to_string(),
-                        function_name: "git_read_files".to_string(),
-                        arguments: json!({ "files": [{ "path": "x" }] }),
-                        thought_signature: None,
-                    }]),
+                    tool_calls: Some(self.calls.clone()),
                     usage: None,
                     truncated: false,
                 });
@@ -496,13 +532,103 @@ mod tests {
         }
     }
 
+    /// Blocks until every call in the batch is in flight. Under a sequential
+    /// implementation the first call never returns.
+    struct ConcurrencyProbe {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl crate::toolbox::framework::LlmTool<crate::toolbox::SashikoToolContext> for ConcurrencyProbe {
+        fn name(&self) -> &'static str {
+            "concurrency_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that waits for the rest of its batch."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": { "n": { "type": "integer" } } })
+        }
+
+        async fn call(
+            &self,
+            _args: Value,
+            _context: &crate::toolbox::SashikoToolContext,
+        ) -> Result<Value> {
+            self.barrier.wait().await;
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_batch_of_tool_calls_runs_concurrently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::probing(3));
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        toolbox.register_tool(ConcurrencyProbe {
+            barrier: Arc::new(tokio::sync::Barrier::new(3)),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(toolbox),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_concurrent")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let run = stage.execute_isolated(&env, &EmptyState, None);
+        let (_outcome, _mutation) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the batch must run concurrently; a sequential loop never clears the barrier")
+            .expect("the stage must not end");
+    }
+
+    #[tokio::test]
+    async fn test_batched_tool_results_keep_their_call_order() {
+        // join_all preserves the input order, which is what keeps a tool
+        // result next to its call on the Gemini path, where the result
+        // carries only the function name and not the call id.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "c"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_batch")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a batch of rejected calls must not end the stage");
+
+        let seen = provider.seen.lock().unwrap();
+        let ids: Vec<_> = seen[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.tool_call_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["call_0", "call_1", "call_2"]);
+    }
+
     #[tokio::test]
     async fn test_rejected_tool_call_is_reported_to_the_model_not_fatal() {
         let tmp = tempfile::tempdir().unwrap();
-        let provider = Arc::new(ToolCallingProvider {
-            turn: Mutex::new(0),
-            seen: Mutex::new(Vec::new()),
-        });
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["x"]));
         let env = WorkflowEnv {
             provider: provider.clone(),
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
