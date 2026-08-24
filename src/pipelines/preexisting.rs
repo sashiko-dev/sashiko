@@ -372,15 +372,9 @@ impl LlmSession for PreexistingReportSession<'_> {
 // 4. Pipeline Driver
 // ---------------------------------------------------------------------------
 
-/// Generates a random unique slug for a newly discovered pre-existing bug (e.g. `pb-a1b2c3d4`).
+/// Generates a random unique UUID for a newly discovered pre-existing bug.
 pub fn generate_preexisting_slug() -> String {
-    let mut rng = fastrand::Rng::new();
-    let mut hex = String::with_capacity(8);
-    for _ in 0..8 {
-        let b = rng.u8(..16);
-        hex.push_str(&format!("{:x}", b));
-    }
-    format!("pb-{}", hex)
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Executes the standalone pre-existing bug pipeline for a single candidate concern.
@@ -804,7 +798,7 @@ mod tests {
             PreexistingBugOutcome::NewlyDiscovered { bug } => {
                 assert_eq!(bug.problem, "Buffer overflow in e1000 rx handler");
                 assert_eq!(bug.severity, Severity::Critical);
-                assert!(bug.slug.starts_with("pb-"));
+                assert!(uuid::Uuid::parse_str(&bug.slug).is_ok());
                 assert_eq!(bug.discovered_in_patchset_id, Some(ps_id));
                 assert_eq!(
                     bug.introduced_in_commit.as_deref(),

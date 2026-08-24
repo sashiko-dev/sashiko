@@ -112,7 +112,7 @@ Linux kernel bugs are highly localized to specific subsystems and files.
 #### Step 4: Standalone Inline Review Generation
 - For confirmed High/Critical newly discovered bugs:
   - A dedicated prompt generates a self-contained LKML-style report quoting the problematic codebase lines (`> ...`) from the mainline tree, explaining the failure mechanism, citing the introducing commit, and suggesting a fix.
-  - The bug is saved in `preexisting_bugs` with a unique slug (e.g. `pb-a1b2c3d4`), locations JSON, standalone inline review, vector embedding, introducing commit, fixed status, and discovery metadata.
+  - The bug is saved in `preexisting_bugs` with a unique UUID slug, locations JSON, standalone inline review, vector embedding, introducing commit, fixed status, and discovery metadata.
 
 ---
 
@@ -128,16 +128,17 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
     severity INTEGER NOT NULL, -- 1: Low, 2: Medium, 3: High, 4: Critical
     severity_explanation TEXT,
     locations TEXT,            -- JSON array of location objects
-    subsystem TEXT,            -- Subsystem name (e.g. net, mm, fs)
-    source_files TEXT,         -- JSON array of affected file paths
-    inline_review TEXT,        -- Dedicated standalone inline review
-    vector_json TEXT,          -- Serialized vector representation for matching
+    subsystem TEXT,            -- Subsystem name (e.g., 'net', 'btrfs')
+    source_files TEXT,         -- JSON array of source file paths
+    inline_review TEXT NOT NULL, -- Standalone LKML review text
+    logs TEXT,                 -- Full multi-turn interaction logs
+    vector_json TEXT,          -- Serialized sparse term vector for fast similarity search
     discovered_in_patchset_id INTEGER,
     discovered_in_patch_id INTEGER,
     discovered_in_commit TEXT,
-    introduced_in_commit TEXT, -- Commit SHA/details that introduced the bug
-    is_fixed INTEGER NOT NULL DEFAULT 0, -- 1 = fixed in mainline trunk, 0 = active/unfixed
-    fixed_in_commit TEXT,      -- Commit SHA/details that fixed the bug if fixed
+    introduced_in_commit TEXT,
+    is_fixed INTEGER NOT NULL DEFAULT 0,
+    fixed_in_commit TEXT,
     created_at INTEGER NOT NULL,
     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
@@ -201,9 +202,9 @@ pub struct PreexistingBug {
   ```text
   Newly Discovered Pre-existing Issues in Surrounding Codebase:
   - [Critical] Out-of-bounds read in eth_type_trans()
-    View details & inline report: https://sashiko.dev/bug/pb-a1b2c3d4
+    View details & inline report: https://sashiko.dev/bug/9b68471d-c24b-49d1-9ad0-565531d14695
   - [High] Missing mutex unlock on error path in proc_sys_call()
-    View details & inline report: https://sashiko.dev/bug/pb-e5f6g7h8
+    View details & inline report: https://sashiko.dev/bug/a3c2e1f4-5b6d-7e8f-9012-3456789abcde
   ```
 
 ### 5.3 Web UI (`static/index.html`)
