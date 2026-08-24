@@ -1,0 +1,21 @@
+{
+  "concerns_count": 2,
+  "dismissed_concerns": [],
+  "dismissed_concerns_count": 0,
+  "findings": [
+    {
+      "description": "Ensure sample_cache_insert validates non-null pointer",
+      "origin": "resolution_introduced",
+      "severity": "high",
+      "title": "intent changed in merge"
+    },
+    {
+      "description": "Missing null check in sample_cache_insert",
+      "origin": "resolution_introduced",
+      "severity": "high",
+      "title": "null check dropped"
+    }
+  ],
+  "fixes": "",
+  "review_inline": "commit 3333333333333333333333333333333333333333\nAuthor: Alice Developer <alice@example.com>\nSubject: fs: sample_cache: implement buffer cache pool and purge\n\n> if (!entry)\n>     return -EINVAL;\n\nFinding: intent changed in merge\nSeverity: high\n\nFinding: null check dropped\nSeverity: high\n"
+}
