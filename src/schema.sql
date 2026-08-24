@@ -292,6 +292,7 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
     subsystem TEXT,            -- Subsystem name (e.g. net, mm, fs)
     source_files TEXT,         -- JSON array of affected file paths
     inline_review TEXT NOT NULL,
+    logs TEXT,
     vector_json TEXT,          -- Serialized vector representation for matching
     discovered_in_patchset_id INTEGER,
     discovered_in_patch_id INTEGER,

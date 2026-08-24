@@ -218,6 +218,7 @@ pub struct PreexistingBug {
     pub subsystem: Option<String>,
     pub source_files: Option<Vec<String>>,
     pub inline_review: String,
+    pub logs: Option<String>,
     pub vector_json: Option<String>,
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
@@ -235,6 +236,7 @@ pub struct NewPreexistingBug {
     pub subsystem: Option<String>,
     pub source_files: Option<Vec<String>>,
     pub inline_review: String,
+    pub logs: Option<String>,
     pub vector_json: Option<String>,
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
@@ -812,6 +814,7 @@ impl Database {
                     subsystem TEXT,
                     source_files TEXT,
                     inline_review TEXT NOT NULL,
+                    logs TEXT,
                     vector_json TEXT,
                     discovered_in_patchset_id INTEGER,
                     discovered_in_patch_id INTEGER,
@@ -823,6 +826,7 @@ impl Database {
                 (),
             )
             .await;
+        let _ = self.try_add_column("preexisting_bugs", "logs", "TEXT").await;
         let _ = self
             .try_create_index("idx_preexisting_bugs_slug", "preexisting_bugs", "slug")
             .await;
@@ -1222,16 +1226,21 @@ impl Database {
             .and_then(|v| serde_json::to_string(v).ok());
         let compressed_inline =
             crate::compression::compress_string_if_needed(&bug.inline_review);
+        let compressed_logs = bug
+            .logs
+            .as_ref()
+            .map(|l| crate::compression::compress_string_if_needed(l))
+            .unwrap_or(libsql::Value::Null);
 
         let mut rows = self
             .conn
             .query(
                 "INSERT INTO preexisting_bugs (
                     slug, problem, severity, severity_explanation, locations,
-                    subsystem, source_files, inline_review, vector_json,
+                    subsystem, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.slug.as_str(),
@@ -1242,6 +1251,7 @@ impl Database {
                     bug.subsystem.clone(),
                     source_files_val,
                     compressed_inline,
+                    compressed_logs,
                     bug.vector_json.clone(),
                     bug.discovered_in_patchset_id,
                     bug.discovered_in_patch_id,
@@ -1251,7 +1261,7 @@ impl Database {
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
             Ok(id)
         } else {
@@ -1264,7 +1274,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
-                        subsystem, source_files, inline_review, vector_json,
+                        subsystem, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, created_at
                  FROM preexisting_bugs WHERE id = ?",
@@ -1284,7 +1294,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
-                        subsystem, source_files, inline_review, vector_json,
+                        subsystem, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, created_at
                  FROM preexisting_bugs WHERE slug = ?",
@@ -1352,7 +1362,7 @@ impl Database {
         // Query rows
         let select_sql = format!(
             "SELECT id, slug, problem, severity, severity_explanation, locations,
-                    subsystem, source_files, inline_review, vector_json,
+                    subsystem, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, created_at
              FROM preexisting_bugs
@@ -1398,7 +1408,7 @@ impl Database {
             .conn
             .query(
                 "SELECT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
-                        pb.subsystem, pb.source_files, pb.inline_review, pb.vector_json,
+                        pb.subsystem, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.created_at, rpb.is_newly_discovered
                  FROM preexisting_bugs pb
@@ -1412,7 +1422,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_preexisting_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(14).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(15).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1427,7 +1437,7 @@ impl Database {
             .conn
             .query(
                 "SELECT DISTINCT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
-                        pb.subsystem, pb.source_files, pb.inline_review, pb.vector_json,
+                        pb.subsystem, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.created_at, rpb.is_newly_discovered
                  FROM preexisting_bugs pb
@@ -1442,7 +1452,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_preexisting_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(14).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(15).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1454,7 +1464,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
-                        subsystem, source_files, inline_review, vector_json,
+                        subsystem, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, created_at
                  FROM preexisting_bugs",
@@ -1486,11 +1496,14 @@ impl Database {
         let inline_review: String = crate::compression::get_compressed_string_opt(row, 8)
             .unwrap_or(None)
             .unwrap_or_else(|| row.get::<String>(8).unwrap_or_default());
-        let vector_json: Option<String> = row.get(9).ok().flatten();
-        let discovered_in_patchset_id: Option<i64> = row.get(10).ok().flatten();
-        let discovered_in_patch_id: Option<i64> = row.get(11).ok().flatten();
-        let discovered_in_commit: Option<String> = row.get(12).ok().flatten();
-        let created_at: i64 = row.get(13)?;
+        let logs: Option<String> = crate::compression::get_compressed_string_opt(row, 9)
+            .unwrap_or(None)
+            .or_else(|| row.get::<Option<String>>(9).ok().flatten());
+        let vector_json: Option<String> = row.get(10).ok().flatten();
+        let discovered_in_patchset_id: Option<i64> = row.get(11).ok().flatten();
+        let discovered_in_patch_id: Option<i64> = row.get(12).ok().flatten();
+        let discovered_in_commit: Option<String> = row.get(13).ok().flatten();
+        let created_at: i64 = row.get(14)?;
 
         Ok(PreexistingBug {
             id,
@@ -1502,6 +1515,7 @@ impl Database {
             subsystem,
             source_files,
             inline_review,
+            logs,
             vector_json,
             discovered_in_patchset_id,
             discovered_in_patch_id,
@@ -9837,6 +9851,7 @@ mod tests {
             subsystem: Some("net".to_string()),
             source_files: Some(vec!["drivers/net/e1000.c".to_string()]),
             inline_review: "> problematic_code();\nMemory is leaked here.".to_string(),
+            logs: Some("[{\"role\":\"system\",\"content\":\"test system\"}]".to_string()),
             vector_json: Some("[0.1, 0.2, 0.3]".to_string()),
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
@@ -9854,10 +9869,12 @@ mod tests {
         assert_eq!(fetched.severity, Severity::High);
         assert_eq!(fetched.subsystem.as_deref(), Some("net"));
         assert_eq!(fetched.inline_review, "> problematic_code();\nMemory is leaked here.");
+        assert_eq!(fetched.logs.as_deref(), Some("[{\"role\":\"system\",\"content\":\"test system\"}]"));
 
         // Fetch by slug
         let fetched_slug = db.get_preexisting_bug_by_slug("pb-test-1234").await.unwrap().expect("Bug should exist");
         assert_eq!(fetched_slug.id, bug_id);
+        assert_eq!(fetched_slug.logs.as_deref(), Some("[{\"role\":\"system\",\"content\":\"test system\"}]"));
 
         // List bugs with search and filter
         let (list, total) = db.list_preexisting_bugs(Some(1), Some(10), Some(Severity::High), Some("net"), Some("e1000")).await.unwrap();
