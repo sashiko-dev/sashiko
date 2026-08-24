@@ -345,7 +345,7 @@ impl Reviewer {
                 .unwrap_or(&review.patch_message_id);
             Self::queue_notifications(
                 ctx,
-                patchset.id,
+ patchset.id, Some(review.id),
                 review.patch_id,
                 &review.patch_message_id,
                 ps_msg_id,
@@ -1344,6 +1344,104 @@ impl Reviewer {
                                     }
                                 }
 
+                                if let Some(preexisting_arr) = review_content
+                                    .get("preexisting_concerns")
+                                    .and_then(|f| f.as_array())
+                                {
+                                    for concern in preexisting_arr {
+                                        let problem = concern
+                                            .get("description")
+                                            .or_else(|| concern.get("type"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if problem.is_empty() {
+                                            continue;
+                                        }
+                                        let reasoning = concern
+                                            .get("reasoning")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let locations = concern.get("locations").cloned();
+                                        let mut source_files = Vec::new();
+                                        if let Some(locs) =
+                                            locations.as_ref().and_then(|v| v.as_array())
+                                        {
+                                            for loc in locs {
+                                                if let Some(f) =
+                                                    loc.get("file").and_then(|v| v.as_str())
+                                                {
+                                                    source_files.push(f.to_string());
+                                                }
+                                            }
+                                        }
+                                        let input =
+                                            crate::pipelines::preexisting::PreexistingBugInput {
+                                                problem,
+                                                reasoning,
+                                                locations,
+                                                subsystem: None,
+                                                source_files,
+                                                commit_sha: commit_sha.clone(),
+                                                patchset_id: Some(patchset_id),
+                                                patch_id: Some(patch_id),
+                                                baseline_sha: Some(baseline_ref.to_string()),
+                                            };
+                                        let mut toolbox = None;
+                                        if let Some(wt) = worktree_path {
+                                            toolbox = Some(Arc::new(crate::toolbox::ToolBox::new(
+                                                wt.to_path_buf(),
+                                                None,
+                                            )));
+                                        }
+                                        match crate::pipelines::preexisting::process_preexisting_issue(
+                                            ctx.provider.as_ref(),
+                                            toolbox,
+                                            &ctx.db,
+                                            input,
+                                            Some("preexisting_bug"),
+                                        )
+                                        .await
+                                        {
+                                            Ok(outcome) => match outcome {
+                                                crate::pipelines::preexisting::PreexistingBugOutcome::NewlyDiscovered {
+                                                    bug,
+                                                } => {
+                                                    let _ = ctx
+                                                        .db
+                                                        .link_review_to_preexisting_bug(
+                                                            review_id, bug.id, true,
+                                                        )
+                                                        .await;
+                                                }
+                                                crate::pipelines::preexisting::PreexistingBugOutcome::Duplicate {
+                                                    existing_bug,
+                                                    ..
+                                                } => {
+                                                    let _ = ctx
+                                                        .db
+                                                        .link_review_to_preexisting_bug(
+                                                            review_id,
+                                                            existing_bug.id,
+                                                            false,
+                                                        )
+                                                        .await;
+                                                }
+                                                crate::pipelines::preexisting::PreexistingBugOutcome::Discarded {
+                                                    ..
+                                                } => {}
+                                            },
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to process candidate pre-existing bug: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let summary =
                                     review_content["summary"].as_str().unwrap_or("").to_string();
                                 let result_desc = "Review completed successfully.";
@@ -1401,7 +1499,7 @@ impl Reviewer {
 
                                             if let Err(e) = Self::queue_notifications(
                                                 ctx,
-                                                patchset_id,
+ patchset_id, Some(review_id),
                                                 patch_id,
                                                 patch_msg_id,
                                                 patchset_msg_id,
@@ -2128,7 +2226,7 @@ impl Reviewer {
     #[allow(clippy::too_many_arguments)]
     async fn queue_notifications(
         ctx: &ReviewContext,
-        patchset_id: i64,
+patchset_id: i64, review_id: Option<i64>,
         patch_id: i64,
         patch_message_id: &str,
         patchset_message_id: &str,
@@ -2145,7 +2243,21 @@ impl Reviewer {
             }
         };
 
+        let newly_discovered_preexisting = if let Some(r_id) = review_id {
+            ctx.db
+                .list_preexisting_bugs_for_review(r_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, is_new)| *is_new)
+                .map(|(bug, _)| bug)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
         let findings_count = findings.map(|f| f.len()).unwrap_or(0);
+        let total_issues_count = findings_count + newly_discovered_preexisting.len();
 
         let msg_id = patch_message_id;
         let msg_id_clean = msg_id.trim_matches(|c| c == '<' || c == '>');
@@ -2253,7 +2365,7 @@ impl Reviewer {
             &sender_address,
         );
 
-        if findings_count == 0 {
+        if total_issues_count == 0 {
             let mut sent_positive_review = false;
             if let EmailAction::Send {
                 to,
@@ -2394,26 +2506,26 @@ impl Reviewer {
 
                 let mut header = String::new();
 
-                if let Some(findings_arr) = findings
-                    && !findings_arr.is_empty()
-                {
+                if total_issues_count > 0 {
                     header.push_str(&format!(
                         "Thank you for your contribution! Sashiko AI review found {} potential issue(s) to consider:\n",
-                        findings_arr.len()
+                        total_issues_count
                     ));
 
                     let mut new_findings = Vec::new();
                     let mut preexisting_findings = Vec::new();
 
-                    for f in findings_arr {
-                        let preexisting = f
-                            .get("preexisting")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if preexisting {
-                            preexisting_findings.push(f.clone());
-                        } else {
-                            new_findings.push(f.clone());
+                    if let Some(findings_arr) = findings {
+                        for f in findings_arr {
+                            let preexisting = f
+                                .get("preexisting")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if preexisting {
+                                preexisting_findings.push(f.clone());
+                            } else {
+                                new_findings.push(f.clone());
+                            }
                         }
                     }
 
@@ -2443,7 +2555,10 @@ impl Reviewer {
                         format!("- [{}] {}\n", severity, problem)
                     };
 
-                    if !new_findings.is_empty() && !preexisting_findings.is_empty() {
+                    let has_preexisting = !preexisting_findings.is_empty()
+                        || !newly_discovered_preexisting.is_empty();
+
+                    if !new_findings.is_empty() && has_preexisting {
                         header.push_str("\nNew issues:\n");
                         for f in &new_findings {
                             header.push_str(&format_finding(f));
@@ -2452,14 +2567,30 @@ impl Reviewer {
                         for f in &preexisting_findings {
                             header.push_str(&format_finding(f));
                         }
+                        for bug in &newly_discovered_preexisting {
+                            header.push_str(&format!(
+                                "- [{}] {}: https://sashiko.dev/bug/{}\n",
+                                bug.severity.as_str(),
+                                bug.problem.trim(),
+                                bug.slug
+                            ));
+                        }
                     } else if !new_findings.is_empty() {
                         for f in &new_findings {
                             header.push_str(&format_finding(f));
                         }
-                    } else if !preexisting_findings.is_empty() {
+                    } else if has_preexisting {
                         header.push_str("\nPre-existing issues:\n");
                         for f in &preexisting_findings {
                             header.push_str(&format_finding(f));
+                        }
+                        for bug in &newly_discovered_preexisting {
+                            header.push_str(&format!(
+                                "- [{}] {}: https://sashiko.dev/bug/{}\n",
+                                bug.severity.as_str(),
+                                bug.problem.trim(),
+                                bug.slug
+                            ));
                         }
                     }
 
@@ -3350,7 +3481,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 
         Reviewer::queue_notifications(
             &ctx,
-            ps_id,
+ps_id, None,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3417,7 +3548,7 @@ inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchse
 
         Reviewer::queue_notifications(
             &ctx,
-            ps_id,
+ps_id, None,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",
@@ -3471,7 +3602,7 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
-            ps_id,
+ps_id, None,
             p_id_3,
             "msg_id_p3",
             "msg_id_1",
@@ -3500,6 +3631,82 @@ Pre-existing issues:
 
 inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=3";
         assert_eq!(body, expected_preexisting_only_body);
+
+        // Setup for Scenario 4: Linked newly discovered preexisting bug with slug
+        let rev_id = db
+            .create_review(ps_id, Some(p_id_3), "provider", "model", None, None)
+            .await?;
+        let bug_id = db
+            .create_preexisting_bug(&crate::db::NewPreexistingBug {
+                slug: "pb-deadbeef".to_string(),
+                problem: "Preexisting High UAF in cleanup".to_string(),
+                severity: Severity::High,
+                severity_explanation: Some("Reasoning".to_string()),
+                locations: None,
+                subsystem: Some("net".to_string()),
+                source_files: None,
+                inline_review: "Inline review comment".to_string(),
+                logs: None,
+                vector_json: None,
+                discovered_in_patchset_id: Some(ps_id),
+                discovered_in_patch_id: Some(p_id_3),
+                discovered_in_commit: None,
+                created_at: 1000,
+            })
+            .await?;
+        db.link_review_to_preexisting_bug(rev_id, bug_id, true).await?;
+
+        db.create_message(
+            "msg_id_p4",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Subject 4",
+            1000,
+            "Body 4",
+            "to@example.com",
+            "cc@example.com",
+            None,
+            None,
+        )
+        .await?;
+        let p_id_4 = db.create_patch(ps_id, "msg_id_p4", 4, "diff").await?;
+
+        Reviewer::queue_notifications(
+            &ctx,
+            Some(rev_id),
+            p_id_4,
+            "msg_id_p4",
+            "msg_id_1",
+            4,
+            "inline review content 4",
+            Some(&findings_new_only),
+            "summary",
+        )
+        .await?;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![p_id_4],
+            )
+            .await?;
+        let row = rows.next().await?.expect("Expected email in outbox");
+        let body: String = row.get(0)?;
+        let expected_scenario_4 = "\
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [High] New High issue
+- [Low] New Low issue
+
+Pre-existing issues:
+- [High] Preexisting High UAF in cleanup: https://sashiko.dev/bug/pb-deadbeef
+--
+
+inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=4";
+        assert_eq!(body, expected_scenario_4);
 
         Ok(())
     }
@@ -3576,7 +3783,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
-            ps_id,
+ps_id, None,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3621,7 +3828,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
-            ps_id,
+ps_id, None,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",

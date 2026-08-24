@@ -66,6 +66,7 @@ pub struct PatchsetRow {
 
 #[derive(Debug, Clone)]
 pub struct ReleaseReview {
+    pub id: i64,
     pub patch_id: i64,
     pub patch_message_id: String,
     pub index: i64,
@@ -4170,6 +4171,7 @@ impl Database {
             }
 
             reviews.push(ReleaseReview {
+                id: review_id,
                 patch_id,
                 patch_message_id,
                 index,
