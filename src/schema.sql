@@ -289,7 +289,7 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
     severity INTEGER NOT NULL, -- 1: Low, 2: Medium, 3: High, 4: Critical
     severity_explanation TEXT,
     locations TEXT,            -- JSON array of location objects
-    subsystem TEXT,            -- Subsystem name (e.g. net, mm, fs)
+    subsystems TEXT,           -- JSON array of subsystem names (from MAINTAINERS)
     source_files TEXT,         -- JSON array of affected file paths
     inline_review TEXT NOT NULL,
     logs TEXT,
@@ -307,7 +307,6 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
 
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_slug ON preexisting_bugs(slug);
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_severity ON preexisting_bugs(severity);
-CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_subsystem ON preexisting_bugs(subsystem);
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_is_fixed ON preexisting_bugs(is_fixed);
 
 CREATE TABLE IF NOT EXISTS review_preexisting_bugs (

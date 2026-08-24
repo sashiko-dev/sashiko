@@ -1009,6 +1009,15 @@ async fn analyze_preexisting_bug(
         None
     };
 
+    let mut payload = payload;
+    if payload.subsystems.is_empty()
+        && !payload.source_files.is_empty()
+        && let Ok(mindex) =
+            crate::maintainers::MaintainersIndex::from_repo(&state.settings.git.repository_path)
+    {
+        payload.subsystems = mindex.match_files(&payload.source_files);
+    }
+
     match crate::pipelines::preexisting::process_preexisting_issue(
         provider.as_ref(),
         tools,
@@ -1403,7 +1412,7 @@ mod tests {
                 severity: crate::db::Severity::Critical,
                 severity_explanation: Some("Trace".to_string()),
                 locations: None,
-                subsystem: Some("drivers/net".to_string()),
+                subsystems: vec!["drivers/net".to_string()],
                 source_files: Some(vec!["drivers/net/test.c".to_string()]),
                 inline_review: "Inline review".to_string(),
                 logs: Some("[{\"role\":\"user\",\"content\":\"test\"}]".to_string()),

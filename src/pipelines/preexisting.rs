@@ -42,7 +42,8 @@ pub struct PreexistingBugInput {
     pub problem: String,
     pub reasoning: String,
     pub locations: Option<Value>,
-    pub subsystem: Option<String>,
+    #[serde(default)]
+    pub subsystems: Vec<String>,
     pub source_files: Vec<String>,
     pub commit_sha: Option<String>,
     pub patchset_id: Option<i64>,
@@ -184,7 +185,7 @@ struct DedupJson {
 struct PreexistingDedupSession<'a> {
     candidate_problem: &'a str,
     candidate_locations: Option<&'a Value>,
-    candidate_subsystem: Option<&'a str>,
+    candidate_subsystems: &'a [String],
     known_candidates: &'a [PreexistingBug],
     context_tag: Option<String>,
 }
@@ -214,21 +215,32 @@ impl LlmSession for PreexistingDedupSession<'_> {
                 .as_ref()
                 .map(|f| f.join(", "))
                 .unwrap_or_default();
+            let subs_str = if bug.subsystems.is_empty() {
+                "unknown".to_string()
+            } else {
+                bug.subsystems.join(", ")
+            };
             known_list.push_str(&format!(
-                "- Bug ID {}: [Slug: {}] [Severity: {}] [Subsystem: {}]\n  Problem: {}\n  Affected Files: {}\n\n",
+                "- Bug ID {}: [Slug: {}] [Severity: {}] [Subsystems: {}]\n  Problem: {}\n  Affected Files: {}\n\n",
                 bug.id,
                 bug.slug,
                 bug.severity.as_str(),
-                bug.subsystem.as_deref().unwrap_or("unknown"),
+                subs_str,
                 bug.problem,
                 files_str
             ));
         }
 
+        let cand_subs = if self.candidate_subsystems.is_empty() {
+            "unknown".to_string()
+        } else {
+            self.candidate_subsystems.join(", ")
+        };
+
         format!(
             "Newly Verified Pre-existing Bug:\n\
             Problem: {}\n\
-            Subsystem: {}\n\
+            Subsystems: {}\n\
             Locations:\n{}\n\n\
             Candidate Known Pre-existing Bugs in Database:\n\
             {}\n\
@@ -242,10 +254,7 @@ impl LlmSession for PreexistingDedupSession<'_> {
               \"duplicate_of_id\": 12,\n\
               \"reasoning\": \"Both describe the same missing unlock in foo_cleanup()\"\n\
             }}",
-            self.candidate_problem,
-            self.candidate_subsystem.unwrap_or("unknown"),
-            loc_str,
-            known_list
+            self.candidate_problem, cand_subs, loc_str, known_list
         )
     }
 
@@ -386,8 +395,8 @@ pub async fn process_preexisting_issue(
     context_tag: Option<&str>,
 ) -> Result<PreexistingBugOutcome> {
     info!(
-        "Processing candidate pre-existing issue: '{}' in subsystem '{:?}'",
-        input.problem, input.subsystem
+        "Processing candidate pre-existing issue: '{}' in subsystems '{:?}'",
+        input.problem, input.subsystems
     );
 
     let mut full_history = Vec::new();
@@ -396,7 +405,7 @@ pub async fn process_preexisting_issue(
     // Step 1: Subsystem & File-Aware Fast Vector Space Candidate Retrieval (Top N = 20)
     let query_vector = extract_bug_vector(
         &input.problem,
-        input.subsystem.as_deref(),
+        &input.subsystems,
         &input.source_files,
         input.locations.as_ref(),
     );
@@ -422,7 +431,7 @@ pub async fn process_preexisting_issue(
         let mut dedup_session = PreexistingDedupSession {
             candidate_problem: &input.problem,
             candidate_locations: input.locations.as_ref(),
-            candidate_subsystem: input.subsystem.as_deref(),
+            candidate_subsystems: &input.subsystems,
             known_candidates: &candidate_bugs,
             context_tag: context_tag.map(|s| s.to_string()),
         };
@@ -528,7 +537,7 @@ pub async fn process_preexisting_issue(
         severity,
         severity_explanation,
         locations: final_locations,
-        subsystem: input.subsystem.clone(),
+        subsystems: input.subsystems.clone(),
         source_files: source_files_opt,
         inline_review,
         logs: logs_json,
@@ -597,7 +606,7 @@ mod tests {
             problem: "Memory leak in net/core/dev.c".to_string(),
             reasoning: "Allocated buffer not freed on error path".to_string(),
             locations: Some(json!([{"file": "net/core/dev.c", "line": 100}])),
-            subsystem: Some("net".to_string()),
+            subsystems: vec!["net".to_string()],
             source_files: vec!["net/core/dev.c".to_string()],
             commit_sha: None,
             patchset_id: None,
@@ -646,7 +655,7 @@ mod tests {
             severity: Severity::High,
             severity_explanation: None,
             locations: None,
-            subsystem: Some("net".to_string()),
+            subsystems: vec!["net".to_string()],
             source_files: None,
             inline_review: "".to_string(),
             logs: None,
@@ -663,7 +672,7 @@ mod tests {
         let mut session = PreexistingDedupSession {
             candidate_problem: "Memory leak in net/core/dev.c",
             candidate_locations: None,
-            candidate_subsystem: Some("net"),
+            candidate_subsystems: &["net".to_string()],
             known_candidates: &known_bugs,
             context_tag: None,
         };
@@ -782,7 +791,7 @@ mod tests {
             locations: Some(
                 json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]),
             ),
-            subsystem: Some("net:intel".to_string()),
+            subsystems: vec!["net:intel".to_string()],
             source_files: vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             commit_sha: Some("abcdef123456".to_string()),
             patchset_id: Some(ps_id),
@@ -826,7 +835,7 @@ mod tests {
         // Seed an existing bug into the database
         let existing_vector = extract_bug_vector(
             "Buffer overflow in e1000 rx handler",
-            Some("net:intel"),
+            &["net:intel".to_string()],
             &["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             None,
         );
@@ -838,7 +847,7 @@ mod tests {
                 severity: Severity::High,
                 severity_explanation: Some("Known buffer overflow".to_string()),
                 locations: None,
-                subsystem: Some("net:intel".to_string()),
+                subsystems: vec!["net:intel".to_string()],
                 source_files: Some(vec![
                     "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
                 ]),
@@ -872,7 +881,7 @@ mod tests {
             locations: Some(
                 json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]),
             ),
-            subsystem: Some("net:intel".to_string()),
+            subsystems: vec!["net:intel".to_string()],
             source_files: vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             commit_sha: Some("abcdef123456".to_string()),
             patchset_id: None,

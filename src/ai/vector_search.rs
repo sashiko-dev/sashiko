@@ -92,10 +92,10 @@ pub struct CandidateMatch {
 }
 
 /// Generates a normalized sparse feature vector for a bug given its problem description,
-/// locations, affected source files, and subsystem.
+/// locations, affected source files, and subsystems.
 pub fn extract_bug_vector(
     problem: &str,
-    subsystem: Option<&str>,
+    subsystems: &[String],
     source_files: &[String],
     locations: Option<&serde_json::Value>,
 ) -> BugVector {
@@ -107,11 +107,16 @@ pub fn extract_bug_vector(
         *raw_weights.entry(format!("tok:{}", token)).or_insert(0.0) += weight;
     }
 
-    // 2. Subsystem features (Weight: 4.0)
-    if let Some(sub) = subsystem {
+    // 2. Subsystems features (Weight: 4.0 for exact, 1.5 for tokenized components)
+    for sub in subsystems {
         let cleaned = sub.trim().to_lowercase();
         if !cleaned.is_empty() {
             *raw_weights.entry(format!("sub:{}", cleaned)).or_insert(0.0) += 4.0;
+            for part in tokenize_text(&cleaned) {
+                *raw_weights
+                    .entry(format!("sub_part:{}", part))
+                    .or_insert(0.0) += 1.5;
+            }
         }
     }
 
@@ -321,7 +326,7 @@ pub fn find_top_candidates(
             let files = bug.source_files.clone().unwrap_or_default();
             extract_bug_vector(
                 &bug.problem,
-                bug.subsystem.as_deref(),
+                &bug.subsystems,
                 &files,
                 bug.locations.as_ref(),
             )
@@ -360,7 +365,7 @@ mod tests {
     fn test_extract_vector_and_similarity() {
         let vec1 = extract_bug_vector(
             "Null pointer dereference in e1000_clean_rx_irq",
-            Some("net"),
+            &["net".to_string()],
             &["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             Some(&json!([{
                 "file": "drivers/net/ethernet/intel/e1000/e1000_main.c",
@@ -375,7 +380,7 @@ mod tests {
         // Highly related bug (same file and function, slightly different description)
         let vec2 = extract_bug_vector(
             "Possible NULL dereference when rx ring buffer is empty in e1000_clean_rx_irq",
-            Some("net"),
+            &["net".to_string()],
             &["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             Some(&json!([{
                 "file": "drivers/net/ethernet/intel/e1000/e1000_main.c",
@@ -393,7 +398,7 @@ mod tests {
         // Completely unrelated bug (different subsystem, file, problem)
         let vec3 = extract_bug_vector(
             "Deadlock in ext4_evict_inode during journaling commit",
-            Some("fs"),
+            &["fs".to_string()],
             &["fs/ext4/inode.c".to_string()],
             Some(&json!([{
                 "file": "fs/ext4/inode.c",
@@ -413,7 +418,7 @@ mod tests {
     fn test_vector_json_roundtrip() {
         let vec = extract_bug_vector(
             "Memory leak in foo_init",
-            Some("kernel"),
+            &["kernel".to_string()],
             &["kernel/foo.c".to_string()],
             None,
         );
@@ -434,7 +439,7 @@ mod tests {
             locations: Some(
                 json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }]),
             ),
-            subsystem: Some("net".to_string()),
+            subsystems: vec!["net".to_string()],
             source_files: Some(vec![
                 "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
             ]),
@@ -459,7 +464,7 @@ mod tests {
             locations: Some(
                 json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_probe" }]),
             ),
-            subsystem: Some("net".to_string()),
+            subsystems: vec!["net".to_string()],
             source_files: Some(vec![
                 "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
             ]),
@@ -482,7 +487,7 @@ mod tests {
             severity: Severity::Critical,
             severity_explanation: None,
             locations: Some(json!([{ "file": "fs/btrfs/super.c" }])),
-            subsystem: Some("fs".to_string()),
+            subsystems: vec!["fs".to_string()],
             source_files: Some(vec!["fs/btrfs/super.c".to_string()]),
             inline_review: "review 3".to_string(),
             logs: None,
@@ -498,7 +503,7 @@ mod tests {
 
         let query = extract_bug_vector(
             "e1000_clean_rx_irq causes null pointer exception",
-            Some("net"),
+            &["net".to_string()],
             &["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             Some(
                 &json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }]),

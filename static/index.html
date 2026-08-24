@@ -2466,7 +2466,7 @@
                                             <a href="${bugLink}" style="font-weight:bold; font-size:1.05em; color:var(--text);">${escapeHtml(b.problem)}</a>
                                             <div style="margin-top:4px;">
                                                 <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(b.severity || 'High')}</span>
-                                                ${b.subsystem ? `<span class="tag">${escapeHtml(b.subsystem)}</span>` : ''}
+                                                ${(b.subsystems && Array.isArray(b.subsystems) && b.subsystems.length > 0) ? b.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (b.subsystem ? `<span class="tag">${escapeHtml(b.subsystem)}</span>` : '')}
                                                 <span class="tag">${escapeHtml(b.slug)}</span>
                                                 ${b.is_fixed ? `<span class="tag" style="background:rgba(46,160,67,0.15); color:var(--status-reviewed); font-weight:bold;">Fixed in Trunk</span>` : `<span class="tag" style="background:rgba(218,54,51,0.15); color:var(--status-failed); font-weight:bold;">Active in Trunk</span>`}
                                                 ${b.introduced_in_commit ? `<span class="tag" title="${escapeHtml(b.introduced_in_commit)}">Intro: ${escapeHtml(b.introduced_in_commit.length > 20 ? b.introduced_in_commit.substring(0, 20) + '...' : b.introduced_in_commit)}</span>` : ''}
@@ -3021,7 +3021,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Severity:</div><div><strong style="color:${sevColor}">${escapeHtml(data.severity || 'High')}</strong></div></div>
                     <div class="kv"><div class="label">Mainline Status:</div><div>${mainlineStatusHtml}</div></div>
                     ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced in:</div><div><code>${escapeHtml(data.introduced_in_commit)}</code></div></div>` : ''}
-                    <div class="kv"><div class="label">Subsystem:</div><div>${data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-'}</div></div>
+                    <div class="kv"><div class="label">Subsystems:</div><div>${(data.subsystems && Array.isArray(data.subsystems) && data.subsystems.length > 0) ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-')}</div></div>
                     <div class="kv"><div class="label">Discovered:</div><div>${date}</div></div>
                     <div class="kv"><div class="label">Found in:</div><div>${discoveredInHtml}</div></div>
                 </div>

@@ -1376,12 +1376,21 @@ impl Reviewer {
                                                 }
                                             }
                                         }
+                                        let matched_subsystems = if let Ok(mindex) =
+                                            crate::maintainers::MaintainersIndex::from_repo(
+                                                &ctx.settings.git.repository_path,
+                                            ) {
+                                            mindex.match_files(&source_files)
+                                        } else {
+                                            Vec::new()
+                                        };
+
                                         let input =
                                             crate::pipelines::preexisting::PreexistingBugInput {
                                                 problem,
                                                 reasoning,
                                                 locations,
-                                                subsystem: None,
+                                                subsystems: matched_subsystems,
                                                 source_files,
                                                 commit_sha: commit_sha.clone(),
                                                 patchset_id: Some(patchset_id),
@@ -3673,7 +3682,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 severity: Severity::High,
                 severity_explanation: Some("Reasoning".to_string()),
                 locations: None,
-                subsystem: Some("net".to_string()),
+                subsystems: vec!["net".to_string()],
                 source_files: None,
                 inline_review: "Inline review comment".to_string(),
                 logs: None,

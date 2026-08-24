@@ -216,7 +216,7 @@ pub struct PreexistingBug {
     pub severity: Severity,
     pub severity_explanation: Option<String>,
     pub locations: Option<serde_json::Value>,
-    pub subsystem: Option<String>,
+    pub subsystems: Vec<String>,
     pub source_files: Option<Vec<String>>,
     pub inline_review: String,
     pub logs: Option<String>,
@@ -237,7 +237,7 @@ pub struct NewPreexistingBug {
     pub severity: Severity,
     pub severity_explanation: Option<String>,
     pub locations: Option<serde_json::Value>,
-    pub subsystem: Option<String>,
+    pub subsystems: Vec<String>,
     pub source_files: Option<Vec<String>>,
     pub inline_review: String,
     pub logs: Option<String>,
@@ -818,7 +818,7 @@ impl Database {
                     severity INTEGER NOT NULL,
                     severity_explanation TEXT,
                     locations TEXT,
-                    subsystem TEXT,
+                    subsystems TEXT,
                     source_files TEXT,
                     inline_review TEXT NOT NULL,
                     logs TEXT,
@@ -835,6 +835,9 @@ impl Database {
                 )",
                 (),
             )
+            .await;
+        let _ = self
+            .try_add_column("preexisting_bugs", "subsystems", "TEXT")
             .await;
         let _ = self
             .try_add_column("preexisting_bugs", "logs", "TEXT")
@@ -856,13 +859,6 @@ impl Database {
                 "idx_preexisting_bugs_severity",
                 "preexisting_bugs",
                 "severity",
-            )
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_preexisting_bugs_subsystem",
-                "preexisting_bugs",
-                "subsystem",
             )
             .await;
         let _ = self
@@ -1252,6 +1248,7 @@ impl Database {
             .source_files
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
+        let subsystems_val = serde_json::to_string(&bug.subsystems).ok();
         let compressed_inline = crate::compression::compress_string_if_needed(&bug.inline_review);
         let compressed_logs = bug
             .logs
@@ -1259,12 +1256,12 @@ impl Database {
             .map(|l| crate::compression::compress_string_if_needed(l))
             .unwrap_or(libsql::Value::Null);
 
-        let mut rows = self
+        let mut rows: libsql::Rows = self
             .conn
             .query(
                 "INSERT INTO preexisting_bugs (
                     slug, problem, severity, severity_explanation, locations,
-                    subsystem, source_files, inline_review, logs, vector_json,
+                    subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, is_fixed,
                     fixed_in_commit, created_at
@@ -1276,7 +1273,7 @@ impl Database {
                     bug.severity as i32,
                     bug.severity_explanation.clone(),
                     locations_val,
-                    bug.subsystem.clone(),
+                    subsystems_val,
                     source_files_val,
                     compressed_inline,
                     compressed_logs,
@@ -1305,7 +1302,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
-                        subsystem, source_files, inline_review, logs, vector_json,
+                        subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, is_fixed,
                         fixed_in_commit, created_at
@@ -1326,7 +1323,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
-                        subsystem, source_files, inline_review, logs, vector_json,
+                        subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, is_fixed,
                         fixed_in_commit, created_at
@@ -1363,8 +1360,8 @@ impl Database {
         }
 
         if let Some(sub) = subsystem {
-            conditions.push("subsystem = ?");
-            params.push(libsql::Value::Text(sub.to_string()));
+            conditions.push("subsystems LIKE ?");
+            params.push(libsql::Value::Text(format!("%{}%", sub)));
         }
 
         if let Some(q) = search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1393,7 +1390,7 @@ impl Database {
         // Query rows
         let select_sql = format!(
             "SELECT id, slug, problem, severity, severity_explanation, locations,
-                    subsystem, source_files, inline_review, logs, vector_json,
+                    subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, is_fixed,
                     fixed_in_commit, created_at
@@ -1440,7 +1437,7 @@ impl Database {
             .conn
             .query(
                 "SELECT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
-                        pb.subsystem, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
+                        pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
                         pb.fixed_in_commit, pb.created_at, rpb.is_newly_discovered
@@ -1470,7 +1467,7 @@ impl Database {
             .conn
             .query(
                 "SELECT DISTINCT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
-                        pb.subsystem, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
+                        pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
                         pb.fixed_in_commit, pb.created_at, rpb.is_newly_discovered
@@ -1498,7 +1495,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
-                        subsystem, source_files, inline_review, logs, vector_json,
+                        subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, is_fixed,
                         fixed_in_commit, created_at
@@ -1524,7 +1521,17 @@ impl Database {
         let locations_str: Option<String> = row.get(5).ok().flatten();
         let locations: Option<serde_json::Value> =
             locations_str.and_then(|s| serde_json::from_str(&s).ok());
-        let subsystem: Option<String> = row.get(6).ok().flatten();
+        let subsystems_str: Option<String> = row.get(6).ok().flatten();
+        let subsystems: Vec<String> = match subsystems_str {
+            Some(ref s) => serde_json::from_str(s).unwrap_or_else(|_| {
+                if !s.trim().is_empty() {
+                    vec![s.trim().to_string()]
+                } else {
+                    Vec::new()
+                }
+            }),
+            None => Vec::new(),
+        };
         let source_files_str: Option<String> = row.get(7).ok().flatten();
         let source_files: Option<Vec<String>> =
             source_files_str.and_then(|s| serde_json::from_str(&s).ok());
@@ -1550,7 +1557,7 @@ impl Database {
             severity: Severity::from_i32(severity_val),
             severity_explanation,
             locations,
-            subsystem,
+            subsystems,
             source_files,
             inline_review,
             logs,
@@ -3480,7 +3487,8 @@ impl Database {
                         "slug": bug.slug,
                         "problem": bug.problem,
                         "severity": bug.severity.as_str(),
-                        "subsystem": bug.subsystem,
+                        "subsystems": bug.subsystems,
+                        "subsystem": bug.subsystems.first().cloned(),
                         "inline_review": bug.inline_review,
                         "is_newly_discovered": is_new,
                         "created_at": bug.created_at,
@@ -3872,7 +3880,8 @@ impl Database {
                         "slug": bug.slug,
                         "problem": bug.problem,
                         "severity": bug.severity.as_str(),
-                        "subsystem": bug.subsystem,
+                        "subsystems": bug.subsystems,
+                        "subsystem": bug.subsystems.first().cloned(),
                         "inline_review": bug.inline_review,
                         "is_newly_discovered": is_new,
                         "created_at": bug.created_at,
@@ -9934,7 +9943,7 @@ mod tests {
                 "Buffer is allocated but not freed on error path".to_string(),
             ),
             locations: Some(json!([{"file": "drivers/net/e1000.c", "line": 42}])),
-            subsystem: Some("net".to_string()),
+            subsystems: vec!["net".to_string()],
             source_files: Some(vec!["drivers/net/e1000.c".to_string()]),
             inline_review: "> problematic_code();\nMemory is leaked here.".to_string(),
             logs: Some("[{\"role\":\"system\",\"content\":\"test system\"}]".to_string()),
@@ -9960,7 +9969,7 @@ mod tests {
         assert_eq!(fetched.slug, "pb-test-1234");
         assert_eq!(fetched.problem, "Memory leak in e1000_probe()");
         assert_eq!(fetched.severity, Severity::High);
-        assert_eq!(fetched.subsystem.as_deref(), Some("net"));
+        assert_eq!(fetched.subsystems, vec!["net".to_string()]);
         assert_eq!(
             fetched.introduced_in_commit.as_deref(),
             Some("11223344 (net: e1000: add probe)")
