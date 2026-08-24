@@ -281,3 +281,38 @@ CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(statu
 
 CREATE INDEX IF NOT EXISTS idx_reviews_patch_status ON reviews(patch_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS preexisting_bugs (
+    id INTEGER PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    problem TEXT NOT NULL,
+    severity INTEGER NOT NULL, -- 1: Low, 2: Medium, 3: High, 4: Critical
+    severity_explanation TEXT,
+    locations TEXT,            -- JSON array of location objects
+    subsystem TEXT,            -- Subsystem name (e.g. net, mm, fs)
+    source_files TEXT,         -- JSON array of affected file paths
+    inline_review TEXT NOT NULL,
+    vector_json TEXT,          -- Serialized vector representation for matching
+    discovered_in_patchset_id INTEGER,
+    discovered_in_patch_id INTEGER,
+    discovered_in_commit TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
+    FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_slug ON preexisting_bugs(slug);
+CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_severity ON preexisting_bugs(severity);
+CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_subsystem ON preexisting_bugs(subsystem);
+
+CREATE TABLE IF NOT EXISTS review_preexisting_bugs (
+    review_id INTEGER NOT NULL,
+    bug_id INTEGER NOT NULL,
+    is_newly_discovered INTEGER NOT NULL DEFAULT 1, -- 1 = newly discovered, 0 = matched existing
+    PRIMARY KEY(review_id, bug_id),
+    FOREIGN KEY(review_id) REFERENCES reviews(id),
+    FOREIGN KEY(bug_id) REFERENCES preexisting_bugs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_preexisting_bugs_review ON review_preexisting_bugs(review_id);
+CREATE INDEX IF NOT EXISTS idx_review_preexisting_bugs_bug ON review_preexisting_bugs(bug_id);

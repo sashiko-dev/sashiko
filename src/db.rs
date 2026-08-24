@@ -14,7 +14,7 @@
 
 use crate::ReviewStatus;
 use crate::settings::DatabaseSettings;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -155,7 +155,8 @@ pub struct ToolUsage {
     pub output_length: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub enum Severity {
     Low = 1,
     Medium = 2,
@@ -164,6 +165,24 @@ pub enum Severity {
 }
 
 impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Low => "Low",
+            Severity::Medium => "Medium",
+            Severity::High => "High",
+            Severity::Critical => "Critical",
+        }
+    }
+
+    pub fn from_i32(val: i32) -> Self {
+        match val {
+            4 => Severity::Critical,
+            3 => Severity::High,
+            2 => Severity::Medium,
+            _ => Severity::Low,
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let s = s.trim();
@@ -186,6 +205,41 @@ pub struct Finding {
     pub problem: String,
     pub preexisting: Option<bool>,
     pub locations: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreexistingBug {
+    pub id: i64,
+    pub slug: String,
+    pub problem: String,
+    pub severity: Severity,
+    pub severity_explanation: Option<String>,
+    pub locations: Option<serde_json::Value>,
+    pub subsystem: Option<String>,
+    pub source_files: Option<Vec<String>>,
+    pub inline_review: String,
+    pub vector_json: Option<String>,
+    pub discovered_in_patchset_id: Option<i64>,
+    pub discovered_in_patch_id: Option<i64>,
+    pub discovered_in_commit: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewPreexistingBug {
+    pub slug: String,
+    pub problem: String,
+    pub severity: Severity,
+    pub severity_explanation: Option<String>,
+    pub locations: Option<serde_json::Value>,
+    pub subsystem: Option<String>,
+    pub source_files: Option<Vec<String>>,
+    pub inline_review: String,
+    pub vector_json: Option<String>,
+    pub discovered_in_patchset_id: Option<i64>,
+    pub discovered_in_patch_id: Option<i64>,
+    pub discovered_in_commit: Option<String>,
+    pub created_at: i64,
 }
 
 pub struct EmailOutboxRow {
@@ -745,6 +799,77 @@ impl Database {
             )
             .await;
 
+        let _ = self
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS preexisting_bugs (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL UNIQUE,
+                    problem TEXT NOT NULL,
+                    severity INTEGER NOT NULL,
+                    severity_explanation TEXT,
+                    locations TEXT,
+                    subsystem TEXT,
+                    source_files TEXT,
+                    inline_review TEXT NOT NULL,
+                    vector_json TEXT,
+                    discovered_in_patchset_id INTEGER,
+                    discovered_in_patch_id INTEGER,
+                    discovered_in_commit TEXT,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
+                    FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
+                )",
+                (),
+            )
+            .await;
+        let _ = self
+            .try_create_index("idx_preexisting_bugs_slug", "preexisting_bugs", "slug")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_preexisting_bugs_severity",
+                "preexisting_bugs",
+                "severity",
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_preexisting_bugs_subsystem",
+                "preexisting_bugs",
+                "subsystem",
+            )
+            .await;
+
+        let _ = self
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS review_preexisting_bugs (
+                    review_id INTEGER NOT NULL,
+                    bug_id INTEGER NOT NULL,
+                    is_newly_discovered INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(review_id, bug_id),
+                    FOREIGN KEY(review_id) REFERENCES reviews(id),
+                    FOREIGN KEY(bug_id) REFERENCES preexisting_bugs(id)
+                )",
+                (),
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_review_preexisting_bugs_review",
+                "review_preexisting_bugs",
+                "review_id",
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_review_preexisting_bugs_bug",
+                "review_preexisting_bugs",
+                "bug_id",
+            )
+            .await;
+
         Ok(())
     }
 
@@ -1084,6 +1209,305 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn create_preexisting_bug(&self, bug: &NewPreexistingBug) -> Result<i64> {
+        let locations_val = bug
+            .locations
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
+        let source_files_val = bug
+            .source_files
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
+        let compressed_inline =
+            crate::compression::compress_string_if_needed(&bug.inline_review);
+
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO preexisting_bugs (
+                    slug, problem, severity, severity_explanation, locations,
+                    subsystem, source_files, inline_review, vector_json,
+                    discovered_in_patchset_id, discovered_in_patch_id,
+                    discovered_in_commit, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 RETURNING id",
+                libsql::params![
+                    bug.slug.as_str(),
+                    bug.problem.as_str(),
+                    bug.severity as i32,
+                    bug.severity_explanation.clone(),
+                    locations_val,
+                    bug.subsystem.clone(),
+                    source_files_val,
+                    compressed_inline,
+                    bug.vector_json.clone(),
+                    bug.discovered_in_patchset_id,
+                    bug.discovered_in_patch_id,
+                    bug.discovered_in_commit.clone(),
+                    bug.created_at,
+                ],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            Ok(id)
+        } else {
+            bail!("Failed to insert preexisting bug: no id returned");
+        }
+    }
+
+    pub async fn get_preexisting_bug(&self, id: i64) -> Result<Option<PreexistingBug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, slug, problem, severity, severity_explanation, locations,
+                        subsystem, source_files, inline_review, vector_json,
+                        discovered_in_patchset_id, discovered_in_patch_id,
+                        discovered_in_commit, created_at
+                 FROM preexisting_bugs WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(Some(Self::parse_preexisting_bug_row(&row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_preexisting_bug_by_slug(&self, slug: &str) -> Result<Option<PreexistingBug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, slug, problem, severity, severity_explanation, locations,
+                        subsystem, source_files, inline_review, vector_json,
+                        discovered_in_patchset_id, discovered_in_patch_id,
+                        discovered_in_commit, created_at
+                 FROM preexisting_bugs WHERE slug = ?",
+                libsql::params![slug],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(Some(Self::parse_preexisting_bug_row(&row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn list_preexisting_bugs(
+        &self,
+        page: Option<u32>,
+        limit: Option<u32>,
+        severity: Option<Severity>,
+        subsystem: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<(Vec<PreexistingBug>, usize)> {
+        let limit_val = limit.unwrap_or(50) as i64;
+        let page_val = page.unwrap_or(1) as i64;
+        let offset_val = limit_val * (page_val.saturating_sub(1));
+
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+
+        if let Some(sev) = severity {
+            conditions.push("severity = ?");
+            params.push(libsql::Value::Integer(sev as i64));
+        }
+
+        if let Some(sub) = subsystem {
+            conditions.push("subsystem = ?");
+            params.push(libsql::Value::Text(sub.to_string()));
+        }
+
+        if let Some(q) = search {
+            if !q.trim().is_empty() {
+                conditions.push("(problem LIKE ? OR slug LIKE ? OR locations LIKE ?)");
+                let pattern = format!("%{}%", q.trim());
+                params.push(libsql::Value::Text(pattern.clone()));
+                params.push(libsql::Value::Text(pattern.clone()));
+                params.push(libsql::Value::Text(pattern));
+            }
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        // Count total
+        let count_sql = format!("SELECT COUNT(*) FROM preexisting_bugs {}", where_clause);
+        let mut count_rows = self.conn.query(&count_sql, params.clone()).await?;
+        let total: usize = if let Ok(Some(row)) = count_rows.next().await {
+            row.get::<i64>(0).unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // Query rows
+        let select_sql = format!(
+            "SELECT id, slug, problem, severity, severity_explanation, locations,
+                    subsystem, source_files, inline_review, vector_json,
+                    discovered_in_patchset_id, discovered_in_patch_id,
+                    discovered_in_commit, created_at
+             FROM preexisting_bugs
+             {}
+             ORDER BY created_at DESC, id DESC
+             LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        params.push(libsql::Value::Integer(limit_val));
+        params.push(libsql::Value::Integer(offset_val));
+
+        let mut rows = self.conn.query(&select_sql, params).await?;
+        let mut bugs = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            bugs.push(Self::parse_preexisting_bug_row(&row)?);
+        }
+
+        Ok((bugs, total))
+    }
+
+    pub async fn link_review_to_preexisting_bug(
+        &self,
+        review_id: i64,
+        bug_id: i64,
+        is_newly_discovered: bool,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO review_preexisting_bugs (review_id, bug_id, is_newly_discovered)
+                 VALUES (?, ?, ?)",
+                libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_preexisting_bugs_for_review(
+        &self,
+        review_id: i64,
+    ) -> Result<Vec<(PreexistingBug, bool)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
+                        pb.subsystem, pb.source_files, pb.inline_review, pb.vector_json,
+                        pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
+                        pb.discovered_in_commit, pb.created_at, rpb.is_newly_discovered
+                 FROM preexisting_bugs pb
+                 JOIN review_preexisting_bugs rpb ON pb.id = rpb.bug_id
+                 WHERE rpb.review_id = ?
+                 ORDER BY pb.severity DESC, pb.id ASC",
+                libsql::params![review_id],
+            )
+            .await?;
+
+        let mut list = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let bug = Self::parse_preexisting_bug_row(&row)?;
+            let is_newly_discovered: i64 = row.get(14).unwrap_or(1);
+            list.push((bug, is_newly_discovered != 0));
+        }
+
+        Ok(list)
+    }
+
+    pub async fn list_preexisting_bugs_for_patchset(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Vec<(PreexistingBug, bool)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
+                        pb.subsystem, pb.source_files, pb.inline_review, pb.vector_json,
+                        pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
+                        pb.discovered_in_commit, pb.created_at, rpb.is_newly_discovered
+                 FROM preexisting_bugs pb
+                 JOIN review_preexisting_bugs rpb ON pb.id = rpb.bug_id
+                 JOIN reviews r ON rpb.review_id = r.id
+                 WHERE r.patchset_id = ?
+                 ORDER BY pb.severity DESC, pb.id ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        let mut list = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let bug = Self::parse_preexisting_bug_row(&row)?;
+            let is_newly_discovered: i64 = row.get(14).unwrap_or(1);
+            list.push((bug, is_newly_discovered != 0));
+        }
+
+        Ok(list)
+    }
+
+    pub async fn list_all_preexisting_bugs_for_vector_search(&self) -> Result<Vec<PreexistingBug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, slug, problem, severity, severity_explanation, locations,
+                        subsystem, source_files, inline_review, vector_json,
+                        discovered_in_patchset_id, discovered_in_patch_id,
+                        discovered_in_commit, created_at
+                 FROM preexisting_bugs",
+                (),
+            )
+            .await?;
+
+        let mut list = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            list.push(Self::parse_preexisting_bug_row(&row)?);
+        }
+
+        Ok(list)
+    }
+
+    fn parse_preexisting_bug_row(row: &libsql::Row) -> Result<PreexistingBug> {
+        let id: i64 = row.get(0)?;
+        let slug: String = row.get(1)?;
+        let problem: String = row.get(2)?;
+        let severity_val: i32 = row.get(3)?;
+        let severity_explanation: Option<String> = row.get(4).ok().flatten();
+        let locations_str: Option<String> = row.get(5).ok().flatten();
+        let locations: Option<serde_json::Value> =
+            locations_str.and_then(|s| serde_json::from_str(&s).ok());
+        let subsystem: Option<String> = row.get(6).ok().flatten();
+        let source_files_str: Option<String> = row.get(7).ok().flatten();
+        let source_files: Option<Vec<String>> =
+            source_files_str.and_then(|s| serde_json::from_str(&s).ok());
+        let inline_review: String = crate::compression::get_compressed_string_opt(row, 8)
+            .unwrap_or(None)
+            .unwrap_or_else(|| row.get::<String>(8).unwrap_or_default());
+        let vector_json: Option<String> = row.get(9).ok().flatten();
+        let discovered_in_patchset_id: Option<i64> = row.get(10).ok().flatten();
+        let discovered_in_patch_id: Option<i64> = row.get(11).ok().flatten();
+        let discovered_in_commit: Option<String> = row.get(12).ok().flatten();
+        let created_at: i64 = row.get(13)?;
+
+        Ok(PreexistingBug {
+            id,
+            slug,
+            problem,
+            severity: Severity::from_i32(severity_val),
+            severity_explanation,
+            locations,
+            subsystem,
+            source_files,
+            inline_review,
+            vector_json,
+            discovered_in_patchset_id,
+            discovered_in_patch_id,
+            discovered_in_commit,
+            created_at,
+        })
     }
 
     pub async fn get_timeline_stats(&self, subsystem_id: Option<i64>) -> Result<serde_json::Value> {
@@ -9393,5 +9817,89 @@ mod tests {
             .await
             .unwrap();
         assert!(ps.is_some(), "create_patchset must succeed after migration");
+    }
+
+    #[tokio::test]
+    async fn test_preexisting_bug_crud_and_links() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug = NewPreexistingBug {
+            slug: "pb-test-1234".to_string(),
+            problem: "Memory leak in e1000_probe()".to_string(),
+            severity: Severity::High,
+            severity_explanation: Some("Buffer is allocated but not freed on error path".to_string()),
+            locations: Some(json!([{"file": "drivers/net/e1000.c", "line": 42}])),
+            subsystem: Some("net".to_string()),
+            source_files: Some(vec!["drivers/net/e1000.c".to_string()]),
+            inline_review: "> problematic_code();\nMemory is leaked here.".to_string(),
+            vector_json: Some("[0.1, 0.2, 0.3]".to_string()),
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: Some("abc1234".to_string()),
+            created_at: 123456789,
+        };
+
+        let bug_id = db.create_preexisting_bug(&bug).await.unwrap();
+        assert!(bug_id > 0);
+
+        // Fetch by id
+        let fetched = db.get_preexisting_bug(bug_id).await.unwrap().expect("Bug should exist");
+        assert_eq!(fetched.slug, "pb-test-1234");
+        assert_eq!(fetched.problem, "Memory leak in e1000_probe()");
+        assert_eq!(fetched.severity, Severity::High);
+        assert_eq!(fetched.subsystem.as_deref(), Some("net"));
+        assert_eq!(fetched.inline_review, "> problematic_code();\nMemory is leaked here.");
+
+        // Fetch by slug
+        let fetched_slug = db.get_preexisting_bug_by_slug("pb-test-1234").await.unwrap().expect("Bug should exist");
+        assert_eq!(fetched_slug.id, bug_id);
+
+        // List bugs with search and filter
+        let (list, total) = db.list_preexisting_bugs(Some(1), Some(10), Some(Severity::High), Some("net"), Some("e1000")).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, bug_id);
+
+        // Link to review
+        let thread_id = db.create_thread("t1", "subj", 100).await.unwrap();
+        let ps_id = db.create_patchset(
+            thread_id,
+            None,
+            "m1",
+            "subj",
+            "auth",
+            100,
+            1,
+            0,
+            "",
+            "",
+            None,
+            1,
+            None,
+            false,
+            None,
+            None,
+        ).await.unwrap().unwrap();
+        let review_id = db.create_review(ps_id, None, "gemini", "model", None, None).await.unwrap();
+
+        db.link_review_to_preexisting_bug(review_id, bug_id, true).await.unwrap();
+
+        let review_bugs = db.list_preexisting_bugs_for_review(review_id).await.unwrap();
+        assert_eq!(review_bugs.len(), 1);
+        assert_eq!(review_bugs[0].0.id, bug_id);
+        assert!(review_bugs[0].1); // is_newly_discovered == true
+
+        let ps_bugs = db.list_preexisting_bugs_for_patchset(ps_id).await.unwrap();
+        assert_eq!(ps_bugs.len(), 1);
+        assert_eq!(ps_bugs[0].0.id, bug_id);
+
+        let all_bugs = db.list_all_preexisting_bugs_for_vector_search().await.unwrap();
+        assert_eq!(all_bugs.len(), 1);
+        assert_eq!(all_bugs[0].id, bug_id);
     }
 }
