@@ -64,8 +64,8 @@ pub struct KernelReviewState {
     /// Deduplicated dismissed concerns from Stage 8.
     pub deduplicated_dismissed_concerns: Vec<Value>,
 
-    /// Filtered concerns after Stage 9 conflict resolution.
-    pub conflict_resolved_concerns: Vec<Value>,
+    /// Filtered patch-introduced concerns after Stage 9 conflict resolution.
+    pub patch_concerns: Vec<Value>,
     /// Candidate pre-existing concerns extracted after Stage 9 for separate processing.
     pub preexisting_concerns: Vec<Value>,
 
@@ -804,7 +804,7 @@ Example Output:
                     new_concerns.push(concern);
                 }
             }
-            state.conflict_resolved_concerns = new_concerns;
+            state.patch_concerns = new_concerns;
             state.preexisting_concerns = preexisting;
         })
         .build()
@@ -823,7 +823,7 @@ pub fn stage_10_verification(
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{{{{follow_up_series_section}}}}
 
 Consolidated Concerns:
-{{{{conflict_resolved_concerns}}}}
+{{{{patch_concerns}}}}
 
 Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a string containing the vulnerability description), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 
@@ -858,8 +858,8 @@ Example Output:
                     .map(|ctx| format!("\n\n{}", ctx))
                     .unwrap_or_default()
             })
-            .with_var("conflict_resolved_concerns", |s: &KernelReviewState| {
-                serde_json::to_string_pretty(&s.conflict_resolved_concerns).unwrap_or_default()
+            .with_var("patch_concerns", |s: &KernelReviewState| {
+                serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::json())
@@ -965,7 +965,7 @@ pub fn build_kernel_review_workflow_with_options(
         )
         .stage(stage_9_conflict_resolution(max_turns, temperature))
         .early_exit_if(
-            |s| s.conflict_resolved_concerns.is_empty(),
+            |s| s.patch_concerns.is_empty(),
             "No concerns remaining after conflict resolution",
         )
         .stage(stage_10_verification(max_turns, temperature))

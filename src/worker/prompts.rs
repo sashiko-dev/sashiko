@@ -638,7 +638,7 @@ impl Worker {
             all_dismissed_concerns: Vec::new(),
             deduplicated_concerns: Vec::new(),
             deduplicated_dismissed_concerns: Vec::new(),
-            conflict_resolved_concerns: Vec::new(),
+            patch_concerns: Vec::new(),
             preexisting_concerns: Vec::new(),
             findings: Vec::new(),
             review_inline: String::new(),
