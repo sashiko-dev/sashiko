@@ -388,6 +388,43 @@ mod tests {
     }
 
     #[test]
+    fn test_git_grep_hyphen_pattern() {
+        let (linux_path, _prompts_path) = get_test_paths();
+        let toolbox = ToolBox::new(linux_path, None);
+        let rt = Runtime::new().unwrap();
+
+        // Search for a pattern starting with a hyphen (e.g. "-ETIMEDOUT" or "--")
+        let args = json!({
+            "revision": "HEAD",
+            "pattern": "-ETIMEDOUT",
+            "path": "src/"
+        });
+
+        let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
+        // Should succeed without error even if no matches found
+        assert!(
+            result.get("content").is_some()
+                || result.get("matches").is_some()
+                || result.get("message").is_some()
+        );
+    }
+
+    #[test]
+    fn test_git_grep_invalid_revision() {
+        let (linux_path, _prompts_path) = get_test_paths();
+        let toolbox = ToolBox::new(linux_path, None);
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({
+            "revision": "--invalid-option",
+            "pattern": "foo"
+        });
+
+        let result = rt.block_on(toolbox.call("git_grep", args));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_read_prompt() {
         let (linux_path, prompts_path) = get_test_paths();
         // Enable prompt tool by passing path

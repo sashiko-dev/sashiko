@@ -81,8 +81,8 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         let count_only = args["count_only"].as_bool().unwrap_or(false);
         let is_literal = args["is_literal"].as_bool().unwrap_or(false);
 
-        if revision.starts_with('-') || pattern.starts_with('-') {
-            return Err(anyhow!("Invalid revision or pattern"));
+        if revision.starts_with('-') {
+            return Err(anyhow!("Invalid revision: {}", revision));
         }
 
         let mut cmd = Command::new("git");
@@ -100,7 +100,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             cmd.arg("-P");
         }
 
-        cmd.arg(pattern).arg(revision);
+        cmd.arg("-e").arg(pattern).arg(revision);
 
         if let Some(p) = path_str
             && p != "."

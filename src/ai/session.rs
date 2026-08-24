@@ -376,3 +376,143 @@ impl<'a> SessionRunner<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::ProviderCapabilities;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct MockProvider {
+        responses: Mutex<VecDeque<AiResponse>>,
+    }
+
+    impl MockProvider {
+        fn new(responses: Vec<AiResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for MockProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let mut q = self.responses.lock().unwrap();
+            q.pop_front()
+                .ok_or_else(|| anyhow::anyhow!("No more mock responses"))
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    struct DummySession;
+
+    #[async_trait]
+    impl LlmSession for DummySession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        async fn call_tool(&mut self, name: &str, _args: Value) -> Result<Value> {
+            if name == "fail" {
+                anyhow::bail!("Tool execution failed");
+            }
+            Ok(serde_json::json!({"result": "success"}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            Ok(response.content.clone().unwrap_or_default())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_tools_captures_errors_as_json() {
+        let mut session = DummySession;
+        let calls = vec![
+            ToolCall {
+                id: "call_1".to_string(),
+                function_name: "ok_tool".to_string(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            },
+            ToolCall {
+                id: "call_2".to_string(),
+                function_name: "fail".to_string(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            },
+        ];
+
+        let results = session.call_tools(calls).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "call_1");
+        assert_eq!(results[0].1, serde_json::json!({"result": "success"}));
+        assert_eq!(results[1].0, "call_2");
+        assert_eq!(
+            results[1].1,
+            serde_json::json!({"error": "Tool execution failed"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_survives_tool_error() {
+        let responses = vec![
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_err".to_string(),
+                    function_name: "fail".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            AiResponse {
+                content: Some("Recovered after tool error".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider);
+        let mut session = DummySession;
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "Recovered after tool error");
+
+        // Verify history contains the error response for the tool
+        let tool_msg = res.history.iter().find(|m| m.role == AiRole::Tool).unwrap();
+        assert_eq!(tool_msg.tool_call_id, Some("call_err".to_string()));
+        assert!(
+            tool_msg
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("Tool execution failed")
+        );
+    }
+}
