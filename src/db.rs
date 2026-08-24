@@ -3428,6 +3428,23 @@ impl Database {
 
             let reviews = if is_embargoed { Vec::new() } else { reviews };
 
+            let preexisting_bugs = self.list_preexisting_bugs_for_patchset(pid).await.unwrap_or_default();
+            let preexisting_bugs_json = preexisting_bugs
+                .into_iter()
+                .map(|(bug, is_new)| {
+                    serde_json::json!({
+                        "id": bug.id,
+                        "slug": bug.slug,
+                        "problem": bug.problem,
+                        "severity": bug.severity.as_str(),
+                        "subsystem": bug.subsystem,
+                        "inline_review": bug.inline_review,
+                        "is_newly_discovered": is_new,
+                        "created_at": bug.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+
             Ok(Some(serde_json::json!({
                 "id": pid,
                 "message_id": mid,
@@ -3444,6 +3461,7 @@ impl Database {
                 "limit": limit_val,
                 "received_parts": received_parts,
                 "reviews": reviews,
+                "preexisting_bugs": preexisting_bugs_json,
                 "patches": patches,
                 "thread": messages,
                 "subsystems": subsystems,
@@ -3799,6 +3817,23 @@ impl Database {
             .await?;
 
         if let Ok(Some(r)) = rows.next().await {
+            let preexisting_bugs = self.list_preexisting_bugs_for_review(id).await.unwrap_or_default();
+            let preexisting_bugs_json = preexisting_bugs
+                .into_iter()
+                .map(|(bug, is_new)| {
+                    serde_json::json!({
+                        "id": bug.id,
+                        "slug": bug.slug,
+                        "problem": bug.problem,
+                        "severity": bug.severity.as_str(),
+                        "subsystem": bug.subsystem,
+                        "inline_review": bug.inline_review,
+                        "is_newly_discovered": is_new,
+                        "created_at": bug.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+
             Ok(Some(serde_json::json!({
                 "id": r.get::<i64>(0)?,
                 "model": r.get::<Option<String>>(1).ok(),
@@ -3821,6 +3856,7 @@ impl Database {
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                "preexisting_bugs": preexisting_bugs_json,
             })))
         } else {
             Ok(None)

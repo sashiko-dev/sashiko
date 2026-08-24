@@ -179,6 +179,21 @@ pub struct ReviewQuery {
 }
 
 #[derive(Deserialize)]
+pub struct PreexistingBugsQuery {
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+    pub severity: Option<String>,
+    pub subsystem: Option<String>,
+    pub search: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PreexistingBugQuery {
+    pub id: Option<i64>,
+    pub slug: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct RerunPatchQuery {
     pub patchset_id: i64,
     pub patch_id: i64,
@@ -306,6 +321,10 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
+        .route("/api/preexisting_bugs", get(list_preexisting_bugs))
+        .route("/api/preexisting_bug", get(get_preexisting_bug))
+        .route("/api/preexisting_bug/analyze", post(analyze_preexisting_bug))
+        .route("/bug/{slug}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
@@ -931,6 +950,111 @@ async fn get_review_log(
     }
 }
 
+async fn list_preexisting_bugs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PreexistingBugsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let severity = query
+        .severity
+        .as_deref()
+        .map(crate::db::Severity::from_str);
+    match state
+        .db
+        .list_preexisting_bugs(
+            query.page,
+            query.limit,
+            severity,
+            query.subsystem.as_deref(),
+            query.search.as_deref(),
+        )
+        .await
+    {
+        Ok((bugs, total)) => {
+            let page = query.page.unwrap_or(1);
+            let limit = query.limit.unwrap_or(20);
+            Ok(Json(serde_json::json!({
+                "bugs": bugs,
+                "total": total,
+                "page": page,
+                "limit": limit
+            })))
+        }
+        Err(e) => {
+            tracing::error!("Failed to list preexisting bugs: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_preexisting_bug(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PreexistingBugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let result = if let Some(id) = query.id {
+        state.db.get_preexisting_bug(id).await
+    } else if let Some(ref slug) = query.slug {
+        state.db.get_preexisting_bug_by_slug(slug).await
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    match result {
+        Ok(Some(bug)) => Ok(Json(
+            serde_json::to_value(bug).unwrap_or(serde_json::json!({})),
+        )),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Database error fetching preexisting bug: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn analyze_preexisting_bug(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<crate::pipelines::preexisting::PreexistingBugInput>,
+) -> Result<Json<crate::pipelines::preexisting::PreexistingBugOutcome>, (StatusCode, String)> {
+    if state.read_only {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode".to_string(),
+        ));
+    }
+
+    let provider = match crate::ai::create_provider_cached(&state.settings, false, 0).await {
+        Ok(p) => p,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create AI provider: {}", e),
+            ));
+        }
+    };
+
+    match crate::pipelines::preexisting::process_preexisting_issue(
+        provider.as_ref(),
+        None,
+        &state.db,
+        payload,
+        Some("api_preexisting_analyze"),
+    )
+    .await
+    {
+        Ok(outcome) => Ok(Json(outcome)),
+        Err(e) => {
+            tracing::error!("Pre-existing bug analysis failed: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Analysis failed: {}", e),
+            ))
+        }
+    }
+}
+
+async fn redirect_bug(Path(slug): Path<String>) -> impl IntoResponse {
+    Redirect::temporary(&format!("/#/bug/{}", slug))
+}
+
 async fn get_message(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
@@ -1283,5 +1407,83 @@ mod tests {
         let id = generate_synthetic_id("test");
         assert!(id.starts_with("sashiko-test-"));
         assert!(id.ends_with("@sashiko.local"));
+    }
+
+    #[tokio::test]
+    async fn test_preexisting_bug_endpoints() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let _bug_id = db
+            .create_preexisting_bug(&crate::db::NewPreexistingBug {
+                slug: "pb-12345678".to_string(),
+                problem: "UAF in test_device".to_string(),
+                severity: crate::db::Severity::Critical,
+                severity_explanation: Some("Trace".to_string()),
+                locations: None,
+                subsystem: Some("drivers/net".to_string()),
+                source_files: Some(vec!["drivers/net/test.c".to_string()]),
+                inline_review: "Inline review".to_string(),
+                logs: Some("[{\"role\":\"user\",\"content\":\"test\"}]".to_string()),
+                vector_json: None,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                created_at: 123456,
+            })
+            .await
+            .unwrap();
+
+        let settings = Arc::new(crate::settings::Settings::new().unwrap());
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+
+        let app = build_router(settings, db.clone(), event_tx, fetch_tx, true, false, true);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Test 1: list_preexisting_bugs
+        let res = reqwest::get(format!("http://{}/api/preexisting_bugs", addr)).await.unwrap();
+        assert_eq!(res.status(), 200);
+        let json: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["bugs"][0]["slug"], "pb-12345678");
+
+        // Test 2: get_preexisting_bug by slug
+        let res = reqwest::get(format!("http://{}/api/preexisting_bug?slug=pb-12345678", addr)).await.unwrap();
+        assert_eq!(res.status(), 200);
+        let json: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(json["slug"], "pb-12345678");
+        assert_eq!(json["problem"], "UAF in test_device");
+        assert!(json["logs"].is_string());
+
+        // Test 3: redirect_bug
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let res = client
+            .get(format!("http://{}/bug/pb-12345678", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 307);
+        assert_eq!(
+            res.headers().get("location").unwrap().to_str().unwrap(),
+            "/#/bug/pb-12345678"
+        );
     }
 }
