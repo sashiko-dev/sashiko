@@ -988,9 +988,30 @@ async fn analyze_preexisting_bug(
         }
     };
 
+    let repo_path = std::path::PathBuf::from(&state.settings.git.repository_path);
+    let tools = if repo_path.exists() {
+        let mainline_sha = match crate::git_ops::get_commit_hash(&repo_path, "origin/master").await
+        {
+            Ok(sha) => Some(sha),
+            Err(_) => match crate::git_ops::get_commit_hash(&repo_path, "master").await {
+                Ok(sha) => Some(sha),
+                Err(_) => crate::git_ops::get_commit_hash(&repo_path, "HEAD")
+                    .await
+                    .ok(),
+            },
+        };
+        let mut tb = crate::toolbox::ToolBox::new(repo_path, None);
+        if let Some(m_sha) = mainline_sha {
+            tb.set_virtual_head(m_sha);
+        }
+        Some(std::sync::Arc::new(tb))
+    } else {
+        None
+    };
+
     match crate::pipelines::preexisting::process_preexisting_issue(
         provider.as_ref(),
-        None,
+        tools,
         &state.db,
         payload,
         Some("api_preexisting_analyze"),
@@ -1390,6 +1411,9 @@ mod tests {
                 discovered_in_patchset_id: None,
                 discovered_in_patch_id: None,
                 discovered_in_commit: None,
+                introduced_in_commit: None,
+                is_fixed: false,
+                fixed_in_commit: None,
                 created_at: 123456,
             })
             .await

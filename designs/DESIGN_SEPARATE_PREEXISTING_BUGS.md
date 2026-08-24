@@ -102,15 +102,17 @@ Linux kernel bugs are highly localized to specific subsystems and files.
   - If `is_duplicate == true`: The issue is immediately recognized as an existing bug, recording the review association and returning the existing bug details without running expensive tool-based verification.
   - If `is_duplicate == false` (or 0 candidates found): Proceeds to verification.
 
-#### Step 3: Verification & Severity Calibration (For Novel Candidates)
+#### Step 3: Verification Against Linus's Mainline Top-of-Trunk & Severity Calibration
 - For new/unmatched candidate issues:
-  - Invokes verification against the codebase using tools (`git_read_files`, `git_grep`, etc.) to confirm if the defect is genuine.
+  - Invokes verification against the **top-of-trunk in Linus Torvalds' main Linux tree** using tools (`git_read_files`, `git_grep`, `git_blame`, `git_log`).
   - Filters out low/medium severity or non-reproducible concerns, accepting only **High** and **Critical** pre-existing issues.
+  - Determines the **introducing commit** (via `git_blame` and `git_log`) that introduced the vulnerability/defect into the codebase.
+  - Determines if the issue is **already fixed in top-of-trunk** (and by which fixing commit), or if it is currently active/unfixed.
 
 #### Step 4: Standalone Inline Review Generation
 - For confirmed High/Critical newly discovered bugs:
-  - A dedicated prompt generates a self-contained LKML-style report quoting the problematic codebase lines (`> ...`) from the baseline tree, explaining the failure mechanism, and suggesting a fix.
-  - The bug is saved in `preexisting_bugs` with a unique slug (e.g. `pb-a1b2c3d4`), locations JSON, standalone inline review, vector embedding, and discovery metadata.
+  - A dedicated prompt generates a self-contained LKML-style report quoting the problematic codebase lines (`> ...`) from the mainline tree, explaining the failure mechanism, citing the introducing commit, and suggesting a fix.
+  - The bug is saved in `preexisting_bugs` with a unique slug (e.g. `pb-a1b2c3d4`), locations JSON, standalone inline review, vector embedding, introducing commit, fixed status, and discovery metadata.
 
 ---
 
@@ -133,6 +135,9 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
     discovered_in_patchset_id INTEGER,
     discovered_in_patch_id INTEGER,
     discovered_in_commit TEXT,
+    introduced_in_commit TEXT, -- Commit SHA/details that introduced the bug
+    is_fixed INTEGER NOT NULL DEFAULT 0, -- 1 = fixed in mainline trunk, 0 = active/unfixed
+    fixed_in_commit TEXT,      -- Commit SHA/details that fixed the bug if fixed
     created_at INTEGER NOT NULL,
     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
@@ -141,6 +146,7 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_slug ON preexisting_bugs(slug);
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_severity ON preexisting_bugs(severity);
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_subsystem ON preexisting_bugs(subsystem);
+CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_is_fixed ON preexisting_bugs(is_fixed);
 
 CREATE TABLE IF NOT EXISTS review_preexisting_bugs (
     review_id INTEGER NOT NULL,
@@ -166,12 +172,16 @@ pub struct PreexistingBug {
     pub severity_explanation: Option<String>,
     pub locations: Option<serde_json::Value>,
     pub subsystem: Option<String>,
-    pub source_files: Option<serde_json::Value>,
+    pub source_files: Option<Vec<String>>,
     pub inline_review: String,
+    pub logs: Option<String>,
     pub vector_json: Option<String>,
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
     pub discovered_in_commit: Option<String>,
+    pub introduced_in_commit: Option<String>,
+    pub is_fixed: bool,
+    pub fixed_in_commit: Option<String>,
     pub created_at: i64,
 }
 ```

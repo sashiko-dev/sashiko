@@ -1388,12 +1388,42 @@ impl Reviewer {
                                                 patch_id: Some(patch_id),
                                                 baseline_sha: Some(baseline_ref.to_string()),
                                             };
+                                        let repo_path = std::path::PathBuf::from(
+                                            &ctx.settings.git.repository_path,
+                                        );
+                                        let mainline_remote =
+                                            ctx.baseline_registry.mainline_remote_name();
+                                        let mainline_ref = format!("{}/master", mainline_remote);
+                                        let mainline_sha = match get_commit_hash(
+                                            &repo_path,
+                                            &mainline_ref,
+                                        )
+                                        .await
+                                        {
+                                            Ok(sha) => Some(sha),
+                                            Err(_) => {
+                                                match get_commit_hash(&repo_path, "master").await {
+                                                    Ok(sha) => Some(sha),
+                                                    Err(_) => get_commit_hash(&repo_path, "HEAD")
+                                                        .await
+                                                        .ok(),
+                                                }
+                                            }
+                                        };
+
                                         let mut toolbox = None;
-                                        if let Some(wt) = worktree_path {
-                                            toolbox = Some(Arc::new(crate::toolbox::ToolBox::new(
-                                                wt.to_path_buf(),
-                                                None,
-                                            )));
+                                        let base_path = if repo_path.exists() {
+                                            Some(repo_path.clone())
+                                        } else {
+                                            worktree_path.map(|wt| wt.to_path_buf())
+                                        };
+                                        if let Some(target_dir) = base_path {
+                                            let mut tb =
+                                                crate::toolbox::ToolBox::new(target_dir, None);
+                                            if let Some(m_sha) = mainline_sha {
+                                                tb.set_virtual_head(m_sha);
+                                            }
+                                            toolbox = Some(Arc::new(tb));
                                         }
                                         match crate::pipelines::preexisting::process_preexisting_issue(
                                             ctx.provider.as_ref(),
@@ -3651,6 +3681,9 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 discovered_in_patchset_id: Some(ps_id),
                 discovered_in_patch_id: Some(p_id_3),
                 discovered_in_commit: None,
+                introduced_in_commit: None,
+                is_fixed: false,
+                fixed_in_commit: None,
                 created_at: 1000,
             })
             .await?;

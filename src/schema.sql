@@ -297,6 +297,9 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
     discovered_in_patchset_id INTEGER,
     discovered_in_patch_id INTEGER,
     discovered_in_commit TEXT,
+    introduced_in_commit TEXT,
+    is_fixed INTEGER NOT NULL DEFAULT 0,
+    fixed_in_commit TEXT,
     created_at INTEGER NOT NULL,
     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
@@ -305,6 +308,7 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_slug ON preexisting_bugs(slug);
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_severity ON preexisting_bugs(severity);
 CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_subsystem ON preexisting_bugs(subsystem);
+CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_is_fixed ON preexisting_bugs(is_fixed);
 
 CREATE TABLE IF NOT EXISTS review_preexisting_bugs (
     review_id INTEGER NOT NULL,

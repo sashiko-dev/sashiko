@@ -80,6 +80,10 @@ struct VerificationJson {
     severity_explanation: Option<String>,
     verified_locations: Option<Value>,
     discard_reason: Option<String>,
+    introduced_in_commit: Option<String>,
+    #[serde(default)]
+    is_fixed: bool,
+    fixed_in_commit: Option<String>,
 }
 
 struct PreexistingVerifySession<'a> {
@@ -96,9 +100,9 @@ impl LlmSession for PreexistingVerifySession<'_> {
         let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
         format!(
             "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
-            You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate pre-existing vulnerability reported in the Linux kernel codebase.\n\
-            Use available tools to inspect the code, verify call chains, and confirm whether this defect truly exists in the tree.\n\
-            CRITICAL SEVERITY FILTER: We ONLY report High and Critical pre-existing issues. If the issue is valid but only Low or Medium severity, or if it is speculative / unverifiable, mark valid=false with discard_reason explaining the low severity or speculativeness."
+            You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate pre-existing defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
+            Use available tools (git_read_files, git_grep, git_blame, git_log) to inspect the mainline codebase, verify call chains, confirm whether this defect exists, determine the commit that introduced it, and check if it has already been fixed in trunk.\n\
+            CRITICAL SEVERITY FILTER: We ONLY report High and Critical pre-existing issues. If the issue is invalid, speculative, or only Low/Medium severity, mark valid=false with discard_reason explaining why."
         )
     }
 
@@ -116,17 +120,22 @@ impl LlmSession for PreexistingVerifySession<'_> {
             Reasoning: {}\n\
             Locations:\n{}\n\n\
             Task:\n\
-            1. Verify the problem and check the actual codebase using tools.\n\
+            1. Verify the problem against the top-of-trunk of Linus's main tree using the available git tools.\n\
             2. Determine if the issue is a genuine, reproducible High or Critical severity defect in the codebase.\n\
-            3. If it is invalid, a false positive, or only Low/Medium severity, set \"valid\": false and provide \"discard_reason\".\n\
-            4. If it is a confirmed High or Critical severity bug, set \"valid\": true, assign \"severity\": \"High\" or \"Critical\", and detail your proof in \"severity_explanation\".\n\n\
+            3. Use `git_blame` and `git_log` to determine the exact commit that introduced the problem (`introduced_in_commit`, format: \"<sha> (<subject>)\" or \"<sha>\").\n\
+            4. Check if the problem is already fixed in the top-of-trunk tree. If it is already fixed, set \"is_fixed\": true and provide the fixing commit in \"fixed_in_commit\" (format: \"<sha> (<subject>)\"). If still unfixed in trunk, set \"is_fixed\": false and \"fixed_in_commit\": null.\n\
+            5. If the defect is invalid, a false positive, or only Low/Medium severity, set \"valid\": false and provide \"discard_reason\".\n\
+            6. If it is a confirmed High or Critical severity bug, set \"valid\": true, assign \"severity\": \"High\" or \"Critical\", and detail your proof in \"severity_explanation\".\n\n\
             Return ONLY a valid JSON object matching this schema:\n\
             {{\n\
               \"valid\": true,\n\
               \"severity\": \"High\",\n\
               \"severity_explanation\": \"1. ... 2. ...\",\n\
               \"verified_locations\": [ {{\"file\": \"...\", \"function_or_symbol\": \"...\", \"line\": 123}} ],\n\
-              \"discard_reason\": null\n\
+              \"discard_reason\": null,\n\
+              \"introduced_in_commit\": \"abc123456789 (subsystem: add foo handler)\",\n\
+              \"is_fixed\": false,\n\
+              \"fixed_in_commit\": null\n\
             }}",
             self.input.problem, self.input.reasoning, loc_str
         )
@@ -266,6 +275,9 @@ struct PreexistingReportSession<'a> {
     severity: &'a str,
     severity_explanation: &'a str,
     locations: Option<&'a Value>,
+    introduced_in_commit: Option<&'a str>,
+    is_fixed: bool,
+    fixed_in_commit: Option<&'a str>,
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
 }
@@ -292,17 +304,31 @@ impl LlmSession for PreexistingReportSession<'_> {
             .and_then(|v| serde_json::to_string_pretty(v).ok())
             .unwrap_or_else(|| "[]".to_string());
 
+        let intro_str = self
+            .introduced_in_commit
+            .map(|s| format!("Introduced in commit: {}\n", s))
+            .unwrap_or_default();
+        let status_str = if self.is_fixed {
+            format!(
+                "Mainline Status: Fixed in top-of-trunk by commit {}\n",
+                self.fixed_in_commit.unwrap_or("unknown")
+            )
+        } else {
+            "Mainline Status: Active / Unfixed in top-of-trunk\n".to_string()
+        };
+
         format!(
             "Pre-existing Vulnerability Details:\n\
             Problem: {}\n\
             Severity: {}\n\
             Severity Explanation: {}\n\
+            {}{}\
             Locations:\n{}\n\n\
             Task:\n\
             Generate a complete, standalone LKML-style review comment block for this issue.\n\
             Quote the problematic source lines with '> ' and provide interspersed explanations and remediation suggestions.\n\
             Return raw plain text, not JSON or markdown fences.",
-            self.problem, self.severity, self.severity_explanation, loc_str
+            self.problem, self.severity, self.severity_explanation, intro_str, status_str, loc_str
         )
     }
 
@@ -467,6 +493,9 @@ pub async fn process_preexisting_issue(
         .verified_locations
         .or_else(|| input.locations.clone());
     let severity_explanation = verification.severity_explanation;
+    let introduced_in_commit = verification.introduced_in_commit;
+    let is_fixed = verification.is_fixed;
+    let fixed_in_commit = verification.fixed_in_commit;
 
     // Step 4: Standalone Inline Review Generation
     let mut report_session = PreexistingReportSession {
@@ -474,6 +503,9 @@ pub async fn process_preexisting_issue(
         severity: severity.as_str(),
         severity_explanation: severity_explanation.as_deref().unwrap_or(""),
         locations: final_locations.as_ref(),
+        introduced_in_commit: introduced_in_commit.as_deref(),
+        is_fixed,
+        fixed_in_commit: fixed_in_commit.as_deref(),
         tools,
         context_tag: context_tag.map(|s| s.to_string()),
     };
@@ -510,6 +542,9 @@ pub async fn process_preexisting_issue(
         discovered_in_patchset_id: input.patchset_id,
         discovered_in_patch_id: input.patch_id,
         discovered_in_commit: input.commit_sha.clone(),
+        introduced_in_commit,
+        is_fixed,
+        fixed_in_commit,
         created_at: now,
     };
 
@@ -625,6 +660,9 @@ mod tests {
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
+            introduced_in_commit: None,
+            is_fixed: false,
+            fixed_in_commit: None,
             created_at: 100,
         }];
 
@@ -696,6 +734,9 @@ mod tests {
             severity: "High",
             severity_explanation: "Missing free",
             locations: None,
+            introduced_in_commit: Some("11223344 (net: initial dev.c)"),
+            is_fixed: false,
+            fixed_in_commit: None,
             tools: None,
             context_tag: None,
         };
@@ -730,7 +771,10 @@ mod tests {
             "severity": "Critical",
             "severity_explanation": "1. Buffer overflow occurs when size exceeds MTU.",
             "verified_locations": [{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}],
-            "discard_reason": null
+            "discard_reason": null,
+            "introduced_in_commit": "1234567890ab (net: e1000: initial driver)",
+            "is_fixed": false,
+            "fixed_in_commit": null
         }).to_string();
 
         let report_text = "This is a pre-existing issue in the codebase.\n\n> memcpy(skb->data, buf, size);\n\nPotential buffer overflow when size > MTU.\n".to_string();
@@ -762,6 +806,12 @@ mod tests {
                 assert_eq!(bug.severity, Severity::Critical);
                 assert!(bug.slug.starts_with("pb-"));
                 assert_eq!(bug.discovered_in_patchset_id, Some(ps_id));
+                assert_eq!(
+                    bug.introduced_in_commit.as_deref(),
+                    Some("1234567890ab (net: e1000: initial driver)")
+                );
+                assert!(!bug.is_fixed);
+                assert!(bug.fixed_in_commit.is_none());
                 assert!(bug.logs.is_some(), "Logs must be populated");
                 let logs_str = bug.logs.unwrap();
                 assert!(logs_str.contains("pre-existing"));
@@ -804,6 +854,9 @@ mod tests {
                 discovered_in_patchset_id: None,
                 discovered_in_patch_id: None,
                 discovered_in_commit: None,
+                introduced_in_commit: None,
+                is_fixed: false,
+                fixed_in_commit: None,
                 created_at: 1000,
             })
             .await

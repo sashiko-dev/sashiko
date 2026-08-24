@@ -224,6 +224,9 @@ pub struct PreexistingBug {
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
     pub discovered_in_commit: Option<String>,
+    pub introduced_in_commit: Option<String>,
+    pub is_fixed: bool,
+    pub fixed_in_commit: Option<String>,
     pub created_at: i64,
 }
 
@@ -242,6 +245,9 @@ pub struct NewPreexistingBug {
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
     pub discovered_in_commit: Option<String>,
+    pub introduced_in_commit: Option<String>,
+    pub is_fixed: bool,
+    pub fixed_in_commit: Option<String>,
     pub created_at: i64,
 }
 
@@ -820,6 +826,9 @@ impl Database {
                     discovered_in_patchset_id INTEGER,
                     discovered_in_patch_id INTEGER,
                     discovered_in_commit TEXT,
+                    introduced_in_commit TEXT,
+                    is_fixed INTEGER NOT NULL DEFAULT 0,
+                    fixed_in_commit TEXT,
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
                     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
@@ -829,6 +838,15 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("preexisting_bugs", "logs", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("preexisting_bugs", "introduced_in_commit", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("preexisting_bugs", "is_fixed", "INTEGER NOT NULL DEFAULT 0")
+            .await;
+        let _ = self
+            .try_add_column("preexisting_bugs", "fixed_in_commit", "TEXT")
             .await;
         let _ = self
             .try_create_index("idx_preexisting_bugs_slug", "preexisting_bugs", "slug")
@@ -845,6 +863,13 @@ impl Database {
                 "idx_preexisting_bugs_subsystem",
                 "preexisting_bugs",
                 "subsystem",
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_preexisting_bugs_is_fixed",
+                "preexisting_bugs",
+                "is_fixed",
             )
             .await;
 
@@ -1241,8 +1266,9 @@ impl Database {
                     slug, problem, severity, severity_explanation, locations,
                     subsystem, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    discovered_in_commit, introduced_in_commit, is_fixed,
+                    fixed_in_commit, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.slug.as_str(),
@@ -1258,6 +1284,9 @@ impl Database {
                     bug.discovered_in_patchset_id,
                     bug.discovered_in_patch_id,
                     bug.discovered_in_commit.clone(),
+                    bug.introduced_in_commit.clone(),
+                    if bug.is_fixed { 1 } else { 0 },
+                    bug.fixed_in_commit.clone(),
                     bug.created_at,
                 ],
             )
@@ -1278,7 +1307,8 @@ impl Database {
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
                         subsystem, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, created_at
+                        discovered_in_commit, introduced_in_commit, is_fixed,
+                        fixed_in_commit, created_at
                  FROM preexisting_bugs WHERE id = ?",
                 libsql::params![id],
             )
@@ -1298,7 +1328,8 @@ impl Database {
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
                         subsystem, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, created_at
+                        discovered_in_commit, introduced_in_commit, is_fixed,
+                        fixed_in_commit, created_at
                  FROM preexisting_bugs WHERE slug = ?",
                 libsql::params![slug],
             )
@@ -1364,7 +1395,8 @@ impl Database {
             "SELECT id, slug, problem, severity, severity_explanation, locations,
                     subsystem, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, created_at
+                    discovered_in_commit, introduced_in_commit, is_fixed,
+                    fixed_in_commit, created_at
              FROM preexisting_bugs
              {}
              ORDER BY created_at DESC, id DESC
@@ -1410,7 +1442,8 @@ impl Database {
                 "SELECT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystem, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
-                        pb.discovered_in_commit, pb.created_at, rpb.is_newly_discovered
+                        pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
+                        pb.fixed_in_commit, pb.created_at, rpb.is_newly_discovered
                  FROM preexisting_bugs pb
                  JOIN review_preexisting_bugs rpb ON pb.id = rpb.bug_id
                  WHERE rpb.review_id = ?
@@ -1422,7 +1455,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_preexisting_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(15).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(18).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1439,7 +1472,8 @@ impl Database {
                 "SELECT DISTINCT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystem, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
-                        pb.discovered_in_commit, pb.created_at, rpb.is_newly_discovered
+                        pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
+                        pb.fixed_in_commit, pb.created_at, rpb.is_newly_discovered
                  FROM preexisting_bugs pb
                  JOIN review_preexisting_bugs rpb ON pb.id = rpb.bug_id
                  JOIN reviews r ON rpb.review_id = r.id
@@ -1452,7 +1486,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_preexisting_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(15).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(18).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1466,7 +1500,8 @@ impl Database {
                 "SELECT id, slug, problem, severity, severity_explanation, locations,
                         subsystem, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, created_at
+                        discovered_in_commit, introduced_in_commit, is_fixed,
+                        fixed_in_commit, created_at
                  FROM preexisting_bugs",
                 (),
             )
@@ -1503,7 +1538,10 @@ impl Database {
         let discovered_in_patchset_id: Option<i64> = row.get(11).ok().flatten();
         let discovered_in_patch_id: Option<i64> = row.get(12).ok().flatten();
         let discovered_in_commit: Option<String> = row.get(13).ok().flatten();
-        let created_at: i64 = row.get(14)?;
+        let introduced_in_commit: Option<String> = row.get(14).ok().flatten();
+        let is_fixed: bool = row.get::<i64>(15).unwrap_or(0) != 0;
+        let fixed_in_commit: Option<String> = row.get(16).ok().flatten();
+        let created_at: i64 = row.get(17)?;
 
         Ok(PreexistingBug {
             id,
@@ -1520,6 +1558,9 @@ impl Database {
             discovered_in_patchset_id,
             discovered_in_patch_id,
             discovered_in_commit,
+            introduced_in_commit,
+            is_fixed,
+            fixed_in_commit,
             created_at,
         })
     }
@@ -9901,6 +9942,9 @@ mod tests {
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: Some("abc1234".to_string()),
+            introduced_in_commit: Some("11223344 (net: e1000: add probe)".to_string()),
+            is_fixed: true,
+            fixed_in_commit: Some("55667788 (net: e1000: fix leak in probe)".to_string()),
             created_at: 123456789,
         };
 
@@ -9918,6 +9962,15 @@ mod tests {
         assert_eq!(fetched.severity, Severity::High);
         assert_eq!(fetched.subsystem.as_deref(), Some("net"));
         assert_eq!(
+            fetched.introduced_in_commit.as_deref(),
+            Some("11223344 (net: e1000: add probe)")
+        );
+        assert!(fetched.is_fixed);
+        assert_eq!(
+            fetched.fixed_in_commit.as_deref(),
+            Some("55667788 (net: e1000: fix leak in probe)")
+        );
+        assert_eq!(
             fetched.inline_review,
             "> problematic_code();\nMemory is leaked here."
         );
@@ -9933,6 +9986,15 @@ mod tests {
             .unwrap()
             .expect("Bug should exist");
         assert_eq!(fetched_slug.id, bug_id);
+        assert_eq!(
+            fetched_slug.introduced_in_commit.as_deref(),
+            Some("11223344 (net: e1000: add probe)")
+        );
+        assert!(fetched_slug.is_fixed);
+        assert_eq!(
+            fetched_slug.fixed_in_commit.as_deref(),
+            Some("55667788 (net: e1000: fix leak in probe)")
+        );
         assert_eq!(
             fetched_slug.logs.as_deref(),
             Some("[{\"role\":\"system\",\"content\":\"test system\"}]")

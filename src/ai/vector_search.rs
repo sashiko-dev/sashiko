@@ -444,6 +444,9 @@ mod tests {
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
+            introduced_in_commit: None,
+            is_fixed: false,
+            fixed_in_commit: None,
             created_at: 100,
         };
 
@@ -466,6 +469,9 @@ mod tests {
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
+            introduced_in_commit: None,
+            is_fixed: false,
+            fixed_in_commit: None,
             created_at: 200,
         };
 
@@ -484,6 +490,9 @@ mod tests {
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
+            introduced_in_commit: None,
+            is_fixed: false,
+            fixed_in_commit: None,
             created_at: 300,
         };
 
