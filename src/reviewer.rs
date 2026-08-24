@@ -32,7 +32,10 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -62,13 +65,20 @@ struct BaselineAttempt {
     log: String,
 }
 
-fn generate_id() -> String {
+static INTERACTION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn generate_interaction_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let start = SystemTime::now();
-    let since_the_epoch = start
+    let epoch_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    format!("rev_{}", since_the_epoch.as_millis())
+        .unwrap_or_default()
+        .as_millis();
+    generate_interaction_id_at(epoch_millis)
+}
+
+fn generate_interaction_id_at(epoch_millis: u128) -> String {
+    let sequence = INTERACTION_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("rev_{}_{}", epoch_millis, sequence)
 }
 
 /// The `Reviewer` service orchestrates the review process for patchsets.
@@ -209,9 +219,23 @@ impl Reviewer {
 
         info!("Found {} pending patchsets for review", patchsets.len());
 
-        for patchset in patchsets {
+        for mut patchset in patchsets {
             let permit = self.semaphore.clone().acquire_owned().await?;
             let target_review_count = patchset.target_review_count.unwrap_or(1) as usize;
+
+            // Mark status as 'In Review' in the DB immediately to prevent double-fetching
+            if let Err(e) = self
+                .db
+                .update_patchset_status(patchset.id, ReviewStatus::InReview.as_str())
+                .await
+            {
+                error!(
+                    "Failed to update status to In Review for {}: {}",
+                    patchset.id, e
+                );
+                continue;
+            }
+            patchset.status = Some(ReviewStatus::InReview.as_str().to_string());
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
@@ -239,25 +263,20 @@ impl Reviewer {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let patchsets = self.db.get_expired_embargoed_patchsets(now, 10).await?;
+        let patchsets = self.db.get_releasable_embargoed_patchsets(now, 10).await?;
 
         if patchsets.is_empty() {
             return Ok(());
         }
 
         info!(
-            "Found {} expired embargoed patchsets to release",
+            "Found {} embargoed patchsets eligible for release",
             patchsets.len()
         );
 
         for patchset in patchsets {
             let patchset_id = patchset.id;
             info!("Releasing embargo for patchset {}", patchset_id);
-
-            let reviews = self
-                .db
-                .get_completed_reviews_for_release(patchset_id)
-                .await?;
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
@@ -270,45 +289,75 @@ impl Reviewer {
                 provider: self.provider.clone(),
             };
 
-            let mut all_success = true;
-            for review in reviews {
-                let ps_msg_id = patchset
-                    .message_id
-                    .as_deref()
-                    .unwrap_or(&review.patch_message_id);
-
-                if let Err(e) = Self::queue_notifications(
-                    &context,
-                    review.patch_id,
-                    &review.patch_message_id,
-                    ps_msg_id,
-                    review.index,
-                    &review.inline_review,
-                    Some(&review.findings),
-                    &review.summary,
-                )
-                .await
-                {
-                    error!(
-                        "Failed to queue notification for patch {}: {}",
-                        review.patch_id, e
-                    );
-                    all_success = false;
-                }
-            }
-
-            if all_success {
-                if let Err(e) = self.db.clear_patchset_embargo(patchset_id).await {
-                    error!(
-                        "Failed to clear embargo for patchset {}: {}",
-                        patchset_id, e
-                    );
-                } else {
-                    info!("Embargo released successfully for patchset {}", patchset_id);
-                }
+            if let Err(e) = Self::release_patchset_results(&context, &patchset).await {
+                error!("Failed to release patchset {}: {}", patchset_id, e);
             }
         }
 
+        Ok(())
+    }
+
+    async fn release_patchset_results(ctx: &ReviewContext, patchset: &PatchsetRow) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if !ctx
+            .db
+            .claim_patchset_embargo_release(patchset.id, now)
+            .await?
+        {
+            info!(
+                "Patchset {} is no longer eligible for embargo release or is already claimed",
+                patchset.id
+            );
+            return Ok(());
+        }
+
+        let result = Self::queue_patchset_notifications(ctx, patchset).await;
+        if result.is_err()
+            && let Err(e) = ctx
+                .db
+                .clear_patchset_embargo_release_claim(patchset.id)
+                .await
+        {
+            error!(
+                "Failed to clear embargo release claim for patchset {}: {}",
+                patchset.id, e
+            );
+        }
+        result
+    }
+
+    async fn queue_patchset_notifications(
+        ctx: &ReviewContext,
+        patchset: &PatchsetRow,
+    ) -> Result<()> {
+        let reviews = ctx
+            .db
+            .get_completed_reviews_for_release(patchset.id)
+            .await?;
+
+        for review in reviews {
+            let ps_msg_id = patchset
+                .message_id
+                .as_deref()
+                .unwrap_or(&review.patch_message_id);
+            Self::queue_notifications(
+                ctx,
+                review.patch_id,
+                &review.patch_message_id,
+                ps_msg_id,
+                review.index,
+                &review.inline_review,
+                Some(&review.findings),
+                &review.summary,
+            )
+            .await?;
+        }
+
+        ctx.db.clear_patchset_embargo(patchset.id).await?;
+        info!("Embargo released successfully for patchset {}", patchset.id);
         Ok(())
     }
 
@@ -403,7 +452,7 @@ impl Reviewer {
         let (found_baseline, patch_commits, logs) =
             Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
 
-        let prompts_hash = get_commit_hash(Path::new("."), "HEAD").await.ok();
+        let prompts_hash = Some(env!("GIT_HASH"));
 
         // Save findings to patchset
         if let Some((resolution, baseline_id, worktree)) = found_baseline {
@@ -413,7 +462,7 @@ impl Reviewer {
                     patchset_id,
                     Some(baseline_id),
                     Some(ctx.settings.ai.model.as_str()),
-                    prompts_hash.as_deref(),
+                    prompts_hash,
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )
@@ -582,7 +631,7 @@ impl Reviewer {
                     let queue = valid_jobs_queue.clone();
                     let ctx_clone = ctx.clone();
                     let input_payload_clone = input_payload.clone();
-                    let prompts_hash_clone = prompts_hash.clone().map(|s| s.to_string());
+                    let prompts_hash_clone = prompts_hash.map(|s| s.to_string());
                     let baseline_ref_clone = baseline_ref_str.to_string();
                     let baseline_id_clone = baseline_id;
                     let embargo_until_clone = patchset.embargo_until;
@@ -652,7 +701,7 @@ impl Reviewer {
                         Some(baseline_id),
                         &input_payload,
                         job.commit_sha,
-                        prompts_hash.as_deref(),
+                        prompts_hash,
                         Some(&worktree.path),
                         &job.diff,
                         patchset.embargo_until,
@@ -669,8 +718,12 @@ impl Reviewer {
             failed_patches += main_failed;
 
             for handle in handles {
-                if let Ok(failed) = handle.await {
-                    failed_patches += failed;
+                match handle.await {
+                    Ok(failed) => failed_patches += failed,
+                    Err(e) => {
+                        error!("Review worker tokio task crashed/panicked: {}", e);
+                        failed_patches += 1;
+                    }
                 }
             }
 
@@ -698,6 +751,16 @@ impl Reviewer {
                     .db
                     .update_patchset_status(patchset_id, &final_status)
                     .await;
+
+                if review_success
+                    && patchset.embargo_until.is_some()
+                    && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
+                {
+                    error!(
+                        "Failed to release clean patchset {} immediately: {}",
+                        patchset_id, e
+                    );
+                }
             }
         } else {
             // No baseline found
@@ -708,7 +771,7 @@ impl Reviewer {
                     patchset_id,
                     None,
                     Some(ctx.settings.ai.model.as_str()),
-                    prompts_hash.as_deref(),
+                    prompts_hash,
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )
@@ -1190,7 +1253,7 @@ impl Reviewer {
 
                     let interaction_id = if let Some(tokens_in) = json_output["tokens_in"].as_u64()
                     {
-                        let i_id = generate_id();
+                        let i_id = generate_interaction_id();
                         let input_ctx = json_output["input_context"].as_str().unwrap_or("");
                         let output_raw = if let Some(r) = json_output.get("review") {
                             r.to_string()
@@ -1264,8 +1327,7 @@ impl Reviewer {
                                         let preexisting = f["preexisting"].as_bool();
                                         let locations = f.get("locations").cloned();
 
-                                        let _ = ctx
-                                            .db
+                                        ctx.db
                                             .create_finding(Finding {
                                                 review_id,
                                                 severity,
@@ -1274,7 +1336,7 @@ impl Reviewer {
                                                 preexisting,
                                                 locations,
                                             })
-                                            .await;
+                                            .await?;
                                     }
                                 }
 
@@ -2065,26 +2127,6 @@ impl Reviewer {
         findings: Option<&Vec<Value>>,
         _summary: &str,
     ) -> Result<()> {
-        let already_processed = {
-            let mut rows = ctx
-                .db
-                .conn
-                .query(
-                    "SELECT 1 FROM email_outbox WHERE patch_id = ?",
-                    libsql::params![patch_id],
-                )
-                .await?;
-            matches!(rows.next().await, Ok(Some(_)))
-        };
-
-        if already_processed {
-            info!(
-                "Notification already processed for patch_id {}, skipping.",
-                patch_id
-            );
-            return Ok(());
-        }
-
         let sender_address = match &ctx.settings.smtp {
             Some(s) => s.sender_address.clone(),
             None => {
@@ -2113,10 +2155,7 @@ impl Reviewer {
         };
 
         let policy = EmailPolicyConfig::load(&ctx.settings.review.email_policy_path)
-            .unwrap_or_else(|_| EmailPolicyConfig {
-                defaults: Default::default(),
-                subsystems: Default::default(),
-            });
+            .map_err(|e| anyhow::anyhow!("Failed to parse email policy: {}", e))?;
 
         let to_list: Vec<String> = msg_details
             .to
@@ -2451,6 +2490,7 @@ mod tests {
     use crate::db::Database;
     use crate::settings::Settings;
     use async_trait::async_trait;
+    use std::collections::HashSet;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{
@@ -2458,6 +2498,16 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn interaction_ids_are_unique_with_the_same_timestamp() {
+        let ids: HashSet<_> = (0..1_000)
+            .map(|_| generate_interaction_id_at(1_234))
+            .collect();
+
+        assert_eq!(ids.len(), 1_000);
+        assert!(ids.iter().all(|id| id.starts_with("rev_1234_")));
+    }
 
     struct MockProvider;
     #[async_trait]

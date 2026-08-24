@@ -33,8 +33,11 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Configure Git to rewrite git:// to https:// to bypass firewalls in production
-RUN git config --global url."https://".insteadOf "git://"
+# Configure Git to rewrite git:// to https:// for hosts known to support Smart HTTP
+RUN git config --global url."https://git.kernel.org/".insteadOf "git://git.kernel.org/" && \
+    git config --global url."https://github.com/".insteadOf "git://github.com/" && \
+    git config --global url."https://gitlab.com/".insteadOf "git://gitlab.com/" && \
+    git config --global url."https://gitlab.freedesktop.org/".insteadOf "git://gitlab.freedesktop.org/"
 
 
 WORKDIR /app

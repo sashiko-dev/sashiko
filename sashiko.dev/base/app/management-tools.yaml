@@ -16,7 +16,7 @@ data:
     DB_PATH="/data/db/sashiko.db"
     BUCKET="${BACKUP_BUCKET:-gs://BACKUP_BUCKET}"
     TIMESTAMP=$(date '+%Y-%m-%d_%Hh-%Mm-%Ss-%Z')
-    TEMP_BACKUP="/tmp/sashiko_backup.db"
+    TEMP_BACKUP="/data/sashiko_backup.db"
 
     echo "--- Starting Backup at $(date) ---"
 
@@ -25,8 +25,11 @@ data:
         exit 1
     fi
 
+    echo "Cleaning remaining artifacts just in case..."
+    rm -f "$TEMP_BACKUP"
+
     echo "Creating consistent SQLite snapshot..."
-    sqlite3 "$DB_PATH" ".backup '$TEMP_BACKUP'"
+    sqlite3 "$DB_PATH" "VACUUM INTO '$TEMP_BACKUP'"
 
     echo "Uploading to Cloud Storage..."
     gsutil cp "$TEMP_BACKUP" "${BUCKET}/sashiko_${TIMESTAMP}.db"

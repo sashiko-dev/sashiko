@@ -586,11 +586,31 @@ pub async fn ensure_remote(
         std::fs::create_dir_all(&timestamp_dir)?;
     }
     let timestamp_file = timestamp_dir.join(name);
+    let fail_file = timestamp_dir.join(format!("{}.fail", name));
 
     let age = std::fs::metadata(&timestamp_file)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
+
+    let fail_age = std::fs::metadata(&fail_file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
+
+    let failed_recently = match fail_age {
+        Some(a) => a < std::time::Duration::from_secs(3600),
+        None => false,
+    };
+
+    if failed_recently && !force_fetch {
+        let reason = "failed recently, backing off";
+        info!("Skipping fetch for {} ({})", name, reason);
+        return Err(anyhow::anyhow!(
+            "Remote {} failed recently, backing off",
+            name
+        ));
+    }
 
     // Check if HEAD exists
     let head_ref = format!("refs/remotes/{}/HEAD", name);
@@ -633,10 +653,16 @@ pub async fn ensure_remote(
     if should_fetch {
         info!("Fetching remote {}", name);
 
+        let mut fetch_args = vec!["fetch", "--prune"];
+        if !url.contains("torvalds/linux.git") && !url.contains("stable/linux.git") {
+            fetch_args.push("--no-tags");
+        }
+        fetch_args.push(name);
+
         let fetch_future = Command::new("git")
             .current_dir(repo_path)
             .args(GIT_PROTOCOL_RESTRICTIONS)
-            .args(["fetch", "--prune", "--no-tags", name])
+            .args(fetch_args)
             .kill_on_drop(true)
             .output();
 
@@ -648,44 +674,7 @@ pub async fn ensure_remote(
         };
 
         match tokio::time::timeout(timeout_duration, fetch_future).await {
-            Ok(Ok(mut fetch)) => {
-                if !fetch.status.success() {
-                    let stderr = String::from_utf8_lossy(&fetch.stderr);
-
-                    // Auto-recover from bad tags
-                    if stderr.contains("fatal: bad object refs/tags/")
-                        && let Some(start) = stderr.find("refs/tags/")
-                    {
-                        let tag_path = &stderr[start..];
-                        let tag_path = tag_path.split_whitespace().next().unwrap_or("");
-                        if !tag_path.is_empty() {
-                            warn!(
-                                "Detected bad tag '{}'. Attempting to delete and retry fetch.",
-                                tag_path
-                            );
-                            let _ = Command::new("git")
-                                .current_dir(repo_path)
-                                .args(["update-ref", "-d", tag_path])
-                                .output()
-                                .await;
-
-                            // Retry the fetch once
-                            let retry_future = Command::new("git")
-                                .current_dir(repo_path)
-                                .args(GIT_PROTOCOL_RESTRICTIONS)
-                                .args(["fetch", "--prune", "--no-tags", name])
-                                .kill_on_drop(true)
-                                .output();
-
-                            if let Ok(Ok(retry_fetch)) =
-                                tokio::time::timeout(timeout_duration, retry_future).await
-                            {
-                                fetch = retry_fetch;
-                            }
-                        }
-                    }
-                }
-
+            Ok(Ok(fetch)) => {
                 if fetch.status.success() {
                     fetch_ok = true;
                 } else {
@@ -709,6 +698,11 @@ pub async fn ensure_remote(
         }
 
         if !fetch_ok {
+            // Record failure timestamp for backoff
+            if let Ok(file) = std::fs::File::create(&fail_file) {
+                let _ = file.set_len(0);
+            }
+
             let max_stale_age = std::time::Duration::from_secs(86400); // 24 hours
             let can_fallback = head_exists
                 && match age {
@@ -727,7 +721,8 @@ pub async fn ensure_remote(
                 return Err(anyhow::anyhow!(error_msg));
             }
         } else {
-            // Update timestamp only on success
+            // Clear any failure file and update success timestamp
+            let _ = std::fs::remove_file(&fail_file);
             if let Ok(file) = std::fs::File::create(&timestamp_file) {
                 let _ = file.set_len(0);
             }
@@ -748,11 +743,39 @@ pub async fn ensure_remote(
             .await?;
 
         if !set_head.status.success() {
-            warn!(
-                "Failed to set-head for remote {}: {}",
-                name,
-                String::from_utf8_lossy(&set_head.stderr)
-            );
+            // Try common default branch names if --auto could not determine HEAD
+            let mut head_resolved = false;
+            for branch in ["master", "main", "for-next", "for-linus"] {
+                let branch_ref = format!("refs/remotes/{}/{}", name, branch);
+                let branch_exists = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["show-ref", "--verify", "-q", &branch_ref])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if branch_exists {
+                    let set_explicit = Command::new("git")
+                        .current_dir(repo_path)
+                        .args(GIT_PROTOCOL_RESTRICTIONS)
+                        .args(["remote", "set-head", name, branch])
+                        .output()
+                        .await?;
+                    if set_explicit.status.success() {
+                        head_resolved = true;
+                        break;
+                    }
+                }
+            }
+
+            if !head_resolved {
+                tracing::debug!(
+                    "Could not set default HEAD for remote {}: {}",
+                    name,
+                    String::from_utf8_lossy(&set_head.stderr).trim()
+                );
+            }
         }
     }
 
@@ -1389,85 +1412,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_remote_bad_tag_recovery() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let local_repo_path = temp_dir.path().join("local");
-        let remote_repo_path = temp_dir.path().join("remote");
-
-        std::fs::create_dir(&local_repo_path)?;
-        std::fs::create_dir(&remote_repo_path)?;
-
-        // Init remote repo
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["init"])
-            .output()
-            .await?;
-
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["config", "user.email", "test@example.com"])
-            .output()
-            .await?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["config", "user.name", "Test"])
-            .output()
-            .await?;
-        let mut file = File::create(remote_repo_path.join("file.txt"))?;
-        writeln!(file, "test")?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["add", "file.txt"])
-            .output()
-            .await?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["commit", "-m", "init"])
-            .output()
-            .await?;
-
-        // Init local repo
-        Command::new("git")
-            .current_dir(&local_repo_path)
-            .args(["init"])
-            .output()
-            .await?;
-
-        // Use ensure_remote to add remote and fetch
-        ensure_remote(
-            &local_repo_path,
-            "origin",
-            remote_repo_path.to_str().unwrap(),
-            true,
-        )
-        .await?;
-
-        // Create bad tag in local repo
-        let tags_dir = local_repo_path.join(".git").join("refs").join("tags");
-        std::fs::create_dir_all(&tags_dir)?;
-        let bad_tag_path = tags_dir.join("bad-tag");
-        let mut bad_tag_file = File::create(&bad_tag_path)?;
-        writeln!(bad_tag_file, "0000000000000000000000000000000000000000")?;
-
-        // Fetch again, should auto-recover and delete the bad tag
-        ensure_remote(
-            &local_repo_path,
-            "origin",
-            remote_repo_path.to_str().unwrap(),
-            true,
-        )
-        .await?;
-
-        assert!(
-            !bad_tag_path.exists(),
-            "Bad tag should have been deleted by recovery logic"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_ensure_remote_protocol_security() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let repo_path = dir.path().to_path_buf();
@@ -1504,6 +1448,35 @@ mod tests {
             !proof_file.exists(),
             "Command should NOT have been executed!"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_failure_backoff() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+
+        // Init local repo
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+
+        let url = "https://127.0.0.1:9/invalid-repo.git";
+
+        // Initial fetch should attempt and fail
+        let res1 = ensure_remote(&repo_path, "invalid", url, false).await;
+        assert!(res1.is_err());
+
+        let fail_file = repo_path.join(".sashiko/fetch_timestamps/invalid.fail");
+        assert!(fail_file.exists(), "Failure timestamp file should exist");
+
+        // Subsequent non-forced fetch should skip and back off
+        let res2 = ensure_remote(&repo_path, "invalid", url, false).await;
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().to_string().contains("backing off"));
 
         Ok(())
     }

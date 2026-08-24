@@ -21,6 +21,34 @@ fn main() {
     println!("cargo:rerun-if-changed=third_party/prompts");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let git_dir = manifest_dir.join(".git");
+    if git_dir.exists() {
+        println!("cargo:rerun-if-changed=.git/HEAD");
+        if let Ok(head_content) = fs::read_to_string(git_dir.join("HEAD"))
+            && let Some(ref_path) = head_content.strip_prefix("ref: ")
+        {
+            let ref_path = ref_path.trim();
+            println!("cargo:rerun-if-changed=.git/{}", ref_path);
+        }
+    }
+
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string()));
+
+    println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+
     let prompts_dir = manifest_dir.join("third_party/prompts");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let generated = out_dir.join("prompts_generated.rs");

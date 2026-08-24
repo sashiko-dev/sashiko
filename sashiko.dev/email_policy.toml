@@ -46,6 +46,7 @@ subject_prefixes = ["bpf", "bpf-next"]
 lists = ["damon@lists.linux.dev"]
 reply_to_author = true
 cc = ["damon@lists.linux.dev"]
+send_positive_review = true
 
 [subsystems.devicetree]
 lists = ["devicetree@vger.kernel.org"]
@@ -57,10 +58,21 @@ lists = ["dri-devel@lists.freedesktop.org"]
 reply_to_author = true
 cc = ["dri-devel@lists.freedesktop.org"]
 
+[subsystems.intel-gfx]
+lists = ["intel-gfx@lists.freedesktop.org"]
+reply_to_author = true
+cc = ["intel-gfx@lists.freedesktop.org"]
+
+[subsystems.intel-xe]
+lists = ["intel-xe@lists.freedesktop.org"]
+reply_to_author = true
+cc = ["intel-xe@lists.freedesktop.org"]
+
 [subsystems.ext4]
 lists = ["linux-ext4@vger.kernel.org"]
 reply_to_author = true
-cc = ["tytso@mit.edu"]
+cc = ["tytso@mit.edu", "linux-ext4@vger.kernel.org" ]
+send_positive_review = true
 
 [subsystems.net]
 lists = ["netdev@vger.kernel.org"]
@@ -69,8 +81,10 @@ subject_prefixes = ["net", "net-next"]
 
 [subsystems.mptcp]
 lists = ["mptcp@lists.linux.dev"]
-mute_all = true
-subject_prefixes = ["mptcp", "mptcp-next"]
+reply_to_author = true
+cc = ["mptcp@lists.linux.dev"]
+embargo_hours = 0
+subject_prefixes = ["mptcp", "mptcp-net", "mptcp-next"]
 
 [subsystems.mptcp.patchwork]
 enabled = true
@@ -102,6 +116,7 @@ cc = ["antonio@mandelbit.com", "ralf@mandelbit.com", "sd@queasysnail.net"]
 [subsystems.live-patching]
 lists = ["live-patching@vger.kernel.org"]
 reply_all = true
+reply_to_author = true
 
 [subsystems.pci]
 lists = ["linux-pci@vger.kernel.org"]
@@ -180,6 +195,11 @@ cc = ["Danilo Krummrich <dakr@kernel.org>", "Alexandre Courbot <acourbot@nvidia.
 lists = ["linux-btrfs@vger.kernel.org"]
 cc = ["dsterba@suse.cz"]
 
+[subsystems.linux-clk]
+lists = ["linux-clk@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-clk@vger.kernel.org"]
+
 [subsystems.linux-cxl]
 lists = ["linux-cxl@vger.kernel.org"]
 reply_to_author = true
@@ -232,11 +252,20 @@ lists = ["linux-target@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-target@vger.kernel.org"]
 
+[subsystems.linux-trace]
+lists = ["linux-trace-kernel@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-trace-kernel@vger.kernel.org"]
+
 [subsystems.linux-s390]
 lists = ["linux-s390@vger.kernel.org"]
 reply_to_author = true
 send_positive_review = true
-cc = ["linux-s390@vger.kernel.org", "Heiko Carstens <hca@linux.ibm.com>", "Vasily Gorbik <gor@linux.ibm.com>", "Alexander Gordeev <agordeev@linux.ibm.com>"]
+cc = ["linux-s390@vger.kernel.org",
+      "Heiko Carstens <hca@linux.ibm.com>",
+      "Vasily Gorbik <gor@linux.ibm.com>",
+      "Alexander Gordeev <agordeev@linux.ibm.com>",
+      "Christian Borntraeger <borntraeger@linux.ibm.com>"]
 
 [subsystems.kvmarm]
 lists = ["kvmarm@lists.linux.dev"]
@@ -276,3 +305,26 @@ cc = ["Miquel Raynal <miquel.raynal@bootlin.com>",
       "Pratyush Yadav <pratyush@kernel.org>",
       "Michael Walle <mwalle@kernel.org>",
       "Takahiro Kuwano <takahiro.kuwano@infineon.com>"]
+
+[subsystems.audit]
+lists = ["audit@vger.kernel.org"]
+send_positive_review = true
+reply_all = false
+reply_to_author = false
+cc_individuals = false
+cc = ["audit@vger.kernel.org"]
+
+[subsystems.ocfs2]
+lists = ["ocfs2-devel@lists.linux.dev"]
+reply_to_author = true
+send_positive_review = true
+cc = ["Mark Fasheh <mark@fasheh.com>",
+      "Joel Becker <jlbec@evilplan.org>",
+      "Joseph Qi <joseph.qi@linux.alibaba.com>"]
+
+[subsystems.linux-serial]
+lists = ["linux-serial@vger.kernel.org"]
+reply_to_author = true
+send_positive_review = true
+cc = ["linux-serial@vger.kernel.org"]
+

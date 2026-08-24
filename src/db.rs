@@ -74,6 +74,45 @@ pub struct ReleaseReview {
     pub findings: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchsetReviewOutcome {
+    Clean,
+    HasFindings,
+    Incomplete,
+}
+
+const CLEAN_PATCHSET_PREDICATE: &str = "
+    EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Skipped'
+          AND r.result_description = 'Skipped AI review via --no-ai'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM patches pa
+        WHERE pa.patchset_id = p.id
+          AND COALESCE(pa.status, '') != 'Skipped'
+          AND NOT EXISTS (
+              SELECT 1 FROM reviews skipped
+              WHERE skipped.patch_id = pa.id
+                AND skipped.status = 'Skipped'
+                AND skipped.result_description = 'Skipped: touches only ignored files'
+          )
+          AND (
+              SELECT COUNT(*) FROM reviews completed
+              WHERE completed.patch_id = pa.id
+                AND completed.status = 'Reviewed'
+          ) < COALESCE(p.target_review_count, 1)
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        JOIN findings f ON f.review_id = r.id
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MessageRow {
     pub id: i64,
@@ -212,12 +251,12 @@ impl Database {
                 row.get::<Option<String>>(4).ok().flatten(),
                 row.get::<Option<String>>(5).ok().flatten(),
                 row.get::<Option<i64>>(6).ok().flatten(),
-                row.get::<Option<String>>(7).ok().flatten(),
+                crate::compression::get_compressed_string_opt(&row, 7).unwrap_or(None),
                 row.get::<Option<String>>(8).ok().flatten(),
                 row.get::<Option<String>>(9).ok().flatten(),
                 row.get::<Option<String>>(10).ok().flatten(),
                 row.get::<Option<String>>(11).ok().flatten(),
-                row.get::<Option<String>>(12).ok().flatten(),
+                crate::compression::get_compressed_string_opt(&row, 12).unwrap_or(None),
                 row.get::<Option<String>>(13).ok().flatten(),
             ))
         } else {
@@ -313,36 +352,71 @@ impl Database {
         }
     }
 
+    pub fn get_msgid_candidates(msg_id: &str) -> Vec<String> {
+        let trimmed = msg_id.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut candidates = vec![trimmed.to_string()];
+
+        let clean = trimmed.trim_matches(['<', '>']);
+        if clean != trimmed {
+            candidates.push(clean.to_string());
+        } else {
+            candidates.push(format!("<{}>", clean));
+        }
+
+        if let Some(stripped) = clean.strip_suffix("@sashiko.local") {
+            if !stripped.is_empty() {
+                candidates.push(stripped.to_string());
+                candidates.push(format!("<{}>", stripped));
+            }
+        } else {
+            candidates.push(format!("{}@sashiko.local", clean));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|c| seen.insert(c.clone()));
+        candidates
+    }
+
     pub async fn get_patchset_details_by_msgid(
         &self,
         msg_id: &str,
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
+        let candidates = Self::get_msgid_candidates(msg_id);
+
         // 1. Try to find a patchset where this is the cover letter
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_details(id, page, limit).await;
+            }
         }
 
         // 2. Fallback: Find a patchset that contains this message as a patch
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_details(id, page, limit).await;
+            }
         }
 
         Ok(None)
@@ -358,7 +432,8 @@ impl Database {
             .await?;
 
         if let Ok(Some(row)) = rows.next().await {
-            let body: Option<String> = row.get(0).ok();
+            let body: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 0).unwrap_or(None);
             if let Some(b) = body
                 && !b.is_empty()
             {
@@ -420,24 +495,51 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let schema = include_str!("schema.sql");
-        self.conn.execute_batch(schema).await?;
+        let current_version: u32 = {
+            let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
+            if let Some(row) = rows.next().await? {
+                row.get(0).unwrap_or(0)
+            } else {
+                0
+            }
+        };
 
+        if current_version == 0 {
+            let mut check_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+                    (),
+                )
+                .await?;
+            let has_messages = check_rows.next().await?.is_some();
+
+            if has_messages {
+                info!("Legacy database detected, applying legacy migrations (version 0 -> 1)...");
+                self.migrate_legacy_to_1().await?;
+            } else {
+                info!("Fresh database, applying full schema (version 1)...");
+                let schema = include_str!("schema.sql");
+                self.conn.execute_batch(schema).await?;
+            }
+
+            self.conn.execute("PRAGMA user_version = 1", ()).await?;
+            info!("Database is now at version 1.");
+        } else {
+            info!("Database version is {}", current_version);
+            self.migrate_legacy_to_1().await?;
+        }
+
+        self.migrate_patches_unique_constraint_if_needed().await?;
+
+        Ok(())
+    }
+
+    async fn migrate_legacy_to_1(&self) -> Result<()> {
         // Consolidate 'Applying' and 'In Review' states
-        let _ = self
-            .conn
-            .execute(
-                "UPDATE patchsets SET status = 'In Review' WHERE status = 'Applying'",
-                (),
-            )
-            .await;
-        let _ = self
-            .conn
-            .execute(
-                "UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'",
-                (),
-            )
-            .await;
+        // (Handled incrementally or previously migrated)
+        // let _ = self.conn.execute("UPDATE patchsets SET status = 'In Review' WHERE status = 'Applying'", ()).await;
+        // let _ = self.conn.execute("UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'", ()).await;
 
         // Manual migrations for existing tables
         let _ = self
@@ -465,9 +567,7 @@ impl Database {
         let _ = self.try_add_column("patches", "status", "TEXT").await;
         let _ = self.try_add_column("patches", "apply_error", "TEXT").await;
         let _ = self.try_add_column("reviews", "provider", "TEXT").await;
-        let _ = self
-            .try_add_column("reviews", "prompts_git_hash", "TEXT")
-            .await;
+        let _ = self.try_add_column("reviews", "prompts_hash", "TEXT").await;
         let _ = self
             .try_add_column("reviews", "result_description", "TEXT")
             .await;
@@ -475,10 +575,16 @@ impl Database {
         let _ = self.try_add_column("reviews", "logs", "TEXT").await;
         let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
         let _ = self
+            .try_create_index("idx_reviews_patch_status", "reviews", "patch_id, status")
+            .await;
+        let _ = self
             .try_add_column("reviews", "inline_review", "TEXT")
             .await;
         let _ = self
             .try_add_column("patchsets", "baseline_id", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "baseline_part_index", "INTEGER")
             .await;
         let _ = self
             .try_add_column("patchsets", "failed_reason", "TEXT")
@@ -502,6 +608,9 @@ impl Database {
         let _ = self.try_add_column("patchsets", "provider", "TEXT").await;
         let _ = self
             .try_add_column("patchsets", "embargo_until", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "embargo_release_started_at", "INTEGER")
             .await;
         let _ = self.try_add_column("patchsets", "slug", "TEXT").await;
         let _ = self
@@ -581,7 +690,8 @@ impl Database {
             )
             .await;
 
-        // Backfill messages_mailing_lists from messages.mailing_list
+        // Backfill messages_mailing_lists from messages.mailing_list (Already backfilled in production)
+        /*
         let _ = self
             .conn
             .execute(
@@ -593,6 +703,7 @@ impl Database {
                 (),
             )
             .await;
+        */
 
         // Findings table migration
         let _ = self
@@ -633,6 +744,69 @@ impl Database {
                 "strftime('%Y-%m-%d', created_at, 'unixepoch'), status",
             )
             .await;
+
+        Ok(())
+    }
+
+    async fn migrate_patches_unique_constraint_if_needed(&self) -> Result<()> {
+        // Migrate patches table if it has the legacy UNIQUE(message_id) constraint
+        let mut unique_indices = Vec::new();
+        if let Ok(mut rows) = self.conn.query("PRAGMA index_list(patches)", ()).await {
+            while let Ok(Some(row)) = rows.next().await {
+                let is_unique: i64 = row.get(2).unwrap_or(0);
+                let idx_name: String = row.get(1).unwrap_or_default();
+                if is_unique == 1 {
+                    unique_indices.push(idx_name);
+                }
+            }
+        }
+
+        let mut has_old_unique_msgid = false;
+        for idx_name in unique_indices {
+            let mut cols = Vec::new();
+            if let Ok(mut info_rows) = self
+                .conn
+                .query(&format!("PRAGMA index_info(\"{}\")", idx_name), ())
+                .await
+            {
+                while let Ok(Some(irow)) = info_rows.next().await {
+                    let col_name: String = irow.get(2).unwrap_or_default();
+                    cols.push(col_name);
+                }
+            }
+            if cols == vec!["message_id"] {
+                has_old_unique_msgid = true;
+                break;
+            }
+        }
+
+        if has_old_unique_msgid {
+            info!("Migrating patches table to composite UNIQUE(patchset_id, message_id)...");
+            let _ = self.conn.execute("PRAGMA foreign_keys = OFF", ()).await;
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS patches_new (
+                        id INTEGER PRIMARY KEY,
+                        patchset_id INTEGER NOT NULL,
+                        message_id TEXT NOT NULL,
+                        part_index INTEGER,
+                        diff TEXT,
+                        status TEXT,
+                        apply_error TEXT,
+                        FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+                        FOREIGN KEY(message_id) REFERENCES messages(message_id),
+                        UNIQUE(patchset_id, message_id)
+                    );
+                    INSERT OR IGNORE INTO patches_new (id, patchset_id, message_id, part_index, diff, status, apply_error)
+                    SELECT id, patchset_id, message_id, part_index, diff, status, apply_error FROM patches;
+                    DROP TABLE patches;
+                    ALTER TABLE patches_new RENAME TO patches;
+                    CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);",
+                )
+                .await?;
+            let _ = self.conn.execute("PRAGMA foreign_keys = ON", ()).await;
+        }
+
         Ok(())
     }
 
@@ -791,7 +965,11 @@ impl Database {
             self.conn
                 .execute(
                     "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                    libsql::params![status, l, review_id],
+                    libsql::params![
+                        status,
+                        crate::compression::compress_string_if_needed(l),
+                        review_id
+                    ],
                 )
                 .await?;
         } else {
@@ -819,7 +997,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
+                libsql::params![status, result, summary, interaction_id, inline_review.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), review_id],
             )
             .await?;
         Ok(())
@@ -835,8 +1013,8 @@ impl Database {
                 params.workflow_id,
                 params.provider,
                 params.model,
-                params.input,
-                params.output,
+                crate::compression::compress_string_if_needed(params.input),
+                crate::compression::compress_string_if_needed(params.output),
                 params.tokens_in,
                 params.tokens_out,
                 params.tokens_cached,
@@ -1592,7 +1770,7 @@ impl Database {
                 git_blob_hash=excluded.git_blob_hash,
                 mailing_list=excluded.mailing_list,
                 references_hdr=excluded.references_hdr",
-            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, body, to, cc, git_blob_hash, mailing_list, references_hdr],
+            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, crate::compression::compress_string_if_needed(body), to, cc, git_blob_hash, mailing_list, references_hdr],
         ).await?;
         Ok(())
     }
@@ -1644,6 +1822,38 @@ impl Database {
         }
     }
 
+    /// Record `baseline_id` as the series base of `patchset_id` unless a
+    /// lower-numbered part already supplied one. A part re-ingested with
+    /// a corrected baseline replaces its own earlier answer.
+    ///
+    /// Only the first patch's parent is the series base; a later patch's
+    /// parent is just the patch before it. An unset baseline takes any
+    /// part's, since the cover letter wins the lowest index but usually
+    /// carries no base-commit trailer.
+    ///
+    /// `part_index` is None when the part that supplied `baseline_id` is
+    /// unknown, as for a row written before the column existed. Unknown
+    /// ranks below every part: any part displaces it, and it displaces
+    /// only an unset or equally unknown baseline.
+    async fn record_series_baseline(
+        &self,
+        patchset_id: i64,
+        baseline_id: i64,
+        part_index: Option<u32>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET baseline_id = ?, baseline_part_index = ?
+                 WHERE id = ?
+                   AND (baseline_id IS NULL
+                        OR baseline_part_index IS NULL
+                        OR ? <= baseline_part_index)",
+                libsql::params![baseline_id, part_index, patchset_id, part_index],
+            )
+            .await?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_patchset(
         &self,
@@ -1669,20 +1879,36 @@ impl Database {
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
-            clid_candidates.push(clid.to_string());
+            clid_candidates.push((clid.to_string(), false));
         }
-        // Fallback for single-patch git imports where placeholder is sha@sashiko.local
-        // but the actual cover letter becomes the sha itself.
-        clid_candidates.push(format!("{}@sashiko.local", message_id));
+        // Fallback for single-patch git imports where placeholder is
+        // sha@sashiko.local but the actual cover letter becomes the sha
+        // itself.  Only add the fallback when no explicit cover letter
+        // was provided AND the patch is a singleton (total == 1).
+        // Multi-part ranges always have an explicit cover letter ID,
+        // and the fallback would incorrectly match patchsets from
+        // unrelated submissions that happen to share a commit SHA.
+        if cover_letter_message_id.is_none() || total_parts == 1 {
+            clid_candidates.push((format!("{}@sashiko.local", message_id), true));
+        }
 
-        for clid in clid_candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
+        for (clid, scope_to_thread) in clid_candidates {
+            // When using the @sashiko.local fallback, scope the query
+            // to the same thread to avoid cross-patchset contamination.
+            let query = if scope_to_thread {
+                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ? AND thread_id = ?"
+            } else {
+                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?"
+            };
+            let mut rows = if scope_to_thread {
+                self.conn
+                    .query(query, libsql::params![clid.clone(), thread_id])
+                    .await?
+            } else {
+                self.conn
+                    .query(query, libsql::params![clid.clone()])
+                    .await?
+            };
             while let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
                 let existing_subject: String = row.get(3)?;
@@ -1741,11 +1967,7 @@ impl Database {
                 }
 
                 if let Some(bid) = baseline_id {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET baseline_id = ? WHERE id = ?",
-                            libsql::params![bid, id],
-                        )
+                    self.record_series_baseline(id, bid, Some(part_index))
                         .await?;
                 }
 
@@ -1780,7 +2002,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id FROM patchsets 
+                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index FROM patchsets
                  WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)",
                 libsql::params![thread_id, author, window_start, window_end],
             )
@@ -1798,6 +2020,8 @@ impl Database {
             let existing_received: u32 = row.get(6).unwrap_or(0);
             let existing_cover_id: Option<String> = row.get(7).ok();
             let existing_thread_id: Option<i64> = row.get(8).ok();
+            let existing_baseline_id: Option<i64> = row.get(9).ok();
+            let existing_baseline_part: Option<u32> = row.get(10).ok();
 
             // Check if this message is already part of this patchset (Duplicate processing)
             // 1. Check if it is the cover letter.
@@ -1948,7 +2172,12 @@ impl Database {
                 && thread_compatible
                 && !index_collision
             {
-                matches.push((id, existing_subject_index));
+                matches.push((
+                    id,
+                    existing_subject_index,
+                    existing_baseline_id,
+                    existing_baseline_part,
+                ));
             }
         }
 
@@ -1961,7 +2190,9 @@ impl Database {
             let mut current_subject_index = matches[0].1;
 
             // If we have multiple matches, merge others into target_id
-            for (merge_from_id, merge_subject_index) in matches.iter().skip(1) {
+            for (merge_from_id, merge_subject_index, merge_baseline_id, merge_baseline_part) in
+                matches.iter().skip(1)
+            {
                 let merge_from_id = *merge_from_id;
                 info!("Merging patchset {} into {}", merge_from_id, target_id);
 
@@ -2001,6 +2232,14 @@ impl Database {
                     current_subject_index = *merge_subject_index;
                 }
 
+                // A baseline from a lower-numbered part than the target's
+                // is lost when the row is deleted below, with no part left
+                // to supply it again.
+                if let Some(bid) = *merge_baseline_id {
+                    self.record_series_baseline(target_id, bid, *merge_baseline_part)
+                        .await?;
+                }
+
                 // Delete the merged patchset
                 self.conn
                     .execute(
@@ -2024,11 +2263,7 @@ impl Database {
             }
 
             if let Some(bid) = baseline_id {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET baseline_id = ? WHERE id = ?",
-                        libsql::params![bid, target_id],
-                    )
+                self.record_series_baseline(target_id, bid, Some(part_index))
                     .await?;
             }
 
@@ -2087,9 +2322,9 @@ impl Database {
         // No match found, create new patchset
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, skip_filters, only_filters) 
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, skip_filters_json.clone(), only_filters_json.clone()],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
             )
             .await?;
 
@@ -2130,65 +2365,59 @@ impl Database {
             ));
         }
 
-        // Check if patch exists and get old patchset_id to fix counts if we steal it
-        let old_patchset_id: Option<i64> = {
+        // Check if patch with same message_id already exists in this patchset
+        let existing_in_patchset: bool = {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT patchset_id FROM patches WHERE message_id = ?",
-                    libsql::params![message_id],
+                    "SELECT 1 FROM patches WHERE patchset_id = ? AND message_id = ?",
+                    libsql::params![patchset_id, message_id],
                 )
                 .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                Some(row.get(0)?)
-            } else {
-                None
-            }
+            rows.next().await.ok().flatten().is_some()
         };
 
-        // Insert or Update (Move patch to new patchset if duplicate)
-        self.conn.execute(
-            "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
-             ON CONFLICT(message_id) DO UPDATE SET
-                patchset_id=excluded.patchset_id,
-                part_index=excluded.part_index,
-                diff=excluded.diff",
-            libsql::params![patchset_id, message_id, part_index, diff]
-        ).await?;
-
-        // Update received_parts for the NEW patchset
+        // Insert or update within THIS patchset.
         self.conn
             .execute(
-                "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
-                libsql::params![patchset_id, patchset_id],
+                "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(patchset_id, message_id) DO UPDATE SET
+                    part_index=excluded.part_index,
+                    diff=excluded.diff",
+                libsql::params![
+                    patchset_id,
+                    message_id,
+                    part_index,
+                    crate::compression::compress_string_if_needed(diff)
+                ],
             )
             .await?;
 
-        // Update received_parts for the OLD patchset (if we moved it)
-        if let Some(old_id) = old_patchset_id
-            && old_id != patchset_id
-        {
+        // Update received_parts to match the physical patch count in this patchset
+        if !existing_in_patchset {
             self.conn
-                        .execute(
-                            "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
-                            libsql::params![old_id, old_id],
-                        )
-                        .await?;
+                .execute(
+                    "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
+                    libsql::params![patchset_id, patchset_id],
+                )
+                .await?;
         }
 
         // Check if complete and update status
         // We transition from 'Incomplete' OR 'Fetching' to 'Pending' (ready for review)
-        self.conn.execute(
-            "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-            libsql::params![patchset_id],
-        ).await?;
+        self.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+                libsql::params![patchset_id],
+            )
+            .await?;
 
-        // Get the patch ID
+        // Get the patch ID for this patch in this patchset
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patches WHERE message_id = ?",
-                libsql::params![message_id],
+                "SELECT id FROM patches WHERE patchset_id = ? AND message_id = ?",
+                libsql::params![patchset_id, message_id],
             )
             .await?;
 
@@ -2290,7 +2519,9 @@ impl Database {
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE patchsets SET embargo_until = NULL WHERE id = ?",
+                "UPDATE patchsets
+                 SET embargo_until = NULL, embargo_release_started_at = NULL
+                 WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -2459,7 +2690,7 @@ impl Database {
                 author: row.get(4).ok(),
                 subject: row.get(5).ok(),
                 date: row.get(6).ok(),
-                body: row.get(7).ok(),
+                body: crate::compression::get_compressed_string_opt(&row, 7).unwrap_or(None),
                 to: row.get(8).ok(),
                 cc: row.get(9).ok(),
                 git_blob_hash: row.get(10).ok(),
@@ -2580,7 +2811,8 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 14).unwrap_or(None);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -2714,11 +2946,11 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(3).ok(),
+                    "output": crate::compression::get_compressed_string_opt(&r, 3).unwrap_or(None),
                     "result": r.get::<Option<String>>(4).ok(),
                     "status": r.get::<Option<String>>(5).ok(),
-                    "inline_review": r.get::<Option<String>>(6).ok(),
-                    "logs": r.get::<Option<String>>(7).ok(),
+                    "inline_review": crate::compression::get_compressed_string_opt(&r, 6).unwrap_or(None),
+                    "logs": crate::compression::get_compressed_string_opt(&r, 7).unwrap_or(None),
                     "tokens_in": r.get::<Option<u32>>(8).ok(),
                     "tokens_out": r.get::<Option<u32>>(9).ok(),
                     "patch_id": r.get::<Option<i64>>(10).ok(),
@@ -2825,7 +3057,8 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 14).unwrap_or(None);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -2955,10 +3188,10 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(2).ok(),
+                    "output": crate::compression::get_compressed_string_opt(&r, 2).unwrap_or(None),
                     "result": r.get::<Option<String>>(3).ok(),
                     "status": r.get::<Option<String>>(4).ok(),
-                    "inline_review": r.get::<Option<String>>(5).ok(),
+                    "inline_review": crate::compression::get_compressed_string_opt(&r, 5).unwrap_or(None),
                     "tokens_in": r.get::<Option<u32>>(6).ok(),
                     "tokens_out": r.get::<Option<u32>>(7).ok(),
                     "patch_id": r.get::<Option<i64>>(8).ok(),
@@ -3035,28 +3268,34 @@ impl Database {
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+        let candidates = Self::get_msgid_candidates(msg_id);
+
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_summary(id, page, limit).await;
+            }
         }
 
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let id: i64 = row.get(0)?;
+                return self.get_patchset_summary(id, page, limit).await;
+            }
         }
 
         Ok(None)
@@ -3110,7 +3349,7 @@ impl Database {
             .query(
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
-                        r.provider, r.prompts_git_hash, r.result_description,
+                        r.provider, r.prompts_hash, r.result_description,
                         r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
@@ -3126,8 +3365,8 @@ impl Database {
                 "model": r.get::<Option<String>>(1).ok(),
                 "summary": r.get::<Option<String>>(2).ok(),
                 "created_at": r.get::<Option<i64>>(3).ok(),
-                "input": r.get::<Option<String>>(4).ok(),
-                "output": r.get::<Option<String>>(5).ok(),
+                "input": crate::compression::get_compressed_string_opt(&r, 4).unwrap_or(None),
+                "output": crate::compression::get_compressed_string_opt(&r, 5).unwrap_or(None),
                 "baseline": {
                     "repo_url": r.get::<Option<String>>(6).ok(),
                     "branch": r.get::<Option<String>>(7).ok(),
@@ -3137,8 +3376,8 @@ impl Database {
                 "prompts_hash": r.get::<Option<String>>(10).ok(),
                 "result": r.get::<Option<String>>(11).ok(),
                 "status": r.get::<Option<String>>(12).ok(),
-                "inline_review": r.get::<Option<String>>(13).ok(),
-                "logs": r.get::<Option<String>>(14).ok(),
+                "inline_review": crate::compression::get_compressed_string_opt(&r, 13).unwrap_or(None),
+                "logs": crate::compression::get_compressed_string_opt(&r, 14).unwrap_or(None),
                 "tokens_in": r.get::<Option<u32>>(15).ok(),
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
@@ -3189,7 +3428,7 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             let index: i64 = row.get(1).unwrap_or(0);
-            let diff: String = row.get(2)?;
+            let diff: String = crate::compression::get_compressed_string(&row, 2)?;
             let subject: String = row.get(3).unwrap_or_default();
             let author: String = row.get(4).unwrap_or_default();
             let date: i64 = row.get(5).unwrap_or(0);
@@ -3242,23 +3481,26 @@ impl Database {
         Ok(patchsets)
     }
 
-    pub async fn get_expired_embargoed_patchsets(
+    pub async fn get_releasable_embargoed_patchsets(
         &self,
         now: i64,
         limit: usize,
     ) -> Result<Vec<PatchsetRow>> {
-        let mut rows = self.conn.query(
+        let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until
              FROM patchsets p
-             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL AND p.embargo_until <= ? 
-             AND NOT EXISTS (
-                 SELECT 1 FROM email_outbox eo 
-                 JOIN patches pa ON eo.patch_id = pa.id 
-                 WHERE pa.patchset_id = p.id
-             ) 
-             ORDER BY p.date ASC LIMIT ?",
-            libsql::params![now, limit as i64],
-        ).await?;
+             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+             AND (
+                 p.embargo_until <= ?
+                 OR ({CLEAN_PATCHSET_PREDICATE})
+             )
+             ORDER BY CASE WHEN p.embargo_until <= ? THEN 0 ELSE 1 END, p.date ASC LIMIT ?"
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, libsql::params![now - 600, now, now, limit as i64])
+            .await?;
 
         let mut patchsets = Vec::new();
         loop {
@@ -3305,6 +3547,117 @@ impl Database {
         Ok(patchsets)
     }
 
+    pub async fn get_patchset_review_outcome(
+        &self,
+        patchset_id: i64,
+    ) -> Result<PatchsetReviewOutcome> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status, COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        };
+        let status: String = row.get(0).unwrap_or_default();
+        let target_review_count: i64 = row.get(1).unwrap_or(1);
+        if status != ReviewStatus::Reviewed.as_str() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut no_ai_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews
+                 WHERE patchset_id = ? AND status = 'Skipped'
+                   AND result_description = 'Skipped AI review via --no-ai'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if no_ai_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut incomplete_rows = self
+            .conn
+            .query(
+                "SELECT 1
+                 FROM patches p
+                 WHERE p.patchset_id = ?
+                   AND COALESCE(p.status, '') != 'Skipped'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews skipped
+                       WHERE skipped.patch_id = p.id
+                         AND skipped.status = 'Skipped'
+                         AND skipped.result_description = 'Skipped: touches only ignored files'
+                   )
+                   AND (
+                       SELECT COUNT(*) FROM reviews r
+                       WHERE r.patch_id = p.id AND r.status = 'Reviewed'
+                   ) < ?
+                 LIMIT 1",
+                libsql::params![patchset_id, target_review_count],
+            )
+            .await?;
+        if incomplete_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut reviewed_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews WHERE patchset_id = ? AND status = 'Reviewed' LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if reviewed_rows.next().await?.is_none() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut finding_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM findings f
+                 JOIN reviews r ON r.id = f.review_id
+                 WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if finding_rows.next().await?.is_some() {
+            Ok(PatchsetReviewOutcome::HasFindings)
+        } else {
+            Ok(PatchsetReviewOutcome::Clean)
+        }
+    }
+
+    pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
+        let sql = format!(
+            "UPDATE patchsets AS p SET embargo_release_started_at = ?
+             WHERE p.id = ? AND p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+               AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+               AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
+        );
+        let updated = self
+            .conn
+            .execute(&sql, libsql::params![now, id, now - 600, now])
+            .await?;
+        Ok(updated == 1)
+    }
+
+    pub async fn clear_patchset_embargo_release_claim(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET embargo_release_started_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_completed_reviews_for_release(
         &self,
         patchset_id: i64,
@@ -3325,8 +3678,12 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let patch_id: i64 = row.get(1)?;
-            let inline_review: String = row.get(2).unwrap_or_default();
-            let summary: String = row.get(3).unwrap_or_default();
+            let inline_review: String = crate::compression::get_compressed_string_opt(&row, 2)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let summary: String = crate::compression::get_compressed_string_opt(&row, 3)
+                .unwrap_or(None)
+                .unwrap_or_default();
             let patch_message_id: String = row.get(4).unwrap_or_default();
             let index: i64 = row.get(5).unwrap_or_default();
             temp_reviews.push((
@@ -3504,10 +3861,38 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
+        let candidates = Self::get_msgid_candidates(msgid);
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if rows.next().await.ok().flatten().is_some() {
+                return Ok(true);
+            }
+
+            let mut p_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if p_rows.next().await.ok().flatten().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_fetching_patchset(
         &self,
-        article_id: &str,
+        root_msg_id: &str,
         subject: &str,
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
@@ -3520,13 +3905,7 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        let root_msg_id = if article_id.contains('@') {
-            article_id.to_string()
-        } else {
-            format!("{}@sashiko.local", article_id)
-        };
-
-        let clid_candidates = vec![article_id.to_string(), root_msg_id.clone()];
+        let clid_candidates = Self::get_msgid_candidates(root_msg_id);
 
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
@@ -3547,7 +3926,12 @@ impl Database {
 
                 // Only reset to Fetching if it failed or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
-                if status == "Failed" || status == "Fetching" {
+                if status == "Failed"
+                    || status == "Fetching"
+                    || status == "Cancelled"
+                    || status == "Failed To Apply"
+                    || status == "FailedToApply"
+                {
                     self.conn.execute(
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
                         libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
@@ -3558,7 +3942,7 @@ impl Database {
         }
 
         // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
-        let thread_id = self.ensure_thread_for_message(&root_msg_id, now).await?;
+        let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
 
         // 3. Create the fetching patchset
         let mut rows = self.conn
@@ -3575,18 +3959,20 @@ impl Database {
             Err(anyhow::anyhow!("Failed to get patchset ID"))
         }
     }
-    pub async fn update_patchset_error(&self, article_id: &str, error: &str) -> Result<()> {
-        let root_msg_id = if article_id.contains('@') {
-            article_id.to_string()
-        } else {
-            format!("{}@sashiko.local", article_id)
-        };
-        self.conn
-            .execute(
-                "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
-                libsql::params![error, root_msg_id],
-            )
-            .await?;
+    pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
+        let candidates = Self::get_msgid_candidates(root_msg_id);
+        for clid in candidates {
+            let res = self
+                .conn
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
+                    libsql::params![error, clid],
+                )
+                .await?;
+            if res > 0 {
+                return Ok(());
+            }
+        }
         Ok(())
     }
 
@@ -3602,7 +3988,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
-                libsql::params![baseline_id, model_name, prompts_hash, logs, provider, id],
+                libsql::params![baseline_id, model_name, prompts_hash, logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), provider, id],
             )
             .await?;
         Ok(())
@@ -3799,6 +4185,18 @@ impl Database {
         target_url: &str,
         context: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchwork_outbox
+                 WHERE patch_msg_id = ? AND api_url = ? AND context = ?",
+                libsql::params![patch_msg_id, api_url, context],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -3929,6 +4327,23 @@ impl Database {
         references_hdr: &str,
         body: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM email_outbox
+                 WHERE patch_id IS NULL AND to_addresses = ? AND subject = ? AND in_reply_to = ?",
+                libsql::params![
+                    serde_json::to_string(&[to_address])
+                        .map_err(|e| libsql::Error::Misuse(e.to_string()))?,
+                    subject,
+                    in_reply_to
+                ],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         let to_json = serde_json::to_string(&[to_address])
             .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
@@ -4506,6 +4921,205 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_clean_patchset_is_releasable_before_embargo_expiry() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_clean_embargo", "Clean Embargo", 70000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_clean_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Clean Embargo",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_clean_embargo",
+                "Clean Embargo",
+                "Author <author@example.com>",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_clean_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Review completed successfully.",
+            Some("clean"),
+            None,
+            Some("No issues found."),
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(releasable.iter().any(|patchset| patchset.id == ps_id));
+
+        assert!(db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(!db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(
+            db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.clear_patchset_embargo_release_claim(ps_id)
+            .await
+            .unwrap();
+
+        db.update_patchset_status(ps_id, "Pending").await.unwrap();
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "Pre-existing issue".to_string(),
+            preexisting: Some(true),
+            locations: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::HasFindings
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    #[tokio::test]
+    async fn test_no_ai_review_is_not_clean() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_no_ai_embargo", "No AI Embargo", 71000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_no_ai_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "No AI Embargo",
+            71000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_no_ai_embargo",
+                "No AI Embargo",
+                "Author <author@example.com>",
+                71000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_no_ai_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Skipped",
+            "Skipped AI review via --no-ai",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        let releasable = db.get_releasable_embargoed_patchsets(now, 1).await.unwrap();
+        assert!(releasable.iter().all(|patchset| patchset.id != ps_id));
     }
 
     #[tokio::test]
@@ -5386,6 +6000,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_review_details() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "msg1", thread_id, None, "Author", "Subject", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg1"),
+                "msg1",
+                "Subject",
+                "Author",
+                100,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db.create_patch(ps_id, "msg1", 1, "diff").await.unwrap();
+
+        let baseline_id = db
+            .create_baseline(
+                Some("https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"),
+                Some("master"),
+                Some("commit_hash"),
+            )
+            .await
+            .unwrap();
+
+        db.create_ai_interaction(AiInteractionParams {
+            id: "interaction_1",
+            parent_id: None,
+            workflow_id: None,
+            provider: "gemini",
+            model: "gemini-2.5",
+            input: "prompt input",
+            output: "prompt output",
+            tokens_in: 120,
+            tokens_out: 45,
+            tokens_cached: 10,
+        })
+        .await
+        .unwrap();
+
+        let review_id = db
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "gemini",
+                "gemini-2.5",
+                Some(baseline_id),
+                Some("hash123"),
+            )
+            .await
+            .unwrap();
+
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "LGTM",
+            Some("Summary of patch"),
+            Some("interaction_1"),
+            Some("Inline comment"),
+            Some("{\"step\": \"done\"}"),
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_review_details(review_id)
+            .await
+            .unwrap()
+            .expect("review details should exist");
+        assert_eq!(details["id"], review_id);
+        assert_eq!(details["model"], "gemini-2.5");
+        assert_eq!(details["provider"], "gemini");
+        assert_eq!(details["prompts_hash"], "hash123");
+        assert_eq!(details["summary"], "Summary of patch");
+        assert_eq!(details["result"], "LGTM");
+        assert_eq!(details["status"], "Reviewed");
+        assert_eq!(details["inline_review"], "Inline comment");
+        assert_eq!(details["logs"], "{\"step\": \"done\"}");
+        assert_eq!(details["tokens_in"], 120);
+        assert_eq!(details["tokens_out"], 45);
+        assert_eq!(details["tokens_cached"], 10);
+        assert_eq!(details["baseline"]["branch"], "master");
+        assert_eq!(details["baseline"]["commit"], "commit_hash");
+
+        // Non-existent review
+        let none_details = db.get_review_details(99999).await.unwrap();
+        assert!(none_details.is_none());
+    }
+
+    #[tokio::test]
     async fn test_rerun_patchset_logic() {
         let db = setup_db().await;
 
@@ -6230,5 +6951,2447 @@ mod tests {
             ps1, ps2,
             "Patchset from B4 Relay devnull alias and real author email MUST merge"
         );
+    }
+
+    /// Add one part of a series to the patchset identified by cover
+    /// letter "cover".
+    async fn add_part(db: &Database, thread_id: i64, part: u32, baseline: Option<i64>) -> i64 {
+        let msg = format!("msg_{}", part);
+        db.create_message(
+            &msg,
+            thread_id,
+            Some("cover"),
+            "author@example.com",
+            "Patch",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.create_patchset(
+            thread_id,
+            Some("cover"),
+            &msg,
+            &format!("[PATCH {}/3] Subject", part),
+            "author@example.com",
+            100,
+            3,
+            1,
+            "",
+            "",
+            None,
+            part,
+            baseline,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn patchset_baseline(db: &Database, id: i64) -> Option<i64> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT baseline_id FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).ok()
+    }
+
+    #[tokio::test]
+    async fn test_baseline_comes_from_lowest_part() {
+        // A later part must not overwrite the first patch's parent,
+        // whatever order the parts arrive in.
+        for order in [[1u32, 2, 3], [3, 2, 1], [2, 3, 1]] {
+            let db = setup_db().await;
+            let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+            db.create_message(
+                "cover",
+                thread_id,
+                None,
+                "author@example.com",
+                "Cover",
+                100,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let base = db
+                .create_baseline(None, None, Some("series_base"))
+                .await
+                .unwrap();
+            let after1 = db
+                .create_baseline(None, None, Some("patch1"))
+                .await
+                .unwrap();
+            let after2 = db
+                .create_baseline(None, None, Some("patch2"))
+                .await
+                .unwrap();
+
+            let mut ps_id = 0;
+            for part in order {
+                // Part N's parent is patch N-1; part 1's parent is the base.
+                let baseline = match part {
+                    1 => base,
+                    2 => after1,
+                    _ => after2,
+                };
+                ps_id = add_part(&db, thread_id, part, Some(baseline)).await;
+            }
+
+            assert_eq!(
+                patchset_baseline(&db, ps_id).await,
+                Some(base),
+                "arrival order {:?} must leave the first patch's parent as the baseline",
+                order
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_baseline_recorded_when_lowest_part_has_none() {
+        // A cover letter with no base-commit trailer wins the lowest part
+        // index while supplying no baseline.
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+
+        let ps_id = add_part(&db, thread_id, 0, None).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, None);
+
+        let ps_id = add_part(&db, thread_id, 1, Some(base)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(base));
+    }
+
+    #[tokio::test]
+    async fn test_baseline_from_lowest_part_behind_a_cover_letter() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+        let after1 = db
+            .create_baseline(None, None, Some("patch1"))
+            .await
+            .unwrap();
+
+        add_part(&db, thread_id, 0, None).await;
+        let ps_id = add_part(&db, thread_id, 2, Some(after1)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(after1));
+
+        let ps_id = add_part(&db, thread_id, 1, Some(base)).await;
+        assert_eq!(
+            patchset_baseline(&db, ps_id).await,
+            Some(base),
+            "patch 1 must replace the baseline a later part filled in"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_baseline_corrected_by_resubmitted_lowest_part() {
+        // Resubmitting a series is how a patchset that recorded the
+        // wrong baseline gets repaired.
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let wrong = db.create_baseline(None, None, Some("wrong")).await.unwrap();
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+
+        let ps_id = add_part(&db, thread_id, 1, Some(wrong)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(wrong));
+
+        let ps_id = add_part(&db, thread_id, 1, Some(base)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(base));
+    }
+
+    /// Add one part of a series as its own patchset, reached through the
+    /// author and time matching path rather than the cover letter lookup.
+    /// The parts share a git send-email message-id prefix, which is what
+    /// lets a later part match across threads and merge the two rows.
+    async fn add_unthreaded_part(
+        db: &Database,
+        thread_id: i64,
+        part: u32,
+        date: i64,
+        baseline: Option<i64>,
+    ) -> i64 {
+        let author = "Merge Author <merge@example.com>";
+        let msg = format!("20260731120000.4242-{}-merge@example.com", part);
+        let subject = format!("[PATCH {}/3] Subject", part);
+        db.create_message(
+            &msg, thread_id, None, author, &subject, date, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+
+        let id = db
+            .create_patchset(
+                thread_id, None, &msg, &subject, author, date, 3, 1, "", "", None, part, baseline,
+                true, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(id, &msg, part, "").await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn test_baseline_survives_patchset_merge() {
+        // Two patchsets form because the parts land in separate threads
+        // more than a day apart. A part between them matches both, and the
+        // merge keeps the row created first -- the one holding the higher
+        // part's baseline.
+        let db = setup_db().await;
+        let thread_hi = db
+            .create_thread("root_hi", "Subject", 100_000)
+            .await
+            .unwrap();
+        let thread_lo = db
+            .create_thread("root_lo", "Subject", 250_000)
+            .await
+            .unwrap();
+        let thread_mid = db
+            .create_thread("root_mid", "Subject", 175_000)
+            .await
+            .unwrap();
+
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+        let after1 = db
+            .create_baseline(None, None, Some("patch1"))
+            .await
+            .unwrap();
+        let after2 = db
+            .create_baseline(None, None, Some("patch2"))
+            .await
+            .unwrap();
+
+        let ps_hi = add_unthreaded_part(&db, thread_hi, 2, 100_000, Some(after1)).await;
+        let ps_lo = add_unthreaded_part(&db, thread_lo, 1, 250_000, Some(base)).await;
+        assert_ne!(ps_hi, ps_lo, "the two parts must form separate patchsets");
+
+        let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, Some(after2)).await;
+        assert_eq!(ps_id, ps_hi, "the merge keeps the patchset created first");
+        assert_eq!(
+            patchset_baseline(&db, ps_id).await,
+            Some(base),
+            "the merged-away patchset's baseline must survive the merge"
+        );
+    }
+
+    /// Verify that a commit SHA submitted as a singleton does NOT steal
+    /// a patch from a range patchset in a different thread.
+    ///
+    /// Regression test for the clid_candidates fallback that matched
+    /// across unrelated patchsets via the @sashiko.local suffix.
+    #[tokio::test]
+    async fn test_range_patch_not_stolen_by_singleton() {
+        let db = setup_db().await;
+        let author = "Akhil R <akhilrajeev@nvidia.com>";
+
+        // Thread 1: single commit submission (sha_D).
+        // For singletons, cover_letter_message_id = message_id.
+        let t1 = db
+            .create_thread("sha_D", "Single commit", 90000)
+            .await
+            .unwrap();
+        db.create_message(
+            "sha_D",
+            t1,
+            None,
+            author,
+            "i2c: tegra: Update timing",
+            90000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some("sha_D"),
+                "sha_D",
+                "i2c: tegra: Update timing",
+                author,
+                90000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, "sha_D", 1, "diff-single")
+            .await
+            .unwrap();
+
+        // Verify single patchset is full (1/1)
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1);
+        assert_eq!(det["total_parts"], 1);
+
+        // Thread 2: range submission (A..D) with 4 commits.
+        // The root message_id is the range itself.
+        let t2 = db
+            .create_thread("range_root", "Range submission", 90010)
+            .await
+            .unwrap();
+
+        // Create the root/cover message for the range
+        db.create_message(
+            "range_root",
+            t2,
+            None,
+            author,
+            "Range A..D",
+            90010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // First patch establishes the range patchset
+        db.create_message(
+            "sha_A",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 1/4] Patch sha_A",
+            90011,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_A",
+                "[PATCH 1/4] Patch sha_A",
+                author,
+                90011,
+                4,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "sha_A", 1, "diff-sha_A")
+            .await
+            .unwrap();
+
+        // Patches 2-3 merge into the range patchset
+        for (i, sha) in ["sha_B", "sha_C"].iter().enumerate() {
+            let idx = (i + 2) as u32;
+            db.create_message(
+                sha,
+                t2,
+                Some("range_root"),
+                author,
+                &format!("[PATCH {}/4] Patch {}", idx, sha),
+                90010 + idx as i64,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let ps = db
+                .create_patchset(
+                    t2,
+                    Some("range_root"),
+                    sha,
+                    &format!("[PATCH {}/4] Patch {}", idx, sha),
+                    author,
+                    90010 + idx as i64,
+                    4,
+                    0,
+                    "",
+                    "",
+                    None,
+                    idx,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(ps, ps_range, "Patch {}/4 should merge into range", idx);
+            db.create_patch(ps, sha, idx, &format!("diff-{}", sha))
+                .await
+                .unwrap();
+        }
+
+        // Now patch 4/4: its message_id "sha_D_range" differs from
+        // the singleton's "sha_D", but the @sashiko.local fallback
+        // used to construct "sha_D_range@sashiko.local" which is
+        // different enough. The real issue was when message_id was
+        // literally the same SHA. Simulate that: message_id = "sha_D"
+        // but in thread t2.
+        db.create_message(
+            "sha_D_in_range",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 4/4] i2c: tegra: Update timing",
+            90014,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_4 = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_D_in_range",
+                "[PATCH 4/4] i2c: tegra: Update timing",
+                author,
+                90014,
+                4,
+                0,
+                "",
+                "",
+                None,
+                4,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("Patch 4/4 should merge into range, not be dropped");
+
+        assert_eq!(
+            ps_4, ps_range,
+            "Patch 4/4 must merge into the range patchset, not the singleton"
+        );
+
+        db.create_patch(ps_4, "sha_D_in_range", 4, "diff-sha_D")
+            .await
+            .unwrap();
+
+        // Range patchset should have all 4 patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 4,
+            "Range patchset should have all 4 patches"
+        );
+
+        // Singleton should still be untouched (1/1)
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton patchset should still have exactly 1 patch"
+        );
+    }
+
+    /// Count the actual patch rows owned by a patchset.
+    async fn count_patches(db: &Database, patchset_id: i64) -> i64 {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await
+            .unwrap();
+        if let Ok(Some(row)) = rows.next().await {
+            row.get(0).unwrap()
+        } else {
+            0
+        }
+    }
+
+    /// Verify that create_patch does not steal a patch from one patchset
+    /// to give it to another when both share the same message_id (SHA).
+    ///
+    /// Reproduces the bug where submitting a single commit then a range
+    /// containing the same commit causes the singleton to drop to 0/1.
+    #[tokio::test]
+    async fn test_create_patch_no_cross_patchset_steal() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "abcdef1234567890abcdef1234567890abcdef12";
+
+        // Thread 1: singleton submission
+        let t1 = db
+            .create_thread("single_root", "Single", 80000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Fix something",
+            80000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Fix something",
+                author,
+                80000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-singleton")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1, "Singleton should have 1 patch");
+
+        // Thread 2: range submission that includes the same SHA
+        let t2 = db
+            .create_thread("range_root", "Range", 80010)
+            .await
+            .unwrap();
+        db.create_message(
+            "range_root",
+            t2,
+            None,
+            author,
+            "Range cover",
+            80010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "sha_other",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 1/2] Other fix",
+            80011,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_other",
+                "[PATCH 1/2] Other fix",
+                author,
+                80011,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "sha_other", 1, "diff-other")
+            .await
+            .unwrap();
+
+        // Patch 2/2 uses the SAME message_id as the singleton.
+        db.create_message(
+            shared_sha,
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 2/2] Fix something",
+            80012,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // This should NOT steal the patch from ps_single.
+        db.create_patch(ps_range, shared_sha, 2, "diff-range-copy")
+            .await
+            .unwrap();
+
+        // Singleton must keep its patch
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton must keep its patch (was stolen by range)"
+        );
+        // Verify the actual patch row still belongs to the singleton
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+
+        // Range should have both patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range should have both patches"
+        );
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own both patch rows"
+        );
+
+        // Resubmit the same range patch again (idempotent guard)
+        db.create_patch(ps_range, shared_sha, 2, "diff-range-copy")
+            .await
+            .unwrap();
+
+        // received_parts must not exceed total_parts
+        let range_det2 = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det2["received_parts"], 2,
+            "Resubmission must not over-count received_parts"
+        );
+    }
+
+    /// Same singleton submitted twice: create_patch should be idempotent
+    /// via ON CONFLICT within the same patchset.
+    #[tokio::test]
+    async fn test_create_patch_same_singleton_twice() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+
+        let t1 = db.create_thread("root_dup", "Dup", 70000).await.unwrap();
+        db.create_message(
+            "sha_dup",
+            t1,
+            None,
+            author,
+            "Fix duplicate",
+            70000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                t1,
+                Some("sha_dup"),
+                "sha_dup",
+                "Fix duplicate",
+                author,
+                70000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First insert
+        db.create_patch(ps, "sha_dup", 1, "diff-v1").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1);
+
+        // Second insert (same patchset, same message_id) -- idempotent
+        db.create_patch(ps, "sha_dup", 1, "diff-v2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 1,
+            "Duplicate insert in same patchset must stay at 1"
+        );
+    }
+
+    /// Same range submitted twice: each patch in the range should be
+    /// idempotent via ON CONFLICT within the same patchset.
+    #[tokio::test]
+    async fn test_create_patch_same_range_twice() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+
+        let t1 = db
+            .create_thread("range_dup_root", "Range dup", 71000)
+            .await
+            .unwrap();
+        db.create_message(
+            "range_dup_root",
+            t1,
+            None,
+            author,
+            "Range cover",
+            71000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for sha in ["sha_r1", "sha_r2"] {
+            db.create_message(
+                sha,
+                t1,
+                Some("range_dup_root"),
+                author,
+                &format!("[PATCH] {}", sha),
+                71001,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ps = db
+            .create_patchset(
+                t1,
+                Some("range_dup_root"),
+                "sha_r1",
+                "[PATCH 1/2] sha_r1",
+                author,
+                71001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First round
+        db.create_patch(ps, "sha_r1", 1, "diff-r1").await.unwrap();
+        db.create_patch(ps, "sha_r2", 2, "diff-r2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 2);
+
+        // Second round (duplicate range submission)
+        db.create_patch(ps, "sha_r1", 1, "diff-r1").await.unwrap();
+        db.create_patch(ps, "sha_r2", 2, "diff-r2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 2,
+            "Duplicate range in same patchset must stay at 2"
+        );
+    }
+
+    /// Range submitted first, then singleton with shared SHA: neither
+    /// should lose its patch.
+    #[tokio::test]
+    async fn test_create_patch_range_then_singleton() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "shared_range_then_single";
+
+        // Thread 1: range first
+        let t1 = db
+            .create_thread("rts_range_root", "Range first", 72000)
+            .await
+            .unwrap();
+        db.create_message(
+            "rts_range_root",
+            t1,
+            None,
+            author,
+            "Range cover",
+            72000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "rts_other",
+            t1,
+            Some("rts_range_root"),
+            author,
+            "[PATCH 1/2] Other",
+            72001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            Some("rts_range_root"),
+            author,
+            "[PATCH 2/2] Shared",
+            72002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t1,
+                Some("rts_range_root"),
+                "rts_other",
+                "[PATCH 1/2] Other",
+                author,
+                72001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "rts_other", 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared")
+            .await
+            .unwrap();
+
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range should have 2 patches"
+        );
+
+        // Thread 2: singleton with the shared SHA
+        let t2 = db
+            .create_thread("rts_single", "Single after", 72010)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            None,
+            author,
+            "Shared commit alone",
+            72010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t2,
+                Some(shared_sha),
+                shared_sha,
+                "Shared commit alone",
+                author,
+                72010,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // This should NOT steal from the range
+        db.create_patch(ps_single, shared_sha, 1, "diff-single")
+            .await
+            .unwrap();
+
+        // Range must still have 2 patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range must keep both patches after singleton submission"
+        );
+        // Verify the range physically owns both patch rows
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own both patch rows"
+        );
+
+        // Singleton should have 1
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton should have 1 patch"
+        );
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+    }
+
+    /// 4-patch range where a shared commit is in the middle (not last):
+    /// ensures that all 4 patches are inserted physically and received_parts is 4.
+    #[tokio::test]
+    async fn test_create_patch_range_shared_mid_sequence() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "sha_mid_shared";
+
+        // Thread 1: singleton with the shared SHA
+        let t1 = db
+            .create_thread("mid_single_root", "Single", 90000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Shared commit",
+            90000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Shared commit",
+                author,
+                90000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-single")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1, "Singleton should have 1 patch");
+
+        // Thread 2: 4-patch range where shared_sha is patch 2 of 4
+        let t2 = db
+            .create_thread("mid_range_root", "Range", 90010)
+            .await
+            .unwrap();
+        db.create_message(
+            "mid_range_root",
+            t2,
+            None,
+            author,
+            "Range cover",
+            90010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for sha in ["sha_p1", shared_sha, "sha_p3", "sha_p4"] {
+            db.create_message(
+                sha,
+                t2,
+                Some("mid_range_root"),
+                author,
+                &format!("[PATCH] {}", sha),
+                90011,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .ok(); // shared_sha message already exists, ignore dup
+        }
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("mid_range_root"),
+                "sha_p1",
+                "[PATCH 1/4] sha_p1",
+                author,
+                90011,
+                4,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Insert patches in order: p1, shared (cross-patchset), p3, p4
+        db.create_patch(ps_range, "sha_p1", 1, "diff-p1")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 1,
+            "After p1: received_parts should be 1"
+        );
+
+        // Patch 2: shared SHA — cross-patchset, bumps received_parts
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 2,
+            "After shared: received_parts should be 2"
+        );
+
+        // Patch 3: normal insert — must NOT overwrite the bump
+        db.create_patch(ps_range, "sha_p3", 3, "diff-p3")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 3,
+            "After p3: received_parts should be 3 (COUNT bug would give 2)"
+        );
+
+        // Patch 4: normal insert — completes the range
+        db.create_patch(ps_range, "sha_p4", 4, "diff-p4")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 4,
+            "After p4: range must be complete with 4/4"
+        );
+
+        // Verify physical patch ownership: range has all 4 physical patches
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            4,
+            "Range should physically own all 4 patches"
+        );
+
+        // Singleton must still have its patch
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton must keep its patch"
+        );
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+
+        // Status check: range should be Pending (complete)
+        assert!(
+            det["status"] == "Pending" || det["status"] == "In Review",
+            "Range status should transition to Pending/In Review, got: {}",
+            det["status"]
+        );
+    }
+
+    /// Verify that when a commit SHA is shared across multiple patchsets
+    /// (e.g. submitted as a singleton and then in a range resubmission),
+    /// both patchsets physically own their patch rows in the database,
+    /// so that get_patch_diffs and get_patchset_details return all patches
+    /// for both patchsets.
+    #[tokio::test]
+    async fn test_cross_patchset_shared_commit_physical_rows_and_diffs() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let shared_sha = "shared_commit_sha_1234567890";
+        let other_sha = "other_commit_sha_0987654321";
+
+        // 1. Thread 1: Singleton patchset with shared_sha
+        let t1 = db
+            .create_thread("t1_singleton", "Singleton Subject", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Singleton commit",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Singleton commit",
+                author,
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-shared-v1")
+            .await
+            .unwrap();
+
+        // 2. Thread 2: 2-patch range containing other_sha (part 1) and shared_sha (part 2)
+        let t2 = db
+            .create_thread("t2_range_cover", "Range Subject", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "t2_range_cover",
+            t2,
+            None,
+            author,
+            "Range Cover Letter",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            other_sha,
+            t2,
+            Some("t2_range_cover"),
+            author,
+            "[PATCH 1/2] Other commit",
+            2001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            Some("t2_range_cover"),
+            author,
+            "[PATCH 2/2] Shared commit",
+            2002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("t2_range_cover"),
+                other_sha,
+                "[PATCH 1/2] Other commit",
+                author,
+                2001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, other_sha, 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared-v2")
+            .await
+            .unwrap();
+
+        // Check singleton: must have 1 physical patch row and 1 diff
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own 1 patch row"
+        );
+        let single_diffs = db.get_patch_diffs(ps_single).await.unwrap();
+        assert_eq!(
+            single_diffs.len(),
+            1,
+            "Singleton must have 1 patch diff returned by get_patch_diffs"
+        );
+        assert_eq!(single_diffs[0].6, shared_sha);
+
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["patches"].as_array().unwrap().len(),
+            1,
+            "Singleton details must contain 1 patch"
+        );
+
+        // Check range: must have 2 physical patch rows and 2 diffs
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own 2 patch rows"
+        );
+        let range_diffs = db.get_patch_diffs(ps_range).await.unwrap();
+        assert_eq!(
+            range_diffs.len(),
+            2,
+            "Range must have 2 patch diffs returned by get_patch_diffs (including shared SHA)"
+        );
+        assert_eq!(range_diffs[0].6, other_sha);
+        assert_eq!(range_diffs[1].6, shared_sha);
+
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["patches"].as_array().unwrap().len(),
+            2,
+            "Range details must contain 2 patches"
+        );
+    }
+
+    /// Verify the reverse ingestion order: range first, then singleton with
+    /// the shared commit. The singleton must physically own its patch row
+    /// and return its diff.
+    #[tokio::test]
+    async fn test_cross_patchset_shared_commit_range_then_singleton() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let shared_sha = "shared_commit_rev_1234567890";
+        let other_sha = "other_commit_rev_0987654321";
+
+        // 1. Thread 1: 2-patch range containing other_sha (part 1) and shared_sha (part 2)
+        let t1 = db
+            .create_thread("t1_range_cover", "Range Subject", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "t1_range_cover",
+            t1,
+            None,
+            author,
+            "Range Cover Letter",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            other_sha,
+            t1,
+            Some("t1_range_cover"),
+            author,
+            "[PATCH 1/2] Other commit",
+            1001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            Some("t1_range_cover"),
+            author,
+            "[PATCH 2/2] Shared commit",
+            1002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t1,
+                Some("t1_range_cover"),
+                other_sha,
+                "[PATCH 1/2] Other commit",
+                author,
+                1001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, other_sha, 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared-v1")
+            .await
+            .unwrap();
+
+        // 2. Thread 2: Singleton patchset with shared_sha
+        let t2 = db
+            .create_thread("t2_singleton", "Singleton Subject", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            None,
+            author,
+            "Singleton commit",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t2,
+                Some(shared_sha),
+                shared_sha,
+                "Singleton commit",
+                author,
+                2000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-shared-v2")
+            .await
+            .unwrap();
+
+        // Check range: must have 2 physical patch rows and 2 diffs
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own 2 patch rows"
+        );
+        let range_diffs = db.get_patch_diffs(ps_range).await.unwrap();
+        assert_eq!(
+            range_diffs.len(),
+            2,
+            "Range must have 2 patch diffs returned by get_patch_diffs"
+        );
+
+        // Check singleton: must have 1 physical patch row and 1 diff
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own 1 patch row"
+        );
+        let single_diffs = db.get_patch_diffs(ps_single).await.unwrap();
+        assert_eq!(
+            single_diffs.len(),
+            1,
+            "Singleton must have 1 patch diff returned by get_patch_diffs"
+        );
+        assert_eq!(single_diffs[0].6, shared_sha);
+
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["patches"].as_array().unwrap().len(),
+            1,
+            "Singleton details must contain 1 patch"
+        );
+    }
+
+    /// Verify that get_patchset_details_by_msgid and get_patchset_summary_by_msgid
+    /// resolve synthetic IDs when queried by bare SHA.
+    #[tokio::test]
+    async fn test_get_patchset_details_by_synthetic_msgid() {
+        let db = setup_db().await;
+        let sha = "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4";
+        let synthetic_id = format!("{}@sashiko.local", sha);
+
+        // Create a fetching patchset with the synthetic cover_letter_message_id
+        let ps_id = db
+            .create_fetching_patchset(
+                &synthetic_id,
+                "Fetching patchset subject",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. Querying with the bare SHA must find the patchset details
+        let details = db
+            .get_patchset_details_by_msgid(sha, None, None)
+            .await
+            .unwrap();
+        assert!(
+            details.is_some(),
+            "get_patchset_details_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
+        );
+        assert_eq!(details.unwrap()["id"], ps_id);
+
+        // 2. Querying with bracketed SHA must also find the patchset details
+        let details_bracketed = db
+            .get_patchset_details_by_msgid(&format!("<{}>", sha), None, None)
+            .await
+            .unwrap();
+        assert_eq!(details_bracketed.unwrap()["id"], ps_id);
+
+        // 3. Querying with full synthetic ID must also find the patchset details
+        let details_full = db
+            .get_patchset_details_by_msgid(&synthetic_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(details_full.unwrap()["id"], ps_id);
+
+        // 4. Querying with the bare SHA must also find the patchset summary
+        let summary = db
+            .get_patchset_summary_by_msgid(sha, None, None)
+            .await
+            .unwrap();
+        assert!(
+            summary.is_some(),
+            "get_patchset_summary_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
+        );
+        assert_eq!(summary.unwrap()["id"], ps_id);
+
+        // 5. update_patchset_error with bare SHA updates the synthetic patchset
+        db.update_patchset_error(sha, "Fetch failed: timeout")
+            .await
+            .unwrap();
+        let updated = db
+            .get_patchset_details_by_msgid(sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["status"], "Failed");
+        assert_eq!(updated["failed_reason"], "Fetch failed: timeout");
+    }
+
+    /// Verify that has_patchset_by_msgid detects patchsets by bare SHA
+    /// for synthetic @sashiko.local cover letters and for patches in the patches table.
+    #[tokio::test]
+    async fn test_has_patchset_by_msgid_synthetic_and_patch_sha() {
+        let db = setup_db().await;
+        let sha_fetching = "deadbeef1234567890abcdef1234567890abcdef";
+        let synthetic_id = format!("{}@sashiko.local", sha_fetching);
+
+        // 1. Placeholder patchset in Fetching state with @sashiko.local cover letter
+        db.create_fetching_patchset(
+            &synthetic_id,
+            "Fetching placeholder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Must return true when queried by bare SHA
+        assert!(
+            db.has_patchset_by_msgid(sha_fetching).await.unwrap(),
+            "has_patchset_by_msgid should return true for bare SHA matching @sashiko.local cover letter"
+        );
+
+        // 2. Patchset with physical patch row
+        let sha_patch = "c0ffee1234567890abcdef1234567890abcdef";
+        let t = db
+            .create_thread("t_thread", "Test Thread", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_letter@example.com",
+            t,
+            None,
+            "Author <a@example.com>",
+            "Cover Subject",
+            999,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_patch,
+            t,
+            Some("cover_letter@example.com"),
+            "Author <a@example.com>",
+            "Patch Subject",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                t,
+                Some("cover_letter@example.com"),
+                sha_patch,
+                "Patch Subject",
+                "Author <a@example.com>",
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps, sha_patch, 1, "diff-patch")
+            .await
+            .unwrap();
+
+        // Must return true when queried by the patch's SHA even if cover letter is different
+        assert!(
+            db.has_patchset_by_msgid(sha_patch).await.unwrap(),
+            "has_patchset_by_msgid should return true for SHA existing in patches table"
+        );
+    }
+
+    /// Verify that has_patchset_by_msgid returns false for Failed and Cancelled
+    /// patchsets so that retry submissions can be re-fetched.
+    #[tokio::test]
+    async fn test_has_patchset_by_msgid_excludes_failed_and_cancelled() {
+        let db = setup_db().await;
+        let sha_failed = "f00f00f001234567890abcdef1234567890abcdef";
+        let synthetic_failed = format!("{}@sashiko.local", sha_failed);
+
+        // 1. Create a patchset and mark it Failed
+        let _ps_failed = db
+            .create_fetching_patchset(
+                &synthetic_failed,
+                "Fetching failed placeholder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_patchset_error(sha_failed, "Remote host unreachable")
+            .await
+            .unwrap();
+
+        // Must return false for Failed patchset to allow retry
+        assert!(
+            !db.has_patchset_by_msgid(sha_failed).await.unwrap(),
+            "has_patchset_by_msgid should return false for Failed patchset to allow retry"
+        );
+
+        // 2. Create a patchset and mark it Cancelled
+        let sha_cancelled = "c00c00c001234567890abcdef1234567890abcdef";
+        let synthetic_cancelled = format!("{}@sashiko.local", sha_cancelled);
+        let ps_cancelled = db
+            .create_fetching_patchset(
+                &synthetic_cancelled,
+                "Fetching cancelled placeholder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_cancelled, "Cancelled")
+            .await
+            .unwrap();
+
+        // Must return false for Cancelled patchset to allow retry
+        assert!(
+            !db.has_patchset_by_msgid(sha_cancelled).await.unwrap(),
+            "has_patchset_by_msgid should return false for Cancelled patchset to allow retry"
+        );
+
+        // 3. Create a patchset with a physical patch row, then mark patchset Failed
+        let sha_failed_patch = "a11a11a111234567890abcdef1234567890abcdef";
+        let t_failed = db
+            .create_thread("t_f", "Failed thread", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_failed@example.com",
+            t_failed,
+            None,
+            "Author <a@example.com>",
+            "Failed Subject",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_failed_patch,
+            t_failed,
+            Some("cover_failed@example.com"),
+            "Author <a@example.com>",
+            "Failed Patch Subject",
+            2001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_f = db
+            .create_patchset(
+                t_failed,
+                Some("cover_failed@example.com"),
+                sha_failed_patch,
+                "Failed Patch Subject",
+                "Author <a@example.com>",
+                2001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_f, sha_failed_patch, 1, "diff-fail")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_f, "Failed").await.unwrap();
+
+        // Must return false when queried by the patch's SHA because its patchset is Failed
+        assert!(
+            !db.has_patchset_by_msgid(sha_failed_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Failed patchset"
+        );
+
+        // 4. Create a patchset with a physical patch row, then mark patchset Cancelled
+        let sha_cancelled_patch = "b22b22b221234567890abcdef1234567890abcdef";
+        let t_cancelled = db
+            .create_thread("t_c", "Cancelled thread", 3000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_cancelled@example.com",
+            t_cancelled,
+            None,
+            "Author <a@example.com>",
+            "Cancelled Subject",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_cancelled_patch,
+            t_cancelled,
+            Some("cover_cancelled@example.com"),
+            "Author <a@example.com>",
+            "Cancelled Patch Subject",
+            3001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_c = db
+            .create_patchset(
+                t_cancelled,
+                Some("cover_cancelled@example.com"),
+                sha_cancelled_patch,
+                "Cancelled Patch Subject",
+                "Author <a@example.com>",
+                3001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_c, sha_cancelled_patch, 1, "diff-cancel")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_c, "Cancelled").await.unwrap();
+
+        // Must return false when queried by the patch's SHA because its patchset is Cancelled
+        assert!(
+            !db.has_patchset_by_msgid(sha_cancelled_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Cancelled patchset"
+        );
+
+        // 5. Create a patchset with a physical patch row, then mark patchset Failed To Apply
+        let sha_fta_patch = "c33c33c331234567890abcdef1234567890abcdef";
+        let t_fta = db
+            .create_thread("t_fta", "Failed to apply thread", 4000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_fta@example.com",
+            t_fta,
+            None,
+            "Author <a@example.com>",
+            "FTA Subject",
+            4000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_fta_patch,
+            t_fta,
+            Some("cover_fta@example.com"),
+            "Author <a@example.com>",
+            "FTA Patch Subject",
+            4001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_fta = db
+            .create_patchset(
+                t_fta,
+                Some("cover_fta@example.com"),
+                sha_fta_patch,
+                "FTA Patch Subject",
+                "Author <a@example.com>",
+                4001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_fta, sha_fta_patch, 1, "diff-fta")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_fta, "Failed To Apply")
+            .await
+            .unwrap();
+
+        // Must return false when queried by cover letter and by patch SHA
+        assert!(
+            !db.has_patchset_by_msgid("cover_fta@example.com")
+                .await
+                .unwrap(),
+            "has_patchset_by_msgid should return false for cover letter of Failed To Apply patchset"
+        );
+        assert!(
+            !db.has_patchset_by_msgid(sha_fta_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Failed To Apply patchset"
+        );
+    }
+
+    /// Verify that create_fetching_patchset resets patchsets in 'Failed To Apply'
+    /// status to 'Fetching' so that re-submitted patches can transition to 'Pending'.
+    #[tokio::test]
+    async fn test_failed_to_apply_patchset_resettable_and_reingestible() {
+        let db = setup_db().await;
+        let sha = "d44d44d441234567890abcdef1234567890abcdef";
+        let synthetic_cover = format!("{}@sashiko.local", sha);
+
+        // 1. Create a placeholder and ingest the patch
+        let ps_id = db
+            .create_fetching_patchset(
+                &synthetic_cover,
+                "Fetching initial",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let t = db
+            .create_thread("t_reingest", "Thread", 5000)
+            .await
+            .unwrap();
+        db.create_message(
+            sha,
+            t,
+            Some(&synthetic_cover),
+            "Author <a@example.com>",
+            "Patch Subject",
+            5000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_created = db
+            .create_patchset(
+                t,
+                Some(&synthetic_cover),
+                sha,
+                "Patch Subject",
+                "Author <a@example.com>",
+                5000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id, ps_created);
+
+        db.create_patch(ps_id, sha, 1, "diff-v1").await.unwrap();
+
+        // 2. Mark patchset Failed To Apply during review
+        db.update_patchset_status(ps_id, "Failed To Apply")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["status"], "Failed To Apply");
+
+        // 3. User re-submits: create_fetching_patchset must reset status to Fetching
+        let ps_re_id = db
+            .create_fetching_patchset(
+                &synthetic_cover,
+                "Fetching retry",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ps_re_id, ps_id);
+
+        let det_after_fetch = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_after_fetch["status"], "Fetching");
+
+        // 4. Ingestion re-runs create_patchset and create_patch
+        let ps_reingested = db
+            .create_patchset(
+                t,
+                Some(&synthetic_cover),
+                sha,
+                "Patch Subject Retry",
+                "Author <a@example.com>",
+                5010,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_reingested, ps_id);
+
+        db.create_patch(ps_id, sha, 1, "diff-v2").await.unwrap();
+
+        // Patchset must now successfully be in Pending status (ready for review)
+        let det_final = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_final["status"], "Pending");
+    }
+
+    /// Verify that an existing database at user_version = 1 with the legacy
+    /// UNIQUE(message_id) constraint is automatically migrated by db.migrate()
+    /// without requiring a user_version bump.
+    #[tokio::test]
+    async fn test_migrate_patches_table_from_version_1_legacy_constraint() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+
+        // 1. Manually set up a schema matching version 1 with the old UNIQUE(message_id)
+        db.conn
+            .execute_batch(
+                "CREATE TABLE threads (id INTEGER PRIMARY KEY, root_message_id TEXT, subject TEXT, last_updated INTEGER);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, thread_id INTEGER, in_reply_to TEXT, author TEXT, subject TEXT, date INTEGER, body TEXT, to_recipients TEXT, cc_recipients TEXT, git_blob_hash TEXT, mailing_list TEXT, references_hdr TEXT);
+                 CREATE TABLE patchsets (id INTEGER PRIMARY KEY, thread_id INTEGER, cover_letter_message_id TEXT, subject TEXT, author TEXT, date INTEGER, status TEXT DEFAULT 'Incomplete', total_parts INTEGER, received_parts INTEGER, subject_index INTEGER DEFAULT 9999, parser_version INTEGER DEFAULT 0, to_recipients TEXT, cc_recipients TEXT, baseline_id INTEGER, baseline_part_index INTEGER, model_name TEXT, mr_url TEXT, mr_title TEXT, mr_number INTEGER, prompts_git_hash TEXT, baseline_logs TEXT, failed_reason TEXT, skip_filters TEXT, only_filters TEXT, target_review_count INTEGER DEFAULT 1, provider TEXT, embargo_until INTEGER, embargo_release_started_at INTEGER, slug TEXT);
+                 CREATE TABLE patches (
+                     id INTEGER PRIMARY KEY,
+                     patchset_id INTEGER NOT NULL,
+                     message_id TEXT NOT NULL UNIQUE,
+                     part_index INTEGER,
+                     diff TEXT,
+                     status TEXT,
+                     apply_error TEXT,
+                     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+                     FOREIGN KEY(message_id) REFERENCES messages(message_id)
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .await
+            .unwrap();
+
+        // 2. Run migrate() on this existing version 1 database
+        db.migrate().await.unwrap();
+
+        // 3. Verify that create_patch works for multiple patchsets sharing the same message_id
+        let author = "Dev <dev@example.com>";
+        let t = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+        db.create_message(
+            "shared_sha",
+            t,
+            None,
+            author,
+            "Shared",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps1 = db
+            .create_patchset(
+                t,
+                Some("shared_sha"),
+                "shared_sha",
+                "P1",
+                author,
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let ps2 = db
+            .create_patchset(
+                t,
+                Some("ps2_cover"),
+                "shared_sha",
+                "P2",
+                author,
+                1001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let patch1 = db.create_patch(ps1, "shared_sha", 1, "diff1").await;
+        assert!(patch1.is_ok(), "First patch insertion should succeed");
+
+        let patch2 = db.create_patch(ps2, "shared_sha", 1, "diff2").await;
+        assert!(
+            patch2.is_ok(),
+            "Second patch with same SHA in different patchset must succeed after migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_adds_missing_columns_to_version_1_db() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+
+        // 1. Set up a version 1 database that lacks baseline_part_index in patchsets
+        db.conn
+            .execute_batch(
+                "CREATE TABLE threads (id INTEGER PRIMARY KEY, root_message_id TEXT, subject TEXT, last_updated INTEGER);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, thread_id INTEGER, in_reply_to TEXT, author TEXT, subject TEXT, date INTEGER, body TEXT, to_recipients TEXT, cc_recipients TEXT, git_blob_hash TEXT, mailing_list TEXT, references_hdr TEXT);
+                 CREATE TABLE patchsets (id INTEGER PRIMARY KEY, thread_id INTEGER, cover_letter_message_id TEXT, subject TEXT, author TEXT, date INTEGER, status TEXT DEFAULT 'Incomplete', total_parts INTEGER, received_parts INTEGER, subject_index INTEGER DEFAULT 9999, parser_version INTEGER DEFAULT 0, to_recipients TEXT, cc_recipients TEXT, baseline_id INTEGER, model_name TEXT, mr_url TEXT, mr_title TEXT, mr_number INTEGER, prompts_git_hash TEXT, baseline_logs TEXT, failed_reason TEXT, skip_filters TEXT, only_filters TEXT, target_review_count INTEGER DEFAULT 1, provider TEXT, embargo_until INTEGER, embargo_release_started_at INTEGER, slug TEXT);
+                 CREATE TABLE patches (id INTEGER PRIMARY KEY, patchset_id INTEGER NOT NULL, message_id TEXT NOT NULL, part_index INTEGER, diff TEXT, status TEXT, apply_error TEXT, UNIQUE(patchset_id, message_id));
+                 PRAGMA user_version = 1;",
+            )
+            .await
+            .unwrap();
+
+        // 2. Run migrate()
+        db.migrate().await.unwrap();
+
+        // 3. Verify baseline_part_index column exists and can be inserted into
+        let author = "Dev <dev@example.com>";
+        let t = db
+            .create_thread("root2", "Test Thread 2", 1000)
+            .await
+            .unwrap();
+        let ps = db
+            .create_patchset(
+                t,
+                Some("ps_cover"),
+                "msg_sha",
+                "P1",
+                author,
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(ps.is_some(), "create_patchset must succeed after migration");
     }
 }

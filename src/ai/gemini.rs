@@ -430,22 +430,13 @@ impl GenAiClient for GeminiClient {
     }
 }
 
-pub struct StdioGeminiClient {
-    registry: std::sync::Arc<crate::ai::IpcRegistry>,
-    writer: std::sync::Arc<crate::ai::AtomicWriter>,
-    reader_started: std::sync::atomic::AtomicBool,
-}
+// The registry and writer are process-wide, so holding them in fields would
+// only cache what the accessors already return.
+pub struct StdioGeminiClient;
 
 impl StdioGeminiClient {
     pub fn new() -> Self {
-        let registry = std::sync::Arc::new(crate::ai::IpcRegistry::new());
-        let writer = std::sync::Arc::new(crate::ai::AtomicWriter::new());
-
-        Self {
-            registry,
-            writer,
-            reader_started: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self
     }
 }
 
@@ -458,14 +449,10 @@ impl Default for StdioGeminiClient {
 #[async_trait]
 impl AiProvider for StdioGeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        if !self
-            .reader_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            crate::ai::start_stdin_reader(std::sync::Arc::downgrade(&self.registry));
-        }
+        crate::ai::ensure_stdin_reader();
 
-        let tx_id = self.registry.next_id();
+        let registry = crate::ai::ipc_registry();
+        let tx_id = registry.next_id();
         let envelope = json!({
             "type": "ai_request",
             "tx_id": tx_id,
@@ -474,9 +461,9 @@ impl AiProvider for StdioGeminiClient {
 
         let line = serde_json::to_string(&envelope)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.registry.register(tx_id, tx).await;
+        registry.register(tx_id, tx).await?;
 
-        self.writer.write_line(&line).await?;
+        crate::ai::ipc_writer().write_line(&line).await?;
 
         match rx.await {
             Ok(Ok(resp)) => Ok(resp),

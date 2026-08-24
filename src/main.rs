@@ -14,7 +14,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sashiko::db::Database;
-use sashiko::events::{Event, ParsedArticle};
+use sashiko::events::{Event, MessageSource, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
     ProgressEvent, ReviewOptions, WorkerOptions, print_worker_json, result_has_error,
@@ -444,11 +444,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _permit = permit; // Hold permit until task completion
 
                 match event {
-                    Event::IngestionFailed { article_id, error } => {
+                    Event::IngestionFailed {
+                        article_id,
+                        error,
+                        source,
+                    } => {
                         if let Err(e) = tx
                             .send(ParsedArticle {
                                 group: "error".to_string(),
                                 article_id,
+                                source,
                                 metadata: None,
                                 patch: None,
                                 baseline: None,
@@ -514,10 +519,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             part_index: index,
                         });
 
+                        let source = if group.starts_with("git-import") {
+                            MessageSource::GitImport
+                        } else {
+                            MessageSource::GitFetch
+                        };
+
                         if let Err(e) = tx
                             .send(ParsedArticle {
                                 group,
                                 article_id,
+                                source,
                                 metadata: Some(metadata),
                                 patch,
                                 baseline: base_commit,
@@ -535,6 +547,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Event::RawMboxSubmitted {
                         raw,
+                        submission_id,
+                        source,
                         group,
                         baseline,
                         skip_subjects,
@@ -569,17 +583,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             match parse_result {
                                 Ok(Ok((metadata, patch_opt))) => {
-                                    // Override group "api-submit" -> "manual" to avoid synthetic ID logic
-                                    let effective_group = if group_clone == "api-submit" {
-                                        "manual".to_string()
-                                    } else {
-                                        group_clone
-                                    };
+                                    // Do not override group "api-submit" to allow grouping logic to trigger
+                                    let effective_group = group_clone;
 
                                     if let Err(e) = tx_clone
                                         .send(ParsedArticle {
                                             group: effective_group,
-                                            article_id: msg_id,
+                                            article_id: submission_id.clone(),
+                                            source,
                                             metadata: Some(metadata),
                                             patch: patch_opt,
                                             baseline: baseline_clone,
@@ -637,6 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .send(ParsedArticle {
                                         group,
                                         article_id,
+                                        source: MessageSource::Nntp,
                                         metadata: Some(metadata),
                                         patch: patch_opt,
                                         baseline,
@@ -677,8 +689,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total_ingested = 0;
         let mut total_errors = 0;
 
-        let policy =
-            sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml").unwrap_or_default();
+        let policy = sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml")
+            .expect("Failed to parse email_policy.toml");
 
         loop {
             let count = parsed_rx.recv_many(&mut buffer, 100).await;
@@ -793,6 +805,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize custom remotes
+    // Start Background Compressor Worker
+    tokio::spawn(sashiko::worker::compressor::run_compressor(db.clone()));
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 
     // Clean up stale worktree directories on disk first
@@ -860,6 +874,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Keep the main thread running
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 
@@ -1630,6 +1656,7 @@ async fn process_parsed_article(
     let ParsedArticle {
         group,
         article_id,
+        source,
         metadata,
         patch,
         baseline,
@@ -1641,10 +1668,12 @@ async fn process_parsed_article(
         mr_number,
     } = article;
 
+    let root_msg_id = resolve_root_msg_id(source, &article_id);
+
     // Handle ingestion failure
     if let Some(err) = failed_error {
         info!("Handling ingestion failure for {}: {}", article_id, err);
-        if let Err(e) = worker_db.update_patchset_error(&article_id, &err).await {
+        if let Err(e) = worker_db.update_patchset_error(&root_msg_id, &err).await {
             error!("Failed to update patchset error in DB: {}", e);
         }
         return ProcessStatus::Ingested; // Successfully handled the failure event
@@ -1715,12 +1744,6 @@ async fn process_parsed_article(
         } else if group == "git-fetch" || group == "api-submit" {
             // Group these by article_id (which is the range or single SHA/local_id)
             // For singletons, the message itself is the root.
-            let root_msg_id = if metadata.total == 1 {
-                metadata.message_id.clone()
-            } else {
-                format!("{}@sashiko.local", article_id)
-            };
-
             match worker_db
                 .ensure_thread_for_message(&root_msg_id, metadata.date)
                 .await
@@ -1891,7 +1914,6 @@ async fn process_parsed_article(
     );
     */
 
-    let root_msg_id = format!("{}@sashiko.local", article_id);
     let cover_letter_id = if group == "git-fetch" {
         // Always use root_msg_id for git-fetch to match the placeholder ID
         Some(root_msg_id.as_str())
@@ -1931,14 +1953,14 @@ async fn process_parsed_article(
                     format!("!{}: {}", number, title),
                     metadata.author.clone(),
                     metadata.total,
-                    true,
+                    is_strict_author(source, metadata.total),
                 )
             } else {
                 (
                     metadata.subject.clone(),
                     metadata.author.clone(),
                     metadata.total,
-                    !group.starts_with("git-import"),
+                    is_strict_author(source, metadata.total),
                 )
             }
         } else {
@@ -1946,7 +1968,7 @@ async fn process_parsed_article(
                 metadata.subject.clone(),
                 metadata.author.clone(),
                 metadata.total,
-                !group.starts_with("git-import"),
+                is_strict_author(source, metadata.total),
             )
         };
 
@@ -2196,6 +2218,28 @@ fn calculate_embargo_hours(
         *delays_to_consider.iter().min().unwrap()
     } else {
         policy.defaults.embargo_hours.unwrap_or(0)
+    }
+}
+
+fn resolve_root_msg_id(source: MessageSource, article_id: &str) -> String {
+    match source {
+        MessageSource::Nntp
+        | MessageSource::ApiFetchThread
+        | MessageSource::GitArchive
+        | MessageSource::ApiInject => article_id.to_string(),
+        MessageSource::GitFetch | MessageSource::GitImport => {
+            format!("{}@sashiko.local", article_id)
+        }
+    }
+}
+
+fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
+    match source {
+        MessageSource::GitImport | MessageSource::GitArchive => false,
+        MessageSource::GitFetch if total_parts > 1 => false,
+        MessageSource::ApiInject if total_parts > 1 => false,
+        MessageSource::ApiFetchThread if total_parts > 1 => false,
+        _ => true,
     }
 }
 
@@ -2622,5 +2666,48 @@ mod tests {
         settings.forge.disable_nntp = true; // This is the default
         let should_start_ingestor = !(settings.forge.enabled && settings.forge.disable_nntp);
         assert!(!should_start_ingestor);
+    }
+
+    #[test]
+    fn test_resolve_root_msg_id() {
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::Nntp, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::ApiFetchThread, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitArchive, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::ApiInject, "sashiko-123"),
+            "sashiko-123"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitFetch, "abc123_sha"),
+            "abc123_sha@sashiko.local"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitImport, "range_a_b"),
+            "range_a_b@sashiko.local"
+        );
+    }
+
+    #[test]
+    fn test_is_strict_author() {
+        assert!(is_strict_author(MessageSource::Nntp, 1));
+        assert!(is_strict_author(MessageSource::Nntp, 6));
+        assert!(!is_strict_author(MessageSource::ApiFetchThread, 6)); // Lenient for series
+        assert!(!is_strict_author(MessageSource::GitFetch, 6)); // Lenient for series
+        assert!(is_strict_author(MessageSource::GitFetch, 1)); // Strict for singleton
+
+        assert!(!is_strict_author(MessageSource::GitImport, 6));
+        assert!(!is_strict_author(MessageSource::GitArchive, 6));
+
+        assert!(is_strict_author(MessageSource::ApiInject, 1)); // Strict for singleton
+        assert!(!is_strict_author(MessageSource::ApiInject, 6)); // Lenient for series
     }
 }

@@ -426,7 +426,7 @@ mod tests {
         let args = json!({
             "revision": "HEAD",
             "files": [
-                { "path": "src/worker/prompts.rs" }
+                { "path": "Cargo.lock" }
             ]
         });
 
@@ -441,15 +441,10 @@ mod tests {
         let returned_items = res["metadata"]["returned_items"].as_u64().unwrap() as usize;
         let actual_lines = content.lines().count();
 
-        // We expect actual_lines to match returned_items, or at least be extremely close (including warning lines).
-        // Currently, returned_items is slice.len() (2448), but content only has allowed_lines (~800) lines!
         println!("returned_items metadata: {}", returned_items);
         println!("actual returned content lines: {}", actual_lines);
 
-        assert!(
-            actual_lines < 2400,
-            "Content was not truncated! (should be around 800 lines)"
-        );
+        assert!(actual_lines < 3200, "Content was not truncated!");
         assert_eq!(
             returned_items + 1,
             actual_lines,
@@ -464,9 +459,9 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         let args = json!({
-            "object": "HEAD:src/worker/prompts.rs",
+            "object": "HEAD:Cargo.lock",
             "start_line": 1,
-            "end_line": 3000
+            "end_line": 4000
         });
 
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
@@ -479,14 +474,54 @@ mod tests {
         println!("git_show returned_items metadata: {}", returned_items);
         println!("git_show actual returned content lines: {}", actual_lines);
 
-        assert!(
-            actual_lines < 2400,
-            "Content was not truncated! (should be around 800 lines)"
-        );
+        assert!(actual_lines < 3200, "Content was not truncated!");
         assert_eq!(
             returned_items + 1,
             actual_lines,
             "git_show returned_items metadata does not match actual lines returned (accounting for warning line)!"
         );
+    }
+
+    #[test]
+    fn test_git_read_files_empty_file_with_range() {
+        // Regression: reading a file that is empty at the revision with an
+        // explicit line range must not panic. total_lines is 0 for such a
+        // file, and the bounds clamp used to invert (lower 1 > upper 0).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo_path.join("empty.txt"), "").unwrap();
+        run_git(&["add", "empty.txt"]);
+        run_git(&["commit", "-m", "Add empty file"]);
+
+        let toolbox = ToolBox::new(repo_path, None);
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({
+            "revision": "HEAD",
+            "files": [
+                { "path": "empty.txt", "start_line": 1, "end_line": 5 }
+            ]
+        });
+        let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+
+        let res = &results[0];
+        assert!(res.get("error").is_none(), "unexpected error: {res:?}");
+        assert_eq!(res["content"].as_str().unwrap(), "");
+        assert_eq!(res["total_lines"].as_u64().unwrap(), 0);
     }
 }

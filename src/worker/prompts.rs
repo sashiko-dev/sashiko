@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::ai::{
-    AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
-    ClassifyAiError, ErrorAction, LlmSession, SessionRunner, ValidationError,
+    AiErrorClass, AiMessage, AiProvider, AiResponse, AiTool, ClassifyAiError, ErrorAction,
+    LlmSession, SessionRunner, ValidationError,
 };
 use crate::toolbox::ToolBox;
-use crate::worker::stage::{ReviewStage, create_stage};
+use crate::worker::stage::ReviewStage;
 use anyhow::{Context, Result};
 
 /// Typed errors that must not be silently retried.
@@ -51,20 +51,19 @@ impl ClassifyAiError for ReviewError {
     }
 }
 
+use crate::worker::kernel_workflow::{
+    KernelReviewState, build_kernel_review_workflow_with_options, kernel_system_prompt,
+};
+use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tracing::{info, warn};
 
 /// System identity prompt - used across all AI interactions
 pub const SYSTEM_IDENTITY: &str = "";
-
-/// Subsystem guides that are loaded per-stage in get_stage_prompt() and should
-/// be excluded from Phase 0's shared context to avoid double-counting.
-const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct PatchInput {
@@ -92,6 +91,7 @@ pub struct WorkerConfig {
     pub temperature: f32,
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
+    pub baseline_sha: Option<String>,
     pub stages: Option<Vec<u8>>,
 }
 
@@ -128,7 +128,7 @@ pub struct WorkerResult {
 }
 
 pub struct PromptRegistry {
-    base_dir: PathBuf,
+    pub base_dir: PathBuf,
 }
 
 impl PromptRegistry {
@@ -301,7 +301,7 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 You are the lead reviewer validating consolidated concerns. You will be given a list of deduplicated concerns after conflict resolution.
 1. Validate each concern and prove the provided reasoning. Report all valid concerns as findings. If necessary, use tools to gather additional material. Discard all false positives.
 2. CRITICAL RULE: To discard a concern as a false positive, you MUST find concrete proof that explicitly invalidates the concern's reasoning. If you cannot find definitive proof that the concern is a false positive, it must be reported as a finding. If you're not sure about something and it's critical in the reasoning validation, make it obvious: if X is possible, then problem Y can occur. Always try to validate if X is possible yourself.
-3. SERIES VALIDATION RULE: If you are reviewing a patch that is NOT the last patch in the series (indicated by the presence of subsequent patches in the Full Series Context), you MUST check if each identified concern is still a problem in the final state of the series (the end of the Series Range). If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
+3. SERIES VALIDATION RULE: If follow-up patches in this series are provided in the context, check if each identified concern is resolved or fixed in the final state of the series. If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
 4. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit \"mm: fix allocation\"'). Existing historical commits in the tree should still be referenced by their standard hash.
 5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
 6. If the problem did exist in the code before the patch was applied, say it explicitly: 'This problem wasn't introduced by this patch, but...'. Discard low- and medium-severity pre-existing problems, report only high- and critical severity issues.
@@ -357,6 +357,46 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
             clean.push_str("\n\n");
         }
         Ok((content, clean))
+    }
+
+    /// Append the same per-stage guide files that [`Self::get_stage_prompt`]
+    /// appends, for pipelines that supply their own instruction text via
+    /// `StagePrompt::Override` (which bypasses `get_stage_prompt`).
+    pub async fn append_stage_guides(
+        &self,
+        stage: u8,
+        content: &mut String,
+        clean: &mut String,
+    ) -> Result<()> {
+        let mut clean_files = Vec::new();
+        match stage {
+            3 => {
+                self.append_file(content, &mut clean_files, "callstack.md")
+                    .await?;
+                self.append_file(content, &mut clean_files, "technical-patterns.md")
+                    .await?;
+            }
+            5 => {
+                self.append_file(content, &mut clean_files, "subsystem/locking.md")
+                    .await?;
+            }
+            10 => {
+                self.append_file(content, &mut clean_files, "false-positive-guide.md")
+                    .await?;
+                self.append_file(content, &mut clean_files, "severity.md")
+                    .await?;
+            }
+            11 => {
+                self.append_file(content, &mut clean_files, "inline-template.md")
+                    .await?;
+            }
+            _ => {}
+        }
+        if !clean_files.is_empty() {
+            clean.push_str(&clean_files.join(", "));
+            clean.push_str("\n\n");
+        }
+        Ok(())
     }
 
     async fn append_file(
@@ -449,6 +489,7 @@ pub struct Worker {
     max_interactions: usize,
     temperature: f32,
     series_range: Option<String>,
+    baseline_sha: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
 }
@@ -468,6 +509,7 @@ impl Worker {
             max_interactions: config.max_interactions,
             temperature: config.temperature,
             series_range: config.series_range,
+            baseline_sha: config.baseline_sha,
             context_tag: None,
             stages: config.stages,
         }
@@ -478,7 +520,6 @@ impl Worker {
         patchset: Value,
         progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
     ) -> Result<WorkerResult> {
-        // 1. Extract inputs
         let mut target_commit_diff = String::new();
         let mut target_commit_diff_only = String::new();
 
@@ -492,13 +533,26 @@ impl Worker {
             .unwrap_or_else(|| "multi".to_string());
         self.context_tag = Some(format!("[ps:{} p:{}] ", ps_id, p_id));
 
-        let mut baseline_sha = "unknown".to_string();
-        if let Some(ref range) = self.series_range {
-            let parts: Vec<&str> = range.split("..").collect();
-            if !parts.is_empty() {
-                baseline_sha = parts[0].to_string();
-            }
-        }
+        let baseline_sha = self
+            .baseline_sha
+            .clone()
+            .or_else(|| {
+                patchset
+                    .get("baseline")
+                    .and_then(|b| b.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                self.series_range.as_ref().and_then(|range| {
+                    let parts: Vec<&str> = range.split("..").collect();
+                    if !parts.is_empty() && !parts[0].is_empty() {
+                        Some(parts[0].to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_else(|| "unknown".to_string());
 
         let mut target_commit_sha = "unknown".to_string();
         if let Some(patches) = patchset["patches"].as_array() {
@@ -517,7 +571,21 @@ impl Worker {
         }
 
         if let Some(patches) = patchset["patches"].as_array() {
-            for p in patches {
+            let target_patches: Vec<&Value> = if let Some(idx) = patchset["patch_index"].as_i64() {
+                let filtered: Vec<&Value> = patches
+                    .iter()
+                    .filter(|p| p["index"].as_i64() == Some(idx))
+                    .collect();
+                if filtered.is_empty() {
+                    patches.iter().collect()
+                } else {
+                    filtered
+                }
+            } else {
+                patches.iter().collect()
+            };
+
+            for p in target_patches {
                 let diff_body = p["diff"].as_str().unwrap_or("");
                 let changelog_opt = crate::patch::extract_changelog_from_body(diff_body);
 
@@ -542,269 +610,47 @@ impl Worker {
             }
         }
 
-        let mut all_concerns = Vec::new();
-        let mut all_dismissed_concerns = Vec::new();
-        let mut total_tokens_in = 0;
-        let mut total_tokens_out = 0;
-        let mut total_tokens_cached = 0;
-
-        // Phase 0: Pre-screen relevant prompts
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::PreScreenStarted);
-        }
-        let subsystem_md_path = self.prompts.base_dir.join("subsystem/subsystem.md");
-        let selected_prompts = if subsystem_md_path.exists() {
-            match tokio::fs::read_to_string(&subsystem_md_path).await {
-                Ok(subsystem_md) => {
-                    info!("Executing Phase 0: Pre-screening relevant subsystem guides.");
-                    let phase0_system = "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```";
-                    let phase0_prompt = format!(
-                        "<subsystem_guide_index>\n{}\n</subsystem_guide_index>\n\n<patch>\n{}\n</patch>",
-                        subsystem_md, target_commit_diff
-                    );
-                    let schema = json!({
-                        "type": "object",
-                        "properties": {
-                            "selected_prompts": {
-                                "type": "array",
-                                "items": { "type": "string" }
-                            }
-                        },
-                        "required": ["selected_prompts"]
-                    });
-
-                    let req = AiRequest {
-                        system: Some(phase0_system.to_string()),
-                        messages: vec![AiMessage {
-                            role: AiRole::User,
-                            content: Some(phase0_prompt),
-                            thought: None,
-                            thought_signature: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                        }],
-                        tools: None,
-                        temperature: Some(0.0),
-                        response_format: Some(AiResponseFormat::Json {
-                            schema: Some(schema),
-                        }),
-                        context_tag: self
-                            .context_tag
-                            .as_ref()
-                            .map(|prefix| format!("{}s:0] ", &prefix[..prefix.len() - 2])),
-                    };
-
-                    let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
-                    let val = self
-                        .json_request("s0", req, &mut tokens, |v| {
-                            v.get("selected_prompts")
-                                .and_then(|v| v.as_array())
-                                .ok_or_else(|| "missing 'selected_prompts' array".to_string())
-                                .map(|_| ())
-                        })
-                        .await;
-                    total_tokens_in = tokens.0;
-                    total_tokens_out = tokens.1;
-                    total_tokens_cached = tokens.2;
-                    val.and_then(|val| {
-                        let arr = val.get("selected_prompts")?.as_array()?;
-                        let prompts: Vec<String> = arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .filter(|name| !STAGE_EXCLUSIVE_GUIDES.contains(&name.as_str()))
-                            .collect();
-                        info!("Phase 0 selected prompts: {:?}", prompts);
-                        Some(prompts)
-                    })
-                }
-                Err(e) => {
-                    warn!("Failed to read subsystem.md for Phase 0: {}", e);
-                    None
-                }
-            }
-        } else {
-            warn!(
-                "subsystem.md not found for Phase 0 at {:?}",
-                subsystem_md_path
-            );
-            None
-        };
-
-        let (static_context, clean_static_context) = self
-            .prompts
-            .build_context(selected_prompts.as_deref())
-            .await?;
-
-        let mut git_metadata = String::new();
-        git_metadata.push_str("\n\n=== Active Git Metadata ===\n");
-        git_metadata.push_str(&format!("Target Commit SHA: {}\n", target_commit_sha));
-        git_metadata.push_str(&format!("Baseline SHA: {}\n", baseline_sha));
-        git_metadata.push_str("===========================\n");
-
-        let mut dynamic_context = String::new();
-        dynamic_context.push_str(&git_metadata);
-        dynamic_context.push_str("\n\nTarget Commit:\n");
-        dynamic_context.push_str(&target_commit_diff);
-        let mut clean_dynamic_context = dynamic_context.clone();
-
-        let mut dynamic_context_no_log = String::new();
-        dynamic_context_no_log.push_str(&git_metadata);
-        dynamic_context_no_log.push_str("\n\nTarget Commit Diff:\n");
-        dynamic_context_no_log.push_str(&target_commit_diff_only);
-        let mut clean_dynamic_context_no_log = dynamic_context_no_log.clone();
-
-        // Prefetch AST context based on the diff
         let worktree_path = self.tools.get_worktree_path();
-        if let Ok(prefetched) =
-            crate::worker::prefetch::prefetch_context(worktree_path, &target_commit_diff).await
-            && !prefetched.is_empty()
-        {
-            dynamic_context.push_str("\n\n<pre_fetched_context>\n");
-            dynamic_context.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
-            dynamic_context.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
-            dynamic_context.push_str(&prefetched);
-            dynamic_context.push_str("\n</pre_fetched_context>\n");
+        let prefetched_context =
+            crate::worker::prefetch::prefetch_context(worktree_path, &target_commit_diff)
+                .await
+                .unwrap_or_default();
 
-            clean_dynamic_context.push_str("\n\n<pre_fetched_context>\n");
-            clean_dynamic_context.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
-            clean_dynamic_context.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
-            clean_dynamic_context.push_str("{{prefetched_context}}\n</pre_fetched_context>\n");
+        let follow_up_series_context = build_follow_up_series_context(
+            self.series_range.as_deref(),
+            &patchset,
+            &target_commit_sha,
+        );
 
-            dynamic_context_no_log.push_str("\n\n<pre_fetched_context>\n");
-            dynamic_context_no_log.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
-            dynamic_context_no_log.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
-            dynamic_context_no_log.push_str(&prefetched);
-            dynamic_context_no_log.push_str("\n</pre_fetched_context>\n");
-
-            clean_dynamic_context_no_log.push_str("\n\n<pre_fetched_context>\n");
-            clean_dynamic_context_no_log.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
-            clean_dynamic_context_no_log.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
-            clean_dynamic_context_no_log
-                .push_str("{{prefetched_context}}\n</pre_fetched_context>\n");
-        }
-        let (shared_context, clean_shared_context) = {
-            // Without cache (or with implicit cache like Claude), we send everything.
-            (
-                format!("{}{}", static_context, dynamic_context),
-                format!("{}{}", clean_static_context, clean_dynamic_context),
-            )
+        let mut state = KernelReviewState {
+            ps_id,
+            p_id,
+            target_commit_sha,
+            baseline_sha,
+            target_commit_diff,
+            target_commit_diff_only,
+            prefetched_context,
+            series_range: self.series_range.clone(),
+            follow_up_series_context,
+            selected_guides: Vec::new(),
+            manual_stages: self.stages.clone(),
+            planned_stages: Vec::new(),
+            all_concerns: Vec::new(),
+            all_dismissed_concerns: Vec::new(),
+            deduplicated_concerns: Vec::new(),
+            deduplicated_dismissed_concerns: Vec::new(),
+            conflict_resolved_concerns: Vec::new(),
+            findings: Vec::new(),
+            review_inline: String::new(),
+            fixes: String::new(),
         };
 
-        let (shared_context_no_log, clean_shared_context_no_log) = {
-            (
-                format!("{}{}", static_context, dynamic_context_no_log),
-                format!("{}{}", clean_static_context, clean_dynamic_context_no_log),
-            )
-        };
-
-        let mut planning_selected_stages: Option<Vec<u8>> = None;
-        if self.stages.is_none() {
-            if let Some(progress_cb) = progress {
-                progress_cb(WorkerProgressEvent::PlanningStarted);
-            }
-            let schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "relevant_stages": {
-                        "type": "array",
-                        "items": { "type": "integer" },
-                        "description": "Array of stage numbers from 4, 5, 6, 7 that are relevant to this patch. Err on the side of inclusion if unsure."
-                    }
-                },
-                "required": ["relevant_stages"]
-            });
-
-            let planning_prompt = r#"Analyze the provided patch and determine which of the following review stages are relevant and should be executed:
-- Stage 4: Resource management
-- Stage 5: Locking and synchronization
-- Stage 6: Security audit
-- Stage 7: Hardware engineer's review
-
-CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer.
-
-You MUST respond with ONLY a JSON object, no other text. Example:
-```json
-{"relevant_stages": [4, 5, 6, 7]}
-```"#;
-
-            let req = AiRequest {
-                system: None,
-                messages: vec![AiMessage {
-                    role: crate::ai::AiRole::User,
-                    content: Some(format!("{}\n\n{}", shared_context, planning_prompt)),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                }],
-                tools: None,
-                temperature: Some(0.0),
-                response_format: Some(AiResponseFormat::Json {
-                    schema: Some(schema),
-                }),
-                context_tag: self
-                    .context_tag
-                    .as_ref()
-                    .map(|prefix| format!("{} s:p] ", &prefix[..prefix.len() - 2])),
-            };
-
-            info!("Running planning pre-phase");
-            let mut tokens = (total_tokens_in, total_tokens_out, total_tokens_cached);
-            let val = self
-                .json_request("sp", req, &mut tokens, |v| {
-                    v.get("relevant_stages")
-                        .and_then(|v| v.as_array())
-                        .ok_or_else(|| "missing 'relevant_stages' array".to_string())
-                        .map(|_| ())
-                })
-                .await;
-            total_tokens_in = tokens.0;
-            total_tokens_out = tokens.1;
-            total_tokens_cached = tokens.2;
-            if let Some(val) = val {
-                let arr = val["relevant_stages"].as_array().unwrap();
-                let mut stages = vec![1, 2, 3];
-                for v in arr {
-                    if let Some(n) = v.as_u64()
-                        && (4..=7).contains(&n)
-                    {
-                        stages.push(n as u8);
-                    }
-                }
-                info!("Planning phase selected stages: {:?}", stages);
-                planning_selected_stages = Some(stages);
-            }
-        }
-
-        let mut planned_stages = Vec::new();
-        for stage_num in 1..=7 {
-            if let Some(ref selected_stages) = self.stages {
-                if selected_stages.contains(&stage_num) {
-                    planned_stages.push(stage_num);
-                }
-            } else if let Some(ref planned_stages_ref) = planning_selected_stages {
-                if planned_stages_ref.contains(&stage_num) {
-                    planned_stages.push(stage_num);
-                }
-            } else {
-                planned_stages.push(stage_num);
-            }
-        }
-        if !planned_stages.is_empty() {
-            planned_stages.push(8);
-            planned_stages.push(9);
-            planned_stages.push(10);
-            planned_stages.push(11);
-        }
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::ReviewStarted { planned_stages });
-        }
-
-        // Initialize system message in global history once before running stages
         if self.global_history.is_empty() {
+            let sys_template = kernel_system_prompt(true);
+            let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
-                role: AiRole::System,
-                content: Some(clean_shared_context.clone()),
+                role: crate::ai::AiRole::System,
+                content: Some(rendered_sys),
                 thought: None,
                 thought_signature: None,
                 tool_calls: None,
@@ -812,588 +658,84 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             });
         }
 
-        // Construct futures for Stages 1-7
-        let mut stage_futures = Vec::new();
-        for stage_num in 1..=7 {
-            if let Some(ref selected_stages) = self.stages {
-                if !selected_stages.contains(&stage_num) {
-                    continue;
+        let workflow =
+            build_kernel_review_workflow_with_options(self.max_interactions, self.temperature);
+        let env = WorkflowEnv {
+            provider: self.provider.clone(),
+            tools: self.tools.clone(),
+            base_dir: &self.prompts.base_dir,
+            context_tag: self.context_tag.clone(),
+        };
+
+        let manual_stages = self.stages.clone();
+        let event_cb = move |event: WorkflowEvent| {
+            if let Some(progress_cb) = progress {
+                match event {
+                    WorkflowEvent::StageStarted { stage_name } => {
+                        if stage_name == "stage_0_prescreen" {
+                            progress_cb(WorkerProgressEvent::PreScreenStarted);
+                        } else if stage_name == "stage_planning" {
+                            progress_cb(WorkerProgressEvent::PlanningStarted);
+                        } else if let Some(num) = parse_stage_number(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageStarted { stage: num });
+                        }
+                    }
+                    WorkflowEvent::StageFinished { stage_name, .. } => {
+                        if stage_name == "stage_planning" {
+                            let planned = if let Some(ref manual) = manual_stages {
+                                manual.clone()
+                            } else {
+                                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+                            };
+                            progress_cb(WorkerProgressEvent::ReviewStarted {
+                                planned_stages: planned,
+                            });
+                        } else if let Some(num) = parse_stage_number(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageFinished { stage: num });
+                        }
+                    }
+                    WorkflowEvent::StageTurn {
+                        stage_name,
+                        turn,
+                        max_turns,
+                    } => {
+                        if let Some(num) = parse_stage_number(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageTurn {
+                                stage: num,
+                                turn,
+                                max_turns,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
-            } else if let Some(ref planned_stages) = planning_selected_stages
-                && !planned_stages.contains(&stage_num)
-            {
-                info!("Skipping stage {} based on planning phase", stage_num);
-                continue;
             }
+        };
 
-            let stage = create_stage(stage_num);
-            let use_log = stage.use_log_in_context();
-            let system_prompt = if use_log {
-                shared_context.clone()
-            } else {
-                shared_context_no_log.clone()
-            };
-            let clean_system_prompt = if use_log {
-                clean_shared_context.clone()
-            } else {
-                clean_shared_context_no_log.clone()
-            };
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await?;
+        self.global_history.extend(outcome.history.clone());
 
-            stage_futures.push(self.execute_stage(
-                stage,
-                system_prompt,
-                clean_system_prompt,
-                progress,
-            ));
-        }
+        let concerns_count = state.all_concerns.len();
+        let dismissed_concerns = if !state.deduplicated_dismissed_concerns.is_empty() {
+            state.deduplicated_dismissed_concerns.clone()
+        } else {
+            state.all_dismissed_concerns.clone()
+        };
+        let dismissed_concerns_count = dismissed_concerns.len();
 
-        // Run planned stages concurrently
-        info!(
-            "Running {} planned stages concurrently",
-            stage_futures.len()
-        );
-        let stage_results = futures::future::try_join_all(stage_futures).await?;
-
-        // Consolidate results in deterministic order (already preserved by try_join_all)
-        for res in stage_results {
-            total_tokens_in += res.tokens_in;
-            total_tokens_out += res.tokens_out;
-            total_tokens_cached += res.tokens_cached;
-
-            append_stage_items(
-                &mut all_concerns,
-                &res.concerns,
-                res.stage,
-                "General",
-                "description",
-            );
-            append_stage_dismissed_concerns(
-                &mut all_dismissed_concerns,
-                &res.dismissed_concerns,
-                res.stage,
-            );
-
-            // Append history in order
-            self.global_history.extend(res.history);
-        }
-
-        if all_concerns.is_empty() {
-            tracing::info!("No concerns from stages 1-7, skipping stages 8, 9, 10 and 11");
-            let dismissed_concerns_count = all_dismissed_concerns.len();
-            let final_output = serde_json::json!({
-                "findings": [],
-                "dismissed_concerns": all_dismissed_concerns,
-                "review_inline": "No issues found.",
-                "fixes": "",
-                "concerns_count": 0,
-                "dismissed_concerns_count": dismissed_concerns_count
-            });
-            return Ok(WorkerResult {
-                output: Some(final_output),
-                error: None,
-                input_context: "Multi-stage execution completed".to_string(),
-                history: self.global_history.clone(),
-                history_before_pruning: self.global_history.clone(),
-                history_after_pruning: self.global_history.clone(),
-                tokens_in: total_tokens_in,
-                tokens_out: total_tokens_out,
-                tokens_cached: total_tokens_cached,
-            });
-        }
-
-        // Stage 8: Deduplication
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageStarted { stage: 8 });
-        }
-        info!("Running Stage 8 (Deduplication)");
-        let deduplicated_concerns;
-        let deduplicated_dismissed_concerns;
-        {
-            let stage = 8;
-            let (stage_prompt, _) = self.prompts.get_stage_prompt(stage).await?;
-            let system_prompt = shared_context.clone();
-
-            let aggregated_concerns_json =
-                serde_json::to_string_pretty(&all_concerns).unwrap_or_default();
-            let aggregated_dismissed_concerns_json =
-                serde_json::to_string_pretty(&all_dismissed_concerns).unwrap_or_default();
-
-            let user_prompt = format!(
-                r#"{}
-
-Aggregated Concerns:
-{}
-
-Aggregated Dismissed Concerns:
-{}
-
-Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
-Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
-Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations".
-Preserve the most precise location details from the input. Do not invent line numbers; use null when exact values are unknown.
-
-Example Output:
-```json
-{{
-  "concerns": [
-    {{
-      "type": "Memory Leak",
-      "description": "Memory leak in function X",
-      "reasoning": "1. X is called.\n2. Y is allocated but not freed on error path.",
-      "preexisting": false,
-      "locations": [
-        {{
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line": 123,
-          "code_snippet": "problematic_code();",
-          "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
-        }}
-      ]
-    }}
-  ],
-  "dismissed_concerns": [
-    {{
-      "type": "Resource Management",
-      "description": "Possible missing cleanup when foo_init() fails after bar_alloc().",
-      "reasoning": "The concrete code path or ordering that proves this candidate concern does not apply.",
-      "locations": [
-        {{
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line": 125,
-          "code_snippet": "safe_code_path();",
-          "why_this_location_matters": "This is where the cleanup path proves the candidate leak does not apply."
-        }}
-      ]
-    }}
-  ]
-}}
-```"#,
-                stage_prompt, aggregated_concerns_json, aggregated_dismissed_concerns_json
-            );
-
-            let clean_user_prompt = format!(
-                r#"{}
-
-Consolidated Concerns:
-{}
-
-Consolidated Dismissed Concerns:
-{}
-
-Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
-Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
-Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations".
-Preserve the most precise location details from the input. Do not invent line numbers; use null when exact values are unknown."#,
-                stage_prompt, aggregated_concerns_json, aggregated_dismissed_concerns_json
-            );
-
-            let stage_impl = create_stage(stage);
-            let mut session = ReviewStageSession::new(
-                stage_impl,
-                system_prompt,
-                user_prompt,
-                clean_user_prompt,
-                self.tools.clone(),
-                self.temperature,
-                self.context_tag.as_deref(),
-            );
-            let runner = SessionRunner::new(self.provider.as_ref())
-                .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions)
-                .with_turn_callback(move |turn, max_turns| {
-                    if let Some(progress_cb) = progress {
-                        progress_cb(WorkerProgressEvent::StageTurn {
-                            stage,
-                            turn,
-                            max_turns,
-                        });
-                    }
-                });
-            let result = runner.run(&mut session).await?;
-
-            total_tokens_in += result.usage.prompt_tokens as u32;
-            total_tokens_out += result.usage.completion_tokens as u32;
-            total_tokens_cached += result.usage.cached_tokens.unwrap_or(0) as u32;
-            self.global_history.extend(result.history);
-
-            deduplicated_concerns = result.output.get("concerns").unwrap().clone();
-            deduplicated_dismissed_concerns =
-                result.output.get("dismissed_concerns").unwrap().clone();
-        }
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageFinished { stage: 8 });
-        }
-
-        if let Some(c) = deduplicated_concerns.as_array()
-            && c.is_empty()
-        {
-            tracing::info!(
-                "No concerns remaining after Stage 8 deduplication, skipping stages 9, 10 and 11"
-            );
-            let final_output = serde_json::json!({
-                "findings": [],
-                "dismissed_concerns": deduplicated_dismissed_concerns,
-                "review_inline": "No issues found.",
-                "fixes": "",
-                "concerns_count": all_concerns.len(),
-                "dismissed_concerns_count": deduplicated_dismissed_concerns
-                    .as_array()
-                    .map_or(0, Vec::len)
-            });
-            return Ok(WorkerResult {
-                output: Some(final_output),
-                error: None,
-                input_context: "Multi-stage execution completed".to_string(),
-                history: self.global_history.clone(),
-                history_before_pruning: self.global_history.clone(),
-                history_after_pruning: self.global_history.clone(),
-                tokens_in: total_tokens_in,
-                tokens_out: total_tokens_out,
-                tokens_cached: total_tokens_cached,
-            });
-        }
-
-        // Stage 9: Concern/dismissed-concern conflict resolution
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageStarted { stage: 9 });
-        }
-        info!("Running Stage 9 (Concern/dismissed-concern conflict resolution)");
-        let conflict_resolved_concerns;
-        {
-            let stage = 9;
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
-            let system_prompt = shared_context.clone();
-
-            let deduplicated_concerns_json =
-                serde_json::to_string_pretty(&deduplicated_concerns).unwrap_or_default();
-            let deduplicated_dismissed_concerns_json =
-                serde_json::to_string_pretty(&deduplicated_dismissed_concerns).unwrap_or_default();
-
-            let user_prompt = format!(
-                r#"{}
-
-Consolidated Concerns:
-{}
-
-Consolidated Dismissed Concerns:
-{}
-
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
-Preserve the most precise locations from the retained concerns. Do not invent line numbers; use null when exact values are unknown.
-
-Example Output:
-```json
-{{
-  "concerns": [
-    {{
-      "type": "Memory Leak",
-      "description": "Memory leak in function X",
-      "reasoning": "1. X is called.\n2. Y is allocated but not freed on error path.",
-      "preexisting": false,
-      "locations": [
-        {{
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line": 123,
-          "code_snippet": "problematic_code();",
-          "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
-        }}
-      ]
-    }}
-  ]
-}}
-```"#,
-                stage_prompt, deduplicated_concerns_json, deduplicated_dismissed_concerns_json
-            );
-
-            let clean_user_prompt = format!(
-                r#"{}
-
-Consolidated Concerns:
-{}
-
-Consolidated Dismissed Concerns:
-{}
-
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
-Preserve the most precise locations from the retained concerns. Do not invent line numbers; use null when exact values are unknown.
-
-Example Output:
-```json
-{{
-  "concerns": [
-    {{
-      "type": "Memory Leak",
-      "description": "Memory leak in function X",
-      "reasoning": "1. X is called.\n2. Y is allocated but not freed on error path.",
-      "preexisting": false,
-      "locations": [
-        {{
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line": 123,
-          "code_snippet": "problematic_code();",
-          "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
-        }}
-      ]
-    }}
-  ]
-}}
-```"#,
-                clean_stage_prompt,
-                deduplicated_concerns_json,
-                deduplicated_dismissed_concerns_json
-            );
-
-            let stage_impl = create_stage(stage);
-            let mut session = ReviewStageSession::new(
-                stage_impl,
-                system_prompt,
-                user_prompt,
-                clean_user_prompt,
-                self.tools.clone(),
-                self.temperature,
-                self.context_tag.as_deref(),
-            );
-            let runner = SessionRunner::new(self.provider.as_ref())
-                .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions)
-                .with_turn_callback(move |turn, max_turns| {
-                    if let Some(progress_cb) = progress {
-                        progress_cb(WorkerProgressEvent::StageTurn {
-                            stage,
-                            turn,
-                            max_turns,
-                        });
-                    }
-                });
-            let result = runner.run(&mut session).await?;
-
-            total_tokens_in += result.usage.prompt_tokens as u32;
-            total_tokens_out += result.usage.completion_tokens as u32;
-            total_tokens_cached += result.usage.cached_tokens.unwrap_or(0) as u32;
-            self.global_history.extend(result.history);
-
-            conflict_resolved_concerns = result.output.get("concerns").unwrap().clone();
-        }
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageFinished { stage: 9 });
-        }
-
-        if let Some(c) = conflict_resolved_concerns.as_array()
-            && c.is_empty()
-        {
-            tracing::info!(
-                "No concerns remaining after Stage 9 conflict resolution, skipping stages 10 and 11"
-            );
-            let final_output = serde_json::json!({
-                "findings": [],
-                "dismissed_concerns": deduplicated_dismissed_concerns,
-                "review_inline": "No issues found.",
-                "fixes": "",
-                "concerns_count": all_concerns.len(),
-                "dismissed_concerns_count": deduplicated_dismissed_concerns
-                    .as_array()
-                    .map_or(0, Vec::len)
-            });
-            return Ok(WorkerResult {
-                output: Some(final_output),
-                error: None,
-                input_context: "Multi-stage execution completed".to_string(),
-                history: self.global_history.clone(),
-                history_before_pruning: self.global_history.clone(),
-                history_after_pruning: self.global_history.clone(),
-                tokens_in: total_tokens_in,
-                tokens_out: total_tokens_out,
-                tokens_cached: total_tokens_cached,
-            });
-        }
-
-        // Stage 10: Verification
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageStarted { stage: 10 });
-        }
-        info!("Running Stage 10 (Verification)");
-        let findings_json;
-        {
-            let stage = 10;
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
-            let system_prompt = shared_context.clone();
-
-            let full_series_context = if let Some(range) = &self.series_range {
-                let cmd_output = std::process::Command::new("git")
-                    .current_dir(self.tools.get_worktree_path())
-                    .args(["--no-pager", "log", "--reverse", "--format=%s", range])
-                    .output();
-
-                match cmd_output {
-                    Ok(out) if out.status.success() => {
-                        let subjects = String::from_utf8_lossy(&out.stdout).to_string();
-                        format!(
-                            "Series Range: {}\n\nPatches in series:\n{}",
-                            range, subjects
-                        )
-                    }
-                    Ok(out) => {
-                        warn!(
-                            "git log failed for range {}: {}",
-                            range,
-                            String::from_utf8_lossy(&out.stderr)
-                        );
-                        "Failed to retrieve full series context (git log error).".to_string()
-                    }
-                    Err(e) => {
-                        warn!("git command failed: {}", e);
-                        "Failed to retrieve full series context (git execution error).".to_string()
-                    }
-                }
-            } else {
-                "Not applicable (single patch or last patch in series).".to_string()
-            };
-
-            let conflict_resolved_concerns_json =
-                serde_json::to_string_pretty(&conflict_resolved_concerns).unwrap_or_default();
-            let user_prompt = format!(
-                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"preexisting\" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"preexisting\": false,\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ]\n    }}\n  ]\n}}\n```",
-                stage_prompt, full_series_context, conflict_resolved_concerns_json
-            );
-
-            let clean_user_prompt = format!(
-                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{{{{series context}}}}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"preexisting\" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"preexisting\": false,\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ]\n    }}\n  ]\n}}\n```",
-                clean_stage_prompt, conflict_resolved_concerns_json
-            );
-
-            let stage_impl = create_stage(stage);
-            let mut session = ReviewStageSession::new(
-                stage_impl,
-                system_prompt,
-                user_prompt,
-                clean_user_prompt,
-                self.tools.clone(),
-                self.temperature,
-                self.context_tag.as_deref(),
-            );
-            let runner = SessionRunner::new(self.provider.as_ref())
-                .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions)
-                .with_turn_callback(move |turn, max_turns| {
-                    if let Some(progress_cb) = progress {
-                        progress_cb(WorkerProgressEvent::StageTurn {
-                            stage,
-                            turn,
-                            max_turns,
-                        });
-                    }
-                });
-            let result = runner.run(&mut session).await?;
-
-            total_tokens_in += result.usage.prompt_tokens as u32;
-            total_tokens_out += result.usage.completion_tokens as u32;
-            total_tokens_cached += result.usage.cached_tokens.unwrap_or(0) as u32;
-            self.global_history.extend(result.history);
-
-            findings_json = result.output.get("findings").unwrap().clone();
-        }
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageFinished { stage: 10 });
-        }
-
-        if let Some(f) = findings_json.as_array()
-            && f.is_empty()
-        {
-            tracing::info!("No findings from Stage 10, skipping Stage 11");
-            let final_output = serde_json::json!({
-                "findings": findings_json,
-                "dismissed_concerns": deduplicated_dismissed_concerns,
-                "review_inline": "No issues found.",
-                "fixes": "",
-                "concerns_count": all_concerns.len(),
-                "dismissed_concerns_count": deduplicated_dismissed_concerns
-                    .as_array()
-                    .map_or(0, Vec::len)
-            });
-            return Ok(WorkerResult {
-                output: Some(final_output),
-                error: None,
-                input_context: "Multi-stage execution completed".to_string(),
-                history: self.global_history.clone(),
-                history_before_pruning: self.global_history.clone(),
-                history_after_pruning: self.global_history.clone(),
-                tokens_in: total_tokens_in,
-                tokens_out: total_tokens_out,
-                tokens_cached: total_tokens_cached,
-            });
-        }
-
-        // Stage 11
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageStarted { stage: 11 });
-        }
-        info!("Running Stage 11");
-        let review_inline_text;
-        {
-            let stage = 11;
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
-            let system_prompt = shared_context.clone();
-            let findings_str = serde_json::to_string_pretty(&findings_json).unwrap_or_default();
-            let user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
-                stage_prompt, findings_str
-            );
-            let clean_user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
-                clean_stage_prompt, findings_str
-            );
-
-            let stage_impl = create_stage(stage);
-            let mut session = ReviewStageSession::new(
-                stage_impl,
-                system_prompt,
-                user_prompt,
-                clean_user_prompt,
-                self.tools.clone(),
-                self.temperature,
-                self.context_tag.as_deref(),
-            );
-            let runner = SessionRunner::new(self.provider.as_ref())
-                .with_max_validation_attempts(3)
-                .with_max_turns(self.max_interactions)
-                .with_turn_callback(move |turn, max_turns| {
-                    if let Some(progress_cb) = progress {
-                        progress_cb(WorkerProgressEvent::StageTurn {
-                            stage,
-                            turn,
-                            max_turns,
-                        });
-                    }
-                });
-            let result = runner.run(&mut session).await?;
-
-            total_tokens_in += result.usage.prompt_tokens as u32;
-            total_tokens_out += result.usage.completion_tokens as u32;
-            total_tokens_cached += result.usage.cached_tokens.unwrap_or(0) as u32;
-            self.global_history.extend(result.history);
-
-            review_inline_text = result.output.as_str().unwrap().to_string();
-        }
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageFinished { stage: 11 });
-        }
-
-        let fixes_text = String::new();
-        let dismissed_concerns_count = deduplicated_dismissed_concerns
-            .as_array()
-            .map_or(0, Vec::len);
+        let review_inline = if state.review_inline.is_empty() {
+            "No issues found.".to_string()
+        } else {
+            state.review_inline
+        };
 
         let final_output = json!({
-            "findings": findings_json,
-            "dismissed_concerns": deduplicated_dismissed_concerns,
-            "review_inline": review_inline_text,
-            "fixes": fixes_text,
-            "concerns_count": all_concerns.len(),
-            "dismissed_concerns_count": dismissed_concerns_count
+            "findings": state.findings,
+            "dismissed_concerns": dismissed_concerns,
+            "review_inline": review_inline,
+            "fixes": state.fixes,
+            "concerns_count": concerns_count,
+            "dismissed_concerns_count": dismissed_concerns_count,
         });
 
         Ok(WorkerResult {
@@ -1403,247 +745,64 @@ Example Output:
             history: self.global_history.clone(),
             history_before_pruning: self.global_history.clone(),
             history_after_pruning: self.global_history.clone(),
-            tokens_in: total_tokens_in,
-            tokens_out: total_tokens_out,
-            tokens_cached: total_tokens_cached,
-        })
-    }
-
-    async fn json_request(
-        &self,
-        label: &str,
-        req: AiRequest,
-        tokens: &mut (u32, u32, u32),
-        validate: impl Fn(&Value) -> Result<(), String>,
-    ) -> Option<Value> {
-        fn accumulate(tokens: &mut (u32, u32, u32), usage: &crate::ai::AiUsage) {
-            tokens.0 += usage.prompt_tokens as u32;
-            tokens.1 += usage.completion_tokens as u32;
-            tokens.2 += usage.cached_tokens.unwrap_or(0) as u32;
-        }
-
-        fn try_parse(
-            content: &str,
-            validate: &impl Fn(&Value) -> Result<(), String>,
-        ) -> Result<Value, String> {
-            let stripped = content.trim();
-            let stripped = stripped
-                .strip_prefix("```json")
-                .or_else(|| stripped.strip_prefix("```"))
-                .map(|s| s.strip_suffix("```").unwrap_or(s).trim())
-                .unwrap_or(stripped);
-            let v = serde_json::from_str::<Value>(stripped)
-                .map_err(|e| format!("JSON parse error: {}", e))?;
-            validate(&v)?;
-            Ok(v)
-        }
-
-        let retry_base = req.clone();
-        let resp = match self.provider.generate_content(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("{} completion failed: {}", label, e);
-                return None;
-            }
-        };
-        if resp.truncated {
-            warn!("{} completion truncated by provider limit", label);
-            return None;
-        }
-        if let Some(usage) = &resp.usage {
-            accumulate(tokens, usage);
-        }
-        let content = resp.content.as_deref().unwrap_or("");
-        match try_parse(content, &validate) {
-            Ok(v) => return Some(v),
-            Err(e) => {
-                warn!("{}: {}, retrying with correction", label, e);
-                let mut retry_req = retry_base;
-                retry_req.messages.push(AiMessage {
-                    role: AiRole::Assistant,
-                    content: Some(content.to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-                retry_req.messages.push(AiMessage {
-                    role: AiRole::User,
-                    content: Some(format!(
-                        "Your response is not valid: {}\nRespond with ONLY valid JSON conforming to the schema. No markdown, no explanation.",
-                        e
-                    )),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-                match self.provider.generate_content(retry_req).await {
-                    Ok(resp2) => {
-                        if resp2.truncated {
-                            warn!("{} retry completion truncated by provider limit", label);
-                            return None;
-                        }
-                        if let Some(usage) = &resp2.usage {
-                            accumulate(tokens, usage);
-                        }
-                        let content2 = resp2.content.as_deref().unwrap_or("");
-                        match try_parse(content2, &validate) {
-                            Ok(v) => {
-                                warn!("{} succeeded on retry (first attempt was invalid)", label);
-                                return Some(v);
-                            }
-                            Err(e2) => {
-                                warn!("{} failed on retry too: {}", label, e2);
-                            }
-                        }
-                    }
-                    Err(e2) => {
-                        warn!("{} retry request failed: {}", label, e2);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    async fn execute_stage(
-        &self,
-        stage: Box<dyn ReviewStage>,
-        system_prompt: String,
-        _clean_system_prompt: String,
-        progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
-    ) -> Result<StageExecutionResult> {
-        let stage_num = stage.number();
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageStarted { stage: stage_num });
-        }
-        info!("Running Stage {}", stage_num);
-        let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage_num).await?;
-
-        let format_guidance = r#"TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
-
-Once you have gathered sufficient information, return ONLY a JSON object with "concerns" and "dismissed_concerns" arrays.
-If you find no concerns and no dismissed concerns, return `{"concerns": [], "dismissed_concerns": []}`.
-If you find concerns, each must be an object with:
-- "type": A short category string.
-- "description": A clear description of the problem.
-- "reasoning": A step-by-step explanation.
-- "preexisting": A boolean value: `true` if this bug/vulnerability already existed in the codebase before these patches were applied, or `false` if the issue was newly introduced by the reviewed patchset.
-- "locations": An array of objects, each containing "file", "function_or_symbol", "line_range" (e.g., "120-125"), and "why_this_location_matters". Use `null` for "file", "function_or_symbol", or "line_range" when an issue is non-local or the exact value is not known. Do not invent line numbers; use `line_range: null` when the exact lines are not known and explain the triggering condition in "reasoning".
-
-Use the "dismissed_concerns" array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
-If you find dismissed_concerns, each must use the same item schema as concerns except that dismissed_concerns do not need the "preexisting" field:
-- "type": A short category string.
-- "description": The candidate concern that was investigated and disproved.
-- "reasoning": A step-by-step explanation of the evidence proving the candidate concern does not apply.
-- "locations": An array of objects, each containing "file", "function_or_symbol", "line_range" (e.g., "145-150"), and "why_this_location_matters". Use `null` for unknown values. Do not invent line numbers.
-
-CRITICAL REVIEW DIRECTIVE: Do NOT dismiss concerns just because you assume the surrounding system or caller handles it perfectly. Do not be overly charitable to the existing code. If there is a missing initialization, an unhandled edge case, or a brittle logic flow, report it as a concern immediately. Assume the worst-case scenario where external inputs and caller states are malformed.
-
-Example:
-```json
-{
-  "concerns": [
-    {
-      "type": "Issue Category",
-      "description": "What is wrong.",
-      "reasoning": "Why it is wrong.",
-      "preexisting": false,
-      "locations": [
-        {
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line_range": "120-125",
-          "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
-        }
-      ]
-    }
-  ],
-  "dismissed_concerns": [
-    {
-      "type": "Issue Category",
-      "description": "Possible missing cleanup when foo_init() fails after bar_alloc().",
-      "reasoning": "The concrete code path or ordering that proves this candidate concern does not apply.",
-      "locations": [
-        {
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line_range": "145-150",
-          "why_this_location_matters": "This is where the cleanup path proves the candidate leak does not apply."
-        }
-      ]
-    }
-  ]
-}
-```"#;
-
-        let user_prompt = format!("{}\n\n{}", stage_prompt, format_guidance);
-        let clean_user_prompt = format!("{}\n\n{}", clean_stage_prompt, format_guidance);
-
-        let mut session = ReviewStageSession::new(
-            stage,
-            system_prompt,
-            user_prompt,
-            clean_user_prompt,
-            self.tools.clone(),
-            self.temperature,
-            self.context_tag.as_deref(),
-        );
-
-        let runner = SessionRunner::new(self.provider.as_ref())
-            .with_max_validation_attempts(3)
-            .with_max_turns(self.max_interactions)
-            .with_turn_callback(move |turn, max_turns| {
-                if let Some(progress_cb) = progress {
-                    progress_cb(WorkerProgressEvent::StageTurn {
-                        stage: stage_num,
-                        turn,
-                        max_turns,
-                    });
-                }
-            });
-
-        let result = runner.run(&mut session).await?;
-
-        let mut concerns_out = Vec::new();
-        let mut dismissed_concerns_out = Vec::new();
-
-        if let Some(c) = result.output.get("concerns").and_then(|v| v.as_array()) {
-            concerns_out = c.clone();
-        }
-        if let Some(c) = result
-            .output
-            .get("dismissed_concerns")
-            .and_then(|v| v.as_array())
-        {
-            dismissed_concerns_out = c.clone();
-        }
-
-        if let Some(progress_cb) = progress {
-            progress_cb(WorkerProgressEvent::StageFinished { stage: stage_num });
-        }
-
-        Ok(StageExecutionResult {
-            stage: stage_num,
-            concerns: concerns_out,
-            dismissed_concerns: dismissed_concerns_out,
-            tokens_in: result.usage.prompt_tokens as u32,
-            tokens_out: result.usage.completion_tokens as u32,
-            tokens_cached: result.usage.cached_tokens.unwrap_or(0) as u32,
-            history: result.history,
+            tokens_in: outcome.tokens_in,
+            tokens_out: outcome.tokens_out,
+            tokens_cached: outcome.tokens_cached,
         })
     }
 }
 
-struct StageExecutionResult {
-    stage: u8,
-    concerns: Vec<Value>,
-    dismissed_concerns: Vec<Value>,
-    tokens_in: u32,
-    tokens_out: u32,
-    tokens_cached: u32,
-    history: Vec<AiMessage>,
+fn parse_stage_number(name: &str) -> Option<u8> {
+    if let Some(rest) = name.strip_prefix("stage_")
+        && let Some(num_str) = rest.split('_').next()
+    {
+        return num_str.parse().ok();
+    }
+    None
+}
+
+/// Run a single review stage through the shared `SessionRunner` machinery.
+///
+/// Additive helper used by the general pipeline executor (`crate::pipelines`).
+/// It constructs the module-private `ReviewStageSession` exactly like
+/// the legacy stage runner, so alternate pipelines reuse the identical tool
+/// loop, validation, and recitation handling.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_review_stage(
+    provider: &dyn AiProvider,
+    tools: std::sync::Arc<ToolBox>,
+    temperature: f32,
+    max_interactions: usize,
+    context_tag: Option<&str>,
+    stage: Box<dyn ReviewStage>,
+    system_prompt: String,
+    user_prompt: String,
+    clean_user_prompt: String,
+    progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+) -> Result<crate::ai::session::SessionResult<serde_json::Value>> {
+    let stage_num = stage.number();
+    let mut session = ReviewStageSession::new(
+        stage,
+        system_prompt,
+        user_prompt,
+        clean_user_prompt,
+        tools,
+        temperature,
+        context_tag,
+    );
+    let runner = SessionRunner::new(provider)
+        .with_max_validation_attempts(3)
+        .with_max_turns(max_interactions)
+        .with_turn_callback(move |turn, max_turns| {
+            if let Some(cb) = progress {
+                cb(WorkerProgressEvent::StageTurn {
+                    stage: stage_num,
+                    turn,
+                    max_turns,
+                });
+            }
+        });
+    runner.run(&mut session).await
 }
 
 pub fn calculate_series_range(
@@ -1678,6 +837,89 @@ pub fn calculate_series_range(
     }
 }
 
+pub fn build_follow_up_series_context(
+    series_range: Option<&str>,
+    patchset: &Value,
+    target_commit_sha: &str,
+) -> Option<String> {
+    let range = series_range?;
+    let end_sha = range.split("..").nth(1)?;
+    if end_sha.is_empty() {
+        return None;
+    }
+
+    let current_idx = patchset["patch_index"].as_i64().unwrap_or(1);
+    let patches = patchset["patches"].as_array()?;
+    let total_patches = patches.len();
+
+    let current_subject = patches
+        .iter()
+        .find(|p| p["index"].as_i64() == Some(current_idx))
+        .and_then(|p| p["subject"].as_str())
+        .unwrap_or("unknown");
+
+    let mut follow_ups = Vec::new();
+    for p in patches {
+        let idx = p["index"].as_i64().unwrap_or(0);
+        if idx > current_idx {
+            let subj = p["subject"].as_str().unwrap_or("");
+            let commit_id = p["commit_id"].as_str();
+            follow_ups.push((idx, commit_id, subj));
+        }
+    }
+
+    if follow_ups.is_empty() {
+        return None;
+    }
+
+    follow_ups.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut block = String::new();
+    block.push_str("\n\n=== Follow-Up Patches in Series ===\n");
+    block.push_str(&format!(
+        "Current Patch Under Review: [Patch {} of {}] - {}\n",
+        current_idx, total_patches, current_subject
+    ));
+    block.push_str(&format!("Series End Commit (Final State): {}\n\n", end_sha));
+    block.push_str("Subsequent patches in this series:\n");
+
+    for (idx, commit_id, subj) in follow_ups {
+        if let Some(sha) = commit_id {
+            block.push_str(&format!(
+                "- [Patch {} of {}] (commit {}): {}\n",
+                idx, total_patches, sha, subj
+            ));
+        } else {
+            block.push_str(&format!(
+                "- [Patch {} of {}]: {}\n",
+                idx, total_patches, subj
+            ));
+        }
+    }
+
+    let diff_directive = if target_commit_sha != "unknown" && !target_commit_sha.is_empty() {
+        format!(
+            "Use tools (e.g., git_diff with base_revision=\"{}\", target_revision=\"{}\", or git_read_files with revision=\"{}\") to inspect the final code state at the end of the series.",
+            target_commit_sha, end_sha, end_sha
+        )
+    } else {
+        format!(
+            "Use tools (e.g., git_diff with target_revision=\"{}\", or git_read_files with revision=\"{}\") to inspect the final code state at the end of the series.",
+            end_sha, end_sha
+        )
+    };
+
+    block.push_str("\nSERIES VERIFICATION DIRECTIVE:\n");
+    block.push_str(&format!(
+        "Verify if any candidate concern raised against this patch is fixed, refactored, or resolved in the subsequent patches listed above. {} If a concern is resolved by follow-up patches in this series, discard it as a false positive.\n",
+        diff_directive
+    ));
+    block.push_str("===================================\n");
+
+    Some(block)
+}
+
+#[cfg(test)]
 fn append_stage_items(
     target: &mut Vec<Value>,
     items: &[Value],
@@ -1692,10 +934,12 @@ fn append_stage_items(
     }
 }
 
+#[cfg(test)]
 fn append_stage_dismissed_concerns(target: &mut Vec<Value>, items: &[Value], stage: u8) {
     append_stage_items(target, items, stage, "General", "description");
 }
 
+#[cfg(test)]
 fn normalize_stage_item(
     item: &Value,
     stage: u8,
@@ -1905,6 +1149,8 @@ impl LlmSession for ReviewStageSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::AiRole;
+    use crate::worker::stage::create_stage;
 
     #[test]
     fn test_append_stage_dismissed_concerns_preserves_category_type() {
@@ -2083,6 +1329,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_follow_up_series_context_none_when_no_range() {
+        let patchset = serde_json::json!({
+            "patch_index": 1,
+            "patches": [{
+                "index": 1,
+                "subject": "Single patch",
+                "commit_id": "sha1"
+            }]
+        });
+        assert_eq!(
+            build_follow_up_series_context(None, &patchset, "sha1"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_build_follow_up_series_context_none_when_last_patch() {
+        let patchset = serde_json::json!({
+            "patch_index": 2,
+            "patches": [
+                { "index": 1, "subject": "Patch 1", "commit_id": "sha1" },
+                { "index": 2, "subject": "Patch 2", "commit_id": "sha2" }
+            ]
+        });
+        assert_eq!(
+            build_follow_up_series_context(Some("base..sha2"), &patchset, "sha2"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_build_follow_up_series_context_intermediate_patch() {
+        let patchset = serde_json::json!({
+            "patch_index": 1,
+            "patches": [
+                { "index": 1, "subject": "net: add foo API", "commit_id": "sha1" },
+                { "index": 2, "subject": "net: add caller for foo", "commit_id": "sha2" },
+                { "index": 3, "subject": "net: add docs for foo", "commit_id": "sha3" }
+            ]
+        });
+        let ctx = build_follow_up_series_context(Some("base..sha3"), &patchset, "sha1");
+        assert!(ctx.is_some());
+        let content = ctx.unwrap();
+        assert!(content.contains("Current Patch Under Review: [Patch 1 of 3] - net: add foo API"));
+        assert!(content.contains("Series End Commit (Final State): sha3"));
+        assert!(content.contains("- [Patch 2 of 3] (commit sha2): net: add caller for foo"));
+        assert!(content.contains("- [Patch 3 of 3] (commit sha3): net: add docs for foo"));
+        assert!(!content.contains("- [Patch 1 of 3]"));
+        assert!(content.contains("SERIES VERIFICATION DIRECTIVE:"));
+        assert!(content.contains("base_revision=\"sha1\""));
+        assert!(content.contains("target_revision=\"sha3\""));
+        assert!(content.contains("git_read_files with revision=\"sha3\""));
+    }
+
+    #[test]
+    fn test_build_follow_up_series_context_unordered_patches() {
+        let patchset = serde_json::json!({
+            "patch_index": 1,
+            "patches": [
+                { "index": 3, "subject": "Patch 3", "commit_id": "sha3" },
+                { "index": 1, "subject": "Patch 1", "commit_id": "sha1" },
+                { "index": 2, "subject": "Patch 2", "commit_id": "sha2" }
+            ]
+        });
+        let ctx = build_follow_up_series_context(Some("base..sha3"), &patchset, "sha1");
+        assert!(ctx.is_some());
+        let content = ctx.unwrap();
+        let p2_pos = content.find("Patch 2 of 3").unwrap();
+        let p3_pos = content.find("Patch 3 of 3").unwrap();
+        assert!(
+            p2_pos < p3_pos,
+            "Patch 2 should appear before Patch 3 in follow-up list"
+        );
+    }
+
+    #[test]
+    fn test_build_follow_up_series_context_unknown_target_sha() {
+        let patchset = serde_json::json!({
+            "patch_index": 1,
+            "patches": [
+                { "index": 1, "subject": "Patch 1" },
+                { "index": 2, "subject": "Patch 2", "commit_id": "sha2" }
+            ]
+        });
+        let ctx = build_follow_up_series_context(Some("base..sha2"), &patchset, "unknown");
+        assert!(ctx.is_some());
+        let content = ctx.unwrap();
+        assert!(!content.contains("base_revision=\"unknown\""));
+        assert!(content.contains("target_revision=\"sha2\""));
+    }
+
     struct MockProviderAlwaysFails;
     #[async_trait::async_trait]
     impl crate::ai::AiProvider for MockProviderAlwaysFails {
@@ -2117,6 +1455,7 @@ mod tests {
             max_interactions: 3,
             temperature: 0.0,
             series_range: None,
+            baseline_sha: None,
             custom_prompt: None,
             stages: None,
         };
@@ -2464,6 +1803,7 @@ mod tests {
             max_interactions: 3,
             temperature: 0.0,
             series_range: None,
+            baseline_sha: None,
             custom_prompt: None,
             stages: Some(vec![1]),
         };
@@ -2479,5 +1819,204 @@ mod tests {
         if let Err(e) = &res {
             panic!("Expected run to succeed, got error: {:?}", e);
         }
+    }
+
+    #[tokio::test]
+    async fn test_baseline_sha_in_worker_context_when_single_patch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = std::sync::Arc::new(MockBlockedProvider {
+            attempts: AtomicUsize::new(0),
+        });
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let config = WorkerConfig {
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: Some("explicit_baseline_sha".to_string()),
+            custom_prompt: None,
+            stages: Some(vec![1]),
+        };
+        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;", "commit_id": "target_sha"}]
+        });
+
+        let res = worker.run(patchset, None).await;
+        assert!(res.is_ok());
+        let worker_res = res.unwrap();
+        assert!(!worker_res.history.is_empty());
+        // System prompt contains the Active Git Metadata:
+        let sys_content = worker_res.history[0].content.as_deref().unwrap_or_default();
+        assert!(sys_content.contains("Baseline SHA: explicit_baseline_sha"));
+        assert!(sys_content.contains("Target Commit SHA: target_sha"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_patch_worker_context_only_contains_target_patch_diff() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = std::sync::Arc::new(MockBlockedProvider {
+            attempts: AtomicUsize::new(0),
+        });
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let config = WorkerConfig {
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: Some("base_sha..sha2".to_string()),
+            baseline_sha: Some("base_sha".to_string()),
+            custom_prompt: None,
+            stages: Some(vec![1]),
+        };
+        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+
+        let patchset = serde_json::json!({
+            "id": 100,
+            "patch_index": 1,
+            "patches": [
+                {
+                    "index": 1,
+                    "subject": "Patch 1 Subject",
+                    "diff": "diff --git a/file1.c b/file1.c\n+int patch1_unique_symbol;",
+                    "commit_id": "sha1"
+                },
+                {
+                    "index": 2,
+                    "subject": "Patch 2 Subject",
+                    "diff": "diff --git a/file2.c b/file2.c\n+int patch2_unique_symbol;",
+                    "commit_id": "sha2"
+                }
+            ]
+        });
+
+        let res = worker.run(patchset, None).await;
+        assert!(res.is_ok());
+        let worker_res = res.unwrap();
+        assert!(!worker_res.history.is_empty());
+        let sys_content = worker_res.history[0].content.as_deref().unwrap_or_default();
+        assert!(sys_content.contains("Target Commit SHA: sha1"));
+        assert!(sys_content.contains("patch1_unique_symbol"));
+        assert!(!sys_content.contains("patch2_unique_symbol"));
+    }
+
+    struct MockMultiStageSeriesProvider;
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for MockMultiStageSeriesProvider {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            let last_user = request
+                .messages
+                .iter()
+                .rfind(|m| m.role == crate::ai::AiRole::User)
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or_default();
+
+            let content = if last_user.contains("# Stage 1.") || last_user.contains("# Stage 8.") {
+                r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
+            } else if last_user.contains("# Stage 9.") {
+                r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
+            } else if last_user.contains("# Stage 10.") {
+                r#"{"findings": []}"#
+            } else {
+                r#"{"concerns": [], "dismissed_concerns": []}"#
+            };
+
+            Ok(crate::ai::AiResponse {
+                content: Some(content.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stage_10_log_history_contains_follow_up_series_context() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = std::sync::Arc::new(MockMultiStageSeriesProvider);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let config = WorkerConfig {
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: Some("base_sha..sha2".to_string()),
+            baseline_sha: Some("base_sha".to_string()),
+            custom_prompt: None,
+            stages: Some(vec![1]),
+        };
+        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+
+        let patchset = serde_json::json!({
+            "id": 200,
+            "patch_index": 1,
+            "patches": [
+                {
+                    "index": 1,
+                    "subject": "Patch 1 Subject",
+                    "diff": "diff --git a/file1.c b/file1.c\n+int patch1;",
+                    "commit_id": "sha1"
+                },
+                {
+                    "index": 2,
+                    "subject": "Patch 2 Subject",
+                    "diff": "diff --git a/file2.c b/file2.c\n+int patch2;",
+                    "commit_id": "sha2"
+                }
+            ]
+        });
+
+        let res = worker.run(patchset, None).await;
+        assert!(res.is_ok());
+        let worker_res = res.unwrap();
+        assert!(!worker_res.history.is_empty());
+
+        let stage10_user_msg = worker_res
+            .history
+            .iter()
+            .find(|m| {
+                m.role == crate::ai::AiRole::User
+                    && m.content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("# Stage 10.")
+            })
+            .expect("Stage 10 user message should be in history");
+
+        let content = stage10_user_msg.content.as_deref().unwrap();
+        assert!(content.contains("=== Follow-Up Patches in Series ==="));
+        assert!(content.contains("Series End Commit (Final State): sha2"));
+        assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
+        assert!(content.contains("SERIES VERIFICATION DIRECTIVE:"));
     }
 }

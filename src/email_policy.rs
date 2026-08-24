@@ -594,4 +594,12 @@ mod tests {
         let net = config.subsystems.get("net").expect("net missing");
         assert_eq!(net.patchwork.fail_severity, "Critical");
     }
+
+    #[test]
+    fn test_production_policy_is_valid() {
+        let path = "sashiko.dev/email_policy.toml";
+        if std::path::Path::new(path).exists() {
+            let _ = EmailPolicyConfig::load(path).expect("Production email policy failed to parse");
+        }
+    }
 }

@@ -56,8 +56,13 @@ data:
     server {
         listen 8080;
         server_name localhost;
+        location = /health {
+            return 200 "OK\n";
+            add_header Content-Type text/plain;
+        }
         location / {
             root /usr/share/nginx/html;
+            try_files $uri $uri/ /index.html;
             index index.html;
             add_header Last-Modified "";
             add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0";

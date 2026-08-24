@@ -2181,9 +2181,6 @@
                     <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
                 </a>`;
 
-                let totalTokens = 0;
-                reviews.forEach(r => totalTokens += (r.tokens_in || 0) + (r.tokens_out || 0) + (r.tokens_cached || 0));
-
                 const borderStyle = '';
 
                 let statusHtml = '';
@@ -2356,7 +2353,9 @@
 
             const modelName = data.model_name || '-';
             const providerModel = data.provider ? `${data.provider}/${modelName}` : modelName;
-            const promptsHash = data.prompts_git_hash ? data.prompts_git_hash.substring(0, 8) : '-';
+            const promptsHash = (data.prompts_git_hash || config.git_hash || config.version)
+                ? (data.prompts_git_hash || config.git_hash || config.version).substring(0, 8)
+                : '-';
             
             let baselineStr = '-';
             if (data.baseline) {
@@ -2837,7 +2836,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!res.ok) throw new Error('Review not found');
             const data = await res.json();
 
-            const totalTokens = (data.tokens_in || 0) + (data.tokens_out || 0) + (data.tokens_cached || 0);
             let logs = [];
             if (Array.isArray(data.logs)) {
                 logs = data.logs;
@@ -2911,7 +2909,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <h1>
                     <span>Interaction Log</span>
                      <span class="header-subtitle">
-                        ${data.model || '?'} · ${data.prompts_hash ? 'Sashiko ver.: ' + data.prompts_hash.substring(0, 8) + ' · ' : ''}
+                        ${(() => {
+                            const ver = data.prompts_hash || config.git_hash || config.version;
+                            return ver ? 'Sashiko ver.: ' + ver.substring(0, 8) + ' · ' : '';
+                        })()}
                         <span class="status-badge status-${(data.status || '').replace(/ /g, '')}">${data.status}</span>
                     </span>
                 </h1>
@@ -3228,7 +3229,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     return !['pending', 'inreview'].includes(s) && !s.includes('failedtoapply');
                 });
 
-                const totalTokensIn = tokenReviews.reduce((acc, r) => acc + (r.tokens_in || 0), 0);
+                // tokens_in counts the cached prefix, so subtract it here to
+                // keep the two cards from reporting the same tokens twice.
+                const totalTokensIn = tokenReviews.reduce((acc, r) => acc + Math.max(0, (r.tokens_in || 0) - (r.tokens_cached || 0)), 0);
                 const totalTokensOut = tokenReviews.reduce((acc, r) => acc + (r.tokens_out || 0), 0);
                 const totalTokensCached = tokenReviews.reduce((acc, r) => acc + (r.tokens_cached || 0), 0);
                 

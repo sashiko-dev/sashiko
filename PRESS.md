@@ -8,6 +8,9 @@ Direct discussions and feedback from the Linux kernel community.
 > "But I think that lately quite a noticeable percentage of reports have become very much valid. As you say, Sashiko tends to be quite good. Even when it flags something unnecessarily and there's no actual problem, there's likely to be a reason for the question. And we've seen some truly stellar reports too. Things that are deep and subtle, and the AI is 100% correct. So anybody who thinks that all AI is slop is in denial about the current state."
 > — *[Linus Torvalds](https://lore.kernel.org/all/CAHk-=wi_drr4Ls9KtXW1k8L2FUDF0YdnyjvKmPgLXHDFnnRWEg@mail.gmail.com/)*
 
+> "Now, I think the other side of AI - and this is where Sashiko comes in - is that it basically does end up being a tool that can then increase the trust in the patch. So AI giveth, and AI taketh away. But the basic issue shouldn't be AI per se, it should be that notion of 'trust'. And yes, some maintainers will then trust tools like Sashiko more than others. And that's perfectly fine."
+> — *[Linus Torvalds](https://lore.kernel.org/all/CAHk-=wgbGarE7Ozw4VG6oUKDj9pk-8DRoDiX00bo1MwEMm9UWQ@mail.gmail.com/)*
+
 > "Rule #1 is, surely, 'don't add bugs'. This thing finds bugs. If its hit rate is 50% then that's plenty high enough to justify people spending time to go through and check its output. [...] That's a really high hit rate! How can we possibly not use this, if we care about Rule #1?"
 > — *[Andrew Morton](https://lore.kernel.org/all/20260323170537.0aee4e4906169db510e9893c@linux-foundation.org/)*
 
@@ -23,6 +26,7 @@ In-depth coverage from the premier Linux news source.
 * [Reviewing kernel patches with LLMs](https://lwn.net/Articles/1073583/)
 * [Dirk and Linus discuss AI and kernel development](https://lwn.net/Articles/1073761/)
 * [Debating the role of large language models in the kernel community](https://lwn.net/Articles/1083275/)
+* [Development statistics for the 7.2 kernel](https://lwn.net/Articles/1088776/)
 
 ## The Linux Foundation
 * [Linux Foundation on X](https://x.com/linuxfoundation/status/2036497032429305989)

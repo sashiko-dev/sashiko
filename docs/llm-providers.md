@@ -240,6 +240,10 @@ subscription -- no per-token charge, no API key.
 cp docs/examples/Settings.codex-cli.toml Settings.toml
 ```
 
+For OpenAI's coding-optimized model, use
+`docs/examples/Settings.gpt-5-codex.toml` instead (same backend,
+`model = "gpt-5-codex"`).
+
 **What you get:**
 
 - Runs `codex exec --json --sandbox read-only` as a stateless backend
@@ -267,6 +271,59 @@ Copy `examples/Settings.devin-cli.toml` to your `Settings.toml` and adjust as ne
 - Each review may spawn many `devin` processes. Lower `review.concurrency`
   if you hit subscription rate limits.
 
+## Ollama
+
+[Ollama](https://ollama.com/) allows running LLMs locally.
+
+**Prerequisites:** Install Ollama and pull your desired model (e.g., `ollama pull deepseek-v3`).
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.ollama.toml Settings.toml
+```
+
+**What you get:**
+
+- Private, local execution of LLMs
+- Support for reasoning models via the `think` setting
+- No API key or subscription required
+- `context_window_size` maps to Ollama's `num_ctx`
+
+## vLLM
+
+[vLLM](https://docs.vllm.ai/) serves local models behind an
+OpenAI-compatible API.
+
+**Prerequisites:** Start a vLLM server, e.g.:
+
+```bash
+vllm serve Qwen/Qwen3-8B --max-model-len 32768 --host 0.0.0.0 --port 8000
+```
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.vllm.toml Settings.toml
+```
+
+**What you get:**
+
+- Private, local execution of LLMs
+- Reasoning model support: `<think>` blocks and `reasoning_content` are
+  separated from the answer automatically, and thinking can be toggled via
+  the `enable_thinking` setting
+- Leaving `max_tokens` unset lets vLLM generate up to the remaining context,
+  which is useful for servers running with a small `--max-model-len`
+- Optional `guided_json` setting to enforce JSON responses through guided
+  decoding on backends that support it
+- Optional `enable_tools` setting to forward tool definitions; requires a
+  server started with `--enable-auto-tool-choice` and `--tool-call-parser`
+- If the server was started with `--api-key`, export it as `VLLM_API_KEY`
+  (or `LLM_API_KEY`)
+
+Set `context_window_size` to match the server's `--max-model-len`.
+
 ## OpenAI-Compatible Providers
 
 Sashiko includes an OpenAI-compatible provider for endpoints that
@@ -279,3 +336,53 @@ cp docs/examples/Settings.openai-compat.toml Settings.toml
 ```
 
 Adjust `base_url` to point to your provider's endpoint.
+
+`base_url` may be either:
+
+- a shorthand such as `http://localhost:8080/v1` (the `/chat/completions`
+  suffix is appended automatically), or
+- the full chat completions URL, e.g.
+  `https://api.z.ai/api/coding/paas/v4/chat/completions`. Use this form for
+  providers whose path is not a recognised shorthand.
+
+**z.ai / Zhipu (glm-*) example:**
+
+z.ai exposes two OpenAI-compatible gateways with **separate billing**: a
+direct API (`…/api/paas/v4/…`, billed to the API resource package) and a
+coding-plan gateway (`…/api/coding/paas/v4/…`, billed to the coding-plan
+subscription). To review against the coding-plan quota, point `base_url` at
+the full coding endpoint and set `LLM_API_KEY` (or `OPENAI_API_KEY`):
+
+```toml
+[ai]
+provider = "openai-compatible"
+model = "glm-5.2"
+
+[ai.openai_compat]
+base_url = "https://api.z.ai/api/coding/paas/v4/chat/completions"
+context_window_size = 128000
+max_tokens = 16384
+```
+
+**OrcaRouter example:**
+
+[OrcaRouter](https://www.orcarouter.ai) is an OpenAI-compatible gateway to
+models from OpenAI, Anthropic, Google, and other providers behind a single
+endpoint and API key. Point `base_url` at `https://api.orcarouter.ai/v1` and
+use a namespaced model id such as `openai/gpt-4o-mini`:
+
+```toml
+[ai]
+provider = "openai-compatible"
+model = "openai/gpt-4o-mini"
+
+[ai.openai_compat]
+base_url = "https://api.orcarouter.ai/v1"
+context_window_size = 128000
+max_tokens = 16384
+```
+
+For OpenAI's own API with an API key (rather than a self-hosted
+compatible endpoint), use `docs/examples/Settings.openai-api.toml`:
+set `provider = "openai"`, `model = "gpt-5.6-sol"`, and export
+`OPENAI_API_KEY`.

@@ -17,7 +17,7 @@ use crate::email_policy::EmailPolicyConfig;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 pub struct PatchworkWorker {
     db: Arc<Database>,
@@ -40,13 +40,8 @@ impl PatchworkWorker {
     /// from the config file (and SASHIKO_PATCHWORK_TOKEN env var) at
     /// delivery time.
     fn resolve_token(&self, api_url: &str) -> Option<String> {
-        let config = match EmailPolicyConfig::load(&self.email_policy_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to load email policy for token resolution: {}", e);
-                return None;
-            }
-        };
+        let config = EmailPolicyConfig::load(&self.email_policy_path)
+            .expect("Failed to load email policy for token resolution");
 
         // Check subsystem policies for a matching api_url
         for sub in config.subsystems.values() {

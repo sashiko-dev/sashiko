@@ -163,8 +163,11 @@ impl GitReadFilesTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        let start_line = start_line.map(|s| s.clamp(1, total_lines));
-        let end_line = end_line.map(|e| e.clamp(1, total_lines));
+        // total_lines is 0 for an empty file, and clamp() panics when its
+        // lower bound exceeds its upper one. The bounds below already handle
+        // the empty case; this pre-clamp only has to avoid tripping over it.
+        let start_line = start_line.map(|s| s.clamp(1, total_lines.max(1)));
+        let end_line = end_line.map(|e| e.clamp(1, total_lines.max(1)));
 
         let (start, end) = match (start_line, end_line) {
             (Some(s), Some(e)) => (s.max(1) - 1, e.min(total_lines)),

@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
 use sashiko::settings::Settings;
+use sashiko::utils::utf8_prefix;
 use serde_json::{Value, from_str};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -225,16 +226,21 @@ async fn main() -> Result<()> {
         .unwrap();
 
     // Load settings, falling back to defaults if file missing/invalid
-    let base_url = cli.server.unwrap_or_else(|| {
-        Settings::new()
-            .map(|s| {
-                if s.server.host.contains(':') {
-                    format!("http://[::1]:{}", s.server.port)
-                } else {
-                    format!("http://{}:{}", s.server.host, s.server.port)
-                }
-            })
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+    let base_url = cli.server.unwrap_or_else(|| match Settings::new() {
+        Ok(s) => {
+            if s.server.host.contains(':') {
+                format!("http://[::1]:{}", s.server.port)
+            } else {
+                format!("http://{}:{}", s.server.host, s.server.port)
+            }
+        }
+        Err(e) => {
+            if e.to_string().contains("not found") {
+                "http://127.0.0.1:8080".to_string()
+            } else {
+                panic!("Failed to parse Settings.toml: {}", e);
+            }
+        }
     });
 
     let client = Client::new();
@@ -556,11 +562,7 @@ async fn handle_list(
                     print_colored(status_color, &format!("{:<18}", status_str));
 
                     let subject = item.subject.unwrap_or_else(|| "(no subject)".to_string());
-                    let subject_display = if subject.len() > 48 {
-                        format!("{}...", &subject[..45])
-                    } else {
-                        subject
-                    };
+                    let subject_display = format_subject(&subject);
 
                     let date_display = if let Some(ts) = item.date {
                         format_timestamp(ts)
@@ -587,6 +589,14 @@ async fn handle_list(
     }
 
     Ok(())
+}
+
+fn format_subject(subject: &str) -> String {
+    if subject.len() > 48 {
+        format!("{}...", utf8_prefix(subject, 45))
+    } else {
+        subject.to_string()
+    }
 }
 
 fn review_has_issues(review: &Value) -> bool {
@@ -2027,6 +2037,13 @@ fn format_timestamp(ts: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_format_subject_handles_multibyte_cutoff() {
+        let subject = format!("{}🙂rest", "a".repeat(44));
+
+        assert_eq!(format_subject(&subject), format!("{}...", "a".repeat(44)));
+    }
 
     #[test]
     fn test_count_severities_mixed() {

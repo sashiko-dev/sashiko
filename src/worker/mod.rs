@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod compressor;
 pub mod email;
+pub mod kernel_workflow;
 pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;

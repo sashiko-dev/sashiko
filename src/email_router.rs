@@ -421,6 +421,50 @@ mod tests {
     }
 
     #[test]
+    fn test_author_only_delivery() {
+        // A subsystem that tracks its list but sends the review only to the
+        // patch author: reply_all=false strips the list, reply_to_author adds
+        // the author, cc_individuals=false drops non-list individuals.
+        let mut subsystems = HashMap::new();
+        subsystems.insert(
+            "drm-intel".to_string(),
+            SubsystemPolicy {
+                lists: vec!["intel-xe@lists.freedesktop.org".to_string()],
+                reply_all: false,
+                reply_to_author: true,
+                cc_individuals: false,
+                mute_all: false,
+                ..Default::default()
+            },
+        );
+        let policy = EmailPolicyConfig {
+            defaults: SubsystemPolicy {
+                reply_all: false,
+                reply_to_author: false,
+                cc_individuals: false,
+                mute_all: false,
+                ..Default::default()
+            },
+            subsystems,
+        };
+        let action = EmailRouter::resolve_recipients(
+            &policy,
+            &["intel-xe@lists.freedesktop.org".to_string()],
+            &["maintainer@test.com".to_string()],
+            "author@test.com",
+            "bot@sashiko.dev",
+        );
+        match action {
+            Action::Send { to, cc, .. } => {
+                assert!(to.contains(&"author@test.com".to_string()));
+                assert!(!to.contains(&"intel-xe@lists.freedesktop.org".to_string()));
+                assert!(cc.is_empty(), "non-list individuals should be dropped");
+            }
+            Action::Mute => panic!("Should not mute"),
+        }
+    }
+
+    #[test]
     fn test_defaults() {
         let policy = build_test_policy();
         // Unknown list -> defaults apply (private, reply_to_author=true, cc_individuals=true)

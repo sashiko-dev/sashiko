@@ -1,0 +1,9 @@
+[ai]
+provider = "ollama"
+model = "deepseek-v3"
+max_input_tokens = 32768
+
+[ai.ollama]
+base_url = "http://localhost:11434"
+context_window_size = 32768
+think = "medium"

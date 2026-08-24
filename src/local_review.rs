@@ -16,7 +16,10 @@ use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
-    worker::{PatchInput, ReviewInput, Worker, WorkerConfig, prompts::PromptRegistry},
+    worker::{
+        PatchInput, ReviewInput, Worker, WorkerConfig, calculate_series_range,
+        prompts::PromptRegistry,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use futures::stream::StreamExt;
@@ -414,6 +417,7 @@ async fn review_single_patch(
     patchset_id: i64,
     subject: &str,
     p: &PatchInput,
+    all_patches: &[PatchInput],
     rich_patches: &[Value],
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
@@ -482,10 +486,12 @@ async fn review_single_patch(
         }
 
         let prompts = PromptRegistry::new(options.prompts.clone());
-        let series_range = patch_shas
-            .get(&p.index)
-            .filter(|sha| sha.as_str() != baseline_sha)
-            .map(|sha| format!("{}..{}", baseline_sha, sha));
+        let series_range = calculate_series_range(
+            all_patches,
+            std::slice::from_ref(p),
+            patch_shas,
+            baseline_sha,
+        );
 
         let mut worker = Worker::new(
             provider,
@@ -497,6 +503,7 @@ async fn review_single_patch(
                 temperature: ai.temperature,
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
+                baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
             },
         );
@@ -551,7 +558,8 @@ async fn review_single_patch(
             "id": patchset_id,
             "subject": subject,
             "patches": rich_patches,
-            "patch_index": Some(p.index)
+            "patch_index": Some(p.index),
+            "baseline": baseline_sha
         });
 
         match worker
@@ -784,7 +792,7 @@ async fn run_worker_in_worktree(
         },
     );
 
-    let rich_patches: Vec<Value> = patches_to_review
+    let rich_patches: Vec<Value> = patches
         .iter()
         .map(|p| {
             let date_str = if let Some(ts) = p.date {
@@ -815,6 +823,7 @@ async fn run_worker_in_worktree(
         let patch_shas = &patch_shas;
         let options = &options;
         let subject_clone = subject.clone();
+        let all_patches = &patches;
         async move {
             review_single_patch(
                 worktree,
@@ -822,6 +831,7 @@ async fn run_worker_in_worktree(
                 patchset_id,
                 &subject_clone,
                 p,
+                all_patches,
                 &rich_patches,
                 patch_shas,
                 options,
@@ -889,7 +899,10 @@ async fn run_worker_in_worktree(
             if !combined_inline.is_empty() {
                 combined_inline.push_str("\n\n");
             }
-            combined_inline.push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+            if patches_to_review.len() > 1 {
+                combined_inline
+                    .push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+            }
             combined_inline.push_str(inline.trim());
         }
 
@@ -1312,5 +1325,217 @@ mod tests {
         assert!(std::fs::read_to_string(worktree.path.join("file.txt"))?.contains("Change"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_series_range_in_local_review() {
+        let p1 = PatchInput {
+            index: 1,
+            diff: "diff1".to_string(),
+            subject: Some("Patch 1".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha1".to_string()),
+        };
+        let p2 = PatchInput {
+            index: 2,
+            diff: "diff2".to_string(),
+            subject: Some("Patch 2".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha2".to_string()),
+        };
+        let all_patches = vec![p1.clone(), p2.clone()];
+        let mut patch_shas = HashMap::new();
+        patch_shas.insert(1, "sha1".to_string());
+        patch_shas.insert(2, "sha2".to_string());
+
+        let range_p1 = calculate_series_range(
+            &all_patches,
+            std::slice::from_ref(&p1),
+            &patch_shas,
+            "baseline_sha",
+        );
+        assert_eq!(range_p1, Some("baseline_sha..sha2".to_string()));
+
+        let range_p2 = calculate_series_range(
+            &all_patches,
+            std::slice::from_ref(&p2),
+            &patch_shas,
+            "baseline_sha",
+        );
+        assert_eq!(range_p2, None);
+    }
+
+    #[test]
+    fn test_rich_patches_and_follow_up_context_with_patch_index_filter() {
+        use crate::worker::build_follow_up_series_context;
+
+        let p1 = PatchInput {
+            index: 1,
+            diff: "diff1".to_string(),
+            subject: Some("Patch 1".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha1".to_string()),
+        };
+        let p2 = PatchInput {
+            index: 2,
+            diff: "diff2".to_string(),
+            subject: Some("Patch 2".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha2".to_string()),
+        };
+        let all_patches = vec![p1.clone(), p2.clone()];
+        let mut patch_shas = HashMap::new();
+        patch_shas.insert(1, "sha1".to_string());
+        patch_shas.insert(2, "sha2".to_string());
+
+        // When reviewing only patch 1 with index filter:
+        let rich_patches: Vec<Value> = all_patches
+            .iter()
+            .map(|p| {
+                json!({
+                    "index": p.index,
+                    "subject": p.subject,
+                    "author": p.author,
+                    "commit_id": patch_shas.get(&p.index).cloned(),
+                })
+            })
+            .collect();
+
+        let patchset_val = json!({
+            "id": 100,
+            "subject": "Series Subject",
+            "patches": rich_patches,
+            "patch_index": Some(1),
+            "baseline": "baseline_sha"
+        });
+
+        let range = calculate_series_range(
+            &all_patches,
+            std::slice::from_ref(&p1),
+            &patch_shas,
+            "baseline_sha",
+        );
+        assert_eq!(range, Some("baseline_sha..sha2".to_string()));
+
+        let context = build_follow_up_series_context(range.as_deref(), &patchset_val, "sha1");
+        assert!(context.is_some());
+        let ctx_str = context.unwrap();
+        assert!(ctx_str.contains("Current Patch Under Review: [Patch 1 of 2] - Patch 1"));
+        assert!(ctx_str.contains("Series End Commit (Final State): sha2"));
+        assert!(ctx_str.contains("- [Patch 2 of 2] (commit sha2): Patch 2"));
+    }
+
+    #[test]
+    fn test_inline_review_aggregation_single_and_multi_patch() {
+        let single_patch = [PatchInput {
+            index: 1,
+            diff: "diff1".to_string(),
+            subject: Some("[PATCH 1/1] test single".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: None,
+        }];
+        let single_res = [json!({
+            "patch_index": 1,
+            "inline_review": "> +int x;\n+Use unsigned int instead.",
+        })];
+
+        let mut combined_single = String::new();
+        for res in &single_res {
+            let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+            let patch_subject = single_patch
+                .iter()
+                .find(|p| p.index == p_idx)
+                .and_then(|p| p.subject.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(inline) = res["inline_review"].as_str()
+                && !inline.trim().is_empty()
+                && inline.trim() != "No issues found."
+            {
+                if !combined_single.is_empty() {
+                    combined_single.push_str("\n\n");
+                }
+                if single_patch.len() > 1 {
+                    combined_single
+                        .push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+                }
+                combined_single.push_str(inline.trim());
+            }
+        }
+        assert_eq!(combined_single, "> +int x;\n+Use unsigned int instead.");
+        assert!(!combined_single.contains("--- Patch [1]:"));
+
+        let multi_patches = [
+            PatchInput {
+                index: 1,
+                diff: "diff1".to_string(),
+                subject: Some("[PATCH 1/2] test first".to_string()),
+                author: None,
+                date: None,
+                message_id: None,
+                commit_id: None,
+            },
+            PatchInput {
+                index: 2,
+                diff: "diff2".to_string(),
+                subject: Some("[PATCH 2/2] test second".to_string()),
+                author: None,
+                date: None,
+                message_id: None,
+                commit_id: None,
+            },
+        ];
+        let multi_res = [
+            json!({
+                "patch_index": 1,
+                "inline_review": "Comment on patch 1",
+            }),
+            json!({
+                "patch_index": 2,
+                "inline_review": "Comment on patch 2",
+            }),
+        ];
+
+        let mut combined_multi = String::new();
+        for res in &multi_res {
+            let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+            let patch_subject = multi_patches
+                .iter()
+                .find(|p| p.index == p_idx)
+                .and_then(|p| p.subject.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(inline) = res["inline_review"].as_str()
+                && !inline.trim().is_empty()
+                && inline.trim() != "No issues found."
+            {
+                if !combined_multi.is_empty() {
+                    combined_multi.push_str("\n\n");
+                }
+                if multi_patches.len() > 1 {
+                    combined_multi
+                        .push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+                }
+                combined_multi.push_str(inline.trim());
+            }
+        }
+        assert!(
+            combined_multi
+                .contains("--- Patch [1]: [PATCH 1/2] test first ---\nComment on patch 1")
+        );
+        assert!(
+            combined_multi
+                .contains("--- Patch [2]: [PATCH 2/2] test second ---\nComment on patch 2")
+        );
     }
 }
