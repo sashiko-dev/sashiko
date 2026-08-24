@@ -17,12 +17,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::ai::{
     AiMessage, AiProvider, AiResponse, AiResponseFormat, AiTool, ErrorAction, LlmSession,
-    SessionRunner, ValidationError,
+    SessionRunner, ToolCall, ValidationError,
 };
 use crate::toolbox::ToolBox;
 
@@ -288,6 +288,21 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
         self.tools.call(name, args).await
     }
 
+    async fn call_tools(&mut self, calls: Vec<ToolCall>) -> Result<Vec<(String, Value)>> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            // A rejected call is the model's to read and correct. The trait
+            // default propagates the error instead, which ends the stage and
+            // with it the review.
+            let res = match self.tools.call(&call.function_name, call.arguments).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e.to_string() }),
+            };
+            results.push((call.id, res));
+        }
+        Ok(results)
+    }
+
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
         let text = response.content.as_deref().unwrap_or("");
         match self.stage.output_format.validate(text, self.state) {
@@ -416,5 +431,112 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         };
 
         Ok((outcome, mutation))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiRequest, AiRole, ProviderCapabilities};
+    use crate::workflow::output::OutputFormat;
+    use crate::workflow::prompt::PromptTemplate;
+    use std::sync::Mutex;
+
+    #[derive(Default, Clone)]
+    struct EmptyState;
+
+    /// Calls a tool on its first turn, then answers. Records every request so a
+    /// test can check what the model was told about the tool call.
+    struct ToolCallingProvider {
+        turn: Mutex<usize>,
+        seen: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for ToolCallingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.seen.lock().unwrap().push(request);
+            let mut turn = self.turn.lock().unwrap();
+            *turn += 1;
+            if *turn == 1 {
+                // git_read_files without the required "revision" argument.
+                return Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_0".to_string(),
+                        function_name: "git_read_files".to_string(),
+                        arguments: json!({ "files": [{ "path": "x" }] }),
+                        thought_signature: None,
+                    }]),
+                    usage: None,
+                    truncated: false,
+                });
+            }
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rejected_tool_call_is_reported_to_the_model_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider {
+            turn: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_error")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a rejected tool call must not end the stage");
+
+        // The model must have been handed the error and given another turn.
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the model should get a second turn");
+        let tool_reply = seen[1]
+            .messages
+            .iter()
+            .find(|m| m.role == AiRole::Tool)
+            .expect("the second request should carry the tool result");
+        assert!(
+            tool_reply
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("error"),
+            "the model should see the tool's error: {:?}",
+            tool_reply.content
+        );
     }
 }
