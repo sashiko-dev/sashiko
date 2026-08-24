@@ -229,9 +229,23 @@ impl Reviewer {
 
         info!("Found {} pending patchsets for review", patchsets.len());
 
-        for patchset in patchsets {
+        for mut patchset in patchsets {
             let permit = self.semaphore.clone().acquire_owned().await?;
             let target_review_count = patchset.target_review_count.unwrap_or(1) as usize;
+
+            // Mark status as 'In Review' in the DB immediately to prevent double-fetching
+            if let Err(e) = self
+                .db
+                .update_patchset_status(patchset.id, ReviewStatus::InReview.as_str())
+                .await
+            {
+                error!(
+                    "Failed to update status to In Review for {}: {}",
+                    patchset.id, e
+                );
+                continue;
+            }
+            patchset.status = Some(ReviewStatus::InReview.as_str().to_string());
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
@@ -341,6 +355,7 @@ impl Reviewer {
                 .unwrap_or(&review.patch_message_id);
             Self::queue_notifications(
                 ctx,
+                patchset.id,
                 review.patch_id,
                 &review.patch_message_id,
                 ps_msg_id,
@@ -485,7 +500,7 @@ impl Reviewer {
         let (found_baseline, patch_commits, logs) =
             Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
 
-        let prompts_hash = get_commit_hash(Path::new("."), "HEAD").await.ok();
+        let prompts_hash = Some(env!("GIT_HASH"));
 
         // Save findings to patchset
         if let Some((resolution, baseline_id, worktree)) = found_baseline {
@@ -495,7 +510,7 @@ impl Reviewer {
                     patchset_id,
                     Some(baseline_id),
                     Some(ctx.settings.ai.model.as_str()),
-                    prompts_hash.as_deref(),
+                    prompts_hash,
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )
@@ -595,7 +610,10 @@ impl Reviewer {
 
                 // Opt-out logic
                 if skip_regexes.iter().any(|re| re.is_match(_subj)) {
-                    info!("Skipping patch {} (subject matches skip filter)", patch_id);
+                    info!(
+                        "Skipping patch {}/{} (subject matches skip filter)",
+                        patchset_id, index
+                    );
                     should_skip = true;
                 }
 
@@ -605,8 +623,8 @@ impl Reviewer {
                     && !only_regexes.iter().any(|re| re.is_match(_subj))
                 {
                     info!(
-                        "Skipping patch {} (subject does not match any only filter)",
-                        patch_id
+                        "Skipping patch {}/{} (subject does not match any only filter)",
+                        patchset_id, index
                     );
                     should_skip = true;
                 }
@@ -629,8 +647,8 @@ impl Reviewer {
                         || patch_files_count > ctx.settings.review.max_files_touched
                     {
                         info!(
-                            "Skipping patch {} (exceeds size limits: {} lines, {} files)",
-                            patch_id, patch_lines_changed, patch_files_count
+                            "Skipping patch {}/{} (exceeds size limits: {} lines, {} files)",
+                            patchset_id, index, patch_lines_changed, patch_files_count
                         );
                         should_skip = true;
                     }
@@ -664,7 +682,7 @@ impl Reviewer {
                     let queue = valid_jobs_queue.clone();
                     let ctx_clone = ctx.clone();
                     let input_payload_clone = input_payload.clone();
-                    let prompts_hash_clone = prompts_hash.clone().map(|s| s.to_string());
+                    let prompts_hash_clone = prompts_hash.map(|s| s.to_string());
                     let baseline_ref_clone = baseline_ref_str.to_string();
                     let baseline_id_clone = baseline_id;
                     let embargo_until_clone = patchset.embargo_until;
@@ -734,7 +752,7 @@ impl Reviewer {
                         Some(baseline_id),
                         &input_payload,
                         job.commit_sha,
-                        prompts_hash.as_deref(),
+                        prompts_hash,
                         Some(&worktree.path),
                         &job.diff,
                         patchset.embargo_until,
@@ -804,7 +822,7 @@ impl Reviewer {
                     patchset_id,
                     None,
                     Some(ctx.settings.ai.model.as_str()),
-                    prompts_hash.as_deref(),
+                    prompts_hash,
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )
@@ -1409,8 +1427,8 @@ impl Reviewer {
                                         let mut skip_notify = false;
                                         if let Some(until) = embargo_until.filter(|&u| u > now) {
                                             info!(
-                                                "Review completed but embargoed until {} for patch {}",
-                                                until, patch_id
+                                                "Review completed but embargoed until {} for patch {}/{}",
+                                                until, patchset_id, index
                                             );
                                             skip_notify = true;
                                         }
@@ -1430,6 +1448,7 @@ impl Reviewer {
 
                                             if let Err(e) = Self::queue_notifications(
                                                 ctx,
+                                                patchset_id,
                                                 patch_id,
                                                 patch_msg_id,
                                                 patchset_msg_id,
@@ -1441,17 +1460,21 @@ impl Reviewer {
                                             .await
                                             {
                                                 error!(
-                                                    "Failed to queue email for patch {}: {}",
-                                                    patch_id, e
+                                                    "Failed to queue email for patch {}/{} (ID: {}): {}",
+                                                    patchset_id, index, patch_id, e
                                                 );
-                                                db_success = false;
                                             }
                                         }
                                     }
                                 }
-                                if db_success {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Reviewed").await;
+                                if !db_success {
+                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                                    return Ok(PatchResult::ReviewFailed);
                                 }
+                                // Failing the patchset over a notification
+                                // would strand it: get_pending_patchsets()
+                                // selects only Pending rows.
+                                let _ = ctx.db.update_patch_status(patch_id, "Reviewed").await;
                                 return Ok(PatchResult::Success);
                             } else if ctx.settings.ai.no_ai {
                                 info!(
@@ -2152,6 +2175,7 @@ impl Reviewer {
     #[allow(clippy::too_many_arguments)]
     async fn queue_notifications(
         ctx: &ReviewContext,
+        patchset_id: i64,
         patch_id: i64,
         patch_message_id: &str,
         patchset_message_id: &str,
@@ -2363,7 +2387,10 @@ impl Reviewer {
             }
 
             if !sent_positive_review {
-                info!("No issues found for patch {}, skipping email.", patch_id);
+                info!(
+                    "No issues found for patch {}/{} (ID: {}), skipping email.",
+                    patchset_id, index, patch_id
+                );
                 ctx.db
                     .insert_email_outbox(
                         patch_id,
@@ -2382,7 +2409,10 @@ impl Reviewer {
 
         match action {
             EmailAction::Mute => {
-                info!("Email policy muted email for patch {}", patch_id);
+                info!(
+                    "Email policy muted email for patch {}/{} (ID: {})",
+                    patchset_id, index, patch_id
+                );
                 ctx.db
                     .insert_email_outbox(
                         patch_id,
@@ -2508,7 +2538,10 @@ impl Reviewer {
                     )
                     .await?;
 
-                info!("Queued email for patch {}", patch_id);
+                info!(
+                    "Queued email for patch {}/{} (ID: {})",
+                    patchset_id, index, patch_id
+                );
             }
         }
         Ok(())
@@ -3525,6 +3558,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3591,6 +3625,7 @@ inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchse
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",
@@ -3644,6 +3679,7 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_3,
             "msg_id_p3",
             "msg_id_1",
@@ -3748,6 +3784,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3792,6 +3829,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",

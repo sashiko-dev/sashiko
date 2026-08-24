@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::db::Database;
-use crate::events::Event;
+use crate::events::{Event, MessageSource};
 use crate::fetcher::FetchRequest;
 use axum::{
     Json, Router,
@@ -358,7 +358,7 @@ fn generate_synthetic_id(prefix: &str) -> String {
         .expect("Time went backwards");
     // e.g. sashiko-local-1715890000-12345
     format!(
-        "sashiko-{}-{}-{}",
+        "sashiko-{}-{}-{}@sashiko.local",
         prefix,
         since_the_epoch.as_secs(),
         fastrand::u32(..)
@@ -397,12 +397,20 @@ async fn submit_patch(
             let id = generate_synthetic_id("inject");
             info!("Received raw mbox injection: {} (len: {})", id, raw.len());
 
+            let submitted_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .ok();
+
             let event = Event::RawMboxSubmitted {
                 raw,
+                submission_id: id.clone(),
+                source: MessageSource::ApiInject,
                 group: "api-submit".to_string(),
                 baseline: base_commit,
                 skip_subjects,
                 only_subjects,
+                submitted_at,
             };
 
             if let Err(e) = state.sender.send(event).await {
@@ -434,11 +442,30 @@ async fn submit_patch(
                 sha, repo_display
             );
 
+            // Optimistic check: If we already have this patchset in the DB,
+            // skip creating placeholder and skip fetch queue entirely.
+            match state.db.has_patchset_by_msgid(&id).await {
+                Ok(true) => {
+                    info!(
+                        "Remote fetch request for already ingested SHA {}, skipping placeholder and fetch",
+                        id
+                    );
+                    return Ok(Json(SubmitResponse {
+                        status: "accepted".to_string(),
+                        id,
+                    }));
+                }
+                Err(e) => {
+                    error!("Failed to check if patchset exists: {}", e);
+                }
+                _ => {}
+            }
+
             // Create a placeholder record in the DB so the user can track status
             if let Err(e) = state
                 .db
                 .create_fetching_patchset(
-                    &id,
+                    &format!("{}@sashiko.local", id),
                     &format!("Fetching {} from {}...", &sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
@@ -523,6 +550,7 @@ async fn submit_patch(
                         .send(Event::IngestionFailed {
                             article_id: msgid_clone.clone(),
                             error: format!("Failed to fetch thread: {}", e),
+                            source: MessageSource::ApiFetchThread,
                         })
                         .await;
                 }
@@ -592,12 +620,20 @@ async fn fetch_and_inject_thread(
     })
     .await??;
 
+    let submitted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .ok();
+
     let event = Event::RawMboxSubmitted {
         raw,
+        submission_id: msgid.to_string(),
+        source: MessageSource::ApiFetchThread,
         group: "api-submit".to_string(),
         baseline: None,
         skip_subjects: None,
         only_subjects: None,
+        submitted_at,
     };
 
     sender.send(event).await?;
@@ -1133,6 +1169,8 @@ async fn get_config(
         "project_name": state.settings.project.name,
         "project_description": state.settings.project.description,
         "forge_enabled": state.settings.forge.enabled,
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_hash": env!("GIT_HASH"),
     })))
 }
 
@@ -1234,4 +1272,16 @@ async fn forge_webhook(
         "status": "accepted",
         "message": format!("{} {} queued for review", forge.name(), action)
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_synthetic_id_format() {
+        let id = generate_synthetic_id("test");
+        assert!(id.starts_with("sashiko-test-"));
+        assert!(id.ends_with("@sashiko.local"));
+    }
 }

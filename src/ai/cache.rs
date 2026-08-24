@@ -153,8 +153,11 @@ impl AiProvider for CachingAiProvider {
                     fmt_thousands(total)
                 );
                 if let Some(ref mut usage) = resp.usage {
-                    usage.cached_tokens =
-                        Some(usage.cached_tokens.unwrap_or(0) + usage.prompt_tokens);
+                    // The hit serves the whole prompt from this cache, so all
+                    // of it counts as cached.  cached_tokens is a breakdown
+                    // of prompt_tokens rather than an addend.  The count
+                    // recorded with the response covers this same prompt.
+                    usage.cached_tokens = Some(usage.prompt_tokens);
                 }
                 return Ok(resp);
             }
