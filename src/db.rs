@@ -827,7 +827,9 @@ impl Database {
                 (),
             )
             .await;
-        let _ = self.try_add_column("preexisting_bugs", "logs", "TEXT").await;
+        let _ = self
+            .try_add_column("preexisting_bugs", "logs", "TEXT")
+            .await;
         let _ = self
             .try_create_index("idx_preexisting_bugs_slug", "preexisting_bugs", "slug")
             .await;
@@ -1225,8 +1227,7 @@ impl Database {
             .source_files
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
-        let compressed_inline =
-            crate::compression::compress_string_if_needed(&bug.inline_review);
+        let compressed_inline = crate::compression::compress_string_if_needed(&bug.inline_review);
         let compressed_logs = bug
             .logs
             .as_ref()
@@ -1335,14 +1336,12 @@ impl Database {
             params.push(libsql::Value::Text(sub.to_string()));
         }
 
-        if let Some(q) = search {
-            if !q.trim().is_empty() {
-                conditions.push("(problem LIKE ? OR slug LIKE ? OR locations LIKE ?)");
-                let pattern = format!("%{}%", q.trim());
-                params.push(libsql::Value::Text(pattern.clone()));
-                params.push(libsql::Value::Text(pattern.clone()));
-                params.push(libsql::Value::Text(pattern));
-            }
+        if let Some(q) = search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            conditions.push("(problem LIKE ? OR slug LIKE ? OR locations LIKE ?)");
+            let pattern = format!("%{}%", q);
+            params.push(libsql::Value::Text(pattern.clone()));
+            params.push(libsql::Value::Text(pattern.clone()));
+            params.push(libsql::Value::Text(pattern));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -3428,7 +3427,10 @@ impl Database {
 
             let reviews = if is_embargoed { Vec::new() } else { reviews };
 
-            let preexisting_bugs = self.list_preexisting_bugs_for_patchset(pid).await.unwrap_or_default();
+            let preexisting_bugs = self
+                .list_preexisting_bugs_for_patchset(pid)
+                .await
+                .unwrap_or_default();
             let preexisting_bugs_json = preexisting_bugs
                 .into_iter()
                 .map(|(bug, is_new)| {
@@ -3817,7 +3819,10 @@ impl Database {
             .await?;
 
         if let Ok(Some(r)) = rows.next().await {
-            let preexisting_bugs = self.list_preexisting_bugs_for_review(id).await.unwrap_or_default();
+            let preexisting_bugs = self
+                .list_preexisting_bugs_for_review(id)
+                .await
+                .unwrap_or_default();
             let preexisting_bugs_json = preexisting_bugs
                 .into_iter()
                 .map(|(bug, is_new)| {
@@ -9884,7 +9889,9 @@ mod tests {
             slug: "pb-test-1234".to_string(),
             problem: "Memory leak in e1000_probe()".to_string(),
             severity: Severity::High,
-            severity_explanation: Some("Buffer is allocated but not freed on error path".to_string()),
+            severity_explanation: Some(
+                "Buffer is allocated but not freed on error path".to_string(),
+            ),
             locations: Some(json!([{"file": "drivers/net/e1000.c", "line": 42}])),
             subsystem: Some("net".to_string()),
             source_files: Some(vec!["drivers/net/e1000.c".to_string()]),
@@ -9901,50 +9908,74 @@ mod tests {
         assert!(bug_id > 0);
 
         // Fetch by id
-        let fetched = db.get_preexisting_bug(bug_id).await.unwrap().expect("Bug should exist");
+        let fetched = db
+            .get_preexisting_bug(bug_id)
+            .await
+            .unwrap()
+            .expect("Bug should exist");
         assert_eq!(fetched.slug, "pb-test-1234");
         assert_eq!(fetched.problem, "Memory leak in e1000_probe()");
         assert_eq!(fetched.severity, Severity::High);
         assert_eq!(fetched.subsystem.as_deref(), Some("net"));
-        assert_eq!(fetched.inline_review, "> problematic_code();\nMemory is leaked here.");
-        assert_eq!(fetched.logs.as_deref(), Some("[{\"role\":\"system\",\"content\":\"test system\"}]"));
+        assert_eq!(
+            fetched.inline_review,
+            "> problematic_code();\nMemory is leaked here."
+        );
+        assert_eq!(
+            fetched.logs.as_deref(),
+            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
+        );
 
         // Fetch by slug
-        let fetched_slug = db.get_preexisting_bug_by_slug("pb-test-1234").await.unwrap().expect("Bug should exist");
+        let fetched_slug = db
+            .get_preexisting_bug_by_slug("pb-test-1234")
+            .await
+            .unwrap()
+            .expect("Bug should exist");
         assert_eq!(fetched_slug.id, bug_id);
-        assert_eq!(fetched_slug.logs.as_deref(), Some("[{\"role\":\"system\",\"content\":\"test system\"}]"));
+        assert_eq!(
+            fetched_slug.logs.as_deref(),
+            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
+        );
 
         // List bugs with search and filter
-        let (list, total) = db.list_preexisting_bugs(Some(1), Some(10), Some(Severity::High), Some("net"), Some("e1000")).await.unwrap();
+        let (list, total) = db
+            .list_preexisting_bugs(
+                Some(1),
+                Some(10),
+                Some(Severity::High),
+                Some("net"),
+                Some("e1000"),
+            )
+            .await
+            .unwrap();
         assert_eq!(total, 1);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, bug_id);
 
         // Link to review
         let thread_id = db.create_thread("t1", "subj", 100).await.unwrap();
-        let ps_id = db.create_patchset(
-            thread_id,
-            None,
-            "m1",
-            "subj",
-            "auth",
-            100,
-            1,
-            0,
-            "",
-            "",
-            None,
-            1,
-            None,
-            false,
-            None,
-            None,
-        ).await.unwrap().unwrap();
-        let review_id = db.create_review(ps_id, None, "gemini", "model", None, None).await.unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj", "auth", 100, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, None, "gemini", "model", None, None)
+            .await
+            .unwrap();
 
-        db.link_review_to_preexisting_bug(review_id, bug_id, true).await.unwrap();
+        db.link_review_to_preexisting_bug(review_id, bug_id, true)
+            .await
+            .unwrap();
 
-        let review_bugs = db.list_preexisting_bugs_for_review(review_id).await.unwrap();
+        let review_bugs = db
+            .list_preexisting_bugs_for_review(review_id)
+            .await
+            .unwrap();
         assert_eq!(review_bugs.len(), 1);
         assert_eq!(review_bugs[0].0.id, bug_id);
         assert!(review_bugs[0].1); // is_newly_discovered == true
@@ -9953,7 +9984,10 @@ mod tests {
         assert_eq!(ps_bugs.len(), 1);
         assert_eq!(ps_bugs[0].0.id, bug_id);
 
-        let all_bugs = db.list_all_preexisting_bugs_for_vector_search().await.unwrap();
+        let all_bugs = db
+            .list_all_preexisting_bugs_for_vector_search()
+            .await
+            .unwrap();
         assert_eq!(all_bugs.len(), 1);
         assert_eq!(all_bugs[0].id, bug_id);
     }

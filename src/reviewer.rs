@@ -3654,7 +3654,8 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 created_at: 1000,
             })
             .await?;
-        db.link_review_to_preexisting_bug(rev_id, bug_id, true).await?;
+        db.link_review_to_preexisting_bug(rev_id, bug_id, true)
+            .await?;
 
         db.create_message(
             "msg_id_p4",

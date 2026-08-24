@@ -301,7 +301,7 @@ impl LlmSession for PreexistingReportSession<'_> {
             Task:\n\
             Generate a complete, standalone LKML-style review comment block for this issue.\n\
             Quote the problematic source lines with '> ' and provide interspersed explanations and remediation suggestions.\n\
-            Return raw plain text, not JSON or markdown fences." ,
+            Return raw plain text, not JSON or markdown fences.",
             self.problem, self.severity, self.severity_explanation, loc_str
         )
     }
@@ -446,22 +446,25 @@ pub async fn process_preexisting_issue(
         let dedup_result = runner.run(&mut dedup_session).await?;
         full_history.extend(dedup_result.history);
         let dedup = dedup_result.output;
+        let duplicate_match = if dedup.is_duplicate {
+            dedup
+                .duplicate_of_id
+                .and_then(|dup_id| candidate_bugs.iter().find(|b| b.id == dup_id))
+        } else {
+            None
+        };
 
-        if dedup.is_duplicate {
-            if let Some(dup_id) = dedup.duplicate_of_id {
-                if let Some(existing) = candidate_bugs.iter().find(|b| b.id == dup_id) {
-                    info!(
-                        "Matched duplicate pre-existing bug #{} ({})",
-                        dup_id, existing.slug
-                    );
-                    let logs = serde_json::to_string(&full_history).ok();
-                    return Ok(PreexistingBugOutcome::Duplicate {
-                        existing_bug: existing.clone(),
-                        reasoning: dedup.reasoning,
-                        logs,
-                    });
-                }
-            }
+        if let Some(existing) = duplicate_match {
+            info!(
+                "Matched duplicate pre-existing bug #{} ({})",
+                existing.id, existing.slug
+            );
+            let logs = serde_json::to_string(&full_history).ok();
+            return Ok(PreexistingBugOutcome::Duplicate {
+                existing_bug: existing.clone(),
+                reasoning: dedup.reasoning,
+                logs,
+            });
         }
     }
 
@@ -738,7 +741,9 @@ mod tests {
         let input = PreexistingBugInput {
             problem: "Buffer overflow in e1000 rx handler".to_string(),
             reasoning: "Size not checked against MTU".to_string(),
-            locations: Some(json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}])),
+            locations: Some(
+                json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]),
+            ),
             subsystem: Some("net:intel".to_string()),
             source_files: vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             commit_sha: Some("abcdef123456".to_string()),

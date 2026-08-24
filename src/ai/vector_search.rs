@@ -131,9 +131,13 @@ pub fn extract_bug_vector(
             if let Some(symbol) = loc.get("function_or_symbol").and_then(|v| v.as_str()) {
                 let sym_clean = symbol.trim().to_lowercase();
                 if !sym_clean.is_empty() {
-                    *raw_weights.entry(format!("sym:{}", sym_clean)).or_insert(0.0) += 5.0;
+                    *raw_weights
+                        .entry(format!("sym:{}", sym_clean))
+                        .or_insert(0.0) += 5.0;
                     for part in tokenize_identifier(&sym_clean) {
-                        *raw_weights.entry(format!("sym_part:{}", part)).or_insert(0.0) += 2.0;
+                        *raw_weights
+                            .entry(format!("sym_part:{}", part))
+                            .or_insert(0.0) += 2.0;
                     }
                 }
             }
@@ -380,7 +384,11 @@ mod tests {
         );
 
         let sim_related = vec1.cosine_similarity(&vec2);
-        assert!(sim_related > 0.6, "Related bugs should have high similarity, got {}", sim_related);
+        assert!(
+            sim_related > 0.6,
+            "Related bugs should have high similarity, got {}",
+            sim_related
+        );
 
         // Completely unrelated bug (different subsystem, file, problem)
         let vec3 = extract_bug_vector(
@@ -394,7 +402,11 @@ mod tests {
         );
 
         let sim_unrelated = vec1.cosine_similarity(&vec3);
-        assert!(sim_unrelated < 0.1, "Unrelated bugs should have very low similarity, got {}", sim_unrelated);
+        assert!(
+            sim_unrelated < 0.1,
+            "Unrelated bugs should have very low similarity, got {}",
+            sim_unrelated
+        );
     }
 
     #[test]
@@ -419,9 +431,13 @@ mod tests {
             problem: "Null pointer dereference in e1000_clean_rx_irq".to_string(),
             severity: Severity::High,
             severity_explanation: None,
-            locations: Some(json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }])),
+            locations: Some(
+                json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }]),
+            ),
             subsystem: Some("net".to_string()),
-            source_files: Some(vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()]),
+            source_files: Some(vec![
+                "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
+            ]),
             inline_review: "review 1".to_string(),
             logs: None,
             vector_json: None,
@@ -437,9 +453,13 @@ mod tests {
             problem: "Memory leak in e1000_probe".to_string(),
             severity: Severity::High,
             severity_explanation: None,
-            locations: Some(json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_probe" }])),
+            locations: Some(
+                json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_probe" }]),
+            ),
             subsystem: Some("net".to_string()),
-            source_files: Some(vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()]),
+            source_files: Some(vec![
+                "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
+            ]),
             inline_review: "review 2".to_string(),
             logs: None,
             vector_json: None,
@@ -471,14 +491,26 @@ mod tests {
             "e1000_clean_rx_irq causes null pointer exception",
             Some("net"),
             &["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
-            Some(&json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }])),
+            Some(
+                &json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }]),
+            ),
         );
 
-        let candidates = vec![known_bug_1.clone(), known_bug_2.clone(), known_bug_3.clone()];
+        let candidates = vec![
+            known_bug_1.clone(),
+            known_bug_2.clone(),
+            known_bug_3.clone(),
+        ];
         let matches = find_top_candidates(&query, &candidates, 20, 0.15);
 
         assert!(!matches.is_empty());
-        assert_eq!(matches[0].bug.id, 1, "Top match should be bug 1 (exact function and file match)");
-        assert!(matches.iter().all(|m| m.bug.id != 3), "Unrelated bug 3 should not match");
+        assert_eq!(
+            matches[0].bug.id, 1,
+            "Top match should be bug 1 (exact function and file match)"
+        );
+        assert!(
+            matches.iter().all(|m| m.bug.id != 3),
+            "Unrelated bug 3 should not match"
+        );
     }
 }

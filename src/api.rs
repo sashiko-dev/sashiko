@@ -323,7 +323,10 @@ pub fn build_router(
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/preexisting_bugs", get(list_preexisting_bugs))
         .route("/api/preexisting_bug", get(get_preexisting_bug))
-        .route("/api/preexisting_bug/analyze", post(analyze_preexisting_bug))
+        .route(
+            "/api/preexisting_bug/analyze",
+            post(analyze_preexisting_bug),
+        )
         .route("/bug/{slug}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
@@ -954,10 +957,7 @@ async fn list_preexisting_bugs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PreexistingBugsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let severity = query
-        .severity
-        .as_deref()
-        .map(crate::db::Severity::from_str);
+    let severity = query.severity.as_deref().map(crate::db::Severity::from_str);
     match state
         .db
         .list_preexisting_bugs(
@@ -1456,14 +1456,21 @@ mod tests {
         });
 
         // Test 1: list_preexisting_bugs
-        let res = reqwest::get(format!("http://{}/api/preexisting_bugs", addr)).await.unwrap();
+        let res = reqwest::get(format!("http://{}/api/preexisting_bugs", addr))
+            .await
+            .unwrap();
         assert_eq!(res.status(), 200);
         let json: serde_json::Value = res.json().await.unwrap();
         assert_eq!(json["total"], 1);
         assert_eq!(json["bugs"][0]["slug"], "pb-12345678");
 
         // Test 2: get_preexisting_bug by slug
-        let res = reqwest::get(format!("http://{}/api/preexisting_bug?slug=pb-12345678", addr)).await.unwrap();
+        let res = reqwest::get(format!(
+            "http://{}/api/preexisting_bug?slug=pb-12345678",
+            addr
+        ))
+        .await
+        .unwrap();
         assert_eq!(res.status(), 200);
         let json: serde_json::Value = res.json().await.unwrap();
         assert_eq!(json["slug"], "pb-12345678");
