@@ -841,6 +841,7 @@ async fn run_worker_in_worktree(
     // Aggregate findings, inline reviews, history, input context, and concern counts
     let mut combined_findings = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
+    let mut combined_preexisting_concerns = Vec::new();
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
     let mut combined_input_context = String::new();
@@ -870,6 +871,17 @@ async fn run_worker_in_worktree(
             }
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
+            }
+            if let Some(preexisting) = review
+                .get("preexisting_concerns")
+                .and_then(|v| v.as_array())
+            {
+                for c in preexisting {
+                    let mut c_val = c.clone();
+                    c_val["patch_index"] = json!(p_idx);
+                    c_val["patch_subject"] = json!(patch_subject);
+                    combined_preexisting_concerns.push(c_val);
+                }
             }
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
                 total_concerns_count += cc;
@@ -917,6 +929,7 @@ async fn run_worker_in_worktree(
     let review_output = json!({
         "findings": combined_findings,
         "dismissed_concerns": combined_dismissed_concerns,
+        "preexisting_concerns": combined_preexisting_concerns,
         "concerns_count": total_concerns_count,
         "dismissed_concerns_count": total_dismissed_concerns_count
     });
@@ -1527,5 +1540,58 @@ mod tests {
             combined_multi
                 .contains("--- Patch [2]: [PATCH 2/2] test second ---\nComment on patch 2")
         );
+    }
+
+    #[test]
+    fn test_review_output_preserves_preexisting_concerns() {
+        let results = vec![json!({
+            "patch_index": 1,
+            "review": {
+                "findings": [],
+                "dismissed_concerns": [],
+                "preexisting_concerns": [
+                    {
+                        "type": "Missing Lock",
+                        "description": "Lockless write to CTL1 in remove()",
+                        "reasoning": "Concurrency with alarm ioctl",
+                        "preexisting": true,
+                        "locations": []
+                    }
+                ],
+                "concerns_count": 1,
+                "dismissed_concerns_count": 0
+            },
+            "inline_review": "No issues found."
+        })];
+
+        let mut combined_preexisting_concerns = Vec::new();
+        for res in results {
+            let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+            if let Some(preexisting) = res
+                .get("review")
+                .and_then(|r| r.get("preexisting_concerns"))
+                .and_then(|v| v.as_array())
+            {
+                for c in preexisting {
+                    let mut c_val = c.clone();
+                    c_val["patch_index"] = json!(p_idx);
+                    c_val["patch_subject"] = json!("test patch");
+                    combined_preexisting_concerns.push(c_val);
+                }
+            }
+        }
+
+        let review_output = json!({
+            "findings": [],
+            "dismissed_concerns": [],
+            "preexisting_concerns": combined_preexisting_concerns,
+            "concerns_count": 1,
+            "dismissed_concerns_count": 0
+        });
+
+        let pre_arr = review_output["preexisting_concerns"].as_array().unwrap();
+        assert_eq!(pre_arr.len(), 1);
+        assert_eq!(pre_arr[0]["type"], "Missing Lock");
+        assert_eq!(pre_arr[0]["patch_index"], 1);
     }
 }
