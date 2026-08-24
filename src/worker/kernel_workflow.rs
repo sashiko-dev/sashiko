@@ -66,6 +66,8 @@ pub struct KernelReviewState {
 
     /// Filtered concerns after Stage 9 conflict resolution.
     pub conflict_resolved_concerns: Vec<Value>,
+    /// Candidate pre-existing concerns extracted after Stage 9 for separate processing.
+    pub preexisting_concerns: Vec<Value>,
 
     /// Verified findings from Stage 10.
     pub findings: Vec<Value>,
@@ -254,7 +256,7 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 3. SERIES VALIDATION RULE: If follow-up patches in this series are provided in the context, check if each identified concern is resolved or fixed in the final state of the series. If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
 4. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit "mm: fix allocation"'). Existing historical commits in the tree should still be referenced by their standard hash.
 5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
-6. If the problem did exist in the code before the patch was applied, say it explicitly: 'This problem wasn't introduced by this patch, but...'. Discard low- and medium-severity pre-existing problems, report only high- and critical severity issues.
+6. If the problem is determined to have already existed in the code before the patch was applied, mark `"preexisting": true`. Pre-existing issues will be routed to a dedicated pipeline and separate review.
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
 8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
 
@@ -789,7 +791,21 @@ Example Output:
             ..Default::default()
         })
         .reduce(|state, out: Stage9Output| {
-            state.conflict_resolved_concerns = out.concerns;
+            let mut new_concerns = Vec::new();
+            let mut preexisting = Vec::new();
+            for concern in out.concerns {
+                let is_preexisting = concern
+                    .get("preexisting")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_preexisting {
+                    preexisting.push(concern);
+                } else {
+                    new_concerns.push(concern);
+                }
+            }
+            state.conflict_resolved_concerns = new_concerns;
+            state.preexisting_concerns = preexisting;
         })
         .build()
 }
@@ -854,7 +870,26 @@ Example Output:
             ..Default::default()
         })
         .reduce(|state, out: Stage10Output| {
-            state.findings = out.findings;
+            let mut new_findings = Vec::new();
+            for finding in out.findings {
+                let is_preexisting = finding
+                    .get("preexisting")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_preexisting {
+                    let concern = json!({
+                        "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
+                        "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
+                        "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
+                        "preexisting": true,
+                        "locations": finding.get("locations").cloned().unwrap_or(json!([])),
+                    });
+                    state.preexisting_concerns.push(concern);
+                } else {
+                    new_findings.push(finding);
+                }
+            }
+            state.findings = new_findings;
         })
         .build()
 }
