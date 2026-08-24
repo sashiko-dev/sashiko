@@ -371,15 +371,74 @@ pub async fn process_preexisting_issue(
     );
 
     let mut full_history = Vec::new();
+    let runner = SessionRunner::new(provider);
 
-    // Step 1: Issue Verification & Severity Calibration
+    // Step 1: Subsystem & File-Aware Fast Vector Space Candidate Retrieval (Top N = 20)
+    let query_vector = extract_bug_vector(
+        &input.problem,
+        input.subsystem.as_deref(),
+        &input.source_files,
+        input.locations.as_ref(),
+    );
+
+    let known_bugs = db.list_all_preexisting_bugs_for_vector_search().await?;
+    let candidate_matches = find_top_candidates(
+        &query_vector,
+        &known_bugs,
+        DEFAULT_TOP_CANDIDATES,
+        DEFAULT_SIMILARITY_THRESHOLD,
+    );
+
+    debug!(
+        "Found {} potential vector candidate matches for pre-existing issue",
+        candidate_matches.len()
+    );
+
+    // Step 2: LLM Deduplication Confirmation (Short-circuit if duplicate of existing bug)
+    if !candidate_matches.is_empty() {
+        let candidate_bugs: Vec<PreexistingBug> =
+            candidate_matches.iter().map(|m| m.bug.clone()).collect();
+
+        let mut dedup_session = PreexistingDedupSession {
+            candidate_problem: &input.problem,
+            candidate_locations: input.locations.as_ref(),
+            candidate_subsystem: input.subsystem.as_deref(),
+            known_candidates: &candidate_bugs,
+            context_tag: context_tag.map(|s| s.to_string()),
+        };
+
+        let dedup_result = runner.run(&mut dedup_session).await?;
+        full_history.extend(dedup_result.history);
+        let dedup = dedup_result.output;
+        let duplicate_match = if dedup.is_duplicate {
+            dedup
+                .duplicate_of_id
+                .and_then(|dup_id| candidate_bugs.iter().find(|b| b.id == dup_id))
+        } else {
+            None
+        };
+
+        if let Some(existing) = duplicate_match {
+            info!(
+                "Matched duplicate pre-existing bug #{} ({}) - skipping tool verification",
+                existing.id, existing.slug
+            );
+            let logs = serde_json::to_string(&full_history).ok();
+            return Ok(PreexistingBugOutcome::Duplicate {
+                existing_bug: existing.clone(),
+                reasoning: dedup.reasoning,
+                logs,
+            });
+        }
+    }
+
+    // Step 3: Issue Verification & Severity Calibration (only for novel candidates)
     let mut verify_session = PreexistingVerifySession {
         input: &input,
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
     };
 
-    let runner = SessionRunner::new(provider);
     let verify_result = runner.run(&mut verify_session).await?;
     full_history.extend(verify_result.history);
     let verification = verify_result.output;
@@ -408,65 +467,6 @@ pub async fn process_preexisting_issue(
         .verified_locations
         .or_else(|| input.locations.clone());
     let severity_explanation = verification.severity_explanation;
-
-    // Step 2: Vector Space Candidate Retrieval (Top N = 20)
-    let query_vector = extract_bug_vector(
-        &input.problem,
-        input.subsystem.as_deref(),
-        &input.source_files,
-        final_locations.as_ref(),
-    );
-
-    let known_bugs = db.list_all_preexisting_bugs_for_vector_search().await?;
-    let candidate_matches = find_top_candidates(
-        &query_vector,
-        &known_bugs,
-        DEFAULT_TOP_CANDIDATES,
-        DEFAULT_SIMILARITY_THRESHOLD,
-    );
-
-    debug!(
-        "Found {} potential vector candidate matches for pre-existing issue",
-        candidate_matches.len()
-    );
-
-    // Step 3: LLM Deduplication Confirmation
-    if !candidate_matches.is_empty() {
-        let candidate_bugs: Vec<PreexistingBug> =
-            candidate_matches.iter().map(|m| m.bug.clone()).collect();
-
-        let mut dedup_session = PreexistingDedupSession {
-            candidate_problem: &input.problem,
-            candidate_locations: final_locations.as_ref(),
-            candidate_subsystem: input.subsystem.as_deref(),
-            known_candidates: &candidate_bugs,
-            context_tag: context_tag.map(|s| s.to_string()),
-        };
-
-        let dedup_result = runner.run(&mut dedup_session).await?;
-        full_history.extend(dedup_result.history);
-        let dedup = dedup_result.output;
-        let duplicate_match = if dedup.is_duplicate {
-            dedup
-                .duplicate_of_id
-                .and_then(|dup_id| candidate_bugs.iter().find(|b| b.id == dup_id))
-        } else {
-            None
-        };
-
-        if let Some(existing) = duplicate_match {
-            info!(
-                "Matched duplicate pre-existing bug #{} ({})",
-                existing.id, existing.slug
-            );
-            let logs = serde_json::to_string(&full_history).ok();
-            return Ok(PreexistingBugOutcome::Duplicate {
-                existing_bug: existing.clone(),
-                reasoning: dedup.reasoning,
-                logs,
-            });
-        }
-    }
 
     // Step 4: Standalone Inline Review Generation
     let mut report_session = PreexistingReportSession {
@@ -767,6 +767,88 @@ mod tests {
                 assert!(logs_str.contains("pre-existing"));
             }
             _ => panic!("Expected NewlyDiscovered outcome, got {:?}", outcome),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_preexisting_issue_dedup_first_short_circuits_verification() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // Seed an existing bug into the database
+        let existing_vector = extract_bug_vector(
+            "Buffer overflow in e1000 rx handler",
+            Some("net:intel"),
+            &["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
+            None,
+        );
+
+        let existing_id = db
+            .create_preexisting_bug(&NewPreexistingBug {
+                slug: "pb-existing1".to_string(),
+                problem: "Buffer overflow in e1000 rx handler".to_string(),
+                severity: Severity::High,
+                severity_explanation: Some("Known buffer overflow".to_string()),
+                locations: None,
+                subsystem: Some("net:intel".to_string()),
+                source_files: Some(vec![
+                    "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
+                ]),
+                inline_review: "> code\nInline review text".to_string(),
+                logs: None,
+                vector_json: Some(existing_vector.to_json()),
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                created_at: 1000,
+            })
+            .await
+            .unwrap();
+
+        // 1st call: Dedup returns is_duplicate: true. Verification and report generation are skipped!
+        let dedup_json = json!({
+            "is_duplicate": true,
+            "duplicate_of_id": existing_id,
+            "reasoning": "Exact match with known bug #1 in e1000 driver"
+        })
+        .to_string();
+
+        let provider = QueuedMockAiProvider::new(vec![dedup_json]);
+
+        let input = PreexistingBugInput {
+            problem: "Buffer overflow in e1000 rx handler".to_string(),
+            reasoning: "Size not checked against MTU".to_string(),
+            locations: Some(
+                json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]),
+            ),
+            subsystem: Some("net:intel".to_string()),
+            source_files: vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
+            commit_sha: Some("abcdef123456".to_string()),
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: None,
+        };
+
+        let outcome = process_preexisting_issue(&provider, None, &db, input, None)
+            .await
+            .unwrap();
+
+        match outcome {
+            PreexistingBugOutcome::Duplicate {
+                existing_bug,
+                reasoning,
+                logs,
+            } => {
+                assert_eq!(existing_bug.id, existing_id);
+                assert_eq!(existing_bug.slug, "pb-existing1");
+                assert_eq!(reasoning, "Exact match with known bug #1 in e1000 driver");
+                assert!(logs.is_some());
+            }
+            _ => panic!("Expected Duplicate outcome, got {:?}", outcome),
         }
     }
 }

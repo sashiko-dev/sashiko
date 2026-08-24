@@ -89,36 +89,26 @@ pub struct PreexistingBugInput {
 }
 ```
 
-The pipeline executes five discrete steps for each candidate:
+The pipeline executes discrete steps for each candidate, prioritizing early deduplication to eliminate redundant verification work:
 
-#### Step 1: Verification & Severity Calibration
-- Invokes verification against the codebase to confirm if the defect is real.
-- Filters out low/medium severity or non-reproducible concerns, accepting only **High** and **Critical** pre-existing issues.
-
-#### Step 2: Subsystem & File-Aware Candidate Localization
+#### Step 1: Subsystem & File-Aware Fast Vector Space Similarity Search ($N=20$)
 Linux kernel bugs are highly localized to specific subsystems and files.
-- The pipeline identifies primary files (e.g. `drivers/net/ethernet/intel/e1000/e1000_main.c`) and directory prefixes (e.g. `drivers/net/ethernet/intel/`).
-- The database search queries known pre-existing bugs, scoring/boosting those sharing common file paths or subsystem tags.
+- Feature vectors are built from file path components, directory hierarchies, subsystem names, function symbols, and error keywords.
+- Computes cosine similarity against all stored vector embeddings in the `preexisting_bugs` table and selects the **Top 20** candidate matches above the similarity threshold.
 
-#### Step 3: Fast Vector Space Similarity Search ($N=20$)
-- Normalized feature vectors are built from:
-  - File path components and directory hierarchies.
-  - Subsystem name.
-  - Symbol and function names.
-  - Error keywords (e.g. `null pointer dereference`, `deadlock`, `race condition`, `memory leak`, `use-after-free`, `out-of-bounds`).
-- Computes cosine similarity against all stored vector embeddings in the `preexisting_bugs` table.
-- Selects the **Top 20** candidate matches above a minimum similarity threshold.
-
-#### Step 4: LLM Deduplication Confirmation
+#### Step 2: LLM Deduplication Confirmation (Early Short-Circuit)
 - If Top $N$ candidates are found:
-  - Invokes an LLM prompt containing the candidate bug details and the Top $N$ localized candidate bugs.
-  - Prompt instructions:
-    "Analyze if this bug is identical (same root cause and code location) to any of the candidate bugs listed below. Respond with JSON: `{\"is_duplicate\": bool, \"duplicate_of_id\": Option<i64>, \"reasoning\": String}`."
-  - If `is_duplicate == true`: The issue is marked as a recurrence/duplicate of existing Bug ID, recording the association without creating a duplicate record.
-  - If `is_duplicate == false` (or if 0 candidates met threshold): The issue is classified as a **newly discovered pre-existing bug**.
+  - Invokes an LLM prompt comparing candidate details against the Top $N$ known verified bugs.
+  - If `is_duplicate == true`: The issue is immediately recognized as an existing bug, recording the review association and returning the existing bug details without running expensive tool-based verification.
+  - If `is_duplicate == false` (or 0 candidates found): Proceeds to verification.
 
-#### Step 5: Standalone Inline Review Generation
-- For newly discovered bugs:
+#### Step 3: Verification & Severity Calibration (For Novel Candidates)
+- For new/unmatched candidate issues:
+  - Invokes verification against the codebase using tools (`git_read_files`, `git_grep`, etc.) to confirm if the defect is genuine.
+  - Filters out low/medium severity or non-reproducible concerns, accepting only **High** and **Critical** pre-existing issues.
+
+#### Step 4: Standalone Inline Review Generation
+- For confirmed High/Critical newly discovered bugs:
   - A dedicated prompt generates a self-contained LKML-style report quoting the problematic codebase lines (`> ...`) from the baseline tree, explaining the failure mechanism, and suggesting a fix.
   - The bug is saved in `preexisting_bugs` with a unique slug (e.g. `pb-a1b2c3d4`), locations JSON, standalone inline review, vector embedding, and discovery metadata.
 
@@ -191,8 +181,7 @@ pub struct PreexistingBug {
 ## 5. API Endpoints & Reporting
 
 ### 5.1 API Endpoints (`src/api.rs`)
-- `GET /api/preexisting_bugs`: List pre-existing bugs with pagination, severity filter, and search.
-- `GET /api/preexisting_bug?id=<id_or_slug>`: Fetch full details, locations, and dedicated inline review.
+- `GET /api/preexisting_bug?slug=<slug>`: Fetch full details, locations, and dedicated inline review.
 - `POST /api/preexisting_bug/analyze`: Ingest and analyze a candidate pre-existing concern through `PreexistingBugPipeline`.
 - `GET /api/patchset?id=<id>`: Includes linked `preexisting_bugs` (both newly discovered and matched existing).
 

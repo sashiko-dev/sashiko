@@ -179,15 +179,6 @@ pub struct ReviewQuery {
 }
 
 #[derive(Deserialize)]
-pub struct PreexistingBugsQuery {
-    pub page: Option<u32>,
-    pub limit: Option<u32>,
-    pub severity: Option<String>,
-    pub subsystem: Option<String>,
-    pub search: Option<String>,
-}
-
-#[derive(Deserialize)]
 pub struct PreexistingBugQuery {
     pub id: Option<i64>,
     pub slug: Option<String>,
@@ -321,7 +312,6 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
-        .route("/api/preexisting_bugs", get(list_preexisting_bugs))
         .route("/api/preexisting_bug", get(get_preexisting_bug))
         .route(
             "/api/preexisting_bug/analyze",
@@ -953,39 +943,6 @@ async fn get_review_log(
     }
 }
 
-async fn list_preexisting_bugs(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<PreexistingBugsQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let severity = query.severity.as_deref().map(crate::db::Severity::from_str);
-    match state
-        .db
-        .list_preexisting_bugs(
-            query.page,
-            query.limit,
-            severity,
-            query.subsystem.as_deref(),
-            query.search.as_deref(),
-        )
-        .await
-    {
-        Ok((bugs, total)) => {
-            let page = query.page.unwrap_or(1);
-            let limit = query.limit.unwrap_or(20);
-            Ok(Json(serde_json::json!({
-                "bugs": bugs,
-                "total": total,
-                "page": page,
-                "limit": limit
-            })))
-        }
-        Err(e) => {
-            tracing::error!("Failed to list preexisting bugs: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
 async fn get_preexisting_bug(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PreexistingBugQuery>,
@@ -1455,16 +1412,7 @@ mod tests {
             .unwrap();
         });
 
-        // Test 1: list_preexisting_bugs
-        let res = reqwest::get(format!("http://{}/api/preexisting_bugs", addr))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let json: serde_json::Value = res.json().await.unwrap();
-        assert_eq!(json["total"], 1);
-        assert_eq!(json["bugs"][0]["slug"], "pb-12345678");
-
-        // Test 2: get_preexisting_bug by slug
+        // Test 1: get_preexisting_bug by slug
         let res = reqwest::get(format!(
             "http://{}/api/preexisting_bug?slug=pb-12345678",
             addr
