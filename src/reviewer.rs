@@ -1695,21 +1695,9 @@ async fn run_review_tool(
         Command::new(override_bin)
     } else {
         let exe_path = std::env::current_exe()?;
-        let bin_dir = exe_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let review_bin = bin_dir.join("review");
-        if review_bin.exists() {
-            Command::new(review_bin)
-        } else {
-            warn!(
-                "Could not find review binary at {:?}, falling back to cargo run",
-                review_bin
-            );
-            let mut c = Command::new("cargo");
-            c.args(["run", "--bin", "review", "--"]);
-            c
-        }
+        let mut c = Command::new(exe_path);
+        c.arg("worker");
+        c
     };
 
     cmd.args([
