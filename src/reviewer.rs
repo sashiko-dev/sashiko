@@ -345,7 +345,8 @@ impl Reviewer {
                 .unwrap_or(&review.patch_message_id);
             Self::queue_notifications(
                 ctx,
- patchset.id, Some(review.id),
+                patchset.id,
+                Some(review.id),
                 review.patch_id,
                 &review.patch_message_id,
                 ps_msg_id,
@@ -1538,7 +1539,8 @@ impl Reviewer {
 
                                             if let Err(e) = Self::queue_notifications(
                                                 ctx,
- patchset_id, Some(review_id),
+                                                patchset_id,
+                                                Some(review_id),
                                                 patch_id,
                                                 patch_msg_id,
                                                 patchset_msg_id,
@@ -2253,7 +2255,8 @@ impl Reviewer {
     #[allow(clippy::too_many_arguments)]
     async fn queue_notifications(
         ctx: &ReviewContext,
-patchset_id: i64, review_id: Option<i64>,
+        patchset_id: i64,
+        review_id: Option<i64>,
         patch_id: i64,
         patch_message_id: &str,
         patchset_message_id: &str,
@@ -3508,7 +3511,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 
         Reviewer::queue_notifications(
             &ctx,
-ps_id, None,
+            ps_id,
+            None,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3575,7 +3579,8 @@ inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchse
 
         Reviewer::queue_notifications(
             &ctx,
-ps_id, None,
+            ps_id,
+            None,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",
@@ -3629,7 +3634,8 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
-ps_id, None,
+            ps_id,
+            None,
             p_id_3,
             "msg_id_p3",
             "msg_id_1",
@@ -3705,6 +3711,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             Some(rev_id),
             p_id_4,
             "msg_id_p4",
@@ -3814,7 +3821,8 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
-ps_id, None,
+            ps_id,
+            None,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3859,7 +3867,8 @@ ps_id, None,
 
         Reviewer::queue_notifications(
             &ctx,
-ps_id, None,
+            ps_id,
+            None,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",

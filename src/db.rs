@@ -1476,8 +1476,7 @@ impl Database {
             bug.inline_review = crate::compression::get_compressed_string_opt(&row, 8)
                 .unwrap_or_default()
                 .unwrap_or_default();
-            bug.logs = crate::compression::get_compressed_string_opt(&row, 9)
-                .unwrap_or_default();
+            bug.logs = crate::compression::get_compressed_string_opt(&row, 9).unwrap_or_default();
             bugs.push(bug);
         }
 
