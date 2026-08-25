@@ -282,7 +282,7 @@ CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(statu
 CREATE INDEX IF NOT EXISTS idx_reviews_patch_status ON reviews(patch_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS preexisting_bugs (
+CREATE TABLE IF NOT EXISTS bugs (
     id INTEGER PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     problem TEXT NOT NULL,
@@ -305,18 +305,18 @@ CREATE TABLE IF NOT EXISTS preexisting_bugs (
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_slug ON preexisting_bugs(slug);
-CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_severity ON preexisting_bugs(severity);
-CREATE INDEX IF NOT EXISTS idx_preexisting_bugs_is_fixed ON preexisting_bugs(is_fixed);
+CREATE INDEX IF NOT EXISTS idx_bugs_slug ON bugs(slug);
+CREATE INDEX IF NOT EXISTS idx_bugs_severity ON bugs(severity);
+CREATE INDEX IF NOT EXISTS idx_bugs_is_fixed ON bugs(is_fixed);
 
-CREATE TABLE IF NOT EXISTS review_preexisting_bugs (
+CREATE TABLE IF NOT EXISTS review_bugs (
     review_id INTEGER NOT NULL,
     bug_id INTEGER NOT NULL,
     is_newly_discovered INTEGER NOT NULL DEFAULT 1, -- 1 = newly discovered, 0 = matched existing
     PRIMARY KEY(review_id, bug_id),
     FOREIGN KEY(review_id) REFERENCES reviews(id),
-    FOREIGN KEY(bug_id) REFERENCES preexisting_bugs(id)
+    FOREIGN KEY(bug_id) REFERENCES bugs(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_review_preexisting_bugs_review ON review_preexisting_bugs(review_id);
-CREATE INDEX IF NOT EXISTS idx_review_preexisting_bugs_bug ON review_preexisting_bugs(bug_id);
+CREATE INDEX IF NOT EXISTS idx_review_bugs_review ON review_bugs(review_id);
+CREATE INDEX IF NOT EXISTS idx_review_bugs_bug ON review_bugs(bug_id);

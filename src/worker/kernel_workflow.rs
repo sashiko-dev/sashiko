@@ -67,7 +67,7 @@ pub struct KernelReviewState {
     /// Filtered patch-introduced concerns after Stage 9 conflict resolution.
     pub patch_concerns: Vec<Value>,
     /// Candidate pre-existing concerns extracted after Stage 9 for separate processing.
-    pub preexisting_concerns: Vec<Value>,
+    pub concerns: Vec<Value>,
 
     /// Verified findings from Stage 10.
     pub findings: Vec<Value>,
@@ -804,7 +804,7 @@ Example Output:
                 new_concerns.push(concern);
             }
             state.patch_concerns = new_concerns;
-            state.preexisting_concerns = preexisting;
+            state.concerns = preexisting;
         })
         .build()
 }
@@ -870,7 +870,7 @@ Example Output:
         })
         .reduce(|state, out: Stage10Output| {
             let mut new_findings = Vec::new();
-            state.preexisting_concerns.clear();
+            state.concerns.clear();
             for finding in out.findings {
                 let is_preexisting = finding
                     .get("preexisting")
@@ -884,7 +884,7 @@ Example Output:
                         "preexisting": true,
                         "locations": finding.get("locations").cloned().unwrap_or(json!([])),
                     });
-                    state.preexisting_concerns.push(concern);
+                    state.concerns.push(concern);
                 }
                 new_findings.push(finding);
             }

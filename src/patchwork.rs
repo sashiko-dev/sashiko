@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_only_preexisting_produces_success() {
+    fn test_only_produces_success() {
         let findings = vec![finding_preexisting("Critical"), finding_preexisting("High")];
         let result = PatchworkCheckResult::from_policy(&default_policy(), &findings);
         assert_eq!(result.state, "success");
@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_new_and_preexisting_same_severity() {
+    fn test_mixed_new_and_same_severity() {
         let findings = vec![
             finding_new("High"),
             finding_new("High"),
@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_preexisting_treated_as_new() {
+    fn test_missing_treated_as_new() {
         // findings without preexisting field default to new
         let findings = vec![serde_json::json!({"severity": "High", "problem": "test"})];
         let result = PatchworkCheckResult::from_policy(&default_policy(), &findings);
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_null_preexisting_treated_as_new() {
+    fn test_null_treated_as_new() {
         let findings =
             vec![serde_json::json!({"severity": "High", "problem": "test", "preexisting": null})];
         let result = PatchworkCheckResult::from_policy(&default_policy(), &findings);

@@ -33,12 +33,12 @@ use crate::ai::vector_search::{
     DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_TOP_CANDIDATES, extract_bug_vector, find_top_candidates,
 };
 use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool};
-use crate::db::{Database, NewPreexistingBug, PreexistingBug, Severity};
+use crate::db::{Bug, Database, NewBug, Severity};
 use crate::toolbox::ToolBox;
 
 /// Input payload representing a candidate pre-existing defect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreexistingBugInput {
+pub struct BugInput {
     pub problem: String,
     pub reasoning: String,
     pub locations: Option<Value>,
@@ -54,7 +54,7 @@ pub struct PreexistingBugInput {
 /// The result of processing a candidate pre-existing bug through the pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum PreexistingBugOutcome {
+pub enum BugOutcome {
     /// The candidate bug was discarded (invalid, false positive, or Low/Medium severity).
     Discarded {
         reason: String,
@@ -62,12 +62,12 @@ pub enum PreexistingBugOutcome {
     },
     /// The bug was confirmed as an identical duplicate of a known pre-existing bug.
     Duplicate {
-        existing_bug: PreexistingBug,
+        existing_bug: Bug,
         reasoning: String,
         logs: Option<String>,
     },
     /// The bug was confirmed as a newly discovered pre-existing bug.
-    NewlyDiscovered { bug: PreexistingBug },
+    NewlyDiscovered { bug: Bug },
 }
 
 // ---------------------------------------------------------------------------
@@ -87,14 +87,14 @@ struct VerificationJson {
     fixed_in_commit: Option<String>,
 }
 
-struct PreexistingVerifySession<'a> {
-    input: &'a PreexistingBugInput,
+struct VerifySession<'a> {
+    input: &'a BugInput,
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
 }
 
 #[async_trait]
-impl LlmSession for PreexistingVerifySession<'_> {
+impl LlmSession for VerifySession<'_> {
     type Output = VerificationJson;
 
     fn system_prompt(&self) -> String {
@@ -182,16 +182,16 @@ struct DedupJson {
     reasoning: String,
 }
 
-struct PreexistingDedupSession<'a> {
+struct DedupSession<'a> {
     candidate_problem: &'a str,
     candidate_locations: Option<&'a Value>,
     candidate_subsystems: &'a [String],
-    known_candidates: &'a [PreexistingBug],
+    known_candidates: &'a [Bug],
     context_tag: Option<String>,
 }
 
 #[async_trait]
-impl LlmSession for PreexistingDedupSession<'_> {
+impl LlmSession for DedupSession<'_> {
     type Output = DedupJson;
 
     fn system_prompt(&self) -> String {
@@ -279,7 +279,7 @@ impl LlmSession for PreexistingDedupSession<'_> {
 // 3. Standalone Inline Review Generation Session
 // ---------------------------------------------------------------------------
 
-struct PreexistingReportSession<'a> {
+struct ReportSession<'a> {
     problem: &'a str,
     severity: &'a str,
     severity_explanation: &'a str,
@@ -292,7 +292,7 @@ struct PreexistingReportSession<'a> {
 }
 
 #[async_trait]
-impl LlmSession for PreexistingReportSession<'_> {
+impl LlmSession for ReportSession<'_> {
     type Output = String;
 
     fn system_prompt(&self) -> String {
@@ -382,18 +382,18 @@ impl LlmSession for PreexistingReportSession<'_> {
 // ---------------------------------------------------------------------------
 
 /// Generates a random unique UUID for a newly discovered pre-existing bug.
-pub fn generate_preexisting_slug() -> String {
+pub fn generate_slug() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
 /// Executes the standalone pre-existing bug pipeline for a single candidate concern.
-pub async fn process_preexisting_issue(
+pub async fn process_issue(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
     db: &Database,
-    input: PreexistingBugInput,
+    input: BugInput,
     context_tag: Option<&str>,
-) -> Result<PreexistingBugOutcome> {
+) -> Result<BugOutcome> {
     info!(
         "Processing candidate pre-existing issue: '{}' in subsystems '{:?}'",
         input.problem, input.subsystems
@@ -410,7 +410,7 @@ pub async fn process_preexisting_issue(
         input.locations.as_ref(),
     );
 
-    let known_bugs = db.list_all_preexisting_bugs_for_vector_search().await?;
+    let known_bugs = db.list_all_bugs_for_vector_search().await?;
     let candidate_matches = find_top_candidates(
         &query_vector,
         &known_bugs,
@@ -425,10 +425,9 @@ pub async fn process_preexisting_issue(
 
     // Step 2: LLM Deduplication Confirmation (Short-circuit if duplicate of existing bug)
     if !candidate_matches.is_empty() {
-        let candidate_bugs: Vec<PreexistingBug> =
-            candidate_matches.iter().map(|m| m.bug.clone()).collect();
+        let candidate_bugs: Vec<Bug> = candidate_matches.iter().map(|m| m.bug.clone()).collect();
 
-        let mut dedup_session = PreexistingDedupSession {
+        let mut dedup_session = DedupSession {
             candidate_problem: &input.problem,
             candidate_locations: input.locations.as_ref(),
             candidate_subsystems: &input.subsystems,
@@ -453,7 +452,7 @@ pub async fn process_preexisting_issue(
                 existing.id, existing.slug
             );
             let logs = serde_json::to_string(&full_history).ok();
-            return Ok(PreexistingBugOutcome::Duplicate {
+            return Ok(BugOutcome::Duplicate {
                 existing_bug: existing.clone(),
                 reasoning: dedup.reasoning,
                 logs,
@@ -462,7 +461,7 @@ pub async fn process_preexisting_issue(
     }
 
     // Step 3: Issue Verification & Severity Calibration (only for novel candidates)
-    let mut verify_session = PreexistingVerifySession {
+    let mut verify_session = VerifySession {
         input: &input,
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
@@ -478,7 +477,7 @@ pub async fn process_preexisting_issue(
             .unwrap_or_else(|| "Discarded as invalid or below High severity threshold".to_string());
         info!("Pre-existing candidate discarded: {}", reason);
         let logs = serde_json::to_string(&full_history).ok();
-        return Ok(PreexistingBugOutcome::Discarded { reason, logs });
+        return Ok(BugOutcome::Discarded { reason, logs });
     }
 
     let severity = Severity::from_str(&verification.severity);
@@ -489,7 +488,7 @@ pub async fn process_preexisting_issue(
         );
         info!("{}", reason);
         let logs = serde_json::to_string(&full_history).ok();
-        return Ok(PreexistingBugOutcome::Discarded { reason, logs });
+        return Ok(BugOutcome::Discarded { reason, logs });
     }
 
     let final_locations = verification
@@ -501,7 +500,7 @@ pub async fn process_preexisting_issue(
     let fixed_in_commit = verification.fixed_in_commit;
 
     // Step 4: Standalone Inline Review Generation
-    let mut report_session = PreexistingReportSession {
+    let mut report_session = ReportSession {
         problem: &input.problem,
         severity: severity.as_str(),
         severity_explanation: severity_explanation.as_deref().unwrap_or(""),
@@ -520,7 +519,7 @@ pub async fn process_preexisting_issue(
     let logs_json = serde_json::to_string(&full_history).ok();
 
     // Step 5: Persist in Database
-    let slug = generate_preexisting_slug();
+    let slug = generate_slug();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
@@ -531,7 +530,7 @@ pub async fn process_preexisting_issue(
         Some(input.source_files.clone())
     };
 
-    let new_bug = NewPreexistingBug {
+    let new_bug = NewBug {
         slug: slug.clone(),
         problem: input.problem.clone(),
         severity,
@@ -551,18 +550,15 @@ pub async fn process_preexisting_issue(
         created_at: now,
     };
 
-    let bug_id = db.create_preexisting_bug(&new_bug).await?;
-    let saved_bug = db
-        .get_preexisting_bug(bug_id)
-        .await?
-        .expect("Saved bug must exist");
+    let bug_id = db.create_bug(&new_bug).await?;
+    let saved_bug = db.get_bug(bug_id).await?.expect("Saved bug must exist");
 
     info!(
         "Successfully registered newly discovered pre-existing bug #{} ({})",
         bug_id, slug
     );
 
-    Ok(PreexistingBugOutcome::NewlyDiscovered { bug: saved_bug })
+    Ok(BugOutcome::NewlyDiscovered { bug: saved_bug })
 }
 
 #[cfg(test)]
@@ -602,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_session_valid() {
-        let input = PreexistingBugInput {
+        let input = BugInput {
             problem: "Memory leak in net/core/dev.c".to_string(),
             reasoning: "Allocated buffer not freed on error path".to_string(),
             locations: Some(json!([{"file": "net/core/dev.c", "line": 100}])),
@@ -625,7 +621,7 @@ mod tests {
             .to_string(),
         };
 
-        let mut session = PreexistingVerifySession {
+        let mut session = VerifySession {
             input: &input,
             tools: None,
             context_tag: None,
@@ -648,7 +644,7 @@ mod tests {
             .to_string(),
         };
 
-        let known_bugs = vec![PreexistingBug {
+        let known_bugs = vec![Bug {
             id: 42,
             slug: "pb-42".to_string(),
             problem: "Memory leak in dev.c".to_string(),
@@ -669,7 +665,7 @@ mod tests {
             created_at: 100,
         }];
 
-        let mut session = PreexistingDedupSession {
+        let mut session = DedupSession {
             candidate_problem: "Memory leak in net/core/dev.c",
             candidate_locations: None,
             candidate_subsystems: &["net".to_string()],
@@ -732,7 +728,7 @@ mod tests {
             response_text: "This is a pre-existing issue in the codebase.\n\n> int *ptr = alloc();\n> if (!ptr)\n>     return -ENOMEM;\n\nThe buffer is not freed.\n".to_string(),
         };
 
-        let mut session = PreexistingReportSession {
+        let mut session = ReportSession {
             problem: "Memory leak in net/core/dev.c",
             severity: "High",
             severity_explanation: "Missing free",
@@ -751,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_preexisting_issue_flow() {
+    async fn test_process_issue_flow() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
             token: String::new(),
@@ -785,7 +781,7 @@ mod tests {
         // 1st call: Verification, 2nd call: Standalone Report (no existing candidates in DB so dedup is skipped)
         let provider = QueuedMockAiProvider::new(vec![verify_json, report_text]);
 
-        let input = PreexistingBugInput {
+        let input = BugInput {
             problem: "Buffer overflow in e1000 rx handler".to_string(),
             reasoning: "Size not checked against MTU".to_string(),
             locations: Some(
@@ -799,12 +795,12 @@ mod tests {
             baseline_sha: None,
         };
 
-        let outcome = process_preexisting_issue(&provider, None, &db, input, None)
+        let outcome = process_issue(&provider, None, &db, input, None)
             .await
             .unwrap();
 
         match outcome {
-            PreexistingBugOutcome::NewlyDiscovered { bug } => {
+            BugOutcome::NewlyDiscovered { bug } => {
                 assert_eq!(bug.problem, "Buffer overflow in e1000 rx handler");
                 assert_eq!(bug.severity, Severity::Critical);
                 assert!(uuid::Uuid::parse_str(&bug.slug).is_ok());
@@ -824,7 +820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_preexisting_issue_dedup_first_short_circuits_verification() {
+    async fn test_process_issue_dedup_first_short_circuits_verification() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
             token: String::new(),
@@ -841,7 +837,7 @@ mod tests {
         );
 
         let existing_id = db
-            .create_preexisting_bug(&NewPreexistingBug {
+            .create_bug(&NewBug {
                 slug: "pb-existing1".to_string(),
                 problem: "Buffer overflow in e1000 rx handler".to_string(),
                 severity: Severity::High,
@@ -875,7 +871,7 @@ mod tests {
 
         let provider = QueuedMockAiProvider::new(vec![dedup_json]);
 
-        let input = PreexistingBugInput {
+        let input = BugInput {
             problem: "Buffer overflow in e1000 rx handler".to_string(),
             reasoning: "Size not checked against MTU".to_string(),
             locations: Some(
@@ -889,12 +885,12 @@ mod tests {
             baseline_sha: None,
         };
 
-        let outcome = process_preexisting_issue(&provider, None, &db, input, None)
+        let outcome = process_issue(&provider, None, &db, input, None)
             .await
             .unwrap();
 
         match outcome {
-            PreexistingBugOutcome::Duplicate {
+            BugOutcome::Duplicate {
                 existing_bug,
                 reasoning,
                 logs,

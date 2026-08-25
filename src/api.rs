@@ -179,7 +179,7 @@ pub struct ReviewQuery {
 }
 
 #[derive(Deserialize)]
-pub struct PreexistingBugQuery {
+pub struct BugQuery {
     pub id: Option<i64>,
     pub slug: Option<String>,
 }
@@ -312,9 +312,9 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
-        .route("/api/bug", get(get_preexisting_bug))
-        .route("/api/bugs", get(list_preexisting_bugs))
-        .route("/api/bug/analyze", post(analyze_preexisting_bug))
+        .route("/api/bug", get(get_bug))
+        .route("/api/bugs", get(list_bugs))
+        .route("/api/bug/analyze", post(analyze_bug))
         .route("/bug/{slug}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
@@ -941,14 +941,14 @@ async fn get_review_log(
     }
 }
 
-async fn get_preexisting_bug(
+async fn get_bug(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<PreexistingBugQuery>,
+    Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(id) = query.id {
-        state.db.get_preexisting_bug(id).await
+        state.db.get_bug(id).await
     } else if let Some(ref slug) = query.slug {
-        state.db.get_preexisting_bug_by_slug(slug).await
+        state.db.get_bug_by_slug(slug).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
@@ -965,10 +965,10 @@ async fn get_preexisting_bug(
     }
 }
 
-async fn analyze_preexisting_bug(
+async fn analyze_bug(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<crate::pipelines::preexisting::PreexistingBugInput>,
-) -> Result<Json<crate::pipelines::preexisting::PreexistingBugOutcome>, (StatusCode, String)> {
+    Json(payload): Json<crate::pipelines::bug::BugInput>,
+) -> Result<Json<crate::pipelines::bug::BugOutcome>, (StatusCode, String)> {
     if state.read_only {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1016,12 +1016,12 @@ async fn analyze_preexisting_bug(
         payload.subsystems = mindex.match_files(&payload.source_files);
     }
 
-    match crate::pipelines::preexisting::process_preexisting_issue(
+    match crate::pipelines::bug::process_issue(
         provider.as_ref(),
         tools,
         &state.db,
         payload,
-        Some("api_preexisting_analyze"),
+        Some("api_analyze"),
     )
     .await
     {
@@ -1383,7 +1383,7 @@ async fn forge_webhook(
     })))
 }
 
-async fn list_preexisting_bugs(
+async fn list_bugs(
     State(state): State<Arc<AppState>>,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1393,7 +1393,7 @@ async fn list_preexisting_bugs(
 
     match state
         .db
-        .get_preexisting_bugs_list(per_page, offset, pagination.q.as_deref())
+        .get_bugs_list(per_page, offset, pagination.q.as_deref())
         .await
     {
         Ok((items, total)) => Ok(Json(serde_json::json!({
@@ -1419,7 +1419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_preexisting_bug_endpoints() {
+    async fn test_bug_endpoints() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
             token: String::new(),
@@ -1428,7 +1428,7 @@ mod tests {
         db.migrate().await.unwrap();
 
         let _bug_id = db
-            .create_preexisting_bug(&crate::db::NewPreexistingBug {
+            .create_bug(&crate::db::NewBug {
                 slug: "pb-12345678".to_string(),
                 problem: "UAF in test_device".to_string(),
                 severity: crate::db::Severity::Critical,
@@ -1467,7 +1467,7 @@ mod tests {
             .unwrap();
         });
 
-        // Test 1: get_preexisting_bug by slug
+        // Test 1: get_bug by slug
         let res = reqwest::get(format!("http://{}/api/bug?slug=pb-12345678", addr))
             .await
             .unwrap();

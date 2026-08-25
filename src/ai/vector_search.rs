@@ -18,7 +18,7 @@
 //! files, directory hierarchies, subsystem identifiers, and code symbols to perform
 //! sub-millisecond candidate retrieval before LLM verification.
 
-use crate::db::PreexistingBug;
+use crate::db::Bug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -86,7 +86,7 @@ impl Default for BugVector {
 #[derive(Debug, Clone)]
 pub struct CandidateMatch {
     /// The matched known pre-existing bug.
-    pub bug: PreexistingBug,
+    pub bug: Bug,
     /// The computed similarity score (0.0 to 1.0).
     pub similarity: f32,
 }
@@ -311,7 +311,7 @@ fn is_stop_word(word: &str) -> bool {
 /// Searches a collection of known pre-existing bugs and returns the top matching candidates.
 pub fn find_top_candidates(
     query_vector: &BugVector,
-    known_bugs: &[PreexistingBug],
+    known_bugs: &[Bug],
     top_n: usize,
     threshold: f32,
 ) -> Vec<CandidateMatch> {
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_find_top_candidates_ranking() {
-        let known_bug_1 = PreexistingBug {
+        let known_bug_1 = Bug {
             id: 1,
             slug: "pb-1".to_string(),
             problem: "Null pointer dereference in e1000_clean_rx_irq".to_string(),
@@ -455,7 +455,7 @@ mod tests {
             created_at: 100,
         };
 
-        let known_bug_2 = PreexistingBug {
+        let known_bug_2 = Bug {
             id: 2,
             slug: "pb-2".to_string(),
             problem: "Memory leak in e1000_probe".to_string(),
@@ -480,7 +480,7 @@ mod tests {
             created_at: 200,
         };
 
-        let known_bug_3 = PreexistingBug {
+        let known_bug_3 = Bug {
             id: 3,
             slug: "pb-3".to_string(),
             problem: "Unrelated deadlock in fs/btrfs/super.c".to_string(),

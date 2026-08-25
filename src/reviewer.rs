@@ -1345,11 +1345,10 @@ impl Reviewer {
                                     }
                                 }
 
-                                if let Some(preexisting_arr) = review_content
-                                    .get("preexisting_concerns")
-                                    .and_then(|f| f.as_array())
+                                if let Some(arr) =
+                                    review_content.get("concerns").and_then(|f| f.as_array())
                                 {
-                                    for concern in preexisting_arr {
+                                    for concern in arr {
                                         let problem = concern
                                             .get("description")
                                             .or_else(|| concern.get("type"))
@@ -1386,18 +1385,17 @@ impl Reviewer {
                                             Vec::new()
                                         };
 
-                                        let input =
-                                            crate::pipelines::preexisting::PreexistingBugInput {
-                                                problem,
-                                                reasoning,
-                                                locations,
-                                                subsystems: matched_subsystems,
-                                                source_files,
-                                                commit_sha: commit_sha.clone(),
-                                                patchset_id: Some(patchset_id),
-                                                patch_id: Some(patch_id),
-                                                baseline_sha: Some(baseline_ref.to_string()),
-                                            };
+                                        let input = crate::pipelines::bug::BugInput {
+                                            problem,
+                                            reasoning,
+                                            locations,
+                                            subsystems: matched_subsystems,
+                                            source_files,
+                                            commit_sha: commit_sha.clone(),
+                                            patchset_id: Some(patchset_id),
+                                            patch_id: Some(patch_id),
+                                            baseline_sha: Some(baseline_ref.to_string()),
+                                        };
                                         let repo_path = std::path::PathBuf::from(
                                             &ctx.settings.git.repository_path,
                                         );
@@ -1435,40 +1433,40 @@ impl Reviewer {
                                             }
                                             toolbox = Some(Arc::new(tb));
                                         }
-                                        match crate::pipelines::preexisting::process_preexisting_issue(
+                                        match crate::pipelines::bug::process_issue(
                                             ctx.provider.as_ref(),
                                             toolbox,
                                             &ctx.db,
                                             input,
-                                            Some("preexisting_bug"),
+                                            Some("bug"),
                                         )
                                         .await
                                         {
                                             Ok(outcome) => match outcome {
-                                                crate::pipelines::preexisting::PreexistingBugOutcome::NewlyDiscovered {
+                                                crate::pipelines::bug::BugOutcome::NewlyDiscovered {
                                                     bug,
                                                 } => {
                                                     let _ = ctx
                                                         .db
-                                                        .link_review_to_preexisting_bug(
+                                                        .link_review_to_bug(
                                                             review_id, bug.id, true,
                                                         )
                                                         .await;
                                                 }
-                                                crate::pipelines::preexisting::PreexistingBugOutcome::Duplicate {
+                                                crate::pipelines::bug::BugOutcome::Duplicate {
                                                     existing_bug,
                                                     ..
                                                 } => {
                                                     let _ = ctx
                                                         .db
-                                                        .link_review_to_preexisting_bug(
+                                                        .link_review_to_bug(
                                                             review_id,
                                                             existing_bug.id,
                                                             false,
                                                         )
                                                         .await;
                                                 }
-                                                crate::pipelines::preexisting::PreexistingBugOutcome::Discarded {
+                                                crate::pipelines::bug::BugOutcome::Discarded {
                                                     ..
                                                 } => {}
                                             },
@@ -2275,7 +2273,7 @@ impl Reviewer {
 
         let newly_discovered_preexisting = if let Some(r_id) = review_id {
             ctx.db
-                .list_preexisting_bugs_for_review(r_id)
+                .list_bugs_for_review(r_id)
                 .await
                 .unwrap_or_default()
                 .into_iter()
@@ -2543,7 +2541,7 @@ impl Reviewer {
                     ));
 
                     let mut new_findings = Vec::new();
-                    let mut preexisting_findings = Vec::new();
+                    let mut existing_findings = Vec::new();
 
                     if let Some(findings_arr) = findings {
                         for f in findings_arr {
@@ -2552,7 +2550,7 @@ impl Reviewer {
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
                             if preexisting {
-                                preexisting_findings.push(f.clone());
+                                existing_findings.push(f.clone());
                             } else {
                                 new_findings.push(f.clone());
                             }
@@ -2570,7 +2568,7 @@ impl Reviewer {
                     };
 
                     new_findings.sort_by(sort_by_severity);
-                    preexisting_findings.sort_by(sort_by_severity);
+                    existing_findings.sort_by(sort_by_severity);
 
                     let format_finding = |f: &Value| {
                         let problem = f
@@ -2585,8 +2583,8 @@ impl Reviewer {
                         format!("- [{}] {}\n", severity, problem)
                     };
 
-                    let has_preexisting = !preexisting_findings.is_empty()
-                        || !newly_discovered_preexisting.is_empty();
+                    let has_preexisting =
+                        !existing_findings.is_empty() || !newly_discovered_preexisting.is_empty();
 
                     if !new_findings.is_empty() && has_preexisting {
                         header.push_str("\nNew issues:\n");
@@ -2594,7 +2592,7 @@ impl Reviewer {
                             header.push_str(&format_finding(f));
                         }
                         header.push_str("\nPre-existing issues:\n");
-                        for f in &preexisting_findings {
+                        for f in &existing_findings {
                             header.push_str(&format_finding(f));
                         }
                         for bug in &newly_discovered_preexisting {
@@ -2611,7 +2609,7 @@ impl Reviewer {
                         }
                     } else if has_preexisting {
                         header.push_str("\nPre-existing issues:\n");
-                        for f in &preexisting_findings {
+                        for f in &existing_findings {
                             header.push_str(&format_finding(f));
                         }
                         for bug in &newly_discovered_preexisting {
@@ -3498,7 +3496,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                 "preexisting": false
             }),
             json!({
-                "problem": "Preexisting Medium issue",
+                "problem": "Medium issue",
                 "severity": "Medium",
                 "preexisting": true
             }),
@@ -3541,7 +3539,7 @@ New issues:
 - [Low] New Low issue
 
 Pre-existing issues:
-- [Medium] Preexisting Medium issue
+- [Medium] Medium issue
 --
 
 inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=1";
@@ -3626,8 +3624,8 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         .await?;
         let p_id_3 = db.create_patch(ps_id, "msg_id_p3", 3, "diff").await?;
 
-        let findings_preexisting_only = vec![json!({
-            "problem": "Preexisting Medium issue",
+        let findings_only = vec![json!({
+            "problem": "Medium issue",
             "severity": "Medium",
             "preexisting": true
         })];
@@ -3641,7 +3639,7 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             "msg_id_1",
             3, // index
             "inline review content 3",
-            Some(&findings_preexisting_only),
+            Some(&findings_only),
             "summary",
         )
         .await?;
@@ -3655,24 +3653,24 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .await?;
         let row = rows.next().await?.expect("Expected email in outbox");
         let body: String = row.get(0)?;
-        let expected_preexisting_only_body = "\
+        let expected_only_body = "\
 Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
 
 Pre-existing issues:
-- [Medium] Preexisting Medium issue
+- [Medium] Medium issue
 --
 
 inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=3";
-        assert_eq!(body, expected_preexisting_only_body);
+        assert_eq!(body, expected_only_body);
 
         // Setup for Scenario 4: Linked newly discovered preexisting bug with slug
         let rev_id = db
             .create_review(ps_id, Some(p_id_3), "provider", "model", None, None)
             .await?;
         let bug_id = db
-            .create_preexisting_bug(&crate::db::NewPreexistingBug {
+            .create_bug(&crate::db::NewBug {
                 slug: "pb-deadbeef".to_string(),
-                problem: "Preexisting High UAF in cleanup".to_string(),
+                problem: " High UAF in cleanup".to_string(),
                 severity: Severity::High,
                 severity_explanation: Some("Reasoning".to_string()),
                 locations: None,
@@ -3690,8 +3688,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 created_at: 1000,
             })
             .await?;
-        db.link_review_to_preexisting_bug(rev_id, bug_id, true)
-            .await?;
+        db.link_review_to_bug(rev_id, bug_id, true).await?;
 
         db.create_message(
             "msg_id_p4",
@@ -3740,7 +3737,7 @@ New issues:
 - [Low] New Low issue
 
 Pre-existing issues:
-- [High] Preexisting High UAF in cleanup: https://sashiko.dev/bug/pb-deadbeef
+- [High] High UAF in cleanup: https://sashiko.dev/bug/pb-deadbeef
 --
 
 inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=4";

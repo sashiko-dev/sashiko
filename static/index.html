@@ -1348,7 +1348,7 @@
             }
             const bugMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)$/);
             if (bugMatch) {
-                return { view: 'preexisting_bug', id: decodeURIComponent(bugMatch[1]), query };
+                return { view: 'bug', id: decodeURIComponent(bugMatch[1]), query };
             }
             const msgMatch = hash.match(/^#\/message\/(.+)$/);
             if (msgMatch) {
@@ -1437,8 +1437,8 @@
                     case 'patchset':
                         await renderPatchsetView(route.id, route.query || {});
                         break;
-                    case 'preexisting_bug':
-                        await renderPreexistingBugView(route.id);
+                    case 'bug':
+                        await renderBugView(route.id);
                         break;
                     case 'message':
                         await renderMessageView(route.id);
@@ -2503,14 +2503,14 @@
             }
 
             let preexistingBugsHtml = '';
-            if (data.preexisting_bugs && Array.isArray(data.preexisting_bugs) && data.preexisting_bugs.length > 0) {
+            if (data.bugs && Array.isArray(data.bugs) && data.bugs.length > 0) {
                 preexistingBugsHtml = `
                     <div class="section" id="preexisting-bugs">
-                        <h2>Discovered Pre-existing Bugs (${data.preexisting_bugs.length})</h2>
+                        <h2>Discovered Pre-existing Bugs (${data.bugs.length})</h2>
                         <div style="margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em;">
                             The following pre-existing defects in the codebase were identified during review (separated from patch regressions):
                         </div>
-                        ${data.preexisting_bugs.map(b => {
+                        ${data.bugs.map(b => {
                             const sev = (b.severity || 'High').toLowerCase();
                             const sevColor = sev === 'critical' ? 'var(--sev-critical)' : 'var(--sev-high)';
                             const bugLink = `#/bug/${encodeURIComponent(b.slug || b.id)}`;
@@ -2941,7 +2941,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // =====================================================================
         // PRE-EXISTING BUG VIEW
         // =====================================================================
-        async function renderPreexistingBugView(slugOrId) {
+        async function renderBugView(slugOrId) {
             const isId = /^\d+$/.test(slugOrId);
             const queryParam = isId ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug?${queryParam}`);
