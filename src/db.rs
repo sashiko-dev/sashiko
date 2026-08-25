@@ -10801,4 +10801,83 @@ mod tests {
             "v2 authored by B4 relay alias should chain to v1 by the real author"
         );
     }
+
+    #[tokio::test]
+    async fn test_find_previous_version_returns_none_for_v1() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root-fpv", "FPV Test", 1000)
+            .await
+            .unwrap();
+
+        // find_previous_version for v1 should always return None
+        let result = db
+            .find_previous_version(thread_id, "author@test.com", "[PATCH 1/1] Fix", 1)
+            .await
+            .unwrap();
+        assert_eq!(result, None, "v1 should never have a previous version");
+    }
+
+    #[tokio::test]
+    async fn test_find_previous_version_cross_thread_subject_match() {
+        let db = setup_db().await;
+
+        // Create v1 in thread 1
+        let thread1 = db
+            .create_thread("root-ct1", "CT Test 1", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "ct-v1",
+            thread1,
+            None,
+            "dev@kernel.org",
+            "[PATCH 1/1] Fix scheduler",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v1 = db
+            .create_patchset(
+                thread1,
+                None,
+                "ct-v1",
+                "[PATCH 1/1] Fix scheduler",
+                "dev@kernel.org",
+                1000,
+                1,
+                2,
+                "",
+                "",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Search for v1 from a different thread by same author + stripped subject
+        let thread2 = db
+            .create_thread("root-ct2", "CT Test 2", 2000)
+            .await
+            .unwrap();
+        let result = db
+            .find_previous_version(thread2, "dev@kernel.org", "[PATCH v2 1/1] Fix scheduler", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            Some(ps_v1),
+            "Should find v1 via author + stripped subject across threads"
+        );
+    }
 }

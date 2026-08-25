@@ -1373,7 +1373,7 @@ async fn forge_webhook(
         // Different commit range — new version
         let new_version = existing_version + 1;
 
-        let slug = metadata.pr_url.as_ref().map(|url| {
+        let slug = metadata.repo_url.as_ref().map(|url| {
             let repo = crate::forge::extract_repo_name_from_url(url);
             format!("{}-{}-v{}", repo, metadata.pr_number, new_version)
         });
@@ -1437,7 +1437,7 @@ async fn forge_webhook(
     // No existing patchset — create v1
     let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
 
-    let slug = metadata.pr_url.as_ref().map(|url| {
+    let slug = metadata.repo_url.as_ref().map(|url| {
         let repo = crate::forge::extract_repo_name_from_url(url);
         format!("{}-{}", repo, metadata.pr_number)
     });
