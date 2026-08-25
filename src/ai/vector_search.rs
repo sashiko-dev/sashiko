@@ -431,6 +431,7 @@ mod tests {
     #[test]
     fn test_find_top_candidates_ranking() {
         let known_bug_1 = Bug {
+            status: "verified".to_string(),
             id: 1,
             slug: "pb-1".to_string(),
             problem: "Null pointer dereference in e1000_clean_rx_irq".to_string(),
@@ -456,6 +457,7 @@ mod tests {
         };
 
         let known_bug_2 = Bug {
+            status: "verified".to_string(),
             id: 2,
             slug: "pb-2".to_string(),
             problem: "Memory leak in e1000_probe".to_string(),
@@ -481,6 +483,7 @@ mod tests {
         };
 
         let known_bug_3 = Bug {
+            status: "verified".to_string(),
             id: 3,
             slug: "pb-3".to_string(),
             problem: "Unrelated deadlock in fs/btrfs/super.c".to_string(),

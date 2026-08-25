@@ -811,6 +811,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    {
+        let provider =
+            sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
+        let bug_worker = sashiko::worker::bug_worker::BugWorker::new(
+            db.clone(),
+            provider,
+            settings.git.repository_path.clone(),
+        );
+        tokio::spawn(async move {
+            bug_worker.run().await;
+        });
+    }
+    {
+        let provider =
+            sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
+        let bug_worker = sashiko::worker::bug_worker::BugWorker::new(
+            db.clone(),
+            provider,
+            settings.git.repository_path.clone(),
+        );
+        tokio::spawn(async move {
+            bug_worker.run().await;
+        });
+    }
     // Initialize custom remotes
     // Start Background Compressor Worker
     tokio::spawn(sashiko::worker::compressor::run_compressor(db.clone()));

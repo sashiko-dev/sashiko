@@ -398,9 +398,48 @@ pub fn generate_slug() -> String {
 
 /// Executes the standalone pre-existing bug pipeline for a single candidate concern.
 pub async fn process_issue(
+    _provider: &dyn AiProvider,
+    _tools: Option<Arc<ToolBox>>,
+    db: &Database,
+    input: BugInput,
+    _context_tag: Option<&str>,
+) -> Result<BugOutcome> {
+    info!(
+        "Queueing candidate pre-existing issue: '{}' in subsystems '{:?}'",
+        input.problem, input.subsystems
+    );
+    let slug = generate_slug();
+    let new_bug = NewBug {
+        slug: slug.clone(),
+        status: "raw".to_string(),
+        problem: input.problem.clone(),
+        severity: crate::db::Severity::Low,
+        severity_explanation: Some("Pending background validation".to_string()),
+        locations: input.locations.clone(),
+        subsystems: input.subsystems.clone(),
+        source_files: Some(input.source_files.clone()),
+        inline_review: String::new(),
+        logs: None,
+        vector_json: None,
+        discovered_in_patchset_id: input.patchset_id,
+        discovered_in_patch_id: input.patch_id,
+        discovered_in_commit: input.commit_sha.clone(),
+        introduced_in_commit: None,
+        is_fixed: false,
+        fixed_in_commit: None,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    let id = db.create_bug(&new_bug).await?;
+    info!("Queued raw bug {} for asynchronous processing", id);
+    let bug = db.get_bug(id).await?.unwrap();
+    Ok(BugOutcome::NewlyDiscovered { bug })
+}
+
+pub async fn process_issue_worker(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
     db: &Database,
+    bug_row: &crate::db::Bug,
     input: BugInput,
     context_tag: Option<&str>,
 ) -> Result<BugOutcome> {
@@ -420,7 +459,8 @@ pub async fn process_issue(
         input.locations.as_ref(),
     );
 
-    let known_bugs = db.list_all_bugs_for_vector_search().await?;
+    let mut known_bugs = db.list_all_bugs_for_vector_search().await?;
+    known_bugs.retain(|b| b.id != bug_row.id);
     let candidate_matches = find_top_candidates(
         &query_vector,
         &known_bugs,
@@ -461,11 +501,24 @@ pub async fn process_issue(
                 "Matched duplicate pre-existing bug #{} ({}) - skipping tool verification",
                 existing.id, existing.slug
             );
-            let logs = serde_json::to_string(&full_history).ok();
+            let logs = serde_json::to_string(&full_history).unwrap_or_default();
+            db.update_bug_outcome(
+                bug_row.id,
+                "duplicate",
+                crate::db::Severity::Low,
+                None,
+                &dedup.reasoning,
+                Some(&logs),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await?;
             return Ok(BugOutcome::Duplicate {
                 existing_bug: existing.clone(),
                 reasoning: dedup.reasoning,
-                logs,
+                logs: Some(logs),
             });
         }
     }
@@ -529,45 +582,26 @@ pub async fn process_issue(
     let logs_json = serde_json::to_string(&full_history).ok();
 
     // Step 5: Persist in Database
-    let slug = generate_slug();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
 
-    let source_files_opt = if input.source_files.is_empty() {
-        None
-    } else {
-        Some(input.source_files.clone())
-    };
-
-    let new_bug = NewBug {
-        slug: slug.clone(),
-        problem: input.problem.clone(),
+    db.update_bug_outcome(
+        bug_row.id,
+        "verified",
         severity,
-        severity_explanation,
-        locations: final_locations,
-        subsystems: input.subsystems.clone(),
-        source_files: source_files_opt,
-        inline_review,
-        logs: logs_json,
-        vector_json: Some(query_vector.to_json()),
-        discovered_in_patchset_id: input.patchset_id,
-        discovered_in_patch_id: input.patch_id,
-        discovered_in_commit: input.commit_sha.clone(),
-        introduced_in_commit,
+        severity_explanation.as_deref(),
+        &inline_review,
+        logs_json.as_deref(),
+        Some(&query_vector.to_json()),
+        introduced_in_commit.as_deref(),
         is_fixed,
-        fixed_in_commit,
-        created_at: now,
-    };
+        fixed_in_commit.as_deref(),
+    )
+    .await?;
 
-    let bug_id = db.create_bug(&new_bug).await?;
-    let saved_bug = db.get_bug(bug_id).await?.expect("Saved bug must exist");
-
+    let saved_bug = db.get_bug(bug_row.id).await?.expect("Saved bug must exist");
     info!(
-        "Successfully registered newly discovered pre-existing bug #{} ({})",
-        bug_id, slug
+        "Successfully registered newly verified pre-existing bug #{} ({})",
+        bug_row.id, bug_row.slug
     );
-
     Ok(BugOutcome::NewlyDiscovered { bug: saved_bug })
 }
 
@@ -656,6 +690,7 @@ mod tests {
 
         let known_bugs = vec![Bug {
             id: 42,
+            status: "verified".to_string(),
             slug: "pb-42".to_string(),
             problem: "Memory leak in dev.c".to_string(),
             severity: Severity::High,
@@ -805,11 +840,16 @@ mod tests {
             baseline_sha: None,
         };
 
-        let outcome = process_issue(&provider, None, &db, input, None)
+        let outcome = process_issue(&provider, None, &db, input.clone(), None)
             .await
             .unwrap();
 
-        match outcome {
+        let final_outcome = match outcome {
+            BugOutcome::NewlyDiscovered { ref bug } => process_issue_worker(&provider, None, &db, bug, input.clone(), None).await.unwrap(),
+            _ => panic!("Expected NewlyDiscovered outcome initially"),
+        };
+
+        match final_outcome {
             BugOutcome::NewlyDiscovered { bug } => {
                 assert_eq!(bug.problem, "Buffer overflow in e1000 rx handler");
                 assert_eq!(bug.severity, Severity::Critical);
@@ -849,6 +889,7 @@ mod tests {
         let existing_id = db
             .create_bug(&NewBug {
                 slug: "pb-existing1".to_string(),
+                status: "verified".to_string(),
                 problem: "Buffer overflow in e1000 rx handler".to_string(),
                 severity: Severity::High,
                 severity_explanation: Some("Known buffer overflow".to_string()),
@@ -895,11 +936,16 @@ mod tests {
             baseline_sha: None,
         };
 
-        let outcome = process_issue(&provider, None, &db, input, None)
+        let outcome = process_issue(&provider, None, &db, input.clone(), None)
             .await
             .unwrap();
 
-        match outcome {
+        let final_outcome = match outcome {
+            BugOutcome::NewlyDiscovered { ref bug } => process_issue_worker(&provider, None, &db, bug, input.clone(), None).await.unwrap(),
+            _ => panic!("Expected NewlyDiscovered initially"),
+        };
+
+        match final_outcome {
             BugOutcome::Duplicate {
                 existing_bug,
                 reasoning,
@@ -910,7 +956,7 @@ mod tests {
                 assert_eq!(reasoning, "Exact match with known bug #1 in e1000 driver");
                 assert!(logs.is_some());
             }
-            _ => panic!("Expected Duplicate outcome, got {:?}", outcome),
+            _ => panic!("Expected Duplicate outcome, got {:?}", final_outcome),
         }
     }
 }

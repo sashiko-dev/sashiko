@@ -1429,6 +1429,7 @@ mod tests {
 
         let _bug_id = db
             .create_bug(&crate::db::NewBug {
+                status: "raw".to_string(),
                 slug: "pb-12345678".to_string(),
                 problem: "UAF in test_device".to_string(),
                 severity: crate::db::Severity::Critical,

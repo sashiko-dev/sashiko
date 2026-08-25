@@ -22,3 +22,5 @@ pub mod stage;
 pub mod sync;
 
 pub use prompts::*;
+
+pub mod bug_worker;

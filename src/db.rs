@@ -212,6 +212,7 @@ pub struct Finding {
 pub struct Bug {
     pub id: i64,
     pub slug: String,
+    pub status: String,
     pub problem: String,
     pub severity: Severity,
     pub severity_explanation: Option<String>,
@@ -233,6 +234,7 @@ pub struct Bug {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewBug {
     pub slug: String,
+    pub status: String,
     pub problem: String,
     pub severity: Severity,
     pub severity_explanation: Option<String>,
@@ -1236,15 +1238,16 @@ impl Database {
             .conn
             .query(
                 "INSERT INTO bugs (
-                    slug, problem, severity, severity_explanation, locations,
+                    slug, status, problem, severity, severity_explanation, locations,
                     subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, is_fixed,
                     fixed_in_commit, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.slug.as_str(),
+                    bug.status.as_str(),
                     bug.problem.as_str(),
                     bug.severity as i32,
                     bug.severity_explanation.clone(),
@@ -1277,7 +1280,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, slug, problem, severity, severity_explanation, locations,
+                "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, is_fixed,
@@ -1298,7 +1301,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, slug, problem, severity, severity_explanation, locations,
+                "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, is_fixed,
@@ -1313,6 +1316,66 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    
+    pub async fn lock_raw_bug(&self) -> Result<Option<Bug>> {
+        let mut rows = self.conn.query(
+            "SELECT id FROM bugs WHERE status = 'raw' ORDER BY created_at ASC LIMIT 1",
+            ()
+        ).await?;
+        if let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            self.conn.execute("UPDATE bugs SET status = 'processing' WHERE id = ?", libsql::params![id]).await?;
+            self.get_bug(id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_bug_outcome(
+        &self,
+        id: i64,
+        status: &str,
+        severity: Severity,
+        severity_explanation: Option<&str>,
+        inline_review: &str,
+        logs: Option<&str>,
+        vector_json: Option<&str>,
+        introduced_in_commit: Option<&str>,
+        is_fixed: bool,
+        fixed_in_commit: Option<&str>,
+    ) -> Result<()> {
+        let compressed_inline = crate::compression::compress_string_if_needed(inline_review);
+        let compressed_logs = logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null);
+
+        self.conn.execute(
+            "UPDATE bugs SET 
+                status = ?,
+                severity = ?,
+                severity_explanation = ?,
+                inline_review = ?,
+                logs = ?,
+                vector_json = ?,
+                introduced_in_commit = ?,
+                is_fixed = ?,
+                fixed_in_commit = ?
+             WHERE id = ?",
+            libsql::params![
+                status,
+                severity as i32,
+                severity_explanation.map(|s| s.to_string()),
+                compressed_inline,
+                compressed_logs,
+                vector_json.map(|s| s.to_string()),
+                introduced_in_commit.map(|s| s.to_string()),
+                if is_fixed { 1 } else { 0 },
+                fixed_in_commit.map(|s| s.to_string()),
+                id
+            ]
+        ).await?;
+        Ok(())
     }
 
     pub async fn list_bugs(
@@ -1365,7 +1428,7 @@ impl Database {
 
         // Query rows
         let select_sql = format!(
-            "SELECT id, slug, problem, severity, severity_explanation, locations,
+            "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                     subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, is_fixed,
@@ -1412,7 +1475,7 @@ impl Database {
         _q: Option<&str>,
     ) -> Result<(Vec<Bug>, usize)> {
         let mut rows = self.conn.query(
-            "SELECT id, slug, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, logs, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, is_fixed, fixed_in_commit, created_at
+            "SELECT id, slug, status, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, logs, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, is_fixed, fixed_in_commit, created_at
              FROM bugs
              ORDER BY id DESC LIMIT ? OFFSET ?",
             libsql::params![limit as i64, offset as i64],
@@ -1430,6 +1493,7 @@ impl Database {
             let mut bug = Bug {
                 id: row.get(0).unwrap_or_default(),
                 slug: row.get(1).unwrap_or_default(),
+                status: "verified".to_string(),
                 problem: row.get(2).unwrap_or_default(),
                 severity,
                 severity_explanation: row.get(4).unwrap_or_default(),
@@ -1469,7 +1533,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
+                "SELECT pb.id, pb.slug, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
@@ -1496,7 +1560,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT DISTINCT pb.id, pb.slug, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
+                "SELECT DISTINCT pb.id, pb.slug, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
@@ -1524,7 +1588,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, slug, problem, severity, severity_explanation, locations,
+                "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, is_fixed,
@@ -1545,13 +1609,14 @@ impl Database {
     fn parse_bug_row(row: &libsql::Row) -> Result<Bug> {
         let id: i64 = row.get(0)?;
         let slug: String = row.get(1)?;
-        let problem: String = row.get(2)?;
-        let severity_val: i32 = row.get(3)?;
-        let severity_explanation: Option<String> = row.get(4).ok().flatten();
-        let locations_str: Option<String> = row.get(5).ok().flatten();
+        let status: String = row.get(2)?;
+        let problem: String = row.get(3)?;
+        let severity_val: i32 = row.get(4)?;
+        let severity_explanation: Option<String> = row.get(5).ok().flatten();
+        let locations_str: Option<String> = row.get(6).ok().flatten();
         let locations: Option<serde_json::Value> =
             locations_str.and_then(|s| serde_json::from_str(&s).ok());
-        let subsystems_str: Option<String> = row.get(6).ok().flatten();
+        let subsystems_str: Option<String> = row.get(7).ok().flatten();
         let subsystems: Vec<String> = match subsystems_str {
             Some(ref s) => serde_json::from_str(s).unwrap_or_else(|_| {
                 if !s.trim().is_empty() {
@@ -1562,27 +1627,28 @@ impl Database {
             }),
             None => Vec::new(),
         };
-        let source_files_str: Option<String> = row.get(7).ok().flatten();
+        let source_files_str: Option<String> = row.get(8).ok().flatten();
         let source_files: Option<Vec<String>> =
             source_files_str.and_then(|s| serde_json::from_str(&s).ok());
-        let inline_review: String = crate::compression::get_compressed_string_opt(row, 8)
+        let inline_review: String = crate::compression::get_compressed_string_opt(row, 9)
             .unwrap_or(None)
-            .unwrap_or_else(|| row.get::<String>(8).unwrap_or_default());
-        let logs: Option<String> = crate::compression::get_compressed_string_opt(row, 9)
+            .unwrap_or_else(|| row.get::<String>(9).unwrap_or_default());
+        let logs: Option<String> = crate::compression::get_compressed_string_opt(row, 10)
             .unwrap_or(None)
-            .or_else(|| row.get::<Option<String>>(9).ok().flatten());
-        let vector_json: Option<String> = row.get(10).ok().flatten();
-        let discovered_in_patchset_id: Option<i64> = row.get(11).ok().flatten();
-        let discovered_in_patch_id: Option<i64> = row.get(12).ok().flatten();
-        let discovered_in_commit: Option<String> = row.get(13).ok().flatten();
-        let introduced_in_commit: Option<String> = row.get(14).ok().flatten();
-        let is_fixed: bool = row.get::<i64>(15).unwrap_or(0) != 0;
-        let fixed_in_commit: Option<String> = row.get(16).ok().flatten();
-        let created_at: i64 = row.get(17)?;
+            .or_else(|| row.get::<Option<String>>(10).ok().flatten());
+        let vector_json: Option<String> = row.get(11).ok().flatten();
+        let discovered_in_patchset_id: Option<i64> = row.get(12).ok().flatten();
+        let discovered_in_patch_id: Option<i64> = row.get(13).ok().flatten();
+        let discovered_in_commit: Option<String> = row.get(14).ok().flatten();
+        let introduced_in_commit: Option<String> = row.get(15).ok().flatten();
+        let is_fixed: bool = row.get::<i64>(16).unwrap_or(0) != 0;
+        let fixed_in_commit: Option<String> = row.get(17).ok().flatten();
+        let created_at: i64 = row.get(18)?;
 
         Ok(Bug {
             id,
             slug,
+            status,
             problem,
             severity: Severity::from_i32(severity_val),
             severity_explanation,
@@ -9961,6 +10027,7 @@ mod tests {
 
         let bug = NewBug {
             slug: "pb-test-1234".to_string(),
+            status: "raw".to_string(),
             problem: "Memory leak in e1000_probe()".to_string(),
             severity: Severity::High,
             severity_explanation: Some(

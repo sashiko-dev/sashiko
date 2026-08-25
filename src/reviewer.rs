@@ -3669,6 +3669,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .await?;
         let bug_id = db
             .create_bug(&crate::db::NewBug {
+                status: "raw".to_string(),
                 slug: "pb-deadbeef".to_string(),
                 problem: " High UAF in cleanup".to_string(),
                 severity: Severity::High,

@@ -285,6 +285,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE sl
 CREATE TABLE IF NOT EXISTS bugs (
     id INTEGER PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
+    status TEXT DEFAULT 'raw',
     problem TEXT NOT NULL,
     severity INTEGER NOT NULL, -- 1: Low, 2: Medium, 3: High, 4: Critical
     severity_explanation TEXT,
