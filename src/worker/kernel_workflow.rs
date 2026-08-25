@@ -491,12 +491,17 @@ You MUST respond with ONLY a JSON object, no other text. Example:
         .build()
 }
 
+/// Stages 3 to 6 review the diff hunks alone. Every other stage also needs the
+/// commit message, so it gets the git show output with the changelog injected.
+fn stage_uses_commit_log(stage_num: u8) -> bool {
+    !(3..=6).contains(&stage_num)
+}
+
 fn analysis_stage(
     stage_num: u8,
     name: &'static str,
     instruction: &'static str,
     guides: &[&'static str],
-    use_log: bool,
     max_turns: usize,
     temperature: f32,
 ) -> Box<dyn ExecutableStage<KernelReviewState>> {
@@ -510,7 +515,7 @@ fn analysis_stage(
 
     Box::new(
         Stage::builder(name)
-            .system_prompt(kernel_system_prompt(use_log))
+            .system_prompt(kernel_system_prompt(stage_uses_commit_log(stage_num)))
             .user_prompt(user_template)
             .output_format(
                 OutputFormat::json()
@@ -564,7 +569,6 @@ pub fn resolve_analysis_stages_with_options(
                 "stage_1",
                 STAGE_1_INSTRUCTION,
                 &[],
-                true,
                 max_turns,
                 temperature,
             )),
@@ -573,7 +577,6 @@ pub fn resolve_analysis_stages_with_options(
                 "stage_2",
                 STAGE_2_INSTRUCTION,
                 &[],
-                true,
                 max_turns,
                 temperature,
             )),
@@ -582,7 +585,6 @@ pub fn resolve_analysis_stages_with_options(
                 "stage_3",
                 STAGE_3_INSTRUCTION,
                 &["callstack.md", "technical-patterns.md"],
-                false,
                 max_turns,
                 temperature,
             )),
@@ -591,7 +593,6 @@ pub fn resolve_analysis_stages_with_options(
                 "stage_4",
                 STAGE_4_INSTRUCTION,
                 &[],
-                false,
                 max_turns,
                 temperature,
             )),
@@ -600,7 +601,6 @@ pub fn resolve_analysis_stages_with_options(
                 "stage_5",
                 STAGE_5_INSTRUCTION,
                 &["subsystem/locking.md"],
-                false,
                 max_turns,
                 temperature,
             )),
@@ -609,7 +609,6 @@ pub fn resolve_analysis_stages_with_options(
                 "stage_6",
                 STAGE_6_INSTRUCTION,
                 &[],
-                false,
                 max_turns,
                 temperature,
             )),
@@ -618,7 +617,6 @@ pub fn resolve_analysis_stages_with_options(
                 "stage_7",
                 STAGE_7_INSTRUCTION,
                 &[],
-                false,
                 max_turns,
                 temperature,
             )),
@@ -926,6 +924,23 @@ pub fn build_kernel_review_workflow_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_only_stages_3_to_6_review_the_diff_alone() {
+        // Matches ReviewStage::use_log_in_context, which the workflow replaced.
+        for stage in [1, 2, 7] {
+            assert!(
+                stage_uses_commit_log(stage),
+                "stage {stage} needs the commit message"
+            );
+        }
+        for stage in [3, 4, 5, 6] {
+            assert!(
+                !stage_uses_commit_log(stage),
+                "stage {stage} reviews the diff hunks alone"
+            );
+        }
+    }
 
     #[test]
     fn test_build_workflow_graph_structure() {
