@@ -261,10 +261,23 @@ Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS sh
 SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition."#;
 
 const STAGE_JSON_SCHEMA_EXAMPLE: &str = r#"
-Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
+TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
+
+Once you have gathered sufficient information, return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
+If you find no concerns and no dismissed concerns, return {"concerns": [], "dismissed_concerns": []}.
 Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
-Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations".
+- "type": A short category string.
+- "description": A clear description of the problem.
+- "reasoning": A step-by-step explanation.
+- "preexisting": true if this bug already existed in the codebase before these patches were applied, false if the issue was newly introduced by the reviewed patchset.
+- "locations": An array of objects, each containing "file", "function_or_symbol", "line", "code_snippet" and "why_this_location_matters".
+Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations". They mean the same as above, except that "description" is the candidate concern that was investigated and disproved, and "reasoning" is the evidence proving it does not apply.
+
+Use the 'dismissed_concerns' array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
+
 SPECIFICITY REQUIREMENT: When reporting a concern or dismissed_concern, cite exact function name(s), file path(s), and line number(s) when known. Do not invent line numbers; use null when exact values are unknown.
+
+CRITICAL REVIEW DIRECTIVE: Do NOT dismiss concerns just because you assume the surrounding system or caller handles it perfectly. Do not be overly charitable to the existing code. If there is a missing initialization, an unhandled edge case, or a brittle logic flow, report it as a concern immediately. Assume the worst-case scenario where external inputs and caller states are malformed.
 
 Example Output:
 ```json
@@ -938,6 +951,27 @@ mod tests {
             assert!(
                 !stage_uses_commit_log(stage),
                 "stage {stage} reviews the diff hunks alone"
+            );
+        }
+    }
+
+    #[test]
+    fn test_analysis_stages_keep_the_guidance_the_schema_alone_does_not_carry() {
+        // The vendored guides still tell the model to use TodoWrite, which no
+        // longer exists, and stage 10 keeps an anti-charity directive of its
+        // own. Both belong to stages 1 to 7 as well.
+        for required in [
+            "Do not call or mention TodoWrite",
+            "Do not be overly charitable to the existing code",
+            "If you find no concerns and no dismissed concerns",
+            "investigated, and disproved with concrete evidence",
+            "\"preexisting\": true if this bug already existed",
+            "\"reasoning\": A step-by-step explanation.",
+            "the candidate concern that was investigated and disproved",
+        ] {
+            assert!(
+                STAGE_JSON_SCHEMA_EXAMPLE.contains(required),
+                "stage 1-7 guidance lost: {required}"
             );
         }
     }
