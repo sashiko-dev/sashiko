@@ -131,6 +131,7 @@ If tool output is truncated ('truncated': true), page only if directly relevant 
 
 <global_review_guidelines>
 The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.
+@includes
 </global_review_guidelines>
 
 === Active Git Metadata ===
