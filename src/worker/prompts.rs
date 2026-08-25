@@ -667,7 +667,6 @@ impl Worker {
             context_tag: self.context_tag.clone(),
         };
 
-        let manual_stages = self.stages.clone();
         let event_cb = move |event: WorkflowEvent| {
             if let Some(progress_cb) = progress {
                 match event {
@@ -680,17 +679,13 @@ impl Worker {
                             progress_cb(WorkerProgressEvent::StageStarted { stage: num });
                         }
                     }
+                    WorkflowEvent::ParallelResolved { stage_names } => {
+                        progress_cb(WorkerProgressEvent::ReviewStarted {
+                            planned_stages: planned_stages_from(&stage_names),
+                        });
+                    }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if stage_name == "stage_planning" {
-                            let planned = if let Some(ref manual) = manual_stages {
-                                manual.clone()
-                            } else {
-                                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-                            };
-                            progress_cb(WorkerProgressEvent::ReviewStarted {
-                                planned_stages: planned,
-                            });
-                        } else if let Some(num) = parse_stage_number(stage_name) {
+                        if let Some(num) = parse_stage_number(stage_name) {
                             progress_cb(WorkerProgressEvent::StageFinished { stage: num });
                         }
                     }
@@ -750,6 +745,20 @@ impl Worker {
             tokens_cached: outcome.tokens_cached,
         })
     }
+}
+
+/// The stages a review will run: the analysis stages the fan-out resolved, then
+/// the four that always follow them. Nothing resolved means nothing planned,
+/// not a bare tail.
+fn planned_stages_from(stage_names: &[&'static str]) -> Vec<u8> {
+    let mut planned: Vec<u8> = stage_names
+        .iter()
+        .filter_map(|n| parse_stage_number(n))
+        .collect();
+    if !planned.is_empty() {
+        planned.extend([8, 9, 10, 11]);
+    }
+    planned
 }
 
 fn parse_stage_number(name: &str) -> Option<u8> {
@@ -1151,6 +1160,16 @@ mod tests {
     use super::*;
     use crate::ai::AiRole;
     use crate::worker::stage::create_stage;
+
+    #[test]
+    fn test_planned_stages_follow_the_resolved_fan_out() {
+        assert_eq!(
+            planned_stages_from(&["stage_1", "stage_2", "stage_5"]),
+            vec![1, 2, 5, 8, 9, 10, 11]
+        );
+        assert_eq!(planned_stages_from(&[]), Vec::<u8>::new());
+        assert_eq!(planned_stages_from(&["stage_planning"]), Vec::<u8>::new());
+    }
 
     #[test]
     fn test_append_stage_dismissed_concerns_preserves_category_type() {

@@ -34,6 +34,9 @@ pub enum WorkflowEvent {
         tokens_out: u32,
         tokens_cached: u32,
     },
+    /// A dynamic fan-out resolved the stages it will run. Emitted whether or
+    /// not the planning stage ran, so a skipped planner still reports a plan.
+    ParallelResolved { stage_names: Vec<&'static str> },
     /// An early-exit condition was satisfied.
     EarlyExitTriggered { reason: &'static str },
     /// The entire workflow has completed.
