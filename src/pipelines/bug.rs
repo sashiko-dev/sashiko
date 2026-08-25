@@ -205,7 +205,17 @@ impl LlmSession for DedupSession<'_> {
     fn initial_user_prompt(&self) -> String {
         let loc_str = self
             .candidate_locations
-            .and_then(|v| serde_json::to_string_pretty(v).ok())
+            .map(|v| {
+                let mut stripped = v.clone();
+                if let Some(arr) = stripped.as_array_mut() {
+                    for obj in arr {
+                        if let Some(map) = obj.as_object_mut() {
+                            map.remove("line");
+                        }
+                    }
+                }
+                serde_json::to_string_pretty(&stripped).unwrap_or_else(|_| "[]".to_string())
+            })
             .unwrap_or_else(|| "[]".to_string());
 
         let mut known_list = String::new();
