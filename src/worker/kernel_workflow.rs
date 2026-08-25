@@ -799,10 +799,9 @@ Example Output:
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if is_preexisting {
-                    preexisting.push(concern);
-                } else {
-                    new_concerns.push(concern);
+                    preexisting.push(concern.clone());
                 }
+                new_concerns.push(concern);
             }
             state.patch_concerns = new_concerns;
             state.preexisting_concerns = preexisting;
@@ -871,6 +870,7 @@ Example Output:
         })
         .reduce(|state, out: Stage10Output| {
             let mut new_findings = Vec::new();
+            state.preexisting_concerns.clear();
             for finding in out.findings {
                 let is_preexisting = finding
                     .get("preexisting")
@@ -885,9 +885,8 @@ Example Output:
                         "locations": finding.get("locations").cloned().unwrap_or(json!([])),
                     });
                     state.preexisting_concerns.push(concern);
-                } else {
-                    new_findings.push(finding);
                 }
+                new_findings.push(finding);
             }
             state.findings = new_findings;
         })

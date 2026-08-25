@@ -312,11 +312,9 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
-        .route("/api/preexisting_bug", get(get_preexisting_bug))
-        .route(
-            "/api/preexisting_bug/analyze",
-            post(analyze_preexisting_bug),
-        )
+        .route("/api/bug", get(get_preexisting_bug))
+        .route("/api/bugs", get(list_preexisting_bugs))
+        .route("/api/bug/analyze", post(analyze_preexisting_bug))
         .route("/bug/{slug}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
@@ -1385,6 +1383,30 @@ async fn forge_webhook(
     })))
 }
 
+async fn list_preexisting_bugs(
+    State(state): State<Arc<AppState>>,
+    Query(pagination): Query<Pagination>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let page = pagination.page.unwrap_or(1).max(1);
+    let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * per_page;
+
+    match state
+        .db
+        .get_preexisting_bugs_list(per_page, offset, pagination.q.as_deref())
+        .await
+    {
+        Ok((items, total)) => Ok(Json(serde_json::json!({
+            "items": items,
+            "total": total
+        }))),
+        Err(e) => {
+            tracing::error!("Failed to fetch preexisting bugs list: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,12 +1468,9 @@ mod tests {
         });
 
         // Test 1: get_preexisting_bug by slug
-        let res = reqwest::get(format!(
-            "http://{}/api/preexisting_bug?slug=pb-12345678",
-            addr
-        ))
-        .await
-        .unwrap();
+        let res = reqwest::get(format!("http://{}/api/bug?slug=pb-12345678", addr))
+            .await
+            .unwrap();
         assert_eq!(res.status(), 200);
         let json: serde_json::Value = res.json().await.unwrap();
         assert_eq!(json["slug"], "pb-12345678");

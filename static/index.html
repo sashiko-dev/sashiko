@@ -1893,6 +1893,7 @@
                     <div style="flex:1"></div>
                     <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
                     <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
+                    <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}">Bugs</button>
                 </div>
                 <table id="dataTable">
                     <thead id="tableHead"></thead>
@@ -1917,13 +1918,15 @@
 
             if (state.listMode === 'patchsets') {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:50px">Parts</th><th style="width:80px">Status</th><th style="width:120px">Findings</th></tr>`;
+            } else if (state.listMode === 'bugs') {
+                thead.innerHTML = `<tr><th>Problem</th><th style="width:100px">Severity</th><th style="width:180px">Commits</th><th style="width:100px">Date</th><th style="width:80px">Status</th></tr>`;
             } else {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:30px"></th></tr>`;
             }
         }
 
         async function fetchListData() {
-            const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : '/api/messages';
+            const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : (state.listMode === 'bugs' ? '/api/bugs' : '/api/messages');
             let url = `${endpoint}?page=${state.currentPage}&per_page=${state.perPage}`;
             if (state.searchQuery) {
                 url += `&q=${encodeURIComponent(state.searchQuery)}`;
@@ -1945,26 +1948,23 @@
 
             items.forEach((p, idx) => {
                 const row = document.createElement('tr');
-                const d = new Date(p.date * 1000);
-                const dateStr = d.toISOString().split('T')[0];
-                const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-
-                const dateHtml = `
-                    <div>${dateStr}</div>
-                    <div class="text-muted-sm">${timeStr}</div>
-                `;
-
-                // Parse author
-                const author = parseAuthor(p.author);
-                const nameToDisplay = author.name || author.email;
-                const emailToDisplay = author.name ? author.email : '';
-
-                const authorHtml = `
-                    <div>${escapeHtml(nameToDisplay)}</div>
-                    ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
-                `;
 
                 if (state.listMode === 'patchsets') {
+                    const d = new Date(p.date * 1000);
+                    const dateStr = d.toISOString().split('T')[0];
+                    const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                    const dateHtml = `
+                        <div>${dateStr}</div>
+                        <div class="text-muted-sm">${timeStr}</div>
+                    `;
+                    const author = parseAuthor(p.author);
+                    const nameToDisplay = author.name || author.email;
+                    const emailToDisplay = author.name ? author.email : '';
+                    const authorHtml = `
+                        <div>${escapeHtml(nameToDisplay)}</div>
+                        ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                    `;
+
                     const parts = (p.received_parts === p.total_parts && p.total_parts > 0)
                         ? `${p.total_parts}`
                         : `${p.received_parts || 0}/${p.total_parts || 0}`;
@@ -2006,7 +2006,62 @@
                         <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
                         <td>${findingsHtml}</td>
                     `;
+                } else if (state.listMode === 'bugs') {
+                    const clickHandler = (e) => {
+                        if (e.target.closest('.copy-btn')) return;
+                        const target = `#/bug/${encodeURIComponent(p.slug || p.id)}`;
+                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                            window.open(target, '_blank');
+                        } else if (e.button === 0) {
+                            navigate(target);
+                        }
+                    };
+                    row.onclick = clickHandler;
+                    row.onauxclick = clickHandler;
+
+                    let tagsHtml = '';
+                    if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
+                        tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                    }
+                    
+                    const sev = (p.severity || 'Medium').toLowerCase();
+                    const sevColor = sev === 'critical' ? 'var(--sev-critical)' : (sev === 'high' ? 'var(--sev-high)' : 'var(--sev-medium)');
+                    const sevHtml = `<span style="color: ${sevColor}; font-weight: bold;">${escapeHtml(p.severity)}</span>`;
+                    
+                    const commitHtml = p.introduced_in_commit ? `<code style="font-size: 0.8em; margin-bottom: 2px;">Introduced: ${escapeHtml(p.introduced_in_commit.substring(0,12))}</code><br>` : '';
+                    let idHtml = p.discovered_in_commit ? `<code style="font-size: 0.8em;">Discovered: ${escapeHtml(p.discovered_in_commit.substring(0,12))}</code>` : '';
+
+                    let statusLabel = p.is_fixed ? 'Fixed' : 'Active';
+                    const statusClass = p.is_fixed ? 'status-reviewed' : 'status-failed';
+
+                    // Use created_at for bugs
+                    let dBug = new Date((p.created_at || (p.date || 0)) * 1000);
+                    let dateStr = dBug.toISOString().split('T')[0];
+                    let timeStr = dBug.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+
+                    row.innerHTML = `
+                        <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
+                        <td style="line-height:1.2;">${sevHtml}</td>
+                        <td style="line-height:1.2;"><div>${commitHtml}${idHtml}</div></td>
+                        <td style="line-height:1.2;"><div>${dateStr}</div><div class="text-muted-sm">${timeStr}</div></td>
+                        <td><span class="status-badge ${statusClass}">${statusLabel}</span></td>
+                    `;
                 } else {
+                    const d = new Date(p.date * 1000);
+                    const dateStr = d.toISOString().split('T')[0];
+                    const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                    const dateHtml = `
+                        <div>${dateStr}</div>
+                        <div class="text-muted-sm">${timeStr}</div>
+                    `;
+                    const author = parseAuthor(p.author);
+                    const nameToDisplay = author.name || author.email;
+                    const emailToDisplay = author.name ? author.email : '';
+                    const authorHtml = `
+                        <div>${escapeHtml(nameToDisplay)}</div>
+                        ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                    `;
+                    
                     const clickHandler = (e) => {
                         if (e.target.closest('.copy-btn')) return;
                         const target = `#/message/${encodeURIComponent(p.message_id)}`;
@@ -2100,6 +2155,7 @@
             state.currentPage = 1;
             document.getElementById('btn-patchsets').classList.toggle('active', mode === 'patchsets');
             document.getElementById('btn-messages').classList.toggle('active', mode === 'messages');
+            document.getElementById('btn-bugs').classList.toggle('active', mode === 'bugs');
             updateTableHeader();
             fetchListData();
         }
@@ -2888,7 +2944,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function renderPreexistingBugView(slugOrId) {
             const isId = /^\d+$/.test(slugOrId);
             const queryParam = isId ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
-            const res = await fetch(`/api/preexisting_bug?${queryParam}`);
+            const res = await fetch(`/api/bug?${queryParam}`);
             if (!res.ok) throw new Error('Pre-existing bug not found');
             const data = await res.json();
 

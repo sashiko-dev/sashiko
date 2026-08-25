@@ -1429,6 +1429,70 @@ impl Database {
         Ok(())
     }
 
+    pub async fn get_preexisting_bugs_list(
+        &self,
+        limit: usize,
+        offset: usize,
+        _q: Option<&str>,
+    ) -> Result<(Vec<PreexistingBug>, usize)> {
+        let mut rows = self.conn.query(
+            "SELECT id, slug, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, logs, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, is_fixed, fixed_in_commit, created_at
+             FROM preexisting_bugs
+             ORDER BY id DESC LIMIT ? OFFSET ?",
+            libsql::params![limit as i64, offset as i64],
+        ).await?;
+
+        let mut bugs = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let severity_val: i32 = row.get(3).unwrap_or(1);
+            let severity = Severity::from_i32(severity_val);
+
+            let locations_str: Option<String> = row.get(5).ok();
+            let subsystems_str: Option<String> = row.get(6).ok();
+            let source_files_str: Option<String> = row.get(7).ok();
+
+            let mut bug = PreexistingBug {
+                id: row.get(0).unwrap_or_default(),
+                slug: row.get(1).unwrap_or_default(),
+                problem: row.get(2).unwrap_or_default(),
+                severity,
+                severity_explanation: row.get(4).unwrap_or_default(),
+                locations: locations_str.and_then(|s| serde_json::from_str(&s).ok()),
+                subsystems: subsystems_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                source_files: source_files_str.and_then(|s| serde_json::from_str(&s).ok()),
+                inline_review: String::new(),
+                logs: None,
+                vector_json: row.get(10).unwrap_or_default(),
+                discovered_in_patchset_id: row.get(11).unwrap_or_default(),
+                discovered_in_patch_id: row.get(12).unwrap_or_default(),
+                discovered_in_commit: row.get(13).unwrap_or_default(),
+                introduced_in_commit: row.get(14).unwrap_or_default(),
+                is_fixed: row.get(15).unwrap_or_default(),
+                fixed_in_commit: row.get(16).unwrap_or_default(),
+                created_at: row.get(17).unwrap_or_default(),
+            };
+            bug.inline_review = crate::compression::get_compressed_string_opt(&row, 8)
+                .unwrap_or_default()
+                .unwrap_or_default();
+            bug.logs = crate::compression::get_compressed_string_opt(&row, 9)
+                .unwrap_or_default();
+            bugs.push(bug);
+        }
+
+        let mut count_rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM preexisting_bugs", ())
+            .await?;
+        let mut count = 0;
+        if let Ok(Some(row)) = count_rows.next().await {
+            count = row.get::<i64>(0).unwrap_or(0) as usize;
+        }
+
+        Ok((bugs, count))
+    }
+
     pub async fn list_preexisting_bugs_for_review(
         &self,
         review_id: i64,
