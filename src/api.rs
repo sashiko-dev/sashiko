@@ -483,6 +483,8 @@ async fn submit_patch(
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .await
             {
@@ -537,6 +539,8 @@ async fn submit_patch(
                 .create_fetching_patchset(
                     &clean_msgid,
                     &format!("Fetching thread {}...", clean_msgid),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -1339,9 +1343,94 @@ async fn forge_webhook(
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
 
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
+
+    // Check for existing patchset with the same MR number to detect version
+    // updates vs metadata-only changes.
+    if let Some((existing_id, existing_version, existing_range)) = state
+        .db
+        .find_patchset_by_mr_number(metadata.pr_number, metadata.repo_url.as_deref())
+        .await
+        .map_err(|e| {
+            error!("Failed to look up existing MR patchset: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
+        if existing_range.as_deref() == Some(&commit_range) {
+            // Same commit range — metadata-only update (e.g., Draft-to-Ready)
+            let _ = state
+                .db
+                .update_patchset_metadata(
+                    existing_id,
+                    metadata.pr_title.as_deref(),
+                    metadata.pr_url.as_deref(),
+                )
+                .await;
+            return Ok(Json(serde_json::json!({
+                "status": "updated",
+                "version": existing_version
+            })));
+        }
+        // Different commit range — new version
+        let new_version = existing_version + 1;
+
+        let slug = metadata.repo_url.as_ref().map(|url| {
+            let repo = crate::forge::extract_repo_name_from_url(url);
+            format!("{}-{}-v{}", repo, metadata.pr_number, new_version)
+        });
+
+        let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
+        let new_id = state
+            .db
+            .create_fetching_patchset(
+                &placeholder_id,
+                &format!(
+                    "Fetching {} PR/MR: {} (v{})",
+                    forge.name(),
+                    subject,
+                    new_version
+                ),
+                None,
+                None,
+                metadata.pr_url.as_deref(),
+                Some(subject),
+                Some(metadata.pr_number),
+                slug.as_deref(),
+                Some(new_version),
+                Some(&commit_range),
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to create version {} patchset: {}", new_version, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Link to previous version
+        let _ = state.db.link_previous_version(existing_id, new_id).await;
+
+        let req = FetchRequest {
+            repo_url: metadata.repo_url,
+            commit_hash: commit_range,
+            mr_url: metadata.pr_url,
+            mr_title: metadata.pr_title,
+            mr_number: Some(metadata.pr_number),
+        };
+
+        state.fetch_sender.send(req).await.map_err(|e| {
+            error!("Failed to send fetch request to queue: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        return Ok(Json(serde_json::json!({
+            "status": "accepted",
+            "version": new_version,
+            "message": format!("{} {} v{} queued for review", forge.name(), action, new_version)
+        })));
+    }
+
+    // No existing patchset — create v1
     let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
 
-    let slug = metadata.pr_url.as_ref().map(|url| {
+    let slug = metadata.repo_url.as_ref().map(|url| {
         let repo = crate::forge::extract_repo_name_from_url(url);
         format!("{}-{}", repo, metadata.pr_number)
     });
@@ -1357,6 +1446,8 @@ async fn forge_webhook(
             Some(subject),
             Some(metadata.pr_number),
             slug.as_deref(),
+            None,
+            Some(&commit_range),
         )
         .await
         .map_err(|e| {
@@ -1379,6 +1470,7 @@ async fn forge_webhook(
 
     Ok(Json(serde_json::json!({
         "status": "accepted",
+        "version": 1,
         "message": format!("{} {} queued for review", forge.name(), action)
     })))
 }

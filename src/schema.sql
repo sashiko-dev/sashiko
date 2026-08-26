@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS patchsets (
     embargo_until INTEGER,
     embargo_release_started_at INTEGER,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
+    version INTEGER DEFAULT 1,
+    previous_version_id INTEGER REFERENCES patchsets(id) ON DELETE SET NULL,
+    commit_range TEXT,
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)
