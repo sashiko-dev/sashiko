@@ -369,7 +369,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.review.stages = Some(stages.clone());
         info!("Selected stages via --stages flag: {:?}", stages);
     }
-
+    let mut compiled_rules = Vec::new();
+    for rule in &settings.review.priority_rules {
+        match rule.compile() {
+            Ok(r) => compiled_rules.push(r),
+            Err(e) => {
+                error!(
+                    "Invalid priority rule regex '{}': {}. Skipping rule.",
+                    rule.regex, e
+                );
+            }
+        }
+    }
+    let compiled_rules = Arc::new(compiled_rules);
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
@@ -688,6 +700,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DB Worker (Transactional Batching)
     let worker_db = db.clone();
     let mapping = settings.subsystems.mapping.clone();
+    let db_rules = compiled_rules.clone();
     let _db_worker_handle = tokio::spawn(async move {
         info!("DB Worker started");
 
@@ -706,7 +719,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             for article in buffer.drain(..) {
-                match process_parsed_article(&worker_db, article, &policy, &mapping).await {
+                match process_parsed_article(&worker_db, article, &policy, &mapping, &db_rules)
+                    .await
+                {
                     ProcessStatus::Ingested => total_ingested += 1,
                     ProcessStatus::Error => total_errors += 1,
                 }
@@ -1683,6 +1698,7 @@ async fn process_parsed_article(
     article: ParsedArticle,
     policy: &sashiko::email_policy::EmailPolicyConfig,
     subsystem_mapping: &[sashiko::settings::SubsystemMapping],
+    priority_rules: &[sashiko::settings::CompiledPriorityRule],
 ) -> ProcessStatus {
     let ParsedArticle {
         group,
@@ -2017,8 +2033,10 @@ async fn process_parsed_article(
             None
         };
 
+        let priority = sashiko::db::Database::calculate_priority(&subject, priority_rules);
+
         match worker_db
-            .create_patchset(
+            .create_patchset_with_priority(
                 thread_id,
                 cover_letter_id,
                 metadata.message_id.as_str(),
@@ -2038,6 +2056,7 @@ async fn process_parsed_article(
                 strict_author,
                 skip_filters.as_ref(),
                 only_filters.as_ref(),
+                priority,
             )
             .await
         {

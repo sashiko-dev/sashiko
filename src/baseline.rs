@@ -291,10 +291,28 @@ impl BaselineRegistry {
         // with the topic branch once the maintainer rebases.
         if let Some(custom_remotes) = &self.custom_remotes {
             for remote in custom_remotes {
-                // Fetch to ensure we have the latest branches (Issue 1)
-                if let Err(e) =
-                    crate::git_ops::ensure_remote(&self.repo_path, &remote.name, &remote.url, false)
-                        .await
+                // Build refspecs from branch_patterns to limit what we fetch.
+                // Each pattern like "*/6.18" becomes a refspec:
+                //   +refs/heads/*/6.18:refs/remotes/<name>/*/6.18
+                let refspecs: Option<Vec<String>> =
+                    remote.branch_patterns.as_ref().map(|patterns| {
+                        patterns
+                            .iter()
+                            .map(|p| {
+                                format!("+refs/heads/{}:refs/remotes/{}/{}", p, remote.name, p)
+                            })
+                            .collect()
+                    });
+
+                // Fetch with refspecs to limit downloaded objects
+                if let Err(e) = crate::git_ops::ensure_remote_with_refspecs(
+                    &self.repo_path,
+                    &remote.name,
+                    &remote.url,
+                    false,
+                    refspecs.as_deref(),
+                )
+                .await
                 {
                     warn!(
                         "Failed to ensure custom remote {}: {}. Using local branches.",
@@ -305,7 +323,16 @@ impl BaselineRegistry {
                 if remote.check_all_branches {
                     match crate::git_ops::get_remote_branches(&self.repo_path, &remote.name).await {
                         Ok(branches) => {
-                            for branch in branches {
+                            // Filter by branch_patterns if configured
+                            let filtered = if let Some(ref patterns) = remote.branch_patterns {
+                                branches
+                                    .into_iter()
+                                    .filter(|b| crate::git_ops::matches_branch_pattern(b, patterns))
+                                    .collect()
+                            } else {
+                                branches
+                            };
+                            for branch in filtered {
                                 candidates.push(BaselineResolution::RemoteTarget {
                                     url: remote.url.clone(),
                                     name: remote.name.clone(),
@@ -915,6 +942,7 @@ F: patterns/
                 url: dummy_url,
                 check_all_branches: false,
                 only_branches: Some(vec!["master".to_string()]),
+                branch_patterns: None,
             }]),
             repo_path: repo_path.to_path_buf(),
             mainline_remote: None,
@@ -954,6 +982,7 @@ F: patterns/
                 url: dummy_url,
                 check_all_branches: false,
                 only_branches: Some(vec!["topic-next".to_string()]),
+                branch_patterns: None,
             }]),
             repo_path: repo_path.to_path_buf(),
             mainline_remote: None,
