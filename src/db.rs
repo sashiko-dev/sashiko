@@ -1318,15 +1318,22 @@ impl Database {
         }
     }
 
-    
     pub async fn lock_raw_bug(&self) -> Result<Option<Bug>> {
-        let mut rows = self.conn.query(
-            "SELECT id FROM bugs WHERE status = 'raw' ORDER BY created_at ASC LIMIT 1",
-            ()
-        ).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM bugs WHERE status = 'raw' ORDER BY created_at ASC LIMIT 1",
+                (),
+            )
+            .await?;
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
-            self.conn.execute("UPDATE bugs SET status = 'processing' WHERE id = ?", libsql::params![id]).await?;
+            self.conn
+                .execute(
+                    "UPDATE bugs SET status = 'processing' WHERE id = ?",
+                    libsql::params![id],
+                )
+                .await?;
             self.get_bug(id).await
         } else {
             Ok(None)
@@ -1348,10 +1355,13 @@ impl Database {
         fixed_in_commit: Option<&str>,
     ) -> Result<()> {
         let compressed_inline = crate::compression::compress_string_if_needed(inline_review);
-        let compressed_logs = logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null);
+        let compressed_logs = logs
+            .map(crate::compression::compress_string_if_needed)
+            .unwrap_or(libsql::Value::Null);
 
-        self.conn.execute(
-            "UPDATE bugs SET 
+        self.conn
+            .execute(
+                "UPDATE bugs SET 
                 status = ?,
                 severity = ?,
                 severity_explanation = ?,
@@ -1362,19 +1372,20 @@ impl Database {
                 is_fixed = ?,
                 fixed_in_commit = ?
              WHERE id = ?",
-            libsql::params![
-                status,
-                severity as i32,
-                severity_explanation.map(|s| s.to_string()),
-                compressed_inline,
-                compressed_logs,
-                vector_json.map(|s| s.to_string()),
-                introduced_in_commit.map(|s| s.to_string()),
-                if is_fixed { 1 } else { 0 },
-                fixed_in_commit.map(|s| s.to_string()),
-                id
-            ]
-        ).await?;
+                libsql::params![
+                    status,
+                    severity as i32,
+                    severity_explanation.map(|s| s.to_string()),
+                    compressed_inline,
+                    compressed_logs,
+                    vector_json.map(|s| s.to_string()),
+                    introduced_in_commit.map(|s| s.to_string()),
+                    if is_fixed { 1 } else { 0 },
+                    fixed_in_commit.map(|s| s.to_string()),
+                    id
+                ],
+            )
+            .await?;
         Ok(())
     }
 

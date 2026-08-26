@@ -845,7 +845,11 @@ mod tests {
             .unwrap();
 
         let final_outcome = match outcome {
-            BugOutcome::NewlyDiscovered { ref bug } => process_issue_worker(&provider, None, &db, bug, input.clone(), None).await.unwrap(),
+            BugOutcome::NewlyDiscovered { ref bug } => {
+                process_issue_worker(&provider, None, &db, bug, input.clone(), None)
+                    .await
+                    .unwrap()
+            }
             _ => panic!("Expected NewlyDiscovered outcome initially"),
         };
 
@@ -941,7 +945,11 @@ mod tests {
             .unwrap();
 
         let final_outcome = match outcome {
-            BugOutcome::NewlyDiscovered { ref bug } => process_issue_worker(&provider, None, &db, bug, input.clone(), None).await.unwrap(),
+            BugOutcome::NewlyDiscovered { ref bug } => {
+                process_issue_worker(&provider, None, &db, bug, input.clone(), None)
+                    .await
+                    .unwrap()
+            }
             _ => panic!("Expected NewlyDiscovered initially"),
         };
 
