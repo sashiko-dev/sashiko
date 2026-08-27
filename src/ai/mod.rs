@@ -623,6 +623,7 @@ pub mod quota;
 pub mod session;
 pub mod token_budget;
 pub mod truncator;
+pub mod vector_search;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 pub mod vllm;
