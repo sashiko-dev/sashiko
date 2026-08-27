@@ -373,6 +373,63 @@ let event_cb = |event: WorkflowEvent| match event {
 };
 ```
 
+## Overriding the default workflow
+
+The default kernel review workflow is **Rust source**, not a runtime data
+file. There is no `Settings.toml` key, CLI flag, or on-disk workflow file you
+can point Sashiko at — the workflow is compiled into the binary. Overriding it
+means editing the definition in the source tree and rebuilding:
+
+| What | Where |
+|------|-------|
+| Workflow engine and DSL primitives | `src/workflow/` |
+| Default kernel review workflow definition | `src/worker/kernel_workflow.rs` — `build_kernel_review_workflow_with_options()` |
+| The single call site that runs the review | `src/worker/prompts.rs` — `Worker::run`, the `WorkflowEngine::execute(...)` call |
+
+Every review path (the `sashiko review` command, `sashiko-cli local`, and the
+daemon worker) goes through `Worker::run`, which builds the workflow with
+`build_kernel_review_workflow_with_options(max_interactions, temperature)` and
+executes it. There are two ways to override:
+
+1. **Modify the default graph.** Edit `build_kernel_review_workflow_with_options()`
+   in `src/worker/kernel_workflow.rs`: add or remove `.stage(...)` steps, change
+   the `early_exit_if` conditions, tweak a stage's `StagePolicy`, or swap the
+   prompt templates. Because every review path calls this one function, your
+   modified graph is picked up automatically. This is the lowest-friction path —
+   the state type stays `KernelReviewState`, so the result handling in
+   `Worker::run` keeps working unchanged.
+
+   ```rust
+   // src/worker/kernel_workflow.rs
+   pub fn build_kernel_review_workflow_with_options(
+       max_turns: usize,
+       temperature: f32,
+   ) -> Workflow<KernelReviewState> {
+       Workflow::builder("linux_kernel_code_review")
+           .stage(prescreen_stage())
+           // ...existing steps...
+           // add your own step, e.g. an extra verification stage
+           .stage(stage_11_inline_report(max_turns, temperature))
+           .build()
+   }
+   ```
+
+2. **Swap in your own workflow.** Write your own builder (parameterized over
+   your own state type, as in the cherry-pick example above) and replace the
+   workflow construction in `Worker::run` (`src/worker/prompts.rs`). Your
+   workflow receives the same `WorkflowEnv` (provider, tools, prompt base dir)
+   and runs through the same `WorkflowEngine::execute` path, so progress
+   reporting and token accounting keep working. Note that `Worker::run` reads
+   the result out of `KernelReviewState` fields (`findings`, `review_inline`,
+   …) — a workflow over a different state type must also adapt that extraction
+   to still produce a `WorkerResult`.
+
+After editing, rebuild:
+
+```bash
+cargo build --release
+```
+
 ## How changes affect the review pipeline
 
 | You change… | Pipeline effect |
@@ -385,6 +442,7 @@ let event_cb = |event: WorkflowEvent| match event {
 | Any `@include`ed `.md` file | Changes the guidance the model receives in every stage that includes it. |
 | A stage's `StagePolicy` in `kernel_workflow.rs` | Changes tool availability, turn limits, temperature, or recitation handling for that stage. |
 | The workflow graph in `kernel_workflow.rs` | Adds/removes/reorders stages, early exits, or parallel fan-outs for the whole review. |
+| The workflow construction in `Worker::run` (`src/worker/prompts.rs`) | Swaps the default kernel workflow for a custom one (see "Overriding the default workflow"). |
 
 Because stages are declarative and typed, a new review workflow (a security
 audit, a cherry-pick check, a commit-message linter) is a new `Workflow`
