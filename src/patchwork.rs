@@ -63,6 +63,7 @@ impl PatchworkCheckResult {
                 Severity::High => &mut high,
                 Severity::Medium => &mut medium,
                 Severity::Low => &mut low,
+                Severity::Unknown => continue,
             };
 
             if is_preexisting {

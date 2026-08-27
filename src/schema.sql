@@ -299,8 +299,10 @@ CREATE TABLE IF NOT EXISTS bugs (
     discovered_in_patch_id INTEGER,
     discovered_in_commit TEXT,
     introduced_in_commit TEXT,
+    verified_on_sha TEXT,
     is_fixed INTEGER NOT NULL DEFAULT 0,
     fixed_in_commit TEXT,
+    raw_input TEXT,
     created_at INTEGER NOT NULL,
     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)

@@ -156,9 +156,10 @@ pub struct ToolUsage {
     pub output_length: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub enum Severity {
+    #[default]
     Unknown = 0,
     Low = 1,
     Medium = 2,
@@ -237,6 +238,7 @@ pub struct Bug {
     pub verified_on_sha: Option<String>,
     pub is_fixed: bool,
     pub fixed_in_commit: Option<String>,
+    pub raw_input: Option<String>,
     pub created_at: i64,
 }
 
@@ -260,7 +262,26 @@ pub struct NewBug {
     pub verified_on_sha: Option<String>,
     pub is_fixed: bool,
     pub fixed_in_commit: Option<String>,
+    pub raw_input: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct UpdateBugOutcomeParams<'a> {
+    pub status: &'a str,
+    pub problem: Option<&'a str>,
+    pub subsystems: Option<&'a [String]>,
+    pub source_files: Option<&'a [String]>,
+    pub locations: Option<&'a serde_json::Value>,
+    pub severity: Severity,
+    pub severity_explanation: Option<&'a str>,
+    pub inline_review: &'a str,
+    pub logs: Option<&'a str>,
+    pub vector_json: Option<&'a str>,
+    pub introduced_in_commit: Option<&'a str>,
+    pub verified_on_sha: Option<&'a str>,
+    pub is_fixed: bool,
+    pub fixed_in_commit: Option<&'a str>,
 }
 
 pub struct EmailOutboxRow {
@@ -826,6 +847,7 @@ impl Database {
                 "CREATE TABLE IF NOT EXISTS bugs (
                     id INTEGER PRIMARY KEY,
                     slug TEXT NOT NULL UNIQUE,
+                    status TEXT DEFAULT 'raw',
                     problem TEXT NOT NULL,
                     severity INTEGER NOT NULL,
                     severity_explanation TEXT,
@@ -842,6 +864,7 @@ impl Database {
                     verified_on_sha TEXT,
                     is_fixed INTEGER NOT NULL DEFAULT 0,
                     fixed_in_commit TEXT,
+                    raw_input TEXT,
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
                     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
@@ -849,15 +872,20 @@ impl Database {
                 (),
             )
             .await;
+        let _ = self
+            .try_add_column("bugs", "status", "TEXT DEFAULT 'raw'")
+            .await;
         let _ = self.try_add_column("bugs", "subsystems", "TEXT").await;
         let _ = self.try_add_column("bugs", "logs", "TEXT").await;
         let _ = self
             .try_add_column("bugs", "introduced_in_commit", "TEXT")
             .await;
+        let _ = self.try_add_column("bugs", "verified_on_sha", "TEXT").await;
         let _ = self
             .try_add_column("bugs", "is_fixed", "INTEGER NOT NULL DEFAULT 0")
             .await;
         let _ = self.try_add_column("bugs", "fixed_in_commit", "TEXT").await;
+        let _ = self.try_add_column("bugs", "raw_input", "TEXT").await;
         let _ = self.try_create_index("idx_bugs_slug", "bugs", "slug").await;
         let _ = self
             .try_create_index("idx_bugs_severity", "bugs", "severity")
@@ -1252,9 +1280,9 @@ impl Database {
                     slug, status, problem, severity, severity_explanation, locations,
                     subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, introduced_in_commit, is_fixed,
-                    fixed_in_commit, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
+                    fixed_in_commit, raw_input, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.slug.as_str(),
@@ -1272,8 +1300,10 @@ impl Database {
                     bug.discovered_in_patch_id,
                     bug.discovered_in_commit.clone(),
                     bug.introduced_in_commit.clone(),
+                    bug.verified_on_sha.clone(),
                     if bug.is_fixed { 1 } else { 0 },
                     bug.fixed_in_commit.clone(),
+                    bug.raw_input.clone(),
                     bug.created_at,
                 ],
             )
@@ -1294,8 +1324,8 @@ impl Database {
                 "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, introduced_in_commit, is_fixed,
-                        fixed_in_commit, created_at
+                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
+                        fixed_in_commit, raw_input, created_at
                  FROM bugs WHERE id = ?",
                 libsql::params![id],
             )
@@ -1315,8 +1345,8 @@ impl Database {
                 "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, introduced_in_commit, is_fixed,
-                        fixed_in_commit, created_at
+                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
+                        fixed_in_commit, raw_input, created_at
                  FROM bugs WHERE slug = ?",
                 libsql::params![slug],
             )
@@ -1351,30 +1381,32 @@ impl Database {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn update_bug_outcome(
         &self,
         id: i64,
-        status: &str,
-        severity: Severity,
-        severity_explanation: Option<&str>,
-        inline_review: &str,
-        logs: Option<&str>,
-        vector_json: Option<&str>,
-        introduced_in_commit: Option<&str>,
-        verified_on_sha: Option<&str>,
-        is_fixed: bool,
-        fixed_in_commit: Option<&str>,
+        params: UpdateBugOutcomeParams<'_>,
     ) -> Result<()> {
-        let compressed_inline = crate::compression::compress_string_if_needed(inline_review);
-        let compressed_logs = logs
+        let compressed_inline = crate::compression::compress_string_if_needed(params.inline_review);
+        let compressed_logs = params
+            .logs
             .map(crate::compression::compress_string_if_needed)
             .unwrap_or(libsql::Value::Null);
+        let subsystems_json = params
+            .subsystems
+            .and_then(|s| serde_json::to_string(s).ok());
+        let source_files_json = params
+            .source_files
+            .and_then(|f| serde_json::to_string(f).ok());
+        let locations_json = params.locations.and_then(|l| serde_json::to_string(l).ok());
 
         self.conn
             .execute(
                 "UPDATE bugs SET 
                 status = ?,
+                problem = COALESCE(?, problem),
+                subsystems = COALESCE(?, subsystems),
+                source_files = COALESCE(?, source_files),
+                locations = COALESCE(?, locations),
                 severity = ?,
                 severity_explanation = ?,
                 inline_review = ?,
@@ -1386,16 +1418,20 @@ impl Database {
                 fixed_in_commit = ?
              WHERE id = ?",
                 libsql::params![
-                    status,
-                    severity as i32,
-                    severity_explanation.map(|s| s.to_string()),
+                    params.status,
+                    params.problem.map(|s| s.to_string()),
+                    subsystems_json,
+                    source_files_json,
+                    locations_json,
+                    params.severity as i32,
+                    params.severity_explanation.map(|s| s.to_string()),
                     compressed_inline,
                     compressed_logs,
-                    vector_json.map(|s| s.to_string()),
-                    introduced_in_commit.map(|s| s.to_string()),
-                    verified_on_sha.map(|s| s.to_string()),
-                    if is_fixed { 1 } else { 0 },
-                    fixed_in_commit.map(|s| s.to_string()),
+                    params.vector_json.map(|s| s.to_string()),
+                    params.introduced_in_commit.map(|s| s.to_string()),
+                    params.verified_on_sha.map(|s| s.to_string()),
+                    if params.is_fixed { 1 } else { 0 },
+                    params.fixed_in_commit.map(|s| s.to_string()),
                     id
                 ],
             )
@@ -1456,8 +1492,8 @@ impl Database {
             "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                     subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, introduced_in_commit, is_fixed,
-                    fixed_in_commit, created_at
+                    discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
+                    fixed_in_commit, raw_input, created_at
              FROM bugs
              {}
              ORDER BY created_at DESC, id DESC
@@ -1559,7 +1595,7 @@ impl Database {
         _q: Option<&str>,
     ) -> Result<(Vec<Bug>, usize)> {
         let mut rows = self.conn.query(
-            "SELECT id, slug, status, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, logs, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, is_fixed, fixed_in_commit, created_at
+            "SELECT id, slug, status, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, logs, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed, fixed_in_commit, raw_input, created_at
              FROM bugs
              ORDER BY id DESC LIMIT ? OFFSET ?",
             libsql::params![limit as i64, offset as i64],
@@ -1575,7 +1611,6 @@ impl Database {
             let source_files_str: Option<String> = row.get(8).ok().flatten();
 
             let mut bug = Bug {
-                verified_on_sha: None,
                 id: row.get(0).unwrap_or_default(),
                 slug: row.get(1).unwrap_or_default(),
                 status: row.get(2).unwrap_or_else(|_| "verified".to_string()),
@@ -1594,9 +1629,11 @@ impl Database {
                 discovered_in_patch_id: row.get(13).ok().flatten(),
                 discovered_in_commit: row.get(14).ok().flatten(),
                 introduced_in_commit: row.get(15).ok().flatten(),
-                is_fixed: row.get::<i64>(16).unwrap_or(0) != 0,
-                fixed_in_commit: row.get(17).ok().flatten(),
-                created_at: row.get(18).unwrap_or_default(),
+                verified_on_sha: row.get(16).ok().flatten(),
+                is_fixed: row.get::<i64>(17).unwrap_or(0) != 0,
+                fixed_in_commit: row.get(18).ok().flatten(),
+                raw_input: row.get(19).ok().flatten(),
+                created_at: row.get(20).unwrap_or_default(),
             };
             bug.inline_review = crate::compression::get_compressed_string_opt(&row, 9)
                 .unwrap_or_default()
@@ -1621,8 +1658,8 @@ impl Database {
                 "SELECT pb.id, pb.slug, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
-                        pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
-                        pb.fixed_in_commit, pb.created_at, rpb.is_newly_discovered
+                        pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
+                        pb.fixed_in_commit, pb.raw_input, pb.created_at, rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  WHERE rpb.review_id = ?
@@ -1634,7 +1671,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(19).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(21).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1648,8 +1685,8 @@ impl Database {
                 "SELECT DISTINCT pb.id, pb.slug, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
-                        pb.discovered_in_commit, pb.introduced_in_commit, pb.is_fixed,
-                        pb.fixed_in_commit, pb.created_at, rpb.is_newly_discovered
+                        pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
+                        pb.fixed_in_commit, pb.raw_input, pb.created_at, rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  JOIN reviews r ON rpb.review_id = r.id
@@ -1662,7 +1699,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(19).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(21).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1676,8 +1713,8 @@ impl Database {
                 "SELECT id, slug, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, introduced_in_commit, is_fixed,
-                        fixed_in_commit, created_at
+                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
+                        fixed_in_commit, raw_input, created_at
                  FROM bugs
                  WHERE status IN ('open', 'fixed', 'verified')",
                 (),
@@ -1727,12 +1764,14 @@ impl Database {
         let discovered_in_patch_id: Option<i64> = row.get(13).ok().flatten();
         let discovered_in_commit: Option<String> = row.get(14).ok().flatten();
         let introduced_in_commit: Option<String> = row.get(15).ok().flatten();
-        let is_fixed: bool = row.get::<i64>(16).unwrap_or(0) != 0;
-        let fixed_in_commit: Option<String> = row.get(17).ok().flatten();
-        let created_at: i64 = row.get(18)?;
+        let verified_on_sha: Option<String> = row.get(16).ok().flatten();
+        let is_fixed: bool = row.get::<i64>(17).unwrap_or(0) != 0;
+        let fixed_in_commit: Option<String> = row.get(18).ok().flatten();
+        let raw_input: Option<String> = row.get(19).ok().flatten();
+        let created_at: i64 = row.get(20)?;
 
         Ok(Bug {
-            verified_on_sha: None,
+            verified_on_sha,
             id,
             slug,
             status,
@@ -1751,6 +1790,7 @@ impl Database {
             introduced_in_commit,
             is_fixed,
             fixed_in_commit,
+            raw_input,
             created_at,
         })
     }
@@ -10133,6 +10173,7 @@ mod tests {
             introduced_in_commit: Some("11223344 (net: e1000: add probe)".to_string()),
             is_fixed: true,
             fixed_in_commit: Some("55667788 (net: e1000: fix leak in probe)".to_string()),
+            raw_input: None,
             created_at: 123456789,
         };
 

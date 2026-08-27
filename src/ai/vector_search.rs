@@ -454,6 +454,7 @@ mod tests {
             introduced_in_commit: None,
             is_fixed: false,
             fixed_in_commit: None,
+            raw_input: None,
             created_at: 100,
         };
 
@@ -481,6 +482,7 @@ mod tests {
             introduced_in_commit: None,
             is_fixed: false,
             fixed_in_commit: None,
+            raw_input: None,
             created_at: 200,
         };
 
@@ -504,6 +506,7 @@ mod tests {
             introduced_in_commit: None,
             is_fixed: false,
             fixed_in_commit: None,
+            raw_input: None,
             created_at: 300,
         };
 

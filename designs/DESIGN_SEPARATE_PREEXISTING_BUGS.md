@@ -217,7 +217,7 @@ pub struct PreexistingBug {
 
 1. **Step 1: Database Migration & Models**: Add `preexisting_bugs` and `review_preexisting_bugs` tables, indexes, DB methods in `src/db.rs` and `src/schema.sql`.
 2. **Step 2: Vector Space & Localization Engine**: Implement `src/ai/vector_search.rs` (term-frequency/sparse vector, path/subsystem weighting, cosine similarity, top-$N$ candidate retrieval).
-3. **Step 3: Standalone Preexisting Bug Pipeline**: Implement `src/pipelines/preexisting.rs` with verification, vector search, LLM dedup, and standalone inline review generation.
-4. **Step 4: Decouple Patch Review Workflow**: Update `src/worker/kernel_workflow.rs`, `src/worker/prompts.rs`, and `src/local_review.rs` to separate `new_concerns` and route pre-existing concerns through `PreexistingBugPipeline`.
+3. **Step 3: Standalone Preexisting Bug Pipeline**: Implement `src/workflows/linux_bug.rs` with verification, vector search, LLM dedup, and standalone inline review generation.
+4. **Step 4: Decouple Patch Review Workflow**: Update `src/workflows/linux_patch_review.rs`, `src/worker/prompts.rs`, and `src/local_review.rs` to separate `new_concerns` and route pre-existing concerns through `PreexistingBugPipeline`.
 5. **Step 5: Email & Web Reporting**: Update email builder in `src/reviewer.rs`, API endpoints in `src/api.rs`, and UI views in `static/index.html`.
 6. **Step 6: Testing & Verification**: Write unit tests for vector search, pipeline integration, dedup logic, and run `make check-pr`.
