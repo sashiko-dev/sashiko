@@ -1,7 +1,7 @@
 # Sashiko Development and CI Tasks
 
 .PHONY: help build fmt lint test clean
-.PHONY: check-pr check-integration check-all sob integration-test
+.PHONY: check-pr check-integration check-all sob integration-test check-db-invariants
 
 # Default target
 .DEFAULT_GOAL := help
@@ -21,6 +21,7 @@ help:
 	@echo "    check-pr          - Run all PR checks (SOB, Lint, Unit Tests)"
 	@echo "    check-integration - Run integration tests (server + API)"
 	@echo "    check-all         - Run the complete check suite (PR + Integration)"
+	@echo "    check-db-invariants- Check database state anomalies"
 	@echo ""
 	@echo "  Utilities:"
 	@echo "    sob               - Check Signed-off-by tags (RANGE=HEAD~1..HEAD)"
@@ -58,13 +59,16 @@ check-pr: sob lint test
 check-integration: integration-test
 
 # Run the complete check suite (PR + Integration)
-check-all: check-pr check-integration
+check-all: check-pr check-integration check-db-invariants
 
 # Check Signed-off-by tags (default: HEAD~1..HEAD)
 RANGE ?= HEAD~1..HEAD
 sob:
 	-@./scripts/check-sob.sh "$(RANGE)"
-
 # Run #[ignore]-tagged integration tests (spins up real HTTP servers)
 integration-test:
 	@cargo test --all-features --test integration_tests -- --ignored
+
+# Run lightweight database invariant checks
+check-db-invariants:
+	./scripts/check_invariants.sh sashiko.db
