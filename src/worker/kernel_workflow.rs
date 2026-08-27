@@ -49,6 +49,8 @@ pub struct KernelReviewState {
     pub selected_guides: Vec<String>,
     /// Optional manual stages filter (e.g. `--stages 1,2,5`).
     pub manual_stages: Option<Vec<u8>>,
+    /// Caller-supplied instructions appended to the shared system prompt.
+    pub custom_prompt: Option<String>,
     /// Stages selected by dynamic planning (or overridden by manual_stages).
     pub planned_stages: Vec<u8>,
 
@@ -141,7 +143,7 @@ Baseline SHA: {{{{baseline_sha}}}}
 
 Target Commit:
 {diff_var}
-{{{{prefetched_block}}}}"#
+{{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
     ))
     .with_var("target_commit_sha", |s: &KernelReviewState| s.target_commit_sha.clone())
     .with_var("baseline_sha", |s: &KernelReviewState| s.baseline_sha.clone())
@@ -156,6 +158,11 @@ Target Commit:
                 s.prefetched_context
             )
         }
+    })
+    .with_var("custom_prompt_block", |s: &KernelReviewState| {
+        s.custom_prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()).map_or_else(String::new, |p| {
+            format!("\n\n<custom_instructions>\n{p}\n</custom_instructions>")
+        })
     })
     .include_files_from_state(|s: &KernelReviewState| {
         let mut paths = Vec::new();
@@ -982,5 +989,35 @@ mod tests {
         let workflow = build_kernel_review_workflow();
         assert_eq!(workflow.name, "linux_kernel_code_review");
         assert_eq!(workflow.steps.len(), 10);
+    }
+
+    #[test]
+    fn test_custom_prompt_renders_last_and_only_when_it_has_content() {
+        // A non-empty prefetched context, so that closing the prompt is
+        // distinguishable from merely rendering somewhere in it.
+        let render = |custom_prompt| {
+            kernel_system_prompt(true).render_for_log(&KernelReviewState {
+                custom_prompt,
+                prefetched_context: "struct foo { int bar; };".to_string(),
+                ..Default::default()
+            })
+        };
+        let without = render(None);
+
+        for empty in [Some(String::new()), Some("  \n\t ".to_string())] {
+            assert_eq!(
+                render(empty),
+                without,
+                "an empty custom prompt renders nothing"
+            );
+        }
+
+        assert_eq!(
+            render(Some("  Check the locking.  ".to_string())),
+            format!(
+                "{without}\n\n<custom_instructions>\nCheck the locking.\n</custom_instructions>"
+            ),
+            "the custom prompt closes the system prompt"
+        );
     }
 }
