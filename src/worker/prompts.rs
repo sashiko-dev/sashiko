@@ -47,10 +47,10 @@ impl ClassifyAiError for ReviewError {
     }
 }
 
-use crate::worker::kernel_workflow::{
-    KernelReviewState, build_kernel_review_workflow_with_options, kernel_system_prompt,
-};
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
+use crate::workflows::linux_patch_review::{
+    LinuxPatchReviewState, build_linux_patch_review_workflow_with_options, linux_system_prompt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -620,7 +620,7 @@ impl Worker {
             &target_commit_sha,
         );
 
-        let mut state = KernelReviewState {
+        let mut state = LinuxPatchReviewState {
             ps_id,
             p_id,
             target_commit_sha,
@@ -645,7 +645,7 @@ impl Worker {
         };
 
         if self.global_history.is_empty() {
-            let sys_template = kernel_system_prompt(true);
+            let sys_template = linux_system_prompt(true);
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
                 role: crate::ai::AiRole::System,
@@ -658,7 +658,7 @@ impl Worker {
         }
 
         let workflow =
-            build_kernel_review_workflow_with_options(self.max_interactions, self.temperature);
+            build_linux_patch_review_workflow_with_options(self.max_interactions, self.temperature);
         let env = WorkflowEnv {
             provider: self.provider.clone(),
             tools: self.tools.clone(),

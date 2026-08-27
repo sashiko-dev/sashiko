@@ -12,13 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod compressor;
-pub mod email;
-pub mod patchwork;
-pub mod prefetch;
-pub mod prompts;
-pub mod repack;
-pub mod stage;
-pub mod sync;
-
-pub use prompts::*;
+pub mod linux_patch_review;

@@ -435,13 +435,13 @@ pub enum WorkflowEvent {
 
 ---
 
-## 4. End-to-End Walkthrough: Sashiko Kernel Review Workflow
+## 4. End-to-End Walkthrough: Sashiko Linux Patch Review Workflow
 
 Here is how the complete 11-stage Sashiko review protocol is expressed with this declarative architecture:
 
 ```rust
-pub fn build_kernel_review_workflow() -> Workflow<ReviewState> {
-    Workflow::builder("kernel_patch_review")
+pub fn build_linux_patch_review_workflow() -> Workflow<LinuxPatchReviewState> {
+    Workflow::builder("linux_patch_review")
         // Phase 0: Pre-screen relevant subsystem guides based on patch diff
         .stage(
             Stage::builder("phase_0_prescreen")

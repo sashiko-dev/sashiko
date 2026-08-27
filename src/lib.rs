@@ -36,6 +36,7 @@ pub mod toolbox;
 pub mod utils;
 pub mod worker;
 pub mod workflow;
+pub mod workflows;
 
 use std::fmt;
 use std::str::FromStr;

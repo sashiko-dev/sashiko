@@ -15,7 +15,7 @@
 //! Single declarative workflow definition for Sashiko's Linux Kernel Code Review.
 //!
 //! This module specifies the multi-stage review pipeline as a declarative [`Workflow`]
-//! operating over [`KernelReviewState`].
+//! operating over [`LinuxPatchReviewState`].
 
 use std::path::PathBuf;
 
@@ -34,7 +34,7 @@ pub const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
 
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
-pub struct KernelReviewState {
+pub struct LinuxPatchReviewState {
     pub ps_id: String,
     pub p_id: String,
     pub target_commit_sha: String,
@@ -114,7 +114,7 @@ pub struct Stage10Output {
 // Common System Prompt Template
 // ---------------------------------------------------------------------------
 
-pub fn kernel_system_prompt(use_log: bool) -> PromptTemplate<KernelReviewState> {
+pub fn linux_system_prompt(use_log: bool) -> PromptTemplate<LinuxPatchReviewState> {
     let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
     let diff_var = if use_log {
         "{{target_commit_diff}}"
@@ -122,7 +122,7 @@ pub fn kernel_system_prompt(use_log: bool) -> PromptTemplate<KernelReviewState> 
         "{{target_commit_diff_only}}"
     };
 
-    PromptTemplate::<KernelReviewState>::new(format!(
+    PromptTemplate::<LinuxPatchReviewState>::new(format!(
         r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.
 
 You are an expert Linux kernel maintainer. Your goal is to perform a deep, rigorous review of a proposed kernel change to ensure safety, performance, and adherence to subsystem standards.
@@ -145,11 +145,11 @@ Target Commit:
 {diff_var}
 {{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
     ))
-    .with_var("target_commit_sha", |s: &KernelReviewState| s.target_commit_sha.clone())
-    .with_var("baseline_sha", |s: &KernelReviewState| s.baseline_sha.clone())
-    .with_var("target_commit_diff", |s: &KernelReviewState| s.target_commit_diff.clone())
-    .with_var("target_commit_diff_only", |s: &KernelReviewState| s.target_commit_diff_only.clone())
-    .with_var("prefetched_block", |s: &KernelReviewState| {
+    .with_var("target_commit_sha", |s: &LinuxPatchReviewState| s.target_commit_sha.clone())
+    .with_var("baseline_sha", |s: &LinuxPatchReviewState| s.baseline_sha.clone())
+    .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
+    .with_var("target_commit_diff_only", |s: &LinuxPatchReviewState| s.target_commit_diff_only.clone())
+    .with_var("prefetched_block", |s: &LinuxPatchReviewState| {
         if s.prefetched_context.is_empty() {
             String::new()
         } else {
@@ -159,12 +159,12 @@ Target Commit:
             )
         }
     })
-    .with_var("custom_prompt_block", |s: &KernelReviewState| {
+    .with_var("custom_prompt_block", |s: &LinuxPatchReviewState| {
         s.custom_prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()).map_or_else(String::new, |p| {
             format!("\n\n<custom_instructions>\n{p}\n</custom_instructions>")
         })
     })
-    .include_files_from_state(|s: &KernelReviewState| {
+    .include_files_from_state(|s: &LinuxPatchReviewState| {
         let mut paths = Vec::new();
         if !s.selected_guides.is_empty() {
             for guide in &s.selected_guides {
@@ -332,7 +332,7 @@ Example Output:
 
 fn validate_stages_1_to_8(
     _output: &StageConcernsOutput,
-    _state: &KernelReviewState,
+    _state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
     Ok(())
 }
@@ -344,7 +344,7 @@ fn format_stages_1_to_8_feedback(violation: &str) -> String {
     )
 }
 
-fn validate_inline_format(content: &str, _state: &KernelReviewState) -> Result<(), String> {
+fn validate_inline_format(content: &str, _state: &LinuxPatchReviewState) -> Result<(), String> {
     if content.lines().any(|l| l.trim_start().starts_with("```")) {
         return Err("The output contains Markdown code blocks ('```'). It must be plain text as per `inline-template.md`.".to_string());
     }
@@ -428,16 +428,16 @@ fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage_n
 // Stage Definitions
 // ---------------------------------------------------------------------------
 
-pub fn prescreen_stage() -> Stage<KernelReviewState, Phase0Output> {
+pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, Phase0Output> {
     Stage::builder("stage_0_prescreen")
-        .system_prompt(PromptTemplate::<KernelReviewState>::new(
+        .system_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
             "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```",
         ))
         .user_prompt(
-            PromptTemplate::<KernelReviewState>::new(
+            PromptTemplate::<LinuxPatchReviewState>::new(
                 "<subsystem_guide_index>\n@include(\"subsystem/subsystem.md\")\n</subsystem_guide_index>\n\n<patch>\n{{target_commit_diff}}\n</patch>",
             )
-            .with_var("target_commit_diff", |s: &KernelReviewState| s.target_commit_diff.clone())
+            .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
             .include_file("subsystem/subsystem.md"),
         )
         .output_format(OutputFormat::json_with_schema(json!({
@@ -467,10 +467,10 @@ pub fn prescreen_stage() -> Stage<KernelReviewState, Phase0Output> {
         .build()
 }
 
-pub fn planning_stage() -> Stage<KernelReviewState, PlanningOutput> {
+pub fn planning_stage() -> Stage<LinuxPatchReviewState, PlanningOutput> {
     Stage::builder("stage_planning")
-        .system_prompt(kernel_system_prompt(true))
-        .user_prompt(PromptTemplate::<KernelReviewState>::new(
+        .system_prompt(linux_system_prompt(true))
+        .user_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
             r#"Analyze the provided patch and determine which of the following review stages are relevant and should be executed:
 - Stage 4: Resource management
 - Stage 5: Locking and synchronization
@@ -525,8 +525,8 @@ fn analysis_stage(
     guides: &[&'static str],
     max_turns: usize,
     temperature: f32,
-) -> Box<dyn ExecutableStage<KernelReviewState>> {
-    let mut user_template = PromptTemplate::<KernelReviewState>::new(format!(
+) -> Box<dyn ExecutableStage<LinuxPatchReviewState>> {
+    let mut user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
         "{}\n\n{}",
         instruction, STAGE_JSON_SCHEMA_EXAMPLE
     ));
@@ -536,7 +536,7 @@ fn analysis_stage(
 
     Box::new(
         Stage::builder(name)
-            .system_prompt(kernel_system_prompt(stage_uses_commit_log(stage_num)))
+            .system_prompt(linux_system_prompt(stage_uses_commit_log(stage_num)))
             .user_prompt(user_template)
             .output_format(
                 OutputFormat::json()
@@ -550,7 +550,7 @@ fn analysis_stage(
                 ..Default::default()
             })
             .reduce(
-                move |state: &mut KernelReviewState, out: StageConcernsOutput| {
+                move |state: &mut LinuxPatchReviewState, out: StageConcernsOutput| {
                     append_stage_items(
                         &mut state.all_concerns,
                         &out.concerns,
@@ -570,10 +570,10 @@ fn analysis_stage(
 }
 
 pub fn resolve_analysis_stages_with_options(
-    state: &KernelReviewState,
+    state: &LinuxPatchReviewState,
     max_turns: usize,
     temperature: f32,
-) -> Vec<Box<dyn ExecutableStage<KernelReviewState>>> {
+) -> Vec<Box<dyn ExecutableStage<LinuxPatchReviewState>>> {
     let selected_stages = if let Some(ref manual) = state.manual_stages {
         manual.clone()
     } else if !state.planned_stages.is_empty() {
@@ -650,11 +650,11 @@ pub fn resolve_analysis_stages_with_options(
 pub fn stage_8_deduplication(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, StageConcernsOutput> {
+) -> Stage<LinuxPatchReviewState, StageConcernsOutput> {
     Stage::builder("stage_8_deduplication")
-        .system_prompt(kernel_system_prompt(true))
+        .system_prompt(linux_system_prompt(true))
         .user_prompt(
-            PromptTemplate::<KernelReviewState>::new(format!(
+            PromptTemplate::<LinuxPatchReviewState>::new(format!(
                 r#"{STAGE_8_INSTRUCTION}
 
 Aggregated Concerns:
@@ -707,10 +707,10 @@ Example Output:
 }}
 ```"#
             ))
-            .with_var("aggregated_concerns", |s: &KernelReviewState| {
+            .with_var("aggregated_concerns", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.all_concerns).unwrap_or_default()
             })
-            .with_var("aggregated_dismissed_concerns", |s: &KernelReviewState| {
+            .with_var("aggregated_dismissed_concerns", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.all_dismissed_concerns).unwrap_or_default()
             }),
         )
@@ -735,11 +735,11 @@ Example Output:
 pub fn stage_9_conflict_resolution(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, Stage9Output> {
+) -> Stage<LinuxPatchReviewState, Stage9Output> {
     Stage::builder("stage_9_conflict_resolution")
-        .system_prompt(kernel_system_prompt(true))
+        .system_prompt(linux_system_prompt(true))
         .user_prompt(
-            PromptTemplate::<KernelReviewState>::new(format!(
+            PromptTemplate::<LinuxPatchReviewState>::new(format!(
                 r#"{STAGE_9_INSTRUCTION}
 
 Consolidated Concerns:
@@ -774,10 +774,10 @@ Example Output:
 }}
 ```"#
             ))
-            .with_var("deduplicated_concerns", |s: &KernelReviewState| {
+            .with_var("deduplicated_concerns", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.deduplicated_concerns).unwrap_or_default()
             })
-            .with_var("deduplicated_dismissed_concerns", |s: &KernelReviewState| {
+            .with_var("deduplicated_dismissed_concerns", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.deduplicated_dismissed_concerns).unwrap_or_default()
             }),
         )
@@ -797,11 +797,11 @@ Example Output:
 pub fn stage_10_verification(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, Stage10Output> {
+) -> Stage<LinuxPatchReviewState, Stage10Output> {
     Stage::builder("stage_10_verification")
-        .system_prompt(kernel_system_prompt(true))
+        .system_prompt(linux_system_prompt(true))
         .user_prompt(
-            PromptTemplate::<KernelReviewState>::new(format!(
+            PromptTemplate::<LinuxPatchReviewState>::new(format!(
                 r#"{STAGE_10_INSTRUCTION}
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{{{{follow_up_series_section}}}}
@@ -836,13 +836,13 @@ Example Output:
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
-            .with_var("follow_up_series_section", |s: &KernelReviewState| {
+            .with_var("follow_up_series_section", |s: &LinuxPatchReviewState| {
                 s.follow_up_series_context
                     .as_ref()
                     .map(|ctx| format!("\n\n{}", ctx))
                     .unwrap_or_default()
             })
-            .with_var("conflict_resolved_concerns", |s: &KernelReviewState| {
+            .with_var("conflict_resolved_concerns", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.conflict_resolved_concerns).unwrap_or_default()
             }),
         )
@@ -862,11 +862,11 @@ Example Output:
 pub fn stage_11_inline_report(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, String> {
+) -> Stage<LinuxPatchReviewState, String> {
     Stage::builder("stage_11_report")
-        .system_prompt(kernel_system_prompt(true))
+        .system_prompt(linux_system_prompt(true))
         .user_prompt(
-            PromptTemplate::<KernelReviewState>::new(format!(
+            PromptTemplate::<LinuxPatchReviewState>::new(format!(
                 r#"{STAGE_11_INSTRUCTION}
 
 Findings:
@@ -875,7 +875,7 @@ Findings:
 Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
-            .with_var("findings", |s: &KernelReviewState| {
+            .with_var("findings", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.findings).unwrap_or_default()
             }),
         )
@@ -903,16 +903,16 @@ Return raw text output, not JSON."#
 // ---------------------------------------------------------------------------
 
 /// Constructs the complete declarative workflow for Linux kernel patch review.
-pub fn build_kernel_review_workflow() -> Workflow<KernelReviewState> {
-    build_kernel_review_workflow_with_options(20, 0.0)
+pub fn build_linux_patch_review_workflow() -> Workflow<LinuxPatchReviewState> {
+    build_linux_patch_review_workflow_with_options(20, 0.0)
 }
 
 /// Constructs the declarative workflow with custom per-stage interaction limits and temperature.
-pub fn build_kernel_review_workflow_with_options(
+pub fn build_linux_patch_review_workflow_with_options(
     max_turns: usize,
     temperature: f32,
-) -> Workflow<KernelReviewState> {
-    Workflow::builder("linux_kernel_code_review")
+) -> Workflow<LinuxPatchReviewState> {
+    Workflow::builder("linux_patch_review")
         .stage(prescreen_stage())
         .dynamic_parallel(
             planning_stage(),
@@ -986,8 +986,8 @@ mod tests {
 
     #[test]
     fn test_build_workflow_graph_structure() {
-        let workflow = build_kernel_review_workflow();
-        assert_eq!(workflow.name, "linux_kernel_code_review");
+        let workflow = build_linux_patch_review_workflow();
+        assert_eq!(workflow.name, "linux_patch_review");
         assert_eq!(workflow.steps.len(), 10);
     }
 
@@ -996,7 +996,7 @@ mod tests {
         // A non-empty prefetched context, so that closing the prompt is
         // distinguishable from merely rendering somewhere in it.
         let render = |custom_prompt| {
-            kernel_system_prompt(true).render_for_log(&KernelReviewState {
+            linux_system_prompt(true).render_for_log(&LinuxPatchReviewState {
                 custom_prompt,
                 prefetched_context: "struct foo { int bar; };".to_string(),
                 ..Default::default()
