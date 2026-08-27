@@ -145,6 +145,9 @@ repository_path = "third_party/linux"
 [review]
 concurrency = 16
 worktree_dir = "review_trees"
+# Optional local prompt profile for daemon reviews. The bundled Linux kernel
+# profile is used when this is omitted.
+# prompts_path = "third_party/prompts/kernel"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]

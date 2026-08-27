@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 include!(concat!(env!("OUT_DIR"), "/prompts_generated.rs"));
@@ -22,6 +22,42 @@ const COMPLETE_MARKER: &str = ".sashiko-prompts-complete";
 pub fn default_kernel_prompts_path() -> Result<PathBuf> {
     let root = install_prompt_bundle(false)?;
     Ok(root.join("kernel"))
+}
+
+pub(crate) fn resolve_review_prompts_path(configured: Option<&Path>) -> Result<PathBuf> {
+    resolve_review_prompts_path_with(configured, default_kernel_prompts_path)
+}
+
+fn resolve_review_prompts_path_with<F>(
+    configured: Option<&Path>,
+    default_path: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce() -> Result<PathBuf>,
+{
+    let (path, source) = match configured {
+        Some(path) => (path.to_path_buf(), "configured"),
+        None => (default_path()?, "bundled kernel"),
+    };
+
+    if !path.is_dir() {
+        bail!(
+            "{} prompts path is not a directory: {}",
+            source,
+            path.display()
+        );
+    }
+
+    let review_core = path.join("review-core.md");
+    if !review_core.is_file() {
+        bail!(
+            "{} prompts path is missing review-core.md: {}",
+            source,
+            path.display()
+        );
+    }
+
+    Ok(path)
 }
 
 pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
@@ -75,6 +111,13 @@ fn data_home() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn create_prompt_profile(root: &Path) -> PathBuf {
+        let path = root.join("profile");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("review-core.md"), "# Review\n").unwrap();
+        path
+    }
+
     #[test]
     fn test_prompt_bundle_contains_kernel_review_core() {
         assert!(
@@ -82,6 +125,66 @@ mod tests {
                 .iter()
                 .any(|(path, _)| *path == "kernel/review-core.md")
         );
+    }
+
+    #[test]
+    fn test_default_review_prompts_resolve_to_kernel_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let kernel = create_prompt_profile(temp.path());
+
+        let resolved = resolve_review_prompts_path_with(None, || Ok(kernel.clone())).unwrap();
+
+        assert_eq!(resolved, kernel);
+    }
+
+    #[test]
+    fn test_configured_review_prompts_are_used_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = create_prompt_profile(temp.path());
+
+        let resolved = resolve_review_prompts_path_with(Some(&configured), || {
+            panic!("explicit prompt configuration must not use the kernel fallback")
+        })
+        .unwrap();
+
+        assert_eq!(resolved, configured);
+    }
+
+    #[test]
+    fn test_missing_configured_review_prompts_return_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+
+        let error = resolve_review_prompts_path_with(Some(&missing), || {
+            panic!("explicit prompt configuration must not use the kernel fallback")
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured prompts path is not a directory")
+        );
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn test_malformed_configured_review_prompts_return_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let malformed = temp.path().join("profile");
+        std::fs::create_dir(&malformed).unwrap();
+
+        let error = resolve_review_prompts_path_with(Some(&malformed), || {
+            panic!("explicit prompt configuration must not use the kernel fallback")
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured prompts path is missing review-core.md")
+        );
+        assert!(error.to_string().contains(&malformed.display().to_string()));
     }
 
     #[test]

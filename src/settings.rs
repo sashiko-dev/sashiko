@@ -420,6 +420,10 @@ pub struct GitSettings {
 pub struct ReviewSettings {
     pub concurrency: usize,
     pub worktree_dir: String,
+    /// Local prompt profile used by daemon-launched reviews. When omitted,
+    /// the bundled Linux kernel profile is used.
+    #[serde(default)]
+    pub prompts_path: Option<PathBuf>,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_retries")]
@@ -613,8 +617,9 @@ mod tests {
     fn test_production_settings_is_valid() {
         let path = "Settings.toml";
         if Path::new(path).exists() {
-            let _ = Settings::from_file("Settings")
+            let settings = Settings::from_file("Settings")
                 .expect("Production 'Settings.toml' failed to parse");
+            assert!(settings.review.prompts_path.is_none());
         }
     }
 

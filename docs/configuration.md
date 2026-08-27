@@ -184,6 +184,7 @@ pass.
 |-----|------|---------|-------------|
 | `concurrency` | integer | -- | Number of concurrent reviews. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during review. |
+| `prompts_path` | string | bundled kernel profile | Local prompt profile for daemon reviews. The directory must contain `review-core.md`; an invalid explicit path is an error and does not fall back to the kernel profile. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
 | `max_retries` | integer | `3` | Retry count on transient failures. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
