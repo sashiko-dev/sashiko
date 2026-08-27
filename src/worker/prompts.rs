@@ -488,6 +488,7 @@ pub struct Worker {
     baseline_sha: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    custom_prompt: Option<String>,
 }
 
 impl Worker {
@@ -508,6 +509,7 @@ impl Worker {
             baseline_sha: config.baseline_sha,
             context_tag: None,
             stages: config.stages,
+            custom_prompt: config.custom_prompt,
         }
     }
 
@@ -630,6 +632,7 @@ impl Worker {
             follow_up_series_context,
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
+            custom_prompt: self.custom_prompt.clone(),
             planned_stages: Vec::new(),
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
