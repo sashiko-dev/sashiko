@@ -148,7 +148,7 @@ When running the benchmark tool, you can select from several suites in the `benc
 *   **`benchmark_small.json`**: A smaller representative subset (99 entries) for standard testing.
 *   **`benchmark_tiny.json`**: A very brief subset (9 entries) for quick iteration.
 *   **`benchmark_smoke.json`**: Extremely small (3 entries) smoke test.
-*   **`benchmark_preexisting.json`**: **IMPORTANT** - Used to test the kernel bug framework using known, existing kernel bugs and their original patches.
+*   **`benchmark_preexisting.json`**: **IMPORTANT** - Used to test the Linux bug framework using known, existing Linux bugs and their original patches.
 
 
 # LLM Workflow Design

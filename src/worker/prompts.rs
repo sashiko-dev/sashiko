@@ -658,10 +658,8 @@ impl Worker {
             });
         }
 
-        let workflow = build_linux_patch_review_workflow_with_options(
-            self.max_interactions,
-            self.temperature,
-        );
+        let workflow =
+            build_linux_patch_review_workflow_with_options(self.max_interactions, self.temperature);
         let env = WorkflowEnv {
             provider: self.provider.clone(),
             tools: self.tools.clone(),

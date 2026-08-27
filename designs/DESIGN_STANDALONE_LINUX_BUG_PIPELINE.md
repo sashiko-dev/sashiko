@@ -2,7 +2,7 @@
 
 ## 1. Overview & Objectives
 
-Sashiko analyzes Linux kernel patches and codebase contexts, occasionally unearthing candidate pre-existing bugs and latent vulnerabilities. This design document specifies the architecture for the standalone kernel bug pipeline (**Pipeline V2**), replacing the initial prototype with a robust, modular, multi-stage workflow.
+Sashiko analyzes Linux kernel patches and codebase contexts, occasionally unearthing candidate pre-existing bugs and latent vulnerabilities. This design document specifies the architecture for the standalone Linux bug pipeline (**Pipeline V2**), replacing the initial prototype with a robust, modular, multi-stage workflow.
 
 ### 1.1 Key Goals
 1. **Immutable Ingestion & Full Traceability**: Store the unadulterated incoming request payload as a `raw_input` JSON blob in the database before any LLM processing.
