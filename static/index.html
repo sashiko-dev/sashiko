@@ -1346,6 +1346,10 @@
             if (patchMatch) {
                 return { view: 'patchset', id: decodeURIComponent(patchMatch[1]), query };
             }
+            const bugMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)$/);
+            if (bugMatch) {
+                return { view: 'bug', id: decodeURIComponent(bugMatch[1]), query };
+            }
             const msgMatch = hash.match(/^#\/message\/(.+)$/);
             if (msgMatch) {
                 return { view: 'message', id: decodeURIComponent(msgMatch[1]), query };
@@ -1432,6 +1436,9 @@
                         break;
                     case 'patchset':
                         await renderPatchsetView(route.id, route.query || {});
+                        break;
+                    case 'bug':
+                        await renderBugView(route.id);
                         break;
                     case 'message':
                         await renderMessageView(route.id);
@@ -1886,6 +1893,7 @@
                     <div style="flex:1"></div>
                     <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
                     <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
+                    <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}">Bugs</button>
                 </div>
                 <table id="dataTable">
                     <thead id="tableHead"></thead>
@@ -1910,13 +1918,15 @@
 
             if (state.listMode === 'patchsets') {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:50px">Parts</th><th style="width:80px">Status</th><th style="width:120px">Findings</th></tr>`;
+            } else if (state.listMode === 'bugs') {
+                thead.innerHTML = `<tr><th>Problem</th><th style="width:100px">Severity</th><th style="width:180px">Commits</th><th style="width:100px">Date</th><th style="width:80px">Status</th></tr>`;
             } else {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:30px"></th></tr>`;
             }
         }
 
         async function fetchListData() {
-            const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : '/api/messages';
+            const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : (state.listMode === 'bugs' ? '/api/bugs' : '/api/messages');
             let url = `${endpoint}?page=${state.currentPage}&per_page=${state.perPage}`;
             if (state.searchQuery) {
                 url += `&q=${encodeURIComponent(state.searchQuery)}`;
@@ -1938,26 +1948,23 @@
 
             items.forEach((p, idx) => {
                 const row = document.createElement('tr');
-                const d = new Date(p.date * 1000);
-                const dateStr = d.toISOString().split('T')[0];
-                const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-
-                const dateHtml = `
-                    <div>${dateStr}</div>
-                    <div class="text-muted-sm">${timeStr}</div>
-                `;
-
-                // Parse author
-                const author = parseAuthor(p.author);
-                const nameToDisplay = author.name || author.email;
-                const emailToDisplay = author.name ? author.email : '';
-
-                const authorHtml = `
-                    <div>${escapeHtml(nameToDisplay)}</div>
-                    ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
-                `;
 
                 if (state.listMode === 'patchsets') {
+                    const d = new Date(p.date * 1000);
+                    const dateStr = d.toISOString().split('T')[0];
+                    const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                    const dateHtml = `
+                        <div>${dateStr}</div>
+                        <div class="text-muted-sm">${timeStr}</div>
+                    `;
+                    const author = parseAuthor(p.author);
+                    const nameToDisplay = author.name || author.email;
+                    const emailToDisplay = author.name ? author.email : '';
+                    const authorHtml = `
+                        <div>${escapeHtml(nameToDisplay)}</div>
+                        ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                    `;
+
                     const parts = (p.received_parts === p.total_parts && p.total_parts > 0)
                         ? `${p.total_parts}`
                         : `${p.received_parts || 0}/${p.total_parts || 0}`;
@@ -1999,7 +2006,66 @@
                         <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
                         <td>${findingsHtml}</td>
                     `;
+                } else if (state.listMode === 'bugs') {
+                    const clickHandler = (e) => {
+                        if (e.target.closest('.copy-btn')) return;
+                        const target = `#/bug/${encodeURIComponent(p.slug || p.id)}`;
+                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                            window.open(target, '_blank');
+                        } else if (e.button === 0) {
+                            navigate(target);
+                        }
+                    };
+                    row.onclick = clickHandler;
+                    row.onauxclick = clickHandler;
+
+                    let tagsHtml = '';
+                    if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
+                        tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                    }
+                    
+                    const sev = (p.severity || 'Medium').toLowerCase();
+                    const sevColor = sev === 'critical' ? 'var(--sev-critical)' : (sev === 'high' ? 'var(--sev-high)' : 'var(--sev-medium)');
+                    const sevHtml = `<span style="color: ${sevColor}; font-weight: bold;">${escapeHtml(p.severity)}</span>`;
+                    
+                    const commitHtml = p.introduced_in_commit ? `<code style="font-size: 0.8em; margin-bottom: 2px;">Introduced: ${escapeHtml(p.introduced_in_commit.substring(0,12))}</code><br>` : '';
+                    let idHtml = p.discovered_in_commit ? `<code style="font-size: 0.8em;">Discovered: ${escapeHtml(p.discovered_in_commit.substring(0,12))}</code>` : '';
+
+                    let statusLabel = p.is_fixed ? 'Fixed' : 'Active';
+                    let statusClass = p.is_fixed ? 'status-reviewed' : 'status-failed';
+                    if (p.status && p.status.toLowerCase() !== 'open' && p.status.toLowerCase() !== 'fixed') {
+                        statusLabel = p.status.charAt(0).toUpperCase() + p.status.slice(1);
+                        statusClass = p.status.toLowerCase() === 'error' ? 'status-failed' : 'status-pending';
+                    }
+
+                    // Use created_at for bugs
+                    let dBug = new Date((p.created_at || (p.date || 0)) * 1000);
+                    let dateStr = dBug.toISOString().split('T')[0];
+                    let timeStr = dBug.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+
+                    row.innerHTML = `
+                        <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
+                        <td style="line-height:1.2;">${sevHtml}</td>
+                        <td style="line-height:1.2;"><div>${commitHtml}${idHtml}</div></td>
+                        <td style="line-height:1.2;"><div>${dateStr}</div><div class="text-muted-sm">${timeStr}</div></td>
+                        <td><span class="status-badge ${statusClass}">${statusLabel}</span></td>
+                    `;
                 } else {
+                    const d = new Date(p.date * 1000);
+                    const dateStr = d.toISOString().split('T')[0];
+                    const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                    const dateHtml = `
+                        <div>${dateStr}</div>
+                        <div class="text-muted-sm">${timeStr}</div>
+                    `;
+                    const author = parseAuthor(p.author);
+                    const nameToDisplay = author.name || author.email;
+                    const emailToDisplay = author.name ? author.email : '';
+                    const authorHtml = `
+                        <div>${escapeHtml(nameToDisplay)}</div>
+                        ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                    `;
+                    
                     const clickHandler = (e) => {
                         if (e.target.closest('.copy-btn')) return;
                         const target = `#/message/${encodeURIComponent(p.message_id)}`;
@@ -2093,6 +2159,7 @@
             state.currentPage = 1;
             document.getElementById('btn-patchsets').classList.toggle('active', mode === 'patchsets');
             document.getElementById('btn-messages').classList.toggle('active', mode === 'messages');
+            document.getElementById('btn-bugs').classList.toggle('active', mode === 'bugs');
             updateTableHeader();
             fetchListData();
         }
@@ -2320,7 +2387,7 @@
             let paginationHtml = '';
             if (data.total_patches_in_db > data.limit) {
                 const totalPages = Math.ceil(data.total_patches_in_db / data.limit);
-                const basePath = `#/patchset/${encodeURIComponent(data.slug || data.id || data.message_id)}`;
+                const basePath = `#/patchset/${encodeURIComponent((data.slug || data.id) || data.id || data.message_id)}`;
 
                 paginationHtml = `
                     <div class="pagination">
@@ -2439,6 +2506,51 @@
                  `;
             }
 
+            let preexistingBugsHtml = '';
+            if (data.bugs && Array.isArray(data.bugs) && data.bugs.length > 0) {
+                preexistingBugsHtml = `
+                    <div class="section" id="preexisting-bugs">
+                        <h2>Discovered Linux Kernel Bugs (${data.bugs.length})</h2>
+                        <div style="margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em;">
+                            The following Linux Kernel defects in the codebase were identified during review (separated from patch regressions):
+                        </div>
+                        ${data.bugs.map(b => {
+                            const sev = (b.severity || 'High').toLowerCase();
+                            const sevColor = sev === 'critical' ? 'var(--sev-critical)' : 'var(--sev-high)';
+                            const bugLink = `#/bug/${encodeURIComponent((b.slug || b.id) || b.id)}`;
+                            const cardId = 'pb-card-' + Math.random().toString(36).substr(2, 9);
+                            return `
+                                <div class="review-card" style="border-left: 3px solid ${sevColor};">
+                                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+                                        <div>
+                                            <a href="${bugLink}" style="font-weight:bold; font-size:1.05em; color:var(--text);">${escapeHtml(b.problem)}</a>
+                                            <div style="margin-top:4px;">
+                                                <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(b.severity || 'High')}</span>
+                                                ${(b.subsystems && Array.isArray(b.subsystems) && b.subsystems.length > 0) ? b.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (b.subsystem ? `<span class="tag">${escapeHtml(b.subsystem)}</span>` : '')}
+                                                <span class="tag">${escapeHtml((b.slug || b.id))}</span>
+                                                ${(b.status && b.status.toLowerCase() !== 'open' && b.status.toLowerCase() !== 'fixed') ? `<span class="tag" style="background:rgba(88,166,255,0.15); color:var(--status-pending); border:1px solid var(--status-pending); font-weight:bold;">${b.status.charAt(0).toUpperCase() + b.status.slice(1)}</span>` : (b.is_fixed ? `<span class="tag" style="background:rgba(46,160,67,0.15); color:var(--status-reviewed); font-weight:bold;">Fixed in Trunk</span>` : `<span class="tag" style="background:rgba(218,54,51,0.15); color:var(--status-failed); font-weight:bold;">Active in Trunk</span>`)}
+                                                ${b.introduced_in_commit ? `<span class="tag" title="${escapeHtml(b.introduced_in_commit)}">Intro: ${escapeHtml(b.introduced_in_commit.length > 20 ? b.introduced_in_commit.substring(0, 20) + '...' : b.introduced_in_commit)}</span>` : ''}
+                                                ${b.is_newly_discovered ? `<span class="tag" style="background:var(--diff-add-bg); color:var(--status-reviewed);">Newly Discovered</span>` : ''}
+                                            </div>
+                                        </div>
+                                        <a href="${bugLink}" style="font-weight:600; font-size:0.9em; white-space:nowrap;">View Details &rarr;</a>
+                                    </div>
+                                    ${b.description ? `
+                                        <div style="margin-top:10px;">
+                                            <button class="toggle-btn" onclick="toggleCollapsible('${cardId}', this)">▶ Inline Review</button>
+                                            <div id="${cardId}" class="collapsible" style="position:relative; margin-top:6px;">
+                                                <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                                <div class="log-inline-block">${escapeHtml(b.description, true, true)}</div>
+                                            </div>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                `;
+            }
+
             let currentStatus = data.status || 'Pending';
 
             document.getElementById('app').innerHTML = `
@@ -2478,6 +2590,8 @@
 
                 ${baselineLogsHtml}
                 
+                ${preexistingBugsHtml}
+
                 <div class="section">
                     <h2 id="ai-reviews">AI Reviews</h2>
                     ${summaryHtml}
@@ -2658,7 +2772,7 @@
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
 
             let inlineHtml = '';
-            if (r.inline_review) {
+            if (r.description) {
                 // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
                 const hasIssues = parsedFindings && !displayResult.includes('No regressions');
                 const isOpen = hasIssues ? 'open' : '';
@@ -2668,7 +2782,7 @@
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
                         <div id="inline-${uniqueId}" class="collapsible ${isOpen}" style="position: relative;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                            <div class="log-inline-block">${escapeHtml(r.inline_review, true, true)}</div>
+                            <div class="log-inline-block">${escapeHtml(r.description, true, true)}</div>
                         </div>
                     </div>
                 `;
@@ -2829,6 +2943,229 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         // =====================================================================
+        // Linux Kernel Bug VIEW
+        // =====================================================================
+        async function renderBugView(slugOrId) {
+            const isId = /^\d+$/.test(slugOrId);
+            const queryParam = isId ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
+            const res = await fetch(`/api/bug?${queryParam}`);
+            if (!res.ok) throw new Error('Linux Kernel Bug not found');
+            const data = await res.json();
+
+            document.title = `${config.project_name || 'Sashiko'} - Bug ${(data.slug || data.id) || data.id}`;
+
+            const date = data.created_at ? formatDate(data.created_at, true) : '-';
+            const sev = (data.severity || 'High').toLowerCase();
+            const sevColor = sev === 'critical' ? 'var(--sev-critical)' : 'var(--sev-high)';
+
+            let locationsHtml = '';
+            let locations = data.locations;
+            if (typeof locations === 'string') {
+                try { locations = JSON.parse(locations); } catch (e) { }
+            }
+            if (Array.isArray(locations) && locations.length > 0) {
+                locationsHtml = `
+                    <div class="section">
+                        <h2>Affected Locations</h2>
+                        <table style="margin-top:8px;">
+                            <thead>
+                                <tr>
+                                    <th>File</th>
+                                    <th>Function / Symbol</th>
+                                    <th style="width:100px;">Line</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${locations.map(loc => {
+                                    const file = loc.file || loc.path || '-';
+                                    const fn = loc.function || loc.function_or_symbol || loc.symbol || '-';
+                                    const line = loc.line || loc.line_number || '-';
+                                    return `<tr>
+                                        <td><code>${escapeHtml(file)}</code></td>
+                                        <td><code>${escapeHtml(fn)}</code></td>
+                                        <td>${escapeHtml(String(line))}</td>
+                                    </tr>`;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+            } else if (data.source_files && Array.isArray(data.source_files) && data.source_files.length > 0) {
+                locationsHtml = `
+                    <div class="section">
+                        <h2>Affected Files</h2>
+                        <ul>
+                            ${data.source_files.map(f => `<li><code>${escapeHtml(f)}</code></li>`).join('')}
+                        </ul>
+                    </div>
+                `;
+            }
+
+            let inlineReviewHtml = '';
+            if (data.description) {
+                inlineReviewHtml = `
+                    <div class="section">
+                        <h2>Inline Review Comment</h2>
+                        <div style="position: relative; margin-top: 8px;">
+                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                            <div class="log-inline-block">${escapeHtml(data.description, true, true)}</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            let explanationHtml = '';
+            if (data.severity_explanation) {
+                explanationHtml = `
+                    <div class="section">
+                        <h2>Analysis & Severity Explanation</h2>
+                        <div class="log-block" style="max-height:none; font-size: 13px;">${escapeHtml(data.severity_explanation)}</div>
+                    </div>
+                `;
+            }
+
+            let logs = [];
+            if (Array.isArray(data.logs)) {
+                logs = data.logs;
+            } else if (typeof data.logs === 'string') {
+                try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
+            }
+
+            let logsHtml = '';
+            if (logs.length > 0) {
+                const entriesHtml = renderInteractionLogEntries(logs);
+                const logSectionId = 'bug-logs-' + Math.random().toString(36).substr(2, 9);
+                logsHtml = `
+                    <div class="section">
+                        <h2 style="display:flex; align-items:center; gap:10px;">
+                            Pipeline Interaction Logs (${logs.length} entries)
+                            <button class="toggle-btn" onclick="toggleCollapsible('${logSectionId}', this)" style="font-size:0.8em; font-weight:normal;">▶ Show Logs</button>
+                        </h2>
+                        <div id="${logSectionId}" class="collapsible">
+                            <div>${entriesHtml}</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            let discoveredInHtml = '';
+            if (data.discovered_in_patchset_id) {
+                discoveredInHtml = `<a href="#/patchset/${encodeURIComponent(data.discovered_in_patchset_id)}">Patchset #${data.discovered_in_patchset_id}</a>`;
+            } else if (data.discovered_in_commit) {
+                discoveredInHtml = `<code>${escapeHtml(data.discovered_in_commit.substring(0, 12))}</code>`;
+            } else {
+                discoveredInHtml = '-';
+            }
+
+            let statusBadgeHtml = '';
+            let mainlineStatusHtml = '';
+
+            if (data.status && data.status.toLowerCase() !== 'open' && data.status.toLowerCase() !== 'fixed') {
+                const pendingLabel = data.status.charAt(0).toUpperCase() + data.status.slice(1);
+                const colorVar = data.status.toLowerCase() === 'error' ? 'var(--status-failed)' : 'var(--status-pending)';
+                const bgRgba = data.status.toLowerCase() === 'error' ? 'rgba(218,54,51,0.15)' : 'rgba(88,166,255,0.15)';
+                statusBadgeHtml = `<span class="tag" style="font-size:0.6em; vertical-align:middle; background:${bgRgba}; color:${colorVar}; font-weight:bold; border:1px solid ${colorVar};">${pendingLabel}</span>`;
+                mainlineStatusHtml = `<strong style="color:${colorVar};">${pendingLabel} - Awaiting AI Verification</strong>`;
+            } else {
+                statusBadgeHtml = data.is_fixed
+                    ? `<span class="tag" style="font-size:0.6em; vertical-align:middle; background:rgba(46,160,67,0.15); color:var(--status-reviewed); font-weight:bold; border:1px solid var(--status-reviewed);">Fixed in Trunk</span>`
+                    : `<span class="tag" style="font-size:0.6em; vertical-align:middle; background:rgba(218,54,51,0.15); color:var(--status-failed); font-weight:bold; border:1px solid var(--status-failed);">Active in Trunk</span>`;
+
+                mainlineStatusHtml = data.is_fixed
+                    ? `<strong style="color:var(--status-reviewed);">Fixed in top-of-trunk</strong>${data.fixed_in_commit ? ` (commit <code>${escapeHtml(data.fixed_in_commit)}</code>)` : ''}`
+                    : `<strong style="color:var(--status-failed);">Active / Unfixed in top-of-trunk</strong>`;
+            }
+
+            document.getElementById('app').innerHTML = `
+                <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
+                <h1>
+                    <span>${escapeHtml(data.problem || 'Linux Kernel Bug')}</span>
+                    <span style="display:inline-flex; align-items:center; gap:8px;">
+                        <span class="tag" style="font-size:0.6em; vertical-align:middle; background:transparent; border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold;">${escapeHtml(data.severity || 'High')}</span>
+                        <span class="tag" style="font-size:0.6em; vertical-align:middle;">${escapeHtml((data.slug || data.id))}</span>
+                        ${statusBadgeHtml}
+                    </span>
+                </h1>
+
+                <div class="section">
+                    <div class="kv"><div class="label">ID:</div><div><code>${escapeHtml((data.slug || data.id))}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml((data.slug || data.id))}')">Copy</button></div></div>
+                    <div class="kv"><div class="label">Severity:</div><div><strong style="color:${sevColor}">${escapeHtml(data.severity || 'High')}</strong></div></div>
+                    <div class="kv"><div class="label">Mainline Status:</div><div>${mainlineStatusHtml}</div></div>
+                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced in:</div><div><code>${escapeHtml(data.introduced_in_commit)}</code></div></div>` : ''}
+                    <div class="kv"><div class="label">Subsystems:</div><div>${(data.subsystems && Array.isArray(data.subsystems) && data.subsystems.length > 0) ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-')}</div></div>
+                    <div class="kv"><div class="label">Discovered:</div><div>${date}</div></div>
+                    <div class="kv"><div class="label">Found in:</div><div>${discoveredInHtml}</div></div>
+                </div>
+
+                ${inlineReviewHtml}
+                ${explanationHtml}
+                ${locationsHtml}
+                ${logsHtml}
+            `;
+        }
+
+        function renderInteractionLogEntries(logs) {
+            if (!logs || !logs.length) {
+                return '<div style="padding:20px; text-align:center; color:var(--text-dim);">No logs recorded.</div>';
+            }
+            let jsonCounter = 0;
+            return logs.map((entry, idx) => {
+                const role = (entry.role || 'unknown').toLowerCase();
+                const parts = entry.parts || [];
+                let rowClass = 'log-entry';
+                if (role === 'user') rowClass += ' role-user';
+                else if (role === 'model' || role === 'assistant') rowClass += ' role-model';
+                else if (role === 'tool' || role === 'function') rowClass += ' role-tool';
+                else rowClass += ' role-system';
+
+                let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
+
+                let content = '';
+
+                // Unified format: direct content and tool_calls
+                if (entry.thought && typeof entry.thought === 'string') {
+                    content += `<div class="thought-block">${escapeHtml(entry.thought)}</div>`;
+                }
+                
+                if (entry.content && typeof entry.content === 'string') {
+                    if (role === 'tool') {
+                        content += formatJsonExpandable(entry.content, jsonCounter++);
+                    } else {
+                        content += `<div>${escapeHtml(entry.content)}</div>`;
+                    }
+                }
+                if (entry.tool_calls && Array.isArray(entry.tool_calls)) {
+                    entry.tool_calls.forEach(call => {
+                        const callId = jsonCounter++;
+                        content += formatFuncCallExpandable(call.function_name, call.arguments, callId);
+                    });
+                }
+
+                // Gemini format: parts array
+                parts.forEach(part => {
+                    if (part.text) {
+                        if (part.thought) {
+                            content += `<div class="thought-block">${escapeHtml(part.text)}</div>`;
+                        } else {
+                            content += `<div>${escapeHtml(part.text)}</div>`;
+                        }
+                    } else if (part.functionCall || part.function_call) {
+                        const fc = part.functionCall || part.function_call;
+                        const callId = jsonCounter++;
+                        const callHtml = formatFuncCallExpandable(fc.name, fc.args, callId);
+                        content += callHtml;
+                    } else if (part.functionResponse || part.function_response) {
+                        const fr = part.functionResponse || part.function_response;
+                        const respHtml = formatJsonExpandable(fr.response, jsonCounter++);
+                        content += `<div><span style="opacity:0.6">→ ${escapeHtml(fr.name)}:</span> ${respHtml}</div>`;
+                    }
+                });
+
+                return `<div class="${rowClass}"><div class="log-gutter">${label}</div><div class="log-content">${content}</div></div>`;
+            }).join('');
+        }
+
+        // =====================================================================
         // LOG VIEW
         // =====================================================================
         async function renderLogView(id) {
@@ -2843,66 +3180,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
             }
 
-            let logsHtml = '';
-            if (!logs.length) {
-                logsHtml = '<div style="padding:20px; text-align:center; color:var(--text-dim);">No logs recorded.</div>';
-            } else {
-                let jsonCounter = 0;
-                logsHtml = logs.map((entry, idx) => {
-                    const role = (entry.role || 'unknown').toLowerCase();
-                    const parts = entry.parts || [];
-                    let rowClass = 'log-entry';
-                    if (role === 'user') rowClass += ' role-user';
-                    else if (role === 'model' || role === 'assistant') rowClass += ' role-model';
-                    else if (role === 'tool' || role === 'function') rowClass += ' role-tool';
-                    else rowClass += ' role-system';
-
-                    let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
-
-                    let content = '';
-
-                    // Unified format: direct content and tool_calls
-                    if (entry.thought && typeof entry.thought === 'string') {
-                        content += `<div class="thought-block">${escapeHtml(entry.thought)}</div>`;
-                    }
-                    
-                    if (entry.content && typeof entry.content === 'string') {
-                        if (role === 'tool') {
-                            content += formatJsonExpandable(entry.content, jsonCounter++);
-                        } else {
-                            content += `<div>${escapeHtml(entry.content)}</div>`;
-                        }
-                    }
-                    if (entry.tool_calls && Array.isArray(entry.tool_calls)) {
-                        entry.tool_calls.forEach(call => {
-                            const callId = jsonCounter++;
-                            content += formatFuncCallExpandable(call.function_name, call.arguments, callId);
-                        });
-                    }
-
-                    // Gemini format: parts array
-                    parts.forEach(part => {
-                        if (part.text) {
-                            if (part.thought) {
-                                content += `<div class="thought-block">${escapeHtml(part.text)}</div>`;
-                            } else {
-                                content += `<div>${escapeHtml(part.text)}</div>`;
-                            }
-                        } else if (part.functionCall || part.function_call) {
-                            const fc = part.functionCall || part.function_call;
-                            const callId = jsonCounter++;
-                            const callHtml = formatFuncCallExpandable(fc.name, fc.args, callId);
-                            content += callHtml;
-                        } else if (part.functionResponse || part.function_response) {
-                            const fr = part.functionResponse || part.function_response;
-                            const respHtml = formatJsonExpandable(fr.response, jsonCounter++);
-                            content += `<div><span style="opacity:0.6">→ ${escapeHtml(fr.name)}:</span> ${respHtml}</div>`;
-                        }
-                    });
-
-                    return `<div class="${rowClass}"><div class="log-gutter">${label}</div><div class="log-content">${content}</div></div>`;
-                }).join('');
-            }
+            const logsHtml = renderInteractionLogEntries(logs);
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>

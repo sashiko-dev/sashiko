@@ -356,7 +356,7 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
     }
 
     /// Append the same per-stage guide files that [`Self::get_stage_prompt`]
-    /// appends, for pipelines that supply their own instruction text via
+    /// appends, for workflows that supply their own instruction text via
     /// `StagePrompt::Override` (which bypasses `get_stage_prompt`).
     pub async fn append_stage_guides(
         &self,
@@ -638,7 +638,8 @@ impl Worker {
             all_dismissed_concerns: Vec::new(),
             deduplicated_concerns: Vec::new(),
             deduplicated_dismissed_concerns: Vec::new(),
-            conflict_resolved_concerns: Vec::new(),
+            patch_concerns: Vec::new(),
+            concerns: Vec::new(),
             findings: Vec::new(),
             review_inline: String::new(),
             fixes: String::new(),
@@ -657,8 +658,10 @@ impl Worker {
             });
         }
 
-        let workflow =
-            build_linux_patch_review_workflow_with_options(self.max_interactions, self.temperature);
+        let workflow = build_linux_patch_review_workflow_with_options(
+            self.max_interactions,
+            self.temperature,
+        );
         let env = WorkflowEnv {
             provider: self.provider.clone(),
             tools: self.tools.clone(),
@@ -726,6 +729,7 @@ impl Worker {
         let final_output = json!({
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
+            "concerns": state.concerns,
             "review_inline": review_inline,
             "fixes": state.fixes,
             "concerns_count": concerns_count,

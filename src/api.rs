@@ -179,6 +179,12 @@ pub struct ReviewQuery {
 }
 
 #[derive(Deserialize)]
+pub struct BugQuery {
+    pub id: Option<i64>,
+    pub slug: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct RerunPatchQuery {
     pub patchset_id: i64,
     pub patch_id: i64,
@@ -306,6 +312,10 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
+        .route("/api/bug", get(get_bug))
+        .route("/api/bugs", get(list_bugs))
+        .route("/api/bug/analyze", post(analyze_bug))
+        .route("/bug/{slug}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
@@ -931,6 +941,105 @@ async fn get_review_log(
     }
 }
 
+async fn get_bug(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let result = if let Some(id) = query.id {
+        state.db.get_bug(id).await
+    } else if let Some(ref slug) = query.slug {
+        state.db.get_bug_by_slug(slug).await
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    match result {
+        Ok(Some(bug)) => Ok(Json(
+            serde_json::to_value(bug).unwrap_or(serde_json::json!({})),
+        )),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Database error fetching preexisting bug: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn analyze_bug(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<crate::workflows::linux_bug::BugInput>,
+) -> Result<Json<crate::workflows::linux_bug::BugOutcome>, (StatusCode, String)> {
+    if state.read_only {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode".to_string(),
+        ));
+    }
+
+    let provider = match crate::ai::create_provider_cached(&state.settings, false, 0).await {
+        Ok(p) => p,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create AI provider: {}", e),
+            ));
+        }
+    };
+
+    let repo_path = std::path::PathBuf::from(&state.settings.git.repository_path);
+    let tools = if repo_path.exists() {
+        let mainline_sha = match crate::git_ops::get_commit_hash(&repo_path, "origin/master").await
+        {
+            Ok(sha) => Some(sha),
+            Err(_) => match crate::git_ops::get_commit_hash(&repo_path, "master").await {
+                Ok(sha) => Some(sha),
+                Err(_) => crate::git_ops::get_commit_hash(&repo_path, "HEAD")
+                    .await
+                    .ok(),
+            },
+        };
+        let mut tb = crate::toolbox::ToolBox::new(repo_path, None);
+        if let Some(m_sha) = mainline_sha {
+            tb.set_virtual_head(m_sha);
+        }
+        Some(std::sync::Arc::new(tb))
+    } else {
+        None
+    };
+
+    let mut payload = payload;
+    if payload.subsystems.is_empty()
+        && !payload.source_files.is_empty()
+        && let Ok(mindex) =
+            crate::maintainers::MaintainersIndex::from_repo(&state.settings.git.repository_path)
+    {
+        payload.subsystems = mindex.match_files(&payload.source_files);
+    }
+
+    match crate::workflows::linux_bug::process_issue(
+        provider.as_ref(),
+        tools,
+        &state.db,
+        payload,
+        Some("api_analyze"),
+    )
+    .await
+    {
+        Ok(outcome) => Ok(Json(outcome)),
+        Err(e) => {
+            tracing::error!("Pre-existing bug analysis failed: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Analysis failed: {}", e),
+            ))
+        }
+    }
+}
+
+async fn redirect_bug(Path(slug): Path<String>) -> impl IntoResponse {
+    Redirect::temporary(&format!("/#/bug/{}", slug))
+}
+
 async fn get_message(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
@@ -1278,6 +1387,30 @@ async fn forge_webhook(
     })))
 }
 
+async fn list_bugs(
+    State(state): State<Arc<AppState>>,
+    Query(pagination): Query<Pagination>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let page = pagination.page.unwrap_or(1).max(1);
+    let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * per_page;
+
+    match state
+        .db
+        .get_bugs_list(per_page, offset, pagination.q.as_deref())
+        .await
+    {
+        Ok((items, total)) => Ok(Json(serde_json::json!({
+            "items": items,
+            "total": total
+        }))),
+        Err(e) => {
+            tracing::error!("Failed to fetch preexisting bugs list: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,5 +1420,84 @@ mod tests {
         let id = generate_synthetic_id("test");
         assert!(id.starts_with("sashiko-test-"));
         assert!(id.ends_with("@sashiko.local"));
+    }
+
+    #[tokio::test]
+    async fn test_bug_endpoints() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let _bug_id = db
+            .create_bug(&crate::db::NewBug {
+                verified_on_sha: None,
+                status: "raw".to_string(),
+                slug: "pb-12345678".to_string(),
+                problem: "UAF in test_device".to_string(),
+                severity: crate::db::Severity::Critical,
+                severity_explanation: Some("Trace".to_string()),
+                locations: None,
+                subsystems: vec!["drivers/net".to_string()],
+                source_files: Some(vec!["drivers/net/test.c".to_string()]),
+                inline_review: "Inline review".to_string(),
+                logs: Some("[{\"role\":\"user\",\"content\":\"test\"}]".to_string()),
+                vector_json: None,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                introduced_in_commit: None,
+                is_fixed: false,
+                fixed_in_commit: None,
+                raw_input: None,
+                created_at: 123456,
+            })
+            .await
+            .unwrap();
+
+        let settings = Arc::new(crate::settings::Settings::new().unwrap());
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+
+        let app = build_router(settings, db.clone(), event_tx, fetch_tx, true, false, true);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Test 1: get_bug by slug
+        let res = reqwest::get(format!("http://{}/api/bug?slug=pb-12345678", addr))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let json: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(json["id"], "pb-12345678");
+        assert_eq!(json["problem"], "UAF in test_device");
+        assert!(json["logs"].is_string());
+
+        // Test 3: redirect_bug
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let res = client
+            .get(format!("http://{}/bug/pb-12345678", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 307);
+        assert_eq!(
+            res.headers().get("location").unwrap().to_str().unwrap(),
+            "/#/bug/pb-12345678"
+        );
     }
 }

@@ -64,8 +64,10 @@ pub struct LinuxPatchReviewState {
     /// Deduplicated dismissed concerns from Stage 8.
     pub deduplicated_dismissed_concerns: Vec<Value>,
 
-    /// Filtered concerns after Stage 9 conflict resolution.
-    pub conflict_resolved_concerns: Vec<Value>,
+    /// Filtered patch-introduced concerns after Stage 9 conflict resolution.
+    pub patch_concerns: Vec<Value>,
+    /// Candidate pre-existing concerns extracted after Stage 9 for separate processing.
+    pub concerns: Vec<Value>,
 
     /// Verified findings from Stage 10.
     pub findings: Vec<Value>,
@@ -186,15 +188,15 @@ You are a senior Linux kernel maintainer evaluating the high-level intent of a p
 
 const STAGE_2_INSTRUCTION: &str = r#"# Stage 2. High-level implementation verification
 
-You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."#;
+You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations (e.g., bitwise arithmetic that incorrectly shifts values leading to overlapping masks or clobbering adjacent fields), and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."#;
 
 const STAGE_3_INSTRUCTION: &str = r#"# Stage 3. Execution flow verification
 
-You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."#;
+You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for missing teardown/restore of state in error paths (e.g. failing to cleanly restore global state or struct fields that were temporarily modified, such as resetting ID/minor values to -1 before returning on failure). Verify that mathematical operations, sizing, or rounding algorithms don't bypass capacity checks or enable out-of-bounds reads/writes. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."#;
 
 const STAGE_4_INSTRUCTION: &str = r#"# Stage 4. Resource management
 
-You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."#;
+You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. Check if resources freed in one path are accessed in another concurrent or cleanup flow (UAF). If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."#;
 
 const STAGE_5_INSTRUCTION: &str = r#"# Stage 5. Locking and synchronization
 
@@ -203,13 +205,13 @@ Carefully review the proposed patch for ANY locking, concurrency, or synchroniza
 You MUST consider the following categories of issues and report any violations:
 1. Sleeping in atomic context: Are there any calls to `mutex_lock`, `kzalloc` with `GFP_KERNEL`, `msleep`, `cond_resched`, `flush_workqueue`, `synchronize_rcu`, or `cancel_work_sync` while holding a spinlock, rwlock, or within an RCU read-side critical section (`rcu_read_lock`)?
 2. Lock ordering and deadlocks: Are locks acquired in a different order than elsewhere? Does it acquire a mutex while holding another mutex that could cause AB-BA deadlocks? Are IRQs disabled (`spin_lock_irqsave`) when acquiring a lock that is used in hardirq context? Does it acquire a lock already held by a higher-level subsystem (e.g., ethtool)?
-3. Race conditions and lockless access: Are shared variables, list entries, or pointers accessed without holding the appropriate lock? Are there missing memory barriers (`smp_mb`, `smp_wmb`, `smp_rmb`) when lockless access is intended? Are there TOCTOU races where a state is checked outside a lock but relied upon inside?
+3. Race conditions and lockless access: Are shared variables, list entries, or pointers accessed without holding the appropriate lock (e.g., clearing pointers concurrently while others dereference them)? Are there missing memory barriers (`smp_mb`, `smp_wmb`, `smp_rmb`) when lockless access is intended (e.g. in lockless readers reading reused elements)? Are there TOCTOU races where a state is checked outside a lock but relied upon inside?
 4. UAF / Locking Freed Memory: Are locks (`mutex_unlock`, `spin_unlock`) called on objects that have already been freed? Are works/timers destroyed before subsystems are unregistered, allowing new events to use freed works/timers? Is the protocol initialized flag set before private data is ready?
 5. RCU rules: Is `list_splice_init` or similar non-RCU-safe operations used on RCU-protected lists? Is `list_for_each_rcu` used without `rcu_read_lock`?
 6. Unprotected state modifications: Does the patch check state before acquiring the lock (e.g., checking power state before taking mutex)? Are hardware state, flags, or stats updated without proper protection?
 7. Sequence counters: Are stats accumulations directly inside a `u64_stats_fetch_retry` loop leading to double counting? Is it possible for an interrupt to read a sequence counter while the interrupted context is modifying it (deadlock)?
 8. Lock re-initialization: Does it re-initialize a lock that was already initialized, or destroy a lock on a failure path improperly?
-9. Missing locking: Is a port or file exposed to userspace before the driver/TTY linking is complete? Does a worker race with cleanup code leading to dropped/leaked frames?"#;
+9. Missing locking: Is a port or file exposed to userspace before the driver/TTY linking is complete? Are objects added to global/shared lists before they are fully initialized or their resources attached? Does a worker race with cleanup code leading to dropped/leaked frames?"#;
 
 const STAGE_6_INSTRUCTION: &str = r#"# Stage 6. Security audit
 
@@ -254,11 +256,11 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 3. SERIES VALIDATION RULE: If follow-up patches in this series are provided in the context, check if each identified concern is resolved or fixed in the final state of the series. If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
 4. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit "mm: fix allocation"'). Existing historical commits in the tree should still be referenced by their standard hash.
 5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
-6. If the problem did exist in the code before the patch was applied, say it explicitly: 'This problem wasn't introduced by this patch, but...'. Discard low- and medium-severity pre-existing problems, report only high- and critical severity issues.
+6. If the problem is determined to have already existed in the code before the patch was applied, mark `"preexisting": true`. Pre-existing issues will be routed to a dedicated pipeline and separate review.
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
 8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
 
-const STAGE_11_INSTRUCTION: &str = r#"# Stage 11. LKML-friendly report generation
+pub const STAGE_11_INSTRUCTION: &str = r#"# Stage 11. LKML-friendly report generation
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
 
@@ -789,7 +791,21 @@ Example Output:
             ..Default::default()
         })
         .reduce(|state, out: Stage9Output| {
-            state.conflict_resolved_concerns = out.concerns;
+            let mut new_concerns = Vec::new();
+            let mut preexisting = Vec::new();
+            for concern in out.concerns {
+                let is_preexisting = concern
+                    .get("preexisting")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_preexisting {
+                    preexisting.push(concern);
+                } else {
+                    new_concerns.push(concern);
+                }
+            }
+            state.patch_concerns = new_concerns;
+            state.concerns = preexisting;
         })
         .build()
 }
@@ -807,16 +823,16 @@ pub fn stage_10_verification(
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{{{{follow_up_series_section}}}}
 
 Consolidated Concerns:
-{{{{conflict_resolved_concerns}}}}
+{{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a string containing the vulnerability description), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
 ```json
 {{
   "findings": [
     {{
-      "problem": "Memory leak in function X when condition Y is met.",
+      "problem": "mm: memory leak in func_x() due to unmet condition Y",
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
       "preexisting": false,
@@ -842,8 +858,8 @@ Example Output:
                     .map(|ctx| format!("\n\n{}", ctx))
                     .unwrap_or_default()
             })
-            .with_var("conflict_resolved_concerns", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.conflict_resolved_concerns).unwrap_or_default()
+            .with_var("patch_concerns", |s: &LinuxPatchReviewState| {
+                serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::json())
@@ -854,7 +870,26 @@ Example Output:
             ..Default::default()
         })
         .reduce(|state, out: Stage10Output| {
-            state.findings = out.findings;
+            let mut new_findings = Vec::new();
+            state.concerns.clear();
+            for finding in out.findings {
+                let is_preexisting = finding
+                    .get("preexisting")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_preexisting {
+                    let concern = json!({
+                        "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
+                        "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
+                        "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
+                        "preexisting": true,
+                        "locations": finding.get("locations").cloned().unwrap_or(json!([])),
+                    });
+                    state.concerns.push(concern);
+                }
+                new_findings.push(finding);
+            }
+            state.findings = new_findings;
         })
         .build()
 }
@@ -917,7 +952,7 @@ pub fn build_linux_patch_review_workflow_with_options(
         .dynamic_parallel(
             planning_stage(),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
-            ParallelPolicy::FailFast,
+            ParallelPolicy::BestEffort,
         )
         .early_exit_if(
             |s| s.all_concerns.is_empty(),
@@ -930,7 +965,7 @@ pub fn build_linux_patch_review_workflow_with_options(
         )
         .stage(stage_9_conflict_resolution(max_turns, temperature))
         .early_exit_if(
-            |s| s.conflict_resolved_concerns.is_empty(),
+            |s| s.patch_concerns.is_empty(),
             "No concerns remaining after conflict resolution",
         )
         .stage(stage_10_verification(max_turns, temperature))
