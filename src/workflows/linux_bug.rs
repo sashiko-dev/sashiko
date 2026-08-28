@@ -116,6 +116,7 @@ struct VerifySession<'a> {
     master_sha: String,
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
+    prefetched_context: String,
 }
 
 #[async_trait]
@@ -127,8 +128,12 @@ impl LlmSession for VerifySession<'_> {
         format!(
             "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
             You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
-            Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\
-            CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the codebase that the described conditions are impossible, unreachable, or already handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+            Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
+            TOOL USAGE DIRECTIVES:\n\
+            - Actively batch parallel or independent tool calls into a single response when possible to minimize turns.\n\
+            - If tool output is truncated ('truncated': true), page only if directly relevant.\n\
+            - Scope your investigation strictly to the reported functions, immediate error handling paths, and direct caller contracts. Do NOT attempt open-ended whole-kernel call-graph or destructor traversals.\n\n\
+            CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
         )
     }
 
@@ -140,18 +145,28 @@ impl LlmSession for VerifySession<'_> {
             .and_then(|v| serde_json::to_string_pretty(v).ok())
             .unwrap_or_else(|| "[]".to_string());
 
+        let prefetch_block = if self.prefetched_context.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n<pre_fetched_context>\nThe following context was automatically pre-fetched from mainline at commit `{}`. It contains the source code around the reported locations.\nIf this context is sufficient to verify the defect, render your verdict directly without redundant tool calls.\n\n{}\n</pre_fetched_context>\n",
+                self.master_sha, self.prefetched_context
+            )
+        };
+
         format!(
             "Candidate Vulnerability:
 Problem: {problem}
 Reasoning: {reasoning}
 Locations:
 {locations}
-
+{prefetch_block}
 Task:
-1. Verify the problem against the top-of-trunk of Linus's main tree (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in your tool calls instead of `HEAD` or `master` to check the actual top-of-trunk.
-2. Determine if the issue is a genuine, reachable defect in the codebase.
-3. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
-4. If it is a confirmed bug, set \"is_false_positive\": false, \"refutation_evidence\": null, provide your step-by-step proof in \"verification_reasoning\", carry forward and refine the verified code locations in \"relevant_code_locations\", and optionally suggest an \"impact_severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\").
+1. Verify the problem against the mainline code shown above and top-of-trunk of Linus's main tree (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `master` to check the actual top-of-trunk.
+2. Scope your verification to the reported functions, immediate error handling paths, and direct caller contracts. Do not wander across unrelated drivers or files.
+3. Determine if the issue is a genuine, reachable defect in the codebase.
+4. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
+5. If it is a confirmed bug, set \"is_false_positive\": false, \"refutation_evidence\": null, provide your step-by-step proof in \"verification_reasoning\", carry forward and refine the verified code locations in \"relevant_code_locations\", and optionally suggest an \"impact_severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\").
 
 EFFICIENCY LIMIT REQUIREMENT: Limit your investigation to the core defect. Do not trace unneeded macro definitions or unrelated history. You have a strict limit on tool calls; be extremely efficient instead of wandering the history.
 
@@ -166,7 +181,8 @@ Return ONLY a valid JSON object matching this schema:
             master_sha = self.master_sha,
             problem = self.input.problem,
             reasoning = self.input.reasoning,
-            locations = loc_str
+            locations = loc_str,
+            prefetch_block = prefetch_block,
         )
     }
 
@@ -807,6 +823,207 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
     .ok()
 }
 
+pub const MAX_BUG_PREFETCH_CHARS: usize = 20_000;
+pub const MAX_BUG_PREFETCH_FILES: usize = 3;
+pub const MAX_BUG_PREFETCH_SNIPPETS_PER_FILE: usize = 2;
+pub const MAX_BUG_PREFETCH_SNIPPETS_TOTAL: usize = 5;
+pub const MAX_BUG_SNIPPET_LINES: usize = 100;
+
+/// Deterministically pre-fetches code snippets around candidate bug locations from mainline.
+///
+/// Strictly bounded by guardrails to prevent context window bloat from malformed or
+/// adversarial candidate reports:
+/// 1. At most 3 distinct .c/.h files.
+/// 2. At most 2 snippets per file, 5 snippets total.
+/// 3. At most 100 lines per snippet (enclosing function via Tree-sitter or clamped window).
+/// 4. Total character budget <= 20,000 characters (~5,000 tokens).
+pub async fn prefetch_bug_locations(
+    tools: Option<&Arc<ToolBox>>,
+    master_sha: &str,
+    locations: &Option<Value>,
+) -> String {
+    let Some(tools) = tools else {
+        return String::new();
+    };
+    let Some(loc_arr) = locations.as_ref().and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if loc_arr.is_empty() {
+        return String::new();
+    }
+
+    // Step 1: Collect and sanitize candidate file paths (max 3 distinct valid C files)
+    let mut files: Vec<String> = Vec::new();
+    for loc in loc_arr {
+        let Some(file) = loc.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let file = file.trim();
+        if file.contains("..")
+            || file.starts_with('/')
+            || file.starts_with('\\')
+            || (!file.ends_with(".c") && !file.ends_with(".h"))
+        {
+            continue;
+        }
+        if !files.contains(&file.to_string()) {
+            files.push(file.to_string());
+            if files.len() >= MAX_BUG_PREFETCH_FILES {
+                break;
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let worktree = tools.get_worktree_path().to_path_buf();
+    let master_sha_owned = master_sha.to_string();
+    let loc_arr_owned = loc_arr.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut output = String::new();
+        let mut total_snippets = 0;
+
+        for file in files {
+            if total_snippets >= MAX_BUG_PREFETCH_SNIPPETS_TOTAL {
+                break;
+            }
+
+            let git_output = std::process::Command::new("git")
+                .current_dir(&worktree)
+                .args(["show", &format!("{}:{}", master_sha_owned, file)])
+                .output();
+
+            let Ok(out) = git_output else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+
+            let content = String::from_utf8_lossy(&out.stdout).to_string();
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.is_empty() {
+                continue;
+            }
+
+            let file_locs: Vec<&Value> = loc_arr_owned
+                .iter()
+                .filter(|loc| {
+                    loc.get("file")
+                        .and_then(|v| v.as_str())
+                        .map(|f| f.trim() == file)
+                        .unwrap_or(false)
+                })
+                .take(MAX_BUG_PREFETCH_SNIPPETS_PER_FILE)
+                .collect();
+
+            for loc in file_locs {
+                if total_snippets >= MAX_BUG_PREFETCH_SNIPPETS_TOTAL {
+                    break;
+                }
+
+                let line_opt = loc.get("line").and_then(|v| v.as_u64()).map(|l| l as usize);
+                let sym_opt = loc
+                    .get("function_or_symbol")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim);
+
+                let snippet_opt = if let Some(line) = line_opt {
+                    if line >= 1 && line <= lines.len() {
+                        let line_0 = line.saturating_sub(1);
+                        if let Some((block_text, name)) =
+                            crate::worker::prefetch::extract_enclosing_block(
+                                &content, line_0, line_0,
+                            )
+                        {
+                            let b_lines: Vec<&str> = block_text.lines().collect();
+                            let clamped_text = if b_lines.len() > MAX_BUG_SNIPPET_LINES {
+                                let half = MAX_BUG_SNIPPET_LINES / 2;
+                                let start = line_0
+                                    .saturating_sub(half)
+                                    .min(lines.len().saturating_sub(MAX_BUG_SNIPPET_LINES));
+                                let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
+                                lines[start..end].join("\n")
+                            } else {
+                                block_text
+                            };
+                            Some((
+                                clamped_text,
+                                name.or_else(|| sym_opt.map(str::to_string)),
+                                line,
+                            ))
+                        } else {
+                            let start = line.saturating_sub(30).max(1);
+                            let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
+                            let start_0 = start.saturating_sub(1);
+                            let text = lines[start_0..end].join("\n");
+                            Some((text, sym_opt.map(str::to_string), line))
+                        }
+                    } else {
+                        None
+                    }
+                } else if let Some(sym) = sym_opt {
+                    let found_idx = lines.iter().position(|l| l.contains(sym));
+                    if let Some(idx) = found_idx {
+                        let line = idx + 1;
+                        if let Some((block_text, name)) =
+                            crate::worker::prefetch::extract_enclosing_block(&content, idx, idx)
+                        {
+                            let b_lines: Vec<&str> = block_text.lines().collect();
+                            let clamped_text = if b_lines.len() > MAX_BUG_SNIPPET_LINES {
+                                let half = MAX_BUG_SNIPPET_LINES / 2;
+                                let start = idx
+                                    .saturating_sub(half)
+                                    .min(lines.len().saturating_sub(MAX_BUG_SNIPPET_LINES));
+                                let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
+                                lines[start..end].join("\n")
+                            } else {
+                                block_text
+                            };
+                            Some((clamped_text, name.or_else(|| Some(sym.to_string())), line))
+                        } else {
+                            let start = line.saturating_sub(20).max(1);
+                            let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
+                            let start_0 = start.saturating_sub(1);
+                            let text = lines[start_0..end].join("\n");
+                            Some((text, Some(sym.to_string()), line))
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((block, sym_name, line_num)) = snippet_opt {
+                    let header = if let Some(ref name) = sym_name {
+                        format!("--- {}:{} ({}) ---\n", file, line_num, name)
+                    } else {
+                        format!("--- {}:{} ---\n", file, line_num)
+                    };
+
+                    if output.len() + header.len() + block.len() + 1 > MAX_BUG_PREFETCH_CHARS {
+                        output.push_str("\n... (Context prefetch limits reached)\n");
+                        return output;
+                    }
+
+                    output.push_str(&header);
+                    output.push_str(&block);
+                    output.push('\n');
+                    total_snippets += 1;
+                }
+            }
+        }
+
+        output
+    })
+    .await
+    .unwrap_or_default()
+}
+
 pub async fn process_issue_worker(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
@@ -821,16 +1038,19 @@ pub async fn process_issue_worker(
     );
 
     let mut full_history = Vec::new();
-    let runner = SessionRunner::new(provider).with_max_turns(50);
+    let runner = SessionRunner::new(provider).with_max_turns(20);
     let master_sha = get_master_sha(tools.as_ref()).await;
 
     // Stage 1: Verification & Ground-Truth Confirmation
     info!("--- Stage 1: Verification ---");
+    let prefetched_context =
+        prefetch_bug_locations(tools.as_ref(), &master_sha, &input.locations).await;
     let mut verify_session = VerifySession {
         input: &input,
         master_sha: master_sha.clone(),
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
+        prefetched_context,
     };
 
     let verify_result = runner.run(&mut verify_session).await?;
@@ -1134,6 +1354,7 @@ mod tests {
             master_sha: "master".to_string(),
             tools: None,
             context_tag: None,
+            prefetched_context: String::new(),
         };
 
         let runner = SessionRunner::new(&mock_provider);
@@ -1569,5 +1790,97 @@ mod tests {
             }
             _ => panic!("Expected Duplicate outcome, got {:?}", final_outcome),
         }
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_bug_locations_handles_none_or_malformed() {
+        assert_eq!(prefetch_bug_locations(None, "master", &None).await, "");
+        assert_eq!(
+            prefetch_bug_locations(None, "master", &Some(json!([]))).await,
+            ""
+        );
+        assert_eq!(
+            prefetch_bug_locations(None, "master", &Some(json!("not an array"))).await,
+            ""
+        );
+        assert_eq!(
+            prefetch_bug_locations(None, "master", &Some(json!(42))).await,
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_bug_locations_filters_dangerous_and_non_c_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let tb = Arc::new(ToolBox::new(temp.path().to_path_buf(), None));
+
+        let dangerous_locations = json!([
+            {"file": "../../etc/passwd", "line": 10},
+            {"file": "/etc/shadow", "line": 20},
+            {"file": "script.py", "line": 30},
+            {"file": "binary.bin", "line": 40},
+        ]);
+
+        let res = prefetch_bug_locations(Some(&tb), "master", &Some(dangerous_locations)).await;
+        assert_eq!(res, "");
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_bug_locations_extracts_enclosing_function_from_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+
+        // Initialize a minimal git repository with a C source file
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let c_code = r#"#include <stdio.h>
+
+static int target_kernel_func(int a, int b)
+{
+    if (a < 0) {
+        return -1;
+    }
+    return a + b;
+}
+"#;
+        std::fs::write(path.join("test_file.c"), c_code).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "test_file.c"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let tb = Arc::new(ToolBox::new(path.to_path_buf(), None));
+        let locations = json!([
+            {
+                "file": "test_file.c",
+                "line": 5,
+                "function_or_symbol": "target_kernel_func"
+            }
+        ]);
+
+        let res = prefetch_bug_locations(Some(&tb), "HEAD", &Some(locations)).await;
+        assert!(res.contains("--- test_file.c:5 (target_kernel_func) ---"));
+        assert!(res.contains("static int target_kernel_func"));
+        assert!(res.contains("return a + b;"));
     }
 }
