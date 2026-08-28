@@ -284,7 +284,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE sl
 
 CREATE TABLE IF NOT EXISTS bugs (
     id INTEGER PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
+    bugid TEXT NOT NULL UNIQUE,
     status TEXT DEFAULT 'raw',
     problem TEXT NOT NULL,
     severity INTEGER NOT NULL, -- 1: Low, 2: Medium, 3: High, 4: Critical
@@ -308,7 +308,7 @@ CREATE TABLE IF NOT EXISTS bugs (
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_bugs_slug ON bugs(slug);
+CREATE INDEX IF NOT EXISTS idx_bugs_bugid ON bugs(bugid);
 CREATE INDEX IF NOT EXISTS idx_bugs_severity ON bugs(severity);
 CREATE INDEX IF NOT EXISTS idx_bugs_is_fixed ON bugs(is_fixed);
 

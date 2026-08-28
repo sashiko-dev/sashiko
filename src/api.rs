@@ -181,6 +181,7 @@ pub struct ReviewQuery {
 #[derive(Deserialize)]
 pub struct BugQuery {
     pub id: Option<i64>,
+    pub bugid: Option<String>,
     pub slug: Option<String>,
 }
 
@@ -327,7 +328,7 @@ pub fn build_router(
         .route("/api/bugs", get(list_bugs))
         .route("/api/bug/logs", get(get_bug_logs))
         .route("/api/bug/analyze", post(analyze_bug))
-        .route("/bug/{slug}", get(redirect_bug))
+        .route("/bug/{bugid}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
@@ -959,8 +960,8 @@ async fn get_bug(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(id) = query.id {
         state.db.get_bug(id).await
-    } else if let Some(ref slug) = query.slug {
-        state.db.get_bug_by_slug(slug).await
+    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
+        state.db.get_bug_by_bugid(bugid).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
@@ -986,8 +987,8 @@ async fn get_bug_logs(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(id) = query.id {
         state.db.get_bug_logs(id).await
-    } else if let Some(ref slug) = query.slug {
-        state.db.get_bug_logs_by_slug(slug).await
+    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
+        state.db.get_bug_logs_by_bugid(bugid).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
@@ -1077,8 +1078,8 @@ async fn analyze_bug(
     }
 }
 
-async fn redirect_bug(Path(slug): Path<String>) -> impl IntoResponse {
-    Redirect::temporary(&format!("/#/bug/{}", slug))
+async fn redirect_bug(Path(bugid): Path<String>) -> impl IntoResponse {
+    Redirect::temporary(&format!("/#/bug/{}", bugid))
 }
 
 async fn get_message(
@@ -1490,7 +1491,7 @@ mod tests {
             .create_bug(&crate::db::NewBug {
                 verified_on_sha: None,
                 status: "raw".to_string(),
-                slug: "pb-12345678".to_string(),
+                bugid: "linux-12345678".to_string(),
                 problem: "UAF in test_device".to_string(),
                 severity: crate::db::Severity::Critical,
                 severity_explanation: Some("Trace".to_string()),
@@ -1529,24 +1530,37 @@ mod tests {
             .unwrap();
         });
 
-        // Test 1: get_bug by slug (logs omitted)
-        let res = reqwest::get(format!("http://{}/api/bug?slug=pb-12345678", addr))
+        // Test 1: get_bug by bugid (logs omitted)
+        let res = reqwest::get(format!("http://{}/api/bug?bugid=linux-12345678", addr))
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
         let json: serde_json::Value = res.json().await.unwrap();
-        assert_eq!(json["id"], "pb-12345678");
+        assert_eq!(json["bugid"], "linux-12345678");
         assert_eq!(json["problem"], "UAF in test_device");
         assert!(json["logs"].is_null());
 
-        // Test 2: get_bug_logs by slug
-        let res_logs = reqwest::get(format!("http://{}/api/bug/logs?slug=pb-12345678", addr))
+        // Test 1b: get_bug by legacy slug param
+        let res_slug = reqwest::get(format!("http://{}/api/bug?slug=linux-12345678", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_slug.status(), 200);
+
+        // Test 2: get_bug_logs by bugid
+        let res_logs = reqwest::get(format!("http://{}/api/bug/logs?bugid=linux-12345678", addr))
             .await
             .unwrap();
         assert_eq!(res_logs.status(), 200);
         let logs_json: serde_json::Value = res_logs.json().await.unwrap();
         assert!(logs_json.is_array());
         assert_eq!(logs_json[0]["role"], "user");
+
+        // Test 2b: get_bug_logs by legacy slug param
+        let res_logs_slug =
+            reqwest::get(format!("http://{}/api/bug/logs?slug=linux-12345678", addr))
+                .await
+                .unwrap();
+        assert_eq!(res_logs_slug.status(), 200);
 
         // Test 2b: get_bug_logs by id
         let res_logs_id = reqwest::get(format!("http://{}/api/bug/logs?id={}", addr, bug_id))

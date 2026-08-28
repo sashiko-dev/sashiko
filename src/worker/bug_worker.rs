@@ -32,7 +32,7 @@ impl BugWorker {
                     let repo_path = self.repo_path.clone();
 
                     tokio::spawn(async move {
-                        info!("Processing raw bug ID {} ({})", bug.id, bug.slug);
+                        info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
 
                         let input = BugInput {
                             problem: bug.problem.clone(),

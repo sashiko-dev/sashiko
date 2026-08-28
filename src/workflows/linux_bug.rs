@@ -377,9 +377,9 @@ impl LlmSession for DedupSession<'_> {
                 bug.subsystems.join(", ")
             };
             known_list.push_str(&format!(
-                "- Bug ID {}: [Slug: {}] [Severity: {}] [Subsystems: {}]\n  Problem: {}\n  Affected Files: {}\n\n",
+                "- Bug ID {}: [BugID: {}] [Severity: {}] [Subsystems: {}]\n  Problem: {}\n  Affected Files: {}\n\n",
                 bug.id,
-                bug.slug,
+                bug.bugid,
                 bug.severity.as_str(),
                 subs_str,
                 bug.problem,
@@ -720,9 +720,14 @@ Write a short, direct, and detailed technical description of the problem.
 // 7. Pipeline Driver
 // ---------------------------------------------------------------------------
 
-/// Generates a random unique UUID for a newly discovered Linux kernel bug.
+/// Generates a unique bugid for a newly discovered Linux kernel bug (format: linux-<uuid>).
+pub fn generate_bugid() -> String {
+    format!("linux-{}", uuid::Uuid::new_v4())
+}
+
+#[deprecated(note = "use generate_bugid instead")]
 pub fn generate_slug() -> String {
-    uuid::Uuid::new_v4().to_string()
+    generate_bugid()
 }
 
 /// Executes the standalone Linux kernel bug pipeline for a single candidate concern.
@@ -737,10 +742,10 @@ pub async fn process_issue(
         "Queueing candidate Linux kernel issue: '{}' in subsystems '{:?}'",
         input.problem, input.subsystems
     );
-    let slug = generate_slug();
+    let bugid = generate_bugid();
     let raw_input_json = serde_json::to_string(&input).ok();
     let new_bug = NewBug {
-        slug: slug.clone(),
+        bugid: bugid.clone(),
         status: "raw".to_string(),
         problem: input.problem.clone(),
         severity: crate::db::Severity::Unknown,
@@ -1241,11 +1246,12 @@ pub async fn process_issue_worker(
             if let Some(existing) = duplicate_match {
                 info!(
                     "Matched duplicate Linux kernel bug #{} ({})",
-                    existing.id, existing.slug
+                    existing.id, existing.bugid
                 );
                 let logs = serde_json::to_string(&full_history).unwrap_or_default();
                 let dup_meta = serde_json::json!({
-                    "duplicate_of_slug": existing.slug,
+                    "duplicate_of_bugid": existing.bugid,
+                    "duplicate_of_slug": existing.bugid,
                     "duplicate_of_id": existing.id,
                     "reasoning": dedup.reasoning
                 });
@@ -1347,7 +1353,7 @@ pub async fn process_issue_worker(
     let saved_bug = db.get_bug(bug_row.id).await?.expect("Saved bug must exist");
     info!(
         "Successfully registered newly verified Linux kernel bug #{} ({})",
-        bug_row.id, bug_row.slug
+        bug_row.id, bug_row.bugid
     );
     Ok(BugOutcome::NewlyDiscovered { bug: saved_bug })
 }
@@ -1548,7 +1554,7 @@ mod tests {
             verified_on_sha: None,
             id: 42,
             status: "verified".to_string(),
-            slug: "pb-42".to_string(),
+            bugid: "linux-42".to_string(),
             problem: "Memory leak in dev.c".to_string(),
             severity: Severity::High,
             severity_explanation: None,
@@ -1740,7 +1746,8 @@ mod tests {
                     "e1000: buffer overflow in e1000_clean_rx_irq()"
                 );
                 assert_eq!(bug.severity, Severity::Critical);
-                assert!(uuid::Uuid::parse_str(&bug.slug).is_ok());
+                assert!(bug.bugid.starts_with("linux-"));
+                assert!(uuid::Uuid::parse_str(&bug.bugid[6..]).is_ok());
                 assert_eq!(bug.discovered_in_patchset_id, Some(ps_id));
                 assert_eq!(bug.subsystems, vec!["net/intel".to_string()]);
                 assert_eq!(
@@ -1775,7 +1782,7 @@ mod tests {
         let existing_id = db
             .create_bug(&NewBug {
                 verified_on_sha: None,
-                slug: "pb-existing1".to_string(),
+                bugid: "linux-existing1".to_string(),
                 status: "open".to_string(),
                 problem: "e1000: buffer overflow in e1000_clean_rx_irq()".to_string(),
                 severity: Severity::High,
@@ -1861,7 +1868,7 @@ mod tests {
                 logs,
             } => {
                 assert_eq!(existing_bug.id, existing_id);
-                assert_eq!(existing_bug.slug, "pb-existing1");
+                assert_eq!(existing_bug.bugid, "linux-existing1");
                 assert_eq!(reasoning, "Exact match with known bug #1 in e1000 driver");
                 assert!(logs.is_some());
             }

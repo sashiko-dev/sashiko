@@ -218,8 +218,8 @@ pub struct Finding {
 pub struct Bug {
     #[serde(rename = "internal_id")]
     pub id: i64,
-    #[serde(rename = "id")]
-    pub slug: String,
+    #[serde(alias = "slug")]
+    pub bugid: String,
     pub status: String,
     pub problem: String,
     pub severity: Severity,
@@ -242,9 +242,17 @@ pub struct Bug {
     pub created_at: i64,
 }
 
+impl Bug {
+    #[inline]
+    pub fn slug(&self) -> &str {
+        &self.bugid
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewBug {
-    pub slug: String,
+    #[serde(alias = "slug")]
+    pub bugid: String,
     pub status: String,
     pub problem: String,
     pub severity: Severity,
@@ -846,7 +854,7 @@ impl Database {
             .execute(
                 "CREATE TABLE IF NOT EXISTS bugs (
                     id INTEGER PRIMARY KEY,
-                    slug TEXT NOT NULL UNIQUE,
+                    bugid TEXT NOT NULL UNIQUE,
                     status TEXT DEFAULT 'raw',
                     problem TEXT NOT NULL,
                     severity INTEGER NOT NULL,
@@ -872,6 +880,12 @@ impl Database {
                 (),
             )
             .await;
+        // Migration: rename column slug to bugid in bugs table if needed
+        let _ = self
+            .conn
+            .execute("ALTER TABLE bugs RENAME COLUMN slug TO bugid", ())
+            .await;
+        let _ = self.try_add_column("bugs", "bugid", "TEXT").await;
         let _ = self
             .try_add_column("bugs", "status", "TEXT DEFAULT 'raw'")
             .await;
@@ -886,7 +900,9 @@ impl Database {
             .await;
         let _ = self.try_add_column("bugs", "fixed_in_commit", "TEXT").await;
         let _ = self.try_add_column("bugs", "raw_input", "TEXT").await;
-        let _ = self.try_create_index("idx_bugs_slug", "bugs", "slug").await;
+        let _ = self
+            .try_create_index("idx_bugs_bugid", "bugs", "bugid")
+            .await;
         let _ = self
             .try_create_index("idx_bugs_severity", "bugs", "severity")
             .await;
@@ -1277,7 +1293,7 @@ impl Database {
             .conn
             .query(
                 "INSERT INTO bugs (
-                    slug, status, problem, severity, severity_explanation, locations,
+                    bugid, status, problem, severity, severity_explanation, locations,
                     subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
@@ -1285,7 +1301,7 @@ impl Database {
                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
-                    bug.slug.as_str(),
+                    bug.bugid.as_str(),
                     bug.status.as_str(),
                     bug.problem.as_str(),
                     bug.severity as i32,
@@ -1321,7 +1337,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, slug, status, problem, severity, severity_explanation, locations,
+                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
@@ -1338,17 +1354,17 @@ impl Database {
         }
     }
 
-    pub async fn get_bug_by_slug(&self, slug: &str) -> Result<Option<Bug>> {
+    pub async fn get_bug_by_bugid(&self, bugid: &str) -> Result<Option<Bug>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, slug, status, problem, severity, severity_explanation, locations,
+                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
                         fixed_in_commit, raw_input, created_at
-                 FROM bugs WHERE slug = ?",
-                libsql::params![slug],
+                 FROM bugs WHERE bugid = ?",
+                libsql::params![bugid],
             )
             .await?;
 
@@ -1357,6 +1373,10 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn get_bug_by_slug(&self, slug: &str) -> Result<Option<Bug>> {
+        self.get_bug_by_bugid(slug).await
     }
 
     pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
@@ -1373,12 +1393,12 @@ impl Database {
         }
     }
 
-    pub async fn get_bug_logs_by_slug(&self, slug: &str) -> Result<Option<String>> {
+    pub async fn get_bug_logs_by_bugid(&self, bugid: &str) -> Result<Option<String>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT logs FROM bugs WHERE slug = ?",
-                libsql::params![slug],
+                "SELECT logs FROM bugs WHERE bugid = ?",
+                libsql::params![bugid],
             )
             .await?;
         if let Ok(Some(row)) = rows.next().await {
@@ -1388,6 +1408,10 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn get_bug_logs_by_slug(&self, slug: &str) -> Result<Option<String>> {
+        self.get_bug_logs_by_bugid(slug).await
     }
 
     pub async fn lock_raw_bug(&self) -> Result<Option<Bug>> {
@@ -1502,7 +1526,7 @@ impl Database {
         }
 
         if let Some(q) = search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            conditions.push("(problem LIKE ? OR slug LIKE ? OR locations LIKE ?)");
+            conditions.push("(problem LIKE ? OR bugid LIKE ? OR locations LIKE ?)");
             let pattern = format!("%{}%", q);
             params.push(libsql::Value::Text(pattern.clone()));
             params.push(libsql::Value::Text(pattern.clone()));
@@ -1526,7 +1550,7 @@ impl Database {
 
         // Query rows
         let select_sql = format!(
-            "SELECT id, slug, status, problem, severity, severity_explanation, locations,
+            "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
                     subsystems, source_files, inline_review, NULL, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
@@ -1640,7 +1664,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT pb.id, pb.slug, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
+                "SELECT pb.id, pb.bugid, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
@@ -1667,7 +1691,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT DISTINCT pb.id, pb.slug, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
+                "SELECT DISTINCT pb.id, pb.bugid, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
@@ -1695,7 +1719,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, slug, status, problem, severity, severity_explanation, locations,
+                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
@@ -1716,7 +1740,7 @@ impl Database {
 
     fn parse_bug_row(row: &libsql::Row) -> Result<Bug> {
         let id: i64 = row.get(0)?;
-        let slug: String = row.get(1)?;
+        let bugid: String = row.get(1)?;
         let status: String = row.get(2)?;
         let problem: String = row.get(3)?;
         let severity_val: i32 = row.get(4)?;
@@ -1758,7 +1782,7 @@ impl Database {
         Ok(Bug {
             verified_on_sha,
             id,
-            slug,
+            bugid,
             status,
             problem,
             severity: Severity::from_i32(severity_val),
@@ -3689,7 +3713,8 @@ impl Database {
                 .map(|(bug, is_new)| {
                     serde_json::json!({
                         "id": bug.id,
-                        "slug": bug.slug,
+                        "bugid": bug.bugid,
+                        "slug": bug.bugid,
                         "problem": bug.problem,
                         "severity": bug.severity.as_str(),
                         "subsystems": bug.subsystems,
@@ -4079,7 +4104,8 @@ impl Database {
                 .map(|(bug, is_new)| {
                     serde_json::json!({
                         "id": bug.id,
-                        "slug": bug.slug,
+                        "bugid": bug.bugid,
+                        "slug": bug.bugid,
                         "problem": bug.problem,
                         "severity": bug.severity.as_str(),
                         "subsystems": bug.subsystems,
@@ -10139,7 +10165,7 @@ mod tests {
 
         let bug = NewBug {
             verified_on_sha: None,
-            slug: "pb-test-1234".to_string(),
+            bugid: "linux-test-1234".to_string(),
             status: "open".to_string(),
             problem: "Memory leak in e1000_probe()".to_string(),
             severity: Severity::High,
@@ -10167,7 +10193,8 @@ mod tests {
 
         // Fetch by id
         let fetched = db.get_bug(bug_id).await.unwrap().expect("Bug should exist");
-        assert_eq!(fetched.slug, "pb-test-1234");
+        assert_eq!(fetched.bugid, "linux-test-1234");
+        assert_eq!(fetched.slug(), "linux-test-1234");
         assert_eq!(fetched.problem, "Memory leak in e1000_probe()");
         assert_eq!(fetched.severity, Severity::High);
         assert_eq!(fetched.subsystems, vec!["net".to_string()]);
@@ -10189,9 +10216,15 @@ mod tests {
             Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
         );
 
-        // Fetch by slug
+        // Fetch by bugid and slug
+        let fetched_bugid = db
+            .get_bug_by_bugid("linux-test-1234")
+            .await
+            .unwrap()
+            .expect("Bug should exist");
+        assert_eq!(fetched_bugid.id, bug_id);
         let fetched_slug = db
-            .get_bug_by_slug("pb-test-1234")
+            .get_bug_by_slug("linux-test-1234")
             .await
             .unwrap()
             .expect("Bug should exist");
@@ -10257,7 +10290,14 @@ mod tests {
             Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
         );
         assert_eq!(
-            db.get_bug_logs_by_slug("pb-test-1234")
+            db.get_bug_logs_by_bugid("linux-test-1234")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
+        );
+        assert_eq!(
+            db.get_bug_logs_by_slug("linux-test-1234")
                 .await
                 .unwrap()
                 .as_deref(),

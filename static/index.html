@@ -2081,7 +2081,7 @@
                 } else if (state.listMode === 'bugs') {
                     const clickHandler = (e) => {
                         if (e.target.closest('.copy-btn')) return;
-                        const target = `#/bug/${encodeURIComponent(p.slug || p.id)}`;
+                        const target = `#/bug/${encodeURIComponent(p.bugid || p.slug || p.id)}`;
                         if (e.button === 1 || e.ctrlKey || e.metaKey) {
                             window.open(target, '_blank');
                         } else if (e.button === 0) {
@@ -2626,7 +2626,7 @@
                         ${data.bugs.map(b => {
                             const sev = (b.severity || 'High').toLowerCase();
                             const sevColor = sev === 'critical' ? 'var(--sev-critical)' : 'var(--sev-high)';
-                            const bugLink = `#/bug/${encodeURIComponent((b.slug || b.id) || b.id)}`;
+                            const bugLink = `#/bug/${encodeURIComponent((b.bugid || b.slug || b.id))}`;
                             const cardId = 'pb-card-' + Math.random().toString(36).substr(2, 9);
                             return `
                                 <div class="review-card" style="border-left: 3px solid ${sevColor};">
@@ -2636,7 +2636,7 @@
                                             <div style="margin-top:4px;">
                                                 <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(b.severity || 'High')}</span>
                                                 ${(b.subsystems && Array.isArray(b.subsystems) && b.subsystems.length > 0) ? b.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (b.subsystem ? `<span class="tag">${escapeHtml(b.subsystem)}</span>` : '')}
-                                                <span class="tag">${escapeHtml((b.slug || b.id))}</span>
+                                                <span class="tag">${escapeHtml((b.bugid || b.slug || b.id))}</span>
                                                 ${(b.status && b.status.toLowerCase() !== 'open' && b.status.toLowerCase() !== 'fixed') ? `<span class="tag" style="background:rgba(88,166,255,0.15); color:var(--status-pending); border:1px solid var(--status-pending); font-weight:bold;">${b.status.charAt(0).toUpperCase() + b.status.slice(1)}</span>` : (b.is_fixed ? `<span class="tag" style="background:rgba(46,160,67,0.15); color:var(--status-reviewed); font-weight:bold;">Fixed in Trunk</span>` : `<span class="tag" style="background:rgba(218,54,51,0.15); color:var(--status-failed); font-weight:bold;">Active in Trunk</span>`)}
                                                 ${b.introduced_in_commit ? `<span class="tag" title="${escapeHtml(b.introduced_in_commit)}">Intro: ${escapeHtml(b.introduced_in_commit.length > 20 ? b.introduced_in_commit.substring(0, 20) + '...' : b.introduced_in_commit)}</span>` : ''}
                                                 ${b.is_newly_discovered ? `<span class="tag" style="background:var(--diff-add-bg); color:var(--status-reviewed);">Newly Discovered</span>` : ''}
@@ -3061,7 +3061,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!res.ok) throw new Error('Linux Kernel Bug not found');
             const data = await res.json();
 
-            document.title = `${config.project_name || 'Sashiko'} - Bug ${(data.slug || data.id) || data.id}`;
+            document.title = `${config.project_name || 'Sashiko'} - Bug ${(data.bugid || data.slug || data.id)}`;
 
             const date = data.created_at ? formatDate(data.created_at, true) : '-';
             const sev = (data.severity || 'High').toLowerCase();
@@ -3194,13 +3194,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <span>${escapeHtml(data.problem || 'Linux Kernel Bug')}</span>
                     <span style="display:inline-flex; align-items:center; gap:8px;">
                         <span class="tag" style="font-size:0.6em; vertical-align:middle; background:transparent; border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold;">${escapeHtml(data.severity || 'High')}</span>
-                        <span class="tag" style="font-size:0.6em; vertical-align:middle;">${escapeHtml((data.slug || data.id))}</span>
+                        <span class="tag" style="font-size:0.6em; vertical-align:middle;">${escapeHtml((data.bugid || data.slug || data.id))}</span>
                         ${statusBadgeHtml}
                     </span>
                 </h1>
 
                 <div class="section">
-                    <div class="kv"><div class="label">ID:</div><div><code>${escapeHtml((data.slug || data.id))}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml((data.slug || data.id))}')">Copy</button></div></div>
+                    <div class="kv"><div class="label">ID:</div><div><code>${escapeHtml((data.bugid || data.slug || data.id))}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml((data.bugid || data.slug || data.id))}')">Copy</button></div></div>
                     <div class="kv"><div class="label">Severity:</div><div><strong style="color:${sevColor}">${escapeHtml(data.severity || 'High')}</strong></div></div>
                     <div class="kv"><div class="label">Mainline Status:</div><div>${mainlineStatusHtml}</div></div>
                     ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced in:</div><div><code>${escapeHtml(data.introduced_in_commit)}</code></div></div>` : ''}
