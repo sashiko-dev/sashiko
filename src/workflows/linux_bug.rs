@@ -414,7 +414,7 @@ impl LlmSession for DedupSession<'_> {
         "You are an expert Linux kernel maintainer responsible for defect tracking and deduplication.\n\
         You will compare a newly verified Linux kernel bug against a list of known Linux kernel bugs in the codebase.\n\
         Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
-        IMPORTANT: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged. Rule of thumb: if a single fix can fix both bugs, it's the same bug.\n\
+        IMPORTANT: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
         Output raw JSON only."
             .to_string()
     }
@@ -474,7 +474,7 @@ impl LlmSession for DedupSession<'_> {
             Task:\n\
             Determine if the newly verified bug is an identical duplicate of ANY of the candidate bugs listed above.\n\
             - Root cause matching: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged.\n\
-            - Rule of thumb: If a single fix can fix both bugs, it's the same bug.\n\
+            - Rule of thumb: If fixing one issue will resolve the other issue, it's the same bug.\n\
             - If it matches a candidate bug, set \"is_duplicate\": true, set \"duplicate_of_id\": <ID of matched bug>, and explain in \"reasoning\".\n\
             - If it is a distinct or newly discovered issue, set \"is_duplicate\": false, \"duplicate_of_id\": null, and explain in \"reasoning\".\n\n\
             Return ONLY a valid JSON object matching:\n\
@@ -2067,11 +2067,15 @@ mod tests {
 
         let sys = session.system_prompt();
         assert!(sys.contains("same root cause but different consequences"));
-        assert!(sys.contains("single fix can fix both bugs"));
+        assert!(
+            sys.contains("if fixing one issue will resolve the other issue, it's the same bug")
+        );
 
         let user = session.initial_user_prompt();
         assert!(user.contains("same root cause but different consequences"));
-        assert!(user.contains("single fix can fix both bugs"));
+        assert!(
+            user.contains("If fixing one issue will resolve the other issue, it's the same bug")
+        );
     }
 
     struct QueuedMockAiProvider {
