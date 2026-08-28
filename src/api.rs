@@ -185,6 +185,17 @@ pub struct BugQuery {
 }
 
 #[derive(Deserialize)]
+pub struct BugListQuery {
+    pub page: Option<usize>,
+    pub per_page: Option<usize>,
+    pub q: Option<String>,
+    pub subsystem: Option<String>,
+    pub min_severity: Option<String>,
+    pub severity: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct RerunPatchQuery {
     pub patchset_id: i64,
     pub patch_id: i64,
@@ -1419,23 +1430,37 @@ async fn forge_webhook(
 
 async fn list_bugs(
     State(state): State<Arc<AppState>>,
-    Query(pagination): Query<Pagination>,
+    Query(query): Query<BugListQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let page = pagination.page.unwrap_or(1).max(1);
-    let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
-    let offset = (page - 1) * per_page;
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(50).clamp(1, 100);
+
+    let min_sev = query
+        .min_severity
+        .as_deref()
+        .or(query.severity.as_deref())
+        .map(crate::db::Severity::from_str);
 
     match state
         .db
-        .get_bugs_list(per_page, offset, pagination.q.as_deref())
+        .list_bugs(
+            Some(page as u32),
+            Some(per_page as u32),
+            min_sev,
+            query.subsystem.as_deref(),
+            query.status.as_deref(),
+            query.q.as_deref(),
+        )
         .await
     {
         Ok((items, total)) => Ok(Json(serde_json::json!({
             "items": items,
-            "total": total
+            "total": total,
+            "page": page,
+            "per_page": per_page
         }))),
         Err(e) => {
-            tracing::error!("Failed to fetch preexisting bugs list: {}", e);
+            tracing::error!("Failed to fetch bugs list: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1529,7 +1554,41 @@ mod tests {
             .unwrap();
         assert_eq!(res_logs_id.status(), 200);
 
-        // Test 3: redirect_bug
+        // Test 3: list_bugs with subsystem filter
+        let res_sub = reqwest::get(format!("http://{}/api/bugs?subsystem=drivers/net", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_sub.status(), 200);
+        let list_json: serde_json::Value = res_sub.json().await.unwrap();
+        assert_eq!(list_json["total"], 1);
+        assert_eq!(list_json["items"].as_array().unwrap().len(), 1);
+        assert!(list_json["items"][0]["logs"].is_null());
+
+        // Test 3b: list_bugs with non-matching subsystem filter
+        let res_other_sub = reqwest::get(format!("http://{}/api/bugs?subsystem=btrfs", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_other_sub.status(), 200);
+        let empty_list: serde_json::Value = res_other_sub.json().await.unwrap();
+        assert_eq!(empty_list["total"], 0);
+
+        // Test 3c: list_bugs with status filter
+        let res_status = reqwest::get(format!("http://{}/api/bugs?status=raw", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_status.status(), 200);
+        let status_json: serde_json::Value = res_status.json().await.unwrap();
+        assert_eq!(status_json["total"], 1);
+
+        // Test 3d: list_bugs with status filter mismatch
+        let res_open = reqwest::get(format!("http://{}/api/bugs?status=open", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_open.status(), 200);
+        let open_json: serde_json::Value = res_open.json().await.unwrap();
+        assert_eq!(open_json["total"], 0);
+
+        // Test 4: redirect_bug
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()

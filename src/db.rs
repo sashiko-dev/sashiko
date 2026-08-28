@@ -1474,8 +1474,9 @@ impl Database {
         &self,
         page: Option<u32>,
         limit: Option<u32>,
-        severity: Option<Severity>,
+        min_severity: Option<Severity>,
         subsystem: Option<&str>,
+        status: Option<&str>,
         search: Option<&str>,
     ) -> Result<(Vec<Bug>, usize)> {
         let limit_val = limit.unwrap_or(50) as i64;
@@ -1485,14 +1486,19 @@ impl Database {
         let mut conditions = Vec::new();
         let mut params = Vec::new();
 
-        if let Some(sev) = severity {
-            conditions.push("severity = ?");
+        if let Some(sev) = min_severity {
+            conditions.push("severity >= ?");
             params.push(libsql::Value::Integer(sev as i64));
         }
 
-        if let Some(sub) = subsystem {
+        if let Some(sub) = subsystem.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             conditions.push("subsystems LIKE ?");
             params.push(libsql::Value::Text(format!("%{}%", sub)));
+        }
+
+        if let Some(st) = status.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            conditions.push("status = ?");
+            params.push(libsql::Value::Text(st.to_string()));
         }
 
         if let Some(q) = search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1623,63 +1629,11 @@ impl Database {
         &self,
         limit: usize,
         offset: usize,
-        _q: Option<&str>,
+        q: Option<&str>,
     ) -> Result<(Vec<Bug>, usize)> {
-        let mut rows = self.conn.query(
-            "SELECT id, slug, status, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, NULL, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed, fixed_in_commit, raw_input, created_at
-             FROM bugs
-             ORDER BY id DESC LIMIT ? OFFSET ?",
-            libsql::params![limit as i64, offset as i64],
-        ).await?;
-
-        let mut bugs = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let severity_val: i32 = row.get(4).unwrap_or(1);
-            let severity = Severity::from_i32(severity_val);
-
-            let locations_str: Option<String> = row.get(6).ok().flatten();
-            let subsystems_str: Option<String> = row.get(7).ok().flatten();
-            let source_files_str: Option<String> = row.get(8).ok().flatten();
-
-            let mut bug = Bug {
-                id: row.get(0).unwrap_or_default(),
-                slug: row.get(1).unwrap_or_default(),
-                status: row.get(2).unwrap_or_else(|_| "verified".to_string()),
-                problem: row.get(3).unwrap_or_default(),
-                severity,
-                severity_explanation: row.get(5).ok().flatten(),
-                locations: locations_str.and_then(|s| serde_json::from_str(&s).ok()),
-                subsystems: subsystems_str
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default(),
-                source_files: source_files_str.and_then(|s| serde_json::from_str(&s).ok()),
-                inline_review: String::new(),
-                logs: None,
-                vector_json: row.get(11).ok().flatten(),
-                discovered_in_patchset_id: row.get(12).ok().flatten(),
-                discovered_in_patch_id: row.get(13).ok().flatten(),
-                discovered_in_commit: row.get(14).ok().flatten(),
-                introduced_in_commit: row.get(15).ok().flatten(),
-                verified_on_sha: row.get(16).ok().flatten(),
-                is_fixed: row.get::<i64>(17).unwrap_or(0) != 0,
-                fixed_in_commit: row.get(18).ok().flatten(),
-                raw_input: row.get(19).ok().flatten(),
-                created_at: row.get(20).unwrap_or_default(),
-            };
-            bug.inline_review = crate::compression::get_compressed_string_opt(&row, 9)
-                .unwrap_or_default()
-                .unwrap_or_default();
-            bug.logs = None;
-            bugs.push(bug);
-        }
-
-        let mut count_rows = self.conn.query("SELECT COUNT(*) FROM bugs", ()).await?;
-        let mut count = 0;
-        if let Ok(Some(row)) = count_rows.next().await {
-            count = row.get::<i64>(0).unwrap_or(0) as usize;
-        }
-
-        Ok((bugs, count))
+        let page = (offset / limit.max(1)) + 1;
+        self.list_bugs(Some(page as u32), Some(limit as u32), None, None, None, q)
+            .await
     }
 
     pub async fn list_bugs_for_review(&self, review_id: i64) -> Result<Vec<(Bug, bool)>> {
@@ -10263,6 +10217,7 @@ mod tests {
                 Some(10),
                 Some(Severity::High),
                 Some("net"),
+                Some("open"),
                 Some("e1000"),
             )
             .await
@@ -10270,6 +10225,30 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, bug_id);
+        assert!(list[0].logs.is_none());
+
+        // Test status mismatch filter
+        let (list_closed, total_closed) = db
+            .list_bugs(Some(1), Some(10), None, None, Some("dismissed"), None)
+            .await
+            .unwrap();
+        assert_eq!(total_closed, 0);
+        assert_eq!(list_closed.len(), 0);
+
+        // Test min_severity filter (Critical is higher than High)
+        let (list_crit, total_crit) = db
+            .list_bugs(
+                Some(1),
+                Some(10),
+                Some(Severity::Critical),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total_crit, 0);
+        assert_eq!(list_crit.len(), 0);
         assert!(list[0].logs.is_none());
 
         // Dedicated log retrieval
