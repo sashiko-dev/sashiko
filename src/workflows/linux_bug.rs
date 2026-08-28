@@ -858,6 +858,28 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
     .ok()
 }
 
+/// Parses (file_path, line_number) pairs from Linux kernel stack traces, oops dumps,
+/// or panic call traces.
+pub fn parse_stack_trace(text: &str) -> Vec<(String, usize)> {
+    let Ok(re) = regex::Regex::new(r"\b([a-zA-Z0-9_\-\./]+\.(?:c|h|S|rs))\:([0-9]+)\b") else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cap in re.captures_iter(text) {
+        if let (Some(file), Some(line)) = (cap.get(1), cap.get(2)) {
+            let file_str = file.as_str().to_string();
+            let Ok(line_num) = line.as_str().parse::<usize>() else {
+                continue;
+            };
+            if seen.insert((file_str.clone(), line_num)) {
+                results.push((file_str, line_num));
+            }
+        }
+    }
+    results
+}
+
 pub const MAX_BUG_PREFETCH_CHARS: usize = 20_000;
 pub const MAX_BUG_PREFETCH_FILES: usize = 3;
 pub const MAX_BUG_PREFETCH_SNIPPETS_PER_FILE: usize = 2;
@@ -931,12 +953,82 @@ pub async fn prefetch_bug_locations(
                 .args(["show", &format!("{}:{}", master_sha_owned, file)])
                 .output();
 
-            let Ok(out) = git_output else {
-                continue;
+            let (out, actual_file) = match git_output {
+                Ok(o) if o.status.success() => (o, file.clone()),
+                _ => {
+                    // Try tracing rename forwards first
+                    let last_commit = std::process::Command::new("git")
+                        .current_dir(&worktree)
+                        .args(["log", "-n", "1", "--format=%H", "--", &file])
+                        .output();
+                    let mut resolved = None;
+                    if let Ok(lc) = last_commit {
+                        let sha = String::from_utf8_lossy(&lc.stdout).trim().to_string();
+                        if !sha.is_empty() {
+                            let diff_out = std::process::Command::new("git")
+                                .current_dir(&worktree)
+                                .args(["show", "-M", "--name-status", "--format=", &sha])
+                                .output();
+                            if let Ok(do_out) = diff_out {
+                                let diff_str = String::from_utf8_lossy(&do_out.stdout);
+                                for line in diff_str.lines() {
+                                    let parts: Vec<&str> = line.split('\t').collect();
+                                    if parts.len() >= 3
+                                        && parts[0].starts_with('R')
+                                        && parts[1] == file
+                                    {
+                                        let next_path = parts[2].trim();
+                                        let try_out = std::process::Command::new("git")
+                                            .current_dir(&worktree)
+                                            .args([
+                                                "show",
+                                                &format!("{}:{}", master_sha_owned, next_path),
+                                            ])
+                                            .output();
+                                        if let Some(to) =
+                                            try_out.ok().filter(|t| t.status.success())
+                                        {
+                                            resolved = Some((to, next_path.to_string()));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if resolved.is_none() {
+                        // Fallback: check git log --follow backwards
+                        let rename_cmd = std::process::Command::new("git")
+                            .current_dir(&worktree)
+                            .args(["log", "--follow", "--name-only", "--format=format:", &file])
+                            .output();
+                        if let Some(ro) = rename_cmd.ok().filter(|r| r.status.success()) {
+                            let stdout = String::from_utf8_lossy(&ro.stdout);
+                            for line in stdout.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() || trimmed == file {
+                                    continue;
+                                }
+                                let try_out = std::process::Command::new("git")
+                                    .current_dir(&worktree)
+                                    .args(["show", &format!("{}:{}", master_sha_owned, trimmed)])
+                                    .output();
+                                if let Some(to) = try_out.ok().filter(|t| t.status.success()) {
+                                    resolved = Some((to, trimmed.to_string()));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(r) = resolved {
+                        r
+                    } else {
+                        continue;
+                    }
+                }
             };
-            if !out.status.success() {
-                continue;
-            }
 
             let content = String::from_utf8_lossy(&out.stdout).to_string();
             let lines: Vec<&str> = content.lines().collect();
@@ -949,7 +1041,7 @@ pub async fn prefetch_bug_locations(
                 .filter(|loc| {
                     loc.get("file")
                         .and_then(|v| v.as_str())
-                        .map(|f| f.trim() == file)
+                        .map(|f| f.trim() == file || f.trim() == actual_file)
                         .unwrap_or(false)
                 })
                 .take(MAX_BUG_PREFETCH_SNIPPETS_PER_FILE)
@@ -1095,13 +1187,53 @@ pub async fn process_issue_worker(
     let runner = SessionRunner::new(provider).with_max_turns(20);
     let master_sha = get_master_sha(tools.as_ref()).await;
 
+    // Enrich source files and candidate locations via stack trace parsing and git rename tracking
+    let mut effective_source_files = input.source_files.clone();
+    let mut effective_locations = input.locations.clone();
+
+    let trace_frames = parse_stack_trace(&format!("{}\n{}", input.problem, input.reasoning));
+    if !trace_frames.is_empty() {
+        let mut new_locs = Vec::new();
+        for (file, line) in trace_frames {
+            if !effective_source_files.contains(&file) {
+                effective_source_files.push(file.clone());
+            }
+            new_locs.push(serde_json::json!({
+                "file": file,
+                "line": line
+            }));
+        }
+        let has_no_locations = effective_locations
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .is_none_or(|a| a.is_empty());
+        if has_no_locations {
+            effective_locations = Some(Value::Array(new_locs));
+        }
+    }
+
+    if let Some(ref tb) = tools {
+        let repo_path = tb.get_worktree_path();
+        for file in &mut effective_source_files {
+            if crate::git_ops::git_file_exists_at(repo_path, file, Some(&master_sha)).await {
+                continue;
+            }
+            if let Some(renamed) =
+                crate::git_ops::git_find_file_rename(repo_path, file, Some(&master_sha)).await
+            {
+                info!("Traced renamed file from {} to {}", file, renamed);
+                *file = renamed;
+            }
+        }
+    }
+
     // Stage 1: Normalization & Canonical Naming
     info!("--- Stage 1: Normalization ---");
     let maintainers_hint = tools
         .as_ref()
         .and_then(|tb| crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()).ok())
         .map(|mindex| {
-            let matched = mindex.match_files(&input.source_files);
+            let matched = mindex.match_files(&effective_source_files);
             if matched.is_empty() {
                 String::new()
             } else {
@@ -1112,8 +1244,7 @@ pub async fn process_issue_worker(
             }
         });
 
-    let raw_locations_str = input
-        .locations
+    let raw_locations_str = effective_locations
         .as_ref()
         .and_then(|v| serde_json::to_string_pretty(v).ok())
         .unwrap_or_else(|| "[]".to_string());
@@ -1138,13 +1269,13 @@ pub async fn process_issue_worker(
     // Stage 2: Verification & Ground-Truth Confirmation
     info!("--- Stage 2: Verification ---");
     let prefetched_context =
-        prefetch_bug_locations(tools.as_ref(), &master_sha, &input.locations).await;
+        prefetch_bug_locations(tools.as_ref(), &master_sha, &effective_locations).await;
     let mut verify_session = VerifySession {
         title: &norm.canonical_title,
         description: &norm.canonical_description,
         subsystem: &norm.primary_subsystem,
         affected_files: &norm.affected_source_files,
-        locations: input.locations.as_ref(),
+        locations: effective_locations.as_ref(),
         master_sha: master_sha.clone(),
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
@@ -1966,5 +2097,91 @@ static int target_kernel_func(int a, int b)
         assert!(res.contains("--- test_file.c:5 (target_kernel_func) ---"));
         assert!(res.contains("static int target_kernel_func"));
         assert!(res.contains("return a + b;"));
+    }
+
+    #[test]
+    fn test_parse_stack_trace_extracts_frames() {
+        let trace = r#"
+[  12.345678] ? e1000_clean_rx_irq+0x120/0x340 [e1000] drivers/net/ethernet/intel/e1000/e1000_main.c:456
+Call Trace:
+ <TASK>
+ dev_queue_xmit+0x10/0x20 net/core/dev.c:3821
+ ? e1000_clean_rx_irq+0x120/0x340 [e1000] drivers/net/ethernet/intel/e1000/e1000_main.c:456
+ kernel_clone+0x9d/0x3a0 kernel/fork.c:2685
+ </TASK>
+"#;
+        let frames = parse_stack_trace(trace);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames[0],
+            (
+                "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
+                456
+            )
+        );
+        assert_eq!(frames[1], ("net/core/dev.c".to_string(), 3821));
+        assert_eq!(frames[2], ("kernel/fork.c".to_string(), 2685));
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_bug_locations_traces_file_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let c_code = "int old_fn() {\n    return 42;\n}\n";
+        std::fs::write(path.join("old_net.c"), c_code).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "old_net.c"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add old_net.c"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        // Rename old_net.c -> new_net.c
+        std::process::Command::new("git")
+            .args(["mv", "old_net.c", "new_net.c"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "rename to new_net.c"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let tb = Arc::new(ToolBox::new(path.to_path_buf(), None));
+        let locations = json!([
+            {
+                "file": "old_net.c",
+                "line": 2,
+            }
+        ]);
+
+        let res = prefetch_bug_locations(Some(&tb), "HEAD", &Some(locations)).await;
+        assert!(
+            res.contains("return 42;"),
+            "Prefetch must trace renamed file and extract snippet: {}",
+            res
+        );
     }
 }

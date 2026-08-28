@@ -384,6 +384,119 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Checks whether a specific file path exists in git at a specific commit (or HEAD).
+pub async fn git_file_exists_at(repo_path: &Path, file_path: &str, commit: Option<&str>) -> bool {
+    let target = commit.unwrap_or("HEAD");
+    let obj = format!("{}:{}", target, file_path);
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .args(["cat-file", "-e", &obj])
+        .output()
+        .await;
+
+    matches!(output, Ok(out) if out.status.success())
+}
+
+/// Traces Git history to check if a file was renamed or moved across commits,
+/// returning its latest path at the given commit or top-of-trunk.
+pub async fn git_find_file_rename(
+    repo_path: &Path,
+    file_path: &str,
+    target_commit: Option<&str>,
+) -> Option<String> {
+    if !repo_path.exists() {
+        return None;
+    }
+
+    // 1. If file already exists at target, return as-is
+    if git_file_exists_at(repo_path, file_path, target_commit).await {
+        return Some(file_path.to_string());
+    }
+
+    // 2. Trace forward renames (up to 5 steps) via git show -M on the commit modifying the file
+    let mut current_file = file_path.to_string();
+    for _ in 0..5 {
+        let last_commit_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .args(["log", "-n", "1", "--format=%H", "--", &current_file])
+            .output()
+            .await
+            .ok()?;
+
+        if !last_commit_output.status.success() {
+            break;
+        }
+
+        let commit_sha = String::from_utf8_lossy(&last_commit_output.stdout)
+            .trim()
+            .to_string();
+        if commit_sha.is_empty() {
+            break;
+        }
+
+        let diff_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .args(["show", "-M", "--name-status", "--format=", &commit_sha])
+            .output()
+            .await
+            .ok()?;
+
+        if !diff_output.status.success() {
+            break;
+        }
+
+        let diff_str = String::from_utf8_lossy(&diff_output.stdout);
+        let mut renamed_to = None;
+        for line in diff_str.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 3 && parts[0].starts_with('R') && parts[1] == current_file {
+                renamed_to = Some(parts[2].to_string());
+                break;
+            }
+        }
+
+        if let Some(next_path) = renamed_to {
+            current_file = next_path;
+            if git_file_exists_at(repo_path, &current_file, target_commit).await {
+                return Some(current_file);
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 3. Fallback: check git log --follow backwards
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .arg("log")
+        .arg("--follow")
+        .arg("--name-only")
+        .arg("--format=format:")
+        .arg(file_path);
+
+    let Ok(output) = cmd.output().await else {
+        return None;
+    };
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if git_file_exists_at(repo_path, trimmed, target_commit).await {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 #[allow(dead_code)]
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     info!("Pruning git worktrees in {:?}", repo_path);
@@ -1987,6 +2100,64 @@ mod tests {
         .trim()
         .to_string();
         assert_eq!(local_master_sha, upstream_sha);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_git_find_file_rename() -> Result<()> {
+        let repo_dir = TempDir::new()?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["init"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+
+        // 1. Commit initial file
+        std::fs::write(
+            repo_dir.path().join("old_driver.c"),
+            "int old_fn() { return 0; }\n",
+        )?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["add", "old_driver.c"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["commit", "-m", "add old_driver.c"])
+            .output()
+            .await?;
+
+        // 2. Rename file via git mv and commit
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["mv", "old_driver.c", "new_driver.c"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["commit", "-m", "rename to new_driver.c"])
+            .output()
+            .await?;
+
+        // 3. Verify git_find_file_rename traces old_driver.c to new_driver.c
+        let resolved = git_find_file_rename(repo_dir.path(), "old_driver.c", None).await;
+        assert_eq!(resolved, Some("new_driver.c".to_string()));
+
+        // 4. Non-existent file returns None
+        let nonexistent = git_find_file_rename(repo_dir.path(), "does_not_exist.c", None).await;
+        assert_eq!(nonexistent, None);
 
         Ok(())
     }
