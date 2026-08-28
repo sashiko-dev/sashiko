@@ -1508,6 +1508,9 @@ mod tests {
                 is_fixed: false,
                 fixed_in_commit: None,
                 raw_input: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
                 created_at: 123456,
             })
             .await

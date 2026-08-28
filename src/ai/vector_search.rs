@@ -455,6 +455,9 @@ mod tests {
             is_fixed: false,
             fixed_in_commit: None,
             raw_input: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
             created_at: 100,
         };
 
@@ -483,6 +486,9 @@ mod tests {
             is_fixed: false,
             fixed_in_commit: None,
             raw_input: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
             created_at: 200,
         };
 
@@ -507,6 +513,9 @@ mod tests {
             is_fixed: false,
             fixed_in_commit: None,
             raw_input: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
             created_at: 300,
         };
 

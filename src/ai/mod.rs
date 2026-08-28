@@ -316,7 +316,7 @@ pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
 }
 
 /// Token usage statistics for an AI interaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiUsage {
     /// Number of tokens in the input prompt.
     pub prompt_tokens: usize,
@@ -331,6 +331,17 @@ pub struct AiUsage {
     /// provider reports no cache hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<usize>,
+}
+
+impl AiUsage {
+    pub fn accumulate(&mut self, other: &AiUsage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+        if let Some(other_cached) = other.cached_tokens {
+            *self.cached_tokens.get_or_insert(0) += other_cached;
+        }
+    }
 }
 
 /// Information about the capabilities and constraints of an AI provider.
@@ -1282,5 +1293,38 @@ mod tests {
             .await
             .expect_err("a closed registry rejects a registration");
         assert!(matches!(err.class, AiErrorClass::Fatal));
+    }
+
+    #[test]
+    fn test_ai_usage_accumulate() {
+        let mut u1 = AiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: Some(30),
+        };
+        let u2 = AiUsage {
+            prompt_tokens: 200,
+            completion_tokens: 80,
+            total_tokens: 280,
+            cached_tokens: Some(70),
+        };
+        u1.accumulate(&u2);
+        assert_eq!(u1.prompt_tokens, 300);
+        assert_eq!(u1.completion_tokens, 130);
+        assert_eq!(u1.total_tokens, 430);
+        assert_eq!(u1.cached_tokens, Some(100));
+
+        let u3 = AiUsage {
+            prompt_tokens: 50,
+            completion_tokens: 20,
+            total_tokens: 70,
+            cached_tokens: None,
+        };
+        u1.accumulate(&u3);
+        assert_eq!(u1.prompt_tokens, 350);
+        assert_eq!(u1.completion_tokens, 150);
+        assert_eq!(u1.total_tokens, 500);
+        assert_eq!(u1.cached_tokens, Some(100));
     }
 }

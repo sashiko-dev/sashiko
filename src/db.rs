@@ -239,6 +239,12 @@ pub struct Bug {
     pub is_fixed: bool,
     pub fixed_in_commit: Option<String>,
     pub raw_input: Option<String>,
+    #[serde(default)]
+    pub tokens_in: Option<usize>,
+    #[serde(default)]
+    pub tokens_out: Option<usize>,
+    #[serde(default)]
+    pub tokens_cached: Option<usize>,
     pub created_at: i64,
 }
 
@@ -271,6 +277,12 @@ pub struct NewBug {
     pub is_fixed: bool,
     pub fixed_in_commit: Option<String>,
     pub raw_input: Option<String>,
+    #[serde(default)]
+    pub tokens_in: Option<usize>,
+    #[serde(default)]
+    pub tokens_out: Option<usize>,
+    #[serde(default)]
+    pub tokens_cached: Option<usize>,
     pub created_at: i64,
 }
 
@@ -290,6 +302,20 @@ pub struct UpdateBugOutcomeParams<'a> {
     pub verified_on_sha: Option<&'a str>,
     pub is_fixed: bool,
     pub fixed_in_commit: Option<&'a str>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct MarkDuplicateBugParams<'a> {
+    pub ephemeral_id: i64,
+    pub canonical_id: i64,
+    pub reasoning: &'a str,
+    pub logs: Option<&'a str>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
 }
 
 pub struct EmailOutboxRow {
@@ -900,6 +926,11 @@ impl Database {
             .await;
         let _ = self.try_add_column("bugs", "fixed_in_commit", "TEXT").await;
         let _ = self.try_add_column("bugs", "raw_input", "TEXT").await;
+        let _ = self.try_add_column("bugs", "tokens_in", "INTEGER").await;
+        let _ = self.try_add_column("bugs", "tokens_out", "INTEGER").await;
+        let _ = self
+            .try_add_column("bugs", "tokens_cached", "INTEGER")
+            .await;
         let _ = self
             .try_create_index("idx_bugs_bugid", "bugs", "bugid")
             .await;
@@ -1297,8 +1328,8 @@ impl Database {
                     subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                    fixed_in_commit, raw_input, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    fixed_in_commit, raw_input, tokens_in, tokens_out, tokens_cached, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.bugid.as_str(),
@@ -1320,6 +1351,9 @@ impl Database {
                     if bug.is_fixed { 1 } else { 0 },
                     bug.fixed_in_commit.clone(),
                     bug.raw_input.clone(),
+                    bug.tokens_in.map(|t| t as i64),
+                    bug.tokens_out.map(|t| t as i64),
+                    bug.tokens_cached.map(|t| t as i64),
                     bug.created_at,
                 ],
             )
@@ -1341,7 +1375,7 @@ impl Database {
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at
+                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
                  FROM bugs WHERE id = ?",
                 libsql::params![id],
             )
@@ -1362,7 +1396,7 @@ impl Database {
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at
+                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
                  FROM bugs WHERE bugid = ?",
                 libsql::params![bugid],
             )
@@ -1489,7 +1523,10 @@ impl Database {
                 introduced_in_commit = ?,
                 verified_on_sha = ?,
                 is_fixed = ?,
-                fixed_in_commit = ?
+                fixed_in_commit = ?,
+                tokens_in = COALESCE(?, tokens_in),
+                tokens_out = COALESCE(?, tokens_out),
+                tokens_cached = COALESCE(?, tokens_cached)
              WHERE id = ?",
                 libsql::params![
                     params.status,
@@ -1506,6 +1543,9 @@ impl Database {
                     params.verified_on_sha.map(|s| s.to_string()),
                     if params.is_fixed { 1 } else { 0 },
                     params.fixed_in_commit.map(|s| s.to_string()),
+                    params.tokens_in.map(|t| t as i64),
+                    params.tokens_out.map(|t| t as i64),
+                    params.tokens_cached.map(|t| t as i64),
                     id
                 ],
             )
@@ -1573,7 +1613,7 @@ impl Database {
                     subsystems, source_files, inline_review, NULL, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                    fixed_in_commit, raw_input, created_at
+                    fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
              FROM bugs
              {}
              ORDER BY created_at DESC, id DESC
@@ -1612,15 +1652,10 @@ impl Database {
     /// [Reliability Framework] Safely transitions a bug into a Duplicate state while
     /// atomically migrating all associated review linkages to the pre-existing canonical bug.
     /// This single Transaction boundary guarantees tearing cannot occur during deduplication.
-    pub async fn mark_bug_as_duplicate(
-        &self,
-        ephemeral_id: i64,
-        canonical_id: i64,
-        reasoning: &str,
-        logs: Option<&str>,
-    ) -> Result<()> {
-        let compressed_inline = crate::compression::compress_string_if_needed(reasoning);
-        let compressed_logs = logs
+    pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<()> {
+        let compressed_inline = crate::compression::compress_string_if_needed(params.reasoning);
+        let compressed_logs = params
+            .logs
             .map(crate::compression::compress_string_if_needed)
             .unwrap_or(libsql::Value::Null);
 
@@ -1628,23 +1663,27 @@ impl Database {
 
         // 1. Mark ephemeral bug as Duplicate
         tx.execute(
-            "UPDATE bugs SET status = ?1, inline_review = ?2, logs = ?3, vector_json = NULL, is_fixed = 0 WHERE id = ?4",
+            "UPDATE bugs SET status = ?1, inline_review = ?2, logs = ?3, vector_json = NULL, is_fixed = 0,
+             tokens_in = ?5, tokens_out = ?6, tokens_cached = ?7 WHERE id = ?4",
             libsql::params![
                 "duplicate",
                 compressed_inline,
                 compressed_logs,
-                ephemeral_id,
+                params.ephemeral_id,
+                params.tokens_in.map(|t| t as i64),
+                params.tokens_out.map(|t| t as i64),
+                params.tokens_cached.map(|t| t as i64),
             ],
         ).await?;
 
         // 2. Migrate reviews out of the Tombstone immediately
         tx.execute(
             "INSERT OR IGNORE INTO review_bugs (review_id, bug_id) SELECT review_id, ?1 FROM review_bugs WHERE bug_id = ?2",
-            libsql::params![canonical_id, ephemeral_id],
+            libsql::params![params.canonical_id, params.ephemeral_id],
         ).await?;
         tx.execute(
             "DELETE FROM review_bugs WHERE bug_id = ?1",
-            libsql::params![ephemeral_id],
+            libsql::params![params.ephemeral_id],
         )
         .await?;
 
@@ -1687,7 +1726,8 @@ impl Database {
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
-                        pb.fixed_in_commit, pb.raw_input, pb.created_at, rpb.is_newly_discovered
+                        pb.fixed_in_commit, pb.raw_input, pb.created_at, pb.tokens_in, pb.tokens_out, pb.tokens_cached,
+                        rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  WHERE rpb.review_id = ?
@@ -1699,7 +1739,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(21).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(24).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1714,7 +1754,8 @@ impl Database {
                         pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
-                        pb.fixed_in_commit, pb.raw_input, pb.created_at, rpb.is_newly_discovered
+                        pb.fixed_in_commit, pb.raw_input, pb.created_at, pb.tokens_in, pb.tokens_out, pb.tokens_cached,
+                        rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  JOIN reviews r ON rpb.review_id = r.id
@@ -1727,7 +1768,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(21).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(24).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1742,7 +1783,7 @@ impl Database {
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at
+                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
                  FROM bugs
                  WHERE status IN ('open', 'fixed', 'verified')",
                 (),
@@ -1797,6 +1838,21 @@ impl Database {
         let fixed_in_commit: Option<String> = row.get(18).ok().flatten();
         let raw_input: Option<String> = row.get(19).ok().flatten();
         let created_at: i64 = row.get(20)?;
+        let tokens_in: Option<usize> = row
+            .get::<Option<i64>>(21)
+            .ok()
+            .flatten()
+            .map(|v| v as usize);
+        let tokens_out: Option<usize> = row
+            .get::<Option<i64>>(22)
+            .ok()
+            .flatten()
+            .map(|v| v as usize);
+        let tokens_cached: Option<usize> = row
+            .get::<Option<i64>>(23)
+            .ok()
+            .flatten()
+            .map(|v| v as usize);
 
         Ok(Bug {
             verified_on_sha,
@@ -1819,6 +1875,9 @@ impl Database {
             is_fixed,
             fixed_in_commit,
             raw_input,
+            tokens_in,
+            tokens_out,
+            tokens_cached,
             created_at,
         })
     }
@@ -10204,6 +10263,9 @@ mod tests {
             is_fixed: true,
             fixed_in_commit: Some("55667788 (net: e1000: fix leak in probe)".to_string()),
             raw_input: None,
+            tokens_in: Some(100),
+            tokens_out: Some(50),
+            tokens_cached: Some(25),
             created_at: 123456789,
         };
 
@@ -10234,6 +10296,9 @@ mod tests {
             fetched.logs.as_deref(),
             Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
         );
+        assert_eq!(fetched.tokens_in, Some(100));
+        assert_eq!(fetched.tokens_out, Some(50));
+        assert_eq!(fetched.tokens_cached, Some(25));
 
         // Fetch by bugid and slug
         let fetched_bugid = db
@@ -10385,6 +10450,9 @@ mod tests {
             is_fixed: false,
             fixed_in_commit: None,
             raw_input: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
             created_at: 100000,
         };
         let bug_id = db.create_bug(&new_bug).await.unwrap();

@@ -3729,6 +3729,9 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 is_fixed: false,
                 fixed_in_commit: None,
                 raw_input: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
                 created_at: 1000,
             })
             .await?;

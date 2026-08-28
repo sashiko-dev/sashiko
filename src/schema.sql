@@ -303,6 +303,9 @@ CREATE TABLE IF NOT EXISTS bugs (
     is_fixed INTEGER NOT NULL DEFAULT 0,
     fixed_in_commit TEXT,
     raw_input TEXT,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    tokens_cached INTEGER,
     created_at INTEGER NOT NULL,
     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)

@@ -764,6 +764,9 @@ pub async fn process_issue(
         is_fixed: false,
         fixed_in_commit: None,
         raw_input: raw_input_json,
+        tokens_in: None,
+        tokens_out: None,
+        tokens_cached: None,
         created_at: chrono::Utc::now().timestamp(),
     };
     let id = db.create_bug(&new_bug).await?;
@@ -1235,6 +1238,7 @@ pub async fn process_issue_worker(
     );
 
     let mut full_history = Vec::new();
+    let mut total_usage = crate::ai::AiUsage::default();
     let runner = SessionRunner::new(provider).with_max_turns(20);
     let master_sha = get_master_sha(tools.as_ref()).await;
 
@@ -1311,6 +1315,7 @@ pub async fn process_issue_worker(
 
     let norm_result = runner.run(&mut norm_session).await?;
     full_history.extend(norm_result.history);
+    total_usage.accumulate(&norm_result.usage);
     let norm = norm_result.output;
     info!(
         "Stage 1 Complete: Normalized to '{}' in subsystem '{}'",
@@ -1335,6 +1340,7 @@ pub async fn process_issue_worker(
 
     let verify_result = runner.run(&mut verify_session).await?;
     full_history.extend(verify_result.history);
+    total_usage.accumulate(&verify_result.usage);
     let verification = verify_result.output;
     info!(
         "Stage 2 Complete: Verification returned is_false_positive={}",
@@ -1358,6 +1364,9 @@ pub async fn process_issue_worker(
                 severity_explanation: Some(&reason),
                 logs: Some(&logs),
                 verified_on_sha: Some(&master_sha),
+                tokens_in: Some(total_usage.prompt_tokens),
+                tokens_out: Some(total_usage.completion_tokens),
+                tokens_cached: total_usage.cached_tokens,
                 ..Default::default()
             },
         )
@@ -1415,6 +1424,7 @@ pub async fn process_issue_worker(
 
             let dedup_result = runner.run(&mut dedup_session).await?;
             full_history.extend(dedup_result.history);
+            total_usage.accumulate(&dedup_result.usage);
             let dedup = dedup_result.output;
 
             let duplicate_match = if dedup.is_duplicate {
@@ -1439,8 +1449,16 @@ pub async fn process_issue_worker(
                 });
                 let dup_meta_str = serde_json::to_string(&dup_meta).unwrap_or_default();
 
-                db.mark_bug_as_duplicate(bug_row.id, existing.id, &dup_meta_str, Some(&logs))
-                    .await?;
+                db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+                    ephemeral_id: bug_row.id,
+                    canonical_id: existing.id,
+                    reasoning: &dup_meta_str,
+                    logs: Some(&logs),
+                    tokens_in: Some(total_usage.prompt_tokens),
+                    tokens_out: Some(total_usage.completion_tokens),
+                    tokens_cached: total_usage.cached_tokens,
+                })
+                .await?;
                 (
                     true,
                     Some(BugOutcome::Duplicate {
@@ -1475,6 +1493,7 @@ pub async fn process_issue_worker(
     };
     let tracing_result = tracing_runner.run(&mut tracing_session).await?;
     full_history.extend(tracing_result.history);
+    total_usage.accumulate(&tracing_result.usage);
     let introducing_commit_sha = match tracing_result.output.introducing_commit_sha {
         Some(sha) => Some(sha),
         None => {
@@ -1493,6 +1512,7 @@ pub async fn process_issue_worker(
     };
     let severity_result = runner.run(&mut severity_session).await?;
     full_history.extend(severity_result.history);
+    total_usage.accumulate(&severity_result.usage);
     let severity_output = severity_result.output;
     let severity = Severity::from_str(&severity_output.severity);
 
@@ -1509,6 +1529,7 @@ pub async fn process_issue_worker(
     };
     let report_result = runner.run(&mut report_session).await?;
     full_history.extend(report_result.history);
+    total_usage.accumulate(&report_result.usage);
     let inline_review = report_result.output;
 
     // Stage 7: Final Database Write
@@ -1533,6 +1554,9 @@ pub async fn process_issue_worker(
             verified_on_sha: Some(&master_sha),
             is_fixed: false,
             fixed_in_commit: None,
+            tokens_in: Some(total_usage.prompt_tokens),
+            tokens_out: Some(total_usage.completion_tokens),
+            tokens_cached: total_usage.cached_tokens,
         },
     )
     .await?;
@@ -1758,6 +1782,9 @@ mod tests {
             is_fixed: false,
             fixed_in_commit: None,
             raw_input: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
             created_at: 100,
         }];
 
@@ -1989,6 +2016,9 @@ mod tests {
                 is_fixed: false,
                 fixed_in_commit: None,
                 raw_input: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
                 created_at: 1000,
             })
             .await

@@ -3207,6 +3207,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Subsystems:</div><div>${(data.subsystems && Array.isArray(data.subsystems) && data.subsystems.length > 0) ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-')}</div></div>
                     <div class="kv"><div class="label">Discovered:</div><div>${date}</div></div>
                     <div class="kv"><div class="label">Found in:</div><div>${discoveredInHtml}</div></div>
+                    ${(data.tokens_in || data.tokens_out) ? `<div class="kv"><div class="label">Token Usage:</div><div><code>Prompt: ${data.tokens_in || 0} | Completion: ${data.tokens_out || 0}${data.tokens_cached ? ` | Cached: ${data.tokens_cached}` : ''} | Total: ${(data.tokens_in || 0) + (data.tokens_out || 0)}</code></div></div>` : ''}
                 </div>
 
                 ${inlineReviewHtml}
