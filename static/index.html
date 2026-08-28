@@ -2746,7 +2746,7 @@
                                             <button class="toggle-btn" onclick="toggleCollapsible('${cardId}', this)">▶ Inline Review</button>
                                             <div id="${cardId}" class="collapsible" style="position:relative; margin-top:6px;">
                                                 <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                                                <div class="log-inline-block">${escapeHtml(b.description, true, true)}</div>
+                                                <div class="log-inline-block">${escapeHtml(b.description, true, false)}</div>
                                             </div>
                                         </div>
                                     ` : ''}
@@ -3165,49 +3165,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const sevColor = getSeverityColor(sevStr);
             const statusInfo = getBugStatus(data);
 
-            let locationsHtml = '';
-            let locations = data.locations;
-            if (typeof locations === 'string') {
-                try { locations = JSON.parse(locations); } catch (e) { }
-            }
-            if (Array.isArray(locations) && locations.length > 0) {
-                locationsHtml = `
-                    <div class="section">
-                        <h2>Affected Locations</h2>
-                        <table style="margin-top:8px;">
-                            <thead>
-                                <tr>
-                                    <th>File</th>
-                                    <th>Function / Symbol</th>
-                                    <th style="width:100px;">Line</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${locations.map(loc => {
-                                    const file = loc.file || loc.path || '-';
-                                    const fn = loc.function || loc.function_or_symbol || loc.symbol || '-';
-                                    const line = loc.line || loc.line_number || '-';
-                                    return `<tr>
-                                        <td><code>${escapeHtml(file)}</code></td>
-                                        <td><code>${escapeHtml(fn)}</code></td>
-                                        <td>${escapeHtml(String(line))}</td>
-                                    </tr>`;
-                                }).join('')}
-                            </tbody>
-                        </table>
-                    </div>
-                `;
-            } else if (data.source_files && Array.isArray(data.source_files) && data.source_files.length > 0) {
-                locationsHtml = `
-                    <div class="section">
-                        <h2>Affected Files</h2>
-                        <ul>
-                            ${data.source_files.map(f => `<li><code>${escapeHtml(f)}</code></li>`).join('')}
-                        </ul>
-                    </div>
-                `;
-            }
-
             let inlineReviewHtml = '';
             if (data.description) {
                 inlineReviewHtml = `
@@ -3215,18 +3172,34 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <h2>Inline Review Comment</h2>
                         <div style="position: relative; margin-top: 8px;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                            <div class="log-inline-block">${escapeHtml(data.description, true, true)}</div>
+                            <div class="log-inline-block">${escapeHtml(data.description, true, false)}</div>
                         </div>
                     </div>
                 `;
             }
 
-            let explanationHtml = '';
-            if (data.severity_explanation) {
-                explanationHtml = `
+            let rawInputHtml = '';
+            if (data.raw_input) {
+                let formattedRaw = '';
+                try {
+                    const parsed = JSON.parse(data.raw_input);
+                    formattedRaw = escapeHtml(JSON.stringify(parsed, null, 2));
+                } catch (e) {
+                    formattedRaw = escapeHtml(data.raw_input);
+                }
+                const rawInputId = 'bug-raw-input-' + Math.random().toString(36).substr(2, 9);
+                rawInputHtml = `
                     <div class="section">
-                        <h2>Analysis & Severity Explanation</h2>
-                        <div class="log-block" style="max-height:none; font-size: 13px;">${escapeHtml(data.severity_explanation)}</div>
+                        <h2 style="display:flex; align-items:center; gap:10px;">
+                            Raw Input
+                            <button class="toggle-btn" onclick="toggleCollapsible('${rawInputId}', this)" style="font-size:0.8em; font-weight:normal;">▶ Show Raw Input</button>
+                        </h2>
+                        <div id="${rawInputId}" class="collapsible">
+                            <div style="position: relative; margin-top: 8px;">
+                                <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                <div class="log-block" style="max-height: 400px;">${formattedRaw}</div>
+                            </div>
+                        </div>
                     </div>
                 `;
             }
@@ -3273,8 +3246,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>
 
                 ${inlineReviewHtml}
-                ${explanationHtml}
-                ${locationsHtml}
+                ${rawInputHtml}
                 ${logsHtml}
             `;
         }
