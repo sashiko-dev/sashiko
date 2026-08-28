@@ -465,6 +465,12 @@
             color: var(--thought-color);
         }
 
+        .status-Dismissed,
+        .status-Duplicate {
+            color: var(--text-dim);
+            border-color: var(--border);
+        }
+
         /* Subsystem Tags - UNCHANGED */
         .tag {
             display: inline-block;
@@ -1230,6 +1236,9 @@
             stats: null,
             mailingLists: [],
             selectedList: '',
+            bugSubsystem: '',
+            bugMinSeverity: '',
+            bugStatus: '',
             patchsetId: null,
             patchsetPage: 1,
             patchsetTotalPages: 1,
@@ -1916,12 +1925,29 @@
                     </span>
                 </h1>
                 <div class="controls">
-                    <select id="listSelector" onchange="setMailingList(this.value)">
+                    <select id="listSelector" onchange="setMailingList(this.value)" style="${state.listMode === 'bugs' ? 'display:none;' : ''}">
                         <option value="">All Lists</option>
                         ${listOptions}
                     </select>
-                    
-                    <input type="text" id="searchInput" placeholder="Search (subject, author:, date:)" value="${escapeHtml(state.searchQuery)}">
+
+                    <div id="bugFilters" style="display: ${state.listMode === 'bugs' ? 'flex' : 'none'}; gap: 8px; align-items: center;">
+                        <input type="text" id="bugSubsystemInput" placeholder="Subsystem (e.g. net, btrfs)" value="${escapeHtml(state.bugSubsystem || '')}" style="width: 140px;" onchange="setBugFilter('subsystem', this.value)">
+                        <select id="bugSeveritySelector" onchange="setBugFilter('min_severity', this.value)">
+                            <option value="" ${!state.bugMinSeverity ? 'selected' : ''}>All Severities</option>
+                            <option value="Critical" ${state.bugMinSeverity === 'Critical' ? 'selected' : ''}>Critical</option>
+                            <option value="High" ${state.bugMinSeverity === 'High' ? 'selected' : ''}>High+</option>
+                            <option value="Medium" ${state.bugMinSeverity === 'Medium' ? 'selected' : ''}>Medium+</option>
+                            <option value="Low" ${state.bugMinSeverity === 'Low' ? 'selected' : ''}>Low+</option>
+                        </select>
+                        <select id="bugStatusSelector" onchange="setBugFilter('status', this.value)">
+                            <option value="" ${!state.bugStatus ? 'selected' : ''}>All Statuses</option>
+                            <option value="open" ${state.bugStatus === 'open' ? 'selected' : ''}>Open</option>
+                            <option value="dismissed" ${state.bugStatus === 'dismissed' ? 'selected' : ''}>Dismissed</option>
+                            <option value="fixed" ${state.bugStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
+                        </select>
+                    </div>
+
+                    <input type="text" id="searchInput" placeholder="${state.listMode === 'bugs' ? 'Search bugs (problem, file, commit)' : 'Search (subject, author:, date:)'}" value="${escapeHtml(state.searchQuery)}">
 
                     <button onclick="triggerSearch()">Search</button>
                     <button onclick="clearSearch()">Clear</button>
@@ -1968,6 +1994,17 @@
             }
             if (state.selectedList) {
                 url += `&mailing_list=${encodeURIComponent(state.selectedList)}`;
+            }
+            if (state.listMode === 'bugs') {
+                if (state.bugSubsystem) {
+                    url += `&subsystem=${encodeURIComponent(state.bugSubsystem)}`;
+                }
+                if (state.bugMinSeverity) {
+                    url += `&min_severity=${encodeURIComponent(state.bugMinSeverity)}`;
+                }
+                if (state.bugStatus) {
+                    url += `&status=${encodeURIComponent(state.bugStatus)}`;
+                }
             }
 
             const res = await fetch(url);
@@ -2070,7 +2107,13 @@
                     let statusClass = p.is_fixed ? 'status-reviewed' : 'status-failed';
                     if (p.status && p.status.toLowerCase() !== 'open' && p.status.toLowerCase() !== 'fixed') {
                         statusLabel = p.status.charAt(0).toUpperCase() + p.status.slice(1);
-                        statusClass = p.status.toLowerCase() === 'error' ? 'status-failed' : 'status-pending';
+                        if (p.status.toLowerCase() === 'error') {
+                            statusClass = 'status-failed';
+                        } else if (p.status.toLowerCase() === 'dismissed' || p.status.toLowerCase() === 'duplicate') {
+                            statusClass = 'status-Dismissed';
+                        } else {
+                            statusClass = 'status-pending';
+                        }
                     }
 
                     // Use created_at for bugs
@@ -2181,9 +2224,28 @@
             fetchListData();
         }
 
+        function setBugFilter(key, value) {
+            if (key === 'subsystem') state.bugSubsystem = value.trim();
+            if (key === 'min_severity') state.bugMinSeverity = value;
+            if (key === 'status') state.bugStatus = value;
+            state.currentPage = 1;
+            fetchListData();
+        }
+
         function clearSearch() {
             document.getElementById('searchInput').value = '';
             state.searchQuery = '';
+            if (state.listMode === 'bugs') {
+                state.bugSubsystem = '';
+                state.bugMinSeverity = '';
+                state.bugStatus = '';
+                const subInput = document.getElementById('bugSubsystemInput');
+                if (subInput) subInput.value = '';
+                const sevSel = document.getElementById('bugSeveritySelector');
+                if (sevSel) sevSel.value = '';
+                const statSel = document.getElementById('bugStatusSelector');
+                if (statSel) statSel.value = '';
+            }
             state.currentPage = 1;
             fetchListData();
         }
@@ -2195,6 +2257,18 @@
             document.getElementById('btn-patchsets').classList.toggle('active', mode === 'patchsets');
             document.getElementById('btn-messages').classList.toggle('active', mode === 'messages');
             document.getElementById('btn-bugs').classList.toggle('active', mode === 'bugs');
+
+            const listSel = document.getElementById('listSelector');
+            const bugFilters = document.getElementById('bugFilters');
+            const searchInput = document.getElementById('searchInput');
+            if (listSel) listSel.style.display = mode === 'bugs' ? 'none' : '';
+            if (bugFilters) bugFilters.style.display = mode === 'bugs' ? 'flex' : 'none';
+            if (searchInput) {
+                searchInput.placeholder = mode === 'bugs'
+                    ? 'Search bugs (problem, file, commit)'
+                    : 'Search (subject, author:, date:)';
+            }
+
             updateTableHeader();
             fetchListData();
         }
@@ -3086,10 +3160,24 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             if (data.status && data.status.toLowerCase() !== 'open' && data.status.toLowerCase() !== 'fixed') {
                 const pendingLabel = data.status.charAt(0).toUpperCase() + data.status.slice(1);
-                const colorVar = data.status.toLowerCase() === 'error' ? 'var(--status-failed)' : 'var(--status-pending)';
-                const bgRgba = data.status.toLowerCase() === 'error' ? 'rgba(218,54,51,0.15)' : 'rgba(88,166,255,0.15)';
+                let colorVar = 'var(--status-pending)';
+                let bgRgba = 'rgba(88,166,255,0.15)';
+                let statusDetail = `${pendingLabel} - Awaiting AI Verification`;
+                if (data.status.toLowerCase() === 'error') {
+                    colorVar = 'var(--status-failed)';
+                    bgRgba = 'rgba(218,54,51,0.15)';
+                    statusDetail = 'Analysis Failed';
+                } else if (data.status.toLowerCase() === 'dismissed') {
+                    colorVar = 'var(--text-dim)';
+                    bgRgba = 'rgba(139,148,158,0.15)';
+                    statusDetail = 'Dismissed (False Positive / Inactive)';
+                } else if (data.status.toLowerCase() === 'duplicate') {
+                    colorVar = 'var(--thought-color)';
+                    bgRgba = 'rgba(139,148,158,0.15)';
+                    statusDetail = 'Duplicate Bug Report';
+                }
                 statusBadgeHtml = `<span class="tag" style="font-size:0.6em; vertical-align:middle; background:${bgRgba}; color:${colorVar}; font-weight:bold; border:1px solid ${colorVar};">${pendingLabel}</span>`;
-                mainlineStatusHtml = `<strong style="color:${colorVar};">${pendingLabel} - Awaiting AI Verification</strong>`;
+                mainlineStatusHtml = `<strong style="color:${colorVar};">${statusDetail}</strong>`;
             } else {
                 statusBadgeHtml = data.is_fixed
                     ? `<span class="tag" style="font-size:0.6em; vertical-align:middle; background:rgba(46,160,67,0.15); color:var(--status-reviewed); font-weight:bold; border:1px solid var(--status-reviewed);">Fixed in Trunk</span>`
