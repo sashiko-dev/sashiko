@@ -18,7 +18,7 @@
 //! 1. Dedicated single-issue verification and High/Critical severity calibration.
 //! 2. Subsystem & file-localized fast vector candidate retrieval (Top N = 20).
 //! 3. LLM deduplication confirmation against known Linux kernel bugs.
-//! 4. Standalone LKML-style inline review generation for newly discovered bugs.
+//! 4. Standalone LKML-style defect description generation for newly discovered bugs.
 //! 5. Database persistence and review linking.
 
 use anyhow::{Result, bail};
@@ -689,7 +689,7 @@ Return ONLY a valid JSON object matching:
 }
 
 // ---------------------------------------------------------------------------
-// 6. Standalone Inline Review Generation Session (Enrichment)
+// 6. Standalone Description Generation Session (Enrichment)
 // ---------------------------------------------------------------------------
 
 struct ReportSession<'a> {
@@ -709,11 +709,11 @@ impl LlmSession for ReportSession<'_> {
     type Output = String;
 
     fn system_prompt(&self) -> String {
-        r#"You are an expert Linux kernel maintainer generating a comprehensive, standalone review report for a defect discovered in the Linux kernel codebase.
+        r#"You are an expert Linux kernel maintainer generating a comprehensive, standalone technical description for a defect discovered in the Linux kernel codebase.
 Generate a technically thorough, precise, and objective explanation of the problem, suitable for upstream LKML submission.
 
 CRITICAL RULES:
-1. No titles, headers, or subject lines. NEVER start with "Defect Report:", "Report:", "Issue:", or the bug title. Start immediately with the technical description of the defect.
+1. No titles, headers, or subject lines. NEVER start with "Defect Report:", "Report:", "Issue:", "Description:", or the bug title. Start immediately with the technical description of the defect.
 2. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
 3. No conversational filler or literature. Strictly objective and undramatic wording. Do NOT write "While reviewing...", "I noticed that...", "In the Linux kernel...", or concluding summaries.
 4. Detail the entire chain of events/calls and execution path leading to the problem:
@@ -721,7 +721,10 @@ CRITICAL RULES:
    - Detail the step-by-step chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the fault.
    - For all function names, ALWAYS use the format: func().
    - Clarify the precise root cause and failure mechanism (e.g. memory leak on error path, use-after-free, deadlock, null pointer dereference, race condition, integer overflow).
-5. Provide relevant kernel code snippets demonstrating the problematic lines and surrounding context:
+5. Concurrency, Race Conditions, and Deadlocks (WHEN APPLICABLE):
+   - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
+   - Do NOT use a multi-column timeline for non-concurrency defects (such as single-threaded leaks, null pointer dereferences on error paths, missing validation, buffer overflows) or for simple concurrency where concise prose or call-chains are already clear.
+6. Provide relevant kernel code snippets demonstrating the problematic lines and surrounding context:
    - Format each snippet cleanly:
          // path/to/file.c
          int func(struct foo *bar) {
@@ -730,12 +733,14 @@ CRITICAL RULES:
          }
    - Indent code snippets with 4 spaces.
    - Do NOT mention raw line numbers in prose; refer to function names, call chains, or code snippets instead.
-6. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files).
-7. Do NOT use markdown code fences (```) or quote marks ('>').
-8. Format all text paragraphs to wrap at 75 characters per line to be compatible with LKML message formatting rules. Do not wrap code lines.
-9. Ensure clear, readable paragraphs with blank lines between logical steps.
+7. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files).
+8. Do NOT use markdown code fences (```) or quote marks ('>').
+9. Format all text paragraphs to wrap at 75 characters per line to be compatible with LKML message formatting rules. Do not wrap code lines or ASCII diagrams.
+10. Ensure clear, readable paragraphs with blank lines between logical steps.
 
-EXAMPLE FORMAT:
+EXAMPLES:
+
+Example 1 (General defect format):
 
 In parse_durable_handle_context(), dh_info->fp is allocated and referenced
 when processing SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2.
@@ -760,6 +765,39 @@ file structure, resulting in a persistent reference count leak.
             goto out_err;
         }
     }
+
+Example 2 (Race condition multi-column timeline, when clearly helpful):
+
+There is a race condition between dequeue and unlock operations:
+
+    CPU0                                CPU1
+    ----                                ----
+    rt_mutex_lock(l)
+    lock(l->wait_lock)
+    l->owner = T1 | HAS_WAITERS;
+    unlock(l->wait_lock)
+                                        rt_mutex_unlock(l)
+                                        cmpxchg(l->owner, T1, NULL)
+                                          ===> Success (l->owner = NULL)
+    lock(l->wait_lock)
+    fixup_rt_mutex_waiters()
+      owner = l->owner & ~HAS_WAITERS;
+      l->owner = owner;
+        ===> Stale owner T1 restored!
+
+Example 3 (Deadlock multi-column timeline, when clearly helpful):
+
+A circular locking dependency occurs across three CPUs:
+
+        CPU0                     CPU1                     CPU2
+    1   lock(&kvm->slots_lock);
+    2                                                     lock(&vcpu->mutex);
+    3                                                     lock(&kvm->srcu);
+    4                            lock(cpu_hotplug_lock);
+    5                            lock(kvm_lock);
+    6                            lock(&kvm->slots_lock);
+    7                                                     lock(cpu_hotplug_lock);
+    8   sync(&kvm->srcu);
 "#.to_string()
     }
 
@@ -799,15 +837,16 @@ Task:
 Write a detailed technical description of the problem.
 - Detail the entire chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the failure.
 - Explain the precise root cause and failure mechanism in depth.
+- For race conditions, deadlocks, or multi-CPU concurrency bugs—and ONLY when it clearly improves clarity—you may illustrate the sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2). Do NOT use multi-column timelines for non-concurrency defects or where prose is already clear.
 - Include relevant code snippets from the verified codebase illustrating the defect.
 - Format code snippets cleanly indented with 4 spaces (// path/to/file.c followed by function snippet).
 - NEVER use backticks (`) to quote names (variables, functions, symbols, or files).
 - For function names, ALWAYS use func() format.
 - NEVER mention line numbers in prose; refer to function names, call chains, or code snippets instead.
-- Format all text paragraphs hard-wrapped at 75 characters per line (LKML standard). Do not wrap code lines.
+- Format all text paragraphs hard-wrapped at 75 characters per line (LKML standard). Do not wrap code lines or ASCII diagrams.
 - Raw plain text only, no markdown fences, no quote marks ('>').
 - Do NOT provide fix recommendations, remediation advice, or patches.
-- Do NOT include headers like 'Defect Report:' or title banners. Start directly with the technical description.",
+- Do NOT include headers like 'Defect Report:' or 'Description:'. Start directly with the technical description.",
             problem = self.problem,
             severity = self.severity,
             description = self.canonical_description,

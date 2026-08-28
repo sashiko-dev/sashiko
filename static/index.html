@@ -3149,7 +3149,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (data.description) {
                 inlineReviewHtml = `
                     <div class="section">
-                        <h2>Inline Review Comment</h2>
+                        <h2>Description</h2>
                         <div style="position: relative; margin-top: 8px;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
                             <div class="log-inline-block">${escapeHtml(data.description, true, false)}</div>
