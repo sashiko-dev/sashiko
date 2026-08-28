@@ -570,20 +570,28 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                 });
             }
             AiRole::Tool => {
-                // Gemini expects a 'function' role for tool responses
+                // Gemini expects a 'function' role for tool responses.
+                // Consecutive tool responses must be merged into a single turn with multiple parts.
+                let part = Part::FunctionResponse {
+                    function_response: FunctionResponse {
+                        name: msg
+                            .tool_call_id
+                            .context("Tool message missing tool_call_id")?,
+                        response: serde_json::from_str(
+                            &msg.content.unwrap_or_else(|| "{}".to_string()),
+                        )
+                        .unwrap_or(json!({})),
+                    },
+                };
+                if let Some(last) = contents.last_mut()
+                    && last.role == "function"
+                {
+                    last.parts.push(part);
+                    continue;
+                }
                 contents.push(Content {
                     role: "function".to_string(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponse {
-                            name: msg
-                                .tool_call_id
-                                .context("Tool message missing tool_call_id")?,
-                            response: serde_json::from_str(
-                                &msg.content.unwrap_or_else(|| "{}".to_string()),
-                            )
-                            .unwrap_or(json!({})),
-                        },
-                    }],
+                    parts: vec![part],
                 });
             }
         }
@@ -1233,5 +1241,40 @@ mod tests {
             normalized["properties"]["files"]["items"]["properties"]["start_line"]["type"],
             "INTEGER"
         );
+    }
+
+    #[test]
+    fn test_translate_ai_request_merges_consecutive_tool_responses() -> Result<()> {
+        let request = AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res1\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res2\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_2".to_string()),
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "function");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        Ok(())
     }
 }

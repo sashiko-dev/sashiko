@@ -232,10 +232,29 @@ impl<'a> SessionRunner<'a> {
                 cb(turns, self.max_turns);
             }
 
+            let is_final_turn = turns == self.max_turns;
+            if is_final_turn && turns > 1 {
+                let final_prompt = AiMessage {
+                    role: AiRole::User,
+                    content: Some(
+                        "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. Synthesize your final JSON verdict now based on the evidence gathered so far."
+                            .to_string(),
+                    ),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                history.push(final_prompt.clone());
+                log_history.push(final_prompt);
+            }
+
+            let tools = if is_final_turn { None } else { session.tools() };
+
             let request = AiRequest {
                 system: Some(session.system_prompt()),
                 messages: history.clone(),
-                tools: session.tools(),
+                tools,
                 temperature: session.temperature(),
                 response_format: session.response_format(),
                 context_tag: session.context_tag(),
@@ -318,20 +337,26 @@ impl<'a> SessionRunner<'a> {
 
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls {
-                let results = session.call_tools(tool_calls.clone()).await?;
-                for (call_id, result) in results {
-                    let tool_msg = AiMessage {
-                        role: AiRole::Tool,
-                        content: Some(result.to_string()),
-                        thought: None,
-                        thought_signature: None,
-                        tool_calls: None,
-                        tool_call_id: Some(call_id),
-                    };
-                    history.push(tool_msg.clone());
-                    log_history.push(tool_msg);
+                if is_final_turn {
+                    tracing::warn!(
+                        "Model emitted tool calls on final turn; ignoring tools to force validation."
+                    );
+                } else {
+                    let results = session.call_tools(tool_calls.clone()).await?;
+                    for (call_id, result) in results {
+                        let tool_msg = AiMessage {
+                            role: AiRole::Tool,
+                            content: Some(result.to_string()),
+                            thought: None,
+                            thought_signature: None,
+                            tool_calls: None,
+                            tool_call_id: Some(call_id),
+                        };
+                        history.push(tool_msg.clone());
+                        log_history.push(tool_msg);
+                    }
+                    continue; // Loop again to feed tool results back to LLM
                 }
-                continue; // Loop again to feed tool results back to LLM
             }
 
             // No tool calls: validate response
@@ -516,5 +541,51 @@ mod tests {
                 .unwrap()
                 .contains("Tool execution failed")
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_forces_synthesis_on_max_turns() {
+        let responses = vec![
+            // Turn 1: tool call
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "ok_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            // Turn 2 (max turns): synthesized output
+            AiResponse {
+                content: Some("Final synthesized verdict".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider).with_max_turns(2);
+        let mut session = DummySession;
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "Final synthesized verdict");
+
+        // Verify history contains the budget exhausted user message
+        let exhausted_msg = res.history.iter().find(|m| {
+            m.role == AiRole::User
+                && m.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("TURN BUDGET EXHAUSTED")
+        });
+        assert!(exhausted_msg.is_some());
     }
 }
