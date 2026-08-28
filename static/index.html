@@ -1239,6 +1239,8 @@
             bugSubsystem: '',
             bugMinSeverity: '',
             bugStatus: '',
+            bugSortBy: 'created_at',
+            bugSortOrder: 'desc',
             patchsetId: null,
             patchsetPage: 1,
             patchsetTotalPages: 1,
@@ -1980,11 +1982,33 @@
             if (state.listMode === 'patchsets') {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:50px">Parts</th><th style="width:80px">Status</th><th style="width:120px">Findings</th></tr>`;
             } else if (state.listMode === 'bugs') {
-                thead.innerHTML = `<tr><th>Problem</th><th style="width:100px">Severity</th><th style="width:180px">Commits</th><th style="width:100px">Date</th><th style="width:80px">Status</th></tr>`;
+                const sortIndicator = (field) => {
+                    if (state.bugSortBy !== field) return '';
+                    return state.bugSortOrder === 'asc' ? ' ▲' : ' ▼';
+                };
+                thead.innerHTML = `<tr>
+                    <th style="cursor:pointer; user-select:none;" onclick="toggleBugSort('problem')" title="Sort by Problem">Problem${sortIndicator('problem')}</th>
+                    <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('severity')" title="Sort by Severity">Severity${sortIndicator('severity')}</th>
+                    <th style="width:180px">Commits</th>
+                    <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('created_at')" title="Sort by Date">Date${sortIndicator('created_at')}</th>
+                    <th style="width:80px; cursor:pointer; user-select:none;" onclick="toggleBugSort('status')" title="Sort by Status">Status${sortIndicator('status')}</th>
+                </tr>`;
             } else {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:30px"></th></tr>`;
             }
         }
+
+        window.toggleBugSort = function(field) {
+            if (state.bugSortBy === field) {
+                state.bugSortOrder = state.bugSortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                state.bugSortBy = field;
+                state.bugSortOrder = (field === 'problem' || field === 'bugid') ? 'asc' : 'desc';
+            }
+            state.currentPage = 1;
+            renderTableHeaders();
+            fetchListData();
+        };
 
         async function fetchListData() {
             const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : (state.listMode === 'bugs' ? '/api/bugs' : '/api/messages');
@@ -2004,6 +2028,12 @@
                 }
                 if (state.bugStatus) {
                     url += `&status=${encodeURIComponent(state.bugStatus)}`;
+                }
+                if (state.bugSortBy) {
+                    url += `&sort_by=${encodeURIComponent(state.bugSortBy)}`;
+                }
+                if (state.bugSortOrder) {
+                    url += `&sort_order=${encodeURIComponent(state.bugSortOrder)}`;
                 }
             }
 
@@ -3207,6 +3237,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Subsystems:</div><div>${(data.subsystems && Array.isArray(data.subsystems) && data.subsystems.length > 0) ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-')}</div></div>
                     <div class="kv"><div class="label">Discovered:</div><div>${date}</div></div>
                     <div class="kv"><div class="label">Found in:</div><div>${discoveredInHtml}</div></div>
+                    ${data.duplicate_of ? `<div class="kv"><div class="label">Duplicate of:</div><div><a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid || data.duplicate_of.id)}" style="font-weight:bold; color:var(--accent); text-decoration:none;">${escapeHtml(data.duplicate_of.bugid || data.duplicate_of.id)}</a>: ${escapeHtml(data.duplicate_of.problem || '')}</div></div>` : ''}
+                    ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none; margin-right:6px;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
                     ${(data.tokens_in || data.tokens_out) ? `<div class="kv"><div class="label">Token Usage:</div><div><code>Prompt: ${data.tokens_in || 0} | Completion: ${data.tokens_out || 0}${data.tokens_cached ? ` | Cached: ${data.tokens_cached}` : ''} | Total: ${(data.tokens_in || 0) + (data.tokens_out || 0)}</code></div></div>` : ''}
                 </div>
 

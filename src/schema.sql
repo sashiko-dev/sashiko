@@ -306,14 +306,17 @@ CREATE TABLE IF NOT EXISTS bugs (
     tokens_in INTEGER,
     tokens_out INTEGER,
     tokens_cached INTEGER,
+    duplicate_of_id INTEGER,
     created_at INTEGER NOT NULL,
     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
-    FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id)
+    FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id),
+    FOREIGN KEY(duplicate_of_id) REFERENCES bugs(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bugs_bugid ON bugs(bugid);
 CREATE INDEX IF NOT EXISTS idx_bugs_severity ON bugs(severity);
 CREATE INDEX IF NOT EXISTS idx_bugs_is_fixed ON bugs(is_fixed);
+CREATE INDEX IF NOT EXISTS idx_bugs_duplicate_of_id ON bugs(duplicate_of_id);
 
 CREATE TABLE IF NOT EXISTS review_bugs (
     review_id INTEGER NOT NULL,

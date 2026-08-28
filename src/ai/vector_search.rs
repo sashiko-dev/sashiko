@@ -458,6 +458,7 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             tokens_cached: None,
+            duplicate_of_id: None,
             created_at: 100,
         };
 
@@ -489,6 +490,7 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             tokens_cached: None,
+            duplicate_of_id: None,
             created_at: 200,
         };
 
@@ -516,6 +518,7 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             tokens_cached: None,
+            duplicate_of_id: None,
             created_at: 300,
         };
 

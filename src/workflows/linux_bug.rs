@@ -819,6 +819,7 @@ pub async fn process_issue(
         tokens_in: None,
         tokens_out: None,
         tokens_cached: None,
+        duplicate_of_id: None,
         created_at: chrono::Utc::now().timestamp(),
     };
     let id = db.create_bug(&new_bug).await?;
@@ -1847,6 +1848,7 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             tokens_cached: None,
+            duplicate_of_id: None,
             created_at: 100,
         }];
 
@@ -2083,6 +2085,7 @@ mod tests {
                 tokens_in: None,
                 tokens_out: None,
                 tokens_cached: None,
+                duplicate_of_id: None,
                 created_at: 1000,
             })
             .await

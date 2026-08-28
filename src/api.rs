@@ -194,6 +194,8 @@ pub struct BugListQuery {
     pub min_severity: Option<String>,
     pub severity: Option<String>,
     pub status: Option<String>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -969,9 +971,47 @@ async fn get_bug(
     match result {
         Ok(Some(mut bug)) => {
             bug.logs = None;
-            Ok(Json(
-                serde_json::to_value(bug).unwrap_or(serde_json::json!({})),
-            ))
+            let mut val = serde_json::to_value(&bug).unwrap_or(serde_json::json!({}));
+            if bug.status == "duplicate" {
+                let canonical = if let Some(canon_id) = bug.duplicate_of_id {
+                    state.db.get_bug(canon_id).await.ok().flatten()
+                } else if let Ok(parsed) =
+                    serde_json::from_str::<serde_json::Value>(&bug.inline_review)
+                {
+                    if let Some(canon_id) = parsed.get("duplicate_of_id").and_then(|v| v.as_i64()) {
+                        state.db.get_bug(canon_id).await.ok().flatten()
+                    } else if let Some(canon_bugid) =
+                        parsed.get("duplicate_of_bugid").and_then(|v| v.as_str())
+                    {
+                        state.db.get_bug_by_bugid(canon_bugid).await.ok().flatten()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(c) = canonical {
+                    val["duplicate_of"] = serde_json::json!({
+                        "id": c.id,
+                        "bugid": c.bugid,
+                        "problem": c.problem,
+                    });
+                }
+            } else if let Ok(dups) = state.db.list_duplicates_for_bug(bug.id).await {
+                let dup_summaries: Vec<serde_json::Value> = dups
+                    .into_iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "id": d.id,
+                            "bugid": d.bugid,
+                            "problem": d.problem,
+                            "created_at": d.created_at,
+                        })
+                    })
+                    .collect();
+                val["duplicates"] = serde_json::Value::Array(dup_summaries);
+            }
+            Ok(Json(val))
         }
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -1444,14 +1484,16 @@ async fn list_bugs(
 
     match state
         .db
-        .list_bugs(
-            Some(page as u32),
-            Some(per_page as u32),
-            min_sev,
-            query.subsystem.as_deref(),
-            query.status.as_deref(),
-            query.q.as_deref(),
-        )
+        .list_bugs(crate::db::ListBugsParams {
+            page: Some(page as u32),
+            limit: Some(per_page as u32),
+            min_severity: min_sev,
+            subsystem: query.subsystem.as_deref(),
+            status: query.status.as_deref(),
+            search: query.q.as_deref(),
+            sort_by: query.sort_by.as_deref(),
+            sort_order: query.sort_order.as_deref(),
+        })
         .await
     {
         Ok((items, total)) => Ok(Json(serde_json::json!({
@@ -1511,6 +1553,7 @@ mod tests {
                 tokens_in: None,
                 tokens_out: None,
                 tokens_cached: None,
+                duplicate_of_id: None,
                 created_at: 123456,
             })
             .await
@@ -1581,6 +1624,14 @@ mod tests {
         assert_eq!(list_json["items"].as_array().unwrap().len(), 1);
         assert!(list_json["items"][0]["logs"].is_null());
 
+        // Test 3a: list_bugs with hierarchical parent subsystem filter ("drivers" matches "drivers/net")
+        let res_hier = reqwest::get(format!("http://{}/api/bugs?subsystem=drivers", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_hier.status(), 200);
+        let hier_json: serde_json::Value = res_hier.json().await.unwrap();
+        assert_eq!(hier_json["total"], 1);
+
         // Test 3b: list_bugs with non-matching subsystem filter
         let res_other_sub = reqwest::get(format!("http://{}/api/bugs?subsystem=btrfs", addr))
             .await
@@ -1604,6 +1655,75 @@ mod tests {
         assert_eq!(res_open.status(), 200);
         let open_json: serde_json::Value = res_open.json().await.unwrap();
         assert_eq!(open_json["total"], 0);
+
+        // Test 3e: list_bugs with sorting
+        let res_sort = reqwest::get(format!(
+            "http://{}/api/bugs?sort_by=severity&sort_order=desc",
+            addr
+        ))
+        .await
+        .unwrap();
+        assert_eq!(res_sort.status(), 200);
+
+        // Test 3f: duplicate linking on get_bug
+        let dup_id = db
+            .create_bug(&crate::db::NewBug {
+                verified_on_sha: None,
+                status: "raw".to_string(),
+                bugid: "linux-dup-endpoint".to_string(),
+                problem: "Duplicate issue".to_string(),
+                severity: crate::db::Severity::High,
+                severity_explanation: None,
+                locations: None,
+                subsystems: vec!["drivers/net".to_string()],
+                source_files: None,
+                inline_review: String::new(),
+                logs: None,
+                vector_json: None,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                introduced_in_commit: None,
+                is_fixed: false,
+                fixed_in_commit: None,
+                raw_input: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                duplicate_of_id: None,
+                created_at: 123457,
+            })
+            .await
+            .unwrap();
+        db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+            ephemeral_id: dup_id,
+            canonical_id: bug_id,
+            reasoning: "Dup of test_device",
+            logs: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
+        })
+        .await
+        .unwrap();
+
+        // Check duplicate_of on the duplicate bug
+        let res_dup = reqwest::get(format!("http://{}/api/bug?id={}", addr, dup_id))
+            .await
+            .unwrap();
+        assert_eq!(res_dup.status(), 200);
+        let dup_resp: serde_json::Value = res_dup.json().await.unwrap();
+        assert_eq!(dup_resp["duplicate_of"]["id"], bug_id);
+        assert_eq!(dup_resp["duplicate_of"]["bugid"], "linux-12345678");
+
+        // Check duplicates array on canonical bug
+        let res_canon = reqwest::get(format!("http://{}/api/bug?id={}", addr, bug_id))
+            .await
+            .unwrap();
+        assert_eq!(res_canon.status(), 200);
+        let canon_resp: serde_json::Value = res_canon.json().await.unwrap();
+        assert_eq!(canon_resp["duplicates"].as_array().unwrap().len(), 1);
+        assert_eq!(canon_resp["duplicates"][0]["id"], dup_id);
 
         // Test 4: redirect_bug
         let client = reqwest::Client::builder()

@@ -245,6 +245,8 @@ pub struct Bug {
     pub tokens_out: Option<usize>,
     #[serde(default)]
     pub tokens_cached: Option<usize>,
+    #[serde(default)]
+    pub duplicate_of_id: Option<i64>,
     pub created_at: i64,
 }
 
@@ -283,6 +285,8 @@ pub struct NewBug {
     pub tokens_out: Option<usize>,
     #[serde(default)]
     pub tokens_cached: Option<usize>,
+    #[serde(default)]
+    pub duplicate_of_id: Option<i64>,
     pub created_at: i64,
 }
 
@@ -316,6 +320,18 @@ pub struct MarkDuplicateBugParams<'a> {
     pub tokens_in: Option<usize>,
     pub tokens_out: Option<usize>,
     pub tokens_cached: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListBugsParams<'a> {
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+    pub min_severity: Option<Severity>,
+    pub subsystem: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub sort_by: Option<&'a str>,
+    pub sort_order: Option<&'a str>,
 }
 
 pub struct EmailOutboxRow {
@@ -932,6 +948,9 @@ impl Database {
             .try_add_column("bugs", "tokens_cached", "INTEGER")
             .await;
         let _ = self
+            .try_add_column("bugs", "duplicate_of_id", "INTEGER")
+            .await;
+        let _ = self
             .try_create_index("idx_bugs_bugid", "bugs", "bugid")
             .await;
         let _ = self
@@ -939,6 +958,9 @@ impl Database {
             .await;
         let _ = self
             .try_create_index("idx_bugs_is_fixed", "bugs", "is_fixed")
+            .await;
+        let _ = self
+            .try_create_index("idx_bugs_duplicate_of_id", "bugs", "duplicate_of_id")
             .await;
 
         let _ = self
@@ -1328,8 +1350,8 @@ impl Database {
                     subsystems, source_files, inline_review, logs, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                    fixed_in_commit, raw_input, tokens_in, tokens_out, tokens_cached, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    fixed_in_commit, raw_input, tokens_in, tokens_out, tokens_cached, duplicate_of_id, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.bugid.as_str(),
@@ -1354,6 +1376,7 @@ impl Database {
                     bug.tokens_in.map(|t| t as i64),
                     bug.tokens_out.map(|t| t as i64),
                     bug.tokens_cached.map(|t| t as i64),
+                    bug.duplicate_of_id,
                     bug.created_at,
                 ],
             )
@@ -1375,7 +1398,7 @@ impl Database {
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
+                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached, duplicate_of_id
                  FROM bugs WHERE id = ?",
                 libsql::params![id],
             )
@@ -1396,7 +1419,7 @@ impl Database {
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
+                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached, duplicate_of_id
                  FROM bugs WHERE bugid = ?",
                 libsql::params![bugid],
             )
@@ -1553,43 +1576,36 @@ impl Database {
         Ok(())
     }
 
-    pub async fn list_bugs(
-        &self,
-        page: Option<u32>,
-        limit: Option<u32>,
-        min_severity: Option<Severity>,
-        subsystem: Option<&str>,
-        status: Option<&str>,
-        search: Option<&str>,
-    ) -> Result<(Vec<Bug>, usize)> {
-        let limit_val = limit.unwrap_or(50) as i64;
-        let page_val = page.unwrap_or(1) as i64;
+    pub async fn list_bugs(&self, params: ListBugsParams<'_>) -> Result<(Vec<Bug>, usize)> {
+        let limit_val = params.limit.unwrap_or(50) as i64;
+        let page_val = params.page.unwrap_or(1) as i64;
         let offset_val = limit_val * (page_val.saturating_sub(1));
 
         let mut conditions = Vec::new();
-        let mut params = Vec::new();
+        let mut query_params = Vec::new();
 
-        if let Some(sev) = min_severity {
+        if let Some(sev) = params.min_severity {
             conditions.push("severity >= ?");
-            params.push(libsql::Value::Integer(sev as i64));
+            query_params.push(libsql::Value::Integer(sev as i64));
         }
 
-        if let Some(sub) = subsystem.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            conditions.push("subsystems LIKE ?");
-            params.push(libsql::Value::Text(format!("%{}%", sub)));
+        if let Some(sub) = params.subsystem.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            conditions.push("(subsystems LIKE ? OR subsystems LIKE ?)");
+            query_params.push(libsql::Value::Text(format!("%\"{}\"%", sub)));
+            query_params.push(libsql::Value::Text(format!("%\"{}/%", sub)));
         }
 
-        if let Some(st) = status.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(st) = params.status.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             conditions.push("status = ?");
-            params.push(libsql::Value::Text(st.to_string()));
+            query_params.push(libsql::Value::Text(st.to_string()));
         }
 
-        if let Some(q) = search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(q) = params.search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             conditions.push("(problem LIKE ? OR bugid LIKE ? OR locations LIKE ?)");
             let pattern = format!("%{}%", q);
-            params.push(libsql::Value::Text(pattern.clone()));
-            params.push(libsql::Value::Text(pattern.clone()));
-            params.push(libsql::Value::Text(pattern));
+            query_params.push(libsql::Value::Text(pattern.clone()));
+            query_params.push(libsql::Value::Text(pattern.clone()));
+            query_params.push(libsql::Value::Text(pattern));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -1598,9 +1614,23 @@ impl Database {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
+        let sort_col = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("severity") => "severity",
+            Some("problem") => "problem",
+            Some("status") => "status",
+            Some("id") => "id",
+            Some("bugid") => "bugid",
+            _ => "created_at",
+        };
+        let sort_dir = match params.sort_order.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("asc") => "ASC",
+            _ => "DESC",
+        };
+        let order_clause = format!("ORDER BY {} {}, id {}", sort_col, sort_dir, sort_dir);
+
         // Count total
         let count_sql = format!("SELECT COUNT(*) FROM bugs {}", where_clause);
-        let mut count_rows = self.conn.query(&count_sql, params.clone()).await?;
+        let mut count_rows = self.conn.query(&count_sql, query_params.clone()).await?;
         let total: usize = if let Ok(Some(row)) = count_rows.next().await {
             row.get::<i64>(0).unwrap_or(0) as usize
         } else {
@@ -1613,18 +1643,18 @@ impl Database {
                     subsystems, source_files, inline_review, NULL, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                    fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
+                    fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached, duplicate_of_id
              FROM bugs
              {}
-             ORDER BY created_at DESC, id DESC
+             {}
              LIMIT ? OFFSET ?",
-            where_clause
+            where_clause, order_clause
         );
 
-        params.push(libsql::Value::Integer(limit_val));
-        params.push(libsql::Value::Integer(offset_val));
+        query_params.push(libsql::Value::Integer(limit_val));
+        query_params.push(libsql::Value::Integer(offset_val));
 
-        let mut rows = self.conn.query(&select_sql, params).await?;
+        let mut rows = self.conn.query(&select_sql, query_params).await?;
         let mut bugs = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             bugs.push(Self::parse_bug_row(&row)?);
@@ -1664,7 +1694,7 @@ impl Database {
         // 1. Mark ephemeral bug as Duplicate
         tx.execute(
             "UPDATE bugs SET status = ?1, inline_review = ?2, logs = ?3, vector_json = NULL, is_fixed = 0,
-             tokens_in = ?5, tokens_out = ?6, tokens_cached = ?7 WHERE id = ?4",
+             tokens_in = ?5, tokens_out = ?6, tokens_cached = ?7, duplicate_of_id = ?8 WHERE id = ?4",
             libsql::params![
                 "duplicate",
                 compressed_inline,
@@ -1673,6 +1703,7 @@ impl Database {
                 params.tokens_in.map(|t| t as i64),
                 params.tokens_out.map(|t| t as i64),
                 params.tokens_cached.map(|t| t as i64),
+                params.canonical_id,
             ],
         ).await?;
 
@@ -1714,8 +1745,36 @@ impl Database {
         q: Option<&str>,
     ) -> Result<(Vec<Bug>, usize)> {
         let page = (offset / limit.max(1)) + 1;
-        self.list_bugs(Some(page as u32), Some(limit as u32), None, None, None, q)
-            .await
+        self.list_bugs(ListBugsParams {
+            page: Some(page as u32),
+            limit: Some(limit as u32),
+            search: q,
+            ..Default::default()
+        })
+        .await
+    }
+
+    pub async fn list_duplicates_for_bug(&self, canonical_id: i64) -> Result<Vec<Bug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
+                        subsystems, source_files, inline_review, NULL, vector_json,
+                        discovered_in_patchset_id, discovered_in_patch_id,
+                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
+                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached,
+                        duplicate_of_id
+                 FROM bugs
+                 WHERE duplicate_of_id = ?
+                 ORDER BY id ASC",
+                libsql::params![canonical_id],
+            )
+            .await?;
+        let mut list = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            list.push(Self::parse_bug_row(&row)?);
+        }
+        Ok(list)
     }
 
     pub async fn list_bugs_for_review(&self, review_id: i64) -> Result<Vec<(Bug, bool)>> {
@@ -1727,7 +1786,7 @@ impl Database {
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
                         pb.fixed_in_commit, pb.raw_input, pb.created_at, pb.tokens_in, pb.tokens_out, pb.tokens_cached,
-                        rpb.is_newly_discovered
+                        pb.duplicate_of_id, rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  WHERE rpb.review_id = ?
@@ -1739,7 +1798,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(24).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(25).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1755,7 +1814,7 @@ impl Database {
                         pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
                         pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
                         pb.fixed_in_commit, pb.raw_input, pb.created_at, pb.tokens_in, pb.tokens_out, pb.tokens_cached,
-                        rpb.is_newly_discovered
+                        pb.duplicate_of_id, rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  JOIN reviews r ON rpb.review_id = r.id
@@ -1768,7 +1827,7 @@ impl Database {
         let mut list = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(24).unwrap_or(1);
+            let is_newly_discovered: i64 = row.get(25).unwrap_or(1);
             list.push((bug, is_newly_discovered != 0));
         }
 
@@ -1783,7 +1842,8 @@ impl Database {
                         subsystems, source_files, inline_review, logs, vector_json,
                         discovered_in_patchset_id, discovered_in_patch_id,
                         discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached
+                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached,
+                        duplicate_of_id
                  FROM bugs
                  WHERE status IN ('open', 'fixed', 'verified')",
                 (),
@@ -1853,6 +1913,12 @@ impl Database {
             .ok()
             .flatten()
             .map(|v| v as usize);
+        let mut duplicate_of_id: Option<i64> = row.get(24).ok().flatten();
+        if duplicate_of_id.is_none() && status == "duplicate" {
+            duplicate_of_id = serde_json::from_str::<serde_json::Value>(&inline_review)
+                .ok()
+                .and_then(|p| p.get("duplicate_of_id").and_then(|v| v.as_i64()));
+        }
 
         Ok(Bug {
             verified_on_sha,
@@ -1878,6 +1944,7 @@ impl Database {
             tokens_in,
             tokens_out,
             tokens_cached,
+            duplicate_of_id,
             created_at,
         })
     }
@@ -10251,7 +10318,7 @@ mod tests {
                 "Buffer is allocated but not freed on error path".to_string(),
             ),
             locations: Some(json!([{"file": "drivers/net/e1000.c", "line": 42}])),
-            subsystems: vec!["net".to_string()],
+            subsystems: vec!["net/core".to_string()],
             source_files: Some(vec!["drivers/net/e1000.c".to_string()]),
             inline_review: "> problematic_code();\nMemory is leaked here.".to_string(),
             logs: Some("[{\"role\":\"system\",\"content\":\"test system\"}]".to_string()),
@@ -10266,6 +10333,7 @@ mod tests {
             tokens_in: Some(100),
             tokens_out: Some(50),
             tokens_cached: Some(25),
+            duplicate_of_id: None,
             created_at: 123456789,
         };
 
@@ -10278,7 +10346,7 @@ mod tests {
         assert_eq!(fetched.slug(), "linux-test-1234");
         assert_eq!(fetched.problem, "Memory leak in e1000_probe()");
         assert_eq!(fetched.severity, Severity::High);
-        assert_eq!(fetched.subsystems, vec!["net".to_string()]);
+        assert_eq!(fetched.subsystems, vec!["net/core".to_string()]);
         assert_eq!(
             fetched.introduced_in_commit.as_deref(),
             Some("11223344 (net: e1000: add probe)")
@@ -10329,14 +10397,15 @@ mod tests {
 
         // List bugs with search and filter (logs omitted)
         let (list, total) = db
-            .list_bugs(
-                Some(1),
-                Some(10),
-                Some(Severity::High),
-                Some("net"),
-                Some("open"),
-                Some("e1000"),
-            )
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                min_severity: Some(Severity::High),
+                subsystem: Some("net"),
+                status: Some("open"),
+                search: Some("e1000"),
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(total, 1);
@@ -10344,9 +10413,39 @@ mod tests {
         assert_eq!(list[0].id, bug_id);
         assert!(list[0].logs.is_none());
 
+        // Test hierarchical subsystem matching: "net" should match "net/core"
+        let (list_hier, total_hier) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                subsystem: Some("net"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_hier, 1);
+        assert_eq!(list_hier.len(), 1);
+
+        // Substring that is not a prefix should NOT match (e.g. "cor" shouldn't match "net/core")
+        let (_, total_no_match) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                subsystem: Some("cor"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_no_match, 0);
+
         // Test status mismatch filter
         let (list_closed, total_closed) = db
-            .list_bugs(Some(1), Some(10), None, None, Some("dismissed"), None)
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                status: Some("dismissed"),
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(total_closed, 0);
@@ -10354,19 +10453,74 @@ mod tests {
 
         // Test min_severity filter (Critical is higher than High)
         let (list_crit, total_crit) = db
-            .list_bugs(
-                Some(1),
-                Some(10),
-                Some(Severity::Critical),
-                None,
-                None,
-                None,
-            )
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                min_severity: Some(Severity::Critical),
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(total_crit, 0);
         assert_eq!(list_crit.len(), 0);
         assert!(list[0].logs.is_none());
+
+        // Test sorting
+        let (list_sorted, _) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                sort_by: Some("severity"),
+                sort_order: Some("asc"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(list_sorted.len(), 1);
+
+        // Test duplicate linking
+        let dup_bug = NewBug {
+            bugid: "linux-dup-1".to_string(),
+            status: "raw".to_string(),
+            problem: "Duplicate of e1000 leak".to_string(),
+            severity: Severity::High,
+            severity_explanation: None,
+            locations: None,
+            subsystems: vec!["net/core".to_string()],
+            source_files: None,
+            inline_review: String::new(),
+            logs: None,
+            vector_json: None,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            introduced_in_commit: None,
+            verified_on_sha: None,
+            is_fixed: false,
+            fixed_in_commit: None,
+            raw_input: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
+            duplicate_of_id: None,
+            created_at: 100005,
+        };
+        let dup_id = db.create_bug(&dup_bug).await.unwrap();
+        let dup_params = MarkDuplicateBugParams {
+            ephemeral_id: dup_id,
+            canonical_id: bug_id,
+            reasoning: "Duplicate issue",
+            logs: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
+        };
+        db.mark_bug_as_duplicate(dup_params).await.unwrap();
+
+        let duplicates = db.list_duplicates_for_bug(bug_id).await.unwrap();
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].id, dup_id);
+        assert_eq!(duplicates[0].duplicate_of_id, Some(bug_id));
 
         // Dedicated log retrieval
         assert_eq!(
@@ -10453,6 +10607,7 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             tokens_cached: None,
+            duplicate_of_id: None,
             created_at: 100000,
         };
         let bug_id = db.create_bug(&new_bug).await.unwrap();
