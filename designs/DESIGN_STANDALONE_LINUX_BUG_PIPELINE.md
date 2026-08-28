@@ -105,7 +105,8 @@ flowchart TD
   1. Extract sparse feature vector from `canonical_title`, `primary_subsystem`, `affected_source_files`, and `relevant_code_locations`.
   2. Query `preexisting_bugs` / `bugs` table for Top $N=20$ candidate matches above similarity threshold (`0.65`).
   3. If candidates exist, invoke `DedupSession` (1-turn LLM comparison).
-  4. **Strict Semantic Validation**: If `is_duplicate == true`, validator requires that `duplicate_of_id` matches one of the candidate IDs.
+  4. **Root Cause Deduplication Rule**: Bugs with the same root cause but different reported consequences (e.g., wrong synchronization leading to a data race that manifests as a memory leak vs a use-after-free crash) are considered duplicates and merged. Rule of thumb: if a single fix can fix both bugs, it is the same bug.
+  5. **Strict Semantic Validation**: If `is_duplicate == true`, validator requires that `duplicate_of_id` matches one of the candidate IDs.
 * **Early Exit**: If `is_duplicate == true`, record duplicate metadata in DB, link review, release lock, and exit early.
 
 ### 3.5 Stage 4: Origin Tracing (Enrichment)

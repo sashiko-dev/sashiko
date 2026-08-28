@@ -414,6 +414,7 @@ impl LlmSession for DedupSession<'_> {
         "You are an expert Linux kernel maintainer responsible for defect tracking and deduplication.\n\
         You will compare a newly verified Linux kernel bug against a list of known Linux kernel bugs in the codebase.\n\
         Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
+        IMPORTANT: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged. Rule of thumb: if a single fix can fix both bugs, it's the same bug.\n\
         Output raw JSON only."
             .to_string()
     }
@@ -472,6 +473,8 @@ impl LlmSession for DedupSession<'_> {
             {}\n\
             Task:\n\
             Determine if the newly verified bug is an identical duplicate of ANY of the candidate bugs listed above.\n\
+            - Root cause matching: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged.\n\
+            - Rule of thumb: If a single fix can fix both bugs, it's the same bug.\n\
             - If it matches a candidate bug, set \"is_duplicate\": true, set \"duplicate_of_id\": <ID of matched bug>, and explain in \"reasoning\".\n\
             - If it is a distinct or newly discovered issue, set \"is_duplicate\": false, \"duplicate_of_id\": null, and explain in \"reasoning\".\n\n\
             Return ONLY a valid JSON object matching:\n\
@@ -2022,6 +2025,53 @@ mod tests {
         let res = runner.run(&mut session).await.unwrap();
         assert!(res.output.is_duplicate);
         assert_eq!(res.output.duplicate_of_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_dedup_session_prompt_directives() {
+        let known_bugs = vec![Bug {
+            verified_on_sha: None,
+            id: 42,
+            status: "verified".to_string(),
+            bugid: "linux-42".to_string(),
+            problem: "Memory leak in dev.c".to_string(),
+            severity: Severity::High,
+            severity_explanation: None,
+            locations: None,
+            subsystems: vec!["net".to_string()],
+            source_files: None,
+            inline_review: "".to_string(),
+            logs: None,
+            vector_json: None,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            introduced_in_commit: None,
+            is_fixed: false,
+            fixed_in_commit: None,
+            raw_input: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
+            duplicate_of_id: None,
+            created_at: 100,
+        }];
+
+        let session = DedupSession {
+            candidate_problem: "Use-after-free crash in dev.c due to race",
+            candidate_locations: None,
+            candidate_subsystems: &["net".to_string()],
+            known_candidates: &known_bugs,
+            context_tag: None,
+        };
+
+        let sys = session.system_prompt();
+        assert!(sys.contains("same root cause but different consequences"));
+        assert!(sys.contains("single fix can fix both bugs"));
+
+        let user = session.initial_user_prompt();
+        assert!(user.contains("same root cause but different consequences"));
+        assert!(user.contains("single fix can fix both bugs"));
     }
 
     struct QueuedMockAiProvider {
