@@ -266,10 +266,11 @@ Reported Locations:
 Task:
 1. Determine the canonical subsystem for this defect (e.g. 'btrfs', 'net/sched', 'bpf', 'drm/i915', 'sched', 'mm'). Use git_log on the affected file(s) to observe the standard commit prefix used by kernel maintainers.
 2. Formulate a canonical title matching Linux kernel standards: '<subsystem>: <root cause in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
-3. Provide a structured canonical description summarizing:
-   - Trigger / Preconditions: Conditions required to trigger the bug.
-   - Failure Mechanism: Step-by-step execution path causing the fault.
-   - Impact: Consequence of the failure (e.g. UAF, leak, deadlock, panic).
+3. Provide a detailed, structured canonical description:
+   - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect.
+   - Call Chain / Execution Path: Detail the complete chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the problem.
+   - Failure Mechanism: Detail the exact root cause and how the fault or resource corruption occurs.
+   - Impact: Consequence of the failure (e.g. UAF, memory leak, deadlock, null pointer dereference, crash).
 4. List the affected source files.
 
 Return ONLY a valid JSON object matching this schema:
@@ -622,7 +623,9 @@ struct ReportSession<'a> {
     severity_explanation: &'a str,
     locations: Option<&'a Value>,
     introduced_in_commit: Option<&'a str>,
+    tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
+    prefetched_context: String,
 }
 
 #[async_trait]
@@ -630,32 +633,56 @@ impl LlmSession for ReportSession<'_> {
     type Output = String;
 
     fn system_prompt(&self) -> String {
-        r#"You are an automated review bot generating a concise, standalone review comment for a defect discovered in the Linux kernel codebase.
-Generate a short, precise, and technically detailed description of the problem. Straight to the point, no fluff.
+        r#"You are an expert Linux kernel maintainer generating a comprehensive, standalone review report for a defect discovered in the Linux kernel codebase.
+Generate a technically thorough, precise, and objective explanation of the problem, suitable for upstream LKML submission.
 
 CRITICAL RULES:
 1. No titles, headers, or subject lines. NEVER start with "Defect Report:", "Report:", "Issue:", or the bug title. Start immediately with the technical description of the defect.
 2. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
-3. No conversational filler or literature. Strictly objective and technical. Do NOT write "While reviewing...", "I noticed that...", "In the Linux kernel...", or concluding summaries.
-4. If quoting code, cite the file and line range first on a separate line (e.g. "path/to/file.c:123-145") and indent the code snippet with 4 spaces.
-5. Do NOT use backticks to quote code, function, or symbol names.
-6. Do NOT use markdown code fences (```) or quote marks ('>').
-7. Text must be hard-wrapped at 78 characters. Do not wrap code lines.
-8. Detail the exact trigger conditions, the execution path through the functions, and the precise failure mechanism (e.g. memory leak, use-after-free, deadlock, null pointer dereference). Keep it as short and to the point as possible.
+3. No conversational filler or literature. Strictly objective and undramatic wording. Do NOT write "While reviewing...", "I noticed that...", "In the Linux kernel...", or concluding summaries.
+4. Detail the entire chain of events/calls and execution path leading to the problem:
+   - Explain the initial state or preconditions required to trigger the bug.
+   - Detail the step-by-step chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the fault.
+   - For all function names, ALWAYS use the format: func().
+   - Clarify the precise root cause and failure mechanism (e.g. memory leak on error path, use-after-free, deadlock, null pointer dereference, race condition, integer overflow).
+5. Provide relevant kernel code snippets demonstrating the problematic lines and surrounding context:
+   - Format each snippet cleanly:
+         // path/to/file.c
+         int func(struct foo *bar) {
+             ...
+             <problematic lines>
+         }
+   - Indent code snippets with 4 spaces.
+   - Do NOT mention raw line numbers in prose; refer to function names, call chains, or code snippets instead.
+6. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files).
+7. Do NOT use markdown code fences (```) or quote marks ('>').
+8. Format all text paragraphs to wrap at 75 characters per line to be compatible with LKML message formatting rules. Do not wrap code lines.
+9. Ensure clear, readable paragraphs with blank lines between logical steps.
 
 EXAMPLE FORMAT:
 
 In parse_durable_handle_context(), dh_info->fp is allocated and referenced
-when processing SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2. If the context contains
-conflicting flags or if ksmbd_extract_sharename() fails, the function returns
-an error without decrementing the reference count via ksmbd_fd_put(),
-resulting in a reference leak of the underlying file structure.
+when processing SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2.
 
-fs/smb/server/smb2pdu.c:2810-2825
-    rc = parse_durable_handle_context(work, req, lc, &dh_info);
-    if (rc) {
-        status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
-        goto out_err1;
+The chain of events leading to the resource leak is as follows:
+smb2_open()
+  -> create_smb2_pipe() or create_file()
+    -> parse_durable_handle_context()
+      Allocates dh_info->fp with ksmbd_lookup_fd_fast().
+
+If conflicting create flags are present or if ksmbd_extract_sharename()
+fails subsequently in parse_durable_handle_context(), the function takes
+an early error exit path without calling ksmbd_fd_put() on the allocated
+file structure, resulting in a persistent reference count leak.
+
+    // fs/smb/server/smb2pdu.c
+    static int parse_durable_handle_context(...) {
+        ...
+        rc = ksmbd_extract_sharename(share_name, ...);
+        if (rc) {
+            status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
+            goto out_err;
+        }
     }
 "#.to_string()
     }
@@ -671,6 +698,15 @@ fs/smb/server/smb2pdu.c:2810-2825
             .map(|s| format!("Introduced in commit: {}\n", s))
             .unwrap_or_default();
 
+        let code_section = if !self.prefetched_context.trim().is_empty() {
+            format!(
+                "\nVerified Code Context from Repository:\n{}\n",
+                self.prefetched_context.trim()
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             "Linux Kernel Defect Details:
 Title: {problem}
@@ -682,24 +718,40 @@ Verification Details:
 {intro_str}\
 Locations:
 {loc_str}
-
+{code_section}
 Task:
-Write a short, direct, and detailed technical description of the problem.
-- Do NOT include headers like 'Defect Report:' or title banners.
+Write a detailed technical description of the problem.
+- Detail the entire chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the failure.
+- Explain the precise root cause and failure mechanism in depth.
+- Include relevant code snippets from the verified codebase illustrating the defect.
+- Format code snippets cleanly indented with 4 spaces (// path/to/file.c followed by function snippet).
+- NEVER use backticks (`) to quote names (variables, functions, symbols, or files).
+- For function names, ALWAYS use func() format.
+- NEVER mention line numbers in prose; refer to function names, call chains, or code snippets instead.
+- Format all text paragraphs hard-wrapped at 75 characters per line (LKML standard). Do not wrap code lines.
+- Raw plain text only, no markdown fences, no quote marks ('>').
 - Do NOT provide fix recommendations, remediation advice, or patches.
-- Start directly with the technical explanation of what is wrong and how the fault occurs.
-- Raw plain text only, no markdown fences, no backticks, text hard-wrapped at 78 chars.",
+- Do NOT include headers like 'Defect Report:' or title banners. Start directly with the technical description.",
             problem = self.problem,
             severity = self.severity,
             description = self.canonical_description,
             explanation = self.severity_explanation,
             intro_str = intro_str,
             loc_str = loc_str,
+            code_section = code_section,
         )
     }
 
     fn tools(&self) -> Option<Vec<AiTool>> {
-        None
+        self.tools.as_ref().map(|t| t.get_declarations_generic())
+    }
+
+    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+        if let Some(ref tools) = self.tools {
+            tools.call(name, args).await
+        } else {
+            bail!("Tool execution requested but no toolbox available");
+        }
     }
 
     fn context_tag(&self) -> Option<String> {
@@ -1335,7 +1387,7 @@ pub async fn process_issue_worker(
         master_sha: master_sha.clone(),
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
-        prefetched_context,
+        prefetched_context: prefetched_context.clone(),
     };
 
     let verify_result = runner.run(&mut verify_session).await?;
@@ -1518,6 +1570,14 @@ pub async fn process_issue_worker(
 
     // Stage 6: Standalone Plaintext Review Generation (Enrichment)
     info!("--- Stage 6: Standalone Review Generation ---");
+    let verified_prefetched =
+        prefetch_bug_locations(tools.as_ref(), &master_sha, &verified_locations).await;
+    let effective_prefetched = if !verified_prefetched.is_empty() {
+        verified_prefetched
+    } else {
+        prefetched_context
+    };
+
     let mut report_session = ReportSession {
         problem: &norm.canonical_title,
         severity: severity.as_str(),
@@ -1525,7 +1585,9 @@ pub async fn process_issue_worker(
         severity_explanation: &severity_output.severity_explanation,
         locations: verified_locations.as_ref(),
         introduced_in_commit: introduced_in_commit.as_deref(),
+        tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
+        prefetched_context: effective_prefetched,
     };
     let report_result = runner.run(&mut report_session).await?;
     full_history.extend(report_result.history);
@@ -1858,7 +1920,9 @@ mod tests {
             severity_explanation: "Missing free",
             locations: None,
             introduced_in_commit: Some("11223344 (net: initial dev.c)"),
+            tools: None,
             context_tag: None,
+            prefetched_context: String::new(),
         };
 
         let runner = SessionRunner::new(&mock_provider);
