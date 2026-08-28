@@ -1628,6 +1628,22 @@
             return { label: 'Open', cls: 'status-Open', color: 'var(--status-pending)' };
         }
 
+        function formatCommitRef(ref) {
+            if (!ref) return '';
+            const m = String(ref).trim().match(/^([0-9a-fA-F]{7,40})(?:\s+\((.*?)\))?(?:\s+(\[.*?\]))?$/);
+            if (m) {
+                const shortSha = m[1].substring(0, 12);
+                const subject = m[2];
+                const tag = m[3] ? ' ' + m[3] : '';
+                if (subject) {
+                    const cleanSub = subject.startsWith('"') && subject.endsWith('"') ? subject : `"${subject}"`;
+                    return `${shortSha} (${cleanSub})${tag}`;
+                }
+                return `${shortSha}${tag}`;
+            }
+            return String(ref).replace(/\b([0-9a-fA-F]{12})[0-9a-fA-F]{28}\b/g, '$1');
+        }
+
         function escapeHtml(text, highlightDiff = false, renderAiComments = false) {
             if (!text) return '';
             const escaped = String(text)
@@ -2191,8 +2207,8 @@
                     const sevColor = getSeverityColor(sevStr);
                     const sevHtml = `<span style="color: ${sevColor}; font-weight: bold;">${escapeHtml(sevStr)}</span>`;
                     
-                    const commitHtml = p.introduced_in_commit ? `<code style="font-size: 0.8em; margin-bottom: 2px;">Introduced: ${escapeHtml(p.introduced_in_commit.substring(0,12))}</code><br>` : '';
-                    let idHtml = p.discovered_in_commit ? `<code style="font-size: 0.8em;">Discovered: ${escapeHtml(p.discovered_in_commit.substring(0,12))}</code>` : '';
+                    const commitHtml = p.introduced_in_commit ? `<code style="font-size: 0.8em; margin-bottom: 2px;" title="${escapeHtml(formatCommitRef(p.introduced_in_commit))}">Introduced by: ${escapeHtml(formatCommitRef(p.introduced_in_commit))}</code><br>` : '';
+                    let idHtml = p.discovered_in_commit ? `<code style="font-size: 0.8em;">Reported on: ${escapeHtml(p.discovered_in_commit.substring(0,12))}</code>` : '';
 
                     const statusInfo = getBugStatus(p);
 
@@ -3228,37 +3244,29 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>
             `;
 
-            let discoveredInHtml = '';
+            let reportedByHtml = 'Sashiko patch review';
             if (data.discovered_in_patchset_id) {
-                discoveredInHtml = `<a href="#/patchset/${encodeURIComponent(data.discovered_in_patchset_id)}">Patchset #${data.discovered_in_patchset_id}</a>`;
+                reportedByHtml += ` (<a href="#/patchset/${encodeURIComponent(data.discovered_in_patchset_id)}">details</a>)`;
+            } else if (data.discovered_in_patch_id) {
+                reportedByHtml += ` (<a href="#/patch/${encodeURIComponent(data.discovered_in_patch_id)}">details</a>)`;
             } else if (data.discovered_in_commit) {
-                discoveredInHtml = `<code>${escapeHtml(data.discovered_in_commit.substring(0, 12))}</code>`;
-            } else {
-                discoveredInHtml = '-';
+                reportedByHtml += ` (<code>${escapeHtml(data.discovered_in_commit.substring(0, 12))}</code>)`;
             }
 
-            const statusBadgeHtml = `<span class="tag" style="font-size:0.6em; vertical-align:middle; background:transparent; border:1px solid ${statusInfo.color}; color:${statusInfo.color}; font-weight:bold;">${statusInfo.label}</span>`;
-            const statusDetailHtml = `<strong style="color:${statusInfo.color};">${statusInfo.label}</strong>${data.fixed_in_commit ? ` (commit <code>${escapeHtml(data.fixed_in_commit)}</code>)` : ''}`;
+            const statusDetailHtml = `<strong style="color:${statusInfo.color};">${statusInfo.label}</strong>${data.fixed_in_commit ? ` (commit <code>${escapeHtml(formatCommitRef(data.fixed_in_commit))}</code>)` : ''}`;
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
-                <h1>
-                    <span>${escapeHtml(data.problem || 'Linux Kernel Bug')}</span>
-                    <span style="display:inline-flex; align-items:center; gap:8px;">
-                        <span class="tag" style="font-size:0.6em; vertical-align:middle; background:transparent; border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold;">${escapeHtml(sevStr)}</span>
-                        <span class="tag" style="font-size:0.6em; vertical-align:middle;">${escapeHtml((data.bugid || data.slug || data.id))}</span>
-                        ${statusBadgeHtml}
-                    </span>
-                </h1>
+                <h1>${escapeHtml(data.problem || 'Linux Kernel Bug')}</h1>
 
                 <div class="section">
                     <div class="kv"><div class="label">ID:</div><div><code>${escapeHtml((data.bugid || data.slug || data.id))}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml((data.bugid || data.slug || data.id))}')">Copy</button></div></div>
                     <div class="kv"><div class="label">Severity:</div><div><strong style="color:${sevColor}">${escapeHtml(sevStr)}</strong></div></div>
                     <div class="kv"><div class="label">Status:</div><div>${statusDetailHtml}</div></div>
-                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced in:</div><div><code>${escapeHtml(data.introduced_in_commit)}</code></div></div>` : ''}
+                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced by:</div><div><code>${escapeHtml(formatCommitRef(data.introduced_in_commit))}</code></div></div>` : ''}
                     <div class="kv"><div class="label">Subsystems:</div><div>${(data.subsystems && Array.isArray(data.subsystems) && data.subsystems.length > 0) ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-')}</div></div>
-                    <div class="kv"><div class="label">Discovered:</div><div>${date}</div></div>
-                    <div class="kv"><div class="label">Found in:</div><div>${discoveredInHtml}</div></div>
+                    <div class="kv"><div class="label">Reported at:</div><div>${date}</div></div>
+                    <div class="kv"><div class="label">Reported by:</div><div>${reportedByHtml}</div></div>
                     ${data.duplicate_of ? `<div class="kv"><div class="label">Duplicate of:</div><div><a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid || data.duplicate_of.id)}" style="font-weight:bold; color:var(--accent); text-decoration:none;">${escapeHtml(data.duplicate_of.bugid || data.duplicate_of.id)}</a>: ${escapeHtml(data.duplicate_of.problem || '')}</div></div>` : ''}
                     ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none; margin-right:6px;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
                     ${(data.tokens_in || data.tokens_out) ? `<div class="kv"><div class="label">Token Usage:</div><div><code>Prompt: ${data.tokens_in || 0} | Completion: ${data.tokens_out || 0}${data.tokens_cached ? ` | Cached: ${data.tokens_cached}` : ''} | Total: ${(data.tokens_in || 0) + (data.tokens_out || 0)}</code></div></div>` : ''}

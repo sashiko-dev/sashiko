@@ -908,7 +908,8 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
             _ => "".to_string(),
         };
 
-        format!("{} ({}){}", sha, subject, tag_part)
+        let short_sha = if sha.len() >= 12 { &sha[..12] } else { &sha };
+        format!("{} (\"{}\"){}", short_sha, subject, tag_part)
     })
     .await
     .ok()
