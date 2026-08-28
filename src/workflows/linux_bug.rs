@@ -112,7 +112,11 @@ pub struct SeverityJson {
 }
 
 struct VerifySession<'a> {
-    input: &'a BugInput,
+    title: &'a str,
+    description: &'a str,
+    subsystem: &'a str,
+    affected_files: &'a [String],
+    locations: Option<&'a Value>,
     master_sha: String,
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
@@ -139,9 +143,7 @@ impl LlmSession for VerifySession<'_> {
 
     fn initial_user_prompt(&self) -> String {
         let loc_str = self
-            .input
             .locations
-            .as_ref()
             .and_then(|v| serde_json::to_string_pretty(v).ok())
             .unwrap_or_else(|| "[]".to_string());
 
@@ -154,10 +156,18 @@ impl LlmSession for VerifySession<'_> {
             )
         };
 
+        let files_str = if self.affected_files.is_empty() {
+            String::new()
+        } else {
+            format!("Affected Files: {}\n", self.affected_files.join(", "))
+        };
+
         format!(
-            "Candidate Vulnerability:
-Problem: {problem}
-Reasoning: {reasoning}
+            "Candidate Defect to Verify:
+Title: {title}
+Subsystem: {subsystem}
+{files_str}Description:
+{description}
 Locations:
 {locations}
 {prefetch_block}
@@ -179,8 +189,9 @@ Return ONLY a valid JSON object matching this schema:
   \"relevant_code_locations\": [ {{\"file\": \"path/to/file.c\", \"function_or_symbol\": \"function_name\", \"line\": 123}} ]
 }}",
             master_sha = self.master_sha,
-            problem = self.input.problem,
-            reasoning = self.input.reasoning,
+            title = self.title,
+            subsystem = self.subsystem,
+            description = self.description,
             locations = loc_str,
             prefetch_block = prefetch_block,
         )
@@ -221,8 +232,7 @@ Return ONLY a valid JSON object matching this schema:
 struct NormalizeSession<'a> {
     problem: &'a str,
     reasoning: &'a str,
-    verification_reasoning: &'a str,
-    verified_locations: &'a str,
+    locations: &'a str,
     maintainers_hint: Option<String>,
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
@@ -233,8 +243,8 @@ impl LlmSession for NormalizeSession<'_> {
     type Output = NormalizationJson;
 
     fn system_prompt(&self) -> String {
-        "You are an expert Linux kernel maintainer and technical editor. Your role is to normalize a newly verified Linux kernel defect into canonical form.\n\
-        You must standardize the defect's title, subsystem classification, and structured description without altering the technical substance verified in the code.\n\
+        "You are an expert Linux kernel maintainer and technical editor. Your role is to normalize a candidate Linux kernel defect into canonical form.\n\
+        You must standardize the defect's title, subsystem classification, and structured description without altering the technical substance reported.\n\
         Use available tools (git_log, git_read_files, git_grep) to inspect the codebase and git history of affected files to determine the conventional subsystem prefix used by maintainers."
             .to_string()
     }
@@ -247,11 +257,10 @@ impl LlmSession for NormalizeSession<'_> {
             .unwrap_or_default();
 
         format!(
-            "Verified Bug Details:
+            "Candidate Bug Details:
 Original Problem: {problem}
 Reasoning: {reasoning}
-Verification Evidence: {ver_reasoning}
-Verified Locations:
+Reported Locations:
 {locations}
 {hint}
 Task:
@@ -272,8 +281,7 @@ Return ONLY a valid JSON object matching this schema:
 }}",
             problem = self.problem,
             reasoning = self.reasoning,
-            ver_reasoning = self.verification_reasoning,
-            locations = self.verified_locations,
+            locations = self.locations,
             hint = hint_section
         )
     }
@@ -610,6 +618,7 @@ Return ONLY a valid JSON object matching:
 struct ReportSession<'a> {
     problem: &'a str,
     severity: &'a str,
+    canonical_description: &'a str,
     severity_explanation: &'a str,
     locations: Option<&'a Value>,
     introduced_in_commit: Option<&'a str>,
@@ -621,25 +630,33 @@ impl LlmSession for ReportSession<'_> {
     type Output = String;
 
     fn system_prompt(&self) -> String {
-        r#"You are an automated review bot generating a dedicated, standalone defect report for a vulnerability discovered in the codebase.
-Generate a concise, short but detailed description of the problem, straight to the point.
+        r#"You are an automated review bot generating a concise, standalone review comment for a defect discovered in the Linux kernel codebase.
+Generate a short, precise, and technically detailed description of the problem. Straight to the point, no fluff.
 
 CRITICAL RULES:
-1. Follow standard plain-text email style. Ensure the tone is objective and professional. Do not use conversational filler (e.g. "While reviewing... I noticed" or "This is a Linux kernel issue").
-2. The report MUST contain a detailed description of the bug (describing execution paths, context, and root causes).
-3. Do NOT use markdown code fences AND do not use quote marks ('>') for code.
-4. If you present a code snippet, put filename and line range first on a separate line and use a left margin (4 spaces of indentation) to separate it from the normal text.
+1. No titles, headers, or subject lines. NEVER start with "Defect Report:", "Report:", "Issue:", or the bug title. Start immediately with the technical description of the defect.
+2. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
+3. No conversational filler or literature. Strictly objective and technical. Do NOT write "While reviewing...", "I noticed that...", "In the Linux kernel...", or concluding summaries.
+4. If quoting code, cite the file and line range first on a separate line (e.g. "path/to/file.c:123-145") and indent the code snippet with 4 spaces.
 5. Do NOT use backticks to quote code, function, or symbol names.
-6. Explain the exact execution trigger and state precisely what goes wrong.
-7. Any text explanation MUST be wrapped at 78 characters. Do not wrap code snippets.
+6. Do NOT use markdown code fences (```) or quote marks ('>').
+7. Text must be hard-wrapped at 78 characters. Do not wrap code lines.
+8. Detail the exact trigger conditions, the execution path through the functions, and the precise failure mechanism (e.g. memory leak, use-after-free, deadlock, null pointer dereference). Keep it as short and to the point as possible.
 
-EXAMPLE CODE FORMATTING:
+EXAMPLE FORMAT:
 
-fs/btrfs/send.c:2333-2338
-    nce = name_cache_search(sctx, ino, gen);
-    if (nce) {
-        if (ino < sctx->send_progress && nce->need_later_update) {
-            btrfs_lru_cache_remove(&sctx->name_cache, &nce->entry);
+In parse_durable_handle_context(), dh_info->fp is allocated and referenced
+when processing SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2. If the context contains
+conflicting flags or if ksmbd_extract_sharename() fails, the function returns
+an error without decrementing the reference count via ksmbd_fd_put(),
+resulting in a reference leak of the underlying file structure.
+
+fs/smb/server/smb2pdu.c:2810-2825
+    rc = parse_durable_handle_context(work, req, lc, &dh_info);
+    if (rc) {
+        status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
+        goto out_err1;
+    }
 "#.to_string()
     }
 
@@ -653,20 +670,31 @@ fs/btrfs/send.c:2333-2338
             .introduced_in_commit
             .map(|s| format!("Introduced in commit: {}\n", s))
             .unwrap_or_default();
-        let status_str = "Mainline Status: Active / Unfixed in top-of-trunk\n".to_string();
 
         format!(
-            "Linux Kernel Vulnerability Details:\n\
-            Problem: {}\n\
-            Severity: {}\n\
-            Severity Explanation: {}\n\
-            {}{}\
-            Locations:\n{}\n\n\
-            Task:\n\
-            Generate a complete, standalone LKML-style review comment block for this issue.\n\
-            Format problematic source lines with 4 spaces of indentation and provide interspersed explanations and remediation suggestions.\n\
-            Return raw plain text, not JSON or markdown fences.",
-            self.problem, self.severity, self.severity_explanation, intro_str, status_str, loc_str
+            "Linux Kernel Defect Details:
+Title: {problem}
+Severity: {severity}
+Description:
+{description}
+Verification Details:
+{explanation}
+{intro_str}\
+Locations:
+{loc_str}
+
+Task:
+Write a short, direct, and detailed technical description of the problem.
+- Do NOT include headers like 'Defect Report:' or title banners.
+- Do NOT provide fix recommendations, remediation advice, or patches.
+- Start directly with the technical explanation of what is wrong and how the fault occurs.
+- Raw plain text only, no markdown fences, no backticks, text hard-wrapped at 78 chars.",
+            problem = self.problem,
+            severity = self.severity,
+            description = self.canonical_description,
+            explanation = self.severity_explanation,
+            intro_str = intro_str,
+            loc_str = loc_str,
         )
     }
 
@@ -1062,12 +1090,56 @@ pub async fn process_issue_worker(
     let runner = SessionRunner::new(provider).with_max_turns(20);
     let master_sha = get_master_sha(tools.as_ref()).await;
 
-    // Stage 1: Verification & Ground-Truth Confirmation
-    info!("--- Stage 1: Verification ---");
+    // Stage 1: Normalization & Canonical Naming
+    info!("--- Stage 1: Normalization ---");
+    let maintainers_hint = tools
+        .as_ref()
+        .and_then(|tb| crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()).ok())
+        .map(|mindex| {
+            let matched = mindex.match_files(&input.source_files);
+            if matched.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Detected Subsystems from MAINTAINERS: {}",
+                    matched.join(", ")
+                )
+            }
+        });
+
+    let raw_locations_str = input
+        .locations
+        .as_ref()
+        .and_then(|v| serde_json::to_string_pretty(v).ok())
+        .unwrap_or_else(|| "[]".to_string());
+
+    let mut norm_session = NormalizeSession {
+        problem: &input.problem,
+        reasoning: &input.reasoning,
+        locations: &raw_locations_str,
+        maintainers_hint,
+        tools: tools.clone(),
+        context_tag: context_tag.map(|s| s.to_string()),
+    };
+
+    let norm_result = runner.run(&mut norm_session).await?;
+    full_history.extend(norm_result.history);
+    let norm = norm_result.output;
+    info!(
+        "Stage 1 Complete: Normalized to '{}' in subsystem '{}'",
+        norm.canonical_title, norm.primary_subsystem
+    );
+
+    // Stage 2: Verification & Ground-Truth Confirmation
+    info!("--- Stage 2: Verification ---");
     let prefetched_context =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &input.locations).await;
     let mut verify_session = VerifySession {
-        input: &input,
+        title: &norm.canonical_title,
+        description: &norm.canonical_description,
+        subsystem: &norm.primary_subsystem,
+        affected_files: &norm.affected_source_files,
+        locations: input.locations.as_ref(),
         master_sha: master_sha.clone(),
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
@@ -1078,7 +1150,7 @@ pub async fn process_issue_worker(
     full_history.extend(verify_result.history);
     let verification = verify_result.output;
     info!(
-        "Stage 1 Complete: Verification returned is_false_positive={}",
+        "Stage 2 Complete: Verification returned is_false_positive={}",
         verification.is_false_positive
     );
 
@@ -1088,10 +1160,14 @@ pub async fn process_issue_worker(
         });
         info!("Linux kernel candidate discarded: {}", reason);
         let logs = serde_json::to_string(&full_history).unwrap_or_default();
+        let norm_subsystems = vec![norm.primary_subsystem.clone()];
         db.update_bug_outcome(
             bug_row.id,
             crate::db::UpdateBugOutcomeParams {
                 status: "dismissed",
+                problem: Some(&norm.canonical_title),
+                subsystems: Some(&norm_subsystems),
+                source_files: Some(&norm.affected_source_files),
                 severity_explanation: Some(&reason),
                 logs: Some(&logs),
                 verified_on_sha: Some(&master_sha),
@@ -1112,41 +1188,6 @@ pub async fn process_issue_worker(
         .as_ref()
         .and_then(|v| serde_json::to_string_pretty(v).ok())
         .unwrap_or_else(|| "[]".to_string());
-
-    // Stage 2: Normalization & Canonical Naming
-    info!("--- Stage 2: Normalization ---");
-    let maintainers_hint = tools
-        .as_ref()
-        .and_then(|tb| crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()).ok())
-        .map(|mindex| {
-            let matched = mindex.match_files(&input.source_files);
-            if matched.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "Detected Subsystems from MAINTAINERS: {}",
-                    matched.join(", ")
-                )
-            }
-        });
-
-    let mut norm_session = NormalizeSession {
-        problem: &input.problem,
-        reasoning: &input.reasoning,
-        verification_reasoning: &verification.verification_reasoning,
-        verified_locations: &verified_locations_str,
-        maintainers_hint,
-        tools: tools.clone(),
-        context_tag: context_tag.map(|s| s.to_string()),
-    };
-
-    let norm_result = runner.run(&mut norm_session).await?;
-    full_history.extend(norm_result.history);
-    let norm = norm_result.output;
-    info!(
-        "Stage 2 Complete: Normalized to '{}' in subsystem '{}'",
-        norm.canonical_title, norm.primary_subsystem
-    );
 
     // Stage 3: Deduplication Confirmation (under BUG_DEDUP_LOCK)
     info!("--- Stage 3: Deduplication ---");
@@ -1262,11 +1303,12 @@ pub async fn process_issue_worker(
     let severity_output = severity_result.output;
     let severity = Severity::from_str(&severity_output.severity);
 
-    // Stage 6: Standalone Plaintext LKML Report (Enrichment)
+    // Stage 6: Standalone Plaintext Review Generation (Enrichment)
     info!("--- Stage 6: Standalone Review Generation ---");
     let mut report_session = ReportSession {
         problem: &norm.canonical_title,
         severity: severity.as_str(),
+        canonical_description: &norm.canonical_description,
         severity_explanation: &severity_output.severity_explanation,
         locations: verified_locations.as_ref(),
         introduced_in_commit: introduced_in_commit.as_deref(),
@@ -1371,7 +1413,11 @@ mod tests {
         };
 
         let mut session = VerifySession {
-            input: &input,
+            title: "net: dev: fix memory leak in dev_alloc()",
+            description: "Trigger: Netdev allocation failure.\nFailure Mechanism: Missing kfree() on error path.\nImpact: Memory leak.",
+            subsystem: "net",
+            affected_files: &["net/core/dev.c".to_string()],
+            locations: input.locations.as_ref(),
             master_sha: "master".to_string(),
             tools: None,
             context_tag: None,
@@ -1398,6 +1444,13 @@ mod tests {
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
+        let normalize_json = json!({
+            "canonical_title": "net: dev: fix null dereference in dev_read()",
+            "canonical_description": "Trigger: Null pointer passed.\nFailure Mechanism: Dereference without check.\nImpact: Panic.",
+            "primary_subsystem": "net",
+            "affected_source_files": ["net/core/dev.c"]
+        }).to_string();
+
         let verify_json = json!({
             "verification_reasoning": "Caller checks pointer validity before invocation, so NULL dereference is impossible.",
             "is_false_positive": true,
@@ -1406,7 +1459,7 @@ mod tests {
             "relevant_code_locations": null
         }).to_string();
 
-        let provider = QueuedMockAiProvider::new(vec![verify_json]);
+        let provider = QueuedMockAiProvider::new(vec![normalize_json, verify_json]);
 
         let input = BugInput {
             problem: "NULL deref in net/core/dev.c".to_string(),
@@ -1442,6 +1495,9 @@ mod tests {
 
         let bug = db.get_bug(1).await.unwrap().unwrap();
         assert_eq!(bug.status, "dismissed");
+        assert_eq!(bug.problem, "net: dev: fix null dereference in dev_read()");
+        assert_eq!(bug.subsystems, vec!["net".to_string()]);
+        assert_eq!(bug.source_files, Some(vec!["net/core/dev.c".to_string()]));
     }
 
     #[tokio::test]
@@ -1459,8 +1515,7 @@ mod tests {
         let mut session = NormalizeSession {
             problem: "Memory leak in net/core/dev.c",
             reasoning: "Allocated buffer not freed on error path",
-            verification_reasoning: "Buffer allocated by dev_alloc() is not freed.",
-            verified_locations: "[{\"file\": \"net/core/dev.c\", \"line\": 100}]",
+            locations: "[{\"file\": \"net/core/dev.c\", \"line\": 100}]",
             maintainers_hint: Some(
                 "Detected Subsystems from MAINTAINERS: NETWORKING [GENERAL]".to_string(),
             ),
@@ -1573,12 +1628,13 @@ mod tests {
     #[tokio::test]
     async fn test_report_session() {
         let mock_provider = MockAiProvider {
-            response_text: "This is a Linux kernel issue in the codebase.\n\n    int *ptr = alloc();\n    if (!ptr)\n        return -ENOMEM;\n\nThe buffer is not freed.\n".to_string(),
+            response_text: "In dev_alloc(), the allocated buffer is not freed on error.\n\n    int *ptr = alloc();\n    if (!ptr)\n        return -ENOMEM;\n\nThe buffer is not freed.\n".to_string(),
         };
 
         let mut session = ReportSession {
             problem: "Memory leak in net/core/dev.c",
             severity: "High",
+            canonical_description: "Trigger: Netdev allocation failure.\nFailure Mechanism: Missing kfree() on error path.\nImpact: Memory leak.",
             severity_explanation: "Missing free",
             locations: None,
             introduced_in_commit: Some("11223344 (net: initial dev.c)"),
@@ -1609,21 +1665,21 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // 1. Verification
+        // 1. Normalization
+        let normalize_json = json!({
+            "canonical_title": "e1000: buffer overflow in e1000_clean_rx_irq()",
+            "canonical_description": "Trigger: Jumbo frame without adequate skb buffer.\nMechanism: Unchecked memcpy into skb->data.\nImpact: Kernel memory corruption.",
+            "primary_subsystem": "net/intel",
+            "affected_source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"]
+        }).to_string();
+
+        // 2. Verification
         let verify_json = json!({
             "verification_reasoning": "Buffer overflow occurs when size exceeds MTU.",
             "is_false_positive": false,
             "refutation_evidence": null,
             "impact_severity": "Critical",
             "relevant_code_locations": [{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]
-        }).to_string();
-
-        // 2. Normalization
-        let normalize_json = json!({
-            "canonical_title": "e1000: buffer overflow in e1000_clean_rx_irq()",
-            "canonical_description": "Trigger: Jumbo frame without adequate skb buffer.\nMechanism: Unchecked memcpy into skb->data.\nImpact: Kernel memory corruption.",
-            "primary_subsystem": "net/intel",
-            "affected_source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"]
         }).to_string();
 
         // 3. Tracing
@@ -1643,8 +1699,8 @@ mod tests {
         let report_text = "e1000: buffer overflow in e1000_clean_rx_irq()\n\n    memcpy(skb->data, buf, size);\n\nPotential buffer overflow when size > MTU.\n".to_string();
 
         let provider = QueuedMockAiProvider::new(vec![
-            verify_json,
             normalize_json,
+            verify_json,
             tracing_json,
             severity_json,
             report_text,
@@ -1744,20 +1800,20 @@ mod tests {
             .await
             .unwrap();
 
+        let normalize_json = json!({
+            "canonical_title": "e1000: buffer overflow in e1000_clean_rx_irq()",
+            "canonical_description": "Trigger: Jumbo frame.\nMechanism: memcpy.\nImpact: Crash.",
+            "primary_subsystem": "net/intel",
+            "affected_source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"]
+        })
+        .to_string();
+
         let verify_json = json!({
             "verification_reasoning": "Buffer overflow verified.",
             "is_false_positive": false,
             "refutation_evidence": null,
             "impact_severity": "High",
             "relevant_code_locations": [{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]
-        })
-        .to_string();
-
-        let normalize_json = json!({
-            "canonical_title": "e1000: buffer overflow in e1000_clean_rx_irq()",
-            "canonical_description": "Trigger: Jumbo frame.\nMechanism: memcpy.\nImpact: Crash.",
-            "primary_subsystem": "net/intel",
-            "affected_source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"]
         })
         .to_string();
 
@@ -1768,8 +1824,8 @@ mod tests {
         })
         .to_string();
 
-        // Verification, Normalization, Dedup (and enrichment stages 4-6 are skipped!)
-        let provider = QueuedMockAiProvider::new(vec![verify_json, normalize_json, dedup_json]);
+        // Normalization, Verification, Dedup (and enrichment stages 4-6 are skipped!)
+        let provider = QueuedMockAiProvider::new(vec![normalize_json, verify_json, dedup_json]);
 
         let input = BugInput {
             problem: "Buffer overflow in e1000 rx handler".to_string(),
