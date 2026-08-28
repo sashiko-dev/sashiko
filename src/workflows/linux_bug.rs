@@ -155,6 +155,8 @@ pub struct NormalizationJson {
     pub canonical_title: String,
     pub canonical_description: String,
     pub primary_subsystem: String,
+    #[serde(default)]
+    pub subsystems: Option<Vec<String>>,
     pub affected_source_files: Vec<String>,
 }
 
@@ -329,20 +331,22 @@ Reported Locations:
 {locations}
 {hint}
 Task:
-1. Determine the canonical subsystem for this defect (e.g. 'btrfs', 'net/sched', 'bpf', 'drm/i915', 'sched', 'mm'). Use git_log on the affected file(s) to observe the standard commit prefix used by kernel maintainers.
-2. Formulate a canonical title matching Linux kernel standards: '<subsystem>: <root cause in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
-3. Provide a detailed, structured canonical description:
+1. Determine the canonical primary subsystem for this defect (e.g. 'btrfs', 'net/sched', 'bpf', 'drm/i915', 'sched', 'mm'). Use git_log on the affected file(s) to observe the standard commit prefix used by kernel maintainers.
+2. Determine all relevant subsystems affected by this defect (including nested or parent subsystems, e.g. ['net', 'net/sched'], or multiple components touched across boundaries, e.g. ['iommu', 'arm64']).
+3. Formulate a canonical title matching Linux kernel standards: '<primary_subsystem>: <root cause in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+4. Provide a detailed, structured canonical description:
    - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect.
    - Call Chain / Execution Path: Detail the complete chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the problem.
    - Failure Mechanism: Detail the exact root cause and how the fault or resource corruption occurs.
    - Impact: Consequence of the failure (e.g. UAF, memory leak, deadlock, null pointer dereference, crash).
-4. List the affected source files.
+5. List the affected source files.
 
 Return ONLY a valid JSON object matching this schema:
 {{
   \"canonical_title\": \"btrfs: use-after-free in btrfs_cleanup_ordered_extents()\",
   \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
   \"primary_subsystem\": \"btrfs\",
+  \"subsystems\": [\"btrfs\", \"fs\"],
   \"affected_source_files\": [\"fs/btrfs/ordered-data.c\"]
 }}",
             problem = self.problem,
@@ -637,26 +641,33 @@ impl LlmSession for SeveritySession<'_> {
     }
 
     fn initial_user_prompt(&self) -> String {
+        let severity_guide = crate::prompt_bundle::kernel_severity_guide();
         format!(
-            "Verified Linux Kernel Vulnerability:
+            "Verified Linux Kernel Defect:
 Title: {title}
 Description:
 {description}
 Code Locations:
 {locations}
 
+---
+{severity_guide}
+---
+
 Task:
-Assess the severity of this defect and provide an explanation.
+Assess the severity of this defect and provide an explanation following the severity levels and calibration guidelines above.
+State your reasoning (consequence, triggering path, reachability) at the start of severity_explanation so the label is auditable.
 Options for severity: \"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\" (use \"Unknown\" if prerequisites or exploitability cannot be definitively determined).
 
 Return ONLY a valid JSON object matching:
 {{
   \"severity\": \"High\",
-  \"severity_explanation\": \"Explain attack prerequisites, required privileges, and blast radius...\"
+  \"severity_explanation\": \"Explain consequence, triggering path, reachability, attack prerequisites, required privileges, and blast radius...\"
 }}",
             title = self.canonical_title,
             description = self.canonical_description,
-            locations = self.locations
+            locations = self.locations,
+            severity_guide = severity_guide
         )
     }
 
@@ -1436,9 +1447,28 @@ pub async fn process_issue_worker(
     full_history.extend(norm_result.history);
     total_usage.accumulate(&norm_result.usage);
     let norm = norm_result.output;
+    let norm_subsystems = if let Some(ref subs) = norm.subsystems {
+        let mut list = Vec::new();
+        if !norm.primary_subsystem.trim().is_empty() {
+            list.push(norm.primary_subsystem.trim().to_string());
+        }
+        for s in subs {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && !list.iter().any(|item| item.eq_ignore_ascii_case(trimmed)) {
+                list.push(trimmed.to_string());
+            }
+        }
+        if list.is_empty() {
+            vec![norm.primary_subsystem.clone()]
+        } else {
+            list
+        }
+    } else {
+        vec![norm.primary_subsystem.clone()]
+    };
     info!(
-        "Stage 1 Complete: Normalized to '{}' in subsystem '{}'",
-        norm.canonical_title, norm.primary_subsystem
+        "Stage 1 Complete: Normalized to '{}' in subsystems '{:?}'",
+        norm.canonical_title, norm_subsystems
     );
 
     // Stage 2: Verification & Ground-Truth Confirmation
@@ -1472,7 +1502,6 @@ pub async fn process_issue_worker(
         });
         info!("Linux kernel candidate discarded: {}", reason);
         let logs = serde_json::to_string(&full_history).unwrap_or_default();
-        let norm_subsystems = vec![norm.primary_subsystem.clone()];
         db.update_bug_outcome(
             bug_row.id,
             crate::db::UpdateBugOutcomeParams {
@@ -1508,7 +1537,7 @@ pub async fn process_issue_worker(
     info!("--- Stage 3: Deduplication ---");
     let query_vector = extract_bug_vector(
         &norm.canonical_title,
-        std::slice::from_ref(&norm.primary_subsystem),
+        &norm_subsystems,
         &norm.affected_source_files,
         verified_locations.as_ref(),
     );
@@ -1536,7 +1565,7 @@ pub async fn process_issue_worker(
             let mut dedup_session = DedupSession {
                 candidate_problem: &norm.canonical_title,
                 candidate_locations: verified_locations.as_ref(),
-                candidate_subsystems: std::slice::from_ref(&norm.primary_subsystem),
+                candidate_subsystems: &norm_subsystems,
                 known_candidates: &candidate_bugs,
                 context_tag: context_tag.map(|s| s.to_string()),
             };
@@ -1664,7 +1693,6 @@ pub async fn process_issue_worker(
     // Stage 7: Final Database Write
     info!("--- Stage 7: Final Database Write ---");
     let logs_json = serde_json::to_string(&full_history).ok();
-    let norm_subsystems = vec![norm.primary_subsystem];
 
     db.update_bug_outcome(
         bug_row.id,

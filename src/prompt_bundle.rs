@@ -24,6 +24,15 @@ pub fn default_kernel_prompts_path() -> Result<PathBuf> {
     Ok(root.join("kernel"))
 }
 
+/// Returns the compiled-in content of `kernel/severity.md`.
+pub fn kernel_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "kernel/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("kernel/severity.md must exist in prompt bundle")
+}
+
 pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
     let root = prompt_bundle_root()?;
     let marker = root.join(COMPLETE_MARKER);
@@ -82,6 +91,14 @@ mod tests {
                 .iter()
                 .any(|(path, _)| *path == "kernel/review-core.md")
         );
+    }
+
+    #[test]
+    fn test_kernel_severity_guide_not_empty() {
+        let guide = kernel_severity_guide();
+        assert!(guide.contains("# Severity Levels"));
+        assert!(guide.contains("## Critical"));
+        assert!(guide.contains("## High"));
     }
 
     #[test]
