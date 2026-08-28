@@ -747,19 +747,21 @@ async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
         None => return "master".to_string(),
     };
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new("git")
-            .current_dir(tb.get_worktree_path())
-            .args(["rev-parse", "master"])
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                } else {
-                    None
+        let worktree = tb.get_worktree_path();
+        for ref_name in ["origin/master", "master", "HEAD"] {
+            if let Ok(output) = std::process::Command::new("git")
+                .current_dir(worktree)
+                .args(["rev-parse", ref_name])
+                .output()
+                && output.status.success()
+            {
+                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !sha.is_empty() {
+                    return sha;
                 }
-            })
-            .unwrap_or_else(|| "master".to_string())
+            }
+        }
+        "master".to_string()
     })
     .await
     .unwrap_or_else(|_| "master".to_string())
@@ -931,8 +933,58 @@ pub async fn prefetch_bug_locations(
                     .and_then(|v| v.as_str())
                     .map(str::trim);
 
-                let snippet_opt = if let Some(line) = line_opt {
-                    if line >= 1 && line <= lines.len() {
+                let snippet_opt = {
+                    let mut extracted = None;
+                    if let Some(sym) = sym_opt {
+                        let found_idx = lines
+                            .iter()
+                            .position(|l| {
+                                let trimmed = l.trim_start();
+                                trimmed.contains(sym)
+                                    && (trimmed.contains('(')
+                                        || trimmed.starts_with("static")
+                                        || trimmed.starts_with("int")
+                                        || trimmed.starts_with("void"))
+                            })
+                            .or_else(|| lines.iter().position(|l| l.contains(sym)));
+                        if let Some(idx) = found_idx {
+                            let line = idx + 1;
+                            if let Some((block_text, name)) =
+                                crate::worker::prefetch::extract_enclosing_block(&content, idx, idx)
+                            {
+                                let b_lines: Vec<&str> = block_text.lines().collect();
+                                let clamped_text = if b_lines.len() > MAX_BUG_SNIPPET_LINES {
+                                    let half = MAX_BUG_SNIPPET_LINES / 2;
+                                    let start = idx
+                                        .saturating_sub(half)
+                                        .min(lines.len().saturating_sub(MAX_BUG_SNIPPET_LINES));
+                                    let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
+                                    lines[start..end].join("\n")
+                                } else {
+                                    block_text
+                                };
+                                let reported_line = line_opt.unwrap_or(line);
+                                extracted = Some((
+                                    clamped_text,
+                                    name.or_else(|| Some(sym.to_string())),
+                                    reported_line,
+                                ));
+                            } else {
+                                let reported_line = line_opt.unwrap_or(line);
+                                let start = line.saturating_sub(20).max(1);
+                                let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
+                                let start_0 = start.saturating_sub(1);
+                                let text = lines[start_0..end].join("\n");
+                                extracted = Some((text, Some(sym.to_string()), reported_line));
+                            }
+                        }
+                    }
+
+                    if extracted.is_none()
+                        && let Some(line) = line_opt
+                        && line >= 1
+                        && line <= lines.len()
+                    {
                         let line_0 = line.saturating_sub(1);
                         if let Some((block_text, name)) =
                             crate::worker::prefetch::extract_enclosing_block(
@@ -950,52 +1002,21 @@ pub async fn prefetch_bug_locations(
                             } else {
                                 block_text
                             };
-                            Some((
+                            extracted = Some((
                                 clamped_text,
                                 name.or_else(|| sym_opt.map(str::to_string)),
                                 line,
-                            ))
+                            ));
                         } else {
                             let start = line.saturating_sub(30).max(1);
                             let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
                             let start_0 = start.saturating_sub(1);
                             let text = lines[start_0..end].join("\n");
-                            Some((text, sym_opt.map(str::to_string), line))
+                            extracted = Some((text, sym_opt.map(str::to_string), line));
                         }
-                    } else {
-                        None
                     }
-                } else if let Some(sym) = sym_opt {
-                    let found_idx = lines.iter().position(|l| l.contains(sym));
-                    if let Some(idx) = found_idx {
-                        let line = idx + 1;
-                        if let Some((block_text, name)) =
-                            crate::worker::prefetch::extract_enclosing_block(&content, idx, idx)
-                        {
-                            let b_lines: Vec<&str> = block_text.lines().collect();
-                            let clamped_text = if b_lines.len() > MAX_BUG_SNIPPET_LINES {
-                                let half = MAX_BUG_SNIPPET_LINES / 2;
-                                let start = idx
-                                    .saturating_sub(half)
-                                    .min(lines.len().saturating_sub(MAX_BUG_SNIPPET_LINES));
-                                let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
-                                lines[start..end].join("\n")
-                            } else {
-                                block_text
-                            };
-                            Some((clamped_text, name.or_else(|| Some(sym.to_string())), line))
-                        } else {
-                            let start = line.saturating_sub(20).max(1);
-                            let end = (start + MAX_BUG_SNIPPET_LINES).min(lines.len());
-                            let start_0 = start.saturating_sub(1);
-                            let text = lines[start_0..end].join("\n");
-                            Some((text, Some(sym.to_string()), line))
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+
+                    extracted
                 };
 
                 if let Some((block, sym_name, line_num)) = snippet_opt {
