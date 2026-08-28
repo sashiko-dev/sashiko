@@ -1779,6 +1779,41 @@
             }
         }
 
+        async function toggleBugLogs(slugOrId, sectionId, btn) {
+            const contentEl = document.getElementById(`${sectionId}-content`);
+            if (!contentEl) return;
+            if (contentEl.getAttribute('data-loaded') !== 'true') {
+                const prevText = btn.innerText;
+                btn.innerText = 'Loading...';
+                try {
+                    const isId = /^\d+$/.test(slugOrId);
+                    const queryParam = isId ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
+                    const res = await fetch(`/api/bug/logs?${queryParam}`);
+                    if (!res.ok) {
+                        contentEl.innerHTML = '<div style="color:var(--text-muted); padding:8px 0;">No interaction logs found for this bug.</div>';
+                    } else {
+                        const logsData = await res.json();
+                        let logs = [];
+                        if (Array.isArray(logsData)) {
+                            logs = logsData;
+                        } else if (typeof logsData === 'string') {
+                            try { logs = JSON.parse(logsData); } catch (e) { }
+                        }
+                        if (logs.length > 0) {
+                            contentEl.innerHTML = renderInteractionLogEntries(logs);
+                        } else {
+                            contentEl.innerHTML = '<div style="color:var(--text-muted); padding:8px 0;">No interaction log entries recorded.</div>';
+                        }
+                    }
+                    contentEl.setAttribute('data-loaded', 'true');
+                } catch (e) {
+                    contentEl.innerHTML = `<div style="color:var(--status-failed); padding:8px 0;">Failed to load logs: ${escapeHtml(e.message)}</div>`;
+                }
+                btn.innerText = prevText;
+            }
+            toggleCollapsible(sectionId, btn);
+        }
+
         function renderFindingsBadges(counts, status) {
             const { low = 0, medium = 0, high = 0, critical = 0 } = counts;
             if (low + medium + high + critical === 0) {
@@ -3024,29 +3059,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 `;
             }
 
-            let logs = [];
-            if (Array.isArray(data.logs)) {
-                logs = data.logs;
-            } else if (typeof data.logs === 'string') {
-                try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
-            }
-
-            let logsHtml = '';
-            if (logs.length > 0) {
-                const entriesHtml = renderInteractionLogEntries(logs);
-                const logSectionId = 'bug-logs-' + Math.random().toString(36).substr(2, 9);
-                logsHtml = `
-                    <div class="section">
-                        <h2 style="display:flex; align-items:center; gap:10px;">
-                            Pipeline Interaction Logs (${logs.length} entries)
-                            <button class="toggle-btn" onclick="toggleCollapsible('${logSectionId}', this)" style="font-size:0.8em; font-weight:normal;">▶ Show Logs</button>
-                        </h2>
-                        <div id="${logSectionId}" class="collapsible">
-                            <div>${entriesHtml}</div>
-                        </div>
+            const logSectionId = 'bug-logs-' + Math.random().toString(36).substr(2, 9);
+            const logsHtml = `
+                <div class="section">
+                    <h2 style="display:flex; align-items:center; gap:10px;">
+                        Pipeline Interaction Logs
+                        <button class="toggle-btn" onclick="toggleBugLogs('${escapeHtml(String(slugOrId))}', '${logSectionId}', this)" style="font-size:0.8em; font-weight:normal;">▶ Show Logs</button>
+                    </h2>
+                    <div id="${logSectionId}" class="collapsible">
+                        <div id="${logSectionId}-content" style="color: var(--text-muted); font-size: 13px; padding: 4px 0;">Loading logs...</div>
                     </div>
-                `;
-            }
+                </div>
+            `;
 
             let discoveredInHtml = '';
             if (data.discovered_in_patchset_id) {

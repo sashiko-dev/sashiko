@@ -1359,6 +1359,37 @@ impl Database {
         }
     }
 
+    pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT logs FROM bugs WHERE id = ?", libsql::params![id])
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(crate::compression::get_compressed_string_opt(&row, 0)
+                .unwrap_or(None)
+                .or_else(|| row.get::<Option<String>>(0).ok().flatten()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_bug_logs_by_slug(&self, slug: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT logs FROM bugs WHERE slug = ?",
+                libsql::params![slug],
+            )
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(crate::compression::get_compressed_string_opt(&row, 0)
+                .unwrap_or(None)
+                .or_else(|| row.get::<Option<String>>(0).ok().flatten()))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn lock_raw_bug(&self) -> Result<Option<Bug>> {
         let mut rows = self
             .conn
@@ -1490,7 +1521,7 @@ impl Database {
         // Query rows
         let select_sql = format!(
             "SELECT id, slug, status, problem, severity, severity_explanation, locations,
-                    subsystems, source_files, inline_review, logs, vector_json,
+                    subsystems, source_files, inline_review, NULL, vector_json,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
                     fixed_in_commit, raw_input, created_at
@@ -1595,7 +1626,7 @@ impl Database {
         _q: Option<&str>,
     ) -> Result<(Vec<Bug>, usize)> {
         let mut rows = self.conn.query(
-            "SELECT id, slug, status, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, logs, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed, fixed_in_commit, raw_input, created_at
+            "SELECT id, slug, status, problem, severity, severity_explanation, locations, subsystems, source_files, inline_review, NULL, vector_json, discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed, fixed_in_commit, raw_input, created_at
              FROM bugs
              ORDER BY id DESC LIMIT ? OFFSET ?",
             libsql::params![limit as i64, offset as i64],
@@ -1638,7 +1669,7 @@ impl Database {
             bug.inline_review = crate::compression::get_compressed_string_opt(&row, 9)
                 .unwrap_or_default()
                 .unwrap_or_default();
-            bug.logs = crate::compression::get_compressed_string_opt(&row, 10).unwrap_or_default();
+            bug.logs = None;
             bugs.push(bug);
         }
 
@@ -10225,7 +10256,7 @@ mod tests {
             Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
         );
 
-        // List bugs with search and filter
+        // List bugs with search and filter (logs omitted)
         let (list, total) = db
             .list_bugs(
                 Some(1),
@@ -10239,6 +10270,20 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, bug_id);
+        assert!(list[0].logs.is_none());
+
+        // Dedicated log retrieval
+        assert_eq!(
+            db.get_bug_logs(bug_id).await.unwrap().as_deref(),
+            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
+        );
+        assert_eq!(
+            db.get_bug_logs_by_slug("pb-test-1234")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
+        );
 
         // Link to review
         let thread_id = db.create_thread("t1", "subj", 100).await.unwrap();

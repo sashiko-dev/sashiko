@@ -314,6 +314,7 @@ pub fn build_router(
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/bug", get(get_bug))
         .route("/api/bugs", get(list_bugs))
+        .route("/api/bug/logs", get(get_bug_logs))
         .route("/api/bug/analyze", post(analyze_bug))
         .route("/bug/{slug}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
@@ -954,12 +955,41 @@ async fn get_bug(
     };
 
     match result {
-        Ok(Some(bug)) => Ok(Json(
-            serde_json::to_value(bug).unwrap_or(serde_json::json!({})),
-        )),
+        Ok(Some(mut bug)) => {
+            bug.logs = None;
+            Ok(Json(
+                serde_json::to_value(bug).unwrap_or(serde_json::json!({})),
+            ))
+        }
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!("Database error fetching preexisting bug: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_bug_logs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let result = if let Some(id) = query.id {
+        state.db.get_bug_logs(id).await
+    } else if let Some(ref slug) = query.slug {
+        state.db.get_bug_logs_by_slug(slug).await
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    match result {
+        Ok(Some(logs_str)) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&logs_str).unwrap_or(serde_json::Value::String(logs_str));
+            Ok(Json(parsed))
+        }
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Database error fetching bug logs: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1431,7 +1461,7 @@ mod tests {
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
-        let _bug_id = db
+        let bug_id = db
             .create_bug(&crate::db::NewBug {
                 verified_on_sha: None,
                 status: "raw".to_string(),
@@ -1474,7 +1504,7 @@ mod tests {
             .unwrap();
         });
 
-        // Test 1: get_bug by slug
+        // Test 1: get_bug by slug (logs omitted)
         let res = reqwest::get(format!("http://{}/api/bug?slug=pb-12345678", addr))
             .await
             .unwrap();
@@ -1482,7 +1512,22 @@ mod tests {
         let json: serde_json::Value = res.json().await.unwrap();
         assert_eq!(json["id"], "pb-12345678");
         assert_eq!(json["problem"], "UAF in test_device");
-        assert!(json["logs"].is_string());
+        assert!(json["logs"].is_null());
+
+        // Test 2: get_bug_logs by slug
+        let res_logs = reqwest::get(format!("http://{}/api/bug/logs?slug=pb-12345678", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_logs.status(), 200);
+        let logs_json: serde_json::Value = res_logs.json().await.unwrap();
+        assert!(logs_json.is_array());
+        assert_eq!(logs_json[0]["role"], "user");
+
+        // Test 2b: get_bug_logs by id
+        let res_logs_id = reqwest::get(format!("http://{}/api/bug/logs?id={}", addr, bug_id))
+            .await
+            .unwrap();
+        assert_eq!(res_logs_id.status(), 200);
 
         // Test 3: redirect_bug
         let client = reqwest::Client::builder()
