@@ -1262,8 +1262,8 @@
             selectedList: '',
             bugSubsystem: '',
             bugMinSeverity: '',
-            bugStatus: '',
-            bugSortBy: 'created_at',
+            bugStatus: 'open',
+            bugSortBy: 'severity',
             bugSortOrder: 'desc',
             patchsetId: null,
             patchsetPage: 1,
@@ -2038,7 +2038,6 @@
                 thead.innerHTML = `<tr>
                     <th style="cursor:pointer; user-select:none;" onclick="toggleBugSort('problem')" title="Sort by Problem">Problem${sortIndicator('problem')}</th>
                     <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('severity')" title="Sort by Severity">Severity${sortIndicator('severity')}</th>
-                    <th style="width:180px">Commits</th>
                     <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('created_at')" title="Sort by Date">Date${sortIndicator('created_at')}</th>
                     <th style="width:80px; cursor:pointer; user-select:none;" onclick="toggleBugSort('status')" title="Sort by Status">Status${sortIndicator('status')}</th>
                 </tr>`;
@@ -2179,9 +2178,6 @@
                     const sevColor = getSeverityColor(sevStr);
                     const sevHtml = `<span style="color: ${sevColor}; font-weight: bold;">${escapeHtml(sevStr)}</span>`;
                     
-                    const commitHtml = p.introduced_in_commit ? `<code style="font-size: 0.8em; margin-bottom: 2px;" title="${escapeHtml(formatCommitRef(p.introduced_in_commit))}">Introduced by: ${escapeHtml(formatCommitRef(p.introduced_in_commit))}</code><br>` : '';
-                    let idHtml = p.discovered_in_commit ? `<code style="font-size: 0.8em;">Reported on: ${escapeHtml(p.discovered_in_commit.substring(0,12))}</code>` : '';
-
                     const statusInfo = getBugStatus(p);
 
                     // Use created_at for bugs
@@ -2192,7 +2188,6 @@
                     row.innerHTML = `
                         <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
                         <td style="line-height:1.2;">${sevHtml}</td>
-                        <td style="line-height:1.2;"><div>${commitHtml}${idHtml}</div></td>
                         <td style="line-height:1.2;"><div>${dateStr}</div><div class="text-muted-sm">${timeStr}</div></td>
                         <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span></td>
                     `;
@@ -2306,13 +2301,15 @@
             if (state.listMode === 'bugs') {
                 state.bugSubsystem = '';
                 state.bugMinSeverity = '';
-                state.bugStatus = '';
+                state.bugStatus = 'open';
+                state.bugSortBy = 'severity';
+                state.bugSortOrder = 'desc';
                 const subInput = document.getElementById('bugSubsystemInput');
                 if (subInput) subInput.value = '';
                 const sevSel = document.getElementById('bugSeveritySelector');
                 if (sevSel) sevSel.value = '';
                 const statSel = document.getElementById('bugStatusSelector');
-                if (statSel) statSel.value = '';
+                if (statSel) statSel.value = 'open';
             }
             state.currentPage = 1;
             fetchListData();
@@ -2322,6 +2319,17 @@
             if (state.listMode === mode) return;
             state.listMode = mode;
             state.currentPage = 1;
+            if (mode === 'bugs') {
+                if (!state.bugStatus) {
+                    state.bugStatus = 'open';
+                    const statSel = document.getElementById('bugStatusSelector');
+                    if (statSel) statSel.value = 'open';
+                }
+                if (!state.bugSortBy) {
+                    state.bugSortBy = 'severity';
+                    state.bugSortOrder = 'desc';
+                }
+            }
             document.getElementById('btn-patchsets').classList.toggle('active', mode === 'patchsets');
             document.getElementById('btn-messages').classList.toggle('active', mode === 'messages');
             document.getElementById('btn-bugs').classList.toggle('active', mode === 'bugs');

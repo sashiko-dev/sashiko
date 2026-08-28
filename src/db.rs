@@ -1669,19 +1669,26 @@ impl Database {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let sort_col = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("severity") => "severity",
-            Some("problem") => "problem",
-            Some("status") => "status",
-            Some("id") => "id",
-            Some("bugid") => "bugid",
-            _ => "created_at",
-        };
         let sort_dir = match params.sort_order.map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("asc") => "ASC",
             _ => "DESC",
         };
-        let order_clause = format!("ORDER BY {} {}, id {}", sort_col, sort_dir, sort_dir);
+        let order_clause = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("severity") => {
+                format!("ORDER BY severity {}, created_at DESC, id DESC", sort_dir)
+            }
+            Some("problem") => {
+                format!("ORDER BY problem {}, created_at DESC, id DESC", sort_dir)
+            }
+            Some("status") => format!(
+                "ORDER BY status {}, severity DESC, created_at DESC, id DESC",
+                sort_dir
+            ),
+            Some("id") => format!("ORDER BY id {}", sort_dir),
+            Some("bugid") => format!("ORDER BY bugid {}, id {}", sort_dir, sort_dir),
+            Some("created_at") => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
+            _ => format!("ORDER BY severity {}, created_at DESC, id DESC", sort_dir),
+        };
 
         // Count total
         let count_sql = format!("SELECT COUNT(*) FROM bugs {}", where_clause);
