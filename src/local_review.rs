@@ -450,7 +450,14 @@ async fn review_single_patch(
         if let Some(sha) = patch_shas.get(&p.index) {
             let output = tokio::process::Command::new("git")
                 .current_dir(&worktree.path)
-                .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
+                .args([
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "--root",
+                    sha,
+                ])
                 .output()
                 .await;
             if let Ok(out) = output
@@ -669,6 +676,9 @@ async fn run_worker_in_worktree(
             patch_shas.insert(idx, commit_hash.clone());
             if let Ok(show) = worktree.get_commit_show(commit_hash).await {
                 patch_shows.insert(idx, show);
+            }
+            if let Ok(msg) = worktree.get_commit_message(commit_hash).await {
+                patch_messages.insert(idx, msg);
             }
             let subject = patches
                 .iter()
