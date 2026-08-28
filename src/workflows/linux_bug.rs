@@ -335,7 +335,7 @@ Task:
 2. Determine all relevant subsystems affected by this defect (including nested or parent subsystems, e.g. ['net', 'net/sched'], or multiple components touched across boundaries, e.g. ['iommu', 'arm64']).
 3. Formulate a canonical title matching Linux kernel standards: '<primary_subsystem>: <root cause in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
 4. Provide a detailed, structured canonical description:
-   - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect.
+   - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect. If reproducible only under special circumstances (e.g. on a 32-bit machine, specific architecture, or configuration), highlight it first (e.g. 'On a 32-bit architecture...').
    - Call Chain / Execution Path: Detail the complete chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the problem.
    - Failure Mechanism: Detail the exact root cause and how the fault or resource corruption occurs.
    - Impact: Consequence of the failure (e.g. UAF, memory leak, deadlock, null pointer dereference, crash).
@@ -714,33 +714,42 @@ Generate a technically thorough, precise, and objective explanation of the probl
 
 CRITICAL RULES:
 1. No titles, headers, or subject lines. NEVER start with "Defect Report:", "Report:", "Issue:", "Description:", or the bug title. Start immediately with the technical description of the defect.
-2. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
-3. No conversational filler or literature. Strictly objective and undramatic wording. Do NOT write "While reviewing...", "I noticed that...", "In the Linux kernel...", or concluding summaries.
-4. Detail the entire chain of events/calls and execution path leading to the problem:
-   - Explain the initial state or preconditions required to trigger the bug.
+   - If the problem is reproducible only under special circumstances (e.g. on a 32-bit architecture, specific config options, or specific hardware), highlight it first at the very beginning (e.g. "On a 32-bit architecture, ...").
+2. Conciseness and technical precision:
+   - Try to keep the description as short as possible while still explaining the problem in all details.
+   - Avoid redundant representations: you might not need to use both code snippets and a multi-cpu/columns diagram when one clear representation is sufficient.
+3. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
+4. No conversational filler or literature. Strictly objective and undramatic wording. Do NOT write "While reviewing...", "I noticed that...", "In the Linux kernel...", or concluding summaries.
+5. Detail the entire chain of events/calls and execution path leading to the problem:
+   - Explain the initial state, preconditions, or special circumstances required to trigger the bug (highlighting any special conditions such as 32-bit architecture upfront).
    - Detail the step-by-step chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the fault.
    - For all function names, ALWAYS use the format: func().
    - Clarify the precise root cause and failure mechanism (e.g. memory leak on error path, use-after-free, deadlock, null pointer dereference, race condition, integer overflow).
-5. Concurrency, Race Conditions, and Deadlocks (WHEN APPLICABLE):
+6. Concurrency, Race Conditions, and Deadlocks (WHEN APPLICABLE):
    - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
    - Do NOT use a multi-column timeline for non-concurrency defects (such as single-threaded leaks, null pointer dereferences on error paths, missing validation, buffer overflows) or for simple concurrency where concise prose or call-chains are already clear.
-6. Provide relevant kernel code snippets demonstrating the problematic lines and surrounding context:
+   - When a multi-column diagram is used, avoid adding redundant code snippets if the diagram already conveys the issue clearly.
+7. Relevant kernel code snippets (WHEN NEEDED):
+   - Keep code snippets short: cut all unnecessary parts using <...>.
+   - Highlight the most important or problematic parts with ^^^^^ underneath if necessary.
    - Format each snippet cleanly:
          // path/to/file.c
          int func(struct foo *bar) {
-             ...
-             <problematic lines>
+             <...>
+             problematic_call(bar);
+             ^^^^^^^^^^^^^^^^^^^^^^
+             <...>
          }
    - Indent code snippets with 4 spaces.
    - Do NOT mention raw line numbers in prose; refer to function names, call chains, or code snippets instead.
-7. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files).
-8. Do NOT use markdown code fences (```) or quote marks ('>').
-9. Format all text paragraphs to wrap at 75 characters per line to be compatible with LKML message formatting rules. Do not wrap code lines or ASCII diagrams.
-10. Ensure clear, readable paragraphs with blank lines between logical steps.
+8. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files).
+9. Do NOT use markdown code fences (```) or quote marks ('>').
+10. Format all text paragraphs to wrap at 75 characters per line to be compatible with LKML message formatting rules. Do not wrap code lines or ASCII diagrams.
+11. Ensure clear, readable paragraphs with blank lines between logical steps.
 
 EXAMPLES:
 
-Example 1 (General defect format):
+Example 1 (General defect format with short snippet and ^^^^^ highlight):
 
 In parse_durable_handle_context(), dh_info->fp is allocated and referenced
 when processing SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2.
@@ -758,11 +767,12 @@ file structure, resulting in a persistent reference count leak.
 
     // fs/smb/server/smb2pdu.c
     static int parse_durable_handle_context(...) {
-        ...
+        <...>
         rc = ksmbd_extract_sharename(share_name, ...);
         if (rc) {
             status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
             goto out_err;
+            ^^^^^^^^^^^^
         }
     }
 
@@ -798,6 +808,19 @@ A circular locking dependency occurs across three CPUs:
     6                            lock(&kvm->slots_lock);
     7                                                     lock(cpu_hotplug_lock);
     8   sync(&kvm->srcu);
+
+Example 4 (Defect reproducible only under special circumstances):
+
+On a 32-bit architecture, size_t is 32-bit and an integer overflow occurs
+when calculating the allocation size in snd_pcm_hw_params():
+
+    // sound/core/pcm_native.c
+    static int snd_pcm_hw_params(...) {
+        <...>
+        size = params->periods * params->period_bytes;
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        <...>
+    }
 "#.to_string()
     }
 
@@ -835,10 +858,12 @@ Locations:
 {code_section}
 Task:
 Write a detailed technical description of the problem.
+- Try to keep the description as short as possible while still explaining the problem in all details. Avoid redundancy: for example, you might not need to use both code snippets and a multi-cpu/columns diagram.
+- If the problem is reproducible only under special circumstances, e.g. on a 32-bit machine, highlight it first (e.g. 'On a 32-bit architecture...').
 - Detail the entire chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the failure.
 - Explain the precise root cause and failure mechanism in depth.
 - For race conditions, deadlocks, or multi-CPU concurrency bugs—and ONLY when it clearly improves clarity—you may illustrate the sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2). Do NOT use multi-column timelines for non-concurrency defects or where prose is already clear.
-- Include relevant code snippets from the verified codebase illustrating the defect.
+- Keep code snippets short, cut all unnecessary parts using <...>, and highlight the most important parts with ^^^^^ if necessary.
 - Format code snippets cleanly indented with 4 spaces (// path/to/file.c followed by function snippet).
 - NEVER use backticks (`) to quote names (variables, functions, symbols, or files).
 - For function names, ALWAYS use func() format.
@@ -2063,6 +2088,33 @@ mod tests {
         let runner = SessionRunner::new(&mock_provider);
         let res = runner.run(&mut session).await.unwrap();
         assert!(res.output.contains("int *ptr = alloc();"));
+    }
+
+    #[tokio::test]
+    async fn test_report_session_prompt_rules() {
+        let session = ReportSession {
+            problem: "Integer overflow in sound/core/pcm_native.c",
+            severity: "High",
+            canonical_description: "Trigger: 32-bit architecture allocation.\nFailure Mechanism: Overflow.\nImpact: Memory corruption.",
+            severity_explanation: "Buffer overflow",
+            locations: None,
+            introduced_in_commit: None,
+            tools: None,
+            context_tag: None,
+            prefetched_context: String::new(),
+        };
+
+        let sys_prompt = session.system_prompt();
+        assert!(sys_prompt.contains("On a 32-bit architecture"));
+        assert!(sys_prompt.contains("<...>"));
+        assert!(sys_prompt.contains("^^^^^"));
+        assert!(sys_prompt.contains("multi-cpu/columns diagram"));
+
+        let user_prompt = session.initial_user_prompt();
+        assert!(user_prompt.contains("32-bit machine"));
+        assert!(user_prompt.contains("<...>"));
+        assert!(user_prompt.contains("^^^^^"));
+        assert!(user_prompt.contains("multi-cpu/columns diagram"));
     }
 
     #[tokio::test]

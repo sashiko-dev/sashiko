@@ -142,7 +142,10 @@ flowchart TD
 * **Concurrency**: Unlocked.
 * **Tools**: None (`ToolScope::None`).
 * **Prompt Consistency**:
-  - Follow standard plain-text email style wrapped at 78 characters.
+  - Follow standard plain-text email style wrapped at 75 characters.
+  - Highlight special circumstances (e.g., 32-bit architecture) first at the start.
+  - Keep code snippets short, cutting unnecessary parts using `<...>`, and highlighting key lines with `^^^^^`.
+  - Keep description as short as possible while explaining all details, avoiding redundancy between code snippets and multi-CPU/column diagrams.
   - Code snippets indented with 4 spaces (no contradictory `>` instructions).
   - No backticks or markdown fences.
 * **Output**: Plain-text String.
