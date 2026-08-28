@@ -1130,6 +1130,37 @@ pub async fn ensure_remote(
                 );
             }
         }
+
+        // If we fetched 'origin', also keep local tracking branches (master/main) in sync
+        // with origin so local branches do not become stale over time.
+        if name == "origin" {
+            for default_branch in ["master", "main"] {
+                let remote_ref = format!("refs/remotes/origin/{}", default_branch);
+                let local_ref = format!("refs/heads/{}", default_branch);
+                let remote_exists = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["show-ref", "--verify", "-q", &remote_ref])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let local_exists = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["show-ref", "--verify", "-q", &local_ref])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if remote_exists && local_exists {
+                    let _ = Command::new("git")
+                        .current_dir(repo_path)
+                        .args(["update-ref", &local_ref, &remote_ref])
+                        .output()
+                        .await;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1870,6 +1901,92 @@ mod tests {
         let res2 = ensure_remote(&repo_path, "invalid", url, false).await;
         assert!(res2.is_err());
         assert!(res2.unwrap_err().to_string().contains("backing off"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_syncs_local_master_branch() -> Result<()> {
+        let remote_dir = tempfile::tempdir()?;
+        let local_dir = tempfile::tempdir()?;
+
+        // Init upstream remote repo with an initial commit on master
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["init", "-b", "master"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+        std::fs::write(remote_dir.path().join("file.txt"), "v1")?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["add", "file.txt"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["commit", "-m", "commit 1"])
+            .output()
+            .await?;
+
+        // Clone local repo from remote
+        Command::new("git")
+            .args([
+                "clone",
+                remote_dir.path().to_str().unwrap(),
+                local_dir.path().to_str().unwrap(),
+            ])
+            .output()
+            .await?;
+
+        // Add a second commit to upstream
+        std::fs::write(remote_dir.path().join("file.txt"), "v2")?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["commit", "-am", "commit 2"])
+            .output()
+            .await?;
+        let upstream_sha = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(remote_dir.path())
+                .args(["rev-parse", "master"])
+                .output()
+                .await?
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        // Run ensure_remote on local repo for 'origin'
+        ensure_remote(
+            local_dir.path(),
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+            true,
+        )
+        .await?;
+
+        // Verify local branch 'master' was updated to upstream_sha
+        let local_master_sha = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(local_dir.path())
+                .args(["rev-parse", "refs/heads/master"])
+                .output()
+                .await?
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(local_master_sha, upstream_sha);
 
         Ok(())
     }
