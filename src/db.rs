@@ -177,7 +177,15 @@ impl Severity {
             Severity::Critical => "Critical",
         }
     }
+}
 
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl Severity {
     pub fn from_i32(val: i32) -> Self {
         match val {
             4 => Severity::Critical,
@@ -214,7 +222,7 @@ pub struct Finding {
     pub locations: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Bug {
     #[serde(rename = "internal_id")]
     pub id: i64,
@@ -248,6 +256,53 @@ pub struct Bug {
     #[serde(default)]
     pub duplicate_of_id: Option<i64>,
     pub created_at: i64,
+}
+
+impl std::fmt::Debug for Bug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bug")
+            .field("id", &self.id)
+            .field("bugid", &self.bugid)
+            .field("status", &self.status)
+            .field("problem", &self.problem)
+            .field("severity", &self.severity)
+            .field("severity_explanation", &self.severity_explanation)
+            .field("locations", &self.locations)
+            .field("subsystems", &self.subsystems)
+            .field("source_files", &self.source_files)
+            .field("inline_review", &self.inline_review)
+            .field(
+                "logs",
+                &self.logs.as_ref().map(|l| format!("<{} bytes>", l.len())),
+            )
+            .field(
+                "vector_json",
+                &self
+                    .vector_json
+                    .as_ref()
+                    .map(|v| format!("<{} bytes>", v.len())),
+            )
+            .field("discovered_in_patchset_id", &self.discovered_in_patchset_id)
+            .field("discovered_in_patch_id", &self.discovered_in_patch_id)
+            .field("discovered_in_commit", &self.discovered_in_commit)
+            .field("introduced_in_commit", &self.introduced_in_commit)
+            .field("verified_on_sha", &self.verified_on_sha)
+            .field("is_fixed", &self.is_fixed)
+            .field("fixed_in_commit", &self.fixed_in_commit)
+            .field(
+                "raw_input",
+                &self
+                    .raw_input
+                    .as_ref()
+                    .map(|r| format!("<{} bytes>", r.len())),
+            )
+            .field("tokens_in", &self.tokens_in)
+            .field("tokens_out", &self.tokens_out)
+            .field("tokens_cached", &self.tokens_cached)
+            .field("duplicate_of_id", &self.duplicate_of_id)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 impl Bug {

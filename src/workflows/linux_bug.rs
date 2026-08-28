@@ -52,7 +52,7 @@ pub struct BugInput {
 }
 
 /// The result of processing a candidate Linux kernel bug through the pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum BugOutcome {
     /// The candidate bug was discarded (invalid, false positive, or Low/Medium severity).
@@ -68,6 +68,71 @@ pub enum BugOutcome {
     },
     /// The bug was confirmed as a newly discovered Linux kernel bug.
     NewlyDiscovered { bug: Bug },
+}
+
+impl std::fmt::Display for BugOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BugOutcome::NewlyDiscovered { bug } => {
+                write!(
+                    f,
+                    "newly discovered bug {} ({}) [severity: {}]",
+                    bug.id, bug.bugid, bug.severity
+                )
+            }
+            BugOutcome::Duplicate {
+                existing_bug,
+                reasoning,
+                ..
+            } => {
+                write!(
+                    f,
+                    "duplicate of bug {} ({}) - {}",
+                    existing_bug.id, existing_bug.bugid, reasoning
+                )
+            }
+            BugOutcome::Discarded { reason, .. } => {
+                write!(f, "discarded - {}", reason)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BugOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BugOutcome::Discarded { reason, logs } => f
+                .debug_struct("Discarded")
+                .field("reason", reason)
+                .field(
+                    "logs",
+                    &logs.as_ref().map(|l| format!("<{} bytes>", l.len())),
+                )
+                .finish(),
+            BugOutcome::Duplicate {
+                existing_bug,
+                reasoning,
+                logs,
+            } => f
+                .debug_struct("Duplicate")
+                .field("existing_bug_id", &existing_bug.id)
+                .field("existing_bug_bugid", &existing_bug.bugid)
+                .field("reasoning", reasoning)
+                .field(
+                    "logs",
+                    &logs.as_ref().map(|l| format!("<{} bytes>", l.len())),
+                )
+                .finish(),
+            BugOutcome::NewlyDiscovered { bug } => f
+                .debug_struct("NewlyDiscovered")
+                .field("id", &bug.id)
+                .field("bugid", &bug.bugid)
+                .field("status", &bug.status)
+                .field("problem", &bug.problem)
+                .field("severity", &bug.severity)
+                .finish(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

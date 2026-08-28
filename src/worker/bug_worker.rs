@@ -69,7 +69,7 @@ impl BugWorker {
                         .await
                         {
                             Ok(outcome) => {
-                                info!("Successfully processed raw bug {}: {:?}", bug.id, outcome);
+                                info!("Successfully processed raw bug {}: {}", bug.id, outcome);
                             }
                             Err(e) => {
                                 error!("Failed to process raw bug {}: {}", bug.id, e);
