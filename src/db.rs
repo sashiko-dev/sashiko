@@ -1436,6 +1436,25 @@ impl Database {
         }
     }
 
+    /// Recovers bugs that were left in the 'processing' state (e.g. from an unexpected process
+    /// crash or restart) by resetting their status back to 'raw' so they can be re-queued.
+    pub async fn recover_stale_processing_bugs(&self) -> Result<usize> {
+        let count = self
+            .conn
+            .execute(
+                "UPDATE bugs SET status = 'raw' WHERE status = 'processing'",
+                (),
+            )
+            .await?;
+        if count > 0 {
+            info!(
+                "Recovered {} stale processing bugs back to raw state",
+                count
+            );
+        }
+        Ok(count as usize)
+    }
+
     pub async fn update_bug_outcome(
         &self,
         id: i64,
@@ -10335,5 +10354,60 @@ mod tests {
         let all_bugs = db.list_all_bugs_for_vector_search().await.unwrap();
         assert_eq!(all_bugs.len(), 1);
         assert_eq!(all_bugs[0].id, bug_id);
+    }
+
+    #[tokio::test]
+    async fn test_recover_stale_processing_bugs() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let new_bug = NewBug {
+            verified_on_sha: None,
+            bugid: "linux-crash-recovery".to_string(),
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            severity: Severity::High,
+            problem: "Memory leak on crash".to_string(),
+            subsystems: vec!["kernel".to_string()],
+            source_files: None,
+            locations: None,
+            severity_explanation: None,
+            status: "raw".to_string(),
+            inline_review: String::new(),
+            logs: None,
+            vector_json: None,
+            introduced_in_commit: None,
+            is_fixed: false,
+            fixed_in_commit: None,
+            raw_input: None,
+            created_at: 100000,
+        };
+        let bug_id = db.create_bug(&new_bug).await.unwrap();
+
+        // Lock bug -> status becomes 'processing'
+        let locked = db.lock_raw_bug().await.unwrap().expect("should lock bug");
+        assert_eq!(locked.id, bug_id);
+        assert_eq!(locked.status, "processing");
+
+        // No more raw bugs available to lock
+        assert!(db.lock_raw_bug().await.unwrap().is_none());
+
+        // Simulate crash recovery
+        let recovered = db.recover_stale_processing_bugs().await.unwrap();
+        assert_eq!(recovered, 1);
+
+        // Bug should now be raw again and lockable
+        let locked_again = db
+            .lock_raw_bug()
+            .await
+            .unwrap()
+            .expect("should re-lock recovered bug");
+        assert_eq!(locked_again.id, bug_id);
+        assert_eq!(locked_again.status, "processing");
     }
 }

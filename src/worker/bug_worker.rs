@@ -24,6 +24,9 @@ impl BugWorker {
 
     pub async fn run(&self) {
         info!("Starting Bug Worker...");
+        if let Err(e) = self.db.recover_stale_processing_bugs().await {
+            error!("Failed to recover stale processing bugs on startup: {}", e);
+        }
         loop {
             match self.db.lock_raw_bug().await {
                 Ok(Some(bug)) => {
