@@ -858,6 +858,57 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
     .ok()
 }
 
+/// Deterministically executes git blame on candidate locations to identify an introducing commit
+/// as a fallback when LLM origin tracing cannot identify the commit.
+pub async fn deterministic_blame_fallback(
+    tools: Option<&Arc<ToolBox>>,
+    locations: &Option<Value>,
+    target_sha: &str,
+) -> Option<String> {
+    let tb = tools?;
+    let loc_arr = locations.as_ref()?.as_array()?;
+    let worktree = tb.get_worktree_path();
+
+    for loc in loc_arr {
+        let Some(file) = loc.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(line) = loc.get("line").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let blame_output = tokio::process::Command::new("git")
+            .current_dir(worktree)
+            .args(["-c", "safe.bareRepository=all"])
+            .args([
+                "blame",
+                "-L",
+                &format!("{},{}", line, line),
+                "--porcelain",
+                target_sha,
+                "--",
+                file,
+            ])
+            .output()
+            .await;
+
+        if let Some(out) = blame_output.ok().filter(|o| o.status.success()) {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(first_line) = stdout.lines().next() {
+                let sha = first_line.split_whitespace().next().unwrap_or("");
+                if !sha.is_empty() && !sha.chars().all(|c| c == '0') {
+                    info!(
+                        "Blame fallback identified introducing commit: {} for {}:{}",
+                        sha, file, line
+                    );
+                    return Some(sha.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Parses (file_path, line_number) pairs from Linux kernel stack traces, oops dumps,
 /// or panic call traces.
 pub fn parse_stack_trace(text: &str) -> Vec<(String, usize)> {
@@ -1424,8 +1475,13 @@ pub async fn process_issue_worker(
     };
     let tracing_result = tracing_runner.run(&mut tracing_session).await?;
     full_history.extend(tracing_result.history);
-    let introduced_in_commit =
-        format_commit(tools.as_ref(), tracing_result.output.introducing_commit_sha).await;
+    let introducing_commit_sha = match tracing_result.output.introducing_commit_sha {
+        Some(sha) => Some(sha),
+        None => {
+            deterministic_blame_fallback(tools.as_ref(), &verified_locations, &master_sha).await
+        }
+    };
+    let introduced_in_commit = format_commit(tools.as_ref(), introducing_commit_sha).await;
 
     // Stage 5: Severity & Impact Estimation (Enrichment)
     info!("--- Stage 5: Severity & Impact Calibration ---");
@@ -2183,5 +2239,62 @@ Call Trace:
             "Prefetch must trace renamed file and extract snippet: {}",
             res
         );
+    }
+
+    #[tokio::test]
+    async fn test_deterministic_blame_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let c_code = "int a = 1;\nint b = 2;\nint c = 3;\n";
+        std::fs::write(path.join("file.c"), c_code).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "file.c"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let head_commit = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .current_dir(path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let tb = Arc::new(ToolBox::new(path.to_path_buf(), None));
+        let locations = json!([
+            {
+                "file": "file.c",
+                "line": 2,
+            }
+        ]);
+
+        let sha = deterministic_blame_fallback(Some(&tb), &Some(locations), "HEAD").await;
+        assert_eq!(sha, Some(head_commit));
     }
 }
