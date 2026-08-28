@@ -1381,6 +1381,10 @@
             if (patchMatch) {
                 return { view: 'patchset', id: decodeURIComponent(patchMatch[1]), query };
             }
+            const bugLogMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)\/log$/) || hash.match(/^#\/log\/bug\/(.+)$/);
+            if (bugLogMatch) {
+                return { view: 'bug_log', id: decodeURIComponent(bugLogMatch[1]), query };
+            }
             const bugMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)$/);
             if (bugMatch) {
                 return { view: 'bug', id: decodeURIComponent(bugMatch[1]), query };
@@ -1474,6 +1478,9 @@
                         break;
                     case 'bug':
                         await renderBugView(route.id);
+                        break;
+                    case 'bug_log':
+                        await renderBugLogView(route.id);
                         break;
                     case 'message':
                         await renderMessageView(route.id);
@@ -1865,41 +1872,6 @@
                 el.classList.add('open');
                 if (btn) btn.innerText = btn.innerText.replace('▶', '▼');
             }
-        }
-
-        async function toggleBugLogs(slugOrId, sectionId, btn) {
-            const contentEl = document.getElementById(`${sectionId}-content`);
-            if (!contentEl) return;
-            if (contentEl.getAttribute('data-loaded') !== 'true') {
-                const prevText = btn.innerText;
-                btn.innerText = 'Loading...';
-                try {
-                    const isId = /^\d+$/.test(slugOrId);
-                    const queryParam = isId ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
-                    const res = await fetch(`/api/bug/logs?${queryParam}`);
-                    if (!res.ok) {
-                        contentEl.innerHTML = '<div style="color:var(--text-muted); padding:8px 0;">No interaction logs found for this bug.</div>';
-                    } else {
-                        const logsData = await res.json();
-                        let logs = [];
-                        if (Array.isArray(logsData)) {
-                            logs = logsData;
-                        } else if (typeof logsData === 'string') {
-                            try { logs = JSON.parse(logsData); } catch (e) { }
-                        }
-                        if (logs.length > 0) {
-                            contentEl.innerHTML = renderInteractionLogEntries(logs);
-                        } else {
-                            contentEl.innerHTML = '<div style="color:var(--text-muted); padding:8px 0;">No interaction log entries recorded.</div>';
-                        }
-                    }
-                    contentEl.setAttribute('data-loaded', 'true');
-                } catch (e) {
-                    contentEl.innerHTML = `<div style="color:var(--status-failed); padding:8px 0;">Failed to load logs: ${escapeHtml(e.message)}</div>`;
-                }
-                btn.innerText = prevText;
-            }
-            toggleCollapsible(sectionId, btn);
         }
 
         function renderFindingsBadges(counts, status) {
@@ -3204,19 +3176,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 `;
             }
 
-            const logSectionId = 'bug-logs-' + Math.random().toString(36).substr(2, 9);
-            const logsHtml = `
-                <div class="section">
-                    <h2 style="display:flex; align-items:center; gap:10px;">
-                        Pipeline Interaction Logs
-                        <button class="toggle-btn" onclick="toggleBugLogs('${escapeHtml(String(slugOrId))}', '${logSectionId}', this)" style="font-size:0.8em; font-weight:normal;">▶ Show Logs</button>
-                    </h2>
-                    <div id="${logSectionId}" class="collapsible">
-                        <div id="${logSectionId}-content" style="color: var(--text-muted); font-size: 13px; padding: 4px 0;">Loading logs...</div>
-                    </div>
-                </div>
-            `;
-
             let reportedByHtml = 'Sashiko patch review';
             if (data.discovered_in_patchset_id) {
                 reportedByHtml += ` (<a href="#/patchset/${encodeURIComponent(data.discovered_in_patchset_id)}">details</a>)`;
@@ -3227,6 +3186,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             }
 
             const statusDetailHtml = `<strong style="color:${statusInfo.color};">${statusInfo.label}</strong>${data.fixed_in_commit ? ` (commit <code>${escapeHtml(formatCommitRef(data.fixed_in_commit))}</code>)` : ''}`;
+            const bugRef = encodeURIComponent(data.bugid || data.slug || data.id);
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
@@ -3242,12 +3202,56 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Reported by:</div><div>${reportedByHtml}</div></div>
                     ${data.duplicate_of ? `<div class="kv"><div class="label">Duplicate of:</div><div><a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid || data.duplicate_of.id)}" style="font-weight:bold; color:var(--accent); text-decoration:none;">${escapeHtml(data.duplicate_of.bugid || data.duplicate_of.id)}</a>: ${escapeHtml(data.duplicate_of.problem || '')}</div></div>` : ''}
                     ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none; margin-right:6px;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
-                    ${(data.tokens_in || data.tokens_out) ? `<div class="kv"><div class="label">Token Usage:</div><div><code>Prompt: ${data.tokens_in || 0} | Completion: ${data.tokens_out || 0}${data.tokens_cached ? ` | Cached: ${data.tokens_cached}` : ''} | Total: ${(data.tokens_in || 0) + (data.tokens_out || 0)}</code></div></div>` : ''}
+                    <div class="kv"><div class="label">Logs:</div><div><a href="#/bug/${bugRef}/log" style="font-weight:600;">View Pipeline Logs &rarr;</a></div></div>
                 </div>
 
                 ${inlineReviewHtml}
                 ${rawInputHtml}
-                ${logsHtml}
+            `;
+        }
+
+        async function renderBugLogView(slugOrId) {
+            const isId = /^\d+$/.test(slugOrId);
+            const queryParam = isId ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
+            const [bugRes, logRes] = await Promise.all([
+                fetch(`/api/bug?${queryParam}`),
+                fetch(`/api/bug/logs?${queryParam}`)
+            ]);
+            if (!bugRes.ok) throw new Error('Linux Kernel Bug not found');
+            const data = await bugRes.json();
+            const logs = logRes.ok ? await logRes.json() : [];
+
+            document.title = `${config.project_name || 'Sashiko'} - Logs for Bug ${(data.bugid || data.slug || data.id)}`;
+
+            const sevStr = data.severity || 'Unknown';
+            const sevColor = getSeverityColor(sevStr);
+            const statusInfo = getBugStatus(data);
+
+            const bugRef = encodeURIComponent(data.bugid || data.slug || data.id);
+            const tokensPrompt = data.tokens_in || 0;
+            const tokensCompletion = data.tokens_out || 0;
+            const tokensCached = data.tokens_cached || 0;
+            const tokensTotal = tokensPrompt + tokensCompletion;
+
+            const logsHtml = renderInteractionLogEntries(logs);
+
+            document.getElementById('app').innerHTML = `
+                <div class="nav"><a href="#/bug/${bugRef}" onclick="event.preventDefault(); navigate('#/bug/${bugRef}');">← Back to Bug</a></div>
+                <h1>
+                    <span>Pipeline Logs: ${escapeHtml(data.problem || 'Linux Kernel Bug')}</span>
+                </h1>
+
+                <div class="section">
+                    <div class="kv"><div class="label">Bug:</div><div><a href="#/bug/${bugRef}" style="font-weight:bold;">${escapeHtml(data.bugid || data.slug || data.id)}</a>: ${escapeHtml(data.problem || '')}</div></div>
+                    <div class="kv"><div class="label">Severity:</div><div><strong style="color:${sevColor}">${escapeHtml(sevStr)}</strong></div></div>
+                    <div class="kv"><div class="label">Status:</div><div><strong style="color:${statusInfo.color};">${statusInfo.label}</strong></div></div>
+                    <div class="kv"><div class="label">Token Usage:</div><div><code>Prompt: ${tokensPrompt} | Completion: ${tokensCompletion}${tokensCached ? ` | Cached: ${tokensCached}` : ''} | Total: ${tokensTotal}</code></div></div>
+                </div>
+
+                <div class="section">
+                    <h2>Pipeline Interaction Logs</h2>
+                    <div>${logsHtml}</div>
+                </div>
             `;
         }
 
