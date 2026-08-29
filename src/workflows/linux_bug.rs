@@ -717,88 +717,114 @@ Generate a technically thorough, precise, and objective explanation of the probl
 
 CRITICAL RULES:
 1. No titles, headers, or subject lines. NEVER start with "Defect Report:", "Report:", "Issue:", "Description:", or the bug title. Start immediately with the technical description of the defect.
-   - If the problem is reproducible only under special circumstances (e.g. on a 32-bit architecture, specific config options, or specific hardware), highlight it first at the very beginning (e.g. "On a 32-bit architecture, ...").
-2. Conciseness and technical precision:
-   - Try to keep the description as short as possible while still explaining the problem in all details.
-   - Avoid redundant representations: you might not need to use both code snippets and a multi-cpu/columns diagram when one clear representation is sufficient.
-3. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
-4. No conversational filler or literature. Strictly objective and undramatic wording. Do NOT write "While reviewing...", "I noticed that...", "In the Linux kernel...", or concluding summaries.
-5. Detail the entire chain of events/calls and execution path leading to the problem:
-   - Explain the initial state, preconditions, or special circumstances required to trigger the bug (highlighting any special conditions such as 32-bit architecture upfront).
-   - Detail the step-by-step chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the fault.
-   - For all function names, ALWAYS use the format: func().
+2. Lead with the symptom and broken invariant:
+   - The very first sentence must state what goes wrong, in which function/subsystem, and under what condition.
+   - If the problem is reproducible only under special circumstances (e.g. on a 32-bit architecture, specific config options, or specific hardware), highlight it first at the very beginning of the opening sentence (e.g. "On a 32-bit architecture, ...").
+3. Anti-Lecture Directive (Maintainer Audience):
+   - Assume the reader is an experienced Linux kernel maintainer.
+   - Do NOT explain basic kernel mechanics (how RCU works, what spinlocks do, what workqueues or slab caches are). Focus strictly on the broken contract or invariant in this code.
+4. Conciseness and technical precision:
+   - Keep the entire description concise: ideally 1 to 2 cohesive paragraphs.
+   - Do NOT output vertical ASCII call-trees (e.g. func_a() -> func_b() -> func_c()). Refer to callers or flow inline within prose (e.g. "when called from func_a()").
    - Clarify the precise root cause and failure mechanism (e.g. memory leak on error path, use-after-free, deadlock, null pointer dereference, race condition, integer overflow).
-6. Concurrency, Race Conditions, and Deadlocks (WHEN APPLICABLE):
-   - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
-   - Do NOT use a multi-column timeline for non-concurrency defects (such as single-threaded leaks, null pointer dereferences on error paths, missing validation, buffer overflows) or for simple concurrency where concise prose or call-chains are already clear.
-   - When a multi-column diagram is used, avoid adding redundant code snippets if the diagram already conveys the issue clearly.
-7. Relevant kernel code snippets (WHEN NEEDED):
-   - Keep code snippets short: cut all unnecessary parts using <...>.
-   - Highlight the most important or problematic parts with ^^^^^ underneath if necessary.
-   - Format each snippet cleanly:
-         // path/to/file.c
-         int func(struct foo *bar) {
-             <...>
-             problematic_call(bar);
-             ^^^^^^^^^^^^^^^^^^^^^^
-             <...>
+   - State the immediate technical consequence directly (e.g. memory leak, panic, use-after-free, deadlock). Avoid generic security hyperbole.
+   - Argue once: do NOT include conversational filler or literature ("While reviewing...", "I noticed that...", "In the Linux kernel..."), defensive rationalizations, or concluding summaries.
+5. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
+6. Relevant kernel code snippets (WHEN NEEDED):
+   - When a code snippet clarifies the defect, format it cleanly with:
+         // <filepath>:<start_line>-<end_line>
+         return_type func_name(args)
+         {
+         	< ... >
+         	problematic_code();
+         	^^^^^^^^^^^^^^^^^^ // brief comment explaining the invariant broken
+         	< ... >
          }
-   - Indent code snippets with 4 spaces.
-   - Do NOT mention raw line numbers in prose; refer to function names, call chains, or code snippets instead.
+   - Preserve the EXACT indentation (tabs/spaces) verbatim from the source code. Do NOT convert tabs to spaces.
+   - Indent the < ... > (or <...>) omission marker to match the surrounding block's indentation level. Cut all unnecessary parts.
+   - Highlight the most important or problematic parts with ^^^^^ underneath if necessary.
+   - Keep snippets concise (maximum 4-6 lines of code).
+   - Do NOT mention raw line numbers in prose; refer to function names or the snippet header instead.
+7. Concurrency, Race Conditions, and Deadlocks (WHEN APPLICABLE):
+   - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
+   - Mutual Exclusivity: NEVER use both a multi-cpu/columns diagram and a code snippet for the same defect. Choose the single clearer representation.
+   - Do NOT use a multi-column timeline for non-concurrency defects (such as single-threaded leaks, null pointer dereferences on error paths, missing validation, buffer overflows) or for simple concurrency where concise prose is already clear.
 8. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files).
 9. Do NOT use markdown code fences (```) or quote marks ('>').
 10. Format all text paragraphs to wrap at 75 characters per line to be compatible with LKML message formatting rules. Do not wrap code lines or ASCII diagrams.
 11. Ensure clear, readable paragraphs with blank lines between logical steps.
 
+PRE-FLIGHT SELF-CHECK:
+Before outputting, verify:
+- Does sentence 1 state the symptom and broken invariant?
+- Are generic kernel tutorials omitted?
+- Are vertical call trees omitted?
+- Are code snippets under 6 lines, formatted with // <filepath>:<start_line>-<end_line> and verbatim indentation?
+- Are code snippets and ASCII timelines mutually exclusive?
+- Is all prose hard-wrapped at 75 columns?
+
 EXAMPLES:
 
-Example 1 (General defect format with short snippet and ^^^^^ highlight):
+Example 1 (Type mismatch / signedness / boundary check with code snippet and carets):
 
-In parse_durable_handle_context(), dh_info->fp is allocated and referenced
-when processing SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2.
+In rnbd_clt_init_dev(), dev_id is declared as an unsigned u32, but
+ida_alloc_max() returns a signed int that can be negative on error:
 
-The chain of events leading to the resource leak is as follows:
-smb2_open()
-  -> create_smb2_pipe() or create_file()
-    -> parse_durable_handle_context()
-      Allocates dh_info->fp with ksmbd_lookup_fd_fast().
-
-If conflicting create flags are present or if ksmbd_extract_sharename()
-fails subsequently in parse_durable_handle_context(), the function takes
-an early error exit path without calling ksmbd_fd_put() on the allocated
-file structure, resulting in a persistent reference count leak.
-
-    // fs/smb/server/smb2pdu.c
-    static int parse_durable_handle_context(...) {
-        <...>
-        rc = ksmbd_extract_sharename(share_name, ...);
-        if (rc) {
-            status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
-            goto out_err;
-            ^^^^^^^^^^^^
-        }
+    // drivers/block/rnbd/rnbd-clt.c:567-587
+    static int rnbd_clt_init_dev(struct rnbd_clt_dev *dev)
+    {
+    	u32 dev_id;
+    	< ... >
+    	dev_id = ida_alloc_max(&rnbd_clt_ida, MAX_DEVICES, GFP_KERNEL);
+    	if (dev_id < 0) {
+    		^^^^^^^^^^ // always false for u32: negative error code wraps
+    		return dev_id;
+    	}
+    	< ... >
     }
 
-Example 2 (Race condition multi-column timeline, when clearly helpful):
+Because dev_id is unsigned, negative error codes wrap to large positive
+integers. The error check is bypassed, causing the function to proceed
+with an invalid identifier and corrupt subsequent array indexing.
 
-There is a race condition between dequeue and unlock operations:
+Example 2 (Resource / lock leak on error path with code snippet and carets):
 
-    CPU0                                CPU1
-    ----                                ----
-    rt_mutex_lock(l)
-    lock(l->wait_lock)
-    l->owner = T1 | HAS_WAITERS;
-    unlock(l->wait_lock)
-                                        rt_mutex_unlock(l)
-                                        cmpxchg(l->owner, T1, NULL)
-                                          ===> Success (l->owner = NULL)
-    lock(l->wait_lock)
-    fixup_rt_mutex_waiters()
-      owner = l->owner & ~HAS_WAITERS;
-      l->owner = owner;
-        ===> Stale owner T1 restored!
+In parse_durable_handle_context(), if conflicting create flags are present
+or if ksmbd_extract_sharename() fails, the function takes an early error
+exit path without releasing the allocated file structure:
 
-Example 3 (Deadlock multi-column timeline, when clearly helpful):
+    // fs/smb/server/smb2pdu.c:2450-2480
+    static int parse_durable_handle_context(...)
+    {
+    	< ... >
+    	rc = ksmbd_extract_sharename(share_name, ...);
+    	if (rc) {
+    		status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
+    		goto out_err;
+    		^^^^^^^^^^^^ // leaks dh_info->fp without ksmbd_fd_put()
+    	}
+    	< ... >
+    }
+
+This results in a persistent reference count leak whenever invalid create
+parameters or corrupted sharenames are processed.
+
+Example 3 (Race condition multi-column timeline, when clearly helpful):
+
+In xc5000_release(), cancel_delayed_work() does not wait for timer_sleep
+to finish if it is already running, racing with kfree():
+
+    CPU0 (release thread)                  | CPU1 (delayed worker)
+    ---------------------------------------+---------------------------------------
+    xc5000_release()                       | xc5000_do_timer_sleep()
+      cancel_delayed_work()                |
+      kfree(priv);                         |
+                                           | priv->timer_active = 0; // UAF
+
+This causes xc5000_do_timer_sleep() to access freed memory when tuner
+shutdown coincides with an expiring sleep timer.
+
+Example 4 (Deadlock multi-column timeline, when clearly helpful):
 
 A circular locking dependency occurs across three CPUs:
 
@@ -812,17 +838,18 @@ A circular locking dependency occurs across three CPUs:
     7                                                     lock(cpu_hotplug_lock);
     8   sync(&kvm->srcu);
 
-Example 4 (Defect reproducible only under special circumstances):
+Example 5 (Defect reproducible only under special circumstances):
 
 On a 32-bit architecture, size_t is 32-bit and an integer overflow occurs
 when calculating the allocation size in snd_pcm_hw_params():
 
-    // sound/core/pcm_native.c
-    static int snd_pcm_hw_params(...) {
-        <...>
-        size = params->periods * params->period_bytes;
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        <...>
+    // sound/core/pcm_native.c:450-475
+    static int snd_pcm_hw_params(...)
+    {
+    	< ... >
+    	size = params->periods * params->period_bytes;
+    	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ // overflows 32-bit size_t
+    	< ... >
     }
 "#.to_string()
     }
@@ -861,16 +888,27 @@ Locations:
 {code_section}
 Task:
 Write a detailed technical description of the problem.
-- Try to keep the description as short as possible while still explaining the problem in all details. Avoid redundancy: for example, you might not need to use both code snippets and a multi-cpu/columns diagram.
-- If the problem is reproducible only under special circumstances, e.g. on a 32-bit machine, highlight it first (e.g. 'On a 32-bit architecture...').
-- Detail the entire chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the failure.
+- Lead with the symptom: The very first sentence must state what goes wrong, in which function/subsystem, and under what condition.
+- If the problem is reproducible only under special circumstances, e.g. on a 32-bit machine, highlight it first upfront in sentence 1 (e.g. 'On a 32-bit architecture...').
+- Anti-Lecture: Do NOT explain generic kernel concepts (RCU, spinlocks, workqueues). Focus strictly on the broken invariant in this code.
+- Keep the description to 1 to 2 cohesive paragraphs. Avoid vertical call-trees (e.g. func_a() -> func_b() -> func_c()); refer to callers inline instead.
+- Avoid generic security hyperbole; state concrete technical consequences (e.g. memory leak, panic, use-after-free, deadlock).
 - Explain the precise root cause and failure mechanism in depth.
-- For race conditions, deadlocks, or multi-CPU concurrency bugs—and ONLY when it clearly improves clarity—you may illustrate the sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2). Do NOT use multi-column timelines for non-concurrency defects or where prose is already clear.
-- Keep code snippets short, cut all unnecessary parts using <...>, and highlight the most important parts with ^^^^^ if necessary.
-- Format code snippets cleanly indented with 4 spaces (// path/to/file.c followed by function snippet).
+- For race conditions, deadlocks, or multi-CPU concurrency bugs—and ONLY when it clearly improves clarity—you may illustrate the sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
+- Mutual Exclusivity: NEVER use both code snippets and a multi-cpu/columns diagram. Choose the single clearer representation. Do NOT use multi-column timelines for non-concurrency defects.
+- Code snippets: When helpful, include a concise snippet (max 4-6 lines of code) formatted as:
+      // <filepath>:<start_line>-<end_line>
+      return_type func_name(args)
+      {{
+      \t< ... >
+      \tproblematic_code();
+      \t^^^^^^^^^^^^^^^^^^ // brief comment explaining the invariant broken
+      \t< ... >
+      }}
+  Preserve verbatim source indentation (tabs). Cut all unnecessary parts using < ... > (or <...>). Highlight the most important parts with ^^^^^ if necessary.
+- NEVER mention line numbers in prose; refer to function names or the snippet header instead.
 - NEVER use backticks (`) to quote names (variables, functions, symbols, or files).
 - For function names, ALWAYS use func() format.
-- NEVER mention line numbers in prose; refer to function names, call chains, or code snippets instead.
 - Format all text paragraphs hard-wrapped at 75 characters per line (LKML standard). Do not wrap code lines or ASCII diagrams.
 - Raw plain text only, no markdown fences, no quote marks ('>').
 - Do NOT provide fix recommendations, remediation advice, or patches.
