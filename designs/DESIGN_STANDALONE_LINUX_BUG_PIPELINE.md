@@ -93,7 +93,7 @@ flowchart TD
   }
   ```
 * **Canonical Conventions**:
-  - `canonical_title`: `<subsystem>: <root cause in function_name()>` (e.g. `btrfs: use-after-free in btrfs_cleanup_ordered_extents()`). Strict limit of <80 characters, no backticks, no markdown.
+  - `canonical_title`: `<subsystem>: <defect or broken invariant in function_name()>` (e.g. `btrfs: use-after-free in btrfs_cleanup_ordered_extents()`). Strict limit of <80 characters, no backticks, no markdown. Must describe the defect itself, avoiding patch/fix imperative action verbs (e.g., 'fix', 'resolve', 'prevent', 'avoid').
   - `canonical_description`: Structured summary covering trigger conditions, execution path, and failure mechanism.
   - `primary_subsystem`: Canonical short subsystem identifier (e.g. `net`, `bpf`, `btrfs`, `sched`, `drm/amdgpu`).
 

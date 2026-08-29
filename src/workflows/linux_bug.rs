@@ -333,7 +333,8 @@ Reported Locations:
 Task:
 1. Determine the canonical primary subsystem for this defect (e.g. 'btrfs', 'net/sched', 'bpf', 'drm/i915', 'sched', 'mm'). Use git_log on the affected file(s) to observe the standard commit prefix used by kernel maintainers.
 2. Determine all relevant subsystems affected by this defect (including nested or parent subsystems, e.g. ['net', 'net/sched'], or multiple components touched across boundaries, e.g. ['iommu', 'arm64']).
-3. Formulate a canonical title matching Linux kernel standards: '<primary_subsystem>: <root cause in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+3. Formulate a canonical title matching Linux kernel subsystem conventions: '<primary_subsystem>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+   - CRITICAL: This is a bug report title describing an existing defect, NOT a patch or commit title. Do NOT use patch/fix action verbs like 'fix', 'resolve', 'prevent', 'avoid', or 'handle'. State the defect directly (e.g. 'btrfs: use-after-free in btrfs_cleanup_ordered_extents()' or 'iommu/rockchip: array compaction flaw in rk_iommu_probe()', NEVER 'iommu/rockchip: fix array compaction flaw in rk_iommu_probe()').
 4. Provide a detailed, structured canonical description:
    - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect. If reproducible only under special circumstances (e.g. on a 32-bit machine, specific architecture, or configuration), highlight it first (e.g. 'On a 32-bit architecture...').
    - Call Chain / Execution Path: Detail the complete chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the problem.
@@ -380,7 +381,8 @@ Return ONLY a valid JSON object matching this schema:
         let text = response.content.as_deref().unwrap_or("");
         let parsed: NormalizationJson = crate::workflow::output::parse_json_from_text(text)
             .map_err(|e| ValidationError::FormatViolation(e.to_string()))?;
-        if parsed.canonical_title.trim().is_empty() {
+        let title = parsed.canonical_title.trim();
+        if title.is_empty() {
             return Err(ValidationError::FormatViolation(
                 "canonical_title cannot be empty".into(),
             ));
@@ -390,6 +392,36 @@ Return ONLY a valid JSON object matching this schema:
                 "primary_subsystem cannot be empty".into(),
             ));
         }
+
+        let desc = if let Some((_, rest)) = title.split_once(':') {
+            rest.trim().to_ascii_lowercase()
+        } else {
+            title.to_ascii_lowercase()
+        };
+        const FORBIDDEN_PREFIXES: &[&str] = &[
+            "fix ",
+            "fixes ",
+            "fixing ",
+            "resolve ",
+            "resolves ",
+            "resolving ",
+            "prevent ",
+            "prevents ",
+            "preventing ",
+            "avoid ",
+            "avoids ",
+            "avoiding ",
+        ];
+        if FORBIDDEN_PREFIXES
+            .iter()
+            .any(|prefix| desc.starts_with(prefix))
+        {
+            return Err(ValidationError::FormatViolation(format!(
+                "canonical_title must describe the defect rather than a patch/fix; do not use patch action verbs like 'fix', 'prevent', or 'avoid' after the subsystem prefix. Got: '{}'",
+                title
+            )));
+        }
+
         Ok(parsed)
     }
 }
@@ -1892,7 +1924,7 @@ mod tests {
         };
 
         let mut session = VerifySession {
-            title: "net: dev: fix memory leak in dev_alloc()",
+            title: "net: dev: memory leak in dev_alloc()",
             description: "Trigger: Netdev allocation failure.\nFailure Mechanism: Missing kfree() on error path.\nImpact: Memory leak.",
             subsystem: "net",
             affected_files: &["net/core/dev.c".to_string()],
@@ -1924,7 +1956,7 @@ mod tests {
         db.migrate().await.unwrap();
 
         let normalize_json = json!({
-            "canonical_title": "net: dev: fix null dereference in dev_read()",
+            "canonical_title": "net: dev: null dereference in dev_read()",
             "canonical_description": "Trigger: Null pointer passed.\nFailure Mechanism: Dereference without check.\nImpact: Panic.",
             "primary_subsystem": "net",
             "affected_source_files": ["net/core/dev.c"]
@@ -1974,7 +2006,7 @@ mod tests {
 
         let bug = db.get_bug(1).await.unwrap().unwrap();
         assert_eq!(bug.status, "dismissed");
-        assert_eq!(bug.problem, "net: dev: fix null dereference in dev_read()");
+        assert_eq!(bug.problem, "net: dev: null dereference in dev_read()");
         assert_eq!(bug.subsystems, vec!["net".to_string()]);
         assert_eq!(bug.source_files, Some(vec!["net/core/dev.c".to_string()]));
     }
@@ -1983,7 +2015,7 @@ mod tests {
     async fn test_normalize_session() {
         let mock_provider = MockAiProvider {
             response_text: json!({
-                "canonical_title": "net: dev: fix memory leak in dev_alloc()",
+                "canonical_title": "net: dev: memory leak in dev_alloc()",
                 "canonical_description": "Trigger: Netdev allocation failure.\nFailure Mechanism: Missing kfree() on error path.\nImpact: Memory leak.",
                 "primary_subsystem": "net",
                 "affected_source_files": ["net/core/dev.c"]
@@ -2006,10 +2038,121 @@ mod tests {
         let res = runner.run(&mut session).await.unwrap();
         assert_eq!(
             res.output.canonical_title,
-            "net: dev: fix memory leak in dev_alloc()"
+            "net: dev: memory leak in dev_alloc()"
         );
         assert_eq!(res.output.primary_subsystem, "net");
         assert_eq!(res.output.affected_source_files, vec!["net/core/dev.c"]);
+    }
+
+    #[test]
+    fn test_normalize_session_prompt_directives() {
+        let session = NormalizeSession {
+            problem: "Array compaction flaw in rk_iommu_probe",
+            reasoning: "sparse array indexing",
+            locations: "[]",
+            maintainers_hint: None,
+            tools: None,
+            context_tag: None,
+        };
+
+        let prompt = session.initial_user_prompt();
+        assert!(prompt.contains("This is a bug report title describing an existing defect"));
+        assert!(prompt.contains("Do NOT use patch/fix action verbs"));
+        assert!(
+            prompt
+                .contains("NEVER 'iommu/rockchip: fix array compaction flaw in rk_iommu_probe()'")
+        );
+    }
+
+    #[test]
+    fn test_normalize_session_validation_rejects_fix_verbs() {
+        let mut session = NormalizeSession {
+            problem: "problem",
+            reasoning: "reasoning",
+            locations: "[]",
+            maintainers_hint: None,
+            tools: None,
+            context_tag: None,
+        };
+
+        let bad_titles = &[
+            "iommu/rockchip: fix array compaction flaw in rk_iommu_probe()",
+            "net: fixes memory leak in dev_alloc()",
+            "btrfs: resolving use-after-free in cleanup()",
+            "mm: prevent null dereference in alloc_pages()",
+            "sched: avoid deadlock in schedule()",
+        ];
+
+        for bad in bad_titles {
+            let response = AiResponse {
+                content: Some(
+                    json!({
+                        "canonical_title": bad,
+                        "canonical_description": "Description",
+                        "primary_subsystem": "subsys",
+                        "affected_source_files": ["file.c"]
+                    })
+                    .to_string(),
+                ),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            };
+            let err = session.validate(&response).unwrap_err();
+            match err {
+                ValidationError::FormatViolation(msg) => {
+                    assert!(
+                        msg.contains("must describe the defect rather than a patch/fix"),
+                        "Expected format violation message for '{}', got: {}",
+                        bad,
+                        msg
+                    );
+                }
+                _ => panic!("Expected FormatViolation for bad title '{}'", bad),
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalize_session_validation_accepts_defect_titles() {
+        let mut session = NormalizeSession {
+            problem: "problem",
+            reasoning: "reasoning",
+            locations: "[]",
+            maintainers_hint: None,
+            tools: None,
+            context_tag: None,
+        };
+
+        let good_titles = &[
+            "iommu/rockchip: array compaction flaw in rk_iommu_probe()",
+            "btrfs: use-after-free in btrfs_cleanup_ordered_extents()",
+            "net: dev: memory leak in dev_alloc()",
+            "mm: null pointer dereference in alloc_pages()",
+        ];
+
+        for good in good_titles {
+            let response = AiResponse {
+                content: Some(
+                    json!({
+                        "canonical_title": good,
+                        "canonical_description": "Description",
+                        "primary_subsystem": "subsys",
+                        "affected_source_files": ["file.c"]
+                    })
+                    .to_string(),
+                ),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            };
+            let output = session.validate(&response).unwrap();
+            assert_eq!(output.canonical_title, *good);
+        }
     }
 
     #[tokio::test]
