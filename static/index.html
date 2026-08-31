@@ -390,6 +390,131 @@
             font-weight: bold;
         }
 
+        /* Subsystem Multi-select Dropdown */
+        .subsystem-dropdown {
+            position: relative;
+            display: inline-block;
+        }
+
+        .subsystem-dropdown-btn {
+            padding: 4px 10px;
+            font-family: inherit;
+            font-size: inherit;
+            border: 1px solid var(--border);
+            background: var(--btn-bg);
+            color: var(--text);
+            border-radius: 3px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+        }
+
+        .subsystem-dropdown-btn:hover {
+            background: var(--hover);
+        }
+
+        .subsystem-dropdown-menu {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            z-index: 1000;
+            min-width: 280px;
+            max-width: 380px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+        }
+
+        .subsystem-dropdown-header {
+            padding: 8px;
+            border-bottom: 1px solid var(--border-light);
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            background: var(--th-bg);
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }
+
+        .subsystem-dropdown-header input[type="text"] {
+            width: 100%;
+            box-sizing: border-box;
+            background: var(--input-bg);
+            color: var(--text);
+            padding: 4px 8px;
+            font-family: inherit;
+            font-size: 0.9em;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+        }
+
+        .subsystem-dropdown-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            font-size: 0.85em;
+        }
+
+        .subsystem-dropdown-actions a {
+            color: var(--link);
+            cursor: pointer;
+            text-decoration: none;
+        }
+
+        .subsystem-dropdown-actions a:hover {
+            text-decoration: underline;
+        }
+
+        .subsystem-items-container {
+            max-height: 280px;
+            overflow-y: auto;
+            padding: 4px 0;
+        }
+
+        .subsystem-item {
+            display: flex;
+            align-items: center;
+            padding: 5px 10px;
+            cursor: pointer;
+            gap: 8px;
+            font-size: 0.9em;
+            user-select: none;
+            transition: background 0.1s ease;
+        }
+
+        .subsystem-item:hover {
+            background: var(--hover);
+        }
+
+        .subsystem-item input[type="checkbox"] {
+            margin: 0;
+            cursor: pointer;
+        }
+
+        .subsystem-item-name {
+            flex: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .subsystem-item-count {
+            color: var(--text-muted);
+            font-size: 0.85em;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .subsystem-empty-msg {
+            padding: 12px;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.9em;
+        }
+
         /* Table Styles */
         table {
             width: 100%;
@@ -1261,6 +1386,8 @@
             mailingLists: [],
             selectedList: '',
             bugSubsystem: '',
+            bugSubsystemsList: [],
+            selectedSubsystems: null,
             bugMinSeverity: '',
             bugStatus: 'open',
             bugSortBy: 'severity',
@@ -1964,6 +2091,10 @@
         async function renderListView() {
             const app = document.getElementById('app');
 
+            if (state.listMode === 'bugs') {
+                await loadBugSubsystems();
+            }
+
             const listOptions = state.mailingLists.map(l => 
                 `<option value="${escapeHtml(l.group)}" ${state.selectedList === l.group ? 'selected' : ''}>${escapeHtml(l.name)}</option>`
             ).join('');
@@ -1981,8 +2112,23 @@
                         ${listOptions}
                     </select>
 
-                    <div id="bugFilters" style="display: ${state.listMode === 'bugs' ? 'flex' : 'none'}; gap: 8px; align-items: center;">
-                        <input type="text" id="bugSubsystemInput" placeholder="Subsystem (e.g. net, btrfs)" value="${escapeHtml(state.bugSubsystem || '')}" style="width: 140px;" onchange="setBugFilter('subsystem', this.value)">
+                    <div id="bugFilters" style="display: ${state.listMode === 'bugs' ? 'flex' : 'none'}; gap: 8px; align-items: center; position: relative;">
+                        <div id="subsystemDropdown" class="subsystem-dropdown">
+                            <button type="button" id="subsystemDropdownBtn" class="subsystem-dropdown-btn" onclick="toggleSubsystemDropdown(event)">
+                                ${getSubsystemButtonLabel()}
+                            </button>
+                            <div id="subsystemDropdownMenu" class="subsystem-dropdown-menu" style="display: none;" onclick="event.stopPropagation()">
+                                <div class="subsystem-dropdown-header">
+                                    <input type="text" id="subsystemSearchInput" placeholder="Filter subsystems..." oninput="filterSubsystemsList(this.value)">
+                                    <div class="subsystem-dropdown-actions">
+                                        <a href="javascript:void(0)" onclick="selectAllSubsystems(true)">Select All</a>
+                                        <span>|</span>
+                                        <a href="javascript:void(0)" onclick="selectAllSubsystems(false)">Clear</a>
+                                    </div>
+                                </div>
+                                <div id="subsystemItemsContainer" class="subsystem-items-container"></div>
+                            </div>
+                        </div>
                         <select id="bugSeveritySelector" onchange="setBugFilter('min_severity', this.value)">
                             <option value="" ${!state.bugMinSeverity ? 'selected' : ''}>All Severities</option>
                             <option value="Critical" ${state.bugMinSeverity === 'Critical' ? 'selected' : ''}>Critical</option>
@@ -2016,6 +2162,9 @@
             `;
 
             updateTableHeader();
+            if (state.listMode === 'bugs') {
+                renderSubsystemDropdown();
+            }
             await fetchListData();
             fetchStats();
 
@@ -2068,7 +2217,20 @@
                 url += `&mailing_list=${encodeURIComponent(state.selectedList)}`;
             }
             if (state.listMode === 'bugs') {
-                if (state.bugSubsystem) {
+                if (state.selectedSubsystems !== null) {
+                    if (state.selectedSubsystems.size === 0) {
+                        state.totalPages = 1;
+                        const tbody = document.getElementById('tableBody');
+                        if (tbody) {
+                            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 32px 16px;">No subsystems selected. Check one or more subsystems to view bugs.</td></tr>';
+                        }
+                        renderPagination();
+                        return;
+                    }
+                    if (state.selectedSubsystems.size < state.bugSubsystemsList.length) {
+                        url += `&subsystems=${encodeURIComponent(Array.from(state.selectedSubsystems).join(','))}`;
+                    }
+                } else if (state.bugSubsystem) {
                     url += `&subsystem=${encodeURIComponent(state.bugSubsystem)}`;
                 }
                 if (state.bugMinSeverity) {
@@ -2287,10 +2449,129 @@
             fetchListData();
         }
 
+        async function loadBugSubsystems(force = false) {
+            if (!force && state.bugSubsystemsList && state.bugSubsystemsList.length > 0) {
+                return;
+            }
+            try {
+                const status = state.bugStatus || 'open';
+                const res = await fetch(`/api/bugs/subsystems?status=${encodeURIComponent(status)}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    // Skip entries with (0)
+                    state.bugSubsystemsList = (data || []).filter(s => (s.open_bugs || s.count || 0) > 0);
+                    if (state.selectedSubsystems === null || force) {
+                        // Select all other by default
+                        state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+                    }
+                }
+            } catch (e) {
+                console.error("Failed to load bug subsystems:", e);
+            }
+        }
+
+        function getSubsystemButtonLabel() {
+            if (!state.selectedSubsystems || state.bugSubsystemsList.length === 0) {
+                return 'Subsystems (All) &#9662;';
+            }
+            const total = state.bugSubsystemsList.length;
+            const count = state.selectedSubsystems.size;
+            if (count === 0) {
+                return 'Subsystems (None) &#9662;';
+            }
+            if (count === total) {
+                return 'Subsystems (All) &#9662;';
+            }
+            if (count === 1) {
+                const singleName = Array.from(state.selectedSubsystems)[0];
+                const display = singleName.length > 18 ? singleName.substring(0, 16) + '...' : singleName;
+                return `Subsystem: ${escapeHtml(display)} &#9662;`;
+            }
+            return `Subsystems (${count}/${total}) &#9662;`;
+        }
+
+        function renderSubsystemDropdown() {
+            const btn = document.getElementById('subsystemDropdownBtn');
+            if (btn) {
+                btn.innerHTML = getSubsystemButtonLabel();
+            }
+            const container = document.getElementById('subsystemItemsContainer');
+            if (!container) return;
+
+            const filterText = (document.getElementById('subsystemSearchInput')?.value || '').toLowerCase().trim();
+
+            const items = state.bugSubsystemsList
+                .filter(s => !filterText || s.name.toLowerCase().includes(filterText))
+                .map(s => {
+                    const isChecked = state.selectedSubsystems ? state.selectedSubsystems.has(s.name) : true;
+                    const bugCount = s.open_bugs || s.count || 0;
+                    return `
+                        <label class="subsystem-item" onclick="event.stopPropagation()">
+                            <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleSubsystemSelection('${escapeHtml(s.name)}', this.checked)">
+                            <span class="subsystem-item-name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
+                            <span class="subsystem-item-count">(${bugCount})</span>
+                        </label>
+                    `;
+                })
+                .join('');
+
+            container.innerHTML = items || '<div class="subsystem-empty-msg">No subsystems found</div>';
+        }
+
+        function toggleSubsystemDropdown(event) {
+            if (event) event.stopPropagation();
+            const menu = document.getElementById('subsystemDropdownMenu');
+            if (!menu) return;
+            const isVisible = menu.style.display !== 'none';
+            if (isVisible) {
+                menu.style.display = 'none';
+            } else {
+                menu.style.display = 'block';
+                renderSubsystemDropdown();
+                const searchInput = document.getElementById('subsystemSearchInput');
+                if (searchInput) searchInput.focus();
+            }
+        }
+
+        function filterSubsystemsList(query) {
+            renderSubsystemDropdown();
+        }
+
+        function toggleSubsystemSelection(name, checked) {
+            if (!state.selectedSubsystems) {
+                state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+            }
+            if (checked) {
+                state.selectedSubsystems.add(name);
+            } else {
+                state.selectedSubsystems.delete(name);
+            }
+            const btn = document.getElementById('subsystemDropdownBtn');
+            if (btn) btn.innerHTML = getSubsystemButtonLabel();
+            state.currentPage = 1;
+            fetchListData();
+        }
+
+        function selectAllSubsystems(select) {
+            if (select) {
+                state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+            } else {
+                state.selectedSubsystems = new Set();
+            }
+            renderSubsystemDropdown();
+            state.currentPage = 1;
+            fetchListData();
+        }
+
         function setBugFilter(key, value) {
             if (key === 'subsystem') state.bugSubsystem = value.trim();
             if (key === 'min_severity') state.bugMinSeverity = value;
-            if (key === 'status') state.bugStatus = value;
+            if (key === 'status') {
+                state.bugStatus = value;
+                loadBugSubsystems(true).then(() => {
+                    renderSubsystemDropdown();
+                });
+            }
             state.currentPage = 1;
             fetchListData();
         }
@@ -2304,8 +2585,12 @@
                 state.bugStatus = 'open';
                 state.bugSortBy = 'severity';
                 state.bugSortOrder = 'desc';
-                const subInput = document.getElementById('bugSubsystemInput');
-                if (subInput) subInput.value = '';
+                if (state.bugSubsystemsList.length > 0) {
+                    state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+                } else {
+                    state.selectedSubsystems = null;
+                }
+                renderSubsystemDropdown();
                 const sevSel = document.getElementById('bugSeveritySelector');
                 if (sevSel) sevSel.value = '';
                 const statSel = document.getElementById('bugStatusSelector');
@@ -2315,7 +2600,7 @@
             fetchListData();
         }
 
-        function setListMode(mode) {
+        async function setListMode(mode) {
             if (state.listMode === mode) return;
             state.listMode = mode;
             state.currentPage = 1;
@@ -2329,6 +2614,7 @@
                     state.bugSortBy = 'severity';
                     state.bugSortOrder = 'desc';
                 }
+                await loadBugSubsystems();
             }
             document.getElementById('btn-patchsets').classList.toggle('active', mode === 'patchsets');
             document.getElementById('btn-messages').classList.toggle('active', mode === 'messages');
@@ -2343,6 +2629,10 @@
                 searchInput.placeholder = mode === 'bugs'
                     ? 'Search bugs (problem, file, commit)'
                     : 'Search (subject, author:, date:)';
+            }
+
+            if (mode === 'bugs') {
+                renderSubsystemDropdown();
             }
 
             updateTableHeader();
@@ -3860,6 +4150,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 document.getElementById('stats-content').innerHTML = `<div class="error">Error loading stats: ${escapeHtml(e.message)}</div>`;
             }
         }
+
+        window.addEventListener('click', (e) => {
+            const dropdown = document.getElementById('subsystemDropdown');
+            const menu = document.getElementById('subsystemDropdownMenu');
+            if (menu && menu.style.display !== 'none') {
+                if (!dropdown || !dropdown.contains(e.target)) {
+                    menu.style.display = 'none';
+                }
+            }
+        });
 
         loadSettings();
         fetchConfig().then(router);
