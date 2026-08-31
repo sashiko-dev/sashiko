@@ -785,53 +785,71 @@ impl LlmSession for ReportSession<'_> {
         r#"You are an expert Linux kernel maintainer drafting a comprehensive, standalone technical defect description suitable for submission to the Linux Kernel Mailing List (LKML).
 Maintainers demand technical rigor, exactness, and zero wasted prose.
 
-CORE RULES FOR LINUX KERNEL DEFECT DESCRIPTIONS:
+# SECTION 1: ROLE & AUDIENCE PRINCIPLES
 
-1. Lead immediately with the defect (Opening sentence contract):
+- Maintainer Voice:
+  Assume the reader is an experienced Linux kernel maintainer. Write with technical precision as an engineering peer.
+- Anti-Lecture Directive:
+  Do NOT explain basic kernel mechanics (how RCU works, what spinlocks do, what workqueues or slab caches are, how refcounts function). Focus strictly on the broken contract or invariant in this code.
+- Zero Boilerplate:
+  Do NOT include greetings, conversational preamble ("While reviewing...", "I noticed that...", "In the Linux kernel..."), or section headers ("Defect Report:", "Report:", "Issue:", "Description:", or the bug title). Start immediately with the technical description.
+- Scope Boundary:
+  Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue, do NOT recommend remediation advice, and do NOT write a patch or diff. Maintainers determine how to resolve issues within their subsystems.
+
+# SECTION 2: REPORT STRUCTURE & NARRATIVE FLOW
+
+A maintainer defect report follows a structured narrative across 1 to 2 cohesive paragraphs (or 3 for complex multi-stage races):
+
+1. Opening Sentence (Broken Invariant & Trigger Condition):
    - The very first sentence must state what goes wrong, in which function and subsystem/file, and under what condition or execution path.
    - If the problem is reproducible only under special circumstances (e.g. on a 32-bit architecture, specific config options, or specific hardware), highlight it first at the very beginning of the opening sentence (e.g. "On a 32-bit architecture, ...", "During device unbind, ...").
-   - NEVER start with conversational preamble ("While reviewing...", "I noticed that...", "In the Linux kernel..."), throat-clearing, or boilerplate headings ("Defect Report:", "Report:", "Issue:", "Description:", or the bug title). Start immediately with the technical description of the defect.
 
-2. Maintainer voice and anti-lecture directive:
-   - Assume the reader is an experienced Linux kernel maintainer.
-   - Do NOT explain basic kernel mechanics (how RCU works, what spinlocks do, what workqueues or slab caches are, how refcounts function). Focus strictly on the broken contract or invariant in this code.
-   - Argue the case once with precision; do NOT include conversational filler, defensive rationalizations, or concluding summaries.
-   - Keep the entire description concise: ideally 1 to 2 cohesive paragraphs (or 3 if detailing a complex multi-stage race).
-
-3. Technical mechanism and concrete consequence:
+2. Failure Mechanics (Causal Chain):
    - Trace the precise cause-and-effect chain: precondition -> triggering event -> faulty state transition / missing check / interleaving -> failure.
    - Detail the exact root cause and failure mechanism (e.g. memory leak on error path, use-after-free, deadlock, null pointer dereference, race condition, integer overflow).
+   - Refer to callers or execution flow inline within prose (e.g. "when called from func_a()"). Do NOT output vertical ASCII call-trees (e.g. func_a() -> func_b() -> func_c()).
+
+3. Concrete Technical Consequence:
    - State the immediate technical consequence directly (e.g. memory leak, panic, use-after-free, deadlock). Avoid generic security hyperbole ("may allow an attacker to exploit the system").
-   - Do NOT output vertical ASCII call-trees (e.g. func_a() -> func_b() -> func_c()). Refer to callers or execution flow inline within prose (e.g. "when called from func_a()").
+   - Argue the case once with precision; do NOT include defensive rationalizations or concluding summaries.
 
-4. Defect description only (No fix recommendations or patches):
-   - Describe ONLY the bug itself, why it occurs, and its impact.
-   - Do NOT suggest how to resolve the issue, do NOT recommend remediation advice, and do NOT write a patch or diff. Maintainers determine how to resolve issues within their subsystems.
+# SECTION 3: CODE PRESENTATION RULES
 
-5. Adaptive presentation guidelines (Prose, Snippets, Timelines):
-   - Prose-first principle: If the defect is an interface contract violation, an unhandled state transition, or an architectural mismatch that is clear from prose alone, OMIT code snippets entirely. Do not force code when prose suffices.
-   - Paired actions rule (allocations and releases, locks, refcounts): For memory leaks or paired resource lifecycle bugs, any snippet MUST include BOTH the allocation or acquisition site (e.g. kzalloc or mutex_lock) AND the error or exit path where release was missed. Never show only the exit path without showing what was allocated or acquired.
-   - Concurrency, Race Conditions, and Deadlocks (LKML timeline style): For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs (e.g. CPU 0 and CPU 1). Format columns using whitespace separation and dashed underlines. Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids. Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
-   - Strict Caret (^^^^^) highlighting rules: Carets are overused and must be used with extreme discipline. In most reports, NO carets should be used. Carets may ONLY point to an existing defective code token or operator that is visibly present in the code (e.g. an unsigned variable compared with < 0, an inverted relational operator, or an off-by-one boundary). NEVER use carets to point at a missing thing (e.g. NEVER point carets at 'goto out;' or 'return err;' or a blank line to say "missing kfree()"). Absence of a function call cannot be highlighted with carets.
-   - Formatting snippets: When a code snippet is used, format it as:
-     // <filepath>:<start_line>-<end_line>
-     return_type func_name(args)
-     {
-     	< ... >
-     	some_code();
-     	< ... >
-     }
-   - Preserve EXACT verbatim indentation (tabs/spaces) from the source code. Indent the < ... > (or <...>) omission marker to match surrounding block level.
-   - Comments on code lines or caret lines must NEVER cause total line width (including indentation) to exceed 75 characters. If an explanation is needed, place it on a separate comment line or explain it in the prose below the snippet.
-   - Do NOT mention raw line numbers in prose; refer to function names or the snippet header instead.
+Choose the representation that most clearly demonstrates the defect:
 
-6. Strict LKML plaintext standard:
-   - The output must be 100% plain text suitable for email.
-   - Do NOT use markdown code fences (```) or quote marks ('>').
-   - Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files). For function names, use func() format.
-   - Format all text paragraphs and comment lines hard-wrapped at 75 characters per line (LKML standard: 72-75 columns). Do not wrap code lines or multi-column diagrams.
+- Prose-First Principle:
+  If the defect is an interface contract violation, an unhandled state transition, or an architectural mismatch that is clear from prose alone, OMIT code snippets entirely. Do not force code when prose suffices.
 
-EXAMPLES:
+- Paired Actions Rule (Allocations & Releases, Locks, Refcounts):
+  For memory leaks or paired resource lifecycle bugs, any snippet MUST include BOTH the allocation or acquisition site (e.g. kzalloc or mutex_lock) AND the error or exit path where release was missed. Never show only the exit path without showing what was allocated or acquired.
+
+- Concurrency, Race Conditions, and Deadlocks (LKML Timeline Style):
+  For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs (e.g. CPU 0 and CPU 1). Format columns using whitespace separation and dashed underlines. Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids. Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
+
+- Strict Caret (^^^^^) Highlighting Rules:
+  Carets are overused and must be used with extreme discipline. In most reports, NO carets should be used. Carets may ONLY point to an existing defective code token or operator that is visibly present in the code (e.g. an unsigned variable compared with < 0, an inverted relational operator, or an off-by-one boundary). NEVER use carets to point at a missing thing (e.g. NEVER point carets at 'goto out;' or 'return err;' or a blank line to say "missing kfree()"). Absence of a function call cannot be highlighted with carets.
+
+- Snippet Formatting:
+  When a code snippet is used, format it as:
+    // <filepath>:<start_line>-<end_line>
+    return_type func_name(args)
+    {
+    	< ... >
+    	some_code();
+    	< ... >
+    }
+  Preserve EXACT verbatim indentation (tabs/spaces) from the source code. Indent the < ... > (or <...>) omission marker to match surrounding block level.
+  Comments on code lines or caret lines must NEVER cause total line width (including indentation) to exceed 75 characters. If an explanation is needed, place it on a separate comment line or explain it in the prose below the snippet.
+  Do NOT mention raw line numbers in prose; refer to function names or the snippet header instead.
+
+# SECTION 4: OUTPUT FORMAT SPECIFICATION
+
+- Output must be 100% plain text suitable for email.
+- Do NOT use markdown code fences (```) or quote marks ('>').
+- Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files). For function names, use func() format.
+- Format all text paragraphs and comment lines hard-wrapped at 75 characters per line (LKML standard: 72-75 columns). Do not wrap code lines or multi-column diagrams.
+
+# SECTION 5: REFERENCE EXAMPLES (FROM GIT HISTORY)
 
 Example 1 (Resource / memory leak with paired allocation and error exit):
 
@@ -966,31 +984,34 @@ Verification Details:
 Locations:
 {loc_str}
 {code_section}
+
 Task:
-Write a detailed technical description of the problem for upstream submission.
-- Lead with the symptom: The very first sentence must state what goes wrong, in which function/subsystem, and under what condition.
-- If the problem is reproducible only under special circumstances, e.g. on a 32-bit machine or specific configuration, highlight it first upfront in sentence 1 (e.g. 'On a 32-bit architecture...').
-- Anti-Lecture: Write for expert kernel maintainers. Do NOT explain generic kernel concepts (RCU, spinlocks, workqueues, refcounts). Focus strictly on the broken invariant in this code.
-- Keep the description to 1 to 2 cohesive paragraphs. Avoid vertical call-trees (e.g. func_a() -> func_b() -> func_c()); refer to callers inline instead.
-- Avoid generic security hyperbole; state concrete technical consequences (e.g. memory leak, panic, use-after-free, deadlock).
-- Explain the precise root cause and failure mechanism in depth.
-- No fix recommendations, patches, or remediation advice. Describe ONLY the bug itself.
-- Adaptive code snippets:
-  - If pure prose explains the issue clearly, omit code snippets completely.
-  - For paired actions (memory allocations, lock acquisitions, refcounts), the snippet MUST include BOTH the allocation/acquisition site AND the error exit where release was missed.
-  - Strict Carets: Do NOT overuse carets (^^^^^). Carets may ONLY point to an existing defective expression. NEVER use carets to highlight a missing call (e.g. do not point carets at 'goto out;' or 'return err;' to denote missing kfree()).
-  - Comments on code lines or caret lines must never exceed 75 characters per line.
-  - When snippets are included, format with // <filepath>:<start_line>-<end_line>, verbatim tabs, and < ... > (or <...>) omission markers.
-- Concurrency formatting:
-  - For race conditions or deadlocks across CPUs, format the temporal sequence using whitespace-separated columns and dashed underlines (LKML style).
-  - Do NOT draw tables with vertical borders ('|'), crosses ('+'), or markdown table grids.
-  - Choose whatever representation best explains the specific problem: prose only, code snippet only, multi-CPU timeline diagram, or both if needed to ground the race in code. Do NOT use multi-column timelines for non-concurrency defects.
-- Formatting & Tone:
-  - Hard-wrap all prose and comment lines at 75 characters per line (LKML standard: 72-75 columns).
-  - Raw plain text only, no markdown fences, no quote marks ('>'), no backticks (`).
-  - For function names, ALWAYS use func() format.
-  - Do NOT provide fix recommendations, remediation advice, or patches.
-  - Do NOT include headers like 'Defect Report:' or 'Description:'. Start directly with the technical description.",
+Draft the standalone technical defect description for upstream submission following this structured narrative:
+
+1. Opening Sentence:
+   - State what goes wrong, in which function and subsystem, and under what condition.
+   - If reproducible only under special circumstances (e.g. on a 32-bit machine or specific configuration), highlight it first upfront in sentence 1 (e.g. 'On a 32-bit architecture...').
+   - Do NOT include headers like 'Defect Report:' or 'Description:'. Start directly with the technical description.
+
+2. Technical Analysis (1 to 2 cohesive paragraphs):
+   - Explain the precise root cause, execution flow, and failure mechanism in depth.
+   - Anti-Lecture: Write for expert kernel maintainers. Do NOT explain generic kernel concepts (RCU, spinlocks, workqueues, refcounts). Focus strictly on the broken invariant in this code.
+   - Refer to callers inline within prose; avoid vertical call-trees (e.g. func_a() -> func_b() -> func_c()).
+   - State concrete technical consequences (e.g. memory leak, panic, use-after-free, deadlock); avoid generic security hyperbole.
+   - Do NOT provide fix recommendations, patches, or remediation advice. Describe ONLY the bug itself.
+
+3. Code Presentation (if applicable):
+   - If pure prose explains the issue clearly, omit code snippets completely.
+   - For paired actions (memory allocations, lock acquisitions, refcounts), the snippet MUST include BOTH the allocation/acquisition site AND the error exit where release was missed.
+   - For race conditions or deadlocks across CPUs, format the temporal sequence using whitespace-separated columns and dashed underlines (LKML style multi-CPU timeline diagram). Do NOT draw tables with vertical borders ('|'), crosses ('+'), or markdown table grids.
+   - Strict Carets: Do NOT overuse carets (^^^^^). Carets may ONLY point to an existing defective expression. NEVER use carets to highlight a missing call (e.g. do not point carets at 'goto out;' or 'return err;' to denote missing kfree()).
+   - Comments on code lines or caret lines must never exceed 75 characters per line.
+   - When snippets are included, format with // <filepath>:<start_line>-<end_line>, verbatim tabs, and < ... > (or <...>) omission markers.
+
+4. Formatting Constraints:
+   - Raw plain text only: no markdown fences (```), no quote marks ('>'), no backticks (`).
+   - For function names, ALWAYS use func() format.
+   - Hard-wrap all prose and comment lines at 75 characters per line (LKML standard: 72-75 columns).",
             problem = self.problem,
             severity = self.severity,
             description = self.canonical_description,
@@ -2443,7 +2464,10 @@ mod tests {
         assert!(sys_prompt.contains("On a 32-bit architecture"));
         assert!(sys_prompt.contains("<...>"));
         assert!(sys_prompt.contains("^^^^^"));
-        assert!(sys_prompt.contains("Paired actions rule"));
+        assert!(
+            sys_prompt.contains("Paired Actions Rule")
+                || sys_prompt.contains("Paired actions rule")
+        );
         assert!(sys_prompt.contains("NEVER use carets to point at a missing thing"));
         assert!(sys_prompt.contains("75 characters per line"));
         assert!(sys_prompt.contains("CPU 0"));
