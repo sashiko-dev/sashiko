@@ -200,10 +200,6 @@ impl LlmSession for VerifySession<'_> {
             "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
             You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
             Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
-            TOOL USAGE DIRECTIVES:\n\
-            - Actively batch parallel or independent tool calls into a single response when possible to minimize turns.\n\
-            - If tool output is truncated ('truncated': true), page only if directly relevant.\n\
-            - Scope your investigation strictly to the reported functions, immediate error handling paths, and direct caller contracts. Do NOT attempt open-ended whole-kernel call-graph or destructor traversals.\n\n\
             CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
         )
     }
@@ -240,7 +236,7 @@ Locations:
 {prefetch_block}
 Task:
 1. Verify the problem against the mainline code shown above and top-of-trunk of Linus's main tree (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `master` to check the actual top-of-trunk.
-2. Scope your verification to the reported functions, immediate error handling paths, and direct caller contracts. Do not wander across unrelated drivers or files.
+2. Scope your verification to the relevant functions and code blocks. Do not wander across unrelated drivers or files.
 3. Determine if the issue is a genuine, reachable defect in the codebase.
 4. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
 5. If it is a confirmed bug, set \"is_false_positive\": false, \"refutation_evidence\": null, provide your step-by-step proof in \"verification_reasoning\", carry forward and refine the verified code locations in \"relevant_code_locations\", and optionally suggest an \"impact_severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\").
@@ -764,18 +760,21 @@ CRITICAL RULES:
 5. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
 6. Relevant kernel code snippets (WHEN NEEDED):
    - When a code snippet clarifies the defect, format it cleanly with:
-         // <filepath>:<start_line>-<end_line>
-         return_type func_name(args)
-         {
-         	< ... >
-         	problematic_code();
-         	^^^^^^^^^^^^^^^^^^ // brief comment explaining the invariant broken
-         	< ... >
-         }
+     // <filepath>:<start_line>-<end_line>
+     return_type func_name(args)
+     {
+     	int x, y;
+     	< ... >
+
+     	some_code(problematic_code());
+     	          ^^^^^^^^^^^^^^^^^^
+                  // brief comment explaining the invariant broken
+     	< ... >
+     }
    - Preserve the EXACT indentation (tabs/spaces) verbatim from the source code. Do NOT convert tabs to spaces.
-   - Indent the < ... > (or <...>) omission marker to match the surrounding block's indentation level. Cut all unnecessary parts.
-   - Highlight the most important or problematic parts with ^^^^^ underneath if necessary.
-   - Keep snippets concise (maximum 4-6 lines of code).
+   - Indent the < ... > (or <...>) omission marker to match the surrounding block's indentation level. Cut unnecessary parts which complicate the code understanding.
+   - Optionally highlight the most important or problematic parts with ^^^^^ underneath if necessary.
+   - Keep snippets concise.
    - Do NOT mention raw line numbers in prose; refer to function names or the snippet header instead.
 7. Concurrency, Race Conditions, and Deadlocks (WHEN APPLICABLE):
    - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
