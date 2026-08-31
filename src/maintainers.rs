@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 use tracing::info;
 
 /// Represents a compiled file or directory pattern from an `F:` or `X:` line.
@@ -211,7 +211,11 @@ impl MaintainersIndex {
     /// and falls back to reading the `MAINTAINERS` file directly on disk.
     pub fn from_top_of_trunk<P: AsRef<Path>>(repo_path: P) -> Result<Self> {
         let repo = repo_path.as_ref();
-        for git_ref in ["origin/master:MAINTAINERS", "master:MAINTAINERS", "HEAD:MAINTAINERS"] {
+        for git_ref in [
+            "origin/master:MAINTAINERS",
+            "master:MAINTAINERS",
+            "HEAD:MAINTAINERS",
+        ] {
             let output = std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap_or("."), "show", git_ref])
                 .output();
@@ -228,7 +232,10 @@ impl MaintainersIndex {
         // Fallback: Read file directly on disk
         let file_path = repo.join("MAINTAINERS");
         if file_path.exists() {
-            info!("Falling back to loading MAINTAINERS directly from {:?}", file_path);
+            info!(
+                "Falling back to loading MAINTAINERS directly from {:?}",
+                file_path
+            );
             return Self::from_file(&file_path);
         }
 
@@ -445,17 +452,26 @@ impl MaintainersIndex {
     }
 }
 
-static GLOBAL_MAINTAINERS: OnceLock<Arc<MaintainersIndex>> = OnceLock::new();
+static GLOBAL_MAINTAINERS: RwLock<Option<Arc<MaintainersIndex>>> = RwLock::new(None);
 
 /// Initializes the global MAINTAINERS index loaded from the top-of-trunk of Linus's tree.
 /// Can only be set once at startup and is never altered during normal work.
 pub fn init_global_maintainers(index: Arc<MaintainersIndex>) {
-    let _ = GLOBAL_MAINTAINERS.set(index);
+    let mut guard = GLOBAL_MAINTAINERS.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(index);
+    }
+}
+
+/// Clears the global MAINTAINERS index. Intended for test cleanup.
+pub fn clear_global_maintainers() {
+    let mut guard = GLOBAL_MAINTAINERS.write().unwrap();
+    *guard = None;
 }
 
 /// Returns a reference to the global immutable MAINTAINERS index.
 pub fn get_global_maintainers() -> Option<Arc<MaintainersIndex>> {
-    GLOBAL_MAINTAINERS.get().cloned()
+    GLOBAL_MAINTAINERS.read().unwrap().clone()
 }
 
 #[cfg(test)]
@@ -577,6 +593,7 @@ F:	include/linux/mm*
             retrieved.match_file("fs/btrfs/inode.c"),
             vec!["BTRFS FILE SYSTEM"]
         );
+        clear_global_maintainers();
+        assert!(get_global_maintainers().is_none());
     }
 }
-

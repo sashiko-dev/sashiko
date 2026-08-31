@@ -139,6 +139,7 @@ pub struct AppState {
     patchsets_count_cache: AsyncCache<usize>,
     patchsets_homepage_cache: AsyncCache<Vec<crate::db::PatchsetRow>>,
     messages_homepage_cache: AsyncCache<Vec<crate::db::MessageRow>>,
+    bug_subsystems_cache: AsyncMapCache<Option<String>, Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -191,11 +192,17 @@ pub struct BugListQuery {
     pub per_page: Option<usize>,
     pub q: Option<String>,
     pub subsystem: Option<String>,
+    pub subsystems: Option<String>,
     pub min_severity: Option<String>,
     pub severity: Option<String>,
     pub status: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct BugSubsystemsQuery {
+    pub status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -305,6 +312,7 @@ pub fn build_router(
         patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
         messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+        bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
     });
 
     Router::new()
@@ -328,6 +336,8 @@ pub fn build_router(
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/bug", get(get_bug))
         .route("/api/bugs", get(list_bugs))
+        .route("/api/bugs/subsystems", get(list_bug_subsystems))
+        .route("/api/subsystems", get(list_bug_subsystems))
         .route("/api/bug/logs", get(get_bug_logs))
         .route("/api/bug/analyze", post(analyze_bug))
         .route("/bug/{bugid}", get(redirect_bug))
@@ -1093,9 +1103,9 @@ async fn analyze_bug(
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
         if let Some(mindex) = crate::maintainers::get_global_maintainers() {
             payload.subsystems = mindex.match_files(&payload.source_files);
-        } else if let Ok(mindex) =
-            crate::maintainers::MaintainersIndex::from_top_of_trunk(&state.settings.git.repository_path)
-        {
+        } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
+            &state.settings.git.repository_path,
+        ) {
             payload.subsystems = mindex.match_files(&payload.source_files);
         }
     }
@@ -1484,13 +1494,48 @@ async fn list_bugs(
         .or(query.severity.as_deref())
         .map(crate::db::Severity::from_str);
 
+    let parsed_subsystems: Option<Vec<String>> = if let Some(ref subs_str) = query.subsystems {
+        let subs: Vec<String> = if subs_str.trim().starts_with('[') {
+            serde_json::from_str(subs_str).unwrap_or_else(|_| {
+                subs_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+        } else {
+            subs_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        Some(subs)
+    } else if let Some(ref sub_str) = query.subsystem
+        && sub_str.contains(',')
+    {
+        let subs: Vec<String> = sub_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Some(subs)
+    } else {
+        None
+    };
+
     match state
         .db
         .list_bugs(crate::db::ListBugsParams {
             page: Some(page as u32),
             limit: Some(per_page as u32),
             min_severity: min_sev,
-            subsystem: query.subsystem.as_deref(),
+            subsystem: if parsed_subsystems.is_none() {
+                query.subsystem.as_deref()
+            } else {
+                None
+            },
+            subsystems: parsed_subsystems.as_deref(),
             status: query.status.as_deref(),
             search: query.q.as_deref(),
             sort_by: query.sort_by.as_deref(),
@@ -1509,6 +1554,42 @@ async fn list_bugs(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+async fn list_bug_subsystems(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugSubsystemsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let status_key = query.status.clone();
+    let status_filter = query.status.unwrap_or_else(|| "open".to_string());
+
+    let res = state
+        .bug_subsystems_cache
+        .get_or_fetch(status_key, || async {
+            let db = state.db.clone();
+            let counts = db
+                .get_subsystems_bug_counts(Some(&status_filter))
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to fetch bug subsystem counts: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            let list: Vec<serde_json::Value> = counts
+                .into_iter()
+                .map(|(name, count)| {
+                    serde_json::json!({
+                        "name": name,
+                        "count": count,
+                        "open_bugs": count,
+                    })
+                })
+                .collect();
+            Ok::<Vec<serde_json::Value>, StatusCode>(list)
+        })
+        .await?;
+
+    Ok(Json(serde_json::Value::Array(res)))
 }
 
 #[cfg(test)]
@@ -1667,7 +1748,62 @@ mod tests {
         .unwrap();
         assert_eq!(res_sort.status(), 200);
 
-        // Test 3f: duplicate linking on get_bug
+        // Test 3f: list_bugs with multi-subsystem filter (subsystems parameter)
+        let res_multi = reqwest::get(format!(
+            "http://{}/api/bugs?subsystems=drivers/net,btrfs",
+            addr
+        ))
+        .await
+        .unwrap();
+        assert_eq!(res_multi.status(), 200);
+        let multi_json: serde_json::Value = res_multi.json().await.unwrap();
+        assert_eq!(multi_json["total"], 1);
+
+        // Test 3g: list_bugs with comma-separated single subsystem parameter
+        let res_comma = reqwest::get(format!("http://{}/api/bugs?subsystem=drivers/net,fs", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_comma.status(), 200);
+        let comma_json: serde_json::Value = res_comma.json().await.unwrap();
+        assert_eq!(comma_json["total"], 1);
+
+        // Test 3h: list_bugs with non-matching multi-subsystem
+        let res_multi_none =
+            reqwest::get(format!("http://{}/api/bugs?subsystems=btrfs,ext4", addr))
+                .await
+                .unwrap();
+        assert_eq!(res_multi_none.status(), 200);
+        let multi_none_json: serde_json::Value = res_multi_none.json().await.unwrap();
+        assert_eq!(multi_none_json["total"], 0);
+
+        // Test 3i: GET /api/bugs/subsystems with status=raw
+        let res_subs_api = reqwest::get(format!("http://{}/api/bugs/subsystems?status=raw", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_subs_api.status(), 200);
+        let subs_json: serde_json::Value = res_subs_api.json().await.unwrap();
+        let subs_arr = subs_json.as_array().unwrap();
+        assert_eq!(subs_arr.len(), 1);
+        assert_eq!(subs_arr[0]["name"], "drivers/net");
+        assert_eq!(subs_arr[0]["count"], 1);
+        assert_eq!(subs_arr[0]["open_bugs"], 1);
+
+        // Test 3j: GET /api/subsystems alias
+        let res_subs_alias = reqwest::get(format!("http://{}/api/subsystems?status=raw", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_subs_alias.status(), 200);
+
+        // Test 3k: GET /api/bugs/subsystems with status=open (should skip 0-bug entries)
+        let res_subs_open =
+            reqwest::get(format!("http://{}/api/bugs/subsystems?status=open", addr))
+                .await
+                .unwrap();
+        assert_eq!(res_subs_open.status(), 200);
+        let open_subs_json: serde_json::Value = res_subs_open.json().await.unwrap();
+        assert_eq!(open_subs_json.as_array().unwrap().len(), 0);
+
+        // Test 3l: duplicate linking on get_bug
         let dup_id = db
             .create_bug(&crate::db::NewBug {
                 verified_on_sha: None,

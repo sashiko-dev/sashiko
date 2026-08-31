@@ -383,6 +383,7 @@ pub struct ListBugsParams<'a> {
     pub limit: Option<u32>,
     pub min_severity: Option<Severity>,
     pub subsystem: Option<&'a str>,
+    pub subsystems: Option<&'a [String]>,
     pub status: Option<&'a str>,
     pub search: Option<&'a str>,
     pub sort_by: Option<&'a str>,
@@ -1039,6 +1040,38 @@ impl Database {
             .try_create_index("idx_review_bugs_bug", "review_bugs", "bug_id")
             .await;
 
+        let _ = self
+            .try_create_index("idx_bugs_status", "bugs", "status")
+            .await;
+        let _ = self
+            .try_create_index("idx_bugs_status_severity", "bugs", "status, severity")
+            .await;
+
+        let _ = self
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS bugs_subsystems (
+                    bug_id INTEGER NOT NULL,
+                    subsystem TEXT NOT NULL,
+                    PRIMARY KEY (bug_id, subsystem),
+                    FOREIGN KEY(bug_id) REFERENCES bugs(id) ON DELETE CASCADE
+                )",
+                (),
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_bugs_subsystems_subsystem",
+                "bugs_subsystems",
+                "subsystem, bug_id",
+            )
+            .await;
+        let _ = self
+            .try_create_index("idx_bugs_subsystems_bug_id", "bugs_subsystems", "bug_id")
+            .await;
+
+        self.backfill_bugs_subsystems_if_needed().await?;
+
         Ok(())
     }
 
@@ -1101,6 +1134,48 @@ impl Database {
             let _ = self.conn.execute("PRAGMA foreign_keys = ON", ()).await;
         }
 
+        Ok(())
+    }
+
+    async fn backfill_bugs_subsystems_if_needed(&self) -> Result<()> {
+        let mut count_rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM bugs_subsystems", ())
+            .await?;
+        let count = if let Some(row) = count_rows.next().await? {
+            row.get::<i64>(0).unwrap_or(0)
+        } else {
+            0
+        };
+
+        if count == 0 {
+            let mut bug_rows = self
+                .conn
+                .query(
+                    "SELECT id, subsystems FROM bugs WHERE subsystems IS NOT NULL",
+                    (),
+                )
+                .await?;
+            while let Some(row) = bug_rows.next().await? {
+                let id: i64 = row.get(0)?;
+                if let Ok(Some(subsystems_str)) = row.get::<Option<String>>(1)
+                    && let Ok(subsystems) = serde_json::from_str::<Vec<String>>(&subsystems_str)
+                {
+                    for sub in subsystems {
+                        let trimmed = sub.trim();
+                        if !trimmed.is_empty() {
+                            let _ = self
+                                    .conn
+                                    .execute(
+                                        "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
+                                        libsql::params![id, trimmed],
+                                    )
+                                    .await;
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1439,6 +1514,18 @@ impl Database {
 
         if let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
+            for sub in &bug.subsystems {
+                let trimmed = sub.trim();
+                if !trimmed.is_empty() {
+                    let _ = self
+                        .conn
+                        .execute(
+                            "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
+                            libsql::params![id, trimmed],
+                        )
+                        .await;
+                }
+            }
             Ok(id)
         } else {
             bail!("Failed to insert preexisting bug: no id returned");
@@ -1628,6 +1715,29 @@ impl Database {
                 ],
             )
             .await?;
+
+        if let Some(subsystems) = params.subsystems {
+            let _ = self
+                .conn
+                .execute(
+                    "DELETE FROM bugs_subsystems WHERE bug_id = ?",
+                    libsql::params![id],
+                )
+                .await;
+            for sub in subsystems {
+                let trimmed = sub.trim();
+                if !trimmed.is_empty() {
+                    let _ = self
+                        .conn
+                        .execute(
+                            "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
+                            libsql::params![id, trimmed],
+                        )
+                        .await;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1636,27 +1746,73 @@ impl Database {
         let page_val = params.page.unwrap_or(1) as i64;
         let offset_val = limit_val * (page_val.saturating_sub(1));
 
-        let mut conditions = Vec::new();
+        let mut conditions: Vec<std::borrow::Cow<'static, str>> = Vec::new();
         let mut query_params = Vec::new();
 
         if let Some(sev) = params.min_severity {
-            conditions.push("severity >= ?");
+            conditions.push("severity >= ?".into());
             query_params.push(libsql::Value::Integer(sev as i64));
         }
 
-        if let Some(sub) = params.subsystem.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            conditions.push("(subsystems LIKE ? OR subsystems LIKE ?)");
-            query_params.push(libsql::Value::Text(format!("%\"{}\"%", sub)));
-            query_params.push(libsql::Value::Text(format!("%\"{}/%", sub)));
+        if let Some(subs) = params.subsystems {
+            let valid_subs: Vec<&str> = subs
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if valid_subs.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let placeholders = vec!["?"; valid_subs.len()].join(", ");
+            conditions.push(
+                format!(
+                    "id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem IN ({}))",
+                    placeholders
+                )
+                .into(),
+            );
+            for s in valid_subs {
+                query_params.push(libsql::Value::Text(s.to_string()));
+            }
+        } else if let Some(sub) = params.subsystem.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if sub.contains(',') {
+                let parts: Vec<&str> = sub
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    return Ok((Vec::new(), 0));
+                }
+                let placeholders = vec!["?"; parts.len()].join(", ");
+                conditions.push(
+                    format!(
+                        "id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem IN ({}))",
+                        placeholders
+                    )
+                    .into(),
+                );
+                for p in parts {
+                    query_params.push(libsql::Value::Text(p.to_string()));
+                }
+            } else {
+                conditions.push(
+                    "(id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem = ? OR subsystem LIKE ?) OR (subsystems LIKE ? OR subsystems LIKE ?))".into(),
+                );
+                query_params.push(libsql::Value::Text(sub.to_string()));
+                query_params.push(libsql::Value::Text(format!("{}/%", sub)));
+                query_params.push(libsql::Value::Text(format!("%\"{}\"%", sub)));
+                query_params.push(libsql::Value::Text(format!("%\"{}/%", sub)));
+            }
         }
 
         if let Some(st) = params.status.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            conditions.push("status = ?");
+            conditions.push("status = ?".into());
             query_params.push(libsql::Value::Text(st.to_string()));
         }
 
         if let Some(q) = params.search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            conditions.push("(problem LIKE ? OR bugid LIKE ? OR locations LIKE ?)");
+            conditions.push("(problem LIKE ? OR bugid LIKE ? OR locations LIKE ?)".into());
             let pattern = format!("%{}%", q);
             query_params.push(libsql::Value::Text(pattern.clone()));
             query_params.push(libsql::Value::Text(pattern.clone()));
@@ -1723,6 +1879,30 @@ impl Database {
         }
 
         Ok((bugs, total))
+    }
+
+    pub async fn get_subsystems_bug_counts(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<(String, usize)>> {
+        let st = status.unwrap_or("open");
+        let sql = "SELECT bs.subsystem, COUNT(DISTINCT b.id) AS bug_count
+                   FROM bugs_subsystems bs
+                   JOIN bugs b ON bs.bug_id = b.id
+                   WHERE b.status = ?
+                   GROUP BY bs.subsystem
+                   HAVING bug_count > 0
+                   ORDER BY bug_count DESC, bs.subsystem ASC";
+        let mut rows = self.conn.query(sql, libsql::params![st]).await?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let name: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            if count > 0 {
+                results.push((name, count as usize));
+            }
+        }
+        Ok(results)
     }
 
     pub async fn link_review_to_bug(

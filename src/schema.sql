@@ -317,6 +317,8 @@ CREATE INDEX IF NOT EXISTS idx_bugs_bugid ON bugs(bugid);
 CREATE INDEX IF NOT EXISTS idx_bugs_severity ON bugs(severity);
 CREATE INDEX IF NOT EXISTS idx_bugs_is_fixed ON bugs(is_fixed);
 CREATE INDEX IF NOT EXISTS idx_bugs_duplicate_of_id ON bugs(duplicate_of_id);
+CREATE INDEX IF NOT EXISTS idx_bugs_status ON bugs(status);
+CREATE INDEX IF NOT EXISTS idx_bugs_status_severity ON bugs(status, severity);
 
 CREATE TABLE IF NOT EXISTS review_bugs (
     review_id INTEGER NOT NULL,
@@ -329,3 +331,14 @@ CREATE TABLE IF NOT EXISTS review_bugs (
 
 CREATE INDEX IF NOT EXISTS idx_review_bugs_review ON review_bugs(review_id);
 CREATE INDEX IF NOT EXISTS idx_review_bugs_bug ON review_bugs(bug_id);
+
+CREATE TABLE IF NOT EXISTS bugs_subsystems (
+    bug_id INTEGER NOT NULL,
+    subsystem TEXT NOT NULL,
+    PRIMARY KEY (bug_id, subsystem),
+    FOREIGN KEY(bug_id) REFERENCES bugs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_bugs_subsystems_subsystem ON bugs_subsystems(subsystem, bug_id);
+CREATE INDEX IF NOT EXISTS idx_bugs_subsystems_bug_id ON bugs_subsystems(bug_id);
+

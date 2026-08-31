@@ -1645,15 +1645,17 @@ pub async fn process_issue_worker(
     }
 
     // Determine official subsystems programmatically from MAINTAINERS
-    let official_subsystems = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-        let matched = mindex.match_files(&verified_files);
-        if !matched.is_empty() {
-            matched
-        } else {
-            extract_directory_subsystems(&verified_files)
-        }
-    } else if let Some(ref tb) = tools {
-        if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()) {
+    let official_subsystems = if let Some(ref tb) = tools {
+        if let Some(mindex) = crate::maintainers::get_global_maintainers() {
+            let matched = mindex.match_files(&verified_files);
+            if !matched.is_empty() {
+                matched
+            } else {
+                extract_directory_subsystems(&verified_files)
+            }
+        } else if let Ok(mindex) =
+            crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
+        {
             let matched = mindex.match_files(&verified_files);
             if !matched.is_empty() {
                 matched
@@ -1665,6 +1667,13 @@ pub async fn process_issue_worker(
         }
     } else if !input.subsystems.is_empty() {
         input.subsystems.clone()
+    } else if let Some(mindex) = crate::maintainers::get_global_maintainers() {
+        let matched = mindex.match_files(&verified_files);
+        if !matched.is_empty() {
+            matched
+        } else {
+            extract_directory_subsystems(&verified_files)
+        }
     } else {
         extract_directory_subsystems(&verified_files)
     };

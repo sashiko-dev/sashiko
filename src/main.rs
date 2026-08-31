@@ -391,7 +391,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load and initialize authoritative immutable MAINTAINERS index from top-of-trunk
     let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-    let maintainers_index = match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&linux_repo_path) {
+    let maintainers_index = match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(
+        &linux_repo_path,
+    ) {
         Ok(idx) => {
             info!(
                 "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
@@ -1337,10 +1339,10 @@ async fn handle_review_command(
     };
 
     let repo_path = current_git_toplevel()?;
-    if sashiko::maintainers::get_global_maintainers().is_none() {
-        if let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path) {
-            sashiko::maintainers::init_global_maintainers(Arc::new(idx));
-        }
+    if sashiko::maintainers::get_global_maintainers().is_none()
+        && let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
+    {
+        sashiko::maintainers::init_global_maintainers(Arc::new(idx));
     }
     eprintln!("Reviewing: {}", input);
     eprintln!("Using prompts: {}", prompts.display());
