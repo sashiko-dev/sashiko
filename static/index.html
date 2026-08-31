@@ -1778,6 +1778,22 @@
             return String(ref).replace(/\b([0-9a-fA-F]{12})[0-9a-fA-F]{28}\b/g, '$1');
         }
 
+        function formatLocations(locs) {
+            if (!locs) return '';
+            let arr = locs;
+            if (typeof locs === 'string') {
+                try { arr = JSON.parse(locs); } catch (e) { return `<code>${escapeHtml(locs)}</code>`; }
+            }
+            if (!Array.isArray(arr) || arr.length === 0) return '';
+            return arr.map(loc => {
+                if (typeof loc === 'string') return `<code>${escapeHtml(loc)}</code>`;
+                let text = loc.file || '';
+                if (loc.line) text += `:${loc.line}`;
+                if (loc.function_or_symbol) text += ` (${loc.function_or_symbol})`;
+                return `<code>${escapeHtml(text || JSON.stringify(loc))}</code>`;
+            }).join(' ');
+        }
+
         function escapeHtml(text, highlightDiff = false, renderAiComments = false) {
             if (!text) return '';
             const escaped = String(text)
@@ -3434,12 +3450,133 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const sevStr = data.severity || 'Unknown';
             const sevColor = getSeverityColor(sevStr);
             const statusInfo = getBugStatus(data);
+            const bugRef = encodeURIComponent(data.bugid || data.slug || data.id);
 
+            // Parse raw input if present
+            let rawInput = null;
+            if (data.raw_input) {
+                try {
+                    rawInput = typeof data.raw_input === 'string' ? JSON.parse(data.raw_input) : data.raw_input;
+                } catch (e) {}
+            }
+
+            // Reported by / Discovered in
+            let reportedByHtml = 'Sashiko patch review';
+            if (data.discovered_in_patchset_id) {
+                reportedByHtml = `<a href="#/patchset/${encodeURIComponent(data.discovered_in_patchset_id)}">Patchset #${data.discovered_in_patchset_id}</a>`;
+            } else if (data.discovered_in_patch_id) {
+                reportedByHtml = `<a href="#/message/${encodeURIComponent(data.discovered_in_patch_id)}">Patch #${data.discovered_in_patch_id}</a>`;
+            } else if (data.discovered_in_commit) {
+                reportedByHtml = `Commit <code>${escapeHtml(data.discovered_in_commit.substring(0, 12))}</code>`;
+            } else if (rawInput && rawInput.commit_sha) {
+                reportedByHtml = `Commit <code>${escapeHtml(rawInput.commit_sha.substring(0, 12))}</code>`;
+            }
+
+            // Raw Data Fields
+            let candidateProblemHtml = '';
+            if (rawInput && rawInput.problem && rawInput.problem !== data.problem) {
+                candidateProblemHtml = `<div class="kv"><div class="label">Candidate:</div><div>${escapeHtml(rawInput.problem)}</div></div>`;
+            } else {
+                candidateProblemHtml = `<div class="kv"><div class="label">Problem:</div><div>${escapeHtml(data.problem || '(no description)')}</div></div>`;
+            }
+
+            let candidateReasoningHtml = '';
+            if (rawInput && rawInput.reasoning) {
+                candidateReasoningHtml = `
+                    <div class="kv" style="align-items:flex-start;">
+                        <div class="label">Initial Finding:</div>
+                        <div style="white-space: pre-wrap; line-height: 1.4;">${escapeHtml(rawInput.reasoning)}</div>
+                    </div>
+                `;
+            }
+
+            let candidateFilesHtml = '';
+            if (rawInput && Array.isArray(rawInput.source_files) && rawInput.source_files.length > 0) {
+                candidateFilesHtml = `
+                    <div class="kv">
+                        <div class="label">Files:</div>
+                        <div>${rawInput.source_files.map(f => `<code>${escapeHtml(f)}</code>`).join(' ')}</div>
+                    </div>
+                `;
+            }
+
+            let candidateLocsHtml = '';
+            if (rawInput && rawInput.locations) {
+                const locsFormatted = formatLocations(rawInput.locations);
+                if (locsFormatted) {
+                    candidateLocsHtml = `
+                        <div class="kv">
+                            <div class="label">Locations:</div>
+                            <div>${locsFormatted}</div>
+                        </div>
+                    `;
+                }
+            }
+
+            let candidateSubsHtml = '';
+            if (rawInput && Array.isArray(rawInput.subsystems) && rawInput.subsystems.length > 0) {
+                candidateSubsHtml = `
+                    <div class="kv">
+                        <div class="label">Subsystems:</div>
+                        <div>${rawInput.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')}</div>
+                    </div>
+                `;
+            }
+
+            let rawPayloadHtml = '';
+            if (data.raw_input) {
+                let formattedRaw = '';
+                try {
+                    const parsed = typeof data.raw_input === 'string' ? JSON.parse(data.raw_input) : data.raw_input;
+                    formattedRaw = escapeHtml(JSON.stringify(parsed, null, 2));
+                } catch (e) {
+                    formattedRaw = escapeHtml(data.raw_input);
+                }
+                const rawInputId = 'bug-raw-input-' + Math.random().toString(36).substr(2, 9);
+                rawPayloadHtml = `
+                    <div style="margin-top: 10px;">
+                        <button class="toggle-btn" onclick="toggleCollapsible('${rawInputId}', this)" style="font-size:0.85em; font-weight:normal;">▶ Show Raw Payload</button>
+                        <div id="${rawInputId}" class="collapsible">
+                            <div style="position: relative; margin-top: 6px;">
+                                <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                <div class="log-block" style="max-height: 350px;">${formattedRaw}</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Pipeline Enrichments Fields
+            const verifiedFilesHtml = (data.source_files && Array.isArray(data.source_files) && data.source_files.length > 0)
+                ? data.source_files.map(f => `<code>${escapeHtml(f)}</code>`).join(' ')
+                : '';
+
+            const verifiedLocsFormatted = formatLocations(data.locations);
+            const verifiedLocsHtml = verifiedLocsFormatted
+                ? `<div class="kv"><div class="label">Locations:</div><div>${verifiedLocsFormatted}</div></div>`
+                : '';
+
+            const subsystemsHtml = (data.subsystems && Array.isArray(data.subsystems) && data.subsystems.length > 0)
+                ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
+                : (data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-');
+
+            let statusDetailHtml = `<strong style="color:${statusInfo.color};">${statusInfo.label}</strong>`;
+            if (data.is_fixed || (data.status && data.status.toLowerCase() === 'fixed')) {
+                if (data.fixed_in_commit) {
+                    statusDetailHtml += ` &middot; Fixed in commit <code>${escapeHtml(formatCommitRef(data.fixed_in_commit))}</code>`;
+                }
+            } else if (data.status === 'duplicate' && data.duplicate_of) {
+                statusDetailHtml += ` &middot; Duplicate of <a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid || data.duplicate_of.id)}" style="font-weight:bold; color:var(--accent); text-decoration:none;">${escapeHtml(data.duplicate_of.bugid || data.duplicate_of.id)}</a> (${escapeHtml(data.duplicate_of.problem || '')})`;
+            } else if (data.status === 'dismissed' && data.severity_explanation) {
+                statusDetailHtml += ` &middot; Discarded as false positive`;
+            }
+
+            // Defect Report (LKML Description)
             let inlineReviewHtml = '';
             if (data.description) {
                 inlineReviewHtml = `
                     <div class="section">
-                        <h2>Description</h2>
+                        <h2>Defect Report</h2>
                         <div style="position: relative; margin-top: 8px;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
                             <div class="log-inline-block">${escapeHtml(data.description, true, false)}</div>
@@ -3448,63 +3585,95 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 `;
             }
 
-            let rawInputHtml = '';
-            if (data.raw_input) {
-                let formattedRaw = '';
-                try {
-                    const parsed = JSON.parse(data.raw_input);
-                    formattedRaw = escapeHtml(JSON.stringify(parsed, null, 2));
-                } catch (e) {
-                    formattedRaw = escapeHtml(data.raw_input);
-                }
-                const rawInputId = 'bug-raw-input-' + Math.random().toString(36).substr(2, 9);
-                rawInputHtml = `
-                    <div class="section">
-                        <h2 style="display:flex; align-items:center; gap:10px;">
-                            Raw Input
-                            <button class="toggle-btn" onclick="toggleCollapsible('${rawInputId}', this)" style="font-size:0.8em; font-weight:normal;">▶ Show Raw Input</button>
-                        </h2>
-                        <div id="${rawInputId}" class="collapsible">
-                            <div style="position: relative; margin-top: 8px;">
-                                <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                                <div class="log-block" style="max-height: 400px;">${formattedRaw}</div>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }
-
-            let reportedByHtml = 'Sashiko patch review';
-            if (data.discovered_in_patchset_id) {
-                reportedByHtml += ` (<a href="#/patchset/${encodeURIComponent(data.discovered_in_patchset_id)}">details</a>)`;
-            } else if (data.discovered_in_patch_id) {
-                reportedByHtml += ` (<a href="#/patch/${encodeURIComponent(data.discovered_in_patch_id)}">details</a>)`;
-            } else if (data.discovered_in_commit) {
-                reportedByHtml += ` (<code>${escapeHtml(data.discovered_in_commit.substring(0, 12))}</code>)`;
-            }
-
-            const statusDetailHtml = `<strong style="color:${statusInfo.color};">${statusInfo.label}</strong>${data.fixed_in_commit ? ` (commit <code>${escapeHtml(formatCommitRef(data.fixed_in_commit))}</code>)` : ''}`;
-            const bugRef = encodeURIComponent(data.bugid || data.slug || data.id);
+            // Token Usage (matching patchset review cards)
+            const tokensOut = (data.tokens_out || 0);
+            const tokensCached = (data.tokens_cached || 0);
+            const tokensIn = Math.max(0, (data.tokens_in || 0) - tokensCached);
+            const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
-                <h1>${escapeHtml(data.problem || 'Linux Kernel Bug')}</h1>
+                <h1>
+                    <span>${escapeHtml(data.problem || 'Linux Kernel Bug')}</span>
+                    <span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span>
+                </h1>
 
                 <div class="section">
-                    <div class="kv"><div class="label">ID:</div><div><code>${escapeHtml((data.bugid || data.slug || data.id))}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml((data.bugid || data.slug || data.id))}')">Copy</button></div></div>
-                    <div class="kv"><div class="label">Severity:</div><div><strong style="color:${sevColor}">${escapeHtml(sevStr)}</strong></div></div>
-                    <div class="kv"><div class="label">Status:</div><div>${statusDetailHtml}</div></div>
-                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced by:</div><div><code>${escapeHtml(formatCommitRef(data.introduced_in_commit))}</code></div></div>` : ''}
-                    <div class="kv"><div class="label">Subsystems:</div><div>${(data.subsystems && Array.isArray(data.subsystems) && data.subsystems.length > 0) ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (data.subsystem ? `<span class="tag">${escapeHtml(data.subsystem)}</span>` : '-')}</div></div>
+                    <h2>Raw Data</h2>
+                    <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml((data.bugid || data.slug || data.id))}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml((data.bugid || data.slug || data.id))}')">Copy</button></div></div>
                     <div class="kv"><div class="label">Reported at:</div><div>${date}</div></div>
-                    <div class="kv"><div class="label">Reported by:</div><div>${reportedByHtml}</div></div>
-                    ${data.duplicate_of ? `<div class="kv"><div class="label">Duplicate of:</div><div><a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid || data.duplicate_of.id)}" style="font-weight:bold; color:var(--accent); text-decoration:none;">${escapeHtml(data.duplicate_of.bugid || data.duplicate_of.id)}</a>: ${escapeHtml(data.duplicate_of.problem || '')}</div></div>` : ''}
-                    ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none; margin-right:6px;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
-                    <div class="kv"><div class="label">Logs:</div><div><a href="#/bug/${bugRef}/log" style="font-weight:600;">View Pipeline Logs &rarr;</a></div></div>
+                    <div class="kv"><div class="label">Discovered in:</div><div>${reportedByHtml}</div></div>
+                    ${candidateProblemHtml}
+                    ${candidateReasoningHtml}
+                    ${candidateFilesHtml}
+                    ${candidateLocsHtml}
+                    ${candidateSubsHtml}
+                    ${rawPayloadHtml}
+                </div>
+
+                <div class="section">
+                    <h2>Pipeline Enrichments</h2>
+                    <div class="kv">
+                        <div class="label">Severity:</div>
+                        <div>
+                            <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(sevStr)}</span>
+                            ${data.severity_explanation ? `<div style="margin-top:6px; color:var(--text-muted); font-size:0.9em; line-height:1.4;">${escapeHtml(data.severity_explanation)}</div>` : ''}
+                        </div>
+                    </div>
+                    <div class="kv">
+                        <div class="label">Status:</div>
+                        <div>${statusDetailHtml}</div>
+                    </div>
+                    ${(rawInput && rawInput.problem && rawInput.problem !== data.problem) ? `
+                    <div class="kv">
+                        <div class="label">Normalized:</div>
+                        <div>${escapeHtml(data.problem)}</div>
+                    </div>` : ''}
+                    <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
+                    ${verifiedFilesHtml ? `
+                    <div class="kv">
+                        <div class="label">Source Files:</div>
+                        <div>${verifiedFilesHtml}</div>
+                    </div>` : ''}
+                    ${verifiedLocsHtml}
+                    ${data.verified_on_sha ? `
+                    <div class="kv">
+                        <div class="label">Verified on:</div>
+                        <div><code>${escapeHtml(data.verified_on_sha.substring(0, 12))}</code></div>
+                    </div>` : ''}
+                    ${data.introduced_in_commit ? `
+                    <div class="kv">
+                        <div class="label">Introduced by:</div>
+                        <div><code>${escapeHtml(formatCommitRef(data.introduced_in_commit))}</code></div>
+                    </div>` : ''}
+                    ${data.duplicate_of ? `
+                    <div class="kv">
+                        <div class="label">Duplicate of:</div>
+                        <div><a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid || data.duplicate_of.id)}" style="font-weight:bold; color:var(--accent); text-decoration:none;">${escapeHtml(data.duplicate_of.bugid || data.duplicate_of.id)}</a>: ${escapeHtml(data.duplicate_of.problem || '')}</div>
+                    </div>` : ''}
+                    ${(data.duplicates && data.duplicates.length > 0) ? `
+                    <div class="kv">
+                        <div class="label">Duplicates (${data.duplicates.length}):</div>
+                        <div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none; margin-right:6px;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div>
+                    </div>` : ''}
+                    ${(data.fixed_in_commit && !statusDetailHtml.includes(data.fixed_in_commit)) ? `
+                    <div class="kv">
+                        <div class="label">Fixed in:</div>
+                        <div><code>${escapeHtml(formatCommitRef(data.fixed_in_commit))}</code></div>
+                    </div>` : ''}
                 </div>
 
                 ${inlineReviewHtml}
-                ${rawInputHtml}
+
+                <div style="margin-top: 24px; margin-bottom: 0;">
+                    <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;">
+                        <strong>Tokens used:</strong> ${tokenStr}
+                    </div>
+                </div>
+                <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center; font-size: 0.9em;">
+                    <a href="#/bug/${bugRef}/log" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">View Raw Log</a>
+                    <a href="javascript:void(0)" onclick="window.scrollTo({top: 0, behavior: 'smooth'})" style="font-size: 0.95em; color: var(--text-dim); text-decoration: none;">↑ Back to Top</a>
+                </div>
             `;
         }
 
@@ -3526,10 +3695,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const statusInfo = getBugStatus(data);
 
             const bugRef = encodeURIComponent(data.bugid || data.slug || data.id);
-            const tokensPrompt = data.tokens_in || 0;
-            const tokensCompletion = data.tokens_out || 0;
-            const tokensCached = data.tokens_cached || 0;
-            const tokensTotal = tokensPrompt + tokensCompletion;
+            const tokensOut = (data.tokens_out || 0);
+            const tokensCached = (data.tokens_cached || 0);
+            const tokensIn = Math.max(0, (data.tokens_in || 0) - tokensCached);
+            const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
 
             const logsHtml = renderInteractionLogEntries(logs);
 
@@ -3537,13 +3706,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <div class="nav"><a href="#/bug/${bugRef}" onclick="event.preventDefault(); navigate('#/bug/${bugRef}');">← Back to Bug</a></div>
                 <h1>
                     <span>Pipeline Logs: ${escapeHtml(data.problem || 'Linux Kernel Bug')}</span>
+                    <span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span>
                 </h1>
 
                 <div class="section">
                     <div class="kv"><div class="label">Bug:</div><div><a href="#/bug/${bugRef}" style="font-weight:bold;">${escapeHtml(data.bugid || data.slug || data.id)}</a>: ${escapeHtml(data.problem || '')}</div></div>
                     <div class="kv"><div class="label">Severity:</div><div><strong style="color:${sevColor}">${escapeHtml(sevStr)}</strong></div></div>
                     <div class="kv"><div class="label">Status:</div><div><strong style="color:${statusInfo.color};">${statusInfo.label}</strong></div></div>
-                    <div class="kv"><div class="label">Token Usage:</div><div><code>Prompt: ${tokensPrompt} | Completion: ${tokensCompletion}${tokensCached ? ` | Cached: ${tokensCached}` : ''} | Total: ${tokensTotal}</code></div></div>
+                    <div class="kv"><div class="label">Tokens used:</div><div>${tokenStr}</div></div>
                 </div>
 
                 <div class="section">
