@@ -74,7 +74,7 @@ When illustrating race conditions, deadlocks, or multi-CPU interleavings, the mo
   kfree(item);
                                       item->val = 1; // UAF
   ```
-- **Mutual Exclusivity**: Never combine a multi-CPU timeline with a separate C code snippet in the same report. Choose the single most effective representation.
+- **Flexible Representation**: Choose whatever format best explains the specific problem: prose only, code snippet only, multi-CPU timeline diagram, or both if needed to ground the race in code. Do not force an artificial either/or choice if both together make the defect clearer.
 - **Non-Concurrency Exclusion**: Never use multi-column timelines for single-threaded bugs (leaks, buffer overflows, null dereferences on error paths).
 
 ---

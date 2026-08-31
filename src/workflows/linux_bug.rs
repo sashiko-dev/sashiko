@@ -822,7 +822,7 @@ CRITICAL RULES:
 8. Concurrency, Race Conditions, and Deadlocks (LKML timeline style):
    - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs.
    - LKML format: Format columns using whitespace separation and dashed underlines (e.g. CPU 0 and CPU 1). Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids.
-   - Mutual Exclusivity: NEVER use both a multi-CPU timeline and a C code snippet for the same defect. Choose the single clearer representation.
+   - Choose whatever representation best explains the specific problem: prose only, code snippet only, multi-CPU timeline, or a combination if needed to ground the concurrency trace in code.
    - Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
 9. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files). For function names, use func() format.
 10. Do NOT use markdown code fences (```) or quote marks ('>').
@@ -974,7 +974,7 @@ Write a detailed technical description of the problem for upstream submission.
 - Concurrency formatting:
   - For race conditions or deadlocks across CPUs, format the temporal sequence using whitespace-separated columns and dashed underlines (LKML style).
   - Do NOT draw tables with vertical borders ('|'), crosses ('+'), or markdown table grids.
-  - Mutual Exclusivity: NEVER use both code snippets and a multi-cpu/columns diagram. Choose the single clearer representation. Do NOT use multi-column timelines for non-concurrency defects.
+  - Choose whatever representation best explains the specific problem: prose only, code snippet only, multi-CPU timeline diagram, or both if needed to ground the race in code. Do NOT use multi-column timelines for non-concurrency defects.
 - Formatting & Tone:
   - Hard-wrap all prose and comment lines at 75 characters per line (LKML standard).
   - Raw plain text only, no markdown fences, no quote marks ('>'), no backticks (`).
@@ -2423,7 +2423,7 @@ mod tests {
         assert!(user_prompt.contains("<...>"));
         assert!(user_prompt.contains("^^^^^"));
         assert!(user_prompt.contains("NEVER use carets to highlight a missing call"));
-        assert!(user_prompt.contains("multi-cpu/columns diagram"));
+        assert!(user_prompt.contains("multi-CPU timeline diagram"));
     }
 
     #[tokio::test]
