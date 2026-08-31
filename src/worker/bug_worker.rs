@@ -37,20 +37,24 @@ impl BugWorker {
                     tokio::spawn(async move {
                         info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
 
-                        let input = BugInput {
-                            problem: bug.problem.clone(),
+                        let input = if let Some(raw) = bug.raw_input() {
+                            serde_json::from_str::<BugInput>(&raw).ok()
+                        } else {
+                            None
+                        }
+                        .unwrap_or_else(|| BugInput {
+                            problem: bug.problem().to_string(),
                             reasoning: bug
-                                .severity_explanation
-                                .clone()
+                                .severity_explanation()
                                 .unwrap_or_else(|| "No reasoning provided.".to_string()),
-                            locations: bug.locations.clone(),
+                            locations: bug.locations(),
                             subsystems: bug.subsystems.clone(),
-                            source_files: bug.source_files.clone().unwrap_or_default(),
+                            source_files: bug.source_files().unwrap_or_default(),
                             commit_sha: bug.discovered_in_commit.clone(),
                             patchset_id: bug.discovered_in_patchset_id,
                             patch_id: bug.discovered_in_patch_id,
                             baseline_sha: bug.discovered_in_commit.clone(),
-                        };
+                        });
 
                         let mut tb = ToolBox::new(std::path::PathBuf::from(&repo_path), None);
                         if let Some(ref sha) = bug.discovered_in_commit {

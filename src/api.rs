@@ -339,6 +339,7 @@ pub fn build_router(
         .route("/api/bugs/subsystems", get(list_bug_subsystems))
         .route("/api/subsystems", get(list_bug_subsystems))
         .route("/api/bug/logs", get(get_bug_logs))
+        .route("/api/bug/enrichments", get(get_bug_enrichments))
         .route("/api/bug/analyze", post(analyze_bug))
         .route("/bug/{bugid}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
@@ -979,24 +980,28 @@ async fn get_bug(
     };
 
     match result {
-        Ok(Some(mut bug)) => {
-            bug.logs = None;
+        Ok(Some(bug)) => {
             let mut val = serde_json::to_value(&bug).unwrap_or(serde_json::json!({}));
+            val["slug"] = serde_json::Value::String(bug.bugid.clone());
+            val["problem"] = serde_json::Value::String(bug.problem().to_string());
+            val["severity"] = serde_json::to_value(bug.severity()).unwrap();
+            val["severity_explanation"] = serde_json::to_value(bug.severity_explanation()).unwrap();
+            val["description"] = serde_json::to_value(bug.description()).unwrap();
+            val["inline_review"] = serde_json::Value::String(bug.inline_review());
+            val["locations"] = serde_json::to_value(bug.locations()).unwrap();
+            val["source_files"] = serde_json::to_value(bug.source_files()).unwrap();
+            val["introduced_in_commit"] = serde_json::to_value(bug.introduced_in_commit()).unwrap();
+            val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
+            val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
+            val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
+            val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
+            val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
+            val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
+            val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+
             if bug.status == "duplicate" {
                 let canonical = if let Some(canon_id) = bug.duplicate_of_id {
                     state.db.get_bug(canon_id).await.ok().flatten()
-                } else if let Ok(parsed) =
-                    serde_json::from_str::<serde_json::Value>(&bug.inline_review)
-                {
-                    if let Some(canon_id) = parsed.get("duplicate_of_id").and_then(|v| v.as_i64()) {
-                        state.db.get_bug(canon_id).await.ok().flatten()
-                    } else if let Some(canon_bugid) =
-                        parsed.get("duplicate_of_bugid").and_then(|v| v.as_str())
-                    {
-                        state.db.get_bug_by_bugid(canon_bugid).await.ok().flatten()
-                    } else {
-                        None
-                    }
                 } else {
                     None
                 };
@@ -1004,7 +1009,7 @@ async fn get_bug(
                     val["duplicate_of"] = serde_json::json!({
                         "id": c.id,
                         "bugid": c.bugid,
-                        "problem": c.problem,
+                        "problem": c.problem(),
                     });
                 }
             } else if let Ok(dups) = state.db.list_duplicates_for_bug(bug.id).await {
@@ -1014,7 +1019,7 @@ async fn get_bug(
                         serde_json::json!({
                             "id": d.id,
                             "bugid": d.bugid,
-                            "problem": d.problem,
+                            "problem": d.problem(),
                             "created_at": d.created_at,
                         })
                     })
@@ -1026,6 +1031,30 @@ async fn get_bug(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!("Database error fetching preexisting bug: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_bug_enrichments(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let bug = if let Some(id) = query.id {
+        state.db.get_bug(id).await
+    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
+        state.db.get_bug_by_bugid(bugid).await
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    match bug {
+        Ok(Some(bug)) => Ok(Json(
+            serde_json::to_value(&bug.enrichments).unwrap_or_default(),
+        )),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Database error fetching enrichments: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1543,12 +1572,39 @@ async fn list_bugs(
         })
         .await
     {
-        Ok((items, total)) => Ok(Json(serde_json::json!({
-            "items": items,
-            "total": total,
-            "page": page,
-            "per_page": per_page
-        }))),
+        Ok((items, total)) => {
+            let serialized_items: Vec<serde_json::Value> = items
+                .iter()
+                .map(|bug| {
+                    let mut val = serde_json::to_value(bug).unwrap_or(serde_json::json!({}));
+                    val["slug"] = serde_json::Value::String(bug.bugid.clone());
+                    val["problem"] = serde_json::Value::String(bug.problem().to_string());
+                    val["severity"] = serde_json::to_value(bug.severity()).unwrap();
+                    val["severity_explanation"] =
+                        serde_json::to_value(bug.severity_explanation()).unwrap();
+                    val["description"] = serde_json::to_value(bug.description()).unwrap();
+                    val["inline_review"] = serde_json::Value::String(bug.inline_review());
+                    val["locations"] = serde_json::to_value(bug.locations()).unwrap();
+                    val["source_files"] = serde_json::to_value(bug.source_files()).unwrap();
+                    val["introduced_in_commit"] =
+                        serde_json::to_value(bug.introduced_in_commit()).unwrap();
+                    val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
+                    val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
+                    val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
+                    val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
+                    val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
+                    val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
+                    val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+                    val
+                })
+                .collect();
+            Ok(Json(serde_json::json!({
+                "items": serialized_items,
+                "total": total,
+                "page": page,
+                "per_page": per_page
+            })))
+        }
         Err(e) => {
             tracing::error!("Failed to fetch bugs list: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1614,33 +1670,59 @@ mod tests {
 
         let bug_id = db
             .create_bug(&crate::db::NewBug {
-                verified_on_sha: None,
-                status: "raw".to_string(),
                 bugid: "linux-12345678".to_string(),
-                problem: "UAF in test_device".to_string(),
-                severity: crate::db::Severity::Critical,
-                severity_explanation: Some("Trace".to_string()),
-                locations: None,
-                subsystems: vec!["drivers/net".to_string()],
-                source_files: Some(vec!["drivers/net/test.c".to_string()]),
-                inline_review: "Inline review".to_string(),
-                logs: Some("[{\"role\":\"user\",\"content\":\"test\"}]".to_string()),
-                vector_json: None,
+                title: "UAF in test_device".to_string(),
+                status: "raw".to_string(),
+                reporter: "sashiko".to_string(),
+                reported_at: 123456,
                 discovered_in_patchset_id: None,
                 discovered_in_patch_id: None,
                 discovered_in_commit: None,
-                introduced_in_commit: None,
-                is_fixed: false,
-                fixed_in_commit: None,
-                raw_input: None,
-                tokens_in: None,
-                tokens_out: None,
-                tokens_cached: None,
+                source_ref: None,
+                vector_json: None,
                 duplicate_of_id: None,
-                created_at: 123456,
+                subsystems: vec!["drivers/net".to_string()],
             })
             .await
             .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456,
+                content: Some("Trace".to_string()),
+                data_json: Some(serde_json::json!({
+                    "severity": "Critical",
+                    "severity_int": 4,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "report".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123457,
+                content: Some("Inline review".to_string()),
+                data_json: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                logs: Some("[{\"role\":\"user\",\"content\":\"test\"}]".to_string()),
+            },
+        )
+        .await
+        .unwrap();
 
         let settings = Arc::new(crate::settings::Settings::new().unwrap());
         let (event_tx, _event_rx) = mpsc::channel(10);
@@ -1668,6 +1750,20 @@ mod tests {
         assert_eq!(json["bugid"], "linux-12345678");
         assert_eq!(json["problem"], "UAF in test_device");
         assert!(json["logs"].is_null());
+        assert_eq!(json["enrichments"].as_array().unwrap().len(), 2);
+
+        // Test 1c: get_bug_enrichments
+        let res_enrich = reqwest::get(format!(
+            "http://{}/api/bug/enrichments?bugid=linux-12345678",
+            addr
+        ))
+        .await
+        .unwrap();
+        assert_eq!(res_enrich.status(), 200);
+        let enrich_json: serde_json::Value = res_enrich.json().await.unwrap();
+        assert_eq!(enrich_json.as_array().unwrap().len(), 2);
+        assert_eq!(enrich_json[0]["kind"], "severity_calibration");
+        assert_eq!(enrich_json[1]["kind"], "report");
 
         // Test 1b: get_bug by legacy slug param
         let res_slug = reqwest::get(format!("http://{}/api/bug?slug=linux-12345678", addr))
@@ -1806,30 +1902,18 @@ mod tests {
         // Test 3l: duplicate linking on get_bug
         let dup_id = db
             .create_bug(&crate::db::NewBug {
-                verified_on_sha: None,
-                status: "raw".to_string(),
                 bugid: "linux-dup-endpoint".to_string(),
-                problem: "Duplicate issue".to_string(),
-                severity: crate::db::Severity::High,
-                severity_explanation: None,
-                locations: None,
-                subsystems: vec!["drivers/net".to_string()],
-                source_files: None,
-                inline_review: String::new(),
-                logs: None,
-                vector_json: None,
+                title: "Duplicate issue".to_string(),
+                status: "raw".to_string(),
+                reporter: "sashiko".to_string(),
+                reported_at: 123457,
                 discovered_in_patchset_id: None,
                 discovered_in_patch_id: None,
                 discovered_in_commit: None,
-                introduced_in_commit: None,
-                is_fixed: false,
-                fixed_in_commit: None,
-                raw_input: None,
-                tokens_in: None,
-                tokens_out: None,
-                tokens_cached: None,
+                source_ref: None,
+                vector_json: None,
                 duplicate_of_id: None,
-                created_at: 123457,
+                subsystems: vec!["drivers/net".to_string()],
             })
             .await
             .unwrap();

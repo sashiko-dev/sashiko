@@ -3585,6 +3585,115 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 `;
             }
 
+            // Enrichments Timeline
+            let enrichmentsTimelineHtml = '';
+            if (data.enrichments && Array.isArray(data.enrichments) && data.enrichments.length > 0) {
+                const cards = data.enrichments.map((e, idx) => {
+                    const eDate = e.created_at ? formatDate(e.created_at, true) : '-';
+                    const toolModelStr = e.model ? `${e.tool} &middot; ${e.model}` : (e.tool || 'sashiko');
+                    const authorStr = e.author ? ` (${escapeHtml(e.author)})` : '';
+
+                    let kindLabel = (e.kind || 'enrichment').replace(/_/g, ' ');
+                    kindLabel = kindLabel.charAt(0).toUpperCase() + kindLabel.slice(1);
+
+                    let bodyHtml = '';
+                    if (e.content) {
+                        bodyHtml += `<div style="margin-top: 6px; white-space: pre-wrap; line-height: 1.4;">${escapeHtml(e.content)}</div>`;
+                    }
+
+                    if (e.data_json) {
+                        let parsedData = null;
+                        try {
+                            parsedData = typeof e.data_json === 'string' ? JSON.parse(e.data_json) : e.data_json;
+                        } catch (err) {}
+
+                        if (parsedData) {
+                            let detailsHtml = '';
+                            if (e.kind === 'verification') {
+                                if (parsedData.locations) {
+                                    const locFmt = formatLocations(parsedData.locations);
+                                    if (locFmt) detailsHtml += `<div class="kv"><div class="label">Locations:</div><div>${locFmt}</div></div>`;
+                                }
+                                if (parsedData.source_files && Array.isArray(parsedData.source_files)) {
+                                    detailsHtml += `<div class="kv"><div class="label">Source Files:</div><div>${parsedData.source_files.map(f => `<code>${escapeHtml(f)}</code>`).join(' ')}</div></div>`;
+                                }
+                                if (parsedData.verified_on_sha) {
+                                    detailsHtml += `<div class="kv"><div class="label">Verified on:</div><div><code>${escapeHtml(parsedData.verified_on_sha.substring(0, 12))}</code></div></div>`;
+                                }
+                                if (parsedData.is_valid !== undefined) {
+                                    detailsHtml += `<div class="kv"><div class="label">Valid:</div><div>${parsedData.is_valid ? '<span style="color:var(--status-reviewed); font-weight:600;">Yes</span>' : '<span style="color:var(--status-failed); font-weight:600;">No (refuted)</span>'}</div></div>`;
+                                }
+                            } else if (e.kind === 'origin_discovery') {
+                                if (parsedData.introducing_commit_sha) {
+                                    detailsHtml += `<div class="kv"><div class="label">Introduced in:</div><div><code>${escapeHtml(formatCommitRef(parsedData.introducing_commit_sha))}</code></div></div>`;
+                                }
+                            } else if (e.kind === 'severity_calibration') {
+                                if (parsedData.severity) {
+                                    const sc = getSeverityColor(parsedData.severity);
+                                    detailsHtml += `<div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sc}; color:${sc}; font-weight:bold; background:transparent;">${escapeHtml(parsedData.severity)}</span></div></div>`;
+                                }
+                            } else if (e.kind === 'fix_candidate') {
+                                if (parsedData.commit_sha) {
+                                    detailsHtml += `<div class="kv"><div class="label">Fix Commit:</div><div><code>${escapeHtml(formatCommitRef(parsedData.commit_sha))}</code></div></div>`;
+                                }
+                                if (parsedData.status) {
+                                    detailsHtml += `<div class="kv"><div class="label">Status:</div><div>${escapeHtml(parsedData.status)}</div></div>`;
+                                }
+                            } else if (e.kind === 'reproducer') {
+                                if (parsedData.language) {
+                                    detailsHtml += `<div class="kv"><div class="label">Language:</div><div>${escapeHtml(parsedData.language)}</div></div>`;
+                                }
+                            } else if (e.kind === 'link') {
+                                if (parsedData.url) {
+                                    detailsHtml += `<div class="kv"><div class="label">Link:</div><div><a href="${escapeHtml(parsedData.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(parsedData.url)}</a></div></div>`;
+                                }
+                            }
+
+                            const detailId = `enrichment-detail-${e.id || idx}`;
+                            const jsonStr = escapeHtml(JSON.stringify(parsedData, null, 2));
+                            bodyHtml += `
+                                <div style="margin-top: 6px;">
+                                    ${detailsHtml}
+                                    <button class="toggle-btn" onclick="toggleCollapsible('${detailId}', this)" style="font-size:0.8em; font-weight:normal; margin-top:4px;">▶ Show Payload</button>
+                                    <div id="${detailId}" class="collapsible">
+                                        <div class="log-block" style="max-height: 250px; font-size:11px; margin-top:4px;">${jsonStr}</div>
+                                    </div>
+                                </div>
+                            `;
+                        }
+                    }
+
+                    let tokenUsageHtml = '';
+                    if (e.tokens_in || e.tokens_out || e.tokens_cached) {
+                        const eTokensOut = (e.tokens_out || 0);
+                        const eTokensCached = (e.tokens_cached || 0);
+                        const eTokensIn = Math.max(0, (e.tokens_in || 0) - eTokensCached);
+                        tokenUsageHtml = `<div style="font-size:0.85em; color:var(--text-muted); margin-top:6px;">Tokens used: In: ${eTokensIn.toLocaleString()} &middot; Cached: ${eTokensCached.toLocaleString()} &middot; Out: ${eTokensOut.toLocaleString()}</div>`;
+                    }
+
+                    return `
+                        <div class="review-card" style="margin-bottom: 12px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                                <div style="display:flex; align-items:center; gap:8px;">
+                                    <span class="tag" style="font-weight:bold; font-size:0.85em; background:var(--code-bg); border:1px solid var(--border);">${escapeHtml(kindLabel)}</span>
+                                    <span style="font-size:0.85em; color:var(--text-muted);">by <strong>${escapeHtml(toolModelStr)}</strong>${authorStr}</span>
+                                </div>
+                                <div style="font-size:0.8em; color:var(--text-muted);">${eDate}</div>
+                            </div>
+                            ${bodyHtml}
+                            ${tokenUsageHtml}
+                        </div>
+                    `;
+                }).join('');
+
+                enrichmentsTimelineHtml = `
+                    <div class="section">
+                        <h2>Enrichments Timeline (${data.enrichments.length})</h2>
+                        ${cards}
+                    </div>
+                `;
+            }
+
             // Token Usage (matching patchset review cards)
             const tokensOut = (data.tokens_out || 0);
             const tokensCached = (data.tokens_cached || 0);
@@ -3601,6 +3710,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <div class="section">
                     <h2>Raw Data</h2>
                     <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml((data.bugid || data.slug || data.id))}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml((data.bugid || data.slug || data.id))}')">Copy</button></div></div>
+                    <div class="kv"><div class="label">Reporter:</div><div>${escapeHtml(data.reporter || 'sashiko')}</div></div>
                     <div class="kv"><div class="label">Reported at:</div><div>${date}</div></div>
                     <div class="kv"><div class="label">Discovered in:</div><div>${reportedByHtml}</div></div>
                     ${candidateProblemHtml}
@@ -3612,7 +3722,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>
 
                 <div class="section">
-                    <h2>Pipeline Enrichments</h2>
+                    <h2>Current State Summary</h2>
                     <div class="kv">
                         <div class="label">Severity:</div>
                         <div>
@@ -3664,6 +3774,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>
 
                 ${inlineReviewHtml}
+
+                ${enrichmentsTimelineHtml}
 
                 <div style="margin-top: 24px; margin-bottom: 0;">
                     <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;">

@@ -228,34 +228,23 @@ pub struct Bug {
     pub id: i64,
     #[serde(alias = "slug")]
     pub bugid: String,
+    pub title: String,
     pub status: String,
-    pub problem: String,
-    pub severity: Severity,
-    pub severity_explanation: Option<String>,
-    pub locations: Option<serde_json::Value>,
-    pub subsystems: Vec<String>,
-    pub source_files: Option<Vec<String>>,
-    #[serde(rename = "description")]
-    pub inline_review: String,
-    pub logs: Option<String>,
-    pub vector_json: Option<String>,
+    pub reporter: String,
+    pub reported_at: i64,
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
     pub discovered_in_commit: Option<String>,
-    pub introduced_in_commit: Option<String>,
-    pub verified_on_sha: Option<String>,
-    pub is_fixed: bool,
-    pub fixed_in_commit: Option<String>,
-    pub raw_input: Option<String>,
-    #[serde(default)]
-    pub tokens_in: Option<usize>,
-    #[serde(default)]
-    pub tokens_out: Option<usize>,
-    #[serde(default)]
-    pub tokens_cached: Option<usize>,
-    #[serde(default)]
+    pub source_ref: Option<String>,
+    pub vector_json: Option<String>,
     pub duplicate_of_id: Option<i64>,
     pub created_at: i64,
+    pub updated_at: i64,
+
+    #[serde(default)]
+    pub subsystems: Vec<String>,
+    #[serde(default)]
+    pub enrichments: Vec<BugEnrichment>,
 }
 
 impl std::fmt::Debug for Bug {
@@ -263,44 +252,19 @@ impl std::fmt::Debug for Bug {
         f.debug_struct("Bug")
             .field("id", &self.id)
             .field("bugid", &self.bugid)
+            .field("title", &self.title)
             .field("status", &self.status)
-            .field("problem", &self.problem)
-            .field("severity", &self.severity)
-            .field("severity_explanation", &self.severity_explanation)
-            .field("locations", &self.locations)
+            .field("reporter", &self.reporter)
+            .field("reported_at", &self.reported_at)
             .field("subsystems", &self.subsystems)
-            .field("source_files", &self.source_files)
-            .field("inline_review", &self.inline_review)
-            .field(
-                "logs",
-                &self.logs.as_ref().map(|l| format!("<{} bytes>", l.len())),
-            )
-            .field(
-                "vector_json",
-                &self
-                    .vector_json
-                    .as_ref()
-                    .map(|v| format!("<{} bytes>", v.len())),
-            )
+            .field("enrichments", &self.enrichments.len())
             .field("discovered_in_patchset_id", &self.discovered_in_patchset_id)
             .field("discovered_in_patch_id", &self.discovered_in_patch_id)
             .field("discovered_in_commit", &self.discovered_in_commit)
-            .field("introduced_in_commit", &self.introduced_in_commit)
-            .field("verified_on_sha", &self.verified_on_sha)
-            .field("is_fixed", &self.is_fixed)
-            .field("fixed_in_commit", &self.fixed_in_commit)
-            .field(
-                "raw_input",
-                &self
-                    .raw_input
-                    .as_ref()
-                    .map(|r| format!("<{} bytes>", r.len())),
-            )
-            .field("tokens_in", &self.tokens_in)
-            .field("tokens_out", &self.tokens_out)
-            .field("tokens_cached", &self.tokens_cached)
+            .field("source_ref", &self.source_ref)
             .field("duplicate_of_id", &self.duplicate_of_id)
             .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
             .finish()
     }
 }
@@ -310,39 +274,262 @@ impl Bug {
     pub fn slug(&self) -> &str {
         &self.bugid
     }
+
+    #[inline]
+    pub fn problem(&self) -> &str {
+        &self.title
+    }
+
+    pub fn severity(&self) -> Severity {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "severity_calibration"
+                && let Some(ref data) = e.data_json
+            {
+                if let Some(sev_str) = data.get("severity").and_then(|v| v.as_str()) {
+                    return Severity::from_str(sev_str);
+                }
+                if let Some(sev_int) = data.get("severity_int").and_then(|v| v.as_i64()) {
+                    return Severity::from_i32(sev_int as i32);
+                }
+            }
+        }
+        Severity::Unknown
+    }
+
+    pub fn severity_explanation(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "severity_calibration" {
+                if let Some(ref content) = e.content
+                    && !content.is_empty()
+                {
+                    return Some(content.clone());
+                }
+                if let Some(ref data) = e.data_json
+                    && let Some(exp) = data.get("explanation").and_then(|v| v.as_str())
+                {
+                    return Some(exp.to_string());
+                }
+            } else if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(refutation) = data.get("refutation_evidence").and_then(|v| v.as_str())
+            {
+                return Some(refutation.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn description(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "report"
+                && let Some(ref content) = e.content
+            {
+                return Some(content.clone());
+            }
+        }
+        None
+    }
+
+    pub fn inline_review(&self) -> String {
+        self.description().unwrap_or_default()
+    }
+
+    pub fn verified_on_sha(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(sha) = data.get("verified_on_sha").and_then(|v| v.as_str())
+            {
+                return Some(sha.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn locations(&self) -> Option<serde_json::Value> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(locs) = data.get("locations")
+                && !locs.is_null()
+            {
+                return Some(locs.clone());
+            }
+        }
+        for e in &self.enrichments {
+            if (e.kind == "candidate" || e.kind == "raw_candidate")
+                && let Some(ref data) = e.data_json
+                && let Some(locs) = data.get("locations")
+                && !locs.is_null()
+            {
+                return Some(locs.clone());
+            }
+        }
+        None
+    }
+
+    pub fn source_files(&self) -> Option<Vec<String>> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(files) = data
+                    .get("source_files")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            {
+                return Some(files);
+            }
+        }
+        None
+    }
+
+    pub fn introduced_in_commit(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "origin_discovery" {
+                if let Some(ref data) = e.data_json
+                    && let Some(sha) = data.get("introducing_commit_sha").and_then(|v| v.as_str())
+                {
+                    if let Some(title) = data
+                        .get("introducing_commit_title")
+                        .and_then(|v| v.as_str())
+                    {
+                        return Some(format!("{} ({})", &sha[..12.min(sha.len())], title));
+                    }
+                    return Some(sha.to_string());
+                }
+                if let Some(ref content) = e.content {
+                    return Some(content.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        if self.status == "fixed" {
+            return true;
+        }
+        for e in &self.enrichments {
+            if e.kind == "fix_candidate"
+                && let Some(ref data) = e.data_json
+                && data.get("status").and_then(|v| v.as_str()) == Some("merged")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn fixed_in_commit(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "fix_candidate"
+                && let Some(ref data) = e.data_json
+                && let Some(sha) = data.get("commit_sha").and_then(|v| v.as_str())
+            {
+                return Some(sha.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn raw_input(&self) -> Option<String> {
+        for e in &self.enrichments {
+            if e.kind == "candidate" || e.kind == "raw_candidate" {
+                if let Some(ref data) = e.data_json {
+                    return serde_json::to_string(data).ok();
+                }
+                if let Some(ref content) = e.content {
+                    return Some(content.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn tokens_in(&self) -> usize {
+        self.enrichments.iter().filter_map(|e| e.tokens_in).sum()
+    }
+
+    pub fn tokens_out(&self) -> usize {
+        self.enrichments.iter().filter_map(|e| e.tokens_out).sum()
+    }
+
+    pub fn tokens_cached(&self) -> usize {
+        self.enrichments
+            .iter()
+            .filter_map(|e| e.tokens_cached)
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BugEnrichment {
+    pub id: i64,
+    pub bug_id: i64,
+    pub kind: String,
+    pub tool: String,
+    pub model: Option<String>,
+    pub author: Option<String>,
+    pub created_at: i64,
+    pub content: Option<String>,
+    pub data_json: Option<serde_json::Value>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NewBugEnrichment {
+    pub kind: String,
+    pub tool: String,
+    pub model: Option<String>,
+    pub author: Option<String>,
+    pub created_at: i64,
+    pub content: Option<String>,
+    pub data_json: Option<serde_json::Value>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+    pub logs: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewBug {
     #[serde(alias = "slug")]
     pub bugid: String,
+    #[serde(default = "default_bug_title", alias = "problem")]
+    pub title: String,
+    #[serde(default = "default_bug_status")]
     pub status: String,
-    pub problem: String,
-    pub severity: Severity,
-    pub severity_explanation: Option<String>,
-    pub locations: Option<serde_json::Value>,
-    pub subsystems: Vec<String>,
-    pub source_files: Option<Vec<String>>,
-    pub inline_review: String,
-    pub logs: Option<String>,
-    pub vector_json: Option<String>,
+    #[serde(default = "default_bug_reporter")]
+    pub reporter: String,
+    #[serde(default = "default_now")]
+    pub reported_at: i64,
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
     pub discovered_in_commit: Option<String>,
-    pub introduced_in_commit: Option<String>,
-    pub verified_on_sha: Option<String>,
-    pub is_fixed: bool,
-    pub fixed_in_commit: Option<String>,
-    pub raw_input: Option<String>,
-    #[serde(default)]
-    pub tokens_in: Option<usize>,
-    #[serde(default)]
-    pub tokens_out: Option<usize>,
-    #[serde(default)]
-    pub tokens_cached: Option<usize>,
-    #[serde(default)]
+    pub source_ref: Option<String>,
+    pub vector_json: Option<String>,
     pub duplicate_of_id: Option<i64>,
-    pub created_at: i64,
+    #[serde(default)]
+    pub subsystems: Vec<String>,
+}
+
+fn default_bug_title() -> String {
+    String::new()
+}
+
+fn default_bug_status() -> String {
+    "raw".to_string()
+}
+
+fn default_bug_reporter() -> String {
+    "sashiko".to_string()
+}
+
+fn default_now() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 #[derive(Default, Debug, Clone)]
@@ -733,6 +920,7 @@ impl Database {
         }
 
         self.migrate_patches_unique_constraint_if_needed().await?;
+        self.ensure_extensible_bug_schema_if_needed().await?;
 
         Ok(())
     }
@@ -1137,45 +1325,105 @@ impl Database {
         Ok(())
     }
 
-    async fn backfill_bugs_subsystems_if_needed(&self) -> Result<()> {
-        let mut count_rows = self
+    async fn ensure_extensible_bug_schema_if_needed(&self) -> Result<()> {
+        let needs_recreation = self
             .conn
-            .query("SELECT COUNT(*) FROM bugs_subsystems", ())
-            .await?;
-        let count = if let Some(row) = count_rows.next().await? {
-            row.get::<i64>(0).unwrap_or(0)
-        } else {
-            0
-        };
+            .query("SELECT reporter FROM bugs LIMIT 1", ())
+            .await
+            .is_err();
 
-        if count == 0 {
-            let mut bug_rows = self
+        if needs_recreation {
+            let _ = self
                 .conn
-                .query(
-                    "SELECT id, subsystems FROM bugs WHERE subsystems IS NOT NULL",
-                    (),
-                )
-                .await?;
-            while let Some(row) = bug_rows.next().await? {
-                let id: i64 = row.get(0)?;
-                if let Ok(Some(subsystems_str)) = row.get::<Option<String>>(1)
-                    && let Ok(subsystems) = serde_json::from_str::<Vec<String>>(&subsystems_str)
-                {
-                    for sub in subsystems {
-                        let trimmed = sub.trim();
-                        if !trimmed.is_empty() {
-                            let _ = self
-                                    .conn
-                                    .execute(
-                                        "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
-                                        libsql::params![id, trimmed],
-                                    )
-                                    .await;
-                        }
-                    }
-                }
-            }
+                .execute("DROP TABLE IF EXISTS bugs_subsystems", ())
+                .await;
+            let _ = self
+                .conn
+                .execute("DROP TABLE IF EXISTS review_bugs", ())
+                .await;
+            let _ = self
+                .conn
+                .execute("DROP TABLE IF EXISTS bug_enrichments", ())
+                .await;
+            let _ = self.conn.execute("DROP TABLE IF EXISTS bugs", ()).await;
+
+            let schema = r#"
+            CREATE TABLE IF NOT EXISTS bugs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bugid TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'raw',
+                reporter TEXT NOT NULL,
+                reported_at INTEGER NOT NULL,
+                discovered_in_patchset_id INTEGER,
+                discovered_in_patch_id INTEGER,
+                discovered_in_commit TEXT,
+                source_ref TEXT,
+                vector_json TEXT,
+                duplicate_of_id INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
+                FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id),
+                FOREIGN KEY(duplicate_of_id) REFERENCES bugs(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bugs_bugid ON bugs(bugid);
+            CREATE INDEX IF NOT EXISTS idx_bugs_status ON bugs(status);
+            CREATE INDEX IF NOT EXISTS idx_bugs_reporter ON bugs(reporter);
+            CREATE INDEX IF NOT EXISTS idx_bugs_reported_at ON bugs(reported_at);
+            CREATE INDEX IF NOT EXISTS idx_bugs_duplicate_of_id ON bugs(duplicate_of_id);
+
+            CREATE TABLE IF NOT EXISTS bug_enrichments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bug_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                model TEXT,
+                author TEXT,
+                created_at INTEGER NOT NULL,
+                content TEXT,
+                data_json TEXT,
+                tokens_in INTEGER,
+                tokens_out INTEGER,
+                tokens_cached INTEGER,
+                logs TEXT,
+                FOREIGN KEY(bug_id) REFERENCES bugs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bug_enrichments_bug_id ON bug_enrichments(bug_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_bug_enrichments_kind ON bug_enrichments(kind, bug_id);
+            CREATE INDEX IF NOT EXISTS idx_bug_enrichments_tool ON bug_enrichments(tool);
+
+            CREATE TABLE IF NOT EXISTS review_bugs (
+                review_id INTEGER NOT NULL,
+                bug_id INTEGER NOT NULL,
+                is_newly_discovered INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(review_id, bug_id),
+                FOREIGN KEY(review_id) REFERENCES reviews(id),
+                FOREIGN KEY(bug_id) REFERENCES bugs(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_review_bugs_review ON review_bugs(review_id);
+            CREATE INDEX IF NOT EXISTS idx_review_bugs_bug ON review_bugs(bug_id);
+
+            CREATE TABLE IF NOT EXISTS bugs_subsystems (
+                bug_id INTEGER NOT NULL,
+                subsystem TEXT NOT NULL,
+                PRIMARY KEY (bug_id, subsystem),
+                FOREIGN KEY(bug_id) REFERENCES bugs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bugs_subsystems_subsystem ON bugs_subsystems(subsystem, bug_id);
+            CREATE INDEX IF NOT EXISTS idx_bugs_subsystems_bug_id ON bugs_subsystems(bug_id);
+            "#;
+            self.conn.execute_batch(schema).await?;
         }
+
+        Ok(())
+    }
+
+    async fn backfill_bugs_subsystems_if_needed(&self) -> Result<()> {
         Ok(())
     }
 
@@ -1456,58 +1704,35 @@ impl Database {
     }
 
     pub async fn create_bug(&self, bug: &NewBug) -> Result<i64> {
-        let locations_val = bug
-            .locations
-            .as_ref()
-            .and_then(|v| serde_json::to_string(v).ok());
-        let source_files_val = bug
-            .source_files
-            .as_ref()
-            .and_then(|v| serde_json::to_string(v).ok());
-        let subsystems_val = serde_json::to_string(&bug.subsystems).ok();
-        let compressed_inline = crate::compression::compress_string_if_needed(&bug.inline_review);
-        let compressed_logs = bug
-            .logs
-            .as_ref()
-            .map(|l| crate::compression::compress_string_if_needed(l))
-            .unwrap_or(libsql::Value::Null);
-
-        let mut rows: libsql::Rows = self
+        let now = if bug.reported_at > 0 {
+            bug.reported_at
+        } else {
+            chrono::Utc::now().timestamp()
+        };
+        let mut rows = self
             .conn
             .query(
                 "INSERT INTO bugs (
-                    bugid, status, problem, severity, severity_explanation, locations,
-                    subsystems, source_files, inline_review, logs, vector_json,
+                    bugid, title, status, reporter, reported_at,
                     discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                    fixed_in_commit, raw_input, tokens_in, tokens_out, tokens_cached, duplicate_of_id, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    discovered_in_commit, source_ref, vector_json, duplicate_of_id,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.bugid.as_str(),
+                    bug.title.as_str(),
                     bug.status.as_str(),
-                    bug.problem.as_str(),
-                    bug.severity as i32,
-                    bug.severity_explanation.clone(),
-                    locations_val,
-                    subsystems_val,
-                    source_files_val,
-                    compressed_inline,
-                    compressed_logs,
-                    bug.vector_json.clone(),
+                    bug.reporter.as_str(),
+                    now,
                     bug.discovered_in_patchset_id,
                     bug.discovered_in_patch_id,
                     bug.discovered_in_commit.clone(),
-                    bug.introduced_in_commit.clone(),
-                    bug.verified_on_sha.clone(),
-                    if bug.is_fixed { 1 } else { 0 },
-                    bug.fixed_in_commit.clone(),
-                    bug.raw_input.clone(),
-                    bug.tokens_in.map(|t| t as i64),
-                    bug.tokens_out.map(|t| t as i64),
-                    bug.tokens_cached.map(|t| t as i64),
+                    bug.source_ref.clone(),
+                    bug.vector_json.clone(),
                     bug.duplicate_of_id,
-                    bug.created_at,
+                    now,
+                    now,
                 ],
             )
             .await?;
@@ -1528,26 +1753,162 @@ impl Database {
             }
             Ok(id)
         } else {
-            bail!("Failed to insert preexisting bug: no id returned");
+            bail!("Failed to insert bug: no id returned");
         }
+    }
+
+    pub async fn add_bug_enrichment(
+        &self,
+        bug_id: i64,
+        enrichment: &NewBugEnrichment,
+    ) -> Result<i64> {
+        let compressed_content = enrichment
+            .content
+            .as_ref()
+            .map(|c| crate::compression::compress_string_if_needed(c))
+            .unwrap_or(libsql::Value::Null);
+        let compressed_logs = enrichment
+            .logs
+            .as_ref()
+            .map(|l| crate::compression::compress_string_if_needed(l))
+            .unwrap_or(libsql::Value::Null);
+        let data_json_str = enrichment
+            .data_json
+            .as_ref()
+            .and_then(|d| serde_json::to_string(d).ok());
+        let now = if enrichment.created_at > 0 {
+            enrichment.created_at
+        } else {
+            chrono::Utc::now().timestamp()
+        };
+
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO bug_enrichments (
+                    bug_id, kind, tool, model, author, created_at, content, data_json,
+                    tokens_in, tokens_out, tokens_cached, logs
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 RETURNING id",
+                libsql::params![
+                    bug_id,
+                    enrichment.kind.as_str(),
+                    enrichment.tool.as_str(),
+                    enrichment.model.clone(),
+                    enrichment.author.clone(),
+                    now,
+                    compressed_content,
+                    data_json_str,
+                    enrichment.tokens_in.map(|t| t as i64),
+                    enrichment.tokens_out.map(|t| t as i64),
+                    enrichment.tokens_cached.map(|t| t as i64),
+                    compressed_logs,
+                ],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let eid: i64 = row.get(0)?;
+            let _ = self
+                .conn
+                .execute(
+                    "UPDATE bugs SET updated_at = ? WHERE id = ?",
+                    libsql::params![now, bug_id],
+                )
+                .await;
+            Ok(eid)
+        } else {
+            bail!("Failed to insert bug enrichment: no id returned");
+        }
+    }
+
+    pub async fn get_bug_enrichments(&self, bug_id: i64) -> Result<Vec<BugEnrichment>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json,
+                        tokens_in, tokens_out, tokens_cached, logs
+                 FROM bug_enrichments
+                 WHERE bug_id = ?
+                 ORDER BY created_at ASC, id ASC",
+                libsql::params![bug_id],
+            )
+            .await?;
+
+        let mut list = Vec::new();
+        while let Some(row) = rows.next().await? {
+            list.push(Self::parse_bug_enrichment_row(&row)?);
+        }
+        Ok(list)
+    }
+
+    fn parse_bug_enrichment_row(row: &libsql::Row) -> Result<BugEnrichment> {
+        let id: i64 = row.get(0)?;
+        let bug_id: i64 = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let tool: String = row.get(3)?;
+        let model: Option<String> = row.get(4).ok().flatten();
+        let author: Option<String> = row.get(5).ok().flatten();
+        let created_at: i64 = row.get(6)?;
+        let content: Option<String> = crate::compression::get_compressed_string_opt(row, 7)
+            .unwrap_or(None)
+            .or_else(|| row.get::<Option<String>>(7).ok().flatten());
+        let data_json_str: Option<String> = row.get(8).ok().flatten();
+        let data_json: Option<serde_json::Value> =
+            data_json_str.and_then(|s| serde_json::from_str(&s).ok());
+        let tokens_in: Option<usize> = row.get::<Option<i64>>(9).ok().flatten().map(|v| v as usize);
+        let tokens_out: Option<usize> = row
+            .get::<Option<i64>>(10)
+            .ok()
+            .flatten()
+            .map(|v| v as usize);
+        let tokens_cached: Option<usize> = row
+            .get::<Option<i64>>(11)
+            .ok()
+            .flatten()
+            .map(|v| v as usize);
+        let logs: Option<String> = crate::compression::get_compressed_string_opt(row, 12)
+            .unwrap_or(None)
+            .or_else(|| row.get::<Option<String>>(12).ok().flatten());
+
+        Ok(BugEnrichment {
+            id,
+            bug_id,
+            kind,
+            tool,
+            model,
+            author,
+            created_at,
+            content,
+            data_json,
+            tokens_in,
+            tokens_out,
+            tokens_cached,
+            logs,
+        })
     }
 
     pub async fn get_bug(&self, id: i64) -> Result<Option<Bug>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
-                        subsystems, source_files, inline_review, logs, vector_json,
+                "SELECT id, bugid, title, status, reporter, reported_at,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached, duplicate_of_id
+                        discovered_in_commit, source_ref, vector_json, duplicate_of_id,
+                        created_at, updated_at
                  FROM bugs WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(Some(Self::parse_bug_row(&row)?))
+        if let Some(row) = rows.next().await? {
+            let mut bug = Self::parse_bug_row_core(&row)?;
+            bug.subsystems = self
+                .get_subsystems_for_bug(bug.id)
+                .await
+                .unwrap_or_default();
+            bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
+            Ok(Some(bug))
         } else {
             Ok(None)
         }
@@ -1557,18 +1918,23 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
-                        subsystems, source_files, inline_review, logs, vector_json,
+                "SELECT id, bugid, title, status, reporter, reported_at,
                         discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached, duplicate_of_id
+                        discovered_in_commit, source_ref, vector_json, duplicate_of_id,
+                        created_at, updated_at
                  FROM bugs WHERE bugid = ?",
                 libsql::params![bugid],
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(Some(Self::parse_bug_row(&row)?))
+        if let Some(row) = rows.next().await? {
+            let mut bug = Self::parse_bug_row_core(&row)?;
+            bug.subsystems = self
+                .get_subsystems_for_bug(bug.id)
+                .await
+                .unwrap_or_default();
+            bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
+            Ok(Some(bug))
         } else {
             Ok(None)
         }
@@ -1578,32 +1944,48 @@ impl Database {
         self.get_bug_by_bugid(slug).await
     }
 
-    pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
+    pub async fn get_subsystems_for_bug(&self, bug_id: i64) -> Result<Vec<String>> {
         let mut rows = self
             .conn
-            .query("SELECT logs FROM bugs WHERE id = ?", libsql::params![id])
+            .query(
+                "SELECT subsystem FROM bugs_subsystems WHERE bug_id = ? ORDER BY subsystem ASC",
+                libsql::params![bug_id],
+            )
             .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(crate::compression::get_compressed_string_opt(&row, 0)
-                .unwrap_or(None)
-                .or_else(|| row.get::<Option<String>>(0).ok().flatten()))
-        } else {
+        let mut subs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            subs.push(row.get(0)?);
+        }
+        Ok(subs)
+    }
+
+    pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
+        let enrichments = self.get_bug_enrichments(id).await?;
+        let mut combined = Vec::new();
+        for e in enrichments {
+            if let Some(logs_str) = e.logs {
+                if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&logs_str) {
+                    combined.extend(entries);
+                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(&logs_str) {
+                    combined.push(val);
+                } else {
+                    combined.push(serde_json::json!({
+                        "role": e.tool,
+                        "parts": [{"text": logs_str}]
+                    }));
+                }
+            }
+        }
+        if combined.is_empty() {
             Ok(None)
+        } else {
+            Ok(serde_json::to_string(&combined).ok())
         }
     }
 
     pub async fn get_bug_logs_by_bugid(&self, bugid: &str) -> Result<Option<String>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT logs FROM bugs WHERE bugid = ?",
-                libsql::params![bugid],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(crate::compression::get_compressed_string_opt(&row, 0)
-                .unwrap_or(None)
-                .or_else(|| row.get::<Option<String>>(0).ok().flatten()))
+        if let Some(bug) = self.get_bug_by_bugid(bugid).await? {
+            self.get_bug_logs(bug.id).await
         } else {
             Ok(None)
         }
@@ -1621,12 +2003,13 @@ impl Database {
                 (),
             )
             .await?;
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
+            let now = chrono::Utc::now().timestamp();
             self.conn
                 .execute(
-                    "UPDATE bugs SET status = 'processing' WHERE id = ?",
-                    libsql::params![id],
+                    "UPDATE bugs SET status = 'processing', updated_at = ? WHERE id = ?",
+                    libsql::params![now, id],
                 )
                 .await?;
             self.get_bug(id).await
@@ -1654,88 +2037,166 @@ impl Database {
         Ok(count as usize)
     }
 
+    pub async fn update_bug_status(&self, id: i64, status: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs SET status = ?, updated_at = ? WHERE id = ?",
+                libsql::params![status, now, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_bug_title(&self, id: i64, title: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs SET title = ?, updated_at = ? WHERE id = ?",
+                libsql::params![title, now, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_bug_vector(&self, id: i64, vector_json: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs SET vector_json = ?, updated_at = ? WHERE id = ?",
+                libsql::params![vector_json, now, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_bug_subsystems(&self, id: i64, subsystems: &[String]) -> Result<()> {
+        let _ = self
+            .conn
+            .execute(
+                "DELETE FROM bugs_subsystems WHERE bug_id = ?",
+                libsql::params![id],
+            )
+            .await;
+        for sub in subsystems {
+            let trimmed = sub.trim();
+            if !trimmed.is_empty() {
+                let _ = self
+                    .conn
+                    .execute(
+                        "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
+                        libsql::params![id, trimmed],
+                    )
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn update_bug_outcome(
         &self,
         id: i64,
         params: UpdateBugOutcomeParams<'_>,
     ) -> Result<()> {
-        let compressed_inline = crate::compression::compress_string_if_needed(params.inline_review);
-        let compressed_logs = params
-            .logs
-            .map(crate::compression::compress_string_if_needed)
-            .unwrap_or(libsql::Value::Null);
-        let subsystems_json = params
-            .subsystems
-            .and_then(|s| serde_json::to_string(s).ok());
-        let source_files_json = params
-            .source_files
-            .and_then(|f| serde_json::to_string(f).ok());
-        let locations_json = params.locations.and_then(|l| serde_json::to_string(l).ok());
-
-        self.conn
-            .execute(
-                "UPDATE bugs SET 
-                status = ?,
-                problem = COALESCE(?, problem),
-                subsystems = COALESCE(?, subsystems),
-                source_files = COALESCE(?, source_files),
-                locations = COALESCE(?, locations),
-                severity = ?,
-                severity_explanation = ?,
-                inline_review = ?,
-                logs = ?,
-                vector_json = ?,
-                introduced_in_commit = ?,
-                verified_on_sha = ?,
-                is_fixed = ?,
-                fixed_in_commit = ?,
-                tokens_in = COALESCE(?, tokens_in),
-                tokens_out = COALESCE(?, tokens_out),
-                tokens_cached = COALESCE(?, tokens_cached)
-             WHERE id = ?",
-                libsql::params![
-                    params.status,
-                    params.problem.map(|s| s.to_string()),
-                    subsystems_json,
-                    source_files_json,
-                    locations_json,
-                    params.severity as i32,
-                    params.severity_explanation.map(|s| s.to_string()),
-                    compressed_inline,
-                    compressed_logs,
-                    params.vector_json.map(|s| s.to_string()),
-                    params.introduced_in_commit.map(|s| s.to_string()),
-                    params.verified_on_sha.map(|s| s.to_string()),
-                    if params.is_fixed { 1 } else { 0 },
-                    params.fixed_in_commit.map(|s| s.to_string()),
-                    params.tokens_in.map(|t| t as i64),
-                    params.tokens_out.map(|t| t as i64),
-                    params.tokens_cached.map(|t| t as i64),
-                    id
-                ],
-            )
-            .await?;
-
+        let now = chrono::Utc::now().timestamp();
+        if let Some(title) = params.problem {
+            let _ = self.update_bug_title(id, title).await;
+        }
         if let Some(subsystems) = params.subsystems {
+            let _ = self.update_bug_subsystems(id, subsystems).await;
+        }
+        if let Some(vector) = params.vector_json {
+            let _ = self.update_bug_vector(id, vector).await;
+        }
+        self.update_bug_status(id, params.status).await?;
+
+        if params.verified_on_sha.is_some() || params.locations.is_some() {
+            let is_valid = params.status != "dismissed";
+            let refutation = if !is_valid {
+                params.severity_explanation.map(|s| s.to_string())
+            } else {
+                None
+            };
+            let data = serde_json::json!({
+                "verified_on_sha": params.verified_on_sha,
+                "is_valid": is_valid,
+                "refutation_evidence": refutation,
+                "locations": params.locations,
+                "source_files": params.source_files,
+            });
             let _ = self
-                .conn
-                .execute(
-                    "DELETE FROM bugs_subsystems WHERE bug_id = ?",
-                    libsql::params![id],
+                .add_bug_enrichment(
+                    id,
+                    &NewBugEnrichment {
+                        kind: "verification".to_string(),
+                        tool: "sashiko".to_string(),
+                        created_at: now,
+                        content: params.severity_explanation.map(|s| s.to_string()),
+                        data_json: Some(data),
+                        ..Default::default()
+                    },
                 )
                 .await;
-            for sub in subsystems {
-                let trimmed = sub.trim();
-                if !trimmed.is_empty() {
-                    let _ = self
-                        .conn
-                        .execute(
-                            "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
-                            libsql::params![id, trimmed],
-                        )
-                        .await;
-                }
-            }
+        }
+
+        if let Some(intro) = params.introduced_in_commit {
+            let _ = self
+                .add_bug_enrichment(
+                    id,
+                    &NewBugEnrichment {
+                        kind: "origin_discovery".to_string(),
+                        tool: "sashiko".to_string(),
+                        created_at: now,
+                        content: Some(intro.to_string()),
+                        data_json: Some(serde_json::json!({
+                            "introducing_commit_sha": intro,
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+
+        if params.severity != Severity::Unknown {
+            let _ = self
+                .add_bug_enrichment(
+                    id,
+                    &NewBugEnrichment {
+                        kind: "severity_calibration".to_string(),
+                        tool: "sashiko".to_string(),
+                        created_at: now,
+                        content: params.severity_explanation.map(|s| s.to_string()),
+                        data_json: Some(serde_json::json!({
+                            "severity": params.severity.as_str(),
+                            "severity_int": params.severity as i32,
+                            "subsystems": params.subsystems,
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+
+        if !params.inline_review.is_empty() {
+            let _ = self
+                .add_bug_enrichment(
+                    id,
+                    &NewBugEnrichment {
+                        kind: "report".to_string(),
+                        tool: "sashiko".to_string(),
+                        created_at: now,
+                        content: Some(params.inline_review.to_string()),
+                        data_json: Some(serde_json::json!({
+                            "format": "lkml_markdown",
+                        })),
+                        tokens_in: params.tokens_in,
+                        tokens_out: params.tokens_out,
+                        tokens_cached: params.tokens_cached,
+                        logs: params.logs.map(|s| s.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
         }
 
         Ok(())
@@ -1748,11 +2209,6 @@ impl Database {
 
         let mut conditions: Vec<std::borrow::Cow<'static, str>> = Vec::new();
         let mut query_params = Vec::new();
-
-        if let Some(sev) = params.min_severity {
-            conditions.push("severity >= ?".into());
-            query_params.push(libsql::Value::Integer(sev as i64));
-        }
 
         if let Some(subs) = params.subsystems {
             let valid_subs: Vec<&str> = subs
@@ -1797,13 +2253,38 @@ impl Database {
                 }
             } else {
                 conditions.push(
-                    "(id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem = ? OR subsystem LIKE ?) OR (subsystems LIKE ? OR subsystems LIKE ?))".into(),
+                    "id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem = ? OR subsystem LIKE ?)".into(),
                 );
                 query_params.push(libsql::Value::Text(sub.to_string()));
                 query_params.push(libsql::Value::Text(format!("{}/%", sub)));
-                query_params.push(libsql::Value::Text(format!("%\"{}\"%", sub)));
-                query_params.push(libsql::Value::Text(format!("%\"{}/%", sub)));
             }
+        }
+
+        if let Some(min_sev) = params.min_severity
+            && min_sev != Severity::Unknown
+        {
+            conditions.push(
+                "id IN (
+                    SELECT bug_id FROM bug_enrichments
+                    WHERE kind = 'severity_calibration'
+                      AND (
+                          CAST(json_extract(data_json, '$.severity_int') AS INTEGER) >= ?
+                          OR (
+                              json_extract(data_json, '$.severity_int') IS NULL
+                              AND CASE LOWER(json_extract(data_json, '$.severity'))
+                                  WHEN 'critical' THEN 4
+                                  WHEN 'high' THEN 3
+                                  WHEN 'medium' THEN 2
+                                  WHEN 'low' THEN 1
+                                  ELSE 0
+                              END >= ?
+                          )
+                      )
+                )"
+                .into(),
+            );
+            query_params.push(libsql::Value::Integer(min_sev as i64));
+            query_params.push(libsql::Value::Integer(min_sev as i64));
         }
 
         if let Some(st) = params.status.map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1812,9 +2293,8 @@ impl Database {
         }
 
         if let Some(q) = params.search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            conditions.push("(problem LIKE ? OR bugid LIKE ? OR locations LIKE ?)".into());
+            conditions.push("(title LIKE ? OR bugid LIKE ?)".into());
             let pattern = format!("%{}%", q);
-            query_params.push(libsql::Value::Text(pattern.clone()));
             query_params.push(libsql::Value::Text(pattern.clone()));
             query_params.push(libsql::Value::Text(pattern));
         }
@@ -1831,37 +2311,39 @@ impl Database {
         };
         let order_clause = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("severity") => {
-                format!("ORDER BY severity {}, created_at DESC, id DESC", sort_dir)
+                format!(
+                    "ORDER BY COALESCE((
+                        SELECT CAST(json_extract(data_json, '$.severity_int') AS INTEGER)
+                        FROM bug_enrichments
+                        WHERE bug_id = bugs.id AND kind = 'severity_calibration'
+                        ORDER BY created_at DESC LIMIT 1
+                    ), 0) {}, id {}",
+                    sort_dir, sort_dir
+                )
             }
-            Some("problem") => {
-                format!("ORDER BY problem {}, created_at DESC, id DESC", sort_dir)
+            Some("title") | Some("problem") => {
+                format!("ORDER BY title {}, created_at DESC, id DESC", sort_dir)
             }
-            Some("status") => format!(
-                "ORDER BY status {}, severity DESC, created_at DESC, id DESC",
-                sort_dir
-            ),
+            Some("status") => format!("ORDER BY status {}, created_at DESC, id DESC", sort_dir),
             Some("id") => format!("ORDER BY id {}", sort_dir),
             Some("bugid") => format!("ORDER BY bugid {}, id {}", sort_dir, sort_dir),
             Some("created_at") => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
-            _ => format!("ORDER BY severity {}, created_at DESC, id DESC", sort_dir),
+            _ => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
         };
 
-        // Count total
         let count_sql = format!("SELECT COUNT(*) FROM bugs {}", where_clause);
         let mut count_rows = self.conn.query(&count_sql, query_params.clone()).await?;
-        let total: usize = if let Ok(Some(row)) = count_rows.next().await {
+        let total: usize = if let Some(row) = count_rows.next().await? {
             row.get::<i64>(0).unwrap_or(0) as usize
         } else {
             0
         };
 
-        // Query rows
         let select_sql = format!(
-            "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
-                    subsystems, source_files, inline_review, NULL, vector_json,
+            "SELECT id, bugid, title, status, reporter, reported_at,
                     discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                    fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached, duplicate_of_id
+                    discovered_in_commit, source_ref, vector_json, duplicate_of_id,
+                    created_at, updated_at
              FROM bugs
              {}
              {}
@@ -1874,8 +2356,14 @@ impl Database {
 
         let mut rows = self.conn.query(&select_sql, query_params).await?;
         let mut bugs = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            bugs.push(Self::parse_bug_row(&row)?);
+        while let Some(row) = rows.next().await? {
+            let mut bug = Self::parse_bug_row_core(&row)?;
+            bug.subsystems = self
+                .get_subsystems_for_bug(bug.id)
+                .await
+                .unwrap_or_default();
+            bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
+            bugs.push(bug);
         }
 
         Ok((bugs, total))
@@ -1925,37 +2413,43 @@ impl Database {
     /// atomically migrating all associated review linkages to the pre-existing canonical bug.
     /// This single Transaction boundary guarantees tearing cannot occur during deduplication.
     pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<()> {
-        let compressed_inline = crate::compression::compress_string_if_needed(params.reasoning);
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction().await?;
+
+        tx.execute(
+            "UPDATE bugs SET status = 'duplicate', duplicate_of_id = ?, updated_at = ? WHERE id = ?",
+            libsql::params![params.canonical_id, now, params.ephemeral_id],
+        )
+        .await?;
+
         let compressed_logs = params
             .logs
             .map(crate::compression::compress_string_if_needed)
             .unwrap_or(libsql::Value::Null);
 
-        let tx = self.conn.transaction().await?;
-
-        // 1. Mark ephemeral bug as Duplicate
         tx.execute(
-            "UPDATE bugs SET status = ?1, inline_review = ?2, logs = ?3, vector_json = NULL, is_fixed = 0,
-             tokens_in = ?5, tokens_out = ?6, tokens_cached = ?7, duplicate_of_id = ?8 WHERE id = ?4",
+            "INSERT INTO bug_enrichments (
+                bug_id, kind, tool, created_at, content, tokens_in, tokens_out, tokens_cached, logs
+             ) VALUES (?, 'deduplication', 'sashiko', ?, ?, ?, ?, ?, ?)",
             libsql::params![
-                "duplicate",
-                compressed_inline,
-                compressed_logs,
                 params.ephemeral_id,
+                now,
+                params.reasoning,
                 params.tokens_in.map(|t| t as i64),
                 params.tokens_out.map(|t| t as i64),
                 params.tokens_cached.map(|t| t as i64),
-                params.canonical_id,
+                compressed_logs,
             ],
-        ).await?;
+        )
+        .await?;
 
-        // 2. Migrate reviews out of the Tombstone immediately
         tx.execute(
             "INSERT OR IGNORE INTO review_bugs (review_id, bug_id) SELECT review_id, ?1 FROM review_bugs WHERE bug_id = ?2",
             libsql::params![params.canonical_id, params.ephemeral_id],
-        ).await?;
+        )
+        .await?;
         tx.execute(
-            "DELETE FROM review_bugs WHERE bug_id = ?1",
+            "DELETE FROM review_bugs WHERE bug_id = ?",
             libsql::params![params.ephemeral_id],
         )
         .await?;
@@ -1963,6 +2457,7 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+
     pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
         self.conn
             .execute(
@@ -2000,21 +2495,16 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
-                        subsystems, source_files, inline_review, NULL, vector_json,
-                        discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached,
-                        duplicate_of_id
-                 FROM bugs
-                 WHERE duplicate_of_id = ?
-                 ORDER BY id ASC",
+                "SELECT id FROM bugs WHERE duplicate_of_id = ? ORDER BY id ASC",
                 libsql::params![canonical_id],
             )
             .await?;
         let mut list = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            list.push(Self::parse_bug_row(&row)?);
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            if let Some(bug) = self.get_bug(id).await? {
+                list.push(bug);
+            }
         }
         Ok(list)
     }
@@ -2023,26 +2513,29 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT pb.id, pb.bugid, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
-                        pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
-                        pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
-                        pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
-                        pb.fixed_in_commit, pb.raw_input, pb.created_at, pb.tokens_in, pb.tokens_out, pb.tokens_cached,
-                        pb.duplicate_of_id, rpb.is_newly_discovered
+                "SELECT pb.id, rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  WHERE rpb.review_id = ?
-                 ORDER BY pb.severity DESC, pb.id ASC",
+                 ORDER BY pb.id ASC",
                 libsql::params![review_id],
             )
             .await?;
 
         let mut list = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(25).unwrap_or(1);
-            list.push((bug, is_newly_discovered != 0));
+        while let Some(row) = rows.next().await? {
+            let bug_id: i64 = row.get(0)?;
+            let is_newly_discovered: i64 = row.get(1).unwrap_or(1);
+            if let Some(bug) = self.get_bug(bug_id).await? {
+                list.push((bug, is_newly_discovered != 0));
+            }
         }
+
+        list.sort_by(|(a, _), (b, _)| {
+            b.severity()
+                .cmp(&a.severity())
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         Ok(list)
     }
@@ -2051,27 +2544,30 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT DISTINCT pb.id, pb.bugid, pb.status, pb.problem, pb.severity, pb.severity_explanation, pb.locations,
-                        pb.subsystems, pb.source_files, pb.inline_review, pb.logs, pb.vector_json,
-                        pb.discovered_in_patchset_id, pb.discovered_in_patch_id,
-                        pb.discovered_in_commit, pb.introduced_in_commit, pb.verified_on_sha, pb.is_fixed,
-                        pb.fixed_in_commit, pb.raw_input, pb.created_at, pb.tokens_in, pb.tokens_out, pb.tokens_cached,
-                        pb.duplicate_of_id, rpb.is_newly_discovered
+                "SELECT DISTINCT pb.id, rpb.is_newly_discovered
                  FROM bugs pb
                  JOIN review_bugs rpb ON pb.id = rpb.bug_id
                  JOIN reviews r ON rpb.review_id = r.id
                  WHERE r.patchset_id = ?
-                 ORDER BY pb.severity DESC, pb.id ASC",
+                 ORDER BY pb.id ASC",
                 libsql::params![patchset_id],
             )
             .await?;
 
         let mut list = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let bug = Self::parse_bug_row(&row)?;
-            let is_newly_discovered: i64 = row.get(25).unwrap_or(1);
-            list.push((bug, is_newly_discovered != 0));
+        while let Some(row) = rows.next().await? {
+            let bug_id: i64 = row.get(0)?;
+            let is_newly_discovered: i64 = row.get(1).unwrap_or(1);
+            if let Some(bug) = self.get_bug(bug_id).await? {
+                list.push((bug, is_newly_discovered != 0));
+            }
         }
+
+        list.sort_by(|(a, _), (b, _)| {
+            b.severity()
+                .cmp(&a.severity())
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         Ok(list)
     }
@@ -2080,115 +2576,66 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, bugid, status, problem, severity, severity_explanation, locations,
-                        subsystems, source_files, inline_review, logs, vector_json,
-                        discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, introduced_in_commit, verified_on_sha, is_fixed,
-                        fixed_in_commit, raw_input, created_at, tokens_in, tokens_out, tokens_cached,
-                        duplicate_of_id
-                 FROM bugs
-                 WHERE status IN ('open', 'fixed', 'verified')",
+                "SELECT id FROM bugs WHERE status IN ('open', 'fixed', 'verified') ORDER BY id ASC",
                 (),
             )
             .await?;
 
         let mut list = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
-            list.push(Self::parse_bug_row(&row)?);
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            if let Some(bug) = self.get_bug(id).await? {
+                list.push(bug);
+            }
         }
 
         Ok(list)
     }
 
-    fn parse_bug_row(row: &libsql::Row) -> Result<Bug> {
+    fn parse_bug_row_core(row: &libsql::Row) -> Result<Bug> {
         let id: i64 = row.get(0)?;
         let bugid: String = row.get(1)?;
-        let status: String = row.get(2)?;
-        let problem: String = row.get(3)?;
-        let severity_val: i32 = row.get(4)?;
-        let severity_explanation: Option<String> = row.get(5).ok().flatten();
-        let locations_str: Option<String> = row.get(6).ok().flatten();
-        let locations: Option<serde_json::Value> =
-            locations_str.and_then(|s| serde_json::from_str(&s).ok());
-        let subsystems_str: Option<String> = row.get(7).ok().flatten();
-        let subsystems: Vec<String> = match subsystems_str {
-            Some(ref s) => serde_json::from_str(s).unwrap_or_else(|_| {
-                if !s.trim().is_empty() {
-                    vec![s.trim().to_string()]
-                } else {
-                    Vec::new()
-                }
-            }),
-            None => Vec::new(),
-        };
-        let source_files_str: Option<String> = row.get(8).ok().flatten();
-        let source_files: Option<Vec<String>> =
-            source_files_str.and_then(|s| serde_json::from_str(&s).ok());
-        let inline_review: String = crate::compression::get_compressed_string_opt(row, 9)
-            .unwrap_or(None)
-            .unwrap_or_else(|| row.get::<String>(9).unwrap_or_default());
-        let logs: Option<String> = crate::compression::get_compressed_string_opt(row, 10)
-            .unwrap_or(None)
-            .or_else(|| row.get::<Option<String>>(10).ok().flatten());
-        let vector_json: Option<String> = row.get(11).ok().flatten();
-        let discovered_in_patchset_id: Option<i64> = row.get(12).ok().flatten();
-        let discovered_in_patch_id: Option<i64> = row.get(13).ok().flatten();
-        let discovered_in_commit: Option<String> = row.get(14).ok().flatten();
-        let introduced_in_commit: Option<String> = row.get(15).ok().flatten();
-        let verified_on_sha: Option<String> = row.get(16).ok().flatten();
-        let is_fixed: bool = row.get::<i64>(17).unwrap_or(0) != 0;
-        let fixed_in_commit: Option<String> = row.get(18).ok().flatten();
-        let raw_input: Option<String> = row.get(19).ok().flatten();
-        let created_at: i64 = row.get(20)?;
-        let tokens_in: Option<usize> = row
-            .get::<Option<i64>>(21)
-            .ok()
-            .flatten()
-            .map(|v| v as usize);
-        let tokens_out: Option<usize> = row
-            .get::<Option<i64>>(22)
-            .ok()
-            .flatten()
-            .map(|v| v as usize);
-        let tokens_cached: Option<usize> = row
-            .get::<Option<i64>>(23)
-            .ok()
-            .flatten()
-            .map(|v| v as usize);
-        let mut duplicate_of_id: Option<i64> = row.get(24).ok().flatten();
-        if duplicate_of_id.is_none() && status == "duplicate" {
-            duplicate_of_id = serde_json::from_str::<serde_json::Value>(&inline_review)
-                .ok()
-                .and_then(|p| p.get("duplicate_of_id").and_then(|v| v.as_i64()));
-        }
+        let title: String = row.get(2)?;
+        let status: String = row.get(3)?;
+        let reporter: String = row.get(4)?;
+        let reported_at: i64 = row.get(5)?;
+        let discovered_in_patchset_id: Option<i64> = row.get(6).ok().flatten();
+        let discovered_in_patch_id: Option<i64> = row.get(7).ok().flatten();
+        let discovered_in_commit: Option<String> = row.get(8).ok().flatten();
+        let source_ref: Option<String> = row.get(9).ok().flatten();
+        let vector_json: Option<String> = row.get(10).ok().flatten();
+        let duplicate_of_id: Option<i64> = row.get(11).ok().flatten();
+        let created_at: i64 = row.get(12)?;
+        let updated_at: i64 = row.get(13)?;
 
         Ok(Bug {
-            verified_on_sha,
             id,
             bugid,
+            title,
             status,
-            problem,
-            severity: Severity::from_i32(severity_val),
-            severity_explanation,
-            locations,
-            subsystems,
-            source_files,
-            inline_review,
-            logs,
-            vector_json,
+            reporter,
+            reported_at,
             discovered_in_patchset_id,
             discovered_in_patch_id,
             discovered_in_commit,
-            introduced_in_commit,
-            is_fixed,
-            fixed_in_commit,
-            raw_input,
-            tokens_in,
-            tokens_out,
-            tokens_cached,
+            source_ref,
+            vector_json,
             duplicate_of_id,
             created_at,
+            updated_at,
+            subsystems: Vec::new(),
+            enrichments: Vec::new(),
         })
+    }
+
+    pub async fn parse_bug_row(&self, row: &libsql::Row) -> Result<Bug> {
+        let mut bug = Self::parse_bug_row_core(row)?;
+        bug.subsystems = self
+            .get_subsystems_for_bug(bug.id)
+            .await
+            .unwrap_or_default();
+        bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
+        Ok(bug)
     }
 
     pub async fn get_timeline_stats(&self, subsystem_id: Option<i64>) -> Result<serde_json::Value> {
@@ -4102,11 +4549,11 @@ impl Database {
                         "id": bug.id,
                         "bugid": bug.bugid,
                         "slug": bug.bugid,
-                        "problem": bug.problem,
-                        "severity": bug.severity.as_str(),
+                        "problem": bug.problem(),
+                        "severity": bug.severity().as_str(),
                         "subsystems": bug.subsystems,
                         "subsystem": bug.subsystems.first().cloned(),
-                        "inline_review": bug.inline_review,
+                        "inline_review": bug.inline_review(),
                         "is_newly_discovered": is_new,
                         "created_at": bug.created_at,
                     })
@@ -4493,11 +4940,11 @@ impl Database {
                         "id": bug.id,
                         "bugid": bug.bugid,
                         "slug": bug.bugid,
-                        "problem": bug.problem,
-                        "severity": bug.severity.as_str(),
+                        "problem": bug.problem(),
+                        "severity": bug.severity().as_str(),
                         "subsystems": bug.subsystems,
                         "subsystem": bug.subsystems.first().cloned(),
-                        "inline_review": bug.inline_review,
+                        "inline_review": bug.inline_review(),
                         "is_newly_discovered": is_new,
                         "created_at": bug.created_at,
                     })
@@ -10551,64 +10998,144 @@ mod tests {
         db.migrate().await.unwrap();
 
         let bug = NewBug {
-            verified_on_sha: None,
             bugid: "linux-test-1234".to_string(),
+            title: "Memory leak in e1000_probe()".to_string(),
             status: "open".to_string(),
-            problem: "Memory leak in e1000_probe()".to_string(),
-            severity: Severity::High,
-            severity_explanation: Some(
-                "Buffer is allocated but not freed on error path".to_string(),
-            ),
-            locations: Some(json!([{"file": "drivers/net/e1000.c", "line": 42}])),
-            subsystems: vec!["net/core".to_string()],
-            source_files: Some(vec!["drivers/net/e1000.c".to_string()]),
-            inline_review: "> problematic_code();\nMemory is leaked here.".to_string(),
-            logs: Some("[{\"role\":\"system\",\"content\":\"test system\"}]".to_string()),
-            vector_json: Some("[0.1, 0.2, 0.3]".to_string()),
+            reporter: "sashiko".to_string(),
+            reported_at: 123456789,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: Some("abc1234".to_string()),
-            introduced_in_commit: Some("11223344 (net: e1000: add probe)".to_string()),
-            is_fixed: true,
-            fixed_in_commit: Some("55667788 (net: e1000: fix leak in probe)".to_string()),
-            raw_input: None,
-            tokens_in: Some(100),
-            tokens_out: Some(50),
-            tokens_cached: Some(25),
+            source_ref: None,
+            vector_json: Some("[0.1, 0.2, 0.3]".to_string()),
             duplicate_of_id: None,
-            created_at: 123456789,
+            subsystems: vec!["net/core".to_string()],
         };
 
         let bug_id = db.create_bug(&bug).await.unwrap();
         assert!(bug_id > 0);
 
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "verification".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456790,
+                content: None,
+                data_json: Some(json!({
+                    "is_valid": true,
+                    "locations": [{"file": "drivers/net/e1000.c", "line": 42}],
+                    "source_files": ["drivers/net/e1000.c"],
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "origin_discovery".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456791,
+                content: Some("11223344 (net: e1000: add probe)".to_string()),
+                data_json: Some(json!({
+                    "introducing_commit_sha": "11223344 (net: e1000: add probe)",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456792,
+                content: Some("Buffer is allocated but not freed on error path".to_string()),
+                data_json: Some(json!({
+                    "severity": "High",
+                    "severity_int": 3,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "report".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456793,
+                content: Some("> problematic_code();\nMemory is leaked here.".to_string()),
+                data_json: Some(json!({
+                    "format": "lkml_markdown",
+                })),
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                tokens_cached: Some(25),
+                logs: Some("[{\"role\":\"system\",\"content\":\"test system\"}]".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "fix_candidate".to_string(),
+                tool: "human".to_string(),
+                model: None,
+                author: Some("Developer".to_string()),
+                created_at: 123456794,
+                content: None,
+                data_json: Some(json!({
+                    "status": "merged",
+                    "commit_sha": "55667788 (net: e1000: fix leak in probe)",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
         // Fetch by id
         let fetched = db.get_bug(bug_id).await.unwrap().expect("Bug should exist");
         assert_eq!(fetched.bugid, "linux-test-1234");
         assert_eq!(fetched.slug(), "linux-test-1234");
-        assert_eq!(fetched.problem, "Memory leak in e1000_probe()");
-        assert_eq!(fetched.severity, Severity::High);
+        assert_eq!(fetched.problem(), "Memory leak in e1000_probe()");
+        assert_eq!(fetched.severity(), Severity::High);
         assert_eq!(fetched.subsystems, vec!["net/core".to_string()]);
         assert_eq!(
-            fetched.introduced_in_commit.as_deref(),
+            fetched.introduced_in_commit().as_deref(),
             Some("11223344 (net: e1000: add probe)")
         );
-        assert!(fetched.is_fixed);
+        assert!(fetched.is_fixed());
         assert_eq!(
-            fetched.fixed_in_commit.as_deref(),
+            fetched.fixed_in_commit().as_deref(),
             Some("55667788 (net: e1000: fix leak in probe)")
         );
         assert_eq!(
-            fetched.inline_review,
+            fetched.inline_review(),
             "> problematic_code();\nMemory is leaked here."
         );
-        assert_eq!(
-            fetched.logs.as_deref(),
-            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
-        );
-        assert_eq!(fetched.tokens_in, Some(100));
-        assert_eq!(fetched.tokens_out, Some(50));
-        assert_eq!(fetched.tokens_cached, Some(25));
+        assert_eq!(fetched.tokens_in(), 100);
+        assert_eq!(fetched.tokens_out(), 50);
+        assert_eq!(fetched.tokens_cached(), 25);
+        assert_eq!(fetched.enrichments.len(), 5);
 
         // Fetch by bugid and slug
         let fetched_bugid = db
@@ -10624,17 +11151,13 @@ mod tests {
             .expect("Bug should exist");
         assert_eq!(fetched_slug.id, bug_id);
         assert_eq!(
-            fetched_slug.introduced_in_commit.as_deref(),
+            fetched_slug.introduced_in_commit().as_deref(),
             Some("11223344 (net: e1000: add probe)")
         );
-        assert!(fetched_slug.is_fixed);
+        assert!(fetched_slug.is_fixed());
         assert_eq!(
-            fetched_slug.fixed_in_commit.as_deref(),
+            fetched_slug.fixed_in_commit().as_deref(),
             Some("55667788 (net: e1000: fix leak in probe)")
-        );
-        assert_eq!(
-            fetched_slug.logs.as_deref(),
-            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
         );
 
         // List bugs with search and filter (logs omitted)
@@ -10653,7 +11176,6 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, bug_id);
-        assert!(list[0].logs.is_none());
 
         // Test hierarchical subsystem matching: "net" should match "net/core"
         let (list_hier, total_hier) = db
@@ -10705,7 +11227,6 @@ mod tests {
             .unwrap();
         assert_eq!(total_crit, 0);
         assert_eq!(list_crit.len(), 0);
-        assert!(list[0].logs.is_none());
 
         // Test sorting
         let (list_sorted, _) = db
@@ -10723,29 +11244,17 @@ mod tests {
         // Test duplicate linking
         let dup_bug = NewBug {
             bugid: "linux-dup-1".to_string(),
+            title: "Duplicate of e1000 leak".to_string(),
             status: "raw".to_string(),
-            problem: "Duplicate of e1000 leak".to_string(),
-            severity: Severity::High,
-            severity_explanation: None,
-            locations: None,
-            subsystems: vec!["net/core".to_string()],
-            source_files: None,
-            inline_review: String::new(),
-            logs: None,
-            vector_json: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 100005,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
-            introduced_in_commit: None,
-            verified_on_sha: None,
-            is_fixed: false,
-            fixed_in_commit: None,
-            raw_input: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
+            source_ref: None,
+            vector_json: None,
             duplicate_of_id: None,
-            created_at: 100005,
+            subsystems: vec!["net/core".to_string()],
         };
         let dup_id = db.create_bug(&dup_bug).await.unwrap();
         let dup_params = MarkDuplicateBugParams {
@@ -10765,23 +11274,19 @@ mod tests {
         assert_eq!(duplicates[0].duplicate_of_id, Some(bug_id));
 
         // Dedicated log retrieval
+        let logs_str = db.get_bug_logs(bug_id).await.unwrap().unwrap();
+        assert!(logs_str.contains("test system"));
+        let logs_parsed: serde_json::Value = serde_json::from_str(&logs_str).unwrap();
+        assert_eq!(logs_parsed[0]["role"], "system");
+        assert_eq!(logs_parsed[0]["content"], "test system");
+
         assert_eq!(
-            db.get_bug_logs(bug_id).await.unwrap().as_deref(),
-            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
+            db.get_bug_logs_by_bugid("linux-test-1234").await.unwrap(),
+            Some(logs_str.clone())
         );
         assert_eq!(
-            db.get_bug_logs_by_bugid("linux-test-1234")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
-        );
-        assert_eq!(
-            db.get_bug_logs_by_slug("linux-test-1234")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("[{\"role\":\"system\",\"content\":\"test system\"}]")
+            db.get_bug_logs_by_slug("linux-test-1234").await.unwrap(),
+            Some(logs_str)
         );
 
         // Link to review
@@ -10827,30 +11332,18 @@ mod tests {
         db.migrate().await.unwrap();
 
         let new_bug = NewBug {
-            verified_on_sha: None,
             bugid: "linux-crash-recovery".to_string(),
+            title: "Memory leak on crash".to_string(),
+            status: "raw".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 100000,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
-            severity: Severity::High,
-            problem: "Memory leak on crash".to_string(),
-            subsystems: vec!["kernel".to_string()],
-            source_files: None,
-            locations: None,
-            severity_explanation: None,
-            status: "raw".to_string(),
-            inline_review: String::new(),
-            logs: None,
+            source_ref: None,
             vector_json: None,
-            introduced_in_commit: None,
-            is_fixed: false,
-            fixed_in_commit: None,
-            raw_input: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
             duplicate_of_id: None,
-            created_at: 100000,
+            subsystems: vec!["kernel".to_string()],
         };
         let bug_id = db.create_bug(&new_bug).await.unwrap();
 
@@ -10874,5 +11367,259 @@ mod tests {
             .expect("should re-lock recovered bug");
         assert_eq!(locked_again.id, bug_id);
         assert_eq!(locked_again.status, "processing");
+    }
+
+    #[tokio::test]
+    async fn test_bug_enrichments_multi_tool_timeline() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // 1. Initial report from syzbot
+        let new_bug = NewBug {
+            bugid: "linux-syzbot-12345".to_string(),
+            title: "KASAN: use-after-free Read in sock_close".to_string(),
+            status: "raw".to_string(),
+            reporter: "syzbot".to_string(),
+            reported_at: 1700000000,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: Some("c0ffee112233".to_string()),
+            source_ref: Some("https://syzkaller.appspot.com/bug?id=12345".to_string()),
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec!["net".to_string()],
+        };
+        let bug_id = db.create_bug(&new_bug).await.unwrap();
+
+        // Raw crash report enrichment from syzbot
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "report".to_string(),
+                tool: "syzbot".to_string(),
+                model: None,
+                author: None,
+                created_at: 1700000000,
+                content: Some("BUG: KASAN: use-after-free in sock_close+0x42/0x100".to_string()),
+                data_json: Some(json!({
+                    "crash_type": "use-after-free",
+                    "has_reproducer": true,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Reproducer enrichment from syzbot
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "reproducer".to_string(),
+                tool: "syzbot".to_string(),
+                model: None,
+                author: None,
+                created_at: 1700000010,
+                content: Some("#define _GNU_SOURCE\nint main() { ... }".to_string()),
+                data_json: Some(json!({
+                    "language": "C",
+                    "syz_repro": "syz_open_pts() ...",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // 2. Sashiko automated verification with LLM
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "verification".to_string(),
+                tool: "sashiko".to_string(),
+                model: Some("gemini-1.5-pro".to_string()),
+                author: None,
+                created_at: 1700000050,
+                content: Some("Confirmed UAF in net/socket.c sock_close during concurrent disconnect".to_string()),
+                data_json: Some(json!({
+                    "is_valid": true,
+                    "locations": [{"file": "net/socket.c", "line": 642, "function_or_symbol": "sock_close"}],
+                    "source_files": ["net/socket.c"],
+                })),
+                tokens_in: Some(4000),
+                tokens_out: Some(500),
+                tokens_cached: Some(3000),
+                logs: Some("[{\"step\": 1, \"status\": \"verified\"}]".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 3. Sashiko severity calibration
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: Some("gemini-1.5-pro".to_string()),
+                author: None,
+                created_at: 1700000060,
+                content: Some(
+                    "Privilege escalation potential through dangling socket file descriptor"
+                        .to_string(),
+                ),
+                data_json: Some(json!({
+                    "severity": "Critical",
+                    "severity_int": 4,
+                })),
+                tokens_in: Some(1500),
+                tokens_out: Some(200),
+                tokens_cached: Some(1000),
+                logs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 4. Sashiko origin discovery
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "origin_discovery".to_string(),
+                tool: "sashiko".to_string(),
+                model: Some("gemini-1.5-pro".to_string()),
+                author: None,
+                created_at: 1700000070,
+                content: Some("9876543210ab (net: socket: optimize close locking)".to_string()),
+                data_json: Some(json!({
+                    "introducing_commit_sha": "9876543210ab (net: socket: optimize close locking)",
+                })),
+                tokens_in: Some(2000),
+                tokens_out: Some(150),
+                tokens_cached: Some(1500),
+                logs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 5. Human comment
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "comment".to_string(),
+                tool: "human".to_string(),
+                model: None,
+                author: Some("torvalds@linux-foundation.org".to_string()),
+                created_at: 1700000100,
+                content: Some(
+                    "I agree with the origin tracing, we should revert commit 9876543210ab."
+                        .to_string(),
+                ),
+                data_json: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // 6. Fix candidate
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "fix_candidate".to_string(),
+                tool: "human".to_string(),
+                model: None,
+                author: Some("davem@davemloft.net".to_string()),
+                created_at: 1700000200,
+                content: Some("Revert 9876543210ab and add proper socket refcounting".to_string()),
+                data_json: Some(json!({
+                    "status": "merged",
+                    "commit_sha": "fedcba098765 (net: socket: fix race in sock_close)",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Query bug and verify all projections and enrichments
+        let bug = db.get_bug(bug_id).await.unwrap().expect("Bug must exist");
+        assert_eq!(bug.id, bug_id);
+        assert_eq!(bug.bugid, "linux-syzbot-12345");
+        assert_eq!(bug.reporter, "syzbot");
+        assert_eq!(bug.reported_at, 1700000000);
+        assert_eq!(
+            bug.source_ref.as_deref(),
+            Some("https://syzkaller.appspot.com/bug?id=12345")
+        );
+        assert_eq!(bug.problem(), "KASAN: use-after-free Read in sock_close");
+        assert_eq!(bug.severity(), Severity::Critical);
+        assert_eq!(
+            bug.severity_explanation().as_deref(),
+            Some("Privilege escalation potential through dangling socket file descriptor")
+        );
+        assert_eq!(bug.source_files(), Some(vec!["net/socket.c".to_string()]));
+        assert_eq!(
+            bug.introduced_in_commit().as_deref(),
+            Some("9876543210ab (net: socket: optimize close locking)")
+        );
+        assert!(bug.is_fixed());
+        assert_eq!(
+            bug.fixed_in_commit().as_deref(),
+            Some("fedcba098765 (net: socket: fix race in sock_close)")
+        );
+
+        // Verify aggregated token counters
+        assert_eq!(bug.tokens_in(), 4000 + 1500 + 2000);
+        assert_eq!(bug.tokens_out(), 500 + 200 + 150);
+        assert_eq!(bug.tokens_cached(), 3000 + 1000 + 1500);
+
+        // Verify enrichments timeline length and chronological order
+        assert_eq!(bug.enrichments.len(), 7);
+        let kinds: Vec<&str> = bug.enrichments.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "report",
+                "reproducer",
+                "verification",
+                "severity_calibration",
+                "origin_discovery",
+                "comment",
+                "fix_candidate",
+            ]
+        );
+
+        let tools: Vec<&str> = bug.enrichments.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(
+            tools,
+            vec![
+                "syzbot", "syzbot", "sashiko", "sashiko", "sashiko", "human", "human"
+            ]
+        );
+
+        let models: Vec<Option<&str>> =
+            bug.enrichments.iter().map(|e| e.model.as_deref()).collect();
+        assert_eq!(
+            models,
+            vec![
+                None,
+                None,
+                Some("gemini-1.5-pro"),
+                Some("gemini-1.5-pro"),
+                Some("gemini-1.5-pro"),
+                None,
+                None,
+            ]
+        );
+
+        // Check dedicated enrichment query method
+        let enrichments = db.get_bug_enrichments(bug_id).await.unwrap();
+        assert_eq!(enrichments.len(), 7);
     }
 }

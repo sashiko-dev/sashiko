@@ -77,7 +77,9 @@ impl std::fmt::Display for BugOutcome {
                 write!(
                     f,
                     "newly discovered bug {} ({}) [severity: {}]",
-                    bug.id, bug.bugid, bug.severity
+                    bug.id,
+                    bug.bugid,
+                    bug.severity()
                 )
             }
             BugOutcome::Duplicate {
@@ -128,8 +130,8 @@ impl std::fmt::Debug for BugOutcome {
                 .field("id", &bug.id)
                 .field("bugid", &bug.bugid)
                 .field("status", &bug.status)
-                .field("problem", &bug.problem)
-                .field("severity", &bug.severity)
+                .field("problem", &bug.problem())
+                .field("severity", &bug.severity())
                 .finish(),
         }
     }
@@ -514,9 +516,8 @@ impl LlmSession for DedupSession<'_> {
         let mut known_list = String::new();
         for bug in self.known_candidates {
             let files_str = bug
-                .source_files
-                .as_ref()
-                .map(|f| f.join(", "))
+                .source_files()
+                .map(|f: Vec<String>| f.join(", "))
                 .unwrap_or_default();
             let subs_str = if bug.subsystems.is_empty() {
                 "unknown".to_string()
@@ -527,9 +528,9 @@ impl LlmSession for DedupSession<'_> {
                 "- Bug ID {}: [BugID: {}] [Severity: {}] [Subsystems: {}]\n  Problem: {}\n  Affected Files: {}\n\n",
                 bug.id,
                 bug.bugid,
-                bug.severity.as_str(),
+                bug.severity().as_str(),
                 subs_str,
-                bug.problem,
+                bug.problem(),
                 files_str
             ));
         }
@@ -1075,34 +1076,37 @@ pub async fn process_issue(
         input.problem, input.subsystems
     );
     let bugid = generate_bugid();
-    let raw_input_json = serde_json::to_string(&input).ok();
+    let now = chrono::Utc::now().timestamp();
     let new_bug = NewBug {
         bugid: bugid.clone(),
+        title: input.problem.clone(),
         status: "raw".to_string(),
-        problem: input.problem.clone(),
-        severity: crate::db::Severity::Unknown,
-        severity_explanation: None,
-        locations: input.locations.clone(),
-        subsystems: input.subsystems.clone(),
-        source_files: Some(input.source_files.clone()),
-        inline_review: String::new(),
-        logs: None,
-        vector_json: None,
+        reporter: "sashiko".to_string(),
+        reported_at: now,
         discovered_in_patchset_id: input.patchset_id,
         discovered_in_patch_id: input.patch_id,
         discovered_in_commit: input.commit_sha.clone(),
-        introduced_in_commit: None,
-        verified_on_sha: None,
-        is_fixed: false,
-        fixed_in_commit: None,
-        raw_input: raw_input_json,
-        tokens_in: None,
-        tokens_out: None,
-        tokens_cached: None,
+        source_ref: input.commit_sha.clone(),
+        vector_json: None,
         duplicate_of_id: None,
-        created_at: chrono::Utc::now().timestamp(),
+        subsystems: input.subsystems.clone(),
     };
     let id = db.create_bug(&new_bug).await?;
+    let _ = db
+        .add_bug_enrichment(
+            id,
+            &crate::db::NewBugEnrichment {
+                kind: "candidate".to_string(),
+                tool: "sashiko:reviewer".to_string(),
+                model: None,
+                author: None,
+                created_at: now,
+                content: Some(input.reasoning.clone()),
+                data_json: serde_json::to_value(&input).ok(),
+                ..Default::default()
+            },
+        )
+        .await;
     info!("Queued raw bug {} for asynchronous processing", id);
     let bug = db.get_bug(id).await?.unwrap();
     Ok(BugOutcome::NewlyDiscovered { bug })
@@ -1975,6 +1979,7 @@ pub async fn process_issue_worker(
 mod tests {
     use super::*;
     use crate::ai::{AiRequest, ProviderCapabilities};
+    use crate::db::BugEnrichment;
     use serde_json::json;
 
     struct MockAiProvider {
@@ -2113,9 +2118,9 @@ mod tests {
 
         let bug = db.get_bug(1).await.unwrap().unwrap();
         assert_eq!(bug.status, "dismissed");
-        assert_eq!(bug.problem, "net: dev: null dereference in dev_read()");
+        assert_eq!(bug.problem(), "net: dev: null dereference in dev_read()");
         assert_eq!(bug.subsystems, vec!["net".to_string()]);
-        assert_eq!(bug.source_files, Some(vec!["net/core/dev.c".to_string()]));
+        assert_eq!(bug.source_files(), Some(vec!["net/core/dev.c".to_string()]));
     }
 
     #[tokio::test]
@@ -2288,31 +2293,36 @@ mod tests {
         };
 
         let known_bugs = vec![Bug {
-            verified_on_sha: None,
             id: 42,
-            status: "verified".to_string(),
             bugid: "linux-42".to_string(),
-            problem: "Memory leak in dev.c".to_string(),
-            severity: Severity::High,
-            severity_explanation: None,
-            locations: None,
-            subsystems: vec!["net".to_string()],
-            source_files: None,
-            inline_review: "".to_string(),
-            logs: None,
-            vector_json: None,
+            title: "Memory leak in dev.c".to_string(),
+            status: "verified".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 100,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
-            introduced_in_commit: None,
-            is_fixed: false,
-            fixed_in_commit: None,
-            raw_input: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
+            source_ref: None,
+            vector_json: None,
             duplicate_of_id: None,
             created_at: 100,
+            updated_at: 100,
+            subsystems: vec!["net".to_string()],
+            enrichments: vec![BugEnrichment {
+                id: 1,
+                bug_id: 42,
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 100,
+                content: None,
+                data_json: Some(json!({"severity": "High", "severity_int": 3})),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                logs: None,
+            }],
         }];
 
         let mut session = DedupSession {
@@ -2332,31 +2342,36 @@ mod tests {
     #[tokio::test]
     async fn test_dedup_session_prompt_directives() {
         let known_bugs = vec![Bug {
-            verified_on_sha: None,
             id: 42,
-            status: "verified".to_string(),
             bugid: "linux-42".to_string(),
-            problem: "Memory leak in dev.c".to_string(),
-            severity: Severity::High,
-            severity_explanation: None,
-            locations: None,
-            subsystems: vec!["net".to_string()],
-            source_files: None,
-            inline_review: "".to_string(),
-            logs: None,
-            vector_json: None,
+            title: "Memory leak in dev.c".to_string(),
+            status: "verified".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 100,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
-            introduced_in_commit: None,
-            is_fixed: false,
-            fixed_in_commit: None,
-            raw_input: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
+            source_ref: None,
+            vector_json: None,
             duplicate_of_id: None,
             created_at: 100,
+            updated_at: 100,
+            subsystems: vec!["net".to_string()],
+            enrichments: vec![BugEnrichment {
+                id: 1,
+                bug_id: 42,
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 100,
+                content: None,
+                data_json: Some(json!({"severity": "High", "severity_int": 3})),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                logs: None,
+            }],
         }];
 
         let session = DedupSession {
@@ -2597,22 +2612,22 @@ mod tests {
         match final_outcome {
             BugOutcome::NewlyDiscovered { bug } => {
                 assert_eq!(
-                    bug.problem,
+                    bug.problem(),
                     "e1000: buffer overflow in e1000_clean_rx_irq()"
                 );
-                assert_eq!(bug.severity, Severity::Critical);
+                assert_eq!(bug.severity(), Severity::Critical);
                 assert!(bug.bugid.starts_with("linux-"));
                 assert!(uuid::Uuid::parse_str(&bug.bugid[6..]).is_ok());
                 assert_eq!(bug.discovered_in_patchset_id, Some(ps_id));
                 assert_eq!(bug.subsystems, vec!["net/intel".to_string()]);
                 assert_eq!(
-                    bug.introduced_in_commit.as_deref(),
+                    bug.introduced_in_commit().as_deref(),
                     Some("1234567890ab1234567890ab1234567890ab1234")
                 );
-                assert!(!bug.is_fixed);
-                assert!(bug.fixed_in_commit.is_none());
-                assert!(bug.logs.is_some(), "Logs must be populated");
-                assert!(bug.raw_input.is_some(), "Raw input must be preserved");
+                assert!(!bug.is_fixed());
+                assert!(bug.fixed_in_commit().is_none());
+                assert!(!bug.enrichments.is_empty(), "Enrichments must be populated");
+                assert!(bug.raw_input().is_some(), "Raw input must be preserved");
             }
             _ => panic!("Expected NewlyDiscovered outcome, got {:?}", outcome),
         }
@@ -2636,35 +2651,39 @@ mod tests {
 
         let existing_id = db
             .create_bug(&NewBug {
-                verified_on_sha: None,
                 bugid: "linux-existing1".to_string(),
+                title: "e1000: buffer overflow in e1000_clean_rx_irq()".to_string(),
                 status: "open".to_string(),
-                problem: "e1000: buffer overflow in e1000_clean_rx_irq()".to_string(),
-                severity: Severity::High,
-                severity_explanation: Some("Known buffer overflow".to_string()),
-                locations: None,
-                subsystems: vec!["net/intel".to_string()],
-                source_files: Some(vec![
-                    "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
-                ]),
-                inline_review: "Inline review text".to_string(),
-                logs: None,
-                vector_json: Some(existing_vector.to_json()),
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
                 discovered_in_patchset_id: None,
                 discovered_in_patch_id: None,
                 discovered_in_commit: None,
-                introduced_in_commit: None,
-                is_fixed: false,
-                fixed_in_commit: None,
-                raw_input: None,
-                tokens_in: None,
-                tokens_out: None,
-                tokens_cached: None,
+                source_ref: None,
+                vector_json: Some(existing_vector.to_json()),
                 duplicate_of_id: None,
-                created_at: 1000,
+                subsystems: vec!["net/intel".to_string()],
             })
             .await
             .unwrap();
+        db.add_bug_enrichment(
+            existing_id,
+            &crate::db::NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 1000,
+                content: Some("Known buffer overflow".to_string()),
+                data_json: Some(serde_json::json!({
+                    "severity": "High",
+                    "severity_int": 3,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let normalize_json = json!({
             "canonical_title": "e1000: buffer overflow in e1000_clean_rx_irq()",

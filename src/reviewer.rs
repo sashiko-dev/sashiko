@@ -2654,8 +2654,8 @@ impl Reviewer {
                         for bug in &newly_discovered_preexisting {
                             header.push_str(&format!(
                                 "- [{}] {}: https://sashiko.dev/bug/{}\n",
-                                bug.severity.as_str(),
-                                bug.problem.trim(),
+                                bug.severity().as_str(),
+                                bug.problem().trim(),
                                 bug.bugid
                             ));
                         }
@@ -2671,8 +2671,8 @@ impl Reviewer {
                         for bug in &newly_discovered_preexisting {
                             header.push_str(&format!(
                                 "- [{}] {}: https://sashiko.dev/bug/{}\n",
-                                bug.severity.as_str(),
-                                bug.problem.trim(),
+                                bug.severity().as_str(),
+                                bug.problem().trim(),
                                 bug.bugid
                             ));
                         }
@@ -3715,32 +3715,37 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .await?;
         let bug_id = db
             .create_bug(&crate::db::NewBug {
-                verified_on_sha: None,
-                status: "raw".to_string(),
                 bugid: "linux-deadbeef".to_string(),
-                problem: " High UAF in cleanup".to_string(),
-                severity: Severity::High,
-                severity_explanation: Some("Reasoning".to_string()),
-                locations: None,
-                subsystems: vec!["net".to_string()],
-                source_files: None,
-                inline_review: "Inline review comment".to_string(),
-                logs: None,
-                vector_json: None,
+                title: " High UAF in cleanup".to_string(),
+                status: "raw".to_string(),
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
                 discovered_in_patchset_id: Some(ps_id),
                 discovered_in_patch_id: Some(p_id_3),
                 discovered_in_commit: None,
-                introduced_in_commit: None,
-                is_fixed: false,
-                fixed_in_commit: None,
-                raw_input: None,
-                tokens_in: None,
-                tokens_out: None,
-                tokens_cached: None,
+                source_ref: None,
+                vector_json: None,
                 duplicate_of_id: None,
-                created_at: 1000,
+                subsystems: vec!["net".to_string()],
             })
             .await?;
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 1000,
+                content: Some("Reasoning".to_string()),
+                data_json: Some(serde_json::json!({
+                    "severity": "High",
+                    "severity_int": 3,
+                })),
+                ..Default::default()
+            },
+        )
+        .await?;
         db.link_review_to_bug(rev_id, bug_id, true).await?;
 
         db.create_message(

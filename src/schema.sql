@@ -283,42 +283,51 @@ CREATE INDEX IF NOT EXISTS idx_reviews_patch_status ON reviews(patch_id, status)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS bugs (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     bugid TEXT NOT NULL UNIQUE,
-    status TEXT DEFAULT 'raw',
-    problem TEXT NOT NULL,
-    severity INTEGER NOT NULL, -- 1: Low, 2: Medium, 3: High, 4: Critical
-    severity_explanation TEXT,
-    locations TEXT,            -- JSON array of location objects
-    subsystems TEXT,           -- JSON array of subsystem names (from MAINTAINERS)
-    source_files TEXT,         -- JSON array of affected file paths
-    inline_review TEXT NOT NULL,
-    logs TEXT,
-    vector_json TEXT,          -- Serialized vector representation for matching
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'raw',
+    reporter TEXT NOT NULL,
+    reported_at INTEGER NOT NULL,
     discovered_in_patchset_id INTEGER,
     discovered_in_patch_id INTEGER,
     discovered_in_commit TEXT,
-    introduced_in_commit TEXT,
-    verified_on_sha TEXT,
-    is_fixed INTEGER NOT NULL DEFAULT 0,
-    fixed_in_commit TEXT,
-    raw_input TEXT,
-    tokens_in INTEGER,
-    tokens_out INTEGER,
-    tokens_cached INTEGER,
+    source_ref TEXT,
+    vector_json TEXT,
     duplicate_of_id INTEGER,
     created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
     FOREIGN KEY(discovered_in_patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(discovered_in_patch_id) REFERENCES patches(id),
     FOREIGN KEY(duplicate_of_id) REFERENCES bugs(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bugs_bugid ON bugs(bugid);
-CREATE INDEX IF NOT EXISTS idx_bugs_severity ON bugs(severity);
-CREATE INDEX IF NOT EXISTS idx_bugs_is_fixed ON bugs(is_fixed);
-CREATE INDEX IF NOT EXISTS idx_bugs_duplicate_of_id ON bugs(duplicate_of_id);
 CREATE INDEX IF NOT EXISTS idx_bugs_status ON bugs(status);
-CREATE INDEX IF NOT EXISTS idx_bugs_status_severity ON bugs(status, severity);
+CREATE INDEX IF NOT EXISTS idx_bugs_reporter ON bugs(reporter);
+CREATE INDEX IF NOT EXISTS idx_bugs_reported_at ON bugs(reported_at);
+CREATE INDEX IF NOT EXISTS idx_bugs_duplicate_of_id ON bugs(duplicate_of_id);
+
+CREATE TABLE IF NOT EXISTS bug_enrichments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bug_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    model TEXT,
+    author TEXT,
+    created_at INTEGER NOT NULL,
+    content TEXT,
+    data_json TEXT,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    tokens_cached INTEGER,
+    logs TEXT,
+    FOREIGN KEY(bug_id) REFERENCES bugs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_bug_enrichments_bug_id ON bug_enrichments(bug_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_bug_enrichments_kind ON bug_enrichments(kind, bug_id);
+CREATE INDEX IF NOT EXISTS idx_bug_enrichments_tool ON bug_enrichments(tool);
 
 CREATE TABLE IF NOT EXISTS review_bugs (
     review_id INTEGER NOT NULL,

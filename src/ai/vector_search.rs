@@ -323,13 +323,9 @@ pub fn find_top_candidates(
         {
             v
         } else {
-            let files = bug.source_files.clone().unwrap_or_default();
-            extract_bug_vector(
-                &bug.problem,
-                &bug.subsystems,
-                &files,
-                bug.locations.as_ref(),
-            )
+            let files = bug.source_files().unwrap_or_default();
+            let locs = bug.locations();
+            extract_bug_vector(bug.problem(), &bug.subsystems, &files, locs.as_ref())
         };
 
         let sim = query_vector.cosine_similarity(&bug_vec);
@@ -358,7 +354,6 @@ pub fn find_top_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Severity;
     use serde_json::json;
 
     #[test]
@@ -431,95 +426,114 @@ mod tests {
     #[test]
     fn test_find_top_candidates_ranking() {
         let known_bug_1 = Bug {
-            verified_on_sha: None,
-            status: "verified".to_string(),
             id: 1,
             bugid: "linux-1".to_string(),
-            problem: "Null pointer dereference in e1000_clean_rx_irq".to_string(),
-            severity: Severity::High,
-            severity_explanation: None,
-            locations: Some(
-                json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }]),
-            ),
-            subsystems: vec!["net".to_string()],
-            source_files: Some(vec![
-                "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
-            ]),
-            inline_review: "review 1".to_string(),
-            logs: None,
-            vector_json: None,
+            title: "Null pointer dereference in e1000_clean_rx_irq".to_string(),
+            status: "verified".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 100,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
-            introduced_in_commit: None,
-            is_fixed: false,
-            fixed_in_commit: None,
-            raw_input: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
+            source_ref: None,
+            vector_json: None,
             duplicate_of_id: None,
             created_at: 100,
+            updated_at: 100,
+            subsystems: vec!["net".to_string()],
+            enrichments: vec![crate::db::BugEnrichment {
+                id: 1,
+                bug_id: 1,
+                kind: "verification".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 100,
+                content: None,
+                data_json: Some(json!({
+                    "is_valid": true,
+                    "locations": [{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_clean_rx_irq" }],
+                    "source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"],
+                })),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                logs: None,
+            }],
         };
 
         let known_bug_2 = Bug {
-            verified_on_sha: None,
-            status: "verified".to_string(),
             id: 2,
             bugid: "linux-2".to_string(),
-            problem: "Memory leak in e1000_probe".to_string(),
-            severity: Severity::High,
-            severity_explanation: None,
-            locations: Some(
-                json!([{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_probe" }]),
-            ),
-            subsystems: vec!["net".to_string()],
-            source_files: Some(vec![
-                "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
-            ]),
-            inline_review: "review 2".to_string(),
-            logs: None,
-            vector_json: None,
+            title: "Memory leak in e1000_probe".to_string(),
+            status: "verified".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 200,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
-            introduced_in_commit: None,
-            is_fixed: false,
-            fixed_in_commit: None,
-            raw_input: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
+            source_ref: None,
+            vector_json: None,
             duplicate_of_id: None,
             created_at: 200,
+            updated_at: 200,
+            subsystems: vec!["net".to_string()],
+            enrichments: vec![crate::db::BugEnrichment {
+                id: 2,
+                bug_id: 2,
+                kind: "verification".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 200,
+                content: None,
+                data_json: Some(json!({
+                    "is_valid": true,
+                    "locations": [{ "file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "function_or_symbol": "e1000_probe" }],
+                    "source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"],
+                })),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                logs: None,
+            }],
         };
 
         let known_bug_3 = Bug {
-            verified_on_sha: None,
-            status: "verified".to_string(),
             id: 3,
             bugid: "linux-3".to_string(),
-            problem: "Unrelated deadlock in fs/btrfs/super.c".to_string(),
-            severity: Severity::Critical,
-            severity_explanation: None,
-            locations: Some(json!([{ "file": "fs/btrfs/super.c" }])),
-            subsystems: vec!["fs".to_string()],
-            source_files: Some(vec!["fs/btrfs/super.c".to_string()]),
-            inline_review: "review 3".to_string(),
-            logs: None,
-            vector_json: None,
+            title: "Unrelated deadlock in fs/btrfs/super.c".to_string(),
+            status: "verified".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 300,
             discovered_in_patchset_id: None,
             discovered_in_patch_id: None,
             discovered_in_commit: None,
-            introduced_in_commit: None,
-            is_fixed: false,
-            fixed_in_commit: None,
-            raw_input: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
+            source_ref: None,
+            vector_json: None,
             duplicate_of_id: None,
             created_at: 300,
+            updated_at: 300,
+            subsystems: vec!["fs".to_string()],
+            enrichments: vec![crate::db::BugEnrichment {
+                id: 3,
+                bug_id: 3,
+                kind: "verification".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 300,
+                content: None,
+                data_json: Some(json!({
+                    "is_valid": true,
+                    "locations": [{ "file": "fs/btrfs/super.c" }],
+                    "source_files": ["fs/btrfs/super.c"],
+                })),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                logs: None,
+            }],
         };
 
         let query = extract_bug_vector(
