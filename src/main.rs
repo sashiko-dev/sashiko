@@ -389,6 +389,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
 
+    // Load and initialize authoritative immutable MAINTAINERS index from top-of-trunk
+    let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
+    let maintainers_index = match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&linux_repo_path) {
+        Ok(idx) => {
+            info!(
+                "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
+                idx.len()
+            );
+            Arc::new(idx)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load MAINTAINERS from top-of-trunk: {}. Using empty index.",
+                e
+            );
+            Arc::new(sashiko::maintainers::MaintainersIndex::new())
+        }
+    };
+    sashiko::maintainers::init_global_maintainers(maintainers_index);
+
     // Create internal task queues
     // raw_tx -> Parser -> parsed_tx -> DB Worker
     let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(1000);
@@ -1317,6 +1337,11 @@ async fn handle_review_command(
     };
 
     let repo_path = current_git_toplevel()?;
+    if sashiko::maintainers::get_global_maintainers().is_none() {
+        if let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path) {
+            sashiko::maintainers::init_global_maintainers(Arc::new(idx));
+        }
+    }
     eprintln!("Reviewing: {}", input);
     eprintln!("Using prompts: {}", prompts.display());
 

@@ -1090,12 +1090,14 @@ async fn analyze_bug(
     };
 
     let mut payload = payload;
-    if payload.subsystems.is_empty()
-        && !payload.source_files.is_empty()
-        && let Ok(mindex) =
-            crate::maintainers::MaintainersIndex::from_repo(&state.settings.git.repository_path)
-    {
-        payload.subsystems = mindex.match_files(&payload.source_files);
+    if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
+        if let Some(mindex) = crate::maintainers::get_global_maintainers() {
+            payload.subsystems = mindex.match_files(&payload.source_files);
+        } else if let Ok(mindex) =
+            crate::maintainers::MaintainersIndex::from_top_of_trunk(&state.settings.git.repository_path)
+        {
+            payload.subsystems = mindex.match_files(&payload.source_files);
+        }
     }
 
     match crate::workflows::linux_bug::process_issue(

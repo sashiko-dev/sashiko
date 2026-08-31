@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use tracing::info;
 
 /// Represents a compiled file or directory pattern from an `F:` or `X:` line.
@@ -203,6 +204,38 @@ impl MaintainersIndex {
     pub fn from_repo<P: AsRef<Path>>(repo_path: P) -> Result<Self> {
         let path = repo_path.as_ref().join("MAINTAINERS");
         Self::from_file(path)
+    }
+
+    /// Loads and parses MAINTAINERS from the top-of-trunk of Linus's tree in the repository.
+    /// Tries `origin/master:MAINTAINERS`, `master:MAINTAINERS`, `HEAD:MAINTAINERS`,
+    /// and falls back to reading the `MAINTAINERS` file directly on disk.
+    pub fn from_top_of_trunk<P: AsRef<Path>>(repo_path: P) -> Result<Self> {
+        let repo = repo_path.as_ref();
+        for git_ref in ["origin/master:MAINTAINERS", "master:MAINTAINERS", "HEAD:MAINTAINERS"] {
+            let output = std::process::Command::new("git")
+                .args(["-C", repo.to_str().unwrap_or("."), "show", git_ref])
+                .output();
+            if let Ok(out) = output
+                && out.status.success()
+                && !out.stdout.is_empty()
+            {
+                info!("Loaded MAINTAINERS from top-of-trunk ref {}", git_ref);
+                let reader = BufReader::new(&out.stdout[..]);
+                return Self::from_reader(reader);
+            }
+        }
+
+        // Fallback: Read file directly on disk
+        let file_path = repo.join("MAINTAINERS");
+        if file_path.exists() {
+            info!("Falling back to loading MAINTAINERS directly from {:?}", file_path);
+            return Self::from_file(&file_path);
+        }
+
+        Err(anyhow::anyhow!(
+            "Failed to locate or read MAINTAINERS from repository at {:?}",
+            repo
+        ))
     }
 
     /// Parses MAINTAINERS entries from a buffered reader.
@@ -412,6 +445,19 @@ impl MaintainersIndex {
     }
 }
 
+static GLOBAL_MAINTAINERS: OnceLock<Arc<MaintainersIndex>> = OnceLock::new();
+
+/// Initializes the global MAINTAINERS index loaded from the top-of-trunk of Linus's tree.
+/// Can only be set once at startup and is never altered during normal work.
+pub fn init_global_maintainers(index: Arc<MaintainersIndex>) {
+    let _ = GLOBAL_MAINTAINERS.set(index);
+}
+
+/// Returns a reference to the global immutable MAINTAINERS index.
+pub fn get_global_maintainers() -> Option<Arc<MaintainersIndex>> {
+    GLOBAL_MAINTAINERS.get().cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,4 +564,19 @@ F:	include/linux/mm*
         assert!(lists.contains(&"netdev@vger.kernel.org".to_string()));
         assert!(lists.contains(&"linux-btrfs@vger.kernel.org".to_string()));
     }
+
+    #[test]
+    fn test_global_maintainers_lifecycle() {
+        let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        let arc = Arc::new(index);
+        init_global_maintainers(arc.clone());
+
+        let retrieved = get_global_maintainers().expect("Expected global maintainers to be set");
+        assert_eq!(retrieved.len(), 5);
+        assert_eq!(
+            retrieved.match_file("fs/btrfs/inode.c"),
+            vec!["BTRFS FILE SYSTEM"]
+        );
+    }
 }
+

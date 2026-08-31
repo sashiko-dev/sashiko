@@ -1376,10 +1376,15 @@ impl Reviewer {
                                                 }
                                             }
                                         }
-                                        let matched_subsystems = if let Ok(mindex) =
-                                            crate::maintainers::MaintainersIndex::from_repo(
+                                        let matched_subsystems = if let Some(mindex) =
+                                            crate::maintainers::get_global_maintainers()
+                                        {
+                                            mindex.match_files(&source_files)
+                                        } else if let Ok(mindex) =
+                                            crate::maintainers::MaintainersIndex::from_top_of_trunk(
                                                 &ctx.settings.git.repository_path,
-                                            ) {
+                                            )
+                                        {
                                             mindex.match_files(&source_files)
                                         } else {
                                             Vec::new()

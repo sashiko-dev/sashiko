@@ -1587,9 +1587,14 @@ pub async fn process_issue_worker(
 
     // Stage 1: Normalization & Canonical Naming
     info!("--- Stage 1: Normalization ---");
-    let maintainers_hint = tools
-        .as_ref()
-        .and_then(|tb| crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()).ok())
+    let maintainers_hint = crate::maintainers::get_global_maintainers()
+        .or_else(|| {
+            tools.as_ref().and_then(|tb| {
+                crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
+                    .ok()
+                    .map(std::sync::Arc::new)
+            })
+        })
         .map(|mindex| {
             let matched = mindex.match_files(&effective_source_files);
             if matched.is_empty() {
@@ -1640,9 +1645,15 @@ pub async fn process_issue_worker(
     }
 
     // Determine official subsystems programmatically from MAINTAINERS
-    let official_subsystems = if let Some(ref tb) = tools {
-        if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
-        {
+    let official_subsystems = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
+        let matched = mindex.match_files(&verified_files);
+        if !matched.is_empty() {
+            matched
+        } else {
+            extract_directory_subsystems(&verified_files)
+        }
+    } else if let Some(ref tb) = tools {
+        if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()) {
             let matched = mindex.match_files(&verified_files);
             if !matched.is_empty() {
                 matched
