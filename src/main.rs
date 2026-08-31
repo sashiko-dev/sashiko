@@ -425,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Spawn FetchAgent
-    tokio::spawn(async move {
+    let fetch_handle = tokio::spawn(async move {
         fetch_agent.run().await;
     });
 
@@ -725,7 +725,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DB Worker (Transactional Batching)
     let worker_db = db.clone();
     let mapping = settings.subsystems.mapping.clone();
-    let _db_worker_handle = tokio::spawn(async move {
+    let db_worker_handle = tokio::spawn(async move {
         info!("DB Worker started");
 
         let mut buffer = Vec::with_capacity(100);
@@ -810,7 +810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allow_all_submit = cli.enable_unsafe_all_submit;
     let smtp_enabled = settings.smtp.is_some();
     let dry_run = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false);
-    tokio::spawn(async move {
+    let api_handle = tokio::spawn(async move {
         if let Err(e) = sashiko::api::run_server(
             api_settings,
             api_db,
@@ -827,15 +827,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start Email Worker
-    if let Some(smtp_settings) = settings.smtp.clone() {
+    let email_handle = if let Some(smtp_settings) = settings.smtp.clone() {
         let email_worker = sashiko::worker::email::EmailWorker::new(db.clone(), smtp_settings);
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             email_worker.run().await;
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Start Patchwork Worker (processes API check entries when they exist)
-    {
+    let patchwork_handle = {
         let pw_policy_path = settings.review.email_policy_path.clone();
         let pw_max_retries = settings.review.max_retries;
         let patchwork_worker = sashiko::worker::patchwork::PatchworkWorker::new(
@@ -845,10 +847,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tokio::spawn(async move {
             patchwork_worker.run().await;
-        });
-    }
+        })
+    };
 
-    {
+    let bug_worker_handle = {
         let provider =
             sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
         let bug_worker = sashiko::worker::bug_worker::BugWorker::new(
@@ -858,11 +860,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tokio::spawn(async move {
             bug_worker.run().await;
-        });
-    }
+        })
+    };
     // Initialize custom remotes
     // Start Background Compressor Worker
-    tokio::spawn(sashiko::worker::compressor::run_compressor(db.clone()));
+    let compressor_handle = tokio::spawn(sashiko::worker::compressor::run_compressor(db.clone()));
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 
     // Clean up stale worktree directories on disk first
@@ -900,7 +902,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rewrites the pack directory.  Both passes take the object-store
     // lock, so it cannot run underneath the walk.
     let graph_repo_path = repo_path.clone();
-    tokio::spawn(async move {
+    let commit_graph_handle = tokio::spawn(async move {
         if let Err(e) = sashiko::git_ops::write_commit_graph(&graph_repo_path).await {
             error!("Failed to write the commit-graph: {}", e);
         }
@@ -922,30 +924,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start Git Sync Worker
-    {
+    let sync_handle = {
         let sync_worker = sashiko::worker::sync::GitSyncWorker::new(repo_path.clone());
         tokio::spawn(async move {
             sync_worker.run().await;
-        });
-    }
+        })
+    };
 
     // Start Repack Worker
-    {
+    let repack_handle = {
         let repack_worker = sashiko::worker::repack::RepackWorker::new(repo_path.clone());
         tokio::spawn(async move {
             repack_worker.run().await;
-        });
-    }
+        })
+    };
 
     // Start Reviewer Service
     let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
-    tokio::spawn(async move {
+    let reviewer_handle = tokio::spawn(async move {
         reviewer.start().await;
     });
 
     let metrics_db = db.clone();
     let metrics_repo_path = repo_path.clone();
-    tokio::spawn(async move {
+    let metrics_handle = tokio::spawn(async move {
         loop {
             if let Ok(pending) = metrics_db.count_pending_patches().await {
                 sashiko::metrics::set_pending_patches(pending);
@@ -983,11 +985,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 
-    // Abort handles
+    // Abort all background task handles
+    fetch_handle.abort();
     ingestor_handle.abort();
     parser_handle.abort();
+    db_worker_handle.abort();
+    api_handle.abort();
+    if let Some(h) = email_handle {
+        h.abort();
+    }
+    patchwork_handle.abort();
+    bug_worker_handle.abort();
+    compressor_handle.abort();
+    commit_graph_handle.abort();
+    sync_handle.abort();
+    repack_handle.abort();
+    reviewer_handle.abort();
+    metrics_handle.abort();
 
-    Ok(())
+    info!("Shutdown complete.");
+    std::process::exit(0);
 }
 
 fn handle_init_command(
