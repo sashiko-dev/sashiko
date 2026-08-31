@@ -713,14 +713,14 @@ impl LlmSession for SeveritySession<'_> {
     type Output = SeverityJson;
 
     fn system_prompt(&self) -> String {
-        "You are an expert Linux kernel security engineer and maintainer. Assess the severity and impact of a verified defect in the Linux kernel.\n\
-        Evaluate whether the issue leads to memory corruption, privilege escalation, denial of service, data loss, or information leakage.\n\
-        Output raw JSON only."
-            .to_string()
+        format!(
+            "{}\n\nAssess the severity and impact of a verified defect in the Linux kernel following the severity definitions and calibration guidance above.\n\
+            Output raw JSON only matching the schema.",
+            crate::prompt_bundle::kernel_severity_guide()
+        )
     }
 
     fn initial_user_prompt(&self) -> String {
-        let severity_guide = crate::prompt_bundle::kernel_severity_guide();
         format!(
             "Verified Linux Kernel Defect:
 Title: {title}
@@ -729,24 +729,18 @@ Description:
 Code Locations:
 {locations}
 
----
-{severity_guide}
----
-
 Task:
-Assess the severity of this defect and provide an explanation following the severity levels and calibration guidelines above.
+Assess the severity of this defect and provide an explanation following the severity levels and calibration guidance above.
 State your reasoning (consequence, triggering path, reachability) at the start of severity_explanation so the label is auditable.
-Options for severity: \"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\" (use \"Unknown\" if prerequisites or exploitability cannot be definitively determined).
 
 Return ONLY a valid JSON object matching:
 {{
-  \"severity\": \"High\",
+  \"severity\": \"Low\" | \"Medium\" | \"High\" | \"Critical\" | \"Unknown\",
   \"severity_explanation\": \"Explain consequence, triggering path, reachability, attack prerequisites, required privileges, and blast radius...\"
 }}",
             title = self.canonical_title,
             description = self.canonical_description,
             locations = self.locations,
-            severity_guide = severity_guide
         )
     }
 
@@ -804,120 +798,95 @@ CRITICAL RULES:
    - Do NOT output vertical ASCII call-trees (e.g. func_a() -> func_b() -> func_c()). Refer to callers or flow inline within prose (e.g. "when called from func_a()").
    - Clarify the precise root cause and failure mechanism (e.g. memory leak on error path, use-after-free, deadlock, null pointer dereference, race condition, integer overflow).
    - State the immediate technical consequence directly (e.g. memory leak, panic, use-after-free, deadlock). Avoid generic security hyperbole.
-   - Argue once: do NOT include conversational filler or literature ("While reviewing...", "I noticed that...", "In the Linux kernel..."), defensive rationalizations, or concluding summaries.
+   - Argue once: do NOT include conversational filler ("While reviewing...", "I noticed that...", "In the Linux kernel..."), defensive rationalizations, or concluding summaries.
 5. No fix recommendations, patches, or remediation advice. Do NOT suggest how to resolve the issue or how to write a patch. Describe ONLY the bug itself.
-6. Relevant kernel code snippets (WHEN NEEDED):
-   - When a code snippet clarifies the defect, format it cleanly with:
+6. Adaptive kernel code snippet guidelines:
+   - Snippets are optional: If the defect is an interface contract violation, an unhandled state transition, or an architectural mismatch that is clear from prose alone, OMIT code snippets entirely. Do not force code when prose suffices.
+   - Paired actions rule (allocations and releases, locks, refcounts): For memory leaks or paired resource lifecycle bugs, the snippet MUST include BOTH the allocation or acquisition site (e.g. kzalloc or mutex_lock) AND the error or exit path where release was missed. Never show only the exit path without showing what was allocated or acquired. Larger snippets (10-20 lines) are justified and encouraged here to capture full context.
+   - Targeted snippets (4-8 lines): Use for localized expressions, boundary errors, or direct dereferences before null checks.
+   - Formatting: When a code snippet is used, format it as:
      // <filepath>:<start_line>-<end_line>
      return_type func_name(args)
      {
-     	int x, y;
      	< ... >
-
-     	some_code(problematic_code());
-     	          ^^^^^^^^^^^^^^^^^^
-                  // brief comment explaining the invariant broken
+     	some_code();
      	< ... >
      }
-   - Preserve the EXACT indentation (tabs/spaces) verbatim from the source code. Do NOT convert tabs to spaces.
-   - Indent the < ... > (or <...>) omission marker to match the surrounding block's indentation level. Cut unnecessary parts which complicate the code understanding.
-   - Optionally highlight the most important or problematic parts with ^^^^^ underneath if necessary.
-   - Keep snippets concise.
+   - Preserve EXACT verbatim indentation (tabs/spaces) from the source code. Indent the < ... > (or <...>) omission marker to match surrounding block level.
    - Do NOT mention raw line numbers in prose; refer to function names or the snippet header instead.
-7. Concurrency, Race Conditions, and Deadlocks (WHEN APPLICABLE):
-   - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
-   - Mutual Exclusivity: NEVER use both a multi-cpu/columns diagram and a code snippet for the same defect. Choose the single clearer representation.
-   - Do NOT use a multi-column timeline for non-concurrency defects (such as single-threaded leaks, null pointer dereferences on error paths, missing validation, buffer overflows) or for simple concurrency where concise prose is already clear.
-8. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files).
-9. Do NOT use markdown code fences (```) or quote marks ('>').
-10. Format all text paragraphs to wrap at 75 characters per line to be compatible with LKML message formatting rules. Do not wrap code lines or ASCII diagrams.
-11. Ensure clear, readable paragraphs with blank lines between logical steps.
-
-PRE-FLIGHT SELF-CHECK:
-Before outputting, verify:
-- Does sentence 1 state the symptom and broken invariant?
-- Are generic kernel tutorials omitted?
-- Are vertical call trees omitted?
-- Are code snippets under 6 lines, formatted with // <filepath>:<start_line>-<end_line> and verbatim indentation?
-- Are code snippets and ASCII timelines mutually exclusive?
-- Is all prose hard-wrapped at 75 columns?
+7. Strict Caret (^^^^^) highlighting rules:
+   - Carets are overused and must be used with extreme discipline. In most reports, NO carets should be used.
+   - Carets may ONLY point to an existing defective code token or operator that is visibly present in the code (e.g. an unsigned variable compared with < 0, an inverted relational operator, or an off-by-one boundary).
+   - NEVER use carets to point at a missing thing (e.g. NEVER point carets at 'goto out;' or 'return err;' or a blank line to say "missing kfree()"). Absence of a function call cannot be highlighted with carets.
+   - Comments on code lines or caret lines must NEVER cause total line width (including indentation) to exceed 75 characters. If an explanation is needed, place it on a separate comment line or explain it in the prose below the snippet.
+8. Concurrency, Race Conditions, and Deadlocks (LKML timeline style):
+   - For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs.
+   - LKML format: Format columns using whitespace separation and dashed underlines (e.g. CPU 0 and CPU 1). Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids.
+   - Mutual Exclusivity: NEVER use both a multi-CPU timeline and a C code snippet for the same defect. Choose the single clearer representation.
+   - Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
+9. Do NOT use backticks (`) to quote any names (variables, functions, symbols, or files). For function names, use func() format.
+10. Do NOT use markdown code fences (```) or quote marks ('>').
+11. Format all text paragraphs and comment lines hard-wrapped at 75 characters per line (LKML standard: 72-75 columns). Do not wrap code lines or multi-column diagrams.
 
 EXAMPLES:
 
-Example 1 (Type mismatch / signedness / boundary check with code snippet and carets):
+Example 1 (Resource / memory leak with paired allocation and error exit):
 
-In rnbd_clt_init_dev(), dev_id is declared as an unsigned u32, but
-ida_alloc_max() returns a signed int that can be negative on error:
+In parse_durable_handle_context(), if ksmbd_extract_sharename() fails after
+allocating the durable handle buffer, the function returns an error code
+without freeing the allocated buffer:
 
-    // drivers/block/rnbd/rnbd-clt.c:567-587
-    static int rnbd_clt_init_dev(struct rnbd_clt_dev *dev)
-    {
-    	u32 dev_id;
-    	< ... >
-    	dev_id = ida_alloc_max(&rnbd_clt_ida, MAX_DEVICES, GFP_KERNEL);
-    	if (dev_id < 0) {
-    		^^^^^^^^^^ // always false for u32: negative error code wraps
-    		return dev_id;
-    	}
-    	< ... >
-    }
-
-Because dev_id is unsigned, negative error codes wrap to large positive
-integers. The error check is bypassed, causing the function to proceed
-with an invalid identifier and corrupt subsequent array indexing.
-
-Example 2 (Resource / lock leak on error path with code snippet and carets):
-
-In parse_durable_handle_context(), if conflicting create flags are present
-or if ksmbd_extract_sharename() fails, the function takes an early error
-exit path without releasing the allocated file structure:
-
-    // fs/smb/server/smb2pdu.c:2450-2480
+    // fs/smb/server/smb2pdu.c:2450-2475
     static int parse_durable_handle_context(...)
     {
+    	struct ksmbd_file *fp;
+    	< ... >
+    	fp = kzalloc(sizeof(*fp), GFP_KERNEL);
+    	if (!fp)
+    		return -ENOMEM;
     	< ... >
     	rc = ksmbd_extract_sharename(share_name, ...);
     	if (rc) {
     		status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
-    		goto out_err;
-    		^^^^^^^^^^^^ // leaks dh_info->fp without ksmbd_fd_put()
+    		return rc;
     	}
     	< ... >
     }
 
-This results in a persistent reference count leak whenever invalid create
-parameters or corrupted sharenames are processed.
+The allocated fp structure is abandoned on the early return path without
+calling ksmbd_fd_put() or kfree(), leading to a permanent kernel memory
+leak whenever an invalid sharename is received.
 
-Example 3 (Race condition multi-column timeline, when clearly helpful):
+Example 2 (Race condition multi-column timeline across CPUs):
 
 In xc5000_release(), cancel_delayed_work() does not wait for timer_sleep
-to finish if it is already running, racing with kfree():
+to finish if it is already executing, racing with priv deallocation:
 
-    CPU0 (release thread)                  | CPU1 (delayed worker)
-    ---------------------------------------+---------------------------------------
-    xc5000_release()                       | xc5000_do_timer_sleep()
-      cancel_delayed_work()                |
-      kfree(priv);                         |
-                                           | priv->timer_active = 0; // UAF
+    CPU 0 (release thread)              CPU 1 (delayed worker)
+    ----------------------              ----------------------
+    xc5000_release()
+      cancel_delayed_work()
+      kfree(priv);
+                                        xc5000_do_timer_sleep()
+                                          priv->timer_active = 0; // UAF
 
-This causes xc5000_do_timer_sleep() to access freed memory when tuner
+This causes xc5000_do_timer_sleep() to dereference freed memory when tuner
 shutdown coincides with an expiring sleep timer.
 
-Example 4 (Deadlock multi-column timeline, when clearly helpful):
+Example 3 (Broken invariant described in pure prose without a code snippet):
 
-A circular locking dependency occurs across three CPUs:
+In bpf_sk_lookup_assign(), assigning a TCP listening socket to an SKB
+fails to verify that the socket's network namespace matches the incoming
+packet's network namespace.
 
-        CPU0                     CPU1                     CPU2
-    1   lock(&kvm->slots_lock);
-    2                                                     lock(&vcpu->mutex);
-    3                                                     lock(&kvm->srcu);
-    4                            lock(cpu_hotplug_lock);
-    5                            lock(kvm_lock);
-    6                            lock(&kvm->slots_lock);
-    7                                                     lock(cpu_hotplug_lock);
-    8   sync(&kvm->srcu);
+When a BPF program attaches to a cgroup in a non-root network namespace and
+performs a socket lookup across namespaces, the function assigns a foreign
+namespace listener to the SKB. Subsequent TCP input processing in the local
+namespace assumes all associated sockets reside within the packet's own
+netns, resulting in cross-netns socket leaks and routing invariant
+violations.
 
-Example 5 (Defect reproducible only under special circumstances):
+Example 4 (Type mismatch / signedness with targeted carets and short comment):
 
 On a 32-bit architecture, size_t is 32-bit and an integer overflow occurs
 when calculating the allocation size in snd_pcm_hw_params():
@@ -927,9 +896,32 @@ when calculating the allocation size in snd_pcm_hw_params():
     {
     	< ... >
     	size = params->periods * params->period_bytes;
-    	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ // overflows 32-bit size_t
+    	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    	       // overflows 32-bit size_t
     	< ... >
     }
+
+Because params->periods and params->period_bytes are controlled by
+userspace ALSA configuration, multiplication of large values wraps around
+zero, causing kmalloc() to allocate insufficient memory for subsequent DMA
+transfers.
+
+Example 5 (Circular lock dependency / deadlock timeline):
+
+A circular locking dependency exists between slots_lock and vcpu mutex
+across multiple execution contexts:
+
+    CPU 0                               CPU 1
+    -----                               -----
+    lock(&kvm->slots_lock);
+                                        lock(&vcpu->mutex);
+                                        lock(&kvm->slots_lock); // blocks
+    sync(&kvm->srcu);
+      lock(&vcpu->mutex); // deadlock
+
+CPU 0 holds slots_lock while waiting for vcpu mutex via sync_srcu, while
+CPU 1 holds vcpu mutex and attempts to acquire slots_lock, creating an
+unresolvable AB-BA deadlock.
 "#.to_string()
     }
 
@@ -966,32 +958,29 @@ Locations:
 {loc_str}
 {code_section}
 Task:
-Write a detailed technical description of the problem.
+Write a detailed technical description of the problem for upstream submission.
 - Lead with the symptom: The very first sentence must state what goes wrong, in which function/subsystem, and under what condition.
 - If the problem is reproducible only under special circumstances, e.g. on a 32-bit machine, highlight it first upfront in sentence 1 (e.g. 'On a 32-bit architecture...').
 - Anti-Lecture: Do NOT explain generic kernel concepts (RCU, spinlocks, workqueues). Focus strictly on the broken invariant in this code.
 - Keep the description to 1 to 2 cohesive paragraphs. Avoid vertical call-trees (e.g. func_a() -> func_b() -> func_c()); refer to callers inline instead.
 - Avoid generic security hyperbole; state concrete technical consequences (e.g. memory leak, panic, use-after-free, deadlock).
 - Explain the precise root cause and failure mechanism in depth.
-- For race conditions, deadlocks, or multi-CPU concurrency bugs—and ONLY when it clearly improves clarity—you may illustrate the sequence of events using a multi-column ASCII timeline across the involved CPUs (e.g. CPU0 vs CPU1, or CPU0 / CPU1 / CPU2).
-- Mutual Exclusivity: NEVER use both code snippets and a multi-cpu/columns diagram. Choose the single clearer representation. Do NOT use multi-column timelines for non-concurrency defects.
-- Code snippets: When helpful, include a concise snippet (max 4-6 lines of code) formatted as:
-      // <filepath>:<start_line>-<end_line>
-      return_type func_name(args)
-      {{
-      \t< ... >
-      \tproblematic_code();
-      \t^^^^^^^^^^^^^^^^^^ // brief comment explaining the invariant broken
-      \t< ... >
-      }}
-  Preserve verbatim source indentation (tabs). Cut all unnecessary parts using < ... > (or <...>). Highlight the most important parts with ^^^^^ if necessary.
-- NEVER mention line numbers in prose; refer to function names or the snippet header instead.
-- NEVER use backticks (`) to quote names (variables, functions, symbols, or files).
-- For function names, ALWAYS use func() format.
-- Format all text paragraphs hard-wrapped at 75 characters per line (LKML standard). Do not wrap code lines or ASCII diagrams.
-- Raw plain text only, no markdown fences, no quote marks ('>').
-- Do NOT provide fix recommendations, remediation advice, or patches.
-- Do NOT include headers like 'Defect Report:' or 'Description:'. Start directly with the technical description.",
+- Adaptive code snippets:
+  - If pure prose explains the issue clearly, omit code snippets completely.
+  - For paired actions (memory allocations, lock acquisitions, refcounts), the snippet MUST include BOTH the allocation/acquisition site AND the error exit where release was missed.
+  - Strict Carets: Do NOT overuse carets (^^^^^). Carets may ONLY point to an existing defective expression. NEVER use carets to highlight a missing call (e.g. do not point carets at 'goto out;' or 'return err;' to denote missing kfree()).
+  - Comments on code lines or caret lines must never exceed 75 characters per line.
+  - When snippets are included, format with // <filepath>:<start_line>-<end_line>, verbatim tabs, and < ... > (or <...>) omission markers.
+- Concurrency formatting:
+  - For race conditions or deadlocks across CPUs, format the temporal sequence using whitespace-separated columns and dashed underlines (LKML style).
+  - Do NOT draw tables with vertical borders ('|'), crosses ('+'), or markdown table grids.
+  - Mutual Exclusivity: NEVER use both code snippets and a multi-cpu/columns diagram. Choose the single clearer representation. Do NOT use multi-column timelines for non-concurrency defects.
+- Formatting & Tone:
+  - Hard-wrap all prose and comment lines at 75 characters per line (LKML standard).
+  - Raw plain text only, no markdown fences, no quote marks ('>'), no backticks (`).
+  - For function names, ALWAYS use func() format.
+  - Do NOT provide fix recommendations, remediation advice, or patches.
+  - Do NOT include headers like 'Defect Report:' or 'Description:'. Start directly with the technical description.",
             problem = self.problem,
             severity = self.severity,
             description = self.canonical_description,
@@ -2424,13 +2413,36 @@ mod tests {
         assert!(sys_prompt.contains("On a 32-bit architecture"));
         assert!(sys_prompt.contains("<...>"));
         assert!(sys_prompt.contains("^^^^^"));
-        assert!(sys_prompt.contains("multi-cpu/columns diagram"));
+        assert!(sys_prompt.contains("Paired actions rule"));
+        assert!(sys_prompt.contains("NEVER use carets to point at a missing thing"));
+        assert!(sys_prompt.contains("75 characters per line"));
+        assert!(sys_prompt.contains("CPU 0"));
 
         let user_prompt = session.initial_user_prompt();
         assert!(user_prompt.contains("32-bit machine"));
         assert!(user_prompt.contains("<...>"));
         assert!(user_prompt.contains("^^^^^"));
+        assert!(user_prompt.contains("NEVER use carets to highlight a missing call"));
         assert!(user_prompt.contains("multi-cpu/columns diagram"));
+    }
+
+    #[tokio::test]
+    async fn test_severity_session_uses_prompt_file_directly() {
+        let session = SeveritySession {
+            canonical_title: "net: memory leak in dev_alloc()",
+            canonical_description: "Buffer allocated but not freed",
+            locations: "[]",
+            context_tag: None,
+        };
+
+        let sys_prompt = session.system_prompt();
+        assert!(sys_prompt.contains("# Severity Levels"));
+        assert!(sys_prompt.contains("## Calibrating the level"));
+        assert!(sys_prompt.contains("## Critical"));
+        assert!(sys_prompt.contains("## High"));
+        assert!(sys_prompt.contains("## Medium"));
+        assert!(sys_prompt.contains("## Low"));
+        assert!(sys_prompt.contains("Output raw JSON only"));
     }
 
     #[tokio::test]
