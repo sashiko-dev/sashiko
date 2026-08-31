@@ -817,8 +817,8 @@ A maintainer defect report follows a structured narrative across 1 to 2 cohesive
 
 Choose the representation that most clearly demonstrates the defect:
 
-- Prose-First Principle:
-  If the defect is an interface contract violation, an unhandled state transition, or an architectural mismatch that is clear from prose alone, OMIT code snippets entirely. Do not force code when prose suffices.
+- Code Presentation Principle:
+  Include code snippets for all localized defects (including flawed logic, error paths, and paired resource handling). Omit snippets only when the bug is not localized within existing code (e.g. a missing architectural hook or high-level design omission where pure prose is clearer).
 
 - Paired Actions Rule (Allocations & Releases, Locks, Refcounts):
   For memory leaks or paired resource lifecycle bugs, any snippet MUST include BOTH the allocation or acquisition site (e.g. kzalloc or mutex_lock) AND the error or exit path where release was missed. Never show only the exit path without showing what was allocated or acquired.
@@ -1000,13 +1000,13 @@ Draft the standalone technical defect description for upstream submission follow
    - State concrete technical consequences (e.g. memory leak, panic, use-after-free, deadlock); avoid generic security hyperbole.
    - Do NOT provide fix recommendations, patches, or remediation advice. Describe ONLY the bug itself.
 
-3. Code Presentation (if applicable):
-   - If pure prose explains the issue clearly, omit code snippets completely.
+3. Code Presentation:
+   - Include code snippets for all localized defects (including flawed logic, error paths, and paired resource handling). Omit snippets only when the bug is not localized within existing code (e.g. a missing architectural hook or high-level design omission where pure prose is clearer).
    - For paired actions (memory allocations, lock acquisitions, refcounts), the snippet MUST include BOTH the allocation/acquisition site AND the error exit where release was missed.
    - For race conditions or deadlocks across CPUs, format the temporal sequence using whitespace-separated columns and dashed underlines (LKML style multi-CPU timeline diagram). Do NOT draw tables with vertical borders ('|'), crosses ('+'), or markdown table grids.
    - Strict Carets: Do NOT overuse carets (^^^^^). Carets may ONLY point to an existing defective expression. NEVER use carets to highlight a missing call (e.g. do not point carets at 'goto out;' or 'return err;' to denote missing kfree()).
    - Comments on code lines or caret lines must never exceed 75 characters per line.
-   - When snippets are included, format with // <filepath>:<start_line>-<end_line>, verbatim tabs, and < ... > (or <...>) omission markers.
+   - Format snippets with // <filepath>:<start_line>-<end_line>, verbatim tabs, and < ... > (or <...>) omission markers.
 
 4. Formatting Constraints:
    - Raw plain text only: no markdown fences (```), no quote marks ('>'), no backticks (`).
@@ -2476,6 +2476,8 @@ mod tests {
         assert!(sys_prompt.contains("ovl_create_or_link"));
         assert!(sys_prompt.contains("snd_pcm_hw_params"));
         assert!(sys_prompt.contains("slots_lock"));
+        assert!(sys_prompt.contains("Include code snippets for all localized defects"));
+        assert!(sys_prompt.contains("missing architectural hook"));
 
         let user_prompt = session.initial_user_prompt();
         assert!(user_prompt.contains("32-bit machine"));
@@ -2483,6 +2485,8 @@ mod tests {
         assert!(user_prompt.contains("^^^^^"));
         assert!(user_prompt.contains("NEVER use carets to highlight a missing call"));
         assert!(user_prompt.contains("multi-CPU timeline diagram"));
+        assert!(user_prompt.contains("Include code snippets for all localized defects"));
+        assert!(user_prompt.contains("missing architectural hook"));
     }
 
     #[tokio::test]
