@@ -154,10 +154,9 @@ pub struct VerificationJson {
 pub struct NormalizationJson {
     pub canonical_title: String,
     pub canonical_description: String,
-    pub primary_subsystem: String,
-    #[serde(default)]
-    pub subsystems: Option<Vec<String>>,
     pub affected_source_files: Vec<String>,
+    #[serde(default)]
+    pub affected_symbols: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -296,6 +295,7 @@ struct NormalizeSession<'a> {
     problem: &'a str,
     reasoning: &'a str,
     locations: &'a str,
+    master_sha: &'a str,
     maintainers_hint: Option<String>,
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
@@ -306,10 +306,15 @@ impl LlmSession for NormalizeSession<'_> {
     type Output = NormalizationJson;
 
     fn system_prompt(&self) -> String {
-        "You are an expert Linux kernel maintainer and technical editor. Your role is to normalize a candidate Linux kernel defect into canonical form.\n\
-        You must standardize the defect's title, subsystem classification, and structured description without altering the technical substance reported.\n\
-        Use available tools (git_log, git_read_files, git_grep) to inspect the codebase and git history of affected files to determine the conventional subsystem prefix used by maintainers."
-            .to_string()
+        format!(
+            "You are an expert Linux kernel maintainer and technical editor. Your role is to normalize a candidate Linux kernel defect into canonical form.\n\
+            You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
+            The target codebase is Linus Torvalds' mainline Linux kernel tree at top-of-trunk commit `{master_sha}`.\n\
+            Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
+            - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
+            - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional subsystem commit prefix used by maintainers (e.g. 'btrfs:', 'net:', 'mm:', 'drm/i915:').",
+            master_sha = self.master_sha
+        )
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -326,30 +331,31 @@ Reasoning: {reasoning}
 Reported Locations:
 {locations}
 {hint}
+Target Mainline Commit: {master_sha}
+
 Task:
-1. Determine the canonical primary subsystem for this defect (e.g. 'btrfs', 'net/sched', 'bpf', 'drm/i915', 'sched', 'mm'). Use git_log on the affected file(s) to observe the standard commit prefix used by kernel maintainers.
-2. Determine all relevant subsystems affected by this defect (including nested or parent subsystems, e.g. ['net', 'net/sched'], or multiple components touched across boundaries, e.g. ['iommu', 'arm64']).
-3. Formulate a canonical title matching Linux kernel subsystem conventions: '<primary_subsystem>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+1. Determine the conventional subsystem commit prefix for this defect (e.g. 'btrfs', 'net', 'net/sched', 'bpf', 'drm/i915', 'sched', 'mm'). Use git_log on the affected file(s) at revision '{master_sha}' to observe the standard commit prefix used by kernel maintainers.
+2. Formulate a canonical title matching Linux kernel patch conventions: '<subsystem_prefix>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
    - CRITICAL: This is a bug report title describing an existing defect, NOT a patch or commit title. Do NOT use patch/fix action verbs like 'fix', 'resolve', 'prevent', 'avoid', or 'handle'. State the defect directly (e.g. 'btrfs: use-after-free in btrfs_cleanup_ordered_extents()' or 'iommu/rockchip: array compaction flaw in rk_iommu_probe()', NEVER 'iommu/rockchip: fix array compaction flaw in rk_iommu_probe()').
-4. Provide a detailed, structured canonical description:
+3. Provide a detailed, structured canonical description:
    - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect. If reproducible only under special circumstances (e.g. on a 32-bit machine, specific architecture, or configuration), highlight it first (e.g. 'On a 32-bit architecture...').
    - Call Chain / Execution Path: Detail the complete chain of events/calls (e.g. func_a() -> func_b() -> func_c()) leading up to the problem.
    - Failure Mechanism: Detail the exact root cause and how the fault or resource corruption occurs.
    - Impact: Consequence of the failure (e.g. UAF, memory leak, deadlock, null pointer dereference, crash).
-5. List the affected source files.
+4. Verify and list the affected source files and symbols in the mainline tree at commit '{master_sha}'.
 
 Return ONLY a valid JSON object matching this schema:
 {{
   \"canonical_title\": \"btrfs: use-after-free in btrfs_cleanup_ordered_extents()\",
   \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
-  \"primary_subsystem\": \"btrfs\",
-  \"subsystems\": [\"btrfs\", \"fs\"],
-  \"affected_source_files\": [\"fs/btrfs/ordered-data.c\"]
+  \"affected_source_files\": [\"fs/btrfs/ordered-data.c\"],
+  \"affected_symbols\": [\"btrfs_cleanup_ordered_extents\"]
 }}",
             problem = self.problem,
             reasoning = self.reasoning,
             locations = self.locations,
-            hint = hint_section
+            hint = hint_section,
+            master_sha = self.master_sha
         )
     }
 
@@ -383,17 +389,27 @@ Return ONLY a valid JSON object matching this schema:
                 "canonical_title cannot be empty".into(),
             ));
         }
-        if parsed.primary_subsystem.trim().is_empty() {
+        if parsed.affected_source_files.is_empty() {
             return Err(ValidationError::FormatViolation(
-                "primary_subsystem cannot be empty".into(),
+                "affected_source_files cannot be empty".into(),
             ));
         }
 
-        let desc = if let Some((_, rest)) = title.split_once(':') {
-            rest.trim().to_ascii_lowercase()
+        let (prefix, desc) = if let Some((p, rest)) = title.split_once(':') {
+            (p.trim(), rest.trim().to_ascii_lowercase())
         } else {
-            title.to_ascii_lowercase()
+            return Err(ValidationError::FormatViolation(format!(
+                "canonical_title must follow the format '<subsystem_prefix>: <defect description>'. Got: '{}'",
+                title
+            )));
         };
+
+        if prefix.is_empty() {
+            return Err(ValidationError::FormatViolation(
+                "subsystem prefix in canonical_title cannot be empty".into(),
+            ));
+        }
+
         const FORBIDDEN_PREFIXES: &[&str] = &[
             "fix ",
             "fixes ",
@@ -410,7 +426,7 @@ Return ONLY a valid JSON object matching this schema:
         ];
         if FORBIDDEN_PREFIXES
             .iter()
-            .any(|prefix| desc.starts_with(prefix))
+            .any(|forbidden| desc.starts_with(forbidden))
         {
             return Err(ValidationError::FormatViolation(format!(
                 "canonical_title must describe the defect rather than a patch/fix; do not use patch action verbs like 'fix', 'prevent', or 'avoid' after the subsystem prefix. Got: '{}'",
@@ -419,6 +435,38 @@ Return ONLY a valid JSON object matching this schema:
         }
 
         Ok(parsed)
+    }
+}
+
+/// Extracts the subsystem or prefix before the first colon in a canonical title.
+pub fn extract_title_prefix(title: &str) -> &str {
+    if let Some((prefix, _)) = title.split_once(':') {
+        prefix.trim()
+    } else {
+        title.trim()
+    }
+}
+
+/// Extracts coarse directory-based subsystem prefixes (e.g. "fs/btrfs" or "net/core") from file paths.
+pub fn extract_directory_subsystems(files: &[String]) -> Vec<String> {
+    let mut subs = Vec::new();
+    for file in files {
+        let parts: Vec<&str> = file.split('/').collect();
+        let sub = if parts.len() >= 2 {
+            format!("{}/{}", parts[0], parts[1])
+        } else if !parts.is_empty() && !parts[0].is_empty() {
+            parts[0].to_string()
+        } else {
+            continue;
+        };
+        if !subs.contains(&sub) {
+            subs.push(sub);
+        }
+    }
+    if subs.is_empty() {
+        vec!["kernel".to_string()]
+    } else {
+        subs
     }
 }
 
@@ -1574,6 +1622,7 @@ pub async fn process_issue_worker(
         problem: &input.problem,
         reasoning: &input.reasoning,
         locations: &raw_locations_str,
+        master_sha: &master_sha,
         maintainers_hint,
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
@@ -1583,28 +1632,48 @@ pub async fn process_issue_worker(
     full_history.extend(norm_result.history);
     total_usage.accumulate(&norm_result.usage);
     let norm = norm_result.output;
-    let norm_subsystems = if let Some(ref subs) = norm.subsystems {
-        let mut list = Vec::new();
-        if !norm.primary_subsystem.trim().is_empty() {
-            list.push(norm.primary_subsystem.trim().to_string());
-        }
-        for s in subs {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() && !list.iter().any(|item| item.eq_ignore_ascii_case(trimmed)) {
-                list.push(trimmed.to_string());
+
+    // Verify affected source files against mainline tree, falling back to input locations if empty
+    let mut verified_files = Vec::new();
+    if let Some(ref tb) = tools {
+        let repo_path = tb.get_worktree_path();
+        for file in &norm.affected_source_files {
+            if crate::git_ops::git_file_exists_at(repo_path, file, Some(&master_sha)).await {
+                verified_files.push(file.clone());
             }
         }
-        if list.is_empty() {
-            vec![norm.primary_subsystem.clone()]
-        } else {
-            list
-        }
     } else {
-        vec![norm.primary_subsystem.clone()]
+        verified_files = norm.affected_source_files.clone();
+    }
+
+    if verified_files.is_empty() {
+        verified_files = effective_source_files.clone();
+    }
+
+    // Determine official subsystems programmatically from MAINTAINERS
+    let official_subsystems = if let Some(ref tb) = tools {
+        if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
+        {
+            let matched = mindex.match_files(&verified_files);
+            if !matched.is_empty() {
+                matched
+            } else {
+                extract_directory_subsystems(&verified_files)
+            }
+        } else {
+            extract_directory_subsystems(&verified_files)
+        }
+    } else if !input.subsystems.is_empty() {
+        input.subsystems.clone()
+    } else {
+        extract_directory_subsystems(&verified_files)
     };
+
+    let title_prefix = extract_title_prefix(&norm.canonical_title);
+
     info!(
-        "Stage 1 Complete: Normalized to '{}' in subsystems '{:?}'",
-        norm.canonical_title, norm_subsystems
+        "Stage 1 Complete: Normalized to '{}' (prefix '{}') with official subsystems '{:?}'",
+        norm.canonical_title, title_prefix, official_subsystems
     );
 
     // Stage 2: Verification & Ground-Truth Confirmation
@@ -1614,8 +1683,8 @@ pub async fn process_issue_worker(
     let mut verify_session = VerifySession {
         title: &norm.canonical_title,
         description: &norm.canonical_description,
-        subsystem: &norm.primary_subsystem,
-        affected_files: &norm.affected_source_files,
+        subsystem: title_prefix,
+        affected_files: &verified_files,
         locations: effective_locations.as_ref(),
         master_sha: master_sha.clone(),
         tools: tools.clone(),
@@ -1643,8 +1712,8 @@ pub async fn process_issue_worker(
             crate::db::UpdateBugOutcomeParams {
                 status: "dismissed",
                 problem: Some(&norm.canonical_title),
-                subsystems: Some(&norm_subsystems),
-                source_files: Some(&norm.affected_source_files),
+                subsystems: Some(&official_subsystems),
+                source_files: Some(&verified_files),
                 severity_explanation: Some(&reason),
                 logs: Some(&logs),
                 verified_on_sha: Some(&master_sha),
@@ -1673,8 +1742,8 @@ pub async fn process_issue_worker(
     info!("--- Stage 3: Deduplication ---");
     let query_vector = extract_bug_vector(
         &norm.canonical_title,
-        &norm_subsystems,
-        &norm.affected_source_files,
+        &official_subsystems,
+        &verified_files,
         verified_locations.as_ref(),
     );
 
@@ -1701,7 +1770,7 @@ pub async fn process_issue_worker(
             let mut dedup_session = DedupSession {
                 candidate_problem: &norm.canonical_title,
                 candidate_locations: verified_locations.as_ref(),
-                candidate_subsystems: &norm_subsystems,
+                candidate_subsystems: &official_subsystems,
                 known_candidates: &candidate_bugs,
                 context_tag: context_tag.map(|s| s.to_string()),
             };
@@ -1835,8 +1904,8 @@ pub async fn process_issue_worker(
         crate::db::UpdateBugOutcomeParams {
             status: "open",
             problem: Some(&norm.canonical_title),
-            subsystems: Some(&norm_subsystems),
-            source_files: Some(&norm.affected_source_files),
+            subsystems: Some(&official_subsystems),
+            source_files: Some(&verified_files),
             locations: verified_locations.as_ref(),
             severity,
             severity_explanation: Some(&severity_output.severity_explanation),
@@ -1957,7 +2026,6 @@ mod tests {
         let normalize_json = json!({
             "canonical_title": "net: dev: null dereference in dev_read()",
             "canonical_description": "Trigger: Null pointer passed.\nFailure Mechanism: Dereference without check.\nImpact: Panic.",
-            "primary_subsystem": "net",
             "affected_source_files": ["net/core/dev.c"]
         }).to_string();
 
@@ -2016,8 +2084,8 @@ mod tests {
             response_text: json!({
                 "canonical_title": "net: dev: memory leak in dev_alloc()",
                 "canonical_description": "Trigger: Netdev allocation failure.\nFailure Mechanism: Missing kfree() on error path.\nImpact: Memory leak.",
-                "primary_subsystem": "net",
-                "affected_source_files": ["net/core/dev.c"]
+                "affected_source_files": ["net/core/dev.c"],
+                "affected_symbols": ["dev_alloc"]
             })
             .to_string(),
         };
@@ -2026,6 +2094,7 @@ mod tests {
             problem: "Memory leak in net/core/dev.c",
             reasoning: "Allocated buffer not freed on error path",
             locations: "[{\"file\": \"net/core/dev.c\", \"line\": 100}]",
+            master_sha: "abcdef1234567890abcdef1234567890abcdef12",
             maintainers_hint: Some(
                 "Detected Subsystems from MAINTAINERS: NETWORKING [GENERAL]".to_string(),
             ),
@@ -2039,8 +2108,12 @@ mod tests {
             res.output.canonical_title,
             "net: dev: memory leak in dev_alloc()"
         );
-        assert_eq!(res.output.primary_subsystem, "net");
+        assert_eq!(extract_title_prefix(&res.output.canonical_title), "net");
         assert_eq!(res.output.affected_source_files, vec!["net/core/dev.c"]);
+        assert_eq!(
+            res.output.affected_symbols,
+            Some(vec!["dev_alloc".to_string()])
+        );
     }
 
     #[test]
@@ -2049,6 +2122,7 @@ mod tests {
             problem: "Array compaction flaw in rk_iommu_probe",
             reasoning: "sparse array indexing",
             locations: "[]",
+            master_sha: "abcdef1234567890abcdef1234567890abcdef12",
             maintainers_hint: None,
             tools: None,
             context_tag: None,
@@ -2061,6 +2135,14 @@ mod tests {
             prompt
                 .contains("NEVER 'iommu/rockchip: fix array compaction flaw in rk_iommu_probe()'")
         );
+        assert!(
+            prompt.contains("Target Mainline Commit: abcdef1234567890abcdef1234567890abcdef12")
+        );
+        assert!(prompt.contains("git_log"));
+
+        let sys_prompt = session.system_prompt();
+        assert!(sys_prompt.contains("abcdef1234567890abcdef1234567890abcdef12"));
+        assert!(sys_prompt.contains("git_read_files"));
     }
 
     #[test]
@@ -2069,6 +2151,7 @@ mod tests {
             problem: "problem",
             reasoning: "reasoning",
             locations: "[]",
+            master_sha: "master",
             maintainers_hint: None,
             tools: None,
             context_tag: None,
@@ -2088,7 +2171,6 @@ mod tests {
                     json!({
                         "canonical_title": bad,
                         "canonical_description": "Description",
-                        "primary_subsystem": "subsys",
                         "affected_source_files": ["file.c"]
                     })
                     .to_string(),
@@ -2120,6 +2202,7 @@ mod tests {
             problem: "problem",
             reasoning: "reasoning",
             locations: "[]",
+            master_sha: "master",
             maintainers_hint: None,
             tools: None,
             context_tag: None,
@@ -2138,7 +2221,6 @@ mod tests {
                     json!({
                         "canonical_title": good,
                         "canonical_description": "Description",
-                        "primary_subsystem": "subsys",
                         "affected_source_files": ["file.c"]
                     })
                     .to_string(),
@@ -2374,7 +2456,6 @@ mod tests {
         let normalize_json = json!({
             "canonical_title": "e1000: buffer overflow in e1000_clean_rx_irq()",
             "canonical_description": "Trigger: Jumbo frame without adequate skb buffer.\nMechanism: Unchecked memcpy into skb->data.\nImpact: Kernel memory corruption.",
-            "primary_subsystem": "net/intel",
             "affected_source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"]
         }).to_string();
 
@@ -2417,7 +2498,7 @@ mod tests {
             locations: Some(
                 json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]),
             ),
-            subsystems: vec!["net:intel".to_string()],
+            subsystems: vec!["net/intel".to_string()],
             source_files: vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             commit_sha: Some("abcdef123456".to_string()),
             patchset_id: Some(ps_id),
@@ -2513,7 +2594,6 @@ mod tests {
         let normalize_json = json!({
             "canonical_title": "e1000: buffer overflow in e1000_clean_rx_irq()",
             "canonical_description": "Trigger: Jumbo frame.\nMechanism: memcpy.\nImpact: Crash.",
-            "primary_subsystem": "net/intel",
             "affected_source_files": ["drivers/net/ethernet/intel/e1000/e1000_main.c"]
         })
         .to_string();
@@ -2812,5 +2892,157 @@ Call Trace:
 
         let sha = deterministic_blame_fallback(Some(&tb), &Some(locations), "HEAD").await;
         assert_eq!(sha, Some(head_commit));
+    }
+
+    #[test]
+    fn test_extract_title_prefix() {
+        assert_eq!(
+            extract_title_prefix("btrfs: use-after-free in cleanup()"),
+            "btrfs"
+        );
+        assert_eq!(
+            extract_title_prefix("net/sched: qdisc enqueue overflow"),
+            "net/sched"
+        );
+        assert_eq!(extract_title_prefix("no_prefix_title"), "no_prefix_title");
+        assert_eq!(extract_title_prefix("  mm:  null deref  "), "mm");
+    }
+
+    #[test]
+    fn test_extract_directory_subsystems() {
+        let files = vec![
+            "fs/btrfs/ordered-data.c".to_string(),
+            "drivers/net/ethernet/intel/e1000/e1000_main.c".to_string(),
+            "arch/x86/kernel/cpu/common.c".to_string(),
+            "kernel/sched/core.c".to_string(),
+        ];
+        let subs = extract_directory_subsystems(&files);
+        assert_eq!(
+            subs,
+            vec![
+                "fs/btrfs".to_string(),
+                "drivers/net".to_string(),
+                "arch/x86".to_string(),
+                "kernel/sched".to_string()
+            ]
+        );
+
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            extract_directory_subsystems(&empty),
+            vec!["kernel".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_normalize_session_validation_rejects_missing_colon() {
+        let mut session = NormalizeSession {
+            problem: "problem",
+            reasoning: "reasoning",
+            locations: "[]",
+            master_sha: "master",
+            maintainers_hint: None,
+            tools: None,
+            context_tag: None,
+        };
+
+        let response = AiResponse {
+            content: Some(
+                json!({
+                    "canonical_title": "missing colon in title",
+                    "canonical_description": "Description",
+                    "affected_source_files": ["file.c"]
+                })
+                .to_string(),
+            ),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        };
+        let err = session.validate(&response).unwrap_err();
+        match err {
+            ValidationError::FormatViolation(msg) => {
+                assert!(
+                    msg.contains(
+                        "must follow the format '<subsystem_prefix>: <defect description>'"
+                    )
+                );
+            }
+            _ => panic!("Expected FormatViolation for missing colon"),
+        }
+    }
+
+    #[test]
+    fn test_normalize_session_validation_rejects_empty_files() {
+        let mut session = NormalizeSession {
+            problem: "problem",
+            reasoning: "reasoning",
+            locations: "[]",
+            master_sha: "master",
+            maintainers_hint: None,
+            tools: None,
+            context_tag: None,
+        };
+
+        let response = AiResponse {
+            content: Some(
+                json!({
+                    "canonical_title": "btrfs: memory leak in alloc()",
+                    "canonical_description": "Description",
+                    "affected_source_files": []
+                })
+                .to_string(),
+            ),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        };
+        let err = session.validate(&response).unwrap_err();
+        match err {
+            ValidationError::FormatViolation(msg) => {
+                assert!(msg.contains("affected_source_files cannot be empty"));
+            }
+            _ => panic!("Expected FormatViolation for empty affected_source_files"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deterministic_subsystem_resolution_with_maintainers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+
+        let maintainers_content = r#"Maintainers List
+===================
+
+BTRFS FILE SYSTEM
+M:	Chris Mason <clm@fb.com>
+L:	linux-btrfs@vger.kernel.org
+S:	Maintained
+F:	fs/btrfs/
+
+INTEL E1000 NETWORK DRIVER
+M:	Jesse Brandeburg <jesse.brandeburg@intel.com>
+L:	netdev@vger.kernel.org
+S:	Supported
+F:	drivers/net/ethernet/intel/e1000/
+"#;
+        std::fs::write(path.join("MAINTAINERS"), maintainers_content).unwrap();
+
+        let mindex = crate::maintainers::MaintainersIndex::from_repo(path).unwrap();
+        let matched = mindex.match_files([
+            "fs/btrfs/inode.c",
+            "drivers/net/ethernet/intel/e1000/e1000_main.c",
+        ]);
+        assert_eq!(
+            matched,
+            vec![
+                "BTRFS FILE SYSTEM".to_string(),
+                "INTEL E1000 NETWORK DRIVER".to_string()
+            ]
+        );
     }
 }
