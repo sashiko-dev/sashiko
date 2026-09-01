@@ -497,7 +497,11 @@ impl AiProvider for BedrockClient {
                     tracing::warn!("Bedrock throttled, waiting 30s before retry...");
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 }
-                return Err(anyhow::anyhow!("Bedrock Converse API error: {e:#}"));
+                return Err(anyhow::anyhow!(
+                    "Bedrock Converse API error (model_id={}): {}",
+                    self.model_id,
+                    aws_smithy_types::error::display::DisplayErrorContext(&e)
+                ));
             }
         };
 
