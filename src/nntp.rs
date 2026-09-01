@@ -13,16 +13,27 @@
 // limitations under the License.
 
 use anyhow::{Result, anyhow};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::crypto::CryptoProvider;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_util::either::Either;
+use tracing::{debug, info, warn};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The command methods read and write through this, so plaintext and
+/// NNTPS differ only in how `connect` builds the stream.
+type NntpStream = Either<TcpStream, TlsStream<TcpStream>>;
+
 pub struct NntpClient {
-    stream: BufReader<TcpStream>,
+    stream: BufReader<NntpStream>,
     timeout: Duration,
 }
 
@@ -35,13 +46,109 @@ pub struct GroupInfo {
     pub name: String,
 }
 
+/// The crypto provider backing every NNTPS handshake.
+///
+/// Both `ring` and `aws-lc-rs` are linked into this binary by way of
+/// reqwest and lettre. With two providers present rustls cannot pick a
+/// process default on its own, and `ClientConfig::builder()` panics.
+/// Neither crate installs a default; each falls back to its own
+/// provider when none is set. Naming the provider here makes the
+/// choice local rather than a process-wide one for this module alone.
+fn crypto_provider() -> Arc<CryptoProvider> {
+    Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider())
+}
+
+/// Trust anchors come from the host certificate store, so an internal
+/// CA is installed by the deployment rather than named in the config.
+///
+/// The ingestor reconnects every cycle, so a usable config is built
+/// once and cached. A failure is not cached. The host trust store can
+/// be populated after this process starts, and a cached error would
+/// fail every later cycle until a restart.
+async fn native_tls_config() -> Result<Arc<ClientConfig>> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+
+    if let Some(config) = CONFIG.get() {
+        return Ok(config.clone());
+    }
+
+    // Loading the store walks the certificate directory with blocking
+    // file I/O, so it runs off the executor thread.
+    let loaded = tokio::task::spawn_blocking(rustls_native_certs::load_native_certs)
+        .await
+        .map_err(|e| anyhow!("certificate loader panicked: {}", e))?;
+    for error in &loaded.errors {
+        warn!("Ignoring unreadable system certificate: {}", error);
+    }
+
+    let mut roots = RootCertStore::empty();
+    let (added, ignored) = roots.add_parsable_certificates(loaded.certs);
+    debug!("Loaded {} system certificates ({} ignored)", added, ignored);
+    // An empty root store does not fail here; the handshake then fails
+    // with an opaque UnknownIssuer alert.
+    if added == 0 {
+        return Err(anyhow!(
+            "no usable system certificate found; install the CA in the host trust store"
+        ));
+    }
+
+    let config = client_config(roots)?;
+    Ok(CONFIG.get_or_init(|| Arc::new(config)).clone())
+}
+
+/// The one builder chain for every client config, so the TLS test
+/// exercises the same protocol and provider choices as production.
+fn client_config(roots: RootCertStore) -> Result<ClientConfig> {
+    Ok(ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow!("TLS protocol versions rejected: {}", e))?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 impl NntpClient {
-    pub async fn connect(host: &str, port: u16) -> Result<Self> {
+    /// Connect to `host`, wrapping the session in TLS when `tls` is
+    /// set. NNTPS is implicit. The handshake completes before the
+    /// server sends its greeting.
+    pub async fn connect(host: &str, port: u16, tls: bool) -> Result<Self> {
+        let tls_config = if tls {
+            Some(native_tls_config().await?)
+        } else {
+            None
+        };
+        Self::connect_with_tls_config(host, port, tls_config).await
+    }
+
+    pub(crate) async fn connect_with_tls_config(
+        host: &str,
+        port: u16,
+        tls_config: Option<Arc<ClientConfig>>,
+    ) -> Result<Self> {
         let addr = format!("{}:{}", host, port);
-        info!("Connecting to NNTP server at {}", addr);
-        let stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr))
+        info!(
+            "Connecting to NNTP server at {} (tls: {})",
+            addr,
+            tls_config.is_some()
+        );
+        let tcp = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| anyhow!("Connection timed out"))??;
+
+        let stream = match tls_config {
+            Some(config) => {
+                let server_name = ServerName::try_from(host.to_string())
+                    .map_err(|_| anyhow!("Not a valid TLS server name: {}", host))?;
+                let stream = timeout(
+                    DEFAULT_TIMEOUT,
+                    TlsConnector::from(config).connect(server_name, tcp),
+                )
+                .await
+                .map_err(|_| anyhow!("TLS handshake timed out"))??;
+                Either::Right(stream)
+            }
+            None => Either::Left(tcp),
+        };
+
         let mut reader = BufReader::new(stream);
 
         let mut buf = Vec::new();
@@ -196,6 +303,11 @@ impl NntpClient {
         if !response.starts_with("205") {
             debug!("QUIT response was not 205: {}", response);
         }
+        // Dropping a TlsStream sends no close_notify; only shutdown
+        // does. Either forwards poll_shutdown to whichever side it holds.
+        if let Err(e) = self.stream.get_mut().shutdown().await {
+            debug!("Shutdown after QUIT failed: {}", e);
+        }
         Ok(())
     }
 }
@@ -203,8 +315,12 @@ impl NntpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 
     #[tokio::test]
     async fn article_preserves_payload_whitespace_and_framing() {
@@ -245,7 +361,7 @@ lf-only \t\n\
                 .unwrap();
         });
 
-        let mut client = NntpClient::connect("127.0.0.1", address.port())
+        let mut client = NntpClient::connect("127.0.0.1", address.port(), false)
             .await
             .unwrap();
         let article_result = client.article("<issue-320@example.test>").await;
@@ -299,7 +415,7 @@ lf-only \t\n\
                 .unwrap();
         });
 
-        let mut client = NntpClient::connect("127.0.0.1", address.port())
+        let mut client = NntpClient::connect("127.0.0.1", address.port(), false)
             .await
             .unwrap();
         let err = client.group("org.kernel.vger.linux-nfs").await.unwrap_err();
@@ -308,5 +424,94 @@ lf-only \t\n\
         assert!(err.to_string().contains(
             "Mismatched GROUP response: expected org.kernel.vger.linux-nfs, got org.kvack.linux-mm"
         ));
+    }
+
+    /// The last line is dot-stuffed on the wire, so a client that
+    /// forgets to unstuff it returns two leading dots.
+    const ARTICLE_LINES: &[&str] = &[
+        "From: someone@example.com",
+        "Subject: [PATCH] test",
+        "",
+        ".signature",
+    ];
+
+    /// Speak just enough NNTP to serve one ARTICLE and a QUIT.
+    async fn serve_one<S>(stream: S) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut stream = BufReader::new(stream);
+        stream.write_all(b"201 test server ready\r\n").await?;
+        stream.flush().await?;
+
+        loop {
+            let mut line = Vec::new();
+            if stream.read_until(b'\n', &mut line).await? == 0 {
+                break;
+            }
+            let command = String::from_utf8_lossy(&line).trim().to_string();
+
+            if command.starts_with("ARTICLE") {
+                stream
+                    .write_all(b"220 1 <test@example.com> article\r\n")
+                    .await?;
+                for line in ARTICLE_LINES {
+                    if line.starts_with('.') {
+                        stream.write_all(b".").await?;
+                    }
+                    stream.write_all(line.as_bytes()).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                stream.write_all(b".\r\n").await?;
+                stream.flush().await?;
+            } else if command.starts_with("QUIT") {
+                stream.write_all(b"205 closing connection\r\n").await?;
+                stream.flush().await?;
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_article_round_trip() {
+        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = issued.cert.der().clone();
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()));
+
+        let server_config = ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(socket).await.unwrap();
+            serve_one(stream).await.unwrap();
+        });
+
+        // Trust only the certificate the test server just minted, so the
+        // handshake exercises real verification rather than skipping it.
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+
+        let mut client = NntpClient::connect_with_tls_config(
+            &addr.ip().to_string(),
+            addr.port(),
+            Some(Arc::new(client_config(roots).unwrap())),
+        )
+        .await
+        .expect("TLS connect");
+
+        assert_eq!(client.article("1").await.unwrap(), ARTICLE_LINES);
+        client.quit().await.unwrap();
     }
 }

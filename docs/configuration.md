@@ -49,6 +49,12 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 |-----|------|---------|-------------|
 | `server` | string | `"nntp.lore.kernel.org"` | NNTP server hostname. |
 | `port` | integer | `119` | NNTP server port. |
+| `tls` | bool | `false` | Wrap the session in TLS (implicit NNTPS). |
+
+Setting `tls` does not change `port`; set it to `563` as well when
+enabling NNTPS. The certificate is verified against the host trust
+store, so an internal CA must be installed there. `lore.kernel.org`
+offers no TLS-protected NNTP, so this is for internal mirrors.
 
 ### `[smtp]`
 
