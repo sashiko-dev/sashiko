@@ -24,6 +24,25 @@ pub fn default_kernel_prompts_path() -> Result<PathBuf> {
     Ok(root.join("kernel"))
 }
 
+pub fn default_qemu_prompts_path() -> Result<PathBuf> {
+    let root = install_prompt_bundle(false)?;
+    Ok(root.join("qemu"))
+}
+
+pub fn default_llvm_prompts_path() -> Result<PathBuf> {
+    let root = install_prompt_bundle(false)?;
+    Ok(root.join("llvm"))
+}
+
+pub fn default_prompts_path_for_project(project: &str) -> Result<PathBuf> {
+    let root = install_prompt_bundle(false)?;
+    match project.to_ascii_lowercase().as_str() {
+        "qemu" => Ok(root.join("qemu")),
+        "llvm" => Ok(root.join("llvm")),
+        _ => Ok(root.join("kernel")),
+    }
+}
+
 pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
     let root = prompt_bundle_root()?;
     let marker = root.join(COMPLETE_MARKER);
@@ -81,6 +100,42 @@ mod tests {
             PROMPT_BUNDLE_FILES
                 .iter()
                 .any(|(path, _)| *path == "kernel/review-core.md")
+        );
+    }
+
+    #[test]
+    fn test_prompt_bundle_contains_qemu_review_core() {
+        assert!(
+            PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(path, _)| *path == "qemu/review-core.md")
+        );
+    }
+
+    #[test]
+    fn test_prompt_bundle_contains_llvm_review_core() {
+        assert!(
+            PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(path, _)| *path == "llvm/review-core.md")
+        );
+    }
+
+    #[test]
+    fn test_prompt_bundle_contains_qemu_severity() {
+        assert!(
+            PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(path, _)| *path == "qemu/severity.md")
+        );
+    }
+
+    #[test]
+    fn test_prompt_bundle_contains_llvm_severity() {
+        assert!(
+            PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(path, _)| *path == "llvm/severity.md")
         );
     }
 

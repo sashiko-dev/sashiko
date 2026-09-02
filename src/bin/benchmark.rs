@@ -49,6 +49,10 @@ struct Args {
     /// Only run the evaluation phase on existing DB results, skipping ingestion and waiting
     #[arg(long)]
     analyze_only: bool,
+
+    /// Target project (kernel, qemu, llvm). Inferred from benchmark file if omitted.
+    #[arg(long)]
+    project: Option<sashiko::project::Project>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,10 +118,38 @@ async fn main() -> Result<()> {
     let total_entries = benchmark_entries.len();
     info!("Loaded {} benchmark entries.", total_entries);
 
+    let project = args.project.unwrap_or_else(|| {
+        let lower = args.file.to_ascii_lowercase();
+        if lower.contains("qemu") {
+            sashiko::project::Project::Qemu
+        } else if lower.contains("llvm") {
+            sashiko::project::Project::Llvm
+        } else {
+            sashiko::project::Project::Kernel
+        }
+    });
+    info!("Target project for benchmark: {}", project);
+
     if !args.analyze_only {
         let port = args.port.unwrap_or(settings.server.port);
-        let repo_url = args.repo.clone().unwrap_or_else(|| {
-            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string()
+        let repo_url = args.repo.clone().unwrap_or_else(|| match project {
+            sashiko::project::Project::Qemu => {
+                if Path::new("/usr/local/google/home/kfree/qemu").exists() {
+                    "/usr/local/google/home/kfree/qemu".to_string()
+                } else {
+                    "https://gitlab.com/qemu-project/qemu.git".to_string()
+                }
+            }
+            sashiko::project::Project::Llvm => {
+                if Path::new("/usr/local/google/home/kfree/llvm-project").exists() {
+                    "/usr/local/google/home/kfree/llvm-project".to_string()
+                } else {
+                    "https://github.com/llvm/llvm-project.git".to_string()
+                }
+            }
+            sashiko::project::Project::Kernel => {
+                "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string()
+            }
         });
 
         let target_url = if settings.server.host.contains(':') {

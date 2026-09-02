@@ -20,6 +20,7 @@ use sashiko::local_review::{
     ProgressEvent, ReviewOptions, WorkerOptions, print_worker_json, result_has_error,
     result_has_high_or_critical_findings, run_git_review, run_worker_from_stdin,
 };
+use sashiko::project::Project;
 use sashiko::prompt_bundle;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
@@ -136,6 +137,14 @@ enum Commands {
         /// Select which stages from 1-7 to run
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<u8>>,
+
+        /// Target project or pipeline (kernel, qemu, llvm)
+        #[arg(long, visible_alias = "pipeline")]
+        project: Option<Project>,
+
+        /// Repository directory (default: current git repository)
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
 
     /// Internal worker mode for JSON-over-stdio review execution
@@ -188,6 +197,10 @@ enum Commands {
         /// Select which stages from 1-7 to run
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<u8>>,
+
+        /// Target project or pipeline (kernel, qemu, llvm)
+        #[arg(long, visible_alias = "pipeline")]
+        project: Option<Project>,
     },
 }
 
@@ -284,7 +297,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format,
                 color,
                 stages,
+                project,
+                repo,
             } => {
+                let resolved_repo = match repo {
+                    Some(r) => r.clone(),
+                    None => current_git_toplevel()?,
+                };
+                let prompts_path =
+                    resolve_prompts_path(prompts.clone(), *project, Some(&resolved_repo))?;
                 return handle_review_command(
                     input.clone(),
                     baseline.clone(),
@@ -292,10 +313,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *no_ai,
                     custom_prompt.clone(),
                     ai_provider.clone(),
-                    resolve_prompts_path(prompts.clone())?,
+                    prompts_path,
                     *format,
                     *color,
                     stages.clone(),
+                    *project,
+                    resolved_repo,
                 )
                 .await;
             }
@@ -312,17 +335,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ai_provider,
                 custom_prompt,
                 stages,
+                project,
             } => {
                 std::panic::set_hook(Box::new(|info| {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
+
+                let repo_path = repo.as_deref().or(reuse_worktree.as_deref());
+                let prompts_path = resolve_prompts_path(prompts.clone(), *project, repo_path)?;
 
                 let result = run_worker_from_stdin(WorkerOptions {
                     settings_path: None,
                     baseline: baseline.clone(),
                     repo: repo.clone(),
                     worktree_dir: worktree_dir.clone(),
-                    prompts: resolve_prompts_path(prompts.clone())?,
+                    prompts: prompts_path,
                     review_patch_index: *review_patch_index,
                     review_commit: review_commit.clone(),
                     no_ai: *no_ai,
@@ -332,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages: stages.clone(),
                     scratch_clone: false,
                     current_tree: false,
+                    project: *project,
                 })
                 .await;
 
@@ -995,12 +1023,17 @@ fn handle_init_command(
     Ok(())
 }
 
-fn resolve_prompts_path(path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn resolve_prompts_path(
+    path: Option<PathBuf>,
+    project: Option<Project>,
+    repo_path: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = path {
         return Ok(path);
     }
 
-    Ok(prompt_bundle::default_kernel_prompts_path()?)
+    let p = Project::resolve(project, repo_path, None);
+    Ok(p.default_prompts_path()?)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1054,21 +1087,30 @@ struct ProgressState {
     total_turns: usize,
     terminal_width: usize,
     color_choice: ColorChoice,
+    project: Project,
 }
 
-fn stage_short_name(stage: u8) -> &'static str {
-    match stage {
-        1 => "Goal Analysis",
-        2 => "Implementation",
-        3 => "Execution Flow",
-        4 => "Resource Mgmt",
-        5 => "Locking & Sync",
-        6 => "Security Audit",
-        7 => "Hardware Review",
-        8 => "Deduplication",
-        9 => "Conflict Resolution",
-        10 => "Severity Estimation",
-        11 => "Report Generation",
+fn stage_short_name(stage: u8, project: Project) -> &'static str {
+    match (stage, project) {
+        (1, _) => "Goal Analysis",
+        (2, _) => "Implementation",
+        (3, _) => "Execution Flow",
+        (4, Project::Kernel) => "Resource Mgmt",
+        (4, Project::Qemu) => "QOM Lifecycle",
+        (4, Project::Llvm) => "Lifetimes & Iterators",
+        (5, Project::Kernel) => "Locking & Sync",
+        (5, Project::Qemu) => "Concurrency & BQL",
+        (5, Project::Llvm) => "SSA & Correctness",
+        (6, Project::Kernel) => "Security Audit",
+        (6, Project::Qemu) => "Guest Attack Surface",
+        (6, Project::Llvm) => "Crash Safety & Verifier",
+        (7, Project::Kernel) => "Hardware Review",
+        (7, Project::Qemu) => "Virtual Hardware",
+        (7, Project::Llvm) => "Backend & Codegen",
+        (8, _) => "Deduplication",
+        (9, _) => "Conflict Resolution",
+        (10, _) => "Severity Estimation",
+        (11, _) => "Report Generation",
         _ => "Unknown",
     }
 }
@@ -1160,7 +1202,7 @@ fn render_progress(state: &mut ProgressState) {
                     stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
 
                     let (top_stage, top_turn) = stages_with_turns[0];
-                    let stage_name = stage_short_name(top_stage);
+                    let stage_name = stage_short_name(top_stage, state.project);
                     let stage_str = if top_turn > 0 {
                         format!("{} (turn {})", stage_name, top_turn)
                     } else {
@@ -1291,6 +1333,8 @@ async fn handle_review_command(
     format: OutputFormat,
     color: ColorMode,
     stages: Option<Vec<u8>>,
+    project: Option<Project>,
+    repo_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let color_choice = match color {
         ColorMode::Always => ColorChoice::Always,
@@ -1304,7 +1348,6 @@ async fn handle_review_command(
         }
     };
 
-    let repo_path = current_git_toplevel()?;
     eprintln!("Reviewing: {}", input);
     eprintln!("Using prompts: {}", prompts.display());
 
@@ -1329,12 +1372,15 @@ async fn handle_review_command(
         }
     }
 
+    let detected_project = Project::resolve(project, Some(&repo_path), None);
+
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         patches: std::collections::BTreeMap::new(),
         printed_lines: 0,
         total_turns: 0,
         terminal_width: get_terminal_width(),
         color_choice,
+        project: detected_project,
     }));
 
     let progress_state_clone = progress_state.clone();
@@ -1469,6 +1515,7 @@ async fn handle_review_command(
             ai_provider,
             custom_prompt,
             stages,
+            project,
         },
         Some(&progress),
     )
@@ -2525,6 +2572,23 @@ mod tests {
                 assert!(no_ai);
                 assert!(matches!(format, OutputFormat::Json));
                 assert!(matches!(color, ColorMode::Never));
+            }
+            _ => panic!("expected review command"),
+        }
+
+        let args = vec![
+            "sashiko",
+            "review",
+            "--repo",
+            "/path/to/repo",
+            "--project",
+            "qemu",
+        ];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Review { repo, project, .. }) => {
+                assert_eq!(repo, Some(PathBuf::from("/path/to/repo")));
+                assert_eq!(project, Some(Project::Qemu));
             }
             _ => panic!("expected review command"),
         }

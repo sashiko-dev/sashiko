@@ -14,6 +14,8 @@
 
 use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
+    project::Project,
+    prompt_bundle,
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
     worker::{
@@ -47,6 +49,7 @@ pub struct WorkerOptions {
     pub stages: Option<Vec<u8>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
+    pub project: Option<Project>,
 }
 
 impl Default for WorkerOptions {
@@ -66,6 +69,7 @@ impl Default for WorkerOptions {
             stages: None,
             scratch_clone: false,
             current_tree: false,
+            project: None,
         }
     }
 }
@@ -79,6 +83,7 @@ pub struct ReviewOptions {
     pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub project: Option<Project>,
 }
 
 impl Default for ReviewOptions {
@@ -91,6 +96,7 @@ impl Default for ReviewOptions {
             ai_provider: None,
             custom_prompt: None,
             stages: None,
+            project: None,
         }
     }
 }
@@ -261,6 +267,7 @@ pub async fn run_git_review(
             custom_prompt: options.custom_prompt,
             stages: options.stages,
             current_tree: true,
+            project: options.project,
             ..WorkerOptions::default()
         },
         Some(repo_path),
@@ -444,7 +451,24 @@ async fn review_single_patch(
 
         let provider =
             crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
-        let prompts_tool_path = Some(options.prompts.join("tool.md"));
+
+        let detected_project = Project::resolve(options.project, Some(&worktree.path), None);
+        info!(
+            "Active project resolved to {} for patch {}",
+            detected_project, p.index
+        );
+
+        let prompts_dir = if options.prompts == Path::new("third_party/prompts/kernel")
+            || options.prompts == prompt_bundle::default_kernel_prompts_path().unwrap_or_default()
+        {
+            detected_project
+                .default_prompts_path()
+                .unwrap_or_else(|_| options.prompts.clone())
+        } else {
+            options.prompts.clone()
+        };
+
+        let prompts_tool_path = Some(prompts_dir.clone());
 
         let mut patch_files = Vec::new();
         if let Some(sha) = patch_shas.get(&p.index) {
@@ -478,7 +502,7 @@ async fn review_single_patch(
             tools.set_virtual_head(sha.clone());
         }
 
-        let prompts = PromptRegistry::new(options.prompts.clone());
+        let prompts = PromptRegistry::new(prompts_dir);
         let series_range = calculate_series_range(
             all_patches,
             std::slice::from_ref(p),
@@ -498,6 +522,7 @@ async fn review_single_patch(
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
+                project: detected_project,
             },
         );
 

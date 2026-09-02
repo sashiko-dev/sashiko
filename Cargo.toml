@@ -40,6 +40,7 @@ name = "benchmark"
 path = "src/bin/benchmark.rs"
 test = false
 
+
 [features]
 default = ["bedrock"]
 bedrock = ["aws-config", "aws-sdk-bedrockruntime", "aws-smithy-types"]

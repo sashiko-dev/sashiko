@@ -29,6 +29,7 @@ pub mod local_review;
 pub mod nntp;
 pub mod patch;
 pub mod patchwork;
+pub mod project;
 pub mod prompt_bundle;
 pub mod reviewer;
 pub mod settings;
@@ -36,6 +37,8 @@ pub mod toolbox;
 pub mod utils;
 pub mod worker;
 pub mod workflow;
+
+pub use project::Project;
 
 use std::fmt;
 use std::str::FromStr;

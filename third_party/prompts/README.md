@@ -1,6 +1,6 @@
 # Review Prompts for AI-Assisted Code Review
 
-AI-assisted code review prompts for Linux kernel, systemd, and iproute development.
+AI-assisted code review prompts for Linux kernel, QEMU, LLVM, systemd, and iproute development.
 Works with Claude Code and other AI tools.
 
 ## Quick Start

@@ -47,9 +47,12 @@ impl ClassifyAiError for ReviewError {
     }
 }
 
+use crate::project::Project;
 use crate::worker::kernel_workflow::{
     KernelReviewState, build_kernel_review_workflow_with_options, kernel_system_prompt,
 };
+use crate::worker::llvm_workflow::{build_llvm_review_workflow_with_options, llvm_system_prompt};
+use crate::worker::qemu_workflow::{build_qemu_review_workflow_with_options, qemu_system_prompt};
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -89,6 +92,7 @@ pub struct WorkerConfig {
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub project: Project,
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +493,7 @@ pub struct Worker {
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
     custom_prompt: Option<String>,
+    project: Project,
 }
 
 impl Worker {
@@ -510,6 +515,7 @@ impl Worker {
             context_tag: None,
             stages: config.stages,
             custom_prompt: config.custom_prompt,
+            project: config.project,
         }
     }
 
@@ -610,7 +616,7 @@ impl Worker {
 
         let worktree_path = self.tools.get_worktree_path();
         let prefetched_context =
-            crate::worker::prefetch::prefetch_context(worktree_path, &target_commit_diff)
+            crate::worker::prefetch::prefetch_context(worktree_path, &target_commit_diff, self.project.clone())
                 .await
                 .unwrap_or_default();
 
@@ -645,7 +651,11 @@ impl Worker {
         };
 
         if self.global_history.is_empty() {
-            let sys_template = kernel_system_prompt(true);
+            let sys_template = match self.project {
+                Project::Kernel => kernel_system_prompt(true),
+                Project::Qemu => qemu_system_prompt(true),
+                Project::Llvm => llvm_system_prompt(true),
+            };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
                 role: crate::ai::AiRole::System,
@@ -657,8 +667,17 @@ impl Worker {
             });
         }
 
-        let workflow =
-            build_kernel_review_workflow_with_options(self.max_interactions, self.temperature);
+        let workflow = match self.project {
+            Project::Kernel => {
+                build_kernel_review_workflow_with_options(self.max_interactions, self.temperature)
+            }
+            Project::Qemu => {
+                build_qemu_review_workflow_with_options(self.max_interactions, self.temperature)
+            }
+            Project::Llvm => {
+                build_llvm_review_workflow_with_options(self.max_interactions, self.temperature)
+            }
+        };
         let env = WorkflowEnv {
             provider: self.provider.clone(),
             tools: self.tools.clone(),
@@ -1245,6 +1264,7 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: None,
+            project: Project::Kernel,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1395,6 +1415,7 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: Some(vec![1]),
+            project: Project::Kernel,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1429,6 +1450,7 @@ mod tests {
             baseline_sha: Some("explicit_baseline_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec![1]),
+            project: Project::Kernel,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1467,6 +1489,7 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec![1]),
+            project: Project::Kernel,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1563,6 +1586,7 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec![1]),
+            project: Project::Kernel,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

@@ -130,10 +130,10 @@ prompt_caching = true
 
 [server]
 host = "::"
-port = 8080
+port = 8081
 
 [git]
-repository_path = "third_party/linux"
+repository_path = "/usr/local/google/home/kfree/qemu"
 
 # Track custom remotes and attempt to apply patches on their branches
 # [[git.custom_remotes]]

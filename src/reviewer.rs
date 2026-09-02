@@ -1574,13 +1574,22 @@ async fn run_review_tool(
 }
 
 fn default_worker_command() -> Result<Command> {
-    let exe_path = std::env::current_exe()?;
+    let mut exe_path = std::env::current_exe()?;
+    if !exe_path.exists() {
+        let path_str = exe_path.to_string_lossy();
+        if let Some(clean) = path_str.strip_suffix(" (deleted)") {
+            let clean_path = std::path::PathBuf::from(clean);
+            if clean_path.exists() {
+                exe_path = clean_path;
+            }
+        }
+    }
     let bin_dir = exe_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     let is_test_runner = bin_dir.file_name().and_then(|f| f.to_str()) == Some("deps");
 
-    let mut c = if !is_test_runner {
+    let mut c = if !is_test_runner && exe_path.exists() {
         Command::new(exe_path)
     } else if let Some(parent) = bin_dir.parent()
         && parent.join("sashiko").exists()

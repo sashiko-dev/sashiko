@@ -71,7 +71,20 @@ fn add_range(map: &mut LineRangeMap, path: PathBuf, start: usize, end: usize) {
     map.entry(path).or_default().insert((start, end));
 }
 
-pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String> {
+/// Returns true if the file extension is a C/C++ source or header file.
+pub fn is_c_like_source_file(file: &str) -> bool {
+    file.ends_with(".c")
+        || file.ends_with(".h")
+        || file.ends_with(".cpp")
+        || file.ends_with(".cc")
+        || file.ends_with(".cxx")
+        || file.ends_with(".hpp")
+        || file.ends_with(".inc")
+}
+
+use crate::project::Project;
+
+pub async fn prefetch_context(worktree_path: &Path, diff: &str, project: Project) -> Result<String> {
     let file_ranges = parse_diff_ranges(diff);
     let mut range_map: LineRangeMap = BTreeMap::new();
     let mut symbols_to_lookup = HashSet::new();
@@ -80,7 +93,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
 
     // Phase 1: modified code — find enclosing blocks, types, and called functions.
     for (file, ranges) in &file_ranges {
-        if !file.ends_with(".c") && !file.ends_with(".h") {
+        if !is_c_like_source_file(file) {
             continue;
         }
         let file_path = worktree_path.join(file);
@@ -90,8 +103,16 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
 
         if let Ok(content) = fs::read_to_string(&file_path).await {
             for &(start, end) in ranges {
-                for (blk_start, blk_end) in overlapping_definitions(&content, start, end) {
-                    add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+                let defs = overlapping_definitions(&content, start, end);
+                if defs.is_empty() {
+                    let line_count = content.lines().count();
+                    let ctx_start = start.saturating_sub(30);
+                    let ctx_end = std::cmp::min(end + 30, line_count.saturating_sub(1));
+                    add_range(&mut range_map, file_path.clone(), ctx_start, ctx_end);
+                } else {
+                    for (blk_start, blk_end) in defs {
+                        add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+                    }
                 }
                 already_extracted.extend(extract_defined_names(&content, start, end));
                 symbols_to_lookup.extend(extract_type_names(&content, start, end));
@@ -106,7 +127,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     }
 
     // Drop opaque container types.
-    let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, worktree_path).await;
+    let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, worktree_path, project).await;
     for sym in &opaque {
         symbols_to_lookup.remove(sym);
     }
@@ -118,16 +139,25 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     symbols_to_lookup.extend(called_functions);
 
     // _ops structs are large vtables (e.g. net_device_ops) — not useful for review.
-    symbols_to_lookup.retain(|s| !s.ends_with("_ops"));
+    if project == Project::Kernel {
+        symbols_to_lookup.retain(|s| !s.ends_with("_ops"));
+    }
 
     let symbols: Vec<String> = symbols_to_lookup.into_iter().take(50).collect();
 
     // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
     if !symbols.is_empty() {
-        let regex_pattern = format!(
-            "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
-            symbols.join("|")
-        );
+        let regex_pattern = if project == Project::Qemu {
+            format!(
+                r"^((struct|enum|union)\s+({0})\b|#define\s+({0})\b|([a-zA-Z_][a-zA-Z0-9_ \t*]+\s+)?({0})\s*\(|OBJECT_DECLARE_.*?\s*\(\s*({0})\b)",
+                symbols.join("|")
+            )
+        } else {
+            format!(
+                r"^((struct|enum|union)\s+({0})\b|#define\s+({0})\b|([a-zA-Z_][a-zA-Z0-9_ \t*]+\s+)?({0})\s*\()",
+                symbols.join("|")
+            )
+        };
 
         let caller_dirs: HashSet<&str> = file_ranges
             .keys()
@@ -144,7 +174,12 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
             .arg(&regex_pattern)
             .arg("--")
             .arg("*.c")
-            .arg("*.h");
+            .arg("*.h")
+            .arg("*.cpp")
+            .arg("*.cc")
+            .arg("*.cxx")
+            .arg("*.hpp")
+            .arg("*.inc");
 
         let output = match cmd.output().await {
             Ok(o) => o,
@@ -517,9 +552,14 @@ async fn best_definition_range(
 }
 
 fn proximity_score(def_path: &str, is_static: bool, caller_dirs: &HashSet<&str>) -> i32 {
-    // Static .c definitions outside caller directories are almost certainly
+    // Static definitions outside caller directories are almost certainly
     // wrong-file matches (e.g. mkregtable.c reimplements list_add_tail).
-    if is_static && def_path.ends_with(".c") {
+    if is_static
+        && (def_path.ends_with(".c")
+            || def_path.ends_with(".cpp")
+            || def_path.ends_with(".cc")
+            || def_path.ends_with(".cxx"))
+    {
         let def_dir = def_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         if !caller_dirs.contains(def_dir) {
             return -200;
@@ -627,6 +667,7 @@ async fn find_opaque_types(
     types: &HashSet<String>,
     file_ranges: &HashMap<String, Vec<(usize, usize)>>,
     worktree_path: &Path,
+    project: Project,
 ) -> HashSet<String> {
     if types.is_empty() {
         return HashSet::new();
@@ -667,7 +708,16 @@ async fn find_opaque_types(
 
     type_members
         .into_iter()
-        .filter(|(_, members)| members.is_empty() || members.iter().all(|m| m.contains("priv")))
+        .filter(|(_, members)| {
+            if members.is_empty() {
+                return true;
+            }
+            if project == Project::Kernel {
+                members.iter().all(|m| m.contains("priv"))
+            } else {
+                false // For QEMU/LLVM, don't drop types with members just because they look like ->priv
+            }
+        })
         .map(|(t, _)| t.to_string())
         .collect()
 }
@@ -891,5 +941,19 @@ struct MyStruct {
         ranges.insert((50, 60)); // gap of 19 — does not merge
         let merged = merge_ranges(&ranges, 3);
         assert_eq!(merged, vec![(10, 30), (50, 60)]);
+    }
+
+    #[test]
+    fn test_is_c_like_source_file() {
+        assert!(is_c_like_source_file("lib.c"));
+        assert!(is_c_like_source_file("header.h"));
+        assert!(is_c_like_source_file("code.cpp"));
+        assert!(is_c_like_source_file("source.cc"));
+        assert!(is_c_like_source_file("impl.cxx"));
+        assert!(is_c_like_source_file("decl.hpp"));
+        assert!(is_c_like_source_file("table.inc"));
+        assert!(!is_c_like_source_file("script.py"));
+        assert!(!is_c_like_source_file("doc.md"));
+        assert!(!is_c_like_source_file("Makefile"));
     }
 }

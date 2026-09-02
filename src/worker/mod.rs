@@ -15,9 +15,11 @@
 pub mod compressor;
 pub mod email;
 pub mod kernel_workflow;
+pub mod llvm_workflow;
 pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;
+pub mod qemu_workflow;
 pub mod repack;
 pub mod stage;
 pub mod sync;
