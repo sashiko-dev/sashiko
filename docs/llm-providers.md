@@ -324,10 +324,69 @@ cp docs/examples/Settings.vllm.toml Settings.toml
 
 Set `context_window_size` to match the server's `--max-model-len`.
 
+## OpenAI (Responses API)
+
+Uses OpenAI's `/v1/responses` endpoint directly. OpenAI recommends the
+Responses API for reasoning, tool-calling, and multi-turn workflows, so this
+is the recommended provider for the GPT-5.6 family.
+
+**Get an API key:** https://platform.openai.com/api-keys
+
+**Set credentials:**
+
+```bash
+export OPENAI_API_KEY="sk-..."
+# Or use the generic fallback:
+export LLM_API_KEY="sk-..."
+```
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.openai-api.toml Settings.toml
+```
+
+**What you get:**
+
+- Native Responses API — tools and reasoning work together
+- Complete response output is preserved and replayed between tool rounds,
+  including reasoning items and the API's original function-call identifiers
+- Cached input-token usage is reported to Sashiko's token accounting
+- Configurable `reasoning_effort` for cost/quality control
+- Temperature is omitted by the dedicated Responses provider
+- JSON mode supplies the API's `json_object` format and an explicit JSON
+  instruction when needed
+
+**Reasoning effort:**
+
+Set `reasoning_effort` in `[ai.openai]` to control the model's thinking
+budget. GPT-5.6 accepts `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
+and `"max"`.
+
+```toml
+[ai]
+provider = "openai"
+model = "gpt-5.6-terra"
+
+[ai.openai]
+max_tokens = 65536
+reasoning_effort = "medium"
+```
+
+**Migrating from the old OpenAI configuration:**
+
+`[ai.openai_compat]` is for `provider = "openai-compatible"` only. Sashiko
+rejects `provider = "openai"` when that legacy table is its only OpenAI
+configuration. Move the settings to `[ai.openai]`; change a custom
+`/v1/chat/completions` URL to a `/v1/responses` URL, or remove it to use the
+OpenAI default.
+
 ## OpenAI-Compatible Providers
 
-Sashiko includes an OpenAI-compatible provider for endpoints that
-implement the OpenAI chat completions API.
+For third-party endpoints that implement the OpenAI chat completions API.
+Use `provider = "openai-compatible"` — this targets `/v1/chat/completions`
+and works with LM Studio, OpenRouter, z.ai, OrcaRouter, and similar
+services.
 
 **Apply the example config:**
 
@@ -381,8 +440,3 @@ base_url = "https://api.orcarouter.ai/v1"
 context_window_size = 128000
 max_tokens = 16384
 ```
-
-For OpenAI's own API with an API key (rather than a self-hosted
-compatible endpoint), use `docs/examples/Settings.openai-api.toml`:
-set `provider = "openai"`, `model = "gpt-5.6-sol"`, and export
-`OPENAI_API_KEY`.

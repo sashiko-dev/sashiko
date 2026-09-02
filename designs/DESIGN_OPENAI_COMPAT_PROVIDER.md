@@ -2,26 +2,151 @@
 
 ## Context
 
-Sashiko currently supports two AI providers with custom API formats: Gemini (`src/ai/gemini.rs`) and Claude (`src/ai/claude.rs`). Many popular AI providers — OpenAI, GLM (Zhipu AI), Kimi (Moonshot AI), and Minimax — use an OpenAI-compatible chat completions API format. Rather than implementing separate clients for each, we use a single shared `OpenAiCompatClient` that handles all of them via configuration.
+Sashiko supports two OpenAI-related providers:
 
-The official OpenAI API uses `max_completion_tokens` in the request body (introduced with the `o1` model family), while third-party OpenAI-compatible providers use the legacy `max_tokens` field. To support both, we expose two provider names — `"openai"` and `"openai-compatible"` — backed by the same client with a serialization flag.
+1. **`"openai"`** — a dedicated provider targeting OpenAI's `/v1/responses` endpoint (`src/ai/openai_responses.rs`). This is the recommended path for OpenAI's reasoning, tool-calling, and multi-turn workflows, including the GPT-5.6 family.
+
+2. **`"openai-compatible"`** — a shared provider targeting the standard `/v1/chat/completions` endpoint (`src/ai/openai.rs`). This handles third-party OpenAI-compatible services (LM Studio, OpenRouter, z.ai, OrcaRouter, etc.) via configuration.
+
+Previously, both provider names were backed by a single `OpenAiCompatClient` with a serialization flag (`OpenAiProviderType`) to switch between `max_tokens` and `max_completion_tokens`. The split allows the dedicated provider to use the Responses API's native item protocol instead of translating state through the chat-completions format.
 
 ## Design Decisions
 
 | Decision | Choice |
 |---|---|
-| Client architecture | Single `OpenAiCompatClient` in `src/ai/openai.rs`, no per-provider structs or files |
-| Provider names | `"openai"` (official API, uses `max_completion_tokens`) and `"openai-compatible"` (third-party, uses `max_tokens`) |
-| Token limit field | `"openai"` serializes `max_completion_tokens`; `"openai-compatible"` serializes `max_tokens`. Controlled by `OpenAiProviderType` enum on the client. |
-| Stdio support | Not needed for OpenAI-compatible provider |
-| Thinking/reasoning support | Not included in initial implementation (`thought: None` always) |
-| Temperature | Always passed through from `AiRequest` when present |
-| URL configuration | `base_url` from settings → model-based default (glm-*, moonshot-*, abab7-*, MiniMax-*, others) |
-| API key | `OPENAI_API_KEY` env only (fallback to `LLM_API_KEY`), no provider-specific keys |
+| Client architecture | Two separate clients: `OpenAiClient` in `openai_responses.rs` for the Responses API, `OpenAiCompatClient` in `openai.rs` for chat completions |
+| Provider names | `"openai"` (Responses API) and `"openai-compatible"` (chat completions) |
+| Config sections | `[ai.openai]` for the Responses provider, `[ai.openai_compat]` for chat completions |
+| Reasoning | `reasoning_effort` on `[ai.openai]`; GPT-5.6 accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max` (default: `medium`) |
+| Temperature | Always suppressed on the Responses API provider; passed through on `openai-compatible` |
+| Output continuity | Preserve every Responses output item, including reasoning and future item types, and replay it verbatim before tool outputs |
+| Function-call identity | Preserve both the Responses output-item `id` and its `call_id`; never synthesize an item ID |
+| JSON mode | Send `text.format: { type: "json_object" }` and ensure the input explicitly asks for JSON |
+| Token accounting | Map `usage.input_tokens_details.cached_tokens` when present and valid |
+| Token limit field | Responses API uses `max_output_tokens`; chat completions uses `max_tokens` |
+| API key | Both providers: `OPENAI_API_KEY` env → `LLM_API_KEY` fallback |
 
-## Provider Compatibility
+## Provider: `"openai"` (Responses API)
 
-`OpenAiCompatClient` supports any OpenAI-compatible API. Model name determines provider-specific defaults:
+### Files
+
+- `src/ai/openai_responses.rs` — client, wire types, translation
+- `src/settings.rs` — `OpenAiSettings` struct
+- Config section: `[ai.openai]`
+
+### `OpenAiSettings`
+
+```rust
+pub struct OpenAiSettings {
+    pub base_url: Option<String>,
+    pub context_window_size: Option<usize>,
+    pub max_tokens: Option<u32>,
+    pub reasoning_effort: Option<String>,  // GPT-5.6: none, low, medium, high, xhigh, max
+}
+```
+
+### Wire-Format Types (Responses API)
+
+| Struct | Purpose |
+|---|---|
+| `ResponsesRequest` | `model`, `input`, `tools?`, `temperature?`, `max_output_tokens?`, `reasoning?`, `text?` |
+| `ResponsesInputItem` | Untagged enum: `Message`, `FunctionCall`, `FunctionCallOutput` |
+| `ResponsesTool` | `type` ("function"), `name`, `description`, `parameters` |
+| `ReasoningConfig` | `effort?` — GPT-5.6: `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
+| `ResponsesResponse` | `id`, `status`, `output`, `usage` |
+| `ResponsesOutputItem` | Complete raw output item, including `message`, `function_call`, `reasoning`, and future types |
+| `ResponsesContent` | Tagged enum: `OutputText`, `Refusal` |
+
+### Request Translation: `AiRequest` → `ResponsesRequest`
+
+| `AiRequest` | `ResponsesRequest` |
+|---|---|
+| `system: Some(text)` | Input item: `{ role: "system", content: text }` |
+| `AiRole::System` message | Input item: `{ role: "system", content }` |
+| `AiRole::User` message | Input item: `{ role: "user", content }` |
+| `AiRole::Assistant` text | Input item: `{ role: "assistant", content }` |
+| Prior Responses output | Replayed verbatim in its original order, retaining reasoning items and function-call item IDs |
+| `AiRole::Tool` message | Input item: `{ type: "function_call_output", call_id, output }` |
+| `tools` | `[{ type: "function", name, description, parameters }]` |
+| `temperature` | Always `None` (reasoning models reject it) |
+| `reasoning_effort` | `{ reasoning: { effort: "..." } }` when configured |
+| `response_format: Json` | `{ text: { format: { type: "json_object" } } }` plus an explicit JSON instruction if no existing input contains `JSON` |
+
+### Response Translation: `ResponsesResponse` → `AiResponse`
+
+| `ResponsesResponse` | `AiResponse` |
+|---|---|
+| `output[].Message.content[].OutputText` | `content` (joined) |
+| `output[].Message.content[].Refusal` | Logged as warning, discarded |
+| `output[].FunctionCall` | Exposed as a Sashiko tool call while the complete original item is retained for continuation |
+| `output[]` (all types) | Preserved as opaque provider metadata for the next request; no item type is silently dropped |
+| `status == "incomplete"` | `truncated: true` |
+| `usage.input_tokens` | `prompt_tokens` |
+| `usage.output_tokens` | `completion_tokens` |
+| `usage.input_tokens_details.cached_tokens` | `cached_tokens` when nonzero and no larger than `input_tokens` |
+
+### Function Call ID Mapping
+
+The Responses API uses two distinct identifiers for function calls:
+- `id` — the output-item identifier
+- `call_id` — the correlation key linking a `function_call` to its
+  `function_call_output`
+
+Sashiko retains the complete original function-call item so a later request
+reuses both values exactly. Tool output uses the original `call_id`; the
+provider must not infer or synthesize the output-item `id` from it.
+
+### Stateless Continuation
+
+When a response requests tools, the next request includes all of the prior
+response's output items, followed by the corresponding `function_call_output`
+items. In particular, reasoning items must survive this boundary. This lets the
+provider remain stateless and safe to share across concurrent reviews while
+still giving the Responses API the context it requires to continue a tool
+workflow.
+
+## Provider: `"openai-compatible"` (Chat Completions)
+
+### Files
+
+- `src/ai/openai.rs` — client, wire types, translation
+- `src/settings.rs` — `OpenAiCompatSettings` struct
+- Config section: `[ai.openai_compat]`
+
+### `OpenAiCompatSettings`
+
+```rust
+pub struct OpenAiCompatSettings {
+    pub base_url: Option<String>,
+    pub context_window_size: Option<usize>,
+    pub max_tokens: Option<u32>,
+}
+```
+
+### Client Struct
+
+```rust
+pub struct OpenAiCompatClient {
+    model: String,
+    base_url: String,
+    context_window_size: usize,
+    max_tokens: u32,
+    client: reqwest::Client,
+}
+```
+
+### Request Translation
+
+| `AiRequest` | `OpenAiRequest` |
+|---|---|
+| `system: Some(text)` | Message: `{ role: "system", content: text }` |
+| `AiRole::*` messages | Standard chat completions message format |
+| `tools` | `[{ type: "function", function: { name, description, parameters } }]` |
+| `temperature` | Passed through directly |
+| `response_format: Json` | `{ type: "json_object" }` + "json" word injection |
+| Token limit | `max_tokens: N` |
+
+### URL Defaults by Model Prefix
 
 | Model Prefix | Default Endpoint | Default Context Window |
 |---|---|---|
@@ -31,334 +156,59 @@ The official OpenAI API uses `max_completion_tokens` in the request body (introd
 | `moonshot-` | `https://api.moonshot.cn/v1/chat/completions` | 128,000 |
 | `abab7-` / `MiniMax-` | `https://api.minimax.chat/v1/text/chatcompletion_v2` | 245,760 |
 
-All providers use `Authorization: Bearer <OPENAI_API_KEY>` for authentication.
+## Factory: `create_provider_from_ai()`
 
-## `max_completion_tokens` vs `max_tokens`
-
-The official OpenAI API deprecated `max_tokens` in favor of `max_completion_tokens` starting with the `o1` model family. The key differences:
-
-| Aspect | `max_tokens` (legacy) | `max_completion_tokens` (OpenAI) |
-|---|---|---|
-| Used by | Third-party OpenAI-compatible APIs | Official OpenAI API |
-| Provider name | `"openai-compatible"` | `"openai"` |
-| Serialization | `"max_tokens": N` in JSON body | `"max_completion_tokens": N` in JSON body |
-
-Both fields are defined as `Option<u32>` on `OpenAiRequest` with `skip_serializing_if = "Option::is_none"`. The `translate_ai_request()` function sets only the relevant field based on the `OpenAiProviderType` enum.
-
-## Files
-
-### `src/ai/openai.rs`
-
-#### Provider Type Enum
+The `"openai"` and `"openai-compatible"` match arms in `src/ai/mod.rs`
+are separate:
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenAiProviderType {
-    /// Official OpenAI API — uses `max_completion_tokens`.
-    OpenAi,
-    /// Third-party OpenAI-compatible APIs — uses `max_tokens`.
-    OpenAiCompatible,
+"openai" => {
+    // Reads from ai.openai settings.
+    // Rejects the legacy provider="openai" + only ai.openai_compat setup.
+    // Creates openai_responses::OpenAiClient
+}
+"openai-compatible" => {
+    // Reads from ai.openai_compat settings
+    // Creates openai::OpenAiCompatClient
 }
 ```
 
-#### Client Struct (matches Gemini pattern)
+### Configuration Migration
 
-```rust
-pub struct OpenAiCompatClient {
-    model: String,
-    base_url: String,
-    context_window_size: usize,
-    max_tokens: u32,  // Default: 4096
-    provider_type: OpenAiProviderType,
-    client: reqwest::Client,
-}
-```
-
-#### OpenAI Wire-Format Structs (serde-annotated)
-
-| Struct | Key Fields |
-|---|---|
-| `OpenAiRequest` | `model`, `messages`, `tools?`, `temperature?`, `max_tokens?`, `max_completion_tokens?`, `response_format?` |
-| `OpenAiMessage` | `role`, `content?`, `tool_calls?`, `tool_call_id?` |
-| `OpenAiToolCall` | `id`, `type` ("function"), `function: OpenAiToolCallFunction` |
-| `OpenAiToolCallFunction` | `name`, `arguments` (JSON **string**, not object) |
-| `OpenAiTool` | `type` ("function"), `function: OpenAiFunction` |
-| `OpenAiFunction` | `name`, `description`, `parameters` |
-| `OpenAiResponse` | `choices`, `usage` |
-| `OpenAiChoice` | `index`, `message: OpenAiMessage`, `finish_reason` |
-| `OpenAiUsage` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
-
-#### `OpenAiRequest` Token Limit Fields
-
-```rust
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OpenAiRequest {
-    pub model: String,
-    pub messages: Vec<OpenAiMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<OpenAiTool>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<Value>,
-}
-```
-
-#### Error Enum
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum OpenAiCompatError {
-    #[error("Rate limit exceeded, retry after {0:?}")]
-    RateLimitExceeded(Duration),
-    #[error("Transient error: {1}, retry after {0:?}")]
-    TransientError(Duration, String),
-    #[error("Authentication error: {0}")]
-    AuthenticationError(String),
-    #[error("API error {0}: {1}")]
-    ApiError(reqwest::StatusCode, String),
-}
-```
-
-#### Client Methods
-
-| Method | Purpose |
-|---|---|
-| `new(base_url, provider_type, model, context_window_size, max_tokens) -> Self` | Build `reqwest::Client` with `Authorization: Bearer {key}` header (from `OPENAI_API_KEY` → `LLM_API_KEY` env), 120s timeout |
-| `post_request(&self, body: &Value) -> Result<OpenAiResponse, OpenAiCompatError>` | POST JSON `body` to `self.base_url`. Transport error → `TransientError(30s)` (error string sanitized via `redact_secret()`). On HTTP success, reads body as text and parses JSON; parse failure → `ApiError`. HTTP errors: 429 → `RateLimitExceeded` (`Retry-After` header parsed first; body regex `"Please retry in ([0-9.]+)s"` overrides if matched; default 60s), 401/403 → `AuthenticationError`, 500/502/503/504 → `TransientError(30s)`, other → `ApiError`. Includes logging of response tokens on success. |
-| `translate_ai_request(AiRequest, max_tokens, provider_type) -> OpenAiRequest` | See translation mapping below |
-| `translate_ai_response(OpenAiResponse) -> AiResponse` | See translation mapping below |
-| `estimate_tokens_generic(AiRequest) -> usize` | Reuse `TokenBudget::estimate_tokens`. Must include `request.system` along with messages and tools. |
-
-#### Helper Methods
-
-| Method | Purpose |
-|---|---|
-| `default_base_url_for_model(model: &str) -> String` | Returns provider-specific default URL based on model name prefix |
-| `default_context_window_for_model(model: &str) -> usize` | Returns provider-specific default context window based on model name prefix |
-
-#### Request Translation: `AiRequest` → `OpenAiRequest`
-
-| `AiRequest` | `OpenAiRequest` |
-|---|---|
-| `system: Some(text)` | Message: `{ role: "system", content: text }` |
-| `AiRole::System` message | `{ role: "system", content }` |
-| `AiRole::User` message | `{ role: "user", content }` |
-| `AiRole::Assistant` message | `{ role: "assistant", content?, tool_calls? }` — tool_calls with `arguments` serialized as JSON **string** |
-| `AiRole::Tool` message | `{ role: "tool", tool_call_id, content }` |
-| `tools` | `[{ type: "function", function: { name, description, parameters } }]` |
-| `temperature` | Passed through directly when present |
-| `response_format: Json` | `{ type: "json_object" }`. **JSON word injection:** OpenAI requires the word "json" to appear in at least one message when using `json_object` mode. If no message already contains "json" (case-insensitive), the provider appends `"\nRespond in JSON format."` to the first system message, or prepends a new system message `"Respond in JSON format."` if none exists. |
-| `response_format: Text` | `{ type: "text" }` |
-| `OpenAiProviderType::OpenAi` | `{ max_completion_tokens: N }` (OpenAI) |
-| `OpenAiProviderType::OpenAiCompatible` | `{ max_tokens: N }` (OpenAI-compatible) |
-
-#### Response Translation: `OpenAiResponse` → `AiResponse`
-
-| `OpenAiResponse` | `AiResponse` |
-|---|---|
-| `choices[0].message.content` | `content` |
-| (no reasoning support) | `thought: None` |
-| `choices[0].message.tool_calls` | `tool_calls` — `function.arguments` (JSON string) parsed to `serde_json::Value`, `thought_signature: None` |
-| `usage.prompt_tokens` | `prompt_tokens` |
-| `usage.completion_tokens` | `completion_tokens` |
-| `usage.total_tokens` | `total_tokens` |
-| `usage.prompt_tokens_details.cached_tokens` | `cached_tokens` — a breakdown of `prompt_tokens`, which passes through unchanged. A missing or malformed `prompt_tokens_details` is dropped rather than failing the response; zero, or a count larger than `prompt_tokens`, yields `None`. |
-
-#### `impl AiProvider for OpenAiCompatClient`
-
-```rust
-async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-    tracing::info!("Sending OpenAI request...");
-
-    let mut openai_req = translate_ai_request(request, self.max_tokens, self.provider_type)?;
-    openai_req.model = self.model.clone();
-
-    let resp_body = serde_json::to_value(&openai_req)?;
-    let resp = self.post_request(&resp_body).await?;
-    translate_ai_response(resp)
-}
-
-fn estimate_tokens(&self, request: &AiRequest) -> usize {
-    estimate_tokens_generic(request)
-}
-
-fn get_capabilities(&self) -> ProviderCapabilities {
-    ProviderCapabilities {
-        model_name: self.model.clone(),
-        context_window_size: self.context_window_size,
-    }
-}
-```
-
-#### Tests (16 tests in `#[cfg(test)] mod tests`)
-
-##### Request Translation Tests
-
-| # | Test Name | Verifies |
-|---|---|---|
-| 1 | `test_translate_request_system_and_user` | `AiRequest.system` → `{"role": "system"}` message. User → `{"role": "user"}`. Temperature passed through. |
-| 2 | `test_translate_request_system_in_messages` | `AiRole::System` message (not the `system` field) → `{"role": "system"}`. |
-| 3 | `test_translate_request_assistant_tool_call` | Assistant with `tool_calls` → `{"role": "assistant", "tool_calls": [...]}`. `arguments` is a JSON **string**. |
-| 4 | `test_translate_request_tool_response` | Tool message → `{"role": "tool", "tool_call_id": "...", "content": "..."}`. |
-| 5 | `test_translate_request_tools_definition` | `AiTool` → `{"type": "function", "function": {"name", "description", "parameters"}}`. |
-| 5.1 | `test_translate_request_empty_tools` | `Some(vec![])` tools → `None` (for `skip_serializing_if` compatibility). |
-| 6 | `test_translate_request_conversation_chain` | Full user → assistant (tool_calls) → tool response chain. Correct roles and ordering. |
-| 7 | `test_translate_request_json_format` | `AiResponseFormat::Json` → `{"type": "json_object"}`. When no message contains "json", a system message `"Respond in JSON format."` is prepended. |
-| 7.1 | `test_translate_request_json_format_no_injection_when_present` | When messages already contain "json" (case-insensitive), no additional system message is injected. |
-| 8 | `test_translate_request_temperature` | Temperature from `AiRequest` included in `OpenAiRequest.temperature`. |
-
-##### Response Translation Tests
-
-| # | Test Name | Verifies |
-|---|---|---|
-| 9 | `test_translate_response_text` | `choices[0].message.content` → `AiResponse.content`. `thought` is `None`. Usage mapped. |
-| 10 | `test_translate_response_tool_calls` | `tool_calls` with `arguments` as JSON string → parsed `Vec<ToolCall>`. `thought_signature: None`. |
-| 11 | `test_translate_response_empty_choices` | Empty/missing `choices` → error. |
-
-##### Token Estimation Test
-
-| # | Test Name | Verifies |
-|---|---|---|
-| 12 | `test_estimate_tokens` | Token count in reasonable range for known input. Same pattern as `gemini.rs::test_estimate_tokens_logic`. |
-
-##### Config Tests
-
-| # | Test Name | Verifies |
-|---|---|---|
-| 13 | `test_max_tokens_for_openai_compatible` | `OpenAiProviderType::OpenAiCompatible` → serialized JSON has `max_tokens` and no `max_completion_tokens`. |
-| 14 | `test_max_completion_tokens_for_openai` | `OpenAiProviderType::OpenAi` → serialized JSON has `max_completion_tokens` and no `max_tokens`. |
-
-### `src/settings.rs`
-
-```rust
-#[derive(Debug, Deserialize, Clone)]
-pub struct OpenAiCompatSettings {
-    #[serde(default)]
-    pub base_url: Option<String>,
-    #[serde(default)]
-    pub context_window_size: Option<usize>,
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
-}
-```
-
-Field in `AiSettings`:
-
-```rust
-pub openai_compat: Option<OpenAiCompatSettings>,
-```
-
-### `src/ai/mod.rs`
-
-#### Module Declaration
-
-```rust
-pub mod openai;
-```
-
-#### Factory: Combined Match Arm in `create_provider()`
-
-Both arms share the same config-reading logic, differing only in `provider_type`:
-
-```rust
-"openai" | "openai-compatible" => {
-    let provider_type = match settings.ai.provider.to_lowercase().as_str() {
-        "openai" => openai::OpenAiProviderType::OpenAi,
-        _ => openai::OpenAiProviderType::OpenAiCompatible,
-    };
-
-    let base_url = settings.ai.openai_compat
-        .as_ref()
-        .and_then(|c| c.base_url.clone())
-        .unwrap_or_else(|| openai::OpenAiCompatClient::default_base_url_for_model(&settings.ai.model));
-
-    let context_window = settings.ai.openai_compat
-        .as_ref()
-        .and_then(|c| c.context_window_size)
-        .unwrap_or_else(|| openai::OpenAiCompatClient::default_context_window_for_model(&settings.ai.model));
-
-    let max_tokens = settings.ai.openai_compat
-        .as_ref()
-        .and_then(|c| c.max_tokens)
-        .unwrap_or(4096);
-
-    Ok(Arc::new(openai::OpenAiCompatClient::new(
-        base_url,
-        provider_type,
-        settings.ai.model.clone(),
-        context_window,
-        max_tokens,
-    )))
-}
-```
-
-**Note:** Factory does not manipulate environment variables. Constructor reads `OPENAI_API_KEY` → `LLM_API_KEY` internally.
-
-#### Test in `test_create_provider`
-
-```rust
-settings.ai.provider = "openai".to_string();
-settings.ai.model = "gpt-4o".to_string();
-let provider = create_provider(&settings)?;
-assert_eq!(provider.get_capabilities().model_name, "gpt-4o");
-```
+`[ai.openai_compat]` is reserved for `provider = "openai-compatible"`. A
+configuration that selects `provider = "openai"` but supplies only the legacy
+`[ai.openai_compat]` table fails with an actionable migration error instead of
+silently discarding its URL and token settings. Move those values to
+`[ai.openai]`; replace a `/v1/chat/completions` URL with a `/v1/responses` URL
+or omit `base_url` to use the default.
 
 ## Environment Variables
 
 | Variable | Purpose |
 |---|---|
-| `OPENAI_API_KEY` | API key for OpenAI-compatible provider |
+| `OPENAI_API_KEY` | API key for both providers |
 | `LLM_API_KEY` | Fallback API key if `OPENAI_API_KEY` not set |
-
-**API key resolution:** `OPENAI_API_KEY` env → `LLM_API_KEY` env → empty string
-
-**Note:** `OPENAI_BASE_URL` env var is NOT read. Use `[ai.openai_compat].base_url` in settings instead.
 
 ## Configuration Examples
 
 ```toml
-# Standard OpenAI — uses max_completion_tokens
+# OpenAI Responses API — reasoning model with tool support
 [ai]
 provider = "openai"
-model = "gpt-4o"
-temperature = 0.7
+model = "gpt-5.6-terra"
 
-# OpenAI via Azure proxy — uses max_completion_tokens
-[ai]
-provider = "openai"
-model = "gpt-4o"
+[ai.openai]
+max_tokens = 65536
+reasoning_effort = "medium"  # recommended default
+# context_window_size = 1050000  # GPT-5.6; maximum output is 128000
 
-[ai.openai_compat]
-base_url = "https://my-azure-instance.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01"
-
-# GLM (Zhipu AI) via OpenAI-compatible endpoint — uses max_tokens
+# OpenAI-compatible — third-party endpoint
 [ai]
 provider = "openai-compatible"
-model = "glm-4"
+model = "glm-5.2"
 
 [ai.openai_compat]
-base_url = "https://api.eliza.yandex.net/raw/internal/glm-latest/v1/chat/completions"
-
-# Kimi (Moonshot AI) — uses max_tokens
-[ai]
-provider = "openai-compatible"
-model = "moonshot-v1-128k"
-
-[ai.openai_compat]
-base_url = "https://api.moonshot.cn/v1/chat/completions"
-
-# Minimax — uses max_tokens
-[ai]
-provider = "openai-compatible"
-model = "abab7-chat-preview" # or "MiniMax-M2.7"
-
-[ai.openai_compat]
-base_url = "https://api.minimax.chat/v1/text/chatcompletion_v2"
-context_window_size = 245760
-max_tokens = 8192
+base_url = "https://api.z.ai/api/coding/paas/v4/chat/completions"
+context_window_size = 128000
+max_tokens = 16384
 ```

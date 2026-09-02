@@ -109,15 +109,33 @@ Settings for the Gemini provider (`provider = "gemini"`).
 |-----|------|---------|-------------|
 | `explicit_prompt_caching` | bool | `false` | Use explicit caching hints in requests. |
 
+#### `[ai.openai]`
+
+Settings for the dedicated OpenAI provider (`provider = "openai"`), which targets the
+`/v1/responses` endpoint.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/responses` for anything unrecognized. |
+| `context_window_size` | integer | model-derived | Context window size. `1050000` for the GPT-5.6 family; `128000` for most other models. |
+| `max_tokens` | integer | `4096` | Max output tokens per response. |
+| `reasoning_effort` | string | model default | Reasoning effort for GPT-5.6 models: `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. Leave unset to use the model default (`"medium"` for GPT-5.6). |
+
+> **Migration:** `[ai.openai_compat]` belongs only to
+> `provider = "openai-compatible"`. Sashiko rejects the legacy combination
+> of `provider = "openai"` with only `[ai.openai_compat]`; move its settings
+> to `[ai.openai]`. If `base_url` named `/v1/chat/completions`, replace it
+> with a Responses endpoint or omit it to use OpenAI's default.
+
 #### `[ai.openai_compat]`
 
-Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-compatible"`).
+Settings for the OpenAI-compatible provider (`provider = "openai-compatible"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
-| `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
+| `max_tokens` | integer | `4096` | Max output tokens per response. |
 
 #### `[ai.kiro_cli]`
 
