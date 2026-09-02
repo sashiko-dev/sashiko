@@ -411,9 +411,14 @@ pub async fn create_provider_cached(
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .join("response_cache.db");
-        let cached =
-            cache::CachingAiProvider::new(provider, &cache_path.to_string_lossy(), cache_ttl_days)
-                .await?;
+        let key_format = cache::CacheKeyFormat::for_provider(&settings.ai.provider);
+        let cached = cache::CachingAiProvider::new(
+            provider,
+            &cache_path.to_string_lossy(),
+            cache_ttl_days,
+            key_format,
+        )
+        .await?;
         Ok(Arc::new(cached))
     } else {
         Ok(provider)

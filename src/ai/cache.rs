@@ -8,10 +8,26 @@ use tracing::{debug, info};
 
 use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities};
 
-// Versioning deliberately invalidates cached responses produced before
-// provider continuation metadata was retained. Reusing an older cached tool
-// call would otherwise make the following manual Responses turn lossy.
-const CACHE_KEY_VERSION: &str = "sashiko-ai-cache-v2";
+const OPENAI_RESPONSES_CACHE_KEY_VERSION: &str = "sashiko-ai-cache-v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheKeyFormat {
+    /// Preserve the pre-Responses cache keys for providers whose response
+    /// representation did not change.
+    Legacy,
+    /// Invalidate older OpenAI entries that lack lossless continuation data.
+    OpenAiResponsesV2,
+}
+
+impl CacheKeyFormat {
+    pub(super) fn for_provider(provider: &str) -> Self {
+        if provider.eq_ignore_ascii_case("openai") {
+            Self::OpenAiResponsesV2
+        } else {
+            Self::Legacy
+        }
+    }
+}
 
 pub fn fmt_thousands(n: u64) -> String {
     let s = n.to_string();
@@ -28,6 +44,7 @@ pub fn fmt_thousands(n: u64) -> String {
 pub struct CachingAiProvider {
     inner: Arc<dyn AiProvider>,
     conn: libsql::Connection,
+    key_format: CacheKeyFormat,
     session_start: i64,
     hits_this: AtomicU64,
     hits_prev: AtomicU64,
@@ -36,7 +53,12 @@ pub struct CachingAiProvider {
 }
 
 impl CachingAiProvider {
-    pub async fn new(inner: Arc<dyn AiProvider>, cache_path: &str, ttl_days: u64) -> Result<Self> {
+    pub(super) async fn new(
+        inner: Arc<dyn AiProvider>,
+        cache_path: &str,
+        ttl_days: u64,
+        key_format: CacheKeyFormat,
+    ) -> Result<Self> {
         let db = libsql::Builder::new_local(cache_path).build().await?;
         let conn = db.connect()?;
 
@@ -94,6 +116,7 @@ impl CachingAiProvider {
         Ok(Self {
             inner,
             conn,
+            key_format,
             session_start,
             hits_this: AtomicU64::new(0),
             hits_prev: AtomicU64::new(0),
@@ -102,7 +125,7 @@ impl CachingAiProvider {
         })
     }
 
-    fn compute_cache_key(request: &AiRequest) -> String {
+    fn compute_cache_key(request: &AiRequest, key_format: CacheKeyFormat) -> String {
         let mut val = serde_json::to_value(request).unwrap_or_default();
         // Strip nondeterministic fields
         if let serde_json::Value::Object(ref mut map) = val {
@@ -111,8 +134,10 @@ impl CachingAiProvider {
         super::scrub_thought_signatures(&mut val);
         let canonical = serde_json::to_string(&val).unwrap_or_default();
         let mut hasher = Sha256::new();
-        hasher.update(CACHE_KEY_VERSION.as_bytes());
-        hasher.update([0]);
+        if key_format == CacheKeyFormat::OpenAiResponsesV2 {
+            hasher.update(OPENAI_RESPONSES_CACHE_KEY_VERSION.as_bytes());
+            hasher.update([0]);
+        }
         hasher.update(canonical.as_bytes());
         let hash = hasher.finalize();
         hash.iter().map(|b| format!("{:02x}", b)).collect()
@@ -122,7 +147,7 @@ impl CachingAiProvider {
 #[async_trait]
 impl AiProvider for CachingAiProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let hash = Self::compute_cache_key(&request);
+        let hash = Self::compute_cache_key(&request, self.key_format);
         let hash_prefix = &hash[..12];
 
         let mut rows = self
@@ -261,8 +286,8 @@ mod tests {
         let second = request_with_metadata(json!({"thought_signature": "second"}));
 
         assert_ne!(
-            CachingAiProvider::compute_cache_key(&first),
-            CachingAiProvider::compute_cache_key(&second)
+            CachingAiProvider::compute_cache_key(&first, CacheKeyFormat::OpenAiResponsesV2),
+            CachingAiProvider::compute_cache_key(&second, CacheKeyFormat::OpenAiResponsesV2)
         );
     }
 
@@ -277,7 +302,33 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
 
-        let current_hash = CachingAiProvider::compute_cache_key(&request);
-        assert_ne!(current_hash, legacy_hash);
+        assert_eq!(
+            CachingAiProvider::compute_cache_key(&request, CacheKeyFormat::Legacy),
+            legacy_hash
+        );
+        assert_ne!(
+            CachingAiProvider::compute_cache_key(&request, CacheKeyFormat::OpenAiResponsesV2),
+            legacy_hash
+        );
+    }
+
+    #[test]
+    fn cache_key_format_is_scoped_to_openai_responses() {
+        assert_eq!(
+            CacheKeyFormat::for_provider("openai"),
+            CacheKeyFormat::OpenAiResponsesV2
+        );
+        assert_eq!(
+            CacheKeyFormat::for_provider("OPENAI"),
+            CacheKeyFormat::OpenAiResponsesV2
+        );
+        assert_eq!(
+            CacheKeyFormat::for_provider("openai-compatible"),
+            CacheKeyFormat::Legacy
+        );
+        assert_eq!(
+            CacheKeyFormat::for_provider("gemini"),
+            CacheKeyFormat::Legacy
+        );
     }
 }
