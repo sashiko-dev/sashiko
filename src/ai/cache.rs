@@ -8,6 +8,11 @@ use tracing::{debug, info};
 
 use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities};
 
+// Versioning deliberately invalidates cached responses produced before
+// provider continuation metadata was retained. Reusing an older cached tool
+// call would otherwise make the following manual Responses turn lossy.
+const CACHE_KEY_VERSION: &str = "sashiko-ai-cache-v2";
+
 pub fn fmt_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
@@ -105,7 +110,11 @@ impl CachingAiProvider {
         }
         super::scrub_thought_signatures(&mut val);
         let canonical = serde_json::to_string(&val).unwrap_or_default();
-        let hash = Sha256::digest(canonical.as_bytes());
+        let mut hasher = Sha256::new();
+        hasher.update(CACHE_KEY_VERSION.as_bytes());
+        hasher.update([0]);
+        hasher.update(canonical.as_bytes());
+        let hash = hasher.finalize();
         hash.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
@@ -214,5 +223,61 @@ impl AiProvider for CachingAiProvider {
             tokens_saved_this_session: self.tokens_saved_this.load(Ordering::Relaxed),
             tokens_saved_prev_session: self.tokens_saved_prev.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiMessage, AiProviderMetadata, AiResponseFormat, AiRole};
+    use serde_json::json;
+
+    fn request_with_metadata(data: serde_json::Value) -> AiRequest {
+        AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+                provider_metadata: Some(AiProviderMetadata {
+                    provider: "openai.responses".to_string(),
+                    version: 1,
+                    data,
+                }),
+            }],
+            tools: None,
+            temperature: None,
+            response_format: Some(AiResponseFormat::Text),
+            context_tag: None,
+        }
+    }
+
+    #[test]
+    fn cache_key_preserves_opaque_provider_signatures() {
+        let first = request_with_metadata(json!({"thought_signature": "first"}));
+        let second = request_with_metadata(json!({"thought_signature": "second"}));
+
+        assert_ne!(
+            CachingAiProvider::compute_cache_key(&first),
+            CachingAiProvider::compute_cache_key(&second)
+        );
+    }
+
+    #[test]
+    fn cache_key_format_is_versioned() {
+        let request = request_with_metadata(json!({"encrypted_content": "opaque"}));
+        let mut value = serde_json::to_value(&request).unwrap();
+        super::super::scrub_thought_signatures(&mut value);
+        let canonical = serde_json::to_string(&value).unwrap();
+        let legacy_hash = Sha256::digest(canonical.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let current_hash = CachingAiProvider::compute_cache_key(&request);
+        assert_ne!(current_hash, legacy_hash);
     }
 }

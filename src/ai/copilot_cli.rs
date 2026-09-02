@@ -204,6 +204,7 @@ pub fn parse_jsonl_events(raw: &str) -> Result<AiResponse> {
         tool_calls: None,
         usage,
         truncated: false,
+        provider_metadata: None,
     })
 }
 

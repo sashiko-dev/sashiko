@@ -394,6 +394,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,

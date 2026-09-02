@@ -2579,6 +2579,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
@@ -2633,6 +2634,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
@@ -3159,6 +3161,7 @@ fi
                     cached_tokens: Some(self.cached_tokens),
                 }),
                 truncated: false,
+                provider_metadata: None,
             })
         }
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
