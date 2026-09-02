@@ -1,0 +1,32 @@
+[
+    {
+        "Commit": "356c4c441ec01910314c5867c680bef80d1dd373",
+        "Fixed-by": "d30254aec93141d6b89262986a62764b2ae07177",
+        "subsystem": "hw/scsi",
+        "problem_description": "In scsi_disk_emulate_write_same(), reading data from inbuf using the mutable s->qdev.blocksize instead of the allocated request buffer size r->buflen causes an out-of-bounds heap read when a guest concurrently increases the sector size via MODE SELECT."
+    },
+    {
+        "Commit": "33a71a68c6e137c80c9f6a7370d546404ed38513",
+        "Fixed-by": "4f50d637e23770872a997ed2de0729fbacc2c002",
+        "subsystem": "hw/arm",
+        "problem_description": "In hw/arm/ax3000-soc.c, the TypeInfo definition for TYPE_AX3000_SOC omits .class_size, causing type_initialize() to allocate only the parent SysBusDeviceClass size and leading ax3000_class_init() to overwrite adjacent heap memory when setting sc->num_cpus."
+    },
+    {
+        "Commit": "0d148eaf5a3eb14469b536e37bb1936fd0085f03",
+        "Fixed-by": "399ba75fbe308f179da48d183bd48d662ee16199",
+        "subsystem": "hw/intc",
+        "problem_description": "In loongarch_dintc_mem_write(), the guest-controlled cpu_num extracted from the MMIO write address is not validated against s->num_cpu, causing an out-of-bounds CPU lookup and NULL pointer dereference in async_run_on_cpu()."
+    },
+    {
+        "Commit": "b43848a1005cec6e952ce2b3268725a688aa74c6",
+        "Fixed-by": "6595a8d5d17ea1716ddafb34455ec2b29381e232",
+        "subsystem": "hw/net",
+        "problem_description": "In port_tx_write(), the guest-controlled transmit packet size tx_len is not checked against the device buffer capacity BUFSZ_MAX, allowing oversized packets to trigger out-of-bounds reads beyond the device RAM in qemu_send_packet()."
+    },
+    {
+        "Commit": "e41b711485e5b2dcf747ef27cf252a940e09247f",
+        "Fixed-by": "32a90850e1e4222091df07b4b46d5f46a8b90d24",
+        "subsystem": "virtio",
+        "problem_description": "In virtio_net_rss_post_load(), restoring an invalid or zero indirections_len from a migration stream bypasses validation checks, leaving the indirection table unallocated and causing a NULL pointer dereference in virtio_net_process_rss()."
+    }
+]
