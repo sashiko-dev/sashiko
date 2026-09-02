@@ -107,12 +107,30 @@ pub struct ResponsesResponse {
     #[allow(dead_code)]
     pub id: String,
     pub status: String,
+    #[serde(default)]
+    pub error: Option<ResponsesError>,
     /// Preserve the API's output items verbatim. Their shape evolves as new
     /// built-in tools and reasoning features are added, and callers managing
     /// state manually must replay every item without reconstruction.
     pub output: Vec<Value>,
     #[serde(default)]
+    pub incomplete_details: Option<ResponsesIncompleteDetails>,
+    #[serde(default, deserialize_with = "lenient_usage")]
     pub usage: ResponsesUsage,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResponsesError {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -146,6 +164,14 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
+fn lenient_usage<'de, D>(deserializer: D) -> Result<ResponsesUsage, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 // ── Errors ──────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -158,6 +184,12 @@ pub enum OpenAiError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+    #[error("OpenAI Responses generation failed (status={status}, code={code}): {message}")]
+    ResponseFailed {
+        status: String,
+        code: String,
+        message: String,
+    },
 }
 
 impl ClassifyAiError for OpenAiError {
@@ -173,6 +205,7 @@ impl ClassifyAiError for OpenAiError {
             OpenAiError::ApiError(status, _) => {
                 classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
             }
+            OpenAiError::ResponseFailed { .. } => AiErrorClass::Fatal,
         }
     }
 }
@@ -215,7 +248,7 @@ impl OpenAiClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        let base_url = base_url.trim_end_matches('/').to_string();
+        let base_url = Self::normalize_base_url(&base_url)?;
 
         Ok(Self {
             model,
@@ -229,6 +262,32 @@ impl OpenAiClient {
 
     pub fn default_base_url() -> String {
         "https://api.openai.com/v1/responses".to_string()
+    }
+
+    /// Normalize an OpenAI API root or full Responses endpoint.
+    fn normalize_base_url(url: &str) -> Result<String> {
+        let mut parsed = url::Url::parse(url)
+            .map_err(|_| anyhow::anyhow!("Invalid OpenAI Responses url {url}"))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            anyhow::bail!("Invalid OpenAI Responses url {url}");
+        }
+
+        let path = parsed.path().trim_end_matches('/');
+        let normalized_path = match path {
+            "" => "/responses".to_string(),
+            "/v1" => "/v1/responses".to_string(),
+            "/api/v1" => "/api/v1/responses".to_string(),
+            path if path.ends_with("/responses") => path.to_string(),
+            _ => anyhow::bail!(
+                "Invalid OpenAI Responses url {url}; provide an API root or a full /responses endpoint"
+            ),
+        };
+        parsed.set_path(&normalized_path);
+        Ok(parsed.to_string().trim_end_matches('/').to_string())
     }
 
     pub fn default_context_window_for_model(model: &str) -> usize {
@@ -450,7 +509,11 @@ fn translate_ai_request(
         input,
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
         tools,
-        temperature: None,
+        temperature: if model_supports_temperature(model) {
+            request.temperature
+        } else {
+            None
+        },
         max_output_tokens: Some(max_tokens),
         reasoning,
         text,
@@ -459,17 +522,57 @@ fn translate_ai_request(
 
 const OPENAI_RESPONSES_PROVIDER_METADATA: &str = "openai.responses";
 const OPENAI_RESPONSES_PROVIDER_METADATA_VERSION: u32 = 1;
+pub(super) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+fn model_supports_temperature(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    !model.starts_with("gpt-5")
+        && !model.starts_with("o1")
+        && !model.starts_with("o3")
+        && !model.starts_with("o4")
+}
+
+fn response_failed_error(status: &str, error: Option<&ResponsesError>) -> OpenAiError {
+    let code = error
+        .and_then(|error| error.code.as_deref())
+        .unwrap_or("unknown_error")
+        .to_string();
+    let message = error
+        .and_then(|error| error.message.as_deref())
+        .unwrap_or("response returned without error details")
+        .to_string();
+    OpenAiError::ResponseFailed {
+        status: status.to_string(),
+        code,
+        message,
+    }
+}
 
 fn translate_ai_response(resp: ResponsesResponse) -> Result<AiResponse> {
     let mut content_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
 
-    let truncated = resp.status == "incomplete";
+    if resp.error.is_some() {
+        return Err(response_failed_error(&resp.status, resp.error.as_ref()).into());
+    }
+
+    let truncated = match resp.status.as_str() {
+        "completed" => false,
+        "incomplete" => true,
+        _ => return Err(response_failed_error(&resp.status, None).into()),
+    };
 
     if truncated {
+        let reason = resp
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            .unwrap_or("unknown");
         tracing::warn!(
-            "{}OpenAI Responses response truncated (status=incomplete).",
-            crate::ai::get_log_prefix()
+            "{}OpenAI Responses response incomplete (reason={}, output_tokens={}).",
+            crate::ai::get_log_prefix(),
+            reason,
+            resp.usage.output_tokens
         );
     }
 
@@ -619,7 +722,7 @@ mod tests {
         assert_eq!(req.input.len(), 2); // system + user
         assert!(
             req.temperature.is_none(),
-            "Responses API always suppresses temperature"
+            "GPT-5 reasoning models do not accept temperature"
         );
         assert_eq!(req.max_output_tokens, Some(4096));
         assert!(req.reasoning.is_none());
@@ -647,8 +750,44 @@ mod tests {
         assert_eq!(reasoning.effort.as_deref(), Some("medium"));
         assert!(
             req.temperature.is_none(),
-            "Responses API always suppresses temperature"
+            "GPT-5 reasoning models do not accept temperature"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_request_preserves_temperature_for_supported_models() -> Result<()> {
+        for model in ["gpt-4o", "gpt-4o-2024-11-20", "future-chat-model"] {
+            let request = AiRequest {
+                system: None,
+                messages: vec![user_msg("Test")],
+                tools: None,
+                temperature: Some(0.0),
+                response_format: None,
+                context_tag: None,
+            };
+
+            let req = translate_ai_request(request, model, 4096, None)?;
+            assert_eq!(req.temperature, Some(0.0), "model: {model}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_request_suppresses_temperature_for_reasoning_models() -> Result<()> {
+        for model in ["gpt-5.6-sol", "gpt-5", "o1", "o3-mini", "o4-mini"] {
+            let request = AiRequest {
+                system: None,
+                messages: vec![user_msg("Test")],
+                tools: None,
+                temperature: Some(0.0),
+                response_format: None,
+                context_tag: None,
+            };
+
+            let req = translate_ai_request(request, model, 4096, None)?;
+            assert_eq!(req.temperature, None, "model: {model}");
+        }
         Ok(())
     }
 
@@ -753,7 +892,9 @@ mod tests {
         let resp = ResponsesResponse {
             id: "resp_1".to_string(),
             status: "completed".to_string(),
+            error: None,
             output: output.clone(),
+            incomplete_details: None,
             usage: ResponsesUsage::default(),
         };
 
@@ -830,9 +971,23 @@ mod tests {
         let resp = ResponsesResponse {
             id: "resp_3".to_string(),
             status: "incomplete".to_string(),
+            error: None,
             output: vec![],
-            usage: ResponsesUsage::default(),
+            incomplete_details: Some(ResponsesIncompleteDetails {
+                reason: Some("max_output_tokens".to_string()),
+            }),
+            usage: ResponsesUsage {
+                output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+                ..ResponsesUsage::default()
+            },
         };
+
+        assert_eq!(
+            resp.incomplete_details
+                .as_ref()
+                .and_then(|details| details.reason.as_deref()),
+            Some("max_output_tokens")
+        );
 
         let ai_resp = translate_ai_response(resp)?;
         assert!(ai_resp.truncated);
@@ -844,7 +999,9 @@ mod tests {
         let resp = ResponsesResponse {
             id: "resp_4".to_string(),
             status: "completed".to_string(),
+            error: None,
             output: vec![],
+            incomplete_details: None,
             usage: ResponsesUsage {
                 input_tokens: 20,
                 output_tokens: 8,
@@ -921,6 +1078,61 @@ mod tests {
     }
 
     #[test]
+    fn test_translate_response_failed_surfaces_provider_error() -> Result<()> {
+        let resp: ResponsesResponse = serde_json::from_value(json!({
+            "id": "resp_failed",
+            "status": "failed",
+            "error": {
+                "code": "server_error",
+                "message": "The model failed while generating a response."
+            },
+            "output": [],
+            "usage": null
+        }))?;
+
+        let error = translate_ai_response(resp).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OpenAI Responses generation failed (status=failed, code=server_error): \
+             The model failed while generating a response."
+        );
+        assert_eq!(classify_ai_error(&error), AiErrorClass::Fatal);
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_error_wins_over_completed_status() -> Result<()> {
+        let resp: ResponsesResponse = serde_json::from_value(json!({
+            "id": "resp_conflict",
+            "status": "completed",
+            "error": {"code": "server_error", "message": "Generation failed."},
+            "output": []
+        }))?;
+
+        let error = translate_ai_response(resp).unwrap_err();
+        assert!(error.to_string().contains("Generation failed."));
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_rejects_unexpected_statuses() {
+        for status in ["failed", "cancelled", "queued", "in_progress", "future"] {
+            let resp = ResponsesResponse {
+                id: "resp_unexpected".to_string(),
+                status: status.to_string(),
+                error: None,
+                output: vec![],
+                incomplete_details: None,
+                usage: ResponsesUsage::default(),
+            };
+
+            let error = translate_ai_response(resp).unwrap_err();
+            assert!(error.to_string().contains(&format!("status={status}")));
+            assert_eq!(classify_ai_error(&error), AiErrorClass::Fatal);
+        }
+    }
+
+    #[test]
     fn test_error_classification() {
         let err = OpenAiError::RateLimitExceeded(Duration::from_secs(5));
         assert!(matches!(
@@ -955,5 +1167,43 @@ mod tests {
             OpenAiClient::default_context_window_for_model("gpt-5.6-sol"),
             1_050_000
         );
+    }
+
+    #[test]
+    fn test_normalize_base_url() -> Result<()> {
+        for (input, expected) in [
+            ("http://localhost:8080", "http://localhost:8080/responses"),
+            ("http://localhost:8080/", "http://localhost:8080/responses"),
+            (
+                "http://localhost:8080/v1",
+                "http://localhost:8080/v1/responses",
+            ),
+            (
+                "http://localhost:8080/v1/",
+                "http://localhost:8080/v1/responses",
+            ),
+            (
+                "https://proxy.example/api/v1",
+                "https://proxy.example/api/v1/responses",
+            ),
+            (
+                "https://proxy.example/api/v1/",
+                "https://proxy.example/api/v1/responses",
+            ),
+            (
+                "https://api.openai.com/v1/responses",
+                "https://api.openai.com/v1/responses",
+            ),
+            (
+                "https://proxy.example/openai/v1/responses/",
+                "https://proxy.example/openai/v1/responses",
+            ),
+        ] {
+            assert_eq!(OpenAiClient::normalize_base_url(input)?, expected);
+        }
+
+        assert!(OpenAiClient::normalize_base_url("not-a-url").is_err());
+        assert!(OpenAiClient::normalize_base_url("https://proxy.example/v2").is_err());
+        Ok(())
     }
 }

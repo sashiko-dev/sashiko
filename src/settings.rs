@@ -643,12 +643,12 @@ provider = "openai"
 model = "gpt-5.6-terra"
 
 [openai]
-max_tokens = 65536
+max_tokens = 16384
 reasoning_effort = "medium"
 "#;
         let ai: AiSettings = toml::from_str(toml_str).unwrap();
         let openai = ai.openai.unwrap();
-        assert_eq!(openai.max_tokens, Some(65536));
+        assert_eq!(openai.max_tokens, Some(16384));
         assert_eq!(openai.reasoning_effort.as_deref(), Some("medium"));
         assert!(openai.base_url.is_none());
     }

@@ -493,7 +493,9 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                     openai_responses::OpenAiClient::default_context_window_for_model(&ai.model)
                 });
 
-            let max_tokens = openai.and_then(|c| c.max_tokens).unwrap_or(4096);
+            let max_tokens = openai
+                .and_then(|c| c.max_tokens)
+                .unwrap_or(openai_responses::DEFAULT_MAX_OUTPUT_TOKENS);
 
             let reasoning_effort = openai.and_then(|c| c.reasoning_effort.clone());
 
@@ -1359,7 +1361,7 @@ mod tests {
             openai: Some(crate::settings::OpenAiSettings {
                 base_url: None,
                 context_window_size: None,
-                max_tokens: Some(65536),
+                max_tokens: Some(16_384),
                 reasoning_effort: Some("medium".to_string()),
             }),
             ollama: None,
