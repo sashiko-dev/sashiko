@@ -436,6 +436,7 @@ fn translate_response(
         },
         usage,
         truncated: false,
+        provider_metadata: None,
     })
 }
 
@@ -594,6 +595,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             },
             AiMessage {
                 role: AiRole::User,
@@ -602,6 +604,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             },
         ]);
         req.system = Some("System 1.".to_string());
@@ -633,6 +636,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
         req.response_format = Some(crate::ai::AiResponseFormat::Json { schema: None });
 
@@ -661,6 +665,7 @@ mod tests {
                 thought_signature: None,
             }]),
             tool_call_id: None,
+            provider_metadata: None,
         }]);
 
         let params = translate_request(&req, false, 4096, None, None)?;
@@ -693,6 +698,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
+            provider_metadata: None,
         }]);
 
         let params = translate_request(&req, false, 4096, None, None)?;
@@ -717,6 +723,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
         req.tools = Some(vec![AiTool {
             name: "read_file".to_string(),
@@ -750,6 +757,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
         req.tools = Some(vec![]);
 
@@ -786,6 +794,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
 
         let params = translate_request(&req, false, 8192, None, None)?;
@@ -802,6 +811,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
 
         let params = translate_request(&req, false, 8192, Some("adaptive"), Some("high"))?;
@@ -821,6 +831,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
         req.system = Some("System prompt.".to_string());
 
@@ -843,6 +854,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             },
             AiMessage {
                 role: AiRole::Assistant,
@@ -851,6 +863,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             },
         ]);
 
@@ -879,6 +892,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_a".to_string()),
+                provider_metadata: None,
             },
             AiMessage {
                 role: AiRole::Tool,
@@ -887,6 +901,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_b".to_string()),
+                provider_metadata: None,
             },
         ]);
 
@@ -909,6 +924,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
 
         let params = translate_request(&req, false, 4096, None, None)?;
@@ -927,6 +943,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
         req.tools = Some(vec![AiTool {
             name: "read_file".to_string(),
@@ -954,6 +971,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]);
         req.tools = Some(vec![AiTool {
             name: "read_file".to_string(),
