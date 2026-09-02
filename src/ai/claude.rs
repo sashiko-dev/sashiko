@@ -729,7 +729,7 @@ impl AiProvider for StdioClaudeClient {
 
         match rx.await {
             Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(remote_err)) => Err(remote_err.into()),
+            Ok(Err(remote_err)) => Err(remote_err.into_anyhow()),
             Err(_) => Err(anyhow::anyhow!(
                 "IPC channel disconnected waiting for response"
             )),

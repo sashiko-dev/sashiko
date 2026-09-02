@@ -15,8 +15,8 @@
 use crate::ReviewStatus;
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
-    create_provider_cached,
+    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, RemoteTerminalKind,
+    classify_ai_error, create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
@@ -40,6 +40,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
+
+fn remote_terminal_kind_from_error(error: &anyhow::Error) -> Option<RemoteTerminalKind> {
+    match error.downcast_ref::<ReviewError>() {
+        Some(ReviewError::BudgetExceeded(_)) => Some(RemoteTerminalKind::BudgetExceeded),
+        _ => None,
+    }
+}
 
 #[derive(Clone)]
 struct ReviewContext {
@@ -1515,6 +1522,7 @@ impl Reviewer {
                 }
                 Err(e) => {
                     error!("Review execution failed for {}: {}", patchset_id, e);
+                    let terminal_kind = remote_terminal_kind_from_error(&e);
                     let _ = ctx
                         .db
                         .complete_review(
@@ -1527,7 +1535,7 @@ impl Reviewer {
                             None,
                         )
                         .await;
-                    if retries < max_retries {
+                    if terminal_kind.is_none() && retries < max_retries {
                         retries += 1;
                         continue;
                     }
@@ -1842,7 +1850,6 @@ async fn run_review_tool_with_cmd(
                                                         .await;
                                                 }
                                             }
-
                                             let mut local_turn = turn_count_clone.fetch_add(1, Ordering::SeqCst);
                                             local_turn += 1;
 
@@ -1927,7 +1934,13 @@ async fn run_review_tool_with_cmd(
                                                         if token_budget > 0 && current_total > token_budget {
                                                             let err_msg = format!("Token budget exceeded: {} uncached input + output tokens used > {} limit", current_total, token_budget);
 
-                                                            let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
+                                                            let payload = RemoteAiErrorPayload::new(
+                                                                err_msg.clone(),
+                                                                AiErrorClass::Fatal,
+                                                            )
+                                                            .with_terminal_kind(Some(
+                                                                RemoteTerminalKind::BudgetExceeded,
+                                                            ));
                                                             let reply = json!({
                                                                 "type": "error",
                                                                 "tx_id": tx_id,
@@ -1949,7 +1962,13 @@ async fn run_review_tool_with_cmd(
                                                         if output_budget > 0 && current_output > output_budget {
                                                             let err_msg = format!("Output token budget exceeded: {} output tokens used > {} limit", current_output, output_budget);
 
-                                                            let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
+                                                            let payload = RemoteAiErrorPayload::new(
+                                                                err_msg.clone(),
+                                                                AiErrorClass::Fatal,
+                                                            )
+                                                            .with_terminal_kind(Some(
+                                                                RemoteTerminalKind::BudgetExceeded,
+                                                            ));
                                                             let reply = json!({
                                                                 "type": "error",
                                                                 "tx_id": tx_id,
@@ -2015,7 +2034,10 @@ async fn run_review_tool_with_cmd(
                                                 Err(e) => {
                                                     let class = classify_ai_error(&e);
                                                     let message = e.to_string();
-                                                    let payload = RemoteAiErrorPayload::new(message, class);
+                                                    let terminal_kind = remote_terminal_kind_from_error(&e);
+                                                    let payload =
+                                                        RemoteAiErrorPayload::new(message, class)
+                                                            .with_terminal_kind(terminal_kind);
                                                     let reply = json!({
                                                         "type": "error",
                                                         "tx_id": tx_id,
@@ -2030,6 +2052,12 @@ async fn run_review_tool_with_cmd(
                                                             error!("Failed to write AI response to child: {}", e);
                                                         }
                                                         let _ = writer.flush().await;
+                                                    }
+
+                                                    if terminal_kind
+                                                        == Some(RemoteTerminalKind::BudgetExceeded)
+                                                    {
+                                                        let _ = abort_tx_clone.send(e).await;
                                                     }
 
                                                     None
@@ -2592,12 +2620,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_remote_terminal_kind_only_tags_budget_exceeded_review_error() {
+        let budget: anyhow::Error =
+            ReviewError::BudgetExceeded("provider terminal".to_string()).into();
+        assert_eq!(
+            remote_terminal_kind_from_error(&budget),
+            Some(RemoteTerminalKind::BudgetExceeded)
+        );
+
+        let limit: anyhow::Error = ReviewError::LimitExceeded.into();
+        assert_eq!(remote_terminal_kind_from_error(&limit), None);
+
+        let format: anyhow::Error = ReviewError::FormatRejection("bad json".to_string()).into();
+        assert_eq!(remote_terminal_kind_from_error(&format), None);
+
+        let generic = anyhow::anyhow!("ordinary provider error");
+        assert_eq!(remote_terminal_kind_from_error(&generic), None);
+    }
+
     struct FailingProvider;
 
     #[async_trait]
     impl AiProvider for FailingProvider {
         async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
             Err(anyhow::anyhow!("fatal provider failure"))
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    struct BudgetExceededProvider;
+
+    #[async_trait]
+    impl AiProvider for BudgetExceededProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Err(ReviewError::BudgetExceeded("kiro terminal budget".to_string()).into())
         }
 
         fn estimate_tokens(&self, _request: &AiRequest) -> usize {
@@ -2832,6 +2899,26 @@ fi
         let result = run_single_ai_request_mock(mock_script, Arc::new(FailingProvider)).await?;
 
         assert_eq!(result["patches"][0]["status"], "typed_fatal");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_review_tool_aborts_on_terminal_budget_error() -> Result<()> {
+        let mock_script = r#"#!/bin/bash
+read -r input
+echo '{"type":"ai_request","payload":{"messages":[{"role":"user","content":"hello"}]}}'
+read -r ai_response
+read -r shutdown
+"#;
+
+        let err = run_single_ai_request_mock(mock_script, Arc::new(BudgetExceededProvider))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<ReviewError>(),
+            Some(ReviewError::BudgetExceeded(_))
+        ));
         Ok(())
     }
 

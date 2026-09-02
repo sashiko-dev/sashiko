@@ -226,6 +226,48 @@ cp docs/examples/Settings.kiro-cli.toml Settings.toml
 - An isolated temporary agent with a deny-all hook prevents accidental
   tool execution
 
+**Diagnostics:**
+
+- Set `KIRO_ACP_VERBOSE=1` (or `2`/`3`, `v`/`vv`/`vvv`) to pass Kiro `-v`
+  flags for SDK-level diagnostics. Kiro writes those traces to stdout
+  interleaved with JSON-RPC; Sashiko captures them as malformed stdout
+  diagnostics and does not count them as ACP activity for idle-time metrics.
+- Treat verbose traces as sensitive. They can include prompts, responses,
+  request IDs, and provider error details.
+- `KIRO_ACP_RECORD_PATH` is not used by Sashiko. Kiro binaries contain a
+  recorder hook with that name, but direct `kiro-cli acp` probes did not
+  produce record files for the ACP server mode Sashiko launches.
+
+**Containment tuning:**
+
+The Kiro ACP backend has process-local retry and circuit-breaker guards with
+safe defaults. Override these only for benchmark diagnosis:
+
+- `SASHIKO__AI__KIRO_MAX_TRANSIENT_ATTEMPTS_PER_TURN` (default `3`)
+- `SASHIKO__AI__KIRO_MAX_SAME_TRANSIENT_STREAK_PER_TURN` (default `2`)
+- `SASHIKO__AI__KIRO_MAX_TURN_WALL_CLOCK_SECS` (default `1200`)
+- `SASHIKO__AI__KIRO_ACP_IDLE_TIMEOUT_SECS` (default `600`)
+- `SASHIKO__AI__KIRO_CIRCUIT_FAILURE_WINDOW_SECS` (default `600`)
+- `SASHIKO__AI__KIRO_CIRCUIT_FAILURE_THRESHOLD` (default `8`)
+- `SASHIKO__AI__KIRO_CIRCUIT_COOLDOWN_SECS` (default `600`)
+
+These defaults come from Kiro-specific benchmark findings:
+
+- Kiro CLI 2.3.0 and 2.4.1 apply AWS Smithy stalled-stream protection with
+  `1 byte/sec` minimum throughput and a `5s` grace period. That guard is inside
+  Kiro and is independent of Kiro's `api.timeout` setting.
+- Sashiko's ACP idle timeout applies while waiting for `initialize`,
+  `session/new`, and `session/prompt` responses. It measures time between
+  JSON-RPC lines on Kiro's stdout, not upstream HTTP bytes. Successful
+  benchmark turns have shown ACP line gaps above 300s and up to about 530s, so
+  the default is 600s.
+- The Kiro outer turn timeout uses `SASHIKO__AI__KIRO_MAX_TURN_WALL_CLOCK_SECS`
+  rather than the generic AI `api_timeout_secs` setting. This is intentional:
+  the generic default is shorter than valid Kiro turns observed in benchmarks,
+  so Kiro timeout tuning must use the Kiro-specific setting. Retries of the
+  same logical prompt share this wall-clock budget rather than receiving a new
+  full timeout.
+
 ## Codex CLI
 
 Uses a local [Codex CLI](https://github.com/openai/codex) (OpenAI)
