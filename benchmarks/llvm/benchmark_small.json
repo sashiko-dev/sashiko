@@ -1,0 +1,32 @@
+[
+    {
+        "Commit": "943e92efde269162465e9125d20992965421568d",
+        "Fixed-by": "a871d3872ac55cfab62492e2a1fb7b056d204668",
+        "subsystem": "llvm/InstCombine",
+        "problem_description": "In InstCombiner::foldICmpOrConstant (llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp), folding icmp eq (or (ptrtoint P), (ptrtoint Q)), 0 creates a single null constant with type P->getType() for both comparisons. If P and Q have different pointer types, comparing Q against P's null pointer type violates type agreement and triggers an assertion failure in CreateICmp."
+    },
+    {
+        "Commit": "cd67cfecb1a154d0759783ae926f8b44c104d7d3",
+        "Fixed-by": "0c3b1c044c6be78d9e8f21f7bb18d9974ebc0d99",
+        "subsystem": "clang",
+        "problem_description": "In CoroutineStmtBuilder::makeNewAndDeleteExpr (clang/lib/Sema/SemaCoroutine.cpp), when the secondary lookup for an aligned operator new fails after a previous successful unaligned lookup, OperatorNew is not cleared, causing clang to retain the unaligned function while marking alignment as required and producing a false parameter count mismatch error."
+    },
+    {
+        "Commit": "99f7018958ed3daf2abf8d49178c24fbf1eb1010",
+        "Fixed-by": "b3946b5bb5c9a4b5feadfe532270ef823116a617",
+        "subsystem": "llvm/CodeGen",
+        "problem_description": "In Rematerializer::isRegIdenticalAtUses (llvm/lib/CodeGen/Rematerializer.cpp), LI.getVNInfoAt(RefSlot) can return a null pointer when a register has no value definition at the given slot, causing an unconditional dereference of DefVN and a segmentation fault crash."
+    },
+    {
+        "Commit": "255162ae0ebe805df151c5c4b48e1a47a5dd74f0",
+        "Fixed-by": "f24da9d03ba5d25c523e050da2ca3c4060ca23d5",
+        "subsystem": "llvm/Target/RISCV",
+        "problem_description": "In emitSCSEpilogue (llvm/lib/Target/RISCV/RISCVFrameLowering.cpp), the instruction iterator passed into the function can equal MBB.end(), causing an invalid iterator dereference and assertion failure or crash when querying MI->getOpcode()."
+    },
+    {
+        "Commit": "417d2d7ce694acfa09a7d950cf1c5c41796eb313",
+        "Fixed-by": "e5b8a7c1eb09dd5abbbc75c3e2b1e36a14d92dc6",
+        "subsystem": "lld",
+        "problem_description": "In handleNonPreemptibleIfunc (lld/ELF/Relocations.cpp), requesting an AUTH GOT entry for a non-preemptible IFUNC symbol triggers an assertion failure in debug builds or silently generates an invalid non-authenticated GOT entry in release builds instead of reporting an unsupported relocation error."
+    }
+]
