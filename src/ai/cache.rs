@@ -4,9 +4,25 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities};
+use super::{
+    AiProvider, AiRequest, AiResponse, CacheStats, MAX_PROVIDER_METADATA_BYTES,
+    ProviderCapabilities,
+};
+
+const MAX_CACHE_ENTRY_BYTES: usize = MAX_PROVIDER_METADATA_BYTES;
+const MAX_CACHE_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+
+struct CacheEntry {
+    hash: String,
+    provider: String,
+    model: String,
+    request_json: String,
+    response_json: String,
+    tokens_saved: i64,
+    created_at: i64,
+}
 
 pub struct CachingAiProvider {
     inner: Arc<dyn AiProvider>,
@@ -16,6 +32,7 @@ pub struct CachingAiProvider {
     hits_prev: AtomicU64,
     tokens_saved_this: AtomicU64,
     tokens_saved_prev: AtomicU64,
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl CachingAiProvider {
@@ -43,7 +60,9 @@ impl CachingAiProvider {
                 response_json TEXT NOT NULL,
                 tokens_saved INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS response_cache_created_at_idx
+                ON response_cache(created_at DESC);",
         )
         .await?;
 
@@ -72,9 +91,19 @@ impl CachingAiProvider {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        info!("Response cache enabled ({})", cache_path);
+        if let Err(error) = async {
+            let transaction = conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            Self::prune_payload(&transaction, MAX_CACHE_PAYLOAD_BYTES).await?;
+            transaction.commit().await.map_err(anyhow::Error::from)
+        }
+        .await
+        {
+            warn!("Response cache: startup pruning failed: {error:#}");
+        }
 
-        Ok(Self {
+        let cache = Self {
             inner,
             conn,
             session_start,
@@ -82,7 +111,11 @@ impl CachingAiProvider {
             hits_prev: AtomicU64::new(0),
             tokens_saved_this: AtomicU64::new(0),
             tokens_saved_prev: AtomicU64::new(0),
-        })
+            write_lock: tokio::sync::Mutex::new(()),
+        };
+
+        info!("Response cache enabled ({})", cache_path);
+        Ok(cache)
     }
 
     fn compute_cache_key(&self, request: &AiRequest) -> String {
@@ -103,6 +136,101 @@ impl CachingAiProvider {
         let hash = hasher.finalize();
         hash.iter().map(|b| format!("{:02x}", b)).collect()
     }
+
+    fn diagnostic_request_json(request: &AiRequest) -> Result<String> {
+        let mut value = serde_json::to_value(request)?;
+        if let Some(messages) = value
+            .get_mut("messages")
+            .and_then(|value| value.as_array_mut())
+        {
+            for message in messages {
+                if let Some(message) = message.as_object_mut() {
+                    message.remove("provider_metadata");
+                }
+            }
+        }
+        Ok(serde_json::to_string(&value)?)
+    }
+
+    #[cfg(test)]
+    async fn payload_bytes(&self) -> Result<usize> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COALESCE(SUM(\
+                    length(CAST(request_json AS BLOB)) + \
+                    length(CAST(response_json AS BLOB))\
+                 ), 0) FROM response_cache",
+                (),
+            )
+            .await?;
+        let bytes: i64 = rows
+            .next()
+            .await?
+            .map(|row| row.get(0))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(bytes.max(0) as usize)
+    }
+
+    async fn prune_payload(connection: &libsql::Connection, limit: usize) -> Result<()> {
+        connection
+            .execute(
+                "WITH newest_first AS (\
+                    SELECT rowid, SUM(\
+                        length(CAST(request_json AS BLOB)) + \
+                        length(CAST(response_json AS BLOB))\
+                    ) OVER (\
+                        ORDER BY created_at DESC, rowid DESC \
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+                    ) AS retained_bytes \
+                    FROM response_cache\
+                 ) \
+                 DELETE FROM response_cache WHERE rowid IN (\
+                    SELECT rowid FROM newest_first WHERE retained_bytes > ?\
+                 )",
+                libsql::params![limit as i64],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn store_entry(&self, entry: CacheEntry) -> Result<()> {
+        let entry_bytes = entry
+            .request_json
+            .len()
+            .saturating_add(entry.response_json.len());
+        if entry_bytes > MAX_CACHE_ENTRY_BYTES {
+            warn!(
+                "Response cache: skipped {}-byte entry exceeding the {}-byte limit",
+                entry_bytes, MAX_CACHE_ENTRY_BYTES
+            );
+            return Ok(());
+        }
+
+        let _guard = self.write_lock.lock().await;
+        let transaction = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    entry.hash,
+                    entry.provider,
+                    entry.model,
+                    entry.request_json,
+                    entry.response_json,
+                    entry.tokens_saved,
+                    entry.created_at
+                ],
+            )
+            .await?;
+        Self::prune_payload(&transaction, MAX_CACHE_PAYLOAD_BYTES).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -121,36 +249,43 @@ impl AiProvider for CachingAiProvider {
 
         if let Some(row) = rows.next().await? {
             let response_json: String = row.get(0)?;
-            let tokens_saved: i64 = row.get(1)?;
-            let created_at: i64 = row.get(2)?;
-            if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
-                let (origin, total) = if created_at >= self.session_start {
-                    self.hits_this.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_this
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("this session", t)
-                } else {
-                    self.hits_prev.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_prev
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("previous session", t)
-                };
-                info!(
-                    "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
-                    hash_prefix, origin, tokens_saved, origin, total
+            if response_json.len() > MAX_CACHE_ENTRY_BYTES {
+                debug!(
+                    "Cache hit [{hash_prefix}]: oversized legacy entry ({} bytes), skipping",
+                    response_json.len()
                 );
-                if let Some(ref mut usage) = resp.usage {
-                    // The hit serves the whole prompt from this cache, so all
-                    // of it counts as cached.  cached_tokens is a breakdown
-                    // of prompt_tokens rather than an addend.  The count
-                    // recorded with the response covers this same prompt.
-                    usage.cached_tokens = Some(usage.prompt_tokens);
+            } else {
+                let tokens_saved: i64 = row.get(1)?;
+                let created_at: i64 = row.get(2)?;
+                if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
+                    let (origin, total) = if created_at >= self.session_start {
+                        self.hits_this.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_this
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("this session", t)
+                    } else {
+                        self.hits_prev.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_prev
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("previous session", t)
+                    };
+                    info!(
+                        "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
+                        hash_prefix, origin, tokens_saved, origin, total
+                    );
+                    if let Some(ref mut usage) = resp.usage {
+                        // The hit serves the whole prompt from this cache, so all
+                        // of it counts as cached.  cached_tokens is a breakdown
+                        // of prompt_tokens rather than an addend.  The count
+                        // recorded with the response covers this same prompt.
+                        usage.cached_tokens = Some(usage.prompt_tokens);
+                    }
+                    return Ok(resp);
                 }
-                return Ok(resp);
             }
         }
         drop(rows);
@@ -160,7 +295,7 @@ impl AiProvider for CachingAiProvider {
         let resp = self.inner.generate_content(request.clone()).await?;
 
         let response_json = serde_json::to_string(&resp)?;
-        let request_json = serde_json::to_string(&request)?;
+        let request_json = Self::diagnostic_request_json(&request)?;
         let caps = self.inner.get_capabilities();
         let tokens_saved = resp
             .usage
@@ -172,21 +307,20 @@ impl AiProvider for CachingAiProvider {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let _ = self
-            .conn
-            .execute(
-                "INSERT OR REPLACE INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    hash,
-                    caps.model_name.clone(),
-                    caps.model_name,
-                    request_json,
-                    response_json,
-                    tokens_saved as i64,
-                    now
-                ],
-            )
-            .await;
+        if let Err(error) = self
+            .store_entry(CacheEntry {
+                hash,
+                provider: caps.model_name.clone(),
+                model: caps.model_name,
+                request_json,
+                response_json,
+                tokens_saved: tokens_saved as i64,
+                created_at: now,
+            })
+            .await
+        {
+            warn!("Response cache: failed to store entry: {error:#}");
+        }
 
         Ok(resp)
     }
@@ -206,5 +340,143 @@ impl AiProvider for CachingAiProvider {
             tokens_saved_this_session: self.tokens_saved_this.load(Ordering::Relaxed),
             tokens_saved_prev_session: self.tokens_saved_prev.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiMessage, AiProviderMetadata, AiRole};
+    use serde_json::json;
+
+    struct FixedProvider;
+
+    #[async_trait]
+    impl AiProvider for FixedProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Ok(AiResponse {
+                content: Some("response".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+                provider_metadata: None,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test".to_string(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    fn request_with_metadata(data: serde_json::Value) -> AiRequest {
+        AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+                provider_metadata: Some(AiProviderMetadata {
+                    provider: "test.provider".to_string(),
+                    version: 1,
+                    data,
+                }),
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        }
+    }
+
+    async fn test_cache() -> Result<(tempfile::TempDir, CachingAiProvider)> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("response-cache.db");
+        let cache = CachingAiProvider::new(
+            Arc::new(FixedProvider),
+            path.to_str().expect("temporary path must be UTF-8"),
+            7,
+        )
+        .await?;
+        Ok((temp, cache))
+    }
+
+    #[tokio::test]
+    async fn diagnostic_request_omits_metadata_but_cache_key_keeps_it() -> Result<()> {
+        let first = request_with_metadata(json!({"opaque": "first"}));
+        let second = request_with_metadata(json!({"opaque": "second"}));
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&CachingAiProvider::diagnostic_request_json(&first)?)?;
+        assert!(diagnostic["messages"][0].get("provider_metadata").is_none());
+
+        let (_temp, cache) = test_cache().await?;
+        assert_ne!(
+            cache.compute_cache_key(&first),
+            cache.compute_cache_key(&second)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_entry_is_not_stored() -> Result<()> {
+        let (_temp, cache) = test_cache().await?;
+        cache
+            .store_entry(CacheEntry {
+                hash: "large".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                request_json: "{}".to_string(),
+                response_json: "x".repeat(MAX_CACHE_ENTRY_BYTES),
+                tokens_saved: 0,
+                created_at: 1,
+            })
+            .await?;
+
+        let mut rows = cache
+            .conn
+            .query("SELECT COUNT(*) FROM response_cache", ())
+            .await?;
+        let count: i64 = rows.next().await?.unwrap().get(0)?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pruning_reserves_room_for_the_next_entry() -> Result<()> {
+        let (_temp, cache) = test_cache().await?;
+        for created_at in 1..=3 {
+            cache
+                .store_entry(CacheEntry {
+                    hash: format!("entry-{created_at}"),
+                    provider: "test".to_string(),
+                    model: "test".to_string(),
+                    request_json: "r".repeat(300),
+                    response_json: "s".repeat(300),
+                    tokens_saved: 0,
+                    created_at,
+                })
+                .await?;
+        }
+
+        CachingAiProvider::prune_payload(&cache.conn, 600).await?;
+        assert!(cache.payload_bytes().await? <= 600);
+
+        let mut rows = cache
+            .conn
+            .query(
+                "SELECT request_hash FROM response_cache ORDER BY created_at",
+                (),
+            )
+            .await?;
+        assert_eq!(rows.next().await?.unwrap().get::<String>(0)?, "entry-3");
+        assert!(rows.next().await?.is_none());
+        Ok(())
     }
 }

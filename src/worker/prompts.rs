@@ -370,6 +370,7 @@ impl Worker {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             });
         }
 
@@ -1247,6 +1248,7 @@ mod tests {
                         tool_calls: None,
                         usage: None,
                         truncated: false,
+                        provider_metadata: None,
                     });
                 }
                 anyhow::bail!(
@@ -1426,6 +1428,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 

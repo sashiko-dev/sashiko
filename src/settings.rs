@@ -346,6 +346,25 @@ pub struct OpenAiCompatSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub token_limit_field: OpenAiTokenLimitField,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiTokenLimitField {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl OpenAiTokenLimitField {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1104,14 +1123,27 @@ provider = "openai"
 model = "gpt-5.6-terra"
 
 [openai]
-max_tokens = 65536
+max_tokens = 16384
 reasoning_effort = "medium"
 "#;
         let ai: AiSettings = toml::from_str(toml_str).unwrap();
         let openai = ai.openai.unwrap();
-        assert_eq!(openai.max_tokens, Some(65536));
+        assert_eq!(openai.max_tokens, Some(16384));
         assert_eq!(openai.reasoning_effort.as_deref(), Some("medium"));
         assert!(openai.base_url.is_none());
+    }
+
+    #[test]
+    fn test_openai_compat_token_limit_field_deserialize() {
+        let defaults: OpenAiCompatSettings = toml::from_str("").unwrap();
+        assert_eq!(defaults.token_limit_field, OpenAiTokenLimitField::MaxTokens);
+
+        let configured: OpenAiCompatSettings =
+            toml::from_str("token_limit_field = \"max_completion_tokens\"").unwrap();
+        assert_eq!(
+            configured.token_limit_field,
+            OpenAiTokenLimitField::MaxCompletionTokens
+        );
     }
 
     #[test]
