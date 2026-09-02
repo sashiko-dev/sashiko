@@ -517,7 +517,8 @@ pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
                     "items": { "type": "string" }
                 }
             },
-            "required": ["selected_prompts"]
+            "required": ["selected_prompts"],
+            "additionalProperties": false
         })))
         .policy(StagePolicy {
             tools: ToolScope::None,
@@ -572,7 +573,8 @@ You MUST respond with ONLY a JSON object, no other text. Use the names exactly a
                     }
                 }
             },
-            "required": ["relevant_stages"]
+            "required": ["relevant_stages"],
+            "additionalProperties": false
         })))
         .policy(StagePolicy {
             tools: ToolScope::None,

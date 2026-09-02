@@ -18,6 +18,7 @@ impl AiProvider for RecordingProvider {
             tool_calls: None,
             usage: None,
             truncated: false,
+            provider_metadata: None,
         })
     }
 

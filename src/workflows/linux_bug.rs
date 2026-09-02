@@ -2076,6 +2076,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
@@ -2326,6 +2327,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             };
             let err = session.validate(&response).unwrap_err();
             match err {
@@ -2376,6 +2378,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             };
             let output = session.validate(&response).unwrap();
             assert_eq!(output.canonical_title, *good);
@@ -2530,6 +2533,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
@@ -3411,6 +3415,7 @@ Call Trace:
             tool_calls: None,
             usage: None,
             truncated: false,
+            provider_metadata: None,
         };
         let err = session.validate(&response).unwrap_err();
         match err {
@@ -3451,6 +3456,7 @@ Call Trace:
             tool_calls: None,
             usage: None,
             truncated: false,
+            provider_metadata: None,
         };
         let err = session.validate(&response).unwrap_err();
         match err {

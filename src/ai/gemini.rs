@@ -993,6 +993,7 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
         },
         usage,
         truncated,
+        provider_metadata: None,
     })
 }
 
@@ -1109,6 +1110,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             response_format: Some(AiResponseFormat::Text),
@@ -1286,6 +1288,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::User,
@@ -1294,6 +1297,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
             ],
             tools: None,
@@ -1342,6 +1346,7 @@ mod tests {
                     thought_signature: Some("thought_sig_abc".to_string()),
                 }]),
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -1427,6 +1432,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_123".to_string()),
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -1465,6 +1471,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -1498,6 +1505,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::Assistant,
@@ -1511,6 +1519,7 @@ mod tests {
                         thought_signature: Some("s1".to_string()),
                     }]),
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::Tool,
@@ -1519,6 +1528,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("c1".to_string()),
+                    provider_metadata: None,
                 },
             ],
             tools: Some(vec![AiTool {
@@ -1602,6 +1612,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("call_1".to_string()),
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::Tool,
@@ -1610,6 +1621,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("call_2".to_string()),
+                    provider_metadata: None,
                 },
             ],
             tools: None,
@@ -1637,6 +1649,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("call_1".to_string()),
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::User,
@@ -1645,6 +1658,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
             ],
             tools: None,

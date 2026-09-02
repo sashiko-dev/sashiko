@@ -569,6 +569,7 @@ mod tests {
                     tool_calls: Some(self.calls.clone()),
                     usage: None,
                     truncated: false,
+                    provider_metadata: None,
                 });
             }
             Ok(AiResponse {
@@ -578,6 +579,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
@@ -871,6 +873,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
