@@ -106,7 +106,8 @@ impl Reviewer {
     /// * `db` - The database connection.
     /// * `settings` - Application settings.
     pub async fn new(db: Arc<Database>, settings: Settings) -> Self {
-        let concurrency = settings.review.concurrency;
+        let mut concurrency = settings.review.concurrency;
+        let max_concurrency = settings.review.max_concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
         let baseline_registry =
@@ -139,11 +140,16 @@ impl Reviewer {
         // On average, an active patch review consumes ~3 LLM slots over its execution lifetime.
         // Thus, the global LLM request semaphore is scaled to (concurrency * 3) to fully
         // saturate LLM capacity while gating local processes/worktrees strictly to `concurrency`.
-        let llm_concurrency = if concurrency < 2 {
+        let mut llm_concurrency = if concurrency < 2 {
             1
         } else {
             std::cmp::max(1, concurrency * 3)
         };
+
+        if max_concurrency.is_some() {
+            concurrency = concurrency.min(max_concurrency.unwrap_or(usize::MAX));
+            llm_concurrency = llm_concurrency.min(max_concurrency.unwrap_or(usize::MAX));
+        }
 
         Self {
             db,
