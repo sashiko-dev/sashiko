@@ -123,3 +123,9 @@ To evaluate the AI's review performance against a set of known issues, follow th
     *   A summary of detection rates (Detected, Missed, Partially Detected) along with performance metrics (Average Tokens In/Out, Average Turns, Average Time) and counts of total concerns and findings will be printed to the console upon completion.
     *   Detailed evaluation results are written to `benchmark_results.json` in the current working directory, which contains explanations from the AI judge for each finding.
 
+
+# Workflow Development
+
+When adding support for a new codebase or domain (like adapting the Linux Kernel workflow to QEMU or LLVM), creating the multi-stage pipeline is only half the battle. You **must** follow the explicit instructions for tuning the AST prefetcher and domain prompts.
+
+See [docs/workflow_development.md](docs/workflow_development.md) for the complete 4-step instruction guide on how to approach developing, testing, and optimizing new AI workflows.
