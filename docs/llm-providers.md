@@ -353,7 +353,8 @@ cp docs/examples/Settings.openai-api.toml Settings.toml
   including reasoning items and the API's original function-call identifiers
 - Cached input-token usage is reported to Sashiko's token accounting
 - Configurable `reasoning_effort` for cost/quality control
-- Temperature is omitted by the dedicated Responses provider
+- Temperature is omitted for known reasoning model families and forwarded to
+  Responses models that support it
 - JSON mode supplies the API's `json_object` format and an explicit JSON
   instruction when needed
 
@@ -369,17 +370,26 @@ provider = "openai"
 model = "gpt-5.6-terra"
 
 [ai.openai]
-max_tokens = 65536
+max_tokens = 16384
 reasoning_effort = "medium"
 ```
+
+`max_tokens` defaults to `16384`. The Responses API counts reasoning tokens
+and visible output against this shared limit. When a response is incomplete,
+Sashiko logs the provider's reason and output-token usage; increase the limit
+for reasoning-heavy workloads if the reason is `max_output_tokens`.
+
+`base_url` defaults to `https://api.openai.com/v1/responses`. A custom value
+may be the full Responses endpoint or a recognized API root: Sashiko appends
+`/responses` to a bare host, `/v1`, or `/api/v1`.
 
 **Migrating from the old OpenAI configuration:**
 
 `[ai.openai_compat]` is for `provider = "openai-compatible"` only. Sashiko
 rejects `provider = "openai"` when that legacy table is its only OpenAI
 configuration. Move the settings to `[ai.openai]`; change a custom
-`/v1/chat/completions` URL to a `/v1/responses` URL, or remove it to use the
-OpenAI default.
+`/v1/chat/completions` URL to a Responses endpoint or API root, or remove it
+to use the OpenAI default.
 
 ## OpenAI-Compatible Providers
 

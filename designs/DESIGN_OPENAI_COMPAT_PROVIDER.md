@@ -18,12 +18,13 @@ Previously, both provider names were backed by a single `OpenAiCompatClient` wit
 | Provider names | `"openai"` (Responses API) and `"openai-compatible"` (chat completions) |
 | Config sections | `[ai.openai]` for the Responses provider, `[ai.openai_compat]` for chat completions |
 | Reasoning | `reasoning_effort` on `[ai.openai]`; GPT-5.6 accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max` (default: `medium`) |
-| Temperature | Always suppressed on the Responses API provider; passed through on `openai-compatible` |
+| Temperature | Suppressed for known reasoning families (`gpt-5`, `o1`, `o3`, `o4`); passed through for other Responses models and on `openai-compatible` |
 | Output continuity | Preserve every Responses output item, including reasoning and future item types, and replay it verbatim before tool outputs |
 | Function-call identity | Preserve both the Responses output-item `id` and its `call_id`; never synthesize an item ID |
 | JSON mode | Send `text.format: { type: "json_object" }` and ensure the input explicitly asks for JSON |
 | Token accounting | Map `usage.input_tokens_details.cached_tokens` when present and valid |
 | Token limit field | Responses API uses `max_output_tokens`; chat completions uses `max_tokens` |
+| Cache compatibility | Salt cache keys only for the Responses provider, preserving existing entries for all other providers |
 | API key | Both providers: `OPENAI_API_KEY` env → `LLM_API_KEY` fallback |
 
 ## Provider: `"openai"` (Responses API)
@@ -53,7 +54,7 @@ pub struct OpenAiSettings {
 | `ResponsesInputItem` | Untagged enum: `Message`, `FunctionCall`, `FunctionCallOutput` |
 | `ResponsesTool` | `type` ("function"), `name`, `description`, `parameters` |
 | `ReasoningConfig` | `effort?` — GPT-5.6: `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
-| `ResponsesResponse` | `id`, `status`, `output`, `usage` |
+| `ResponsesResponse` | `id`, `status`, `error?`, `incomplete_details?`, `output`, `usage` |
 | `ResponsesOutputItem` | Complete raw output item, including `message`, `function_call`, `reasoning`, and future types |
 | `ResponsesContent` | Tagged enum: `OutputText`, `Refusal` |
 
@@ -68,7 +69,7 @@ pub struct OpenAiSettings {
 | Prior Responses output | Replayed verbatim in its original order, retaining reasoning items and function-call item IDs |
 | `AiRole::Tool` message | Input item: `{ type: "function_call_output", call_id, output }` |
 | `tools` | `[{ type: "function", name, description, parameters }]` |
-| `temperature` | Always `None` (reasoning models reject it) |
+| `temperature` | Omitted for known reasoning families; otherwise forwarded |
 | `reasoning_effort` | `{ reasoning: { effort: "..." } }` when configured |
 | `response_format: Json` | `{ text: { format: { type: "json_object" } } }` plus an explicit JSON instruction if no existing input contains `JSON` |
 
@@ -80,10 +81,18 @@ pub struct OpenAiSettings {
 | `output[].Message.content[].Refusal` | Logged as warning, discarded |
 | `output[].FunctionCall` | Exposed as a Sashiko tool call while the complete original item is retained for continuation |
 | `output[]` (all types) | Preserved as opaque provider metadata for the next request; no item type is silently dropped |
-| `status == "incomplete"` | `truncated: true` |
+| `status == "incomplete"` | `truncated: true`; log `incomplete_details.reason` and output-token usage |
+| `status == "failed"` or `error != null` | Return the provider's error directly; never treat it as an empty successful response |
 | `usage.input_tokens` | `prompt_tokens` |
 | `usage.output_tokens` | `completion_tokens` |
 | `usage.input_tokens_details.cached_tokens` | `cached_tokens` when nonzero and no larger than `input_tokens` |
+
+### Endpoint Normalization
+
+The default endpoint is `https://api.openai.com/v1/responses`. Custom values
+may be complete `/responses` endpoints or recognized API roots. Sashiko
+appends `/responses` to a bare host, `/v1`, or `/api/v1`; unsupported partial
+paths are rejected rather than guessed.
 
 ### Function Call ID Mapping
 
@@ -198,8 +207,9 @@ provider = "openai"
 model = "gpt-5.6-terra"
 
 [ai.openai]
-max_tokens = 65536
+max_tokens = 16384  # default
 reasoning_effort = "medium"  # recommended default
+# base_url = "https://proxy.example/v1"  # /responses is appended
 # context_window_size = 1050000  # GPT-5.6; maximum output is 128000
 
 # OpenAI-compatible — third-party endpoint

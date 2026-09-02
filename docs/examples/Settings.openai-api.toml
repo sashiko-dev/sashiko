@@ -9,7 +9,7 @@ provider = "openai"        # official API path; targets the /v1/responses endpoi
 model = "gpt-5.6-terra"
 
 [ai.openai]
-max_tokens = 65536
+max_tokens = 16384           # Default; raise for reasoning-heavy workloads
 reasoning_effort = "medium"  # GPT-5.6 model default
-# base_url = "https://api.openai.com/v1/responses"  # auto-derived; set only to override
+# base_url = "https://api.openai.com/v1/responses"  # default; set only to override
 # context_window_size = 1050000  # GPT-5.6 context window; its maximum output is 128000
