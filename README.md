@@ -161,6 +161,12 @@ This mode:
 
 For local review, Sashiko loads settings from `./Settings.toml` if it exists in the current directory, otherwise from `~/.config/sashiko.toml`. Use `--settings <path>` to point to a specific settings file.
 
+Every review runs as a multi-stage **declarative workflow** (pre-screen,
+dynamic planning, parallel analysis, consolidation, verification, report). To
+understand the stages, control them (custom prompts, stage selection), or
+customize the pipeline, see the
+[Workflows & Review Pipeline](docs/workflows.md) guide.
+
 ### 2. Daemon Mode
 
 The daemon is responsible for monitoring mailing lists (NNTP), managing the database, and coordinating the AI review process. It also provides a Web UI and an API.
