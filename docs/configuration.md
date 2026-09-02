@@ -99,7 +99,7 @@ Core AI settings that apply to all providers.
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
-| `temperature` | float | `1.0` | Sampling temperature. |
+| `temperature` | float | `1.0` | Sampling temperature. Providers and models that do not support it may omit it. |
 | `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
 | `response_cache` | bool | `false` | Cache AI responses to disk. The daemon keeps the cache beside its database; a local review, which has none, keeps it under `$XDG_DATA_HOME/sashiko/`. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. |
@@ -141,15 +141,37 @@ Settings for the Gemini provider (`provider = "gemini"`).
 |-----|------|---------|-------------|
 | `explicit_prompt_caching` | bool | `false` | Use explicit caching hints in requests. |
 
+#### `[ai.openai]`
+
+Settings for the dedicated OpenAI provider (`provider = "openai"`), which targets the
+`/v1/responses` endpoint.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_url` | string | `https://api.openai.com/v1/responses` | HTTPS Responses endpoint or recognized API root. Sashiko appends `/responses` to a bare host, `/v1`, or `/api/v1`; HTTP is allowed only for loopback endpoints. |
+| `context_window_size` | integer | model-derived | Context window size. `1050000` for the GPT-5.6 family; `128000` for most other models. |
+| `max_tokens` | integer | `16384` | Maximum combined reasoning and visible output tokens per response. |
+| `reasoning_effort` | string | model default | Reasoning effort for GPT-5.6 models: `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. Leave unset to use the model default (`"medium"` for GPT-5.6). |
+
+> **Migration:** `provider = "openai"` without an `[ai.openai]` table continues
+> using Chat Completions and `max_completion_tokens`, but emits a deprecation
+> warning. This includes table-less configurations and configurations with
+> only `[ai.openai_compat]`. To make that mode explicit, select
+> `provider = "openai-compatible"` and set
+> `token_limit_field = "max_completion_tokens"`. To opt into Responses, add or
+> migrate settings to `[ai.openai]`; replace a `/v1/chat/completions` URL with
+> a Responses endpoint or API root, or omit it to use OpenAI's default.
+
 #### `[ai.openai_compat]`
 
-Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-compatible"`).
+Settings for the OpenAI-compatible provider (`provider = "openai-compatible"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
-| `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
+| `max_tokens` | integer | `4096` | Max output tokens per response. |
+| `token_limit_field` | string | `"max_tokens"` | Request field used for the output limit. Set to `"max_completion_tokens"` for official Chat Completions reasoning models and compatible proxies that require it. |
 
 #### `[ai.kiro_cli]`
 

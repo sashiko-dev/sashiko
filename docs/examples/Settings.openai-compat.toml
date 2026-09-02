@@ -7,3 +7,4 @@ model = "gemma-xyz"
 base_url = "http://localhost:8080/v1"
 context_window_size = 8192
 max_tokens = 2048
+# token_limit_field = "max_completion_tokens"  # For endpoints that require it
