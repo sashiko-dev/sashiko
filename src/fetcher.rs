@@ -293,7 +293,7 @@ impl FetchAgent {
                         .unwrap_or((None, None, None));
 
                     let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, &commit_or_range)
+                        format!("mr-{}-{}", number, commit_or_range)
                     } else {
                         commit_or_range.clone()
                     };
