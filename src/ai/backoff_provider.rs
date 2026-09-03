@@ -61,6 +61,37 @@ pub trait RetryBudget: Send + Sync {
     fn check(&self) -> Result<()>;
 }
 
+/// A [`RetryBudget`] backed by a wall-clock deadline shared with the caller.
+///
+/// Time spent parked on the quota gate is credited back, so waiting out a rate
+/// limit does not consume the caller's budget.
+pub struct DeadlineBudget {
+    deadline: Arc<std::sync::Mutex<tokio::time::Instant>>,
+}
+
+impl DeadlineBudget {
+    pub fn new(deadline: Arc<std::sync::Mutex<tokio::time::Instant>>) -> Self {
+        Self { deadline }
+    }
+}
+
+impl RetryBudget for DeadlineBudget {
+    fn credit_wait(&self, slept: Duration) {
+        let mut d = self.deadline.lock().unwrap();
+        *d += slept;
+    }
+
+    fn check(&self) -> Result<()> {
+        let current = { *self.deadline.lock().unwrap() };
+        if tokio::time::Instant::now() > current {
+            return Err(anyhow::anyhow!(
+                "Review tool timed out (active time exceeded)"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Adds rate-limit and transient retry with backoff around an inner provider.
 pub struct BackoffProvider {
     inner: Arc<dyn AiProvider>,
@@ -290,6 +321,26 @@ mod tests {
         let err = fast(m.clone()).generate_content(dummy_request()).await;
         assert!(err.is_err());
         assert_eq!(m.calls.load(Ordering::SeqCst), 1); // no retry on fatal
+    }
+
+    #[tokio::test]
+    async fn expired_budget_stops_before_calling() {
+        struct Expired;
+        impl RetryBudget for Expired {
+            fn credit_wait(&self, _slept: Duration) {}
+            fn check(&self) -> Result<()> {
+                Err(anyhow::anyhow!("deadline exceeded"))
+            }
+        }
+        let m = mock(Behaviour::Transient, u32::MAX, Duration::ZERO);
+        let provider = BackoffProvider::new(
+            m.clone(),
+            Arc::new(QuotaManager::new()),
+            Some(Arc::new(Expired)),
+        );
+        assert!(provider.generate_content(dummy_request()).await.is_err());
+        // The budget gates the loop, so the inner provider is never reached.
+        assert_eq!(m.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

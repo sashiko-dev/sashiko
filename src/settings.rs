@@ -533,6 +533,8 @@ fn default_forge() -> ForgeSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewReviewSettings {
     pub concurrency: usize,
+    #[serde(default = "default_review_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -644,6 +646,8 @@ mod tests {
         std::fs::write(&path, format!("{}\n[review]\nconcurrency = 8\n", ai)).unwrap();
         let settings = Settings::local_review_from_file(&path).unwrap();
         assert_eq!(settings.review.concurrency, 8);
+        // timeout_seconds keeps a default, as it does for the daemon.
+        assert_eq!(settings.review.timeout_seconds, 3600);
     }
 
     /// `sashiko init` writes this template, so it has to satisfy the shape a

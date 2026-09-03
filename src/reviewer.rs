@@ -1728,28 +1728,12 @@ async fn run_review_tool_with_cmd(
     // than an open-coded loop. A review is bounded by its activity deadline
     // rather than an attempt count, and time spent waiting out a rate limit is
     // credited back so it does not consume that budget.
-    struct DeadlineBudget {
-        deadline: Arc<std::sync::Mutex<TokioInstant>>,
-    }
-    impl crate::ai::backoff_provider::RetryBudget for DeadlineBudget {
-        fn credit_wait(&self, slept: Duration) {
-            let mut d = self.deadline.lock().unwrap();
-            *d += slept;
-        }
-        fn check(&self) -> Result<()> {
-            let current = { *self.deadline.lock().unwrap() };
-            if TokioInstant::now() > current {
-                return Err(anyhow::anyhow!("Review tool timed out (active time exceeded)"));
-            }
-            Ok(())
-        }
-    }
     let provider: Arc<dyn AiProvider> = Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
         provider,
         quota_manager.clone(),
-        Some(Arc::new(DeadlineBudget {
-            deadline: deadline.clone(),
-        })),
+        Some(Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
+            deadline.clone(),
+        ))),
     ));
 
     let mut spawned_tasks = Vec::new();
