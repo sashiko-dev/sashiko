@@ -532,13 +532,13 @@ fn default_forge() -> ForgeSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewReviewSettings {
-    pub concurrency: Option<usize>,
+    pub concurrency: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewSettings {
     pub ai: AiSettings,
-    pub review: Option<LocalReviewReviewSettings>,
+    pub review: LocalReviewReviewSettings,
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
@@ -627,6 +627,31 @@ mod tests {
             let _ = Settings::from_file("Settings")
                 .expect("Production 'Settings.toml' failed to parse");
         }
+    }
+
+    /// concurrency is required for local reviews exactly as it is for the
+    /// daemon, so an absent [review] section is an error rather than a guess
+    /// at how much machine the review has to itself.
+    #[test]
+    fn test_local_review_requires_a_review_section() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let ai = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n";
+
+        std::fs::write(&path, ai).unwrap();
+        assert!(Settings::local_review_from_file(&path).is_err());
+
+        std::fs::write(&path, format!("{}\n[review]\nconcurrency = 8\n", ai)).unwrap();
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        assert_eq!(settings.review.concurrency, 8);
+    }
+
+    /// `sashiko init` writes this template, so it has to satisfy the shape a
+    /// local review reads or the two commands disagree out of the box.
+    #[test]
+    fn test_init_template_satisfies_local_review() {
+        Settings::local_review_from_file("docs/examples/Settings.example.toml")
+            .expect("init template must parse as local review settings");
     }
 
     #[test]

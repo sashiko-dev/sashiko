@@ -280,18 +280,12 @@ pub async fn run_worker(
     let (mut ai, configured_repo_path, concurrency) = if let Some(path) = &options.settings_path {
         let local_settings = Settings::local_review_from_file(path)
             .with_context(|| format!("Failed to load settings from {}", path.display()))?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
+        let concurrency = local_settings.review.concurrency;
         (local_settings.ai, None, concurrency)
     } else if repo_override.is_some() {
         let local_settings =
             Settings::local_review_settings().context("Failed to load local review settings")?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
+        let concurrency = local_settings.review.concurrency;
         (local_settings.ai, None, concurrency)
     } else {
         let settings = Settings::new().context("Failed to load settings")?;

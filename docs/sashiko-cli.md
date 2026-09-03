@@ -312,6 +312,7 @@ model = "gemini-3.1-pro-preview"
 repository_path = "/path/to/your/kernel/tree"
 
 [review]
+concurrency = 4
 worktree_dir = "review_trees"
 ```
 
