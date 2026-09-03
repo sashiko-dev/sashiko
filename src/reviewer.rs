@@ -1724,6 +1724,34 @@ async fn run_review_tool_with_cmd(
         TokioInstant::now() + Duration::from_secs(settings.review.timeout_seconds),
     ));
 
+    // Retry rate-limited and transient failures with the shared limiter rather
+    // than an open-coded loop. A review is bounded by its activity deadline
+    // rather than an attempt count, and time spent waiting out a rate limit is
+    // credited back so it does not consume that budget.
+    struct DeadlineBudget {
+        deadline: Arc<std::sync::Mutex<TokioInstant>>,
+    }
+    impl crate::ai::backoff_provider::RetryBudget for DeadlineBudget {
+        fn credit_wait(&self, slept: Duration) {
+            let mut d = self.deadline.lock().unwrap();
+            *d += slept;
+        }
+        fn check(&self) -> Result<()> {
+            let current = { *self.deadline.lock().unwrap() };
+            if TokioInstant::now() > current {
+                return Err(anyhow::anyhow!("Review tool timed out (active time exceeded)"));
+            }
+            Ok(())
+        }
+    }
+    let provider: Arc<dyn AiProvider> = Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+        provider,
+        quota_manager.clone(),
+        Some(Arc::new(DeadlineBudget {
+            deadline: deadline.clone(),
+        })),
+    ));
+
     let mut spawned_tasks = Vec::new();
     let interaction_result =
         async {
@@ -1796,10 +1824,8 @@ async fn run_review_tool_with_cmd(
 
                                         let db_clone = db.clone();
                                         let provider_clone = provider.clone();
-                                        let quota_clone = quota_manager.clone();
                                         let settings_clone = settings.clone();
                                         let stdin_clone = stdin_writer.clone();
-                                        let deadline_clone = deadline.clone();
                                         let total_tokens_used_clone = total_tokens_used.clone();
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
@@ -1843,57 +1869,9 @@ async fn run_review_tool_with_cmd(
                                             }
 
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
-                                            let resp_payload = crate::ai::LOG_CONTEXT.scope(ctx_tag, async {
-                                                let mut local_transient_errors = 0;
-                                                loop {
-                                                    let slept = quota_clone.wait_for_access().await;
-                                                    {
-                                                        let mut d = deadline_clone.lock().unwrap();
-                                                        *d += slept;
-                                                    }
-
-                                                    let current_deadline = {
-                                                        let d = deadline_clone.lock().unwrap();
-                                                        *d
-                                                    };
-
-                                                    if TokioInstant::now() > current_deadline {
-                                                        return Err(anyhow::anyhow!(
-                                                            "Review tool timed out (active time exceeded)"
-                                                        ));
-                                                    }
-
-                                                    match provider_clone.generate_content(req.clone()).await {
-                                                        Ok(resp) => {
-                                                            quota_clone.report_success().await;
-                                                            break Ok(resp);
-                                                        }
-                                                        Err(e) => {
-                                                            match classify_ai_error(&e) {
-                                                                AiErrorClass::RateLimit { retry_after } => {
-                                                                    quota_clone
-                                                                        .report_quota_error(retry_after)
-                                                                        .await;
-                                                                    continue;
-                                                                }
-                                                                AiErrorClass::Transient { retry_after } => {
-                                                                    local_transient_errors += 1;
-                                                                    let backoff_secs = (1.0 * (2.0_f64.powi(local_transient_errors - 1))).min(60.0);
-                                                                    let backoff = std::time::Duration::from_secs_f64(backoff_secs).max(retry_after);
-                                                                    tracing::warn!(
-                                                                        "AI provider transient error (streak: {}). Locally backing off for {:.2}s",
-                                                                        local_transient_errors,
-                                                                        backoff.as_secs_f64()
-                                                                    );
-                                                                    tokio::time::sleep(backoff).await;
-                                                                    continue;
-                                                                }
-                                                                AiErrorClass::Fatal => break Err(e),
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }).await;
+                                            let resp_payload = crate::ai::LOG_CONTEXT
+                                                .scope(ctx_tag, provider_clone.generate_content(req.clone()))
+                                                .await;
 
                                             let reply = match resp_payload {
                                                 Ok(p) => {

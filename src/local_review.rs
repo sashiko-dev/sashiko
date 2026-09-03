@@ -425,6 +425,7 @@ fn decorate_provider(
     inner: std::sync::Arc<dyn crate::ai::AiProvider>,
     ai: &AiSettings,
     llm_semaphore: &Arc<Semaphore>,
+    quota: &Arc<crate::ai::quota::QuotaManager>,
 ) -> std::sync::Arc<dyn crate::ai::AiProvider> {
     let provider: std::sync::Arc<dyn crate::ai::AiProvider> = if ai.log_turns {
         std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(inner))
@@ -436,12 +437,20 @@ fn decorate_provider(
         return provider;
     }
 
-    std::sync::Arc::new(
+    let provider: std::sync::Arc<dyn crate::ai::AiProvider> = std::sync::Arc::new(
         crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
             provider,
             llm_semaphore.clone(),
         ),
-    )
+    );
+
+    // Backoff goes outermost, so a call that is waiting out a rate limit holds
+    // no concurrency permit while it sleeps.
+    std::sync::Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+        provider,
+        quota.clone(),
+        None,
+    ))
 }
 
 async fn review_single_patch(
@@ -456,6 +465,7 @@ async fn review_single_patch(
     options: &WorkerOptions,
     baseline_sha: &str,
     llm_semaphore: &Arc<Semaphore>,
+    quota: &Arc<crate::ai::quota::QuotaManager>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     let mut last_error = None;
@@ -478,7 +488,7 @@ async fn review_single_patch(
 
         let provider =
             crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
-        let provider = decorate_provider(provider, ai, llm_semaphore);
+        let provider = decorate_provider(provider, ai, llm_semaphore, quota);
         let prompts_tool_path = Some(options.prompts.join("tool.md"));
 
         let mut patch_files = Vec::new();
@@ -849,6 +859,8 @@ async fn run_worker_in_worktree(
     let llm_semaphore = Arc::new(Semaphore::new(
         crate::ai::concurrency_limited_provider::llm_permits(concurrency),
     ));
+    // Shared so a rate-limit response from one request backs the whole run off.
+    let quota = Arc::new(crate::ai::quota::QuotaManager::new());
 
     // Execute patch reviews concurrently with a limit
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
@@ -858,6 +870,7 @@ async fn run_worker_in_worktree(
         let subject_clone = subject.clone();
         let all_patches = &patches;
         let llm_semaphore = &llm_semaphore;
+        let quota = &quota;
         async move {
             review_single_patch(
                 worktree,
@@ -871,6 +884,7 @@ async fn run_worker_in_worktree(
                 options,
                 baseline_sha,
                 llm_semaphore,
+                quota,
                 progress,
             )
             .await
@@ -1221,12 +1235,101 @@ mod tests {
         Arc::new(StubProvider)
     }
 
+    /// Fails the first call with a rate limit, then succeeds, so a test can
+    /// tell whether the retry limiter was actually installed.
+    struct RateLimitOnce {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for RateLimitOnce {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> Result<crate::ai::AiResponse> {
+            use std::sync::atomic::Ordering;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(crate::ai::gemini::GeminiError::QuotaExceeded(
+                    std::time::Duration::from_millis(5),
+                )
+                .into());
+            }
+            Ok(crate::ai::AiResponse {
+                content: Some("ok".into()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            0
+        }
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "rate-limit-once".into(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    fn dummy_request() -> crate::ai::AiRequest {
+        crate::ai::AiRequest {
+            system: None,
+            messages: vec![crate::ai::AiMessage {
+                role: crate::ai::AiRole::User,
+                content: Some("hi".into()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decorate_provider_retries_rate_limits_for_in_process_reviews() -> Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let mut settings = Settings::new()?;
+        settings.ai.log_turns = false;
+        let sem = Arc::new(Semaphore::new(4));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+
+        // In-process: the limiter waits out the window and retries, so the
+        // caller sees a success rather than the rate-limit error.
+        settings.ai.provider = "claude-cli".to_string();
+        let inner = Arc::new(RateLimitOnce {
+            calls: AtomicU32::new(0),
+        });
+        let decorated = decorate_provider(inner.clone(), &settings.ai, &sem, &quota);
+        let response = decorated.generate_content(dummy_request()).await?;
+        assert_eq!(response.content.as_deref(), Some("ok"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+
+        // Daemon-spawned worker: the daemon owns the retry, so the error is
+        // passed straight back instead of being retried here as well.
+        settings.ai.provider = "stdio-claude".to_string();
+        let inner = Arc::new(RateLimitOnce {
+            calls: AtomicU32::new(0),
+        });
+        let decorated = decorate_provider(inner.clone(), &settings.ai, &sem, &quota);
+        assert!(decorated.generate_content(dummy_request()).await.is_err());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     #[test]
     fn test_decorate_provider_log_turns_gate() -> Result<()> {
         let mut settings = Settings::new()?;
         // A stdio provider skips the limiters, isolating the logging decision.
         settings.ai.provider = "stdio-gemini".to_string();
         let sem = Arc::new(Semaphore::new(1));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
 
         // Off: the provider is handed back untouched, so a review that does not
         // ask for turn logging pays nothing for it.
@@ -1234,7 +1337,7 @@ mod tests {
         let inner = stub();
         assert!(Arc::ptr_eq(
             &inner,
-            &decorate_provider(inner.clone(), &settings.ai, &sem)
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota)
         ));
 
         // On: wrapped, so the turns are logged.
@@ -1242,7 +1345,7 @@ mod tests {
         let inner = stub();
         assert!(!Arc::ptr_eq(
             &inner,
-            &decorate_provider(inner.clone(), &settings.ai, &sem)
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota)
         ));
         Ok(())
     }
@@ -1252,6 +1355,7 @@ mod tests {
         let mut settings = Settings::new()?;
         settings.ai.log_turns = false;
         let sem = Arc::new(Semaphore::new(1));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
 
         // A daemon-spawned worker is throttled by the daemon, so it must be
         // left unwrapped rather than limited twice.
@@ -1259,7 +1363,7 @@ mod tests {
         let inner = stub();
         assert!(Arc::ptr_eq(
             &inner,
-            &decorate_provider(inner.clone(), &settings.ai, &sem)
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota)
         ));
 
         // A review running in-process has nothing in front of it, so it gets
@@ -1268,7 +1372,7 @@ mod tests {
         let inner = stub();
         assert!(!Arc::ptr_eq(
             &inner,
-            &decorate_provider(inner.clone(), &settings.ai, &sem)
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota)
         ));
         Ok(())
     }

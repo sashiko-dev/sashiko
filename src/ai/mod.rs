@@ -638,6 +638,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
+pub mod backoff_provider;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 pub mod cache;
