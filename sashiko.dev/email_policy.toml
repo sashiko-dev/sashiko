@@ -299,12 +299,8 @@ cc = ["media-ci@linuxtv.org"]
 
 [subsystems.mtd]
 lists = ["linux-mtd@lists.infradead.org"]
-cc = ["Miquel Raynal <miquel.raynal@bootlin.com>",
-      "Richard Weinberger <richard@nod.at>",
-      "Vignesh Raghavendra <vigneshr@ti.com>",
-      "Pratyush Yadav <pratyush@kernel.org>",
-      "Michael Walle <mwalle@kernel.org>",
-      "Takahiro Kuwano <takahiro.kuwano@infineon.com>"]
+reply_all = true
+reply_to_author = true
 
 [subsystems.audit]
 lists = ["audit@vger.kernel.org"]
