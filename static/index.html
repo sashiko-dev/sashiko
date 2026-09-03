@@ -3706,6 +3706,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <span>${escapeHtml(data.problem || 'Linux Kernel Bug')}</span>
                     <span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span>
                 </h1>
+                
+                <div style="margin-bottom: 24px; display: flex; gap: 8px;">
+                    <button class="btn primary" onclick="openBugActionModal('comment', '${escapeHtml(data.id || data.slug || data.bugid)}')">Add Comment</button>
+                    ${data.status !== 'closed' && data.status !== 'fixed' ? `<button class="btn" onclick="openBugActionModal('close', '${escapeHtml(data.id || data.slug || data.bugid)}')">Close</button>` : ''}
+                    ${data.status !== 'dismissed' ? `<button class="btn" onclick="openBugActionModal('dismiss', '${escapeHtml(data.id || data.slug || data.bugid)}')">Dismiss</button>` : ''}
+                    ${data.status !== 'duplicate' ? `<button class="btn" onclick="openBugActionModal('mark_duplicate', '${escapeHtml(data.id || data.slug || data.bugid)}')">Mark as Duplicate</button>` : ''}
+                </div>
 
                 <div class="section">
                     <h2>Raw Data</h2>
@@ -4445,7 +4452,135 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
         loadSettings();
         fetchConfig().then(router);
+        function openBugActionModal(action, id) {
+            document.getElementById('bugActionType').value = action;
+            document.getElementById('bugActionTargetId').value = id;
+            document.getElementById('bugActionReason').value = '';
+            document.getElementById('bugActionDuplicateId').value = '';
+            document.getElementById('bugActionError').style.display = 'none';
+            document.getElementById('bugActionSubmitBtn').disabled = false;
+            
+            const titleEl = document.getElementById('bugActionTitle');
+            const reasonLabelEl = document.getElementById('bugActionReasonLabel');
+            const dupSection = document.getElementById('bugActionDuplicateSection');
+            const reasonArea = document.getElementById('bugActionReason');
+            
+            dupSection.style.display = 'none';
+            
+            if (action === 'comment') {
+                titleEl.textContent = 'Add Comment';
+                reasonLabelEl.textContent = 'Comment:';
+                reasonArea.placeholder = 'Type your comment...';
+            } else if (action === 'close') {
+                titleEl.textContent = 'Close Bug';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Why is this being closed?';
+            } else if (action === 'dismiss') {
+                titleEl.textContent = 'Dismiss Bug';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Why is this being dismissed?';
+            } else if (action === 'mark_duplicate') {
+                titleEl.textContent = 'Mark as Duplicate';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Explain why it is a duplicate...';
+                dupSection.style.display = 'block';
+            }
+            
+            document.getElementById('bugActionModal').classList.add('open');
+        }
+
+        function closeBugActionModal() {
+            document.getElementById('bugActionModal').classList.remove('open');
+        }
+
+        async function submitBugAction(event) {
+            event.preventDefault();
+            const action = document.getElementById('bugActionType').value;
+            const id = document.getElementById('bugActionTargetId').value;
+            let reason = document.getElementById('bugActionReason').value.trim();
+            const errorEl = document.getElementById('bugActionError');
+            const submitBtn = document.getElementById('bugActionSubmitBtn');
+            
+            errorEl.style.display = 'none';
+            submitBtn.disabled = true;
+            
+            const payload = { action: action };
+            
+            if (action === 'comment') {
+                if (!reason) {
+                    errorEl.textContent = 'Comment content is required.';
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+                payload.content = reason;
+            } else if (action === 'close' || action === 'dismiss') {
+                if (reason) {
+                    payload.reason = reason;
+                }
+            } else if (action === 'mark_duplicate') {
+                const dupIdStr = document.getElementById('bugActionDuplicateId').value.trim();
+                if (!dupIdStr) {
+                    errorEl.textContent = 'Canonical Bug ID is required.';
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+                payload.duplicate_of_id = parseInt(dupIdStr, 10);
+                if (reason) {
+                    payload.reasoning = reason;
+                }
+            }
+            
+            try {
+                const res = await fetch(`/api/bug/action?id=${encodeURIComponent(id)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!res.ok) {
+                    let errStr = res.statusText;
+                    try { const errObj = await res.json(); if(errObj.error) errStr = errObj.error; } catch(e) {}
+                    throw new Error(errStr);
+                }
+                
+                closeBugActionModal();
+                renderBugView(id);
+                
+            } catch (e) {
+                errorEl.textContent = e.message;
+                errorEl.style.display = 'block';
+                submitBtn.disabled = false;
+            }
+        }
     </script>
+    <div id="bugActionModal" class="modal-overlay" onclick="if(event.target===this) closeBugActionModal()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeBugActionModal()">&times;</span>
+            <div class="about-logo" id="bugActionTitle" style="margin-bottom: 24px;">Action</div>
+            
+            <form id="bugActionForm" onsubmit="submitBugAction(event)">
+                <input type="hidden" id="bugActionType" value="">
+                <input type="hidden" id="bugActionTargetId" value="">
+                
+                <div id="bugActionDuplicateSection" style="display: none; margin-bottom: 16px;">
+                    <div style="margin-bottom: 8px;"><strong>Canonical Bug ID:</strong></div>
+                    <input type="number" id="bugActionDuplicateId" class="search-input" placeholder="e.g. 12" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box;" step="1">
+                    <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Enter the internal database ID of the parent/canonical bug.</div>
+                </div>
+
+                <div style="margin-bottom: 8px;"><strong id="bugActionReasonLabel">Reason / Comment:</strong></div>
+                <textarea id="bugActionReason" class="search-input" style="width: 100%; height: 120px; border: 1px solid var(--border); box-sizing: border-box; resize: vertical;" placeholder="Add reasoning or context..."></textarea>
+                
+                <div style="margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;">
+                    <button type="button" class="btn" onclick="closeBugActionModal()">Cancel</button>
+                    <button type="submit" class="btn primary" id="bugActionSubmitBtn">Submit</button>
+                </div>
+                <div id="bugActionError" style="color: var(--status-failed); margin-top: 12px; display: none;"></div>
+            </form>
+        </div>
+    </div>
 </body>
 
 </html>
