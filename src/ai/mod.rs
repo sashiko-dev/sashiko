@@ -644,6 +644,7 @@ pub mod cache;
 pub mod claude;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod concurrency_limited_provider;
 pub mod copilot_cli;
 pub mod devin_cli;
 pub mod gemini;

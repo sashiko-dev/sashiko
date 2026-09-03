@@ -28,7 +28,9 @@ use std::{
     collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 #[derive(Clone, Debug)]
@@ -416,15 +418,30 @@ pub async fn run_worker(
 /// Per-turn logging is implemented once, as a provider decorator, rather than
 /// in each front end: both local-CLI and daemon-spawned worker reviews run this
 /// same path, so wrapping here covers both.
+///
+/// The limiters are skipped for a daemon-spawned worker, which reaches the
+/// model through a stdio provider and is throttled by the daemon instead.
 fn decorate_provider(
     inner: std::sync::Arc<dyn crate::ai::AiProvider>,
     ai: &AiSettings,
+    llm_semaphore: &Arc<Semaphore>,
 ) -> std::sync::Arc<dyn crate::ai::AiProvider> {
-    if ai.log_turns {
+    let provider: std::sync::Arc<dyn crate::ai::AiProvider> = if ai.log_turns {
         std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(inner))
     } else {
         inner
+    };
+
+    if ai.provider.starts_with("stdio-") {
+        return provider;
     }
+
+    std::sync::Arc::new(
+        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+            provider,
+            llm_semaphore.clone(),
+        ),
+    )
 }
 
 async fn review_single_patch(
@@ -438,6 +455,7 @@ async fn review_single_patch(
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
     baseline_sha: &str,
+    llm_semaphore: &Arc<Semaphore>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     let mut last_error = None;
@@ -460,7 +478,7 @@ async fn review_single_patch(
 
         let provider =
             crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
-        let provider = decorate_provider(provider, ai);
+        let provider = decorate_provider(provider, ai, llm_semaphore);
         let prompts_tool_path = Some(options.prompts.join("tool.md"));
 
         let mut patch_files = Vec::new();
@@ -824,6 +842,14 @@ async fn run_worker_in_worktree(
         })
         .collect();
 
+    // Cap in-flight model calls across the whole run. The patch fan-out below
+    // is bounded by `concurrency`; each patch then fans its stages out
+    // concurrently on top of that, so without a shared ceiling the number of
+    // simultaneous requests is unbounded.
+    let llm_semaphore = Arc::new(Semaphore::new(
+        crate::ai::concurrency_limited_provider::llm_permits(concurrency),
+    ));
+
     // Execute patch reviews concurrently with a limit
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
@@ -831,6 +857,7 @@ async fn run_worker_in_worktree(
         let options = &options;
         let subject_clone = subject.clone();
         let all_patches = &patches;
+        let llm_semaphore = &llm_semaphore;
         async move {
             review_single_patch(
                 worktree,
@@ -843,6 +870,7 @@ async fn run_worker_in_worktree(
                 patch_shas,
                 options,
                 baseline_sha,
+                llm_semaphore,
                 progress,
             )
             .await
@@ -1196,6 +1224,9 @@ mod tests {
     #[test]
     fn test_decorate_provider_log_turns_gate() -> Result<()> {
         let mut settings = Settings::new()?;
+        // A stdio provider skips the limiters, isolating the logging decision.
+        settings.ai.provider = "stdio-gemini".to_string();
+        let sem = Arc::new(Semaphore::new(1));
 
         // Off: the provider is handed back untouched, so a review that does not
         // ask for turn logging pays nothing for it.
@@ -1203,7 +1234,7 @@ mod tests {
         let inner = stub();
         assert!(Arc::ptr_eq(
             &inner,
-            &decorate_provider(inner.clone(), &settings.ai)
+            &decorate_provider(inner.clone(), &settings.ai, &sem)
         ));
 
         // On: wrapped, so the turns are logged.
@@ -1211,7 +1242,33 @@ mod tests {
         let inner = stub();
         assert!(!Arc::ptr_eq(
             &inner,
-            &decorate_provider(inner.clone(), &settings.ai)
+            &decorate_provider(inner.clone(), &settings.ai, &sem)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_decorate_provider_skips_limiters_for_stdio_workers() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.ai.log_turns = false;
+        let sem = Arc::new(Semaphore::new(1));
+
+        // A daemon-spawned worker is throttled by the daemon, so it must be
+        // left unwrapped rather than limited twice.
+        settings.ai.provider = "stdio-claude".to_string();
+        let inner = stub();
+        assert!(Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai, &sem)
+        ));
+
+        // A review running in-process has nothing in front of it, so it gets
+        // the limiter.
+        settings.ai.provider = "claude-cli".to_string();
+        let inner = stub();
+        assert!(!Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai, &sem)
         ));
         Ok(())
     }

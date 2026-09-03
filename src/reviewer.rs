@@ -134,16 +134,8 @@ impl Reviewer {
         .await
         .expect("Failed to create AI provider");
 
-        // Mathematically derived from Sashiko's review pipeline stage composition:
-        // Stages 1-7 run in parallel (7 slots), while Stages 8-11 run sequentially (1 slot).
-        // On average, an active patch review consumes ~3 LLM slots over its execution lifetime.
-        // Thus, the global LLM request semaphore is scaled to (concurrency * 3) to fully
-        // saturate LLM capacity while gating local processes/worktrees strictly to `concurrency`.
-        let llm_concurrency = if concurrency < 2 {
-            1
-        } else {
-            std::cmp::max(1, concurrency * 3)
-        };
+        let llm_concurrency =
+            crate::ai::concurrency_limited_provider::llm_permits(concurrency);
 
         Self {
             db,
@@ -1614,6 +1606,16 @@ async fn run_review_tool_with_cmd(
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
 ) -> Result<serde_json::Value> {
+    // Cap concurrent model calls with the shared limiter instead of taking the
+    // semaphore by hand around each call. This also releases the permit as soon
+    // as the call returns, so a request that is backing off no longer occupies
+    // a slot while it sleeps.
+    let provider: Arc<dyn AiProvider> = Arc::new(
+        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+            provider,
+            llm_semaphore.clone(),
+        ),
+    );
     cmd.args([
         "--json",
         "--baseline",
@@ -1801,7 +1803,6 @@ async fn run_review_tool_with_cmd(
                                         let total_tokens_used_clone = total_tokens_used.clone();
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
-                                        let llm_semaphore_clone = llm_semaphore.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let req: AiRequest = match serde_json::from_value(payload) {
@@ -1861,8 +1862,6 @@ async fn run_review_tool_with_cmd(
                                                             "Review tool timed out (active time exceeded)"
                                                         ));
                                                     }
-
-                                                    let _permit = llm_semaphore_clone.acquire().await?;
 
                                                     match provider_clone.generate_content(req.clone()).await {
                                                         Ok(resp) => {
