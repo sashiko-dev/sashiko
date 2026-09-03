@@ -328,3 +328,8 @@ reply_to_author = true
 send_positive_review = true
 cc = ["linux-serial@vger.kernel.org"]
 
+[subsystems.rdma]
+lists = ["linux-rdma@vger.kernel.org"]
+reply_to_author = true
+send_positive_review = true
+cc = ["linux-rdma@vger.kernel.org"]
