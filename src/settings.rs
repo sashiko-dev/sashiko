@@ -394,6 +394,9 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default)]
+    pub testing_mode: bool,
+    pub jwt_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

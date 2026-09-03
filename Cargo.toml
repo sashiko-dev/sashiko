@@ -86,3 +86,4 @@ subtle = "2"
 url = "2.5.8"
 percent-encoding = "2.3.2"
 uuid = "1.23.4"
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }

@@ -15,6 +15,7 @@ pub mod metrics;
 
 pub mod ai;
 pub mod api;
+pub mod auth;
 pub mod baseline;
 pub mod compression;
 pub mod db;
