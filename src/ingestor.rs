@@ -375,13 +375,20 @@ impl Ingestor {
                     current, overlap
                 );
             } else if current > info.high {
-                warn!(
-                    "Group {}: high-water mark {} is ahead of server tip {}; resetting to tip with overlap",
-                    group_name, current, info.high
-                );
-                let overlap = 100;
-                current = info.high.saturating_sub(overlap);
-                self.db.update_last_article_num(group_name, current).await?;
+                if info.high == 0 {
+                    warn!(
+                        "Group {}: server tip is 0 (possible spool logic error); ignoring high-water mark clamp to prevent mass re-ingestion",
+                        group_name
+                    );
+                } else {
+                    warn!(
+                        "Group {}: high-water mark {} is ahead of server tip {}; resetting to tip with overlap",
+                        group_name, current, info.high
+                    );
+                    let overlap = 100;
+                    current = info.high.saturating_sub(overlap);
+                    self.db.update_last_article_num(group_name, current).await?;
+                }
             }
 
             // Fetch ALL pending messages
