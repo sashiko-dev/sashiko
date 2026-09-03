@@ -36,6 +36,27 @@ pub enum AiRole {
     Tool,
 }
 
+/// Opaque provider-specific data that must accompany a conversation item on a
+/// later turn.
+///
+/// Providers use this for protocol state that cannot be represented by the
+/// common message fields. Consumers must retain it verbatim, but providers
+/// other than the named one must ignore it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiProviderMetadata {
+    /// The provider that owns [`Self::data`].
+    pub provider: String,
+    /// Provider-defined schema version for [`Self::data`].
+    #[serde(default = "default_provider_metadata_version")]
+    pub version: u32,
+    /// Opaque, provider-defined JSON data.
+    pub data: serde_json::Value,
+}
+
+fn default_provider_metadata_version() -> u32 {
+    1
+}
+
 /// A single message in an AI conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiMessage {
@@ -55,6 +76,9 @@ pub struct AiMessage {
     /// Optional ID matching a tool call (required for Tool role).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Opaque provider-specific data required when replaying this message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<AiProviderMetadata>,
 }
 
 /// Represents a request from the AI to call a specific tool/function.
@@ -176,6 +200,9 @@ pub struct AiResponse {
     /// Whether the response was truncated by the provider (e.g., hit max tokens).
     #[serde(default)]
     pub truncated: bool,
+    /// Opaque provider-specific data required when replaying this response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<AiProviderMetadata>,
 }
 
 /// Classifies a remote AI error using the typed stdio protocol payload.
@@ -275,6 +302,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<openai::OpenAiCompatError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<openai_responses::OpenAiError>() {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<claude::ClaudeError>() {
@@ -381,9 +411,14 @@ pub async fn create_provider_cached(
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .join("response_cache.db");
-        let cached =
-            cache::CachingAiProvider::new(provider, &cache_path.to_string_lossy(), cache_ttl_days)
-                .await?;
+        let key_format = cache::CacheKeyFormat::for_provider(&settings.ai.provider);
+        let cached = cache::CachingAiProvider::new(
+            provider,
+            &cache_path.to_string_lossy(),
+            cache_ttl_days,
+            key_format,
+        )
+        .await?;
         Ok(Arc::new(cached))
     } else {
         Ok(provider)
@@ -443,12 +478,44 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         }
         #[cfg(not(feature = "bedrock"))]
         "bedrock" => bail!("bedrock provider requires the 'bedrock' feature"),
-        "openai" | "openai-compatible" => {
-            let provider_type = match ai.provider.to_lowercase().as_str() {
-                "openai" => openai::OpenAiProviderType::OpenAi,
-                _ => openai::OpenAiProviderType::OpenAiCompatible,
-            };
+        "openai" => {
+            if ai.openai.is_none() && ai.openai_compat.is_some() {
+                bail!(
+                    "provider = \"openai\" uses the Responses API and does not read \
+                     [ai.openai_compat]. Rename that section to [ai.openai], or use \
+                     provider = \"openai-compatible\" to continue using the Chat Completions API"
+                );
+            }
 
+            let openai = ai.openai.as_ref();
+            let base_url = openai
+                .and_then(|c| c.base_url.clone())
+                .unwrap_or_else(openai_responses::OpenAiClient::default_base_url);
+
+            let context_window = openai
+                .and_then(|c| c.context_window_size)
+                .unwrap_or_else(|| {
+                    openai_responses::OpenAiClient::default_context_window_for_model(&ai.model)
+                });
+
+            let max_tokens = openai
+                .and_then(|c| c.max_tokens)
+                .unwrap_or(openai_responses::DEFAULT_MAX_OUTPUT_TOKENS);
+
+            let reasoning_effort = openai.and_then(|c| c.reasoning_effort.clone());
+
+            let provider = openai_responses::OpenAiClient::new(
+                base_url,
+                ai.model.clone(),
+                context_window,
+                max_tokens,
+                reasoning_effort,
+                ai.api_timeout_secs,
+            )?;
+
+            Ok(Arc::new(provider))
+        }
+        "openai-compatible" => {
             let base_url = ai
                 .openai_compat
                 .as_ref()
@@ -473,7 +540,6 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
 
             let provider = openai::OpenAiCompatClient::new(
                 base_url,
-                provider_type,
                 ai.model.clone(),
                 context_window,
                 max_tokens,
@@ -618,6 +684,7 @@ pub mod gemini;
 pub mod kiro_cli;
 pub mod ollama;
 pub mod openai;
+pub mod openai_responses;
 pub mod proxy;
 pub mod quota;
 pub mod session;
@@ -629,13 +696,20 @@ pub mod vllm;
 pub use session::{ErrorAction, LlmSession, SessionRunner, ValidationError};
 
 /// Recursively removes `thought_signature` and `thoughtSignature` fields from a JSON value.
+///
+/// Opaque provider metadata is deliberately not traversed: it can contain
+/// provider-issued continuation state whose signature fields must be replayed
+/// verbatim. Human-readable session logs exclude that metadata before they are
+/// persisted.
 pub fn scrub_thought_signatures(val: &mut serde_json::Value) {
     match val {
         serde_json::Value::Object(map) => {
             map.remove("thought_signature");
             map.remove("thoughtSignature");
-            for (_, v) in map.iter_mut() {
-                scrub_thought_signatures(v);
+            for (key, value) in map.iter_mut() {
+                if key != "provider_metadata" {
+                    scrub_thought_signatures(value);
+                }
             }
         }
         serde_json::Value::Array(arr) => {
@@ -890,6 +964,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: Some(0.5),
@@ -928,6 +1003,15 @@ mod tests {
                         "thought_signature": "sig_123"
                     }
                 ],
+                "provider_metadata": {
+                    "provider": "openai.responses",
+                    "version": 1,
+                    "data": [{
+                        "id": "rsn_1",
+                        "type": "reasoning",
+                        "encrypted_content": "opaque"
+                    }]
+                },
                 "usage": {
                     "prompt_tokens": 100,
                     "completion_tokens": 50,
@@ -950,6 +1034,10 @@ mod tests {
         assert_eq!(tool_calls[0].function_name, "my_tool");
         assert_eq!(tool_calls[0].arguments["a"], 1);
         assert_eq!(tool_calls[0].thought_signature.as_deref(), Some("sig_123"));
+        assert_eq!(
+            payload.provider_metadata.as_ref().unwrap().data[0]["encrypted_content"],
+            "opaque"
+        );
 
         let usage = payload.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 100);
@@ -1243,6 +1331,77 @@ mod tests {
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    // Settings does not implement Default (and partial Settings deserialization
+    // does not work — see Task 1's notes), so AiSettings is constructed
+    // directly here rather than going through Settings.
+    #[test]
+    fn test_openai_provider_uses_responses_client() {
+        let ai = AiSettings {
+            provider: "openai".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            max_input_tokens: 150_000,
+            max_interactions: 100,
+            temperature: 1.0,
+            api_timeout_secs: 300,
+            no_ai: false,
+            log_turns: false,
+            response_cache: false,
+            response_cache_ttl_days: 7,
+            claude: None,
+            gemini: None,
+            #[cfg(feature = "bedrock")]
+            bedrock: None,
+            #[cfg(feature = "vertex")]
+            vertex: None,
+            // It is valid to keep settings for another provider while the
+            // dedicated OpenAI provider is active. Only a configuration that
+            // has no [ai.openai] section is the legacy combination.
+            openai_compat: Some(crate::settings::OpenAiCompatSettings {
+                base_url: Some("http://localhost:8080/v1".to_string()),
+                context_window_size: Some(32_768),
+                max_tokens: Some(1024),
+            }),
+            openai: Some(crate::settings::OpenAiSettings {
+                base_url: None,
+                context_window_size: None,
+                max_tokens: Some(16_384),
+                reasoning_effort: Some("medium".to_string()),
+            }),
+            ollama: None,
+            vllm: None,
+            kiro_cli: None,
+            claude_cli: None,
+            devin_cli: None,
+        };
+
+        let provider = create_provider_from_ai(&ai).unwrap();
+        assert_eq!(provider.get_capabilities().model_name, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn test_openai_provider_rejects_legacy_compat_settings() {
+        let legacy_ai: AiSettings = toml::from_str(
+            r#"
+provider = "openai"
+model = "gpt-5.6-sol"
+
+[openai_compat]
+base_url = "http://localhost:8080/v1"
+context_window_size = 32768
+max_tokens = 1024
+"#,
+        )
+        .unwrap();
+
+        let error = create_provider_from_ai(&legacy_ai).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "provider = \"openai\" uses the Responses API and does not read \
+             [ai.openai_compat]. Rename that section to [ai.openai], or use \
+             provider = \"openai-compatible\" to continue using the Chat Completions API"
+        );
     }
 
     // Providers built for concurrent reviews share one tx_id namespace.

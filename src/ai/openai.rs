@@ -37,8 +37,6 @@ pub struct OpenAiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
 }
 
@@ -163,27 +161,17 @@ impl ClassifyAiError for OpenAiCompatError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenAiProviderType {
-    /// Official OpenAI API — uses `max_completion_tokens`.
-    OpenAi,
-    /// Third-party OpenAI-compatible APIs — uses `max_tokens`.
-    OpenAiCompatible,
-}
-
 pub struct OpenAiCompatClient {
     model: String,
     base_url: String,
     context_window_size: usize,
     max_tokens: u32,
-    provider_type: OpenAiProviderType,
     client: Client,
 }
 
 impl OpenAiCompatClient {
     pub fn new(
         base_url: String,
-        provider_type: OpenAiProviderType,
         model: String,
         context_window_size: usize,
         max_tokens: u32,
@@ -214,7 +202,6 @@ impl OpenAiCompatClient {
             base_url,
             context_window_size,
             max_tokens,
-            provider_type,
             client,
         })
     }
@@ -361,11 +348,7 @@ impl OpenAiCompatClient {
     }
 }
 
-fn translate_ai_request(
-    request: AiRequest,
-    max_tokens: u32,
-    provider_type: OpenAiProviderType,
-) -> Result<OpenAiRequest> {
+fn translate_ai_request(request: AiRequest, max_tokens: u32) -> Result<OpenAiRequest> {
     let mut messages = Vec::new();
 
     if let Some(system_text) = request.system {
@@ -478,18 +461,12 @@ fn translate_ai_request(
         }
     }
 
-    let (max_tokens_field, max_completion_tokens_field) = match provider_type {
-        OpenAiProviderType::OpenAi => (None, Some(max_tokens)),
-        OpenAiProviderType::OpenAiCompatible => (Some(max_tokens), None),
-    };
-
     Ok(OpenAiRequest {
         model: String::new(),
         messages,
         tools,
         temperature: request.temperature,
-        max_tokens: max_tokens_field,
-        max_completion_tokens: max_completion_tokens_field,
+        max_tokens: Some(max_tokens),
         response_format,
     })
 }
@@ -557,10 +534,11 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         tool_calls,
         usage,
         truncated,
+        provider_metadata: None,
     })
 }
 
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
+pub fn estimate_tokens_generic(request: &AiRequest) -> usize {
     let mut total = 0;
     if let Some(system) = &request.system {
         total += TokenBudget::estimate_tokens(system);
@@ -591,7 +569,7 @@ impl AiProvider for OpenAiCompatClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         tracing::info!("Sending OpenAI request...");
 
-        let mut openai_req = translate_ai_request(request, self.max_tokens, self.provider_type)?;
+        let mut openai_req = translate_ai_request(request, self.max_tokens)?;
         openai_req.model = self.model.clone();
 
         let resp_body = serde_json::to_value(&openai_req)?;
@@ -682,6 +660,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: Some(0.7),
@@ -689,7 +668,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(openai_req.messages.len(), 2);
         assert_eq!(openai_req.messages[0].role, "system");
@@ -717,6 +696,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::User,
@@ -725,6 +705,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
             ],
             tools: None,
@@ -733,7 +714,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(openai_req.messages.len(), 2);
         assert_eq!(openai_req.messages[0].role, "system");
@@ -762,6 +743,7 @@ mod tests {
                     thought_signature: None,
                 }]),
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -769,7 +751,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(openai_req.messages.len(), 1);
         assert_eq!(openai_req.messages[0].role, "assistant");
@@ -797,6 +779,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: Some("call_123".to_string()),
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -804,7 +787,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(openai_req.messages.len(), 1);
         assert_eq!(openai_req.messages[0].role, "tool");
@@ -835,7 +818,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         let tools = openai_req.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
@@ -858,7 +841,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         // An empty tools array should be mapped to None so it gets skipped in serialization
         assert!(openai_req.tools.is_none());
@@ -878,6 +861,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::Assistant,
@@ -891,6 +875,7 @@ mod tests {
                         thought_signature: None,
                     }]),
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::Tool,
@@ -899,6 +884,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("c1".to_string()),
+                    provider_metadata: None,
                 },
             ],
             tools: Some(vec![AiTool {
@@ -911,7 +897,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(openai_req.messages.len(), 3);
         assert_eq!(openai_req.messages[0].role, "user");
@@ -938,6 +924,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -947,7 +934,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(
             openai_req.response_format,
@@ -975,6 +962,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -982,7 +970,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(
             openai_req.response_format,
@@ -1009,6 +997,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: Some(0.5),
@@ -1016,7 +1005,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(openai_req.temperature, Some(0.5));
 
@@ -1278,6 +1267,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 AiMessage {
                     role: AiRole::Assistant,
@@ -1291,6 +1281,7 @@ mod tests {
                         thought_signature: None,
                     }]),
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
             ],
             tools: Some(vec![AiTool {
@@ -1309,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn test_max_tokens_for_openai_compatible() -> Result<()> {
+    fn test_max_tokens() -> Result<()> {
         let request = AiRequest {
             system: None,
             messages: vec![AiMessage {
@@ -1319,6 +1310,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -1326,46 +1318,13 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         assert_eq!(openai_req.max_tokens, Some(4096));
-        assert_eq!(openai_req.max_completion_tokens, None);
 
-        // Verify serialized JSON has max_tokens and no max_completion_tokens
+        // Verify serialized JSON has max_tokens
         let json = serde_json::to_value(&openai_req)?;
         assert_eq!(json["max_tokens"], 4096);
-        assert!(json.get("max_completion_tokens").is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_max_completion_tokens_for_openai() -> Result<()> {
-        let request = AiRequest {
-            system: None,
-            messages: vec![AiMessage {
-                role: AiRole::User,
-                content: Some("Test".to_string()),
-                thought: None,
-                thought_signature: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            tools: None,
-            temperature: None,
-            response_format: None,
-            context_tag: None,
-        };
-
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAi)?;
-
-        assert_eq!(openai_req.max_tokens, None);
-        assert_eq!(openai_req.max_completion_tokens, Some(4096));
-
-        // Verify serialized JSON has max_completion_tokens and no max_tokens
-        let json = serde_json::to_value(&openai_req)?;
-        assert!(json.get("max_tokens").is_none());
-        assert_eq!(json["max_completion_tokens"], 4096);
 
         Ok(())
     }
@@ -1390,7 +1349,7 @@ mod tests {
             context_tag: None,
         };
 
-        let openai_req = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        let openai_req = translate_ai_request(request, 4096)?;
 
         let tools = openai_req.tools.as_ref().unwrap();
         assert_eq!(tools[0].function.parameters["type"], "object");
