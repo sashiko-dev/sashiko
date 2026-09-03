@@ -411,6 +411,22 @@ pub async fn run_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Wrap the raw provider with the decorators a worker-run review needs.
+///
+/// Per-turn logging is implemented once, as a provider decorator, rather than
+/// in each front end: both local-CLI and daemon-spawned worker reviews run this
+/// same path, so wrapping here covers both.
+fn decorate_provider(
+    inner: std::sync::Arc<dyn crate::ai::AiProvider>,
+    ai: &AiSettings,
+) -> std::sync::Arc<dyn crate::ai::AiProvider> {
+    if ai.log_turns {
+        std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(inner))
+    } else {
+        inner
+    }
+}
+
 async fn review_single_patch(
     worktree: &GitWorktree,
     ai: &AiSettings,
@@ -444,6 +460,7 @@ async fn review_single_patch(
 
         let provider =
             crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
+        let provider = decorate_provider(provider, ai);
         let prompts_tool_path = Some(options.prompts.join("tool.md"));
 
         let mut patch_files = Vec::new();
@@ -1147,6 +1164,57 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
+    use std::sync::Arc;
+
+    /// A provider that does nothing; the decoration tests only care about
+    /// whether it was wrapped, which `Arc::ptr_eq` answers directly.
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for StubProvider {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> Result<crate::ai::AiResponse> {
+            unreachable!("decoration tests never issue a request")
+        }
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            0
+        }
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "stub".into(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    fn stub() -> Arc<dyn crate::ai::AiProvider> {
+        Arc::new(StubProvider)
+    }
+
+    #[test]
+    fn test_decorate_provider_log_turns_gate() -> Result<()> {
+        let mut settings = Settings::new()?;
+
+        // Off: the provider is handed back untouched, so a review that does not
+        // ask for turn logging pays nothing for it.
+        settings.ai.log_turns = false;
+        let inner = stub();
+        assert!(Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai)
+        ));
+
+        // On: wrapped, so the turns are logged.
+        settings.ai.log_turns = true;
+        let inner = stub();
+        assert!(!Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai)
+        ));
+        Ok(())
+    }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
         let output = Command::new("git")

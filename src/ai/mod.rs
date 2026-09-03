@@ -648,6 +648,7 @@ pub mod copilot_cli;
 pub mod devin_cli;
 pub mod gemini;
 pub mod kiro_cli;
+pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
 pub mod proxy;
