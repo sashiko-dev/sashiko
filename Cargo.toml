@@ -78,7 +78,7 @@ toml = "1.0"
 tower-http = { version = "0.7.0", features = ["cors", "fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-tree-sitter = "0.26.9"
+tree-sitter = "0.27.0"
 tree-sitter-c = "0.24.2"
 hmac = "0.13"
 base64 = "0.23"
