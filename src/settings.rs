@@ -397,6 +397,8 @@ pub struct ServerSettings {
     #[serde(default)]
     pub testing_mode: bool,
     pub jwt_secret: Option<String>,
+    #[serde(default)]
+    pub admin_emails: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

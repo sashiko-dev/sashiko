@@ -55,11 +55,8 @@ impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &std::sync::Arc<crate::api::AppState>,
+        _state: &std::sync::Arc<crate::api::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let testing_mode = state.settings.server.testing_mode;
-
-        // If testing_mode is enabled and no token is provided, return anonymous user
         let auth_header = parts
             .headers
             .get("Authorization")
@@ -69,21 +66,17 @@ impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
         let token = match auth_header {
             Some(token) => token,
             None => {
-                if testing_mode {
-                    return Ok(AuthUser {
-                        email: "anonymous@localhost".to_string(),
-                    });
-                }
                 return Err((
                     StatusCode::UNAUTHORIZED,
-                    "Please log in to access this endpoint.",
+                    "Please log in to access bugs repository.",
                 ));
             }
         };
 
-        let secret = match &state.settings.server.jwt_secret {
-            Some(s) => s.clone(),
-            None => {
+        // In a real implementation this would come from the application state / config
+        let secret = match std::env::var("JWT_SECRET") {
+            Ok(s) => s,
+            Err(_) => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "JWT_SECRET is not configured on the server.",
@@ -109,6 +102,22 @@ impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
     }
 }
 
+
+pub struct OptionalAuthUser(pub Option<AuthUser>);
+
+impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for OptionalAuthUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &std::sync::Arc<crate::api::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        match AuthUser::from_request_parts(parts, state).await {
+            Ok(user) => Ok(OptionalAuthUser(Some(user))),
+            Err(_) => Ok(OptionalAuthUser(None)),
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,40 +153,3 @@ mod tests {
     }
 }
 
-pub struct SashikoUser {
-    pub email: String,
-}
-
-impl axum::extract::FromRequestParts<std::sync::Arc<crate::api::AppState>> for SashikoUser {
-    type Rejection = (StatusCode, &'static str);
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &std::sync::Arc<crate::api::AppState>,
-    ) -> Result<Self, Self::Rejection> {
-        let auth_user = match AuthUser::from_request_parts(parts, state).await {
-            Ok(u) => u,
-            Err(e) => {
-                // If it's loopback or allow_all_submit, we can bypass auth.
-                // But we can't easily get ConnectInfo here. Axum allows extracting it if present.
-                let addr = parts
-                    .extensions
-                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>();
-                let is_loopback = addr
-                    .map(|a| a.0.ip().to_canonical().is_loopback())
-                    .unwrap_or(false);
-
-                if is_loopback || state.allow_all_submit {
-                    return Ok(SashikoUser {
-                        email: "localhost@system".to_string(),
-                    });
-                }
-                return Err(e);
-            }
-        };
-
-        Ok(SashikoUser {
-            email: auth_user.email,
-        })
-    }
-}

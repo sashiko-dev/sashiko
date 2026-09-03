@@ -331,6 +331,8 @@ pub fn build_router(
         .route("/api/stats/reviews", get(stats_reviews))
         .route("/api/stats/tools", get(stats_tools))
         .route("/api/submit", post(submit_patch))
+        .route("/api/auth/request-link", post(request_link))
+        .route("/api/auth/verify", get(verify_link))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
@@ -403,6 +405,7 @@ fn generate_synthetic_id(prefix: &str) -> String {
 }
 
 async fn submit_patch(
+    auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SubmitRequest>,
@@ -411,7 +414,7 @@ async fn submit_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+    if !is_authorized(&addr, &state, auth.0.as_ref()) {
         info!("Refused patch submission from non-localhost: {}", addr);
         return Err(StatusCode::FORBIDDEN);
     }
@@ -1304,6 +1307,7 @@ async fn stats_tools(
 }
 
 async fn rerun_patchset(
+    auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
@@ -1312,7 +1316,7 @@ async fn rerun_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+    if !is_authorized(&addr, &state, auth.0.as_ref()) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1330,6 +1334,7 @@ async fn rerun_patchset(
 }
 
 async fn cancel_patchset(
+    auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
@@ -1338,7 +1343,7 @@ async fn cancel_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+    if !is_authorized(&addr, &state, auth.0.as_ref()) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1368,6 +1373,7 @@ async fn cancel_patchset(
 }
 
 async fn rerun_patch(
+    auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Query(query): Query<RerunPatchQuery>,
@@ -1376,7 +1382,7 @@ async fn rerun_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+    if !is_authorized(&addr, &state, auth.0.as_ref()) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1674,6 +1680,7 @@ pub enum BugAction {
 }
 
 async fn bug_action(
+    auth: crate::auth::OptionalAuthUser,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BugQuery>,
@@ -1683,7 +1690,7 @@ async fn bug_action(
         return Err((StatusCode::FORBIDDEN, "Read-only mode".into()));
     }
 
-    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+    if !is_authorized(&addr, &state, auth.0.as_ref()) {
         return Err((StatusCode::FORBIDDEN, "Remote mutations disallowed".into()));
     }
 
@@ -2147,5 +2154,83 @@ mod tests {
         // Verify comment appears in logs
         // Note: comments are mapped differently in get_bug_logs now? Wait, get_bug_logs returns BugEvent-like logs.
         // Actually, just validating 200 response is good enough for now.
+    }
+}
+
+pub fn is_authorized(
+    addr: &std::net::SocketAddr,
+    state: &std::sync::Arc<AppState>,
+    auth: Option<&crate::auth::AuthUser>,
+) -> bool {
+    if state.settings.server.testing_mode {
+        return true;
+    }
+    if state.allow_all_submit {
+        return true;
+    }
+    if addr.ip().to_canonical().is_loopback() {
+        return true;
+    }
+
+    if let Some(user) = auth
+        && (state.settings.server.admin_emails.is_empty()
+            || state.settings.server.admin_emails.contains(&user.email))
+    {
+        return true;
+    }
+
+    false
+}
+
+#[derive(serde::Deserialize)]
+struct RequestLinkRequest {
+    email: String,
+}
+
+async fn request_link(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Json(payload): axum::extract::Json<RequestLinkRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if let Some(secret) = &state.settings.server.jwt_secret {
+        let token =
+            crate::auth::create_token(&payload.email, secret, Some("magic_link".to_string()), 3600)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        tracing::info!(
+            "MAGIC LINK REQUESTED for {}: http://localhost:3000/api/auth/verify?token={}",
+            payload.email,
+            token
+        );
+        Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct VerifyLinkQuery {
+    token: String,
+}
+
+async fn verify_link(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<VerifyLinkQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    if let Some(secret) = &state.settings.server.jwt_secret {
+        let claims = crate::auth::verify_token(&query.token, secret)
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid magic link"))?;
+        if claims.typ.as_deref() != Some("magic_link") {
+            return Err((StatusCode::UNAUTHORIZED, "Invalid token type"));
+        }
+        let session_token =
+            crate::auth::create_token(&claims.sub, secret, Some("session".to_string()), 86400 * 30)
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to create session",
+                    )
+                })?;
+        Ok(Json(serde_json::json!({ "token": session_token })))
+    } else {
+        Err((StatusCode::NOT_IMPLEMENTED, "JWT not configured"))
     }
 }
