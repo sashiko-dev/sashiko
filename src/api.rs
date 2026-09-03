@@ -1776,6 +1776,10 @@ async fn bug_action(
             duplicate_of_id,
             reasoning,
         } => {
+            if duplicate_of_id == bug.id {
+                return Err((StatusCode::BAD_REQUEST, "A bug cannot be a duplicate of itself".into()));
+            }
+
             state
                 .db
                 .mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
