@@ -199,6 +199,11 @@ Sashiko includes a benchmark tool to evaluate review quality against known
 bugs. See the [Benchmarking Guide](docs/benchmarking.md) for setup and
 usage.
 
+## Security & Data Privacy
+
+Sashiko implements stateless JWT-based authorization and login via magic links.
+The server operates without persistent traditional user accounts and retains **no user data** aside from the explicit comments, actions, and review history metadata submitted directly onto the hosted bugs.
+
 ## Communication
 
 We welcome contributions and feedback through two main channels:
