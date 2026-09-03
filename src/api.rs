@@ -1777,7 +1777,10 @@ async fn bug_action(
             reasoning,
         } => {
             if duplicate_of_id == bug.id {
-                return Err((StatusCode::BAD_REQUEST, "A bug cannot be a duplicate of itself".into()));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "A bug cannot be a duplicate of itself".into(),
+                ));
             }
 
             state

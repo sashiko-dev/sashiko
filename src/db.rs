@@ -1748,26 +1748,24 @@ impl Database {
             && min_sev != Severity::Unknown
         {
             conditions.push(
-                "id IN (
-                    SELECT bug_id FROM bug_enrichments
-                    WHERE kind = 'severity_calibration'
-                      AND (
-                          CAST(json_extract(data_json, '$.severity_int') AS INTEGER) >= ?
-                          OR (
-                              json_extract(data_json, '$.severity_int') IS NULL
-                              AND CASE LOWER(json_extract(data_json, '$.severity'))
-                                  WHEN 'critical' THEN 4
-                                  WHEN 'high' THEN 3
-                                  WHEN 'medium' THEN 2
-                                  WHEN 'low' THEN 1
-                                  ELSE 0
-                              END >= ?
-                          )
-                      )
-                )"
-                .into(),
+                "(
+                    SELECT
+                        COALESCE(
+                            CAST(json_extract(data_json, '$.severity_int') AS INTEGER),
+                            CASE LOWER(json_extract(data_json, '$.severity'))
+                                WHEN 'critical' THEN 4
+                                WHEN 'high' THEN 3
+                                WHEN 'medium' THEN 2
+                                WHEN 'low' THEN 1
+                                ELSE 0
+                            END
+                        )
+                    FROM bug_enrichments
+                    WHERE bug_id = bugs.id AND kind = 'severity_calibration'
+                    ORDER BY created_at DESC LIMIT 1
+                ) >= ?"
+                    .into(),
             );
-            query_params.push(libsql::Value::Integer(min_sev as i64));
             query_params.push(libsql::Value::Integer(min_sev as i64));
         }
 
