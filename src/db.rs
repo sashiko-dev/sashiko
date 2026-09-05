@@ -4071,39 +4071,36 @@ impl Database {
         references_hdr: &str,
         body: &str,
     ) -> Result<()> {
-        // Prevent duplicate emails for the same patch
-        let mut rows = self
+        let created_at = chrono::Utc::now().timestamp();
+        let inserted = self
             .conn
-            .query(
-                "SELECT 1 FROM email_outbox WHERE patch_id = ?",
-                libsql::params![patch_id],
+            .execute(
+                "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM email_outbox WHERE patch_id = ?
+                 )",
+                libsql::params![
+                    patch_id,
+                    status,
+                    to_addresses,
+                    cc_addresses,
+                    subject,
+                    in_reply_to,
+                    references_hdr,
+                    body,
+                    created_at,
+                    patch_id,
+                ],
             )
             .await?;
 
-        if let Ok(Some(_)) = rows.next().await {
+        if inserted == 0 {
             tracing::info!(
                 "Email outbox entry already exists for patch_id {}, skipping to prevent duplicates.",
                 patch_id
             );
-            return Ok(());
         }
-
-        let created_at = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            libsql::params![
-                patch_id,
-                status,
-                to_addresses,
-                cc_addresses,
-                subject,
-                in_reply_to,
-                references_hdr,
-                body,
-                created_at,
-            ],
-        ).await?;
         Ok(())
     }
 
@@ -4185,23 +4182,15 @@ impl Database {
         target_url: &str,
         context: &str,
     ) -> Result<()> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT 1 FROM patchwork_outbox
-                 WHERE patch_msg_id = ? AND api_url = ? AND context = ?",
-                libsql::params![patch_msg_id, api_url, context],
-            )
-            .await?;
-        if rows.next().await?.is_some() {
-            return Ok(());
-        }
-
         let created_at = chrono::Utc::now().timestamp();
         self.conn
             .execute(
                 "INSERT INTO patchwork_outbox (patch_msg_id, api_url, check_state, description, target_url, context, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 SELECT ?, ?, ?, ?, ?, ?, ?
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM patchwork_outbox
+                     WHERE patch_msg_id = ? AND api_url = ? AND context = ?
+                 )",
                 libsql::params![
                     patch_msg_id,
                     api_url,
@@ -4210,6 +4199,9 @@ impl Database {
                     target_url,
                     context,
                     created_at,
+                    patch_msg_id,
+                    api_url,
+                    context,
                 ],
             )
             .await?;
@@ -4327,38 +4319,28 @@ impl Database {
         references_hdr: &str,
         body: &str,
     ) -> Result<()> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT 1 FROM email_outbox
-                 WHERE patch_id IS NULL AND to_addresses = ? AND subject = ? AND in_reply_to = ?",
-                libsql::params![
-                    serde_json::to_string(&[to_address])
-                        .map_err(|e| libsql::Error::Misuse(e.to_string()))?,
-                    subject,
-                    in_reply_to
-                ],
-            )
-            .await?;
-        if rows.next().await?.is_some() {
-            return Ok(());
-        }
-
         let created_at = chrono::Utc::now().timestamp();
         let to_json = serde_json::to_string(&[to_address])
             .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
         self.conn
             .execute(
                 "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
-                 VALUES (NULL, ?, ?, '[]', ?, ?, ?, ?, ?)",
+                 SELECT NULL, ?, ?, '[]', ?, ?, ?, ?, ?
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM email_outbox
+                     WHERE patch_id IS NULL AND to_addresses = ? AND subject = ? AND in_reply_to = ?
+                 )",
                 libsql::params![
                     status,
-                    to_json,
+                    to_json.clone(),
                     subject,
                     in_reply_to,
                     references_hdr,
                     body,
                     created_at,
+                    to_json,
+                    subject,
+                    in_reply_to,
                 ],
             )
             .await?;
@@ -4380,6 +4362,79 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    async fn create_test_patch(db: &Database) -> i64 {
+        let thread_id = db
+            .create_thread("outbox-root", "Outbox test", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "outbox-patch",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH] Outbox test",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "outbox-patch",
+                "[PATCH] Outbox test",
+                "Author <author@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(patchset_id, "outbox-patch", 1, "diff")
+            .await
+            .unwrap()
+    }
+
+    async fn run_concurrent_writers<F, Fut>(db: &Arc<Database>, writer: F)
+    where
+        F: Fn(Arc<Database>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        const WRITERS: usize = 32;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let writer = Arc::new(writer);
+        let mut tasks = Vec::with_capacity(WRITERS);
+
+        for _ in 0..WRITERS {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let writer = writer.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                writer(db).await;
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -9393,5 +9448,92 @@ mod tests {
             .await
             .unwrap();
         assert!(ps.is_some(), "create_patchset must succeed after migration");
+    }
+
+    #[tokio::test]
+    async fn concurrent_patchwork_outbox_inserts_are_idempotent() {
+        let db = setup_db().await;
+        run_concurrent_writers(&db, |db| async move {
+            db.insert_patchwork_outbox(
+                "patch@example.com",
+                "https://patchwork.example/api",
+                "success",
+                "review complete",
+                "https://sashiko.example/review/1",
+                "sashiko",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM patchwork_outbox", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_email_outbox_inserts_are_idempotent() {
+        let db = setup_db().await;
+        let patch_id = create_test_patch(&db).await;
+        run_concurrent_writers(&db, move |db| async move {
+            db.insert_email_outbox(
+                patch_id,
+                "Pending",
+                "[\"reviewer@example.com\"]",
+                "[]",
+                "Re: [PATCH] Outbox test",
+                "outbox-patch",
+                "outbox-patch",
+                "No issues found.",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_patchwork_notifications_are_idempotent() {
+        let db = setup_db().await;
+        run_concurrent_writers(&db, |db| async move {
+            db.insert_patchwork_notification(
+                "Pending",
+                "maintainer@example.com",
+                "Re: [PATCH] Outbox test",
+                "outbox-patch",
+                "outbox-patch",
+                "Patchwork update failed.",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
     }
 }
