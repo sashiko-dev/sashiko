@@ -431,12 +431,22 @@ impl Reviewer {
                 vec![BaselineResolution::Commit(commit)]
             } else {
                 ctx.baseline_registry
-                    .resolve_candidates(&all_files, &subject, body.as_deref())
+                    .resolve_candidates(
+                        &all_files,
+                        &subject,
+                        body.as_deref(),
+                        &ctx.settings.subsystems.mapping,
+                    )
                     .await
             }
         } else {
             ctx.baseline_registry
-                .resolve_candidates(&all_files, &subject, body.as_deref())
+                .resolve_candidates(
+                    &all_files,
+                    &subject,
+                    body.as_deref(),
+                    &ctx.settings.subsystems.mapping,
+                )
                 .await
         };
 

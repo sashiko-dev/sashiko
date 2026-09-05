@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 pub struct SubsystemMapping {
     pub pattern: String,
     pub name: String,
+    #[serde(default)]
+    pub base_tree: Option<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -621,6 +625,27 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_subsystem_mapping_baseline_fields() {
+        let settings: SubsystemsSettings = toml::from_str(
+            r#"
+            mapping = [
+                { pattern = "^fs/smb/server/.*", name = "ksmbd", base_tree = "git://git.samba.org/ksmbd.git", base_branch = "for-next" },
+                { pattern = "^net/.*", name = "networking" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.mapping[0].base_tree.as_deref(),
+            Some("git://git.samba.org/ksmbd.git")
+        );
+        assert_eq!(settings.mapping[0].base_branch.as_deref(), Some("for-next"));
+        assert!(settings.mapping[1].base_tree.is_none());
+        assert!(settings.mapping[1].base_branch.is_none());
+    }
 
     #[test]
     fn test_production_settings_is_valid() {
