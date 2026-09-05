@@ -66,6 +66,7 @@ and symbols regexes.
 | hwmon | drivers/hwmon/, hwmon_*, asus-ec-sensors, ec_board_info | hwmon.md |
 | Wireless/mac80211 | drivers/net/wireless/, net/mac80211/, BSS_CHANGED_, vif_cfg_changed, link_info_changed, bss_info_changed | wireless.md |
 | Selftests | tools/testing/selftests/, TEST_PROGS, TEST_FILES, TEST_GEN_FILES | selftests.md |
+| KUnit | kunit, KUNIT_CASE, KUNIT_ASSERT, KUNIT_EXPECT, kunit_test_suite, _kunit.c, .kunitconfig | kunit.md |
 | DT Bindings | Documentation/devicetree/bindings/, *.yaml in devicetree | dt-bindings.md |
 | USB Storage | drivers/usb/storage/, unusual_devs.h, UNUSUAL_DEV, USB_SC_, USB_PR_ | usb-storage.md |
 | ATA/libata | drivers/ata/, ata_dev_, ata_port_, ata_read_log_, ATA_QUIRK_ | ata.md |
