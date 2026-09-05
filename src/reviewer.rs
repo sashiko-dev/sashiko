@@ -81,6 +81,16 @@ fn generate_interaction_id_at(epoch_millis: u128) -> String {
     format!("rev_{}_{}", epoch_millis, sequence)
 }
 
+fn is_xfstests_patch(diff: &str) -> bool {
+    let files = extract_files_from_diff(diff);
+
+    !files.is_empty()
+        && files.iter().all(|file| {
+            let mut components = file.split('/').filter(|part| !part.is_empty());
+            components.next() == Some("tests") && components.count() >= 2
+        })
+}
+
 /// The `Reviewer` service orchestrates the review process for patchsets.
 ///
 /// It manages:
@@ -377,6 +387,43 @@ impl Reviewer {
                 return;
             }
         };
+
+        // Linux selftests live under tools/testing. Top-level tests/<suite>/<case>
+        // paths identify xfstests patches, which must not be reviewed as kernel code.
+        let (xfstests_diffs, diffs): (Vec<_>, Vec<_>) = diffs
+            .into_iter()
+            .partition(|(_, _, diff, _, _, _, _)| is_xfstests_patch(diff));
+
+        for (patch_id, _, _, _, _, _, _) in &xfstests_diffs {
+            info!(
+                "Skipping patch {} because it contains only xfstests paths",
+                patch_id
+            );
+            if let Err(e) = ctx
+                .db
+                .update_patch_status(*patch_id, ReviewStatus::Skipped.as_str())
+                .await
+            {
+                error!(
+                    "Failed to mark xfstests patch {} as skipped: {}",
+                    patch_id, e
+                );
+            }
+        }
+
+        if diffs.is_empty() && !xfstests_diffs.is_empty() {
+            if let Err(e) = ctx
+                .db
+                .update_patchset_status(patchset_id, ReviewStatus::Reviewed.as_str())
+                .await
+            {
+                error!(
+                    "Failed to mark xfstests patchset {} as reviewed: {}",
+                    patchset_id, e
+                );
+            }
+            return;
+        }
 
         // patches_json for input payload (contains all patches)
         let patches_json: Vec<_> = diffs
@@ -2485,6 +2532,167 @@ mod tests {
 
         assert_eq!(ids.len(), 1_000);
         assert!(ids.iter().all(|id| id.starts_with("rev_1234_")));
+    }
+
+    #[test]
+    fn detects_xfstests_patch_paths() {
+        let diff = "\
+diff --git a/tests/ext4/065 b/tests/ext4/065
+new file mode 100755
+--- /dev/null
++++ b/tests/ext4/065
+@@ -0,0 +1 @@
++#! /bin/bash
+diff --git a/tests/ext4/065.out b/tests/ext4/065.out
+new file mode 100644
+--- /dev/null
++++ b/tests/ext4/065.out
+@@ -0,0 +1 @@
++QA output created by 065
+";
+
+        assert!(is_xfstests_patch(diff));
+    }
+
+    #[test]
+    fn does_not_misclassify_kernel_or_mixed_patches() {
+        let kernel_selftest = "\
+diff --git a/tools/testing/selftests/filesystems/ext4/new_test.sh b/tools/testing/selftests/filesystems/ext4/new_test.sh
+new file mode 100755
+";
+        let kernel_ext4 = "\
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 1111111..2222222 100644
+";
+        let mixed = "\
+diff --git a/tests/ext4/065 b/tests/ext4/065
+new file mode 100755
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 1111111..2222222 100644
+";
+
+        assert!(!is_xfstests_patch(kernel_selftest));
+        assert!(!is_xfstests_patch(kernel_ext4));
+        assert!(!is_xfstests_patch(mixed));
+        assert!(!is_xfstests_patch(""));
+    }
+
+    #[tokio::test]
+    async fn skips_xfstests_before_baseline_or_ai_review() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db
+            .create_thread("xfstests-cover@example.com", "xfstests series", 1000)
+            .await?;
+        db.create_message(
+            "xfstests-patch@example.com",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH] ext4/065 encryption and casefold test",
+            1000,
+            "Add an xfstests regression test.",
+            "linux-ext4@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "xfstests-cover@example.com",
+                "xfstests series",
+                "Author <author@example.com>",
+                1000,
+                1,
+                1,
+                "linux-ext4@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .expect("Failed to create patchset");
+        let patch_id = db
+            .create_patch(
+                patchset_id,
+                "xfstests-patch@example.com",
+                1,
+                "\
+diff --git a/tests/ext4/065 b/tests/ext4/065
+new file mode 100755
+--- /dev/null
++++ b/tests/ext4/065
+@@ -0,0 +1 @@
++#! /bin/bash
+diff --git a/tests/ext4/065.out b/tests/ext4/065.out
+new file mode 100644
+--- /dev/null
++++ b/tests/ext4/065.out
+@@ -0,0 +1 @@
++QA output created by 065
+",
+            )
+            .await?;
+
+        let patchset = db
+            .get_pending_patchsets(1)
+            .await?
+            .pop()
+            .expect("Expected pending patchset");
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(BaselineRegistry::new(temp_dir.path(), None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+
+        Reviewer::review_patchset_task(ctx, patchset).await;
+
+        assert_eq!(
+            db.get_patchset_status(patchset_id).await?.as_deref(),
+            Some(ReviewStatus::Reviewed.as_str())
+        );
+
+        let mut patch_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let patch_row = patch_rows.next().await?.expect("Expected patch row");
+        let patch_status: String = patch_row.get(0)?;
+        assert_eq!(patch_status, ReviewStatus::Skipped.as_str());
+
+        let mut review_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM reviews WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let review_row = review_rows.next().await?.expect("Expected review count");
+        let review_count: i64 = review_row.get(0)?;
+        assert_eq!(review_count, 0);
+
+        Ok(())
     }
 
     struct MockProvider;
