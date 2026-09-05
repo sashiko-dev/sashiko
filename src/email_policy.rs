@@ -9,6 +9,8 @@ pub struct PatchworkPolicy {
     pub enabled: bool,
     pub api_url: Option<String>,
     pub token: Option<String>,
+    /// HTTP User-Agent sent to the Patchwork API.
+    pub user_agent: Option<String>,
     pub email: Option<String>,
     /// Minimum finding severity to include in patchwork checks.
     /// Findings below this threshold are excluded from the check
@@ -35,6 +37,7 @@ impl Default for PatchworkPolicy {
             enabled: false,
             api_url: None,
             token: None,
+            user_agent: None,
             email: None,
             min_severity: None,
             fail_severity: default_fail_severity(),
@@ -208,6 +211,7 @@ mod tests {
             [subsystems.net.patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.2"
+            user_agent = "sashiko-test/1.0 (test@example.org)"
         "#;
 
         let mut file = NamedTempFile::new().unwrap();
@@ -241,6 +245,10 @@ mod tests {
         assert_eq!(
             net_policy.patchwork.api_url.as_deref(),
             Some("https://patchwork.kernel.org/api/1.2")
+        );
+        assert_eq!(
+            net_policy.patchwork.user_agent.as_deref(),
+            Some("sashiko-test/1.0 (test@example.org)")
         );
     }
 
