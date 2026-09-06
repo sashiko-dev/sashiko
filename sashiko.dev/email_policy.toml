@@ -175,6 +175,13 @@ reply_to_author = false
 cc_individuals = false
 cc = ["Chuck Lever <cel@kernel.org>", "Jeff Layton <jlayton@kernel.org>", "Anna Schumaker <anna@kernel.org>"]
 
+[subsystems.kexec]
+lists = ["kexec@lists.infradead.org"]
+reply_to_author = true
+send_positive_review = true
+cc_individuals = true
+cc = ["kexec@lists.infradead.org"]
+
 [subsystems.kvm]
 lists = ["kvm@vger.kernel.org"]
 reply_to_author = true
