@@ -509,7 +509,8 @@ async fn review_single_patch(
         let provider =
             crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
         let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
-        let prompts_tool_path = Some(options.prompts.join("tool.md"));
+        // The directory itself: read_prompt resolves a name against it.
+        let prompts_tool_path = Some(options.prompts.clone());
 
         let mut patch_files = Vec::new();
         if let Some(sha) = patch_shas.get(&p.index) {
