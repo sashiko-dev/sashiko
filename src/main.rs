@@ -2091,12 +2091,24 @@ async fn process_parsed_article(
                 }
 
                 if let Some(patch) = patch_opt {
+                    let git_patch_id =
+                        match sashiko::prerequisites::calculate_git_patch_id(&patch.diff).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to calculate stable patch ID for {}: {}",
+                                    patch.message_id, e
+                                );
+                                None
+                            }
+                        };
                     match worker_db
-                        .create_patch(
+                        .create_patch_with_git_patch_id(
                             patchset_id,
                             &patch.message_id,
                             patch.part_index,
                             &patch.diff,
+                            git_patch_id.as_deref(),
                         )
                         .await
                     {
