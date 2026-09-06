@@ -891,6 +891,7 @@ async fn run_worker_in_worktree(
         let all_patches = &patches;
         let llm_semaphore = &llm_semaphore;
         let quota = &quota;
+        let patch_index = p.index;
         async move {
             review_single_patch(
                 worktree,
@@ -909,13 +910,25 @@ async fn run_worker_in_worktree(
                 progress,
             )
             .await
+            .map_err(|e| (patch_index, e))
         }
     }));
 
     let mut buffered = futures_stream.buffer_unordered(concurrency);
     let mut results = Vec::new();
+    let mut review_failures: Vec<(i64, String)> = Vec::new();
     while let Some(res) = buffered.next().await {
-        results.push(res?);
+        match res {
+            Ok(review) => results.push(review),
+            // Returning here would drop every review that already completed,
+            // and they cannot be recovered: this path builds its provider with
+            // create_provider_from_ai, so no response cache, and the turn log
+            // keeps only previews. Record the failure and keep the rest.
+            Err((patch_index, e)) => {
+                error!("AI review for patch {} failed: {}", patch_index, e);
+                review_failures.push((patch_index, e.to_string()));
+            }
+        }
     }
 
     // Aggregate findings, inline reviews, history, input context, and concern counts
@@ -1001,7 +1014,15 @@ async fn run_worker_in_worktree(
         "dismissed_concerns_count": total_dismissed_concerns_count
     });
 
-    let combined_result = json!({
+    for (patch_index, message) in &review_failures {
+        patch_results.push(json!({
+            "index": patch_index,
+            "status": "review_failed",
+            "error": message
+        }));
+    }
+
+    let mut combined_result = json!({
         "patchset_id": patchset_id,
         "baseline": baseline_arg,
         "patches": patch_results,
@@ -1013,6 +1034,16 @@ async fn run_worker_in_worktree(
         "tokens_out": total_tokens_out,
         "tokens_cached": total_tokens_cached
     });
+
+    if !review_failures.is_empty() {
+        let indices: Vec<String> = review_failures.iter().map(|(i, _)| i.to_string()).collect();
+        combined_result["error"] = json!(format!(
+            "AI review failed for {} of {} patches (index {})",
+            review_failures.len(),
+            patches_to_review.len(),
+            indices.join(", ")
+        ));
+    }
 
     Ok(combined_result)
 }
