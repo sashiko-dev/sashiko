@@ -217,8 +217,13 @@ fs/btrfs/send.c:__get_cur_name_and_parent() {
 ## Structure
 Create a note for these items, all of which your report should include:
 
-- [ ] git sha of the commit
-- [ ] Author: line from the commit
+- [ ] The commit header, in the form `git show` prints it:
+  - [ ] First line: the word `commit`, one space, then the full git sha.
+        No colon. Write `commit 06e4fcc9...`, never `commit: 06e4fcc9...`,
+        `commit:06e4fcc9...` nor `Commit 06e4fcc9...`.
+  - [ ] Second line: `Author: $Name <$email>`, taken from the commit.
+  - [ ] `commit` is the only header line without a colon, because it is git's
+        own output rather than a field you are filling in.
 - [ ] One line subject from the commit
 - [ ] A brief (max 3 sentence) summary of the commit.
 - [ ] Any Link: tags from the commit header
