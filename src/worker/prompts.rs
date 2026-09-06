@@ -614,6 +614,8 @@ impl Worker {
                 .await
                 .unwrap_or_default();
 
+        let testing_style_docs = build_testing_style_docs(worktree_path, &target_commit_diff).await;
+
         let follow_up_series_context = build_follow_up_series_context(
             self.series_range.as_deref(),
             &patchset,
@@ -631,6 +633,7 @@ impl Worker {
             series_range: self.series_range.clone(),
             follow_up_series_context,
             selected_guides: Vec::new(),
+            testing_style_docs,
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
             planned_stages: Vec::new(),
@@ -799,6 +802,32 @@ pub fn calculate_series_range(
             })
             .map(|end_sha| format!("{}..{}", baseline_sha, end_sha))
     }
+}
+
+/// Reads the tree's own testing style documents for the frameworks the patch
+/// touches, so the testability stage judges layout and naming against the
+/// project's current rules rather than a restatement of them.
+///
+/// A document the tree does not carry is simply absent: older trees, and
+/// projects that are not Linux, fall back to the conventions the guides
+/// describe.
+pub async fn build_testing_style_docs(worktree_path: &Path, diff: &str) -> String {
+    let mut docs = String::new();
+
+    for relative in crate::worker::kernel_workflow::kernel_test_style_docs(diff) {
+        if let Ok(content) = tokio::fs::read_to_string(worktree_path.join(relative)).await {
+            docs.push_str(&format!("\n\n## {}\n\n{}\n", relative, content));
+        }
+    }
+
+    if docs.is_empty() {
+        return docs;
+    }
+
+    format!(
+        "\n\n<in_tree_style_guides>\nThe project's own testing style documentation, read from the tree under review. Treat it as authoritative: apply it in preference to any convention you remember, and to anything a guide restates. Judge naming, Kconfig entries and file placement against these rules.{}\n</in_tree_style_guides>",
+        docs
+    )
 }
 
 pub fn build_follow_up_series_context(
@@ -1514,11 +1543,16 @@ mod tests {
                 .and_then(|m| m.content.as_deref())
                 .unwrap_or_default();
 
-            let content = if last_user.contains("# Stage 1.") || last_user.contains("# Stage 8.") {
+            // Analysis stages (1-8) and deduplication (9) return both lists,
+            // conflict resolution (10) only concerns, verification (11) findings.
+            let content = if last_user.contains("# Stage 1.")
+                || last_user.contains("# Stage 8.")
+                || last_user.contains("# Stage 9.")
+            {
                 r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
-            } else if last_user.contains("# Stage 9.") {
-                r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
             } else if last_user.contains("# Stage 10.") {
+                r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
+            } else if last_user.contains("# Stage 11.") {
                 r#"{"findings": []}"#
             } else {
                 r#"{"concerns": [], "dismissed_concerns": []}"#
@@ -1547,7 +1581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_10_log_history_contains_follow_up_series_context() {
+    async fn test_stage_11_log_history_contains_follow_up_series_context() {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
@@ -1590,7 +1624,7 @@ mod tests {
         let worker_res = res.unwrap();
         assert!(!worker_res.history.is_empty());
 
-        let stage10_user_msg = worker_res
+        let stage11_user_msg = worker_res
             .history
             .iter()
             .find(|m| {
@@ -1598,11 +1632,11 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or_default()
-                        .contains("# Stage 10.")
+                        .contains("# Stage 11.")
             })
-            .expect("Stage 10 user message should be in history");
+            .expect("Stage 11 user message should be in history");
 
-        let content = stage10_user_msg.content.as_deref().unwrap();
+        let content = stage11_user_msg.content.as_deref().unwrap();
         assert!(content.contains("=== Follow-Up Patches in Series ==="));
         assert!(content.contains("Series End Commit (Final State): sha2"));
         assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));

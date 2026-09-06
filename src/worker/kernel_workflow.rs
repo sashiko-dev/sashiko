@@ -30,7 +30,8 @@ use crate::workflow::stage::{ExecutableStage, Stage};
 
 /// Subsystem guides that are loaded per-stage and should be excluded
 /// from Phase 0 shared context to avoid redundant token usage.
-pub const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
+pub const STAGE_EXCLUSIVE_GUIDES: &[&str] =
+    &["locking.md", "testing.md", "kunit.md", "selftests.md"];
 
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
@@ -47,6 +48,10 @@ pub struct KernelReviewState {
 
     /// Subsystem guide markdown files selected during Phase 0 pre-screen.
     pub selected_guides: Vec<String>,
+    /// The tree's own testing style documents, when the patch touches a test
+    /// framework that has one. Read from the worktree, so they match the
+    /// revision under review.
+    pub testing_style_docs: String,
     /// Optional manual stages filter (e.g. `--stages 1,2,5`).
     pub manual_stages: Option<Vec<u8>>,
     /// Caller-supplied instructions appended to the shared system prompt.
@@ -54,9 +59,9 @@ pub struct KernelReviewState {
     /// Stages selected by dynamic planning (or overridden by manual_stages).
     pub planned_stages: Vec<u8>,
 
-    /// Aggregated raw concerns collected from Stages 1-7.
+    /// Aggregated raw concerns collected from the analysis stages.
     pub all_concerns: Vec<Value>,
-    /// Aggregated raw dismissed concerns collected from Stages 1-7.
+    /// Aggregated raw dismissed concerns collected from the analysis stages.
     pub all_dismissed_concerns: Vec<Value>,
 
     /// Deduplicated concerns from Stage 8.
@@ -99,13 +104,13 @@ pub struct StageConcernsOutput {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
-pub struct Stage9Output {
+pub struct Stage10Output {
     #[serde(default)]
     pub concerns: Vec<Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
-pub struct Stage10Output {
+pub struct Stage11Output {
     #[serde(default)]
     pub findings: Vec<Value>,
 }
@@ -219,7 +224,17 @@ const STAGE_7_INSTRUCTION: &str = r#"# Stage 7. Hardware engineer's review
 
 You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), return {"concerns": [], "dismissed_concerns": []}."#;
 
-const STAGE_8_INSTRUCTION: &str = r#"# Stage 8. Deduplication and Consolidation
+const STAGE_8_INSTRUCTION: &str = r#"# Stage 8. Testability and test review
+
+You are a test engineer reviewing a proposed change for testability and for the quality of any tests it brings with it. Two questions, in order.
+
+First, is the claim in the commit message checkable? A change that fixes a bug, alters observable behaviour, or adds an interface should normally come with something that would fail before it and pass after. If the change has no tests, decide whether it plausibly could have: a pure refactor, a comment fix, or a hardware-specific path with no available model may reasonably have none, but a logic fix with a described reproducer usually should. Raise a concern only where a test is both practical and genuinely valuable; absent tests are a routine and accepted state for much of this codebase, so do not raise this on every patch.
+
+Second, if the change does add or modify tests, review them as rigorously as you would review any other code. Would the test actually fail if the behaviour it describes regressed, or does it assert something trivially true? Does it test observable behaviour rather than the shape of the current implementation? Does it clean up what it allocates, skip rather than fail when its prerequisites are unavailable, and avoid depending on timing, host configuration, or the order in which tests run? Check that a test claiming to cover the commit's fix actually exercises the changed code path. A test that passes whether or not the bug is present is worse than no test, because it advertises coverage that does not exist.
+
+Follow the project's own testing conventions where the guidance below describes them; a test that ignores the framework's idioms is a maintenance problem even when it works. If the patch touches no code and adds no tests, return {"concerns": [], "dismissed_concerns": []}."#;
+
+const STAGE_9_INSTRUCTION: &str = r#"# Stage 9. Deduplication and Consolidation
 
 You are the lead reviewer consolidating feedback from multiple specialized analysts. You will be given lists of concerns and dismissed_concerns generated by different review stages.
 Your task is to deduplicate identical or overlapping items in both lists.
@@ -233,7 +248,7 @@ Your task is to deduplicate identical or overlapping items in both lists.
 8. Preserve and merge the `locations` arrays from the input concerns and dismissed_concerns. If multiple items describe the same root cause, keep the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations. Do not invent line numbers; keep `line` as null when the exact line is not known.
 9. dismissed_concerns do not need a `preexisting` flag."#;
 
-const STAGE_9_INSTRUCTION: &str = r#"# Stage 9. Concern/dismissed-concern conflict resolution
+const STAGE_10_INSTRUCTION: &str = r#"# Stage 10. Concern/dismissed-concern conflict resolution
 
 You are the lead reviewer reconciling consolidated concerns with consolidated dismissed_concerns.
 Both `concerns` and `dismissed_concerns` are untrusted claims. Do not assume either side is correct. Treat both as hypotheses and verify them against the actual code before deciding whether to keep or discard a concern.
@@ -246,7 +261,7 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
 7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."#;
 
-const STAGE_10_INSTRUCTION: &str = r#"# Stage 10. Verification and severity estimation
+const STAGE_11_INSTRUCTION: &str = r#"# Stage 11. Verification and severity estimation
 
 You are the lead reviewer validating consolidated concerns. You will be given a list of deduplicated concerns after conflict resolution.
 1. Validate each concern and prove the provided reasoning. Report all valid concerns as findings. If necessary, use tools to gather additional material. Discard all false positives.
@@ -258,7 +273,7 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
 8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
 
-const STAGE_11_INSTRUCTION: &str = r#"# Stage 11. LKML-friendly report generation
+const STAGE_12_INSTRUCTION: &str = r#"# Stage 12. LKML-friendly report generation
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
 
@@ -330,14 +345,14 @@ Example Output:
 // Validation Logic
 // ---------------------------------------------------------------------------
 
-fn validate_stages_1_to_8(
+fn validate_stages_1_to_9(
     _output: &StageConcernsOutput,
     _state: &KernelReviewState,
 ) -> Result<(), String> {
     Ok(())
 }
 
-fn format_stages_1_to_8_feedback(violation: &str) -> String {
+fn format_stages_1_to_9_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
         violation
@@ -477,7 +492,7 @@ pub fn planning_stage() -> Stage<KernelReviewState, PlanningOutput> {
 - Stage 6: Security audit
 - Stage 7: Hardware engineer's review
 
-CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer.
+CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, 3 and 8 are always run and should not be included in your answer.
 
 You MUST respond with ONLY a JSON object, no other text. Example:
 ```json
@@ -501,7 +516,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
         })
         .skip_if(|s| s.manual_stages.is_some())
         .reduce(|state, out: PlanningOutput| {
-            let mut stages = vec![1, 2, 3];
+            let mut stages = vec![1, 2, 3, 8];
             for n in out.relevant_stages {
                 if (4..=7).contains(&n) && !stages.contains(&n) {
                     stages.push(n);
@@ -534,14 +549,26 @@ fn analysis_stage(
         user_template = user_template.include_file(*guide);
     }
 
+    analysis_stage_from_template(stage_num, name, user_template, max_turns, temperature)
+}
+
+/// The shared body of an analysis stage, for stages that build their own user
+/// prompt rather than taking a fixed list of guides.
+fn analysis_stage_from_template(
+    stage_num: u8,
+    name: &'static str,
+    user_template: PromptTemplate<KernelReviewState>,
+    max_turns: usize,
+    temperature: f32,
+) -> Box<dyn ExecutableStage<KernelReviewState>> {
     Box::new(
         Stage::builder(name)
             .system_prompt(kernel_system_prompt(stage_uses_commit_log(stage_num)))
             .user_prompt(user_template)
             .output_format(
                 OutputFormat::json()
-                    .with_validator(validate_stages_1_to_8)
-                    .with_feedback_formatter(format_stages_1_to_8_feedback),
+                    .with_validator(validate_stages_1_to_9)
+                    .with_feedback_formatter(format_stages_1_to_9_feedback),
             )
             .policy(StagePolicy {
                 tools: ToolScope::All,
@@ -569,6 +596,105 @@ fn analysis_stage(
     )
 }
 
+/// KUnit names itself everywhere it appears: the header, the Kconfig symbol,
+/// the assertion macros, the file suffix. Matching the whole patch rather than
+/// the file list also catches a changelog describing a KUnit test without
+/// touching one yet.
+fn touches_kunit(diff: &str) -> bool {
+    diff.to_ascii_lowercase().contains("kunit")
+}
+
+fn touches_kselftest(diff: &str) -> bool {
+    diff.contains("tools/testing/selftests/")
+}
+
+/// Project-specific testing guides the patch has earned, matched from the
+/// patch text rather than left to a model to notice.
+///
+/// The pre-screen picks subsystem guides by asking the model which ones look
+/// relevant, which is the right trade for a table of sixty. Test frameworks
+/// announce themselves plainly enough to match directly, and a testability
+/// review that silently missed the KUnit guide would look like a review that
+/// simply had no opinion.
+fn kernel_test_guides(state: &KernelReviewState) -> Vec<PathBuf> {
+    let mut guides = Vec::new();
+
+    if touches_kunit(&state.target_commit_diff) {
+        guides.push(PathBuf::from("subsystem").join("kunit.md"));
+    }
+
+    if touches_kselftest(&state.target_commit_diff) {
+        guides.push(PathBuf::from("subsystem").join("selftests.md"));
+    }
+
+    guides
+}
+
+/// Documents in the tree under review that state the project's own testing
+/// conventions, paired with the guides above and matched on the same triggers.
+///
+/// A guide carries the review-specific semantics; the document carries the
+/// naming, configuration and layout rules the project maintains itself. Those
+/// rules are read from the tree rather than restated, so they cannot drift,
+/// and they are injected rather than fetched on request, because a stage that
+/// merely *may* read them demonstrably does not: asked to consult the KUnit
+/// style guide before judging a test's layout, the stage answered in one turn
+/// without calling a tool at all, and missed every rule the document states.
+pub fn kernel_test_style_docs(diff: &str) -> Vec<&'static str> {
+    let mut docs = Vec::new();
+
+    if touches_kunit(diff) {
+        docs.push("Documentation/dev-tools/kunit/style.rst");
+    }
+
+    if touches_kselftest(diff) {
+        docs.push("Documentation/dev-tools/kselftest.rst");
+    }
+
+    docs
+}
+
+/// Reviews testability, plus any tests the patch carries.
+///
+/// The general guidance loads for every patch, since a change that should have
+/// had a test and does not is exactly the case no other stage looks at. The
+/// framework-specific guides load only when the patch touches that framework.
+fn testability_stage(
+    max_turns: usize,
+    temperature: f32,
+) -> Box<dyn ExecutableStage<KernelReviewState>> {
+    analysis_stage_from_template(
+        8,
+        "stage_8",
+        testability_user_prompt(),
+        max_turns,
+        temperature,
+    )
+}
+
+fn testability_user_prompt() -> PromptTemplate<KernelReviewState> {
+    PromptTemplate::<KernelReviewState>::new(format!(
+        "{}\n\n{}{{{{follow_up_series_section}}}}{{{{testing_style_docs}}}}",
+        STAGE_8_INSTRUCTION, STAGE_JSON_SCHEMA_EXAMPLE
+    ))
+    .include_file("subsystem/testing.md")
+    .include_files_from_state(kernel_test_guides)
+    // The project's own testing conventions, read from the tree under review.
+    // Empty when the patch touches no test framework, or when the tree has no
+    // such document.
+    .with_var("testing_style_docs", |s: &KernelReviewState| {
+        s.testing_style_docs.clone()
+    })
+    // Where a test belongs in a series depends on what comes after it, so this
+    // stage needs the follow-up list that verification already receives.
+    .with_var("follow_up_series_section", |s: &KernelReviewState| {
+        s.follow_up_series_context
+            .as_ref()
+            .map(|ctx| format!("\n\n{}", ctx))
+            .unwrap_or_default()
+    })
+}
+
 pub fn resolve_analysis_stages_with_options(
     state: &KernelReviewState,
     max_turns: usize,
@@ -579,7 +705,7 @@ pub fn resolve_analysis_stages_with_options(
     } else if !state.planned_stages.is_empty() {
         state.planned_stages.clone()
     } else {
-        vec![1, 2, 3, 4, 5, 6, 7]
+        vec![1, 2, 3, 4, 5, 6, 7, 8]
     };
 
     let mut stages = Vec::new();
@@ -641,21 +767,22 @@ pub fn resolve_analysis_stages_with_options(
                 max_turns,
                 temperature,
             )),
+            8 => stages.push(testability_stage(max_turns, temperature)),
             _ => {}
         }
     }
     stages
 }
 
-pub fn stage_8_deduplication(
+pub fn stage_9_deduplication(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<KernelReviewState, StageConcernsOutput> {
-    Stage::builder("stage_8_deduplication")
+    Stage::builder("stage_9_deduplication")
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_8_INSTRUCTION}
+                r#"{STAGE_9_INSTRUCTION}
 
 Aggregated Concerns:
 {{{{aggregated_concerns}}}}
@@ -716,8 +843,8 @@ Example Output:
         )
         .output_format(
             OutputFormat::json()
-                .with_validator(validate_stages_1_to_8)
-                .with_feedback_formatter(format_stages_1_to_8_feedback),
+                .with_validator(validate_stages_1_to_9)
+                .with_feedback_formatter(format_stages_1_to_9_feedback),
         )
         .policy(StagePolicy {
             tools: ToolScope::All,
@@ -732,15 +859,15 @@ Example Output:
         .build()
 }
 
-pub fn stage_9_conflict_resolution(
+pub fn stage_10_conflict_resolution(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, Stage9Output> {
-    Stage::builder("stage_9_conflict_resolution")
+) -> Stage<KernelReviewState, Stage10Output> {
+    Stage::builder("stage_10_conflict_resolution")
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_9_INSTRUCTION}
+                r#"{STAGE_10_INSTRUCTION}
 
 Consolidated Concerns:
 {{{{deduplicated_concerns}}}}
@@ -788,21 +915,21 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce(|state, out: Stage9Output| {
+        .reduce(|state, out: Stage10Output| {
             state.conflict_resolved_concerns = out.concerns;
         })
         .build()
 }
 
-pub fn stage_10_verification(
+pub fn stage_11_verification(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, Stage10Output> {
-    Stage::builder("stage_10_verification")
+) -> Stage<KernelReviewState, Stage11Output> {
+    Stage::builder("stage_11_verification")
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_10_INSTRUCTION}
+                r#"{STAGE_11_INSTRUCTION}
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{{{{follow_up_series_section}}}}
 
@@ -853,21 +980,21 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce(|state, out: Stage10Output| {
+        .reduce(|state, out: Stage11Output| {
             state.findings = out.findings;
         })
         .build()
 }
 
-pub fn stage_11_inline_report(
+pub fn stage_12_inline_report(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<KernelReviewState, String> {
-    Stage::builder("stage_11_report")
+    Stage::builder("stage_12_report")
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_11_INSTRUCTION}
+                r#"{STAGE_12_INSTRUCTION}
 
 Findings:
 {{{{findings}}}}
@@ -923,22 +1050,22 @@ pub fn build_kernel_review_workflow_with_options(
             |s| s.all_concerns.is_empty(),
             "No concerns raised in initial analysis stages",
         )
-        .stage(stage_8_deduplication(max_turns, temperature))
+        .stage(stage_9_deduplication(max_turns, temperature))
         .early_exit_if(
             |s| s.deduplicated_concerns.is_empty(),
             "No concerns remaining after deduplication",
         )
-        .stage(stage_9_conflict_resolution(max_turns, temperature))
+        .stage(stage_10_conflict_resolution(max_turns, temperature))
         .early_exit_if(
             |s| s.conflict_resolved_concerns.is_empty(),
             "No concerns remaining after conflict resolution",
         )
-        .stage(stage_10_verification(max_turns, temperature))
+        .stage(stage_11_verification(max_turns, temperature))
         .early_exit_if(
             |s| s.findings.is_empty(),
             "No findings validated in verification stage",
         )
-        .stage(stage_11_inline_report(max_turns, temperature))
+        .stage(stage_12_inline_report(max_turns, temperature))
         .build()
 }
 
@@ -967,7 +1094,7 @@ mod tests {
     fn test_analysis_stages_keep_the_guidance_the_schema_alone_does_not_carry() {
         // The vendored guides still tell the model to use TodoWrite, which no
         // longer exists, and stage 10 keeps an anti-charity directive of its
-        // own. Both belong to stages 1 to 7 as well.
+        // own. Both belong to stages 1 to 8 as well.
         for required in [
             "Do not call or mention TodoWrite",
             "Do not be overly charitable to the existing code",
@@ -979,7 +1106,177 @@ mod tests {
         ] {
             assert!(
                 STAGE_JSON_SCHEMA_EXAMPLE.contains(required),
-                "stage 1-7 guidance lost: {required}"
+                "stage 1-8 guidance lost: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_testability_guides_match_the_patch_not_a_model() {
+        let state = |diff: &str| KernelReviewState {
+            target_commit_diff: diff.to_string(),
+            ..Default::default()
+        };
+        let guide = |name: &str| PathBuf::from("subsystem").join(name);
+
+        // A patch that touches neither framework still gets the stage, but
+        // carries none of the framework-specific weight.
+        assert!(kernel_test_guides(&state("diff --git a/mm/slub.c b/mm/slub.c")).is_empty());
+
+        // KUnit names itself, in the code or only in the changelog.
+        assert_eq!(
+            kernel_test_guides(&state("+	KUNIT_ASSERT_EQ(test, err, 0);")),
+            vec![guide("kunit.md")]
+        );
+        assert_eq!(
+            kernel_test_guides(&state("Add a KUnit test for the parser.")),
+            vec![guide("kunit.md")]
+        );
+
+        assert_eq!(
+            kernel_test_guides(&state(
+                "diff --git a/tools/testing/selftests/net/x.c b/tools/testing/selftests/net/x.c"
+            )),
+            vec![guide("selftests.md")]
+        );
+
+        // A KUnit test living under the kselftest tree earns both.
+        assert_eq!(
+            kernel_test_guides(&state(
+                "a/tools/testing/selftests/x.c\n+	KUNIT_EXPECT_EQ(test, 1, 1);"
+            )),
+            vec![guide("kunit.md"), guide("selftests.md")]
+        );
+    }
+
+    #[test]
+    fn test_testability_stage_sees_what_comes_later_in_the_series() {
+        // Ordering advice -- a test before the refactor it covers, but with or
+        // after the fix it exercises -- is only answerable from the patches
+        // that follow. Verification already receives them; so must this stage.
+        let rendered = testability_user_prompt().render_for_log(&KernelReviewState {
+            follow_up_series_context: Some("=== Follow-Up Patches in Series ===".to_string()),
+            ..Default::default()
+        });
+        assert!(rendered.contains("=== Follow-Up Patches in Series ==="));
+
+        // A patch reviewed on its own has nothing to say about ordering, and
+        // must not be handed an empty placeholder to reason about.
+        let alone = testability_user_prompt().render_for_log(&KernelReviewState::default());
+        assert!(!alone.contains("Follow-Up Patches"));
+        assert!(!alone.contains("follow_up_series_section"));
+    }
+
+    #[test]
+    fn test_testability_style_docs_match_the_same_triggers_as_the_guides() {
+        // The guide and the document it defers to must arrive together, or the
+        // guide points at a section that is not there.
+        let paired = |diff: &str| {
+            let state = KernelReviewState {
+                target_commit_diff: diff.to_string(),
+                ..Default::default()
+            };
+            (
+                kernel_test_guides(&state).len(),
+                kernel_test_style_docs(diff).len(),
+            )
+        };
+
+        assert_eq!(paired("diff --git a/mm/slub.c b/mm/slub.c"), (0, 0));
+        assert_eq!(paired("+\tKUNIT_ASSERT_EQ(test, err, 0);"), (1, 1));
+        assert_eq!(paired("a/tools/testing/selftests/net/x.c"), (1, 1));
+
+        assert_eq!(
+            kernel_test_style_docs("+config FOO_KUNIT_TEST"),
+            vec!["Documentation/dev-tools/kunit/style.rst"]
+        );
+        assert_eq!(
+            kernel_test_style_docs("a/tools/testing/selftests/x.c"),
+            vec!["Documentation/dev-tools/kselftest.rst"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_testability_prompt_carries_the_tree_style_guide() {
+        // Injected rather than fetched: the stage is not asked to call a tool,
+        // because when it was asked it answered without calling one.
+        let rendered = testability_user_prompt().render_for_log(&KernelReviewState {
+            testing_style_docs:
+                "<in_tree_style_guides>\nTest Style and Nomenclature\n</in_tree_style_guides>"
+                    .to_string(),
+            ..Default::default()
+        });
+        assert!(rendered.contains("Test Style and Nomenclature"));
+
+        // A patch touching no test framework carries neither the section nor a
+        // stray placeholder.
+        let bare = testability_user_prompt().render_for_log(&KernelReviewState::default());
+        assert!(!bare.contains("in_tree_style_guides"));
+        assert!(!bare.contains("testing_style_docs"));
+    }
+
+    #[tokio::test]
+    async fn test_style_docs_are_read_from_the_tree_under_review() {
+        let tree = tempfile::tempdir().unwrap();
+        let doc = tree.path().join("Documentation/dev-tools/kunit");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("style.rst"), "Suites are named after...").unwrap();
+
+        let docs = crate::worker::prompts::build_testing_style_docs(
+            tree.path(),
+            "+\tKUNIT_CASE(foo_parse_rejects_empty_input),",
+        )
+        .await;
+        assert!(docs.contains("Suites are named after..."));
+        assert!(docs.contains("Documentation/dev-tools/kunit/style.rst"));
+
+        // A tree without the document yields nothing rather than an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            crate::worker::prompts::build_testing_style_docs(empty.path(), "KUNIT_CASE")
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_testability_stage_runs_for_every_patch() {
+        let stages = |state: &KernelReviewState| {
+            resolve_analysis_stages_with_options(state, 1, 1.0)
+                .iter()
+                .map(|s| s.name())
+                .collect::<Vec<_>>()
+        };
+
+        // No planning result: the fallback list carries it.
+        assert!(stages(&KernelReviewState::default()).contains(&"stage_8"));
+
+        // Planned: the planner seeds it rather than choosing it, so a plan
+        // that names only the stages the planner may pick still has it.
+        let planned = KernelReviewState {
+            planned_stages: vec![1, 2, 3, 8],
+            ..Default::default()
+        };
+        assert!(stages(&planned).contains(&"stage_8"));
+
+        // An explicit --stages request still wins in both directions.
+        let manual = KernelReviewState {
+            manual_stages: Some(vec![6]),
+            planned_stages: vec![6],
+            ..Default::default()
+        };
+        assert!(!stages(&manual).contains(&"stage_8"));
+    }
+
+    #[test]
+    fn test_testing_guides_are_not_broadcast_to_every_stage() {
+        // The testability stage loads these itself. Left in the pre-screen's
+        // set they would ride along in all twelve stages' system prompts, the
+        // reason locking.md is excluded too.
+        for guide in ["testing.md", "kunit.md", "selftests.md"] {
+            assert!(
+                STAGE_EXCLUSIVE_GUIDES.contains(&guide),
+                "{guide} would be broadcast to every stage"
             );
         }
     }

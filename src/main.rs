@@ -66,7 +66,7 @@ struct Cli {
     #[arg(long)]
     enable_unsafe_all_submit: bool,
 
-    /// Debug feature: select which stages from 1-7 to run
+    /// Debug feature: select which stages to run (1-8)
     #[arg(long, hide = true, value_delimiter = ',')]
     stages: Option<Vec<u8>>,
 
@@ -133,7 +133,7 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         color: ColorMode,
 
-        /// Select which stages from 1-7 to run
+        /// Select which stages to run (1-8)
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<u8>>,
     },
@@ -185,7 +185,7 @@ enum Commands {
         #[arg(long)]
         custom_prompt: Option<String>,
 
-        /// Select which stages from 1-7 to run
+        /// Select which stages to run (1-8)
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<u8>>,
     },
@@ -1065,10 +1065,11 @@ fn stage_short_name(stage: u8) -> &'static str {
         5 => "Locking & Sync",
         6 => "Security Audit",
         7 => "Hardware Review",
-        8 => "Deduplication",
-        9 => "Conflict Resolution",
-        10 => "Severity Estimation",
-        11 => "Report Generation",
+        8 => "Testability",
+        9 => "Deduplication",
+        10 => "Conflict Resolution",
+        11 => "Severity Estimation",
+        12 => "Report Generation",
         _ => "Unknown",
     }
 }
