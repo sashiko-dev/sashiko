@@ -102,7 +102,7 @@ cc = ["wsa+renesas@sang-engineering.com"]
 [subsystems.rust-for-linux]
 lists = ["rust-for-linux@vger.kernel.org"]
 reply_to_author = true
-cc = ["ojeda@kernel.org"]
+cc = ["ojeda@kernel.org", "gary@garyguo.net"]
 
 [subsystems.sched-ext]
 lists = ["sched-ext@lists.linux.dev"]
