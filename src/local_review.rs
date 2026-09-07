@@ -1014,13 +1014,7 @@ async fn run_worker_in_worktree(
         "dismissed_concerns_count": total_dismissed_concerns_count
     });
 
-    for (patch_index, message) in &review_failures {
-        patch_results.push(json!({
-            "index": patch_index,
-            "status": "review_failed",
-            "error": message
-        }));
-    }
+    record_review_failures(&mut patch_results, &review_failures);
 
     let mut combined_result = json!({
         "patchset_id": patchset_id,
@@ -1035,15 +1029,11 @@ async fn run_worker_in_worktree(
         "tokens_cached": total_tokens_cached
     });
 
-    if !review_failures.is_empty() {
-        let indices: Vec<String> = review_failures.iter().map(|(i, _)| i.to_string()).collect();
-        combined_result["error"] = json!(format!(
-            "AI review failed for {} of {} patches (index {})",
-            review_failures.len(),
-            patches_to_review.len(),
-            indices.join(", ")
-        ));
-    }
+    set_review_failure_error(
+        &mut combined_result,
+        &review_failures,
+        patches_to_review.len(),
+    );
 
     Ok(combined_result)
 }
@@ -1087,6 +1077,38 @@ pub fn result_has_high_or_critical_findings(result: &Value) -> bool {
             .to_ascii_lowercase();
         is_new && matches!(severity.as_str(), "critical" | "high")
     })
+}
+
+/// Records each failed patch review as an entry in patch_results, alongside
+/// the entries written for patch application.
+fn record_review_failures(patch_results: &mut Vec<Value>, review_failures: &[(i64, String)]) {
+    for (patch_index, message) in review_failures {
+        patch_results.push(json!({
+            "index": patch_index,
+            "status": "review_failed",
+            "error": message
+        }));
+    }
+}
+
+/// Sets the top level error field when any patch review failed, so that
+/// result_has_error still reports the run as failed even though the reviews
+/// that succeeded are returned.
+fn set_review_failure_error(
+    combined_result: &mut Value,
+    review_failures: &[(i64, String)],
+    total_patches: usize,
+) {
+    if review_failures.is_empty() {
+        return;
+    }
+    let indices: Vec<String> = review_failures.iter().map(|(i, _)| i.to_string()).collect();
+    combined_result["error"] = json!(format!(
+        "AI review failed for {} of {} patches (index {})",
+        review_failures.len(),
+        total_patches,
+        indices.join(", ")
+    ));
 }
 
 async fn apply_single_patch(
@@ -1734,6 +1756,47 @@ mod tests {
         assert!(ctx_str.contains("Current Patch Under Review: [Patch 1 of 2] - Patch 1"));
         assert!(ctx_str.contains("Series End Commit (Final State): sha2"));
         assert!(ctx_str.contains("- [Patch 2 of 2] (commit sha2): Patch 2"));
+    }
+
+    #[test]
+    fn test_record_review_failures_marks_each_failed_patch() {
+        let mut patch_results = vec![json!({"index": 1, "status": "applied"})];
+        let failures = vec![
+            (2, "timed out".to_string()),
+            (3, "provider returned no content".to_string()),
+        ];
+
+        record_review_failures(&mut patch_results, &failures);
+
+        assert_eq!(patch_results.len(), 3);
+        assert_eq!(patch_results[0]["status"], "applied");
+        assert_eq!(patch_results[1]["status"], "review_failed");
+        assert_eq!(patch_results[1]["index"], 2);
+        assert_eq!(patch_results[1]["error"], "timed out");
+        assert_eq!(patch_results[2]["index"], 3);
+    }
+
+    #[test]
+    fn test_review_failure_error_is_set_so_the_run_still_reports_failure() {
+        let mut combined_result = json!({"patchset_id": 7, "review": {}});
+        let failures = vec![(2, "timed out".to_string())];
+
+        set_review_failure_error(&mut combined_result, &failures, 12);
+
+        assert!(result_has_error(&combined_result));
+        let message = combined_result["error"].as_str().unwrap_or_default();
+        assert!(message.contains("1 of 12"), "unexpected message: {message}");
+        assert!(message.contains('2'), "unexpected message: {message}");
+    }
+
+    #[test]
+    fn test_no_review_failure_error_when_every_patch_succeeded() {
+        let mut combined_result = json!({"patchset_id": 7, "review": {}});
+
+        set_review_failure_error(&mut combined_result, &[], 12);
+
+        assert!(!result_has_error(&combined_result));
+        assert!(combined_result.get("error").is_none());
     }
 
     #[test]
