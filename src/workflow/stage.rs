@@ -229,6 +229,29 @@ struct StageSession<'a, S, T> {
     last_tool_call: Option<(String, Value)>,
 }
 
+impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> StageSession<'a, S, T> {
+    /// Returns the refusal to hand back when this call repeats the one before
+    /// it, or None when it should run.
+    fn duplicate_refusal(&self, name: &str, args: &Value) -> Option<Value> {
+        let repeated = self
+            .last_tool_call
+            .as_ref()
+            .is_some_and(|last| last.0 == name && last.1 == *args);
+        if repeated {
+            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
+            return Some(json!({
+                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+            }));
+        }
+        None
+    }
+
+    /// Records a call that is about to run, for the guard above.
+    fn record_tool_call(&mut self, name: &str, args: &Value) {
+        self.last_tool_call = Some((name.to_string(), args.clone()));
+    }
+}
+
 #[async_trait]
 impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSession
     for StageSession<'a, S, T>
@@ -287,17 +310,10 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
-        let repeated = self
-            .last_tool_call
-            .as_ref()
-            .is_some_and(|last| last.0 == name && last.1 == args);
-        if repeated {
-            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
-            return Ok(json!({
-                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
-            }));
+        if let Some(refusal) = self.duplicate_refusal(name, &args) {
+            return Ok(refusal);
         }
-        self.last_tool_call = Some((name.to_string(), args.clone()));
+        self.record_tool_call(name, &args);
         match self.tools.call(name, args).await {
             Ok(v) => Ok(v),
             Err(e) => Ok(json!({ "error": e.to_string() })),
@@ -309,24 +325,10 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
         let mut to_run = Vec::new();
 
         for (idx, call) in calls.into_iter().enumerate() {
-            let repeated = self
-                .last_tool_call
-                .as_ref()
-                .is_some_and(|last| last.0 == call.function_name && last.1 == call.arguments);
-            if repeated {
-                tracing::warn!(
-                    "Blocked duplicate tool call: {} with args {:?}",
-                    call.function_name,
-                    call.arguments
-                );
-                results[idx] = Some((
-                    call.id,
-                    json!({
-                        "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
-                    }),
-                ));
+            if let Some(refusal) = self.duplicate_refusal(&call.function_name, &call.arguments) {
+                results[idx] = Some((call.id, refusal));
             } else {
-                self.last_tool_call = Some((call.function_name.clone(), call.arguments.clone()));
+                self.record_tool_call(&call.function_name, &call.arguments);
                 to_run.push((idx, call));
             }
         }
