@@ -301,6 +301,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let mut state = DummyState::default();
@@ -350,6 +351,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let mut state = DummyState::default();

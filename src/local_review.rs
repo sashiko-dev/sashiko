@@ -560,6 +560,7 @@ async fn review_single_patch(
                 max_input_tokens: ai.max_input_tokens,
                 max_interactions: ai.max_interactions,
                 temperature: ai.temperature,
+                dedup_tool_calls: ai.dedup_tool_calls,
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),

@@ -85,6 +85,8 @@ pub struct WorkerConfig {
     pub max_input_tokens: usize,
     pub max_interactions: usize,
     pub temperature: f32,
+    /// See AiSettings::dedup_tool_calls.
+    pub dedup_tool_calls: bool,
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
@@ -484,6 +486,7 @@ pub struct Worker {
     global_history: Vec<AiMessage>,
     max_interactions: usize,
     temperature: f32,
+    dedup_tool_calls: bool,
     series_range: Option<String>,
     baseline_sha: Option<String>,
     context_tag: Option<String>,
@@ -505,6 +508,7 @@ impl Worker {
             global_history: Vec::new(),
             max_interactions: config.max_interactions,
             temperature: config.temperature,
+            dedup_tool_calls: config.dedup_tool_calls,
             series_range: config.series_range,
             baseline_sha: config.baseline_sha,
             context_tag: None,
@@ -664,6 +668,7 @@ impl Worker {
             tools: self.tools.clone(),
             base_dir: &self.prompts.base_dir,
             context_tag: self.context_tag.clone(),
+            dedup_tool_calls: self.dedup_tool_calls,
         };
 
         let event_cb = move |event: WorkflowEvent| {
@@ -1238,6 +1243,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            dedup_tool_calls: false,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1388,6 +1394,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            dedup_tool_calls: false,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1422,6 +1429,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            dedup_tool_calls: false,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1460,6 +1468,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            dedup_tool_calls: false,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1556,6 +1565,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            dedup_tool_calls: false,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
