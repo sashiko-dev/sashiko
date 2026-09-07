@@ -365,6 +365,18 @@ pub struct AiSettings {
     /// Useful for debugging but verbose; disabled by default.
     #[serde(default)]
     pub log_turns: bool,
+    /// Refuse a tool call already made anywhere in the same stage, rather than
+    /// only the one immediately before it.
+    ///
+    /// The existing guard compares against the previous call alone, so a model
+    /// cycling between several calls is never caught. Measured repeat rates
+    /// within a single stage session were 53, 59 and 74 percent, with one
+    /// identical git_grep issued nine times. Every repeat costs a turn, and
+    /// every turn resends the conversation.
+    ///
+    /// Defaults to false, which preserves the existing behaviour.
+    #[serde(default)]
+    pub dedup_tool_calls: bool,
     #[serde(default)]
     pub response_cache: bool,
     #[serde(default = "default_response_cache_ttl_days")]
