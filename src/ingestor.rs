@@ -57,7 +57,12 @@ impl Ingestor {
 
         for entry in &self.settings.mailing_lists.track {
             if !entry.contains(':') && !entry.contains('.') && available_groups.is_none() {
-                match NntpClient::connect(&self.settings.nntp.server, self.settings.nntp.port).await
+                match NntpClient::connect(
+                    &self.settings.nntp.server,
+                    self.settings.nntp.port,
+                    self.settings.nntp.tls,
+                )
+                .await
                 {
                     Ok(mut client) => match client.list().await {
                         Ok(list) => available_groups = Some(list),
@@ -330,8 +335,12 @@ impl Ingestor {
     }
 
     async fn process_nntp_cycle(&self) -> Result<()> {
-        let mut client =
-            NntpClient::connect(&self.settings.nntp.server, self.settings.nntp.port).await?;
+        let mut client = NntpClient::connect(
+            &self.settings.nntp.server,
+            self.settings.nntp.port,
+            self.settings.nntp.tls,
+        )
+        .await?;
 
         for (name, group_name) in self.get_tracked_groups().await? {
             let group_name = &group_name;
@@ -341,9 +350,12 @@ impl Ingestor {
                 Ok(i) => i,
                 Err(e) => {
                     error!("Failed to select group {}: {}", group_name, e);
-                    if let Ok(new_client) =
-                        NntpClient::connect(&self.settings.nntp.server, self.settings.nntp.port)
-                            .await
+                    if let Ok(new_client) = NntpClient::connect(
+                        &self.settings.nntp.server,
+                        self.settings.nntp.port,
+                        self.settings.nntp.tls,
+                    )
+                    .await
                     {
                         client = new_client;
                     }
@@ -422,6 +434,7 @@ impl Ingestor {
                             if let Ok(new_client) = NntpClient::connect(
                                 &self.settings.nntp.server,
                                 self.settings.nntp.port,
+                                self.settings.nntp.tls,
                             )
                             .await
                             {

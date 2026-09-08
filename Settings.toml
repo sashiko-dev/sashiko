@@ -39,6 +39,8 @@ track = ["linux-kernel"]
 [nntp]
 server = "nntp.lore.kernel.org"
 port = 119
+# Wrap the session in TLS (NNTPS). Servers listen for NNTPS on 563.
+# tls = false
 
 # [smtp]
 # **WARNING: BE VERY CAREFUL WHEN ENABLING EMAIL SENDING.**

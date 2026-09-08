@@ -92,7 +92,7 @@ cd sashiko
 Copy `Settings.toml` to customize your configuration. For a full reference of every
 setting, see the [Configuration Reference](docs/configuration.md). The default `Settings.toml` includes sections for:
 *   **Database**: SQLite database path (`sashiko.db`).
-*   **NNTP**: Server details and groups to monitor.
+*   **NNTP**: Server details, optional TLS, and groups to monitor.
 *   **AI**: Provider and model selection.
 *   **Server**: API server host and port.
 *   **Git**: Path to the reference kernel repository.
