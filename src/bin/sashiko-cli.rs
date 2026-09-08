@@ -1604,9 +1604,16 @@ async fn handle_local(
             drop(stdin);
         }
 
-        // Stream stderr for progress in a background task
+        // Stream stderr for progress, while keeping a bounded tail of the
+        // subprocess's log lines. The progress UI consumes these lines, so
+        // without the tail a failed review would collapse to a bare "no output"
+        // message with its actual cause (a stage error, an auth/quota failure)
+        // discarded. On failure we replay the tail so the run explains itself.
         let stderr = child.stderr.take();
         let stderr_handle = tokio::spawn(async move {
+            use std::collections::VecDeque;
+            const STDERR_TAIL_LINES: usize = 100;
+            let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
             if let Some(stderr) = stderr {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let reader = BufReader::new(stderr);
@@ -1628,8 +1635,13 @@ async fn handle_local(
                         eprint_phase(4, 4, "Review complete.");
                         eprintln!();
                     }
+                    if tail.len() == STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
                 }
             }
+            tail
         });
 
         // Capture stdout
@@ -1638,12 +1650,17 @@ async fn handle_local(
             .await
             .context("Failed to wait for review subprocess")?;
 
-        let _ = stderr_handle.await;
+        let stderr_tail = stderr_handle.await.unwrap_or_default();
 
         let exit_code = output.status.code().unwrap_or(1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
         if stdout.trim().is_empty() {
+            // The subprocess failed before emitting a result; replay its log
+            // tail so the actual cause is visible rather than swallowed.
+            for line in &stderr_tail {
+                eprintln!("{line}");
+            }
             return Err(anyhow::anyhow!(
                 "Review subprocess produced no output (exit code: {})",
                 exit_code
