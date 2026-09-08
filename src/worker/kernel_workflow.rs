@@ -28,10 +28,6 @@ use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, Too
 use crate::workflow::prompt::PromptTemplate;
 use crate::workflow::stage::{ExecutableStage, Stage};
 
-/// Subsystem guides that are loaded per-stage and should be excluded
-/// from Phase 0 shared context to avoid redundant token usage.
-pub const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
-
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
 pub struct KernelReviewState {
@@ -45,14 +41,18 @@ pub struct KernelReviewState {
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
 
-    /// Subsystem guide markdown files selected during Phase 0 pre-screen.
+    /// Subsystem guide markdown files selected during the pre-screen and
+    /// shared with every stage.
     pub selected_guides: Vec<String>,
-    /// Optional manual stages filter (e.g. `--stages 1,2,5`).
-    pub manual_stages: Option<Vec<u8>>,
+    /// Guides the pre-screen selected that a stage claims for itself. Held
+    /// apart from `selected_guides` so they reach that stage and no other.
+    pub stage_selected_guides: Vec<String>,
+    /// Optional manual stages filter (e.g. `--stages goal,locking`).
+    pub manual_stages: Option<Vec<String>>,
     /// Caller-supplied instructions appended to the shared system prompt.
     pub custom_prompt: Option<String>,
     /// Stages selected by dynamic planning (or overridden by manual_stages).
-    pub planned_stages: Vec<u8>,
+    pub planned_stages: Vec<String>,
 
     /// Aggregated raw concerns collected from Stages 1-7.
     pub all_concerns: Vec<Value>,
@@ -81,13 +81,13 @@ pub struct KernelReviewState {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct Phase0Output {
+pub struct PrescreenOutput {
     pub selected_prompts: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct PlanningOutput {
-    pub relevant_stages: Vec<u8>,
+    pub relevant_stages: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
@@ -99,13 +99,13 @@ pub struct StageConcernsOutput {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
-pub struct Stage9Output {
+pub struct ConflictResolutionOutput {
     #[serde(default)]
     pub concerns: Vec<Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
-pub struct Stage10Output {
+pub struct VerificationOutput {
     #[serde(default)]
     pub findings: Vec<Value>,
 }
@@ -180,23 +180,23 @@ Target Commit:
 // Stage Builders
 // ---------------------------------------------------------------------------
 
-const STAGE_1_INSTRUCTION: &str = r#"# Stage 1. Analyze commit main goal
+const STAGE_GOAL_INSTRUCTION: &str = r#"# Analyze commit main goal
 
 You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally flawed concepts? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."#;
 
-const STAGE_2_INSTRUCTION: &str = r#"# Stage 2. High-level implementation verification
+const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# High-level implementation verification
 
 You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."#;
 
-const STAGE_3_INSTRUCTION: &str = r#"# Stage 3. Execution flow verification
+const STAGE_EXECUTION_FLOW_INSTRUCTION: &str = r#"# Execution flow verification
 
 You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."#;
 
-const STAGE_4_INSTRUCTION: &str = r#"# Stage 4. Resource management
+const STAGE_RESOURCES_INSTRUCTION: &str = r#"# Resource management
 
 You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."#;
 
-const STAGE_5_INSTRUCTION: &str = r#"# Stage 5. Locking and synchronization
+const STAGE_LOCKING_INSTRUCTION: &str = r#"# Locking and synchronization
 
 You are a world-class concurrency and locking expert auditing a Linux kernel patch.
 Carefully review the proposed patch for ANY locking, concurrency, or synchronization bugs.
@@ -211,15 +211,25 @@ You MUST consider the following categories of issues and report any violations:
 8. Lock re-initialization: Does it re-initialize a lock that was already initialized, or destroy a lock on a failure path improperly?
 9. Missing locking: Is a port or file exposed to userspace before the driver/TTY linking is complete? Does a worker race with cleanup code leading to dropped/leaked frames?"#;
 
-const STAGE_6_INSTRUCTION: &str = r#"# Stage 6. Security audit
+const STAGE_SECURITY_INSTRUCTION: &str = r#"# Security audit
 
 You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."#;
 
-const STAGE_7_INSTRUCTION: &str = r#"# Stage 7. Hardware engineer's review
+const STAGE_HARDWARE_INSTRUCTION: &str = r#"# Hardware engineer's review
 
 You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), return {"concerns": [], "dismissed_concerns": []}."#;
 
-const STAGE_8_INSTRUCTION: &str = r#"# Stage 8. Deduplication and Consolidation
+const STAGE_TESTABILITY_INSTRUCTION: &str = r#"# Testability and test review
+
+You are a test engineer reviewing a proposed change for testability and for the quality of any tests it brings with it. Two questions, in order.
+
+First, is the claim in the commit message checkable? A change that fixes a bug, alters observable behaviour, or adds an interface should normally come with something that would fail before it and pass after. If the change has no tests, decide whether it plausibly could have: a pure refactor, a comment fix, or a hardware-specific path with no available model may reasonably have none, but a logic fix with a described reproducer usually should. Raise a concern only where a test is both practical and genuinely valuable; absent tests are a routine and accepted state for much of this codebase, so do not raise this on every patch.
+
+Second, if the change does add or modify tests, review them as rigorously as you would review any other code. Would the test actually fail if the behaviour it describes regressed, or does it assert something trivially true? Does it test observable behaviour rather than the shape of the current implementation? Does it clean up what it allocates, skip rather than fail when its prerequisites are unavailable, and avoid depending on timing, host configuration, or the order in which tests run? Check that a test claiming to cover the commit's fix actually exercises the changed code path. A test that passes whether or not the bug is present is worse than no test, because it advertises coverage that does not exist.
+
+Follow the project's own testing conventions where the guidance below describes them; a test that ignores the framework's idioms is a maintenance problem even when it works. If the patch touches no code and adds no tests, return {"concerns": [], "dismissed_concerns": []}."#;
+
+const STAGE_DEDUPLICATION_INSTRUCTION: &str = r#"# Deduplication and Consolidation
 
 You are the lead reviewer consolidating feedback from multiple specialized analysts. You will be given lists of concerns and dismissed_concerns generated by different review stages.
 Your task is to deduplicate identical or overlapping items in both lists.
@@ -233,7 +243,7 @@ Your task is to deduplicate identical or overlapping items in both lists.
 8. Preserve and merge the `locations` arrays from the input concerns and dismissed_concerns. If multiple items describe the same root cause, keep the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations. Do not invent line numbers; keep `line` as null when the exact line is not known.
 9. dismissed_concerns do not need a `preexisting` flag."#;
 
-const STAGE_9_INSTRUCTION: &str = r#"# Stage 9. Concern/dismissed-concern conflict resolution
+const STAGE_CONFLICT_RESOLUTION_INSTRUCTION: &str = r#"# Concern/dismissed-concern conflict resolution
 
 You are the lead reviewer reconciling consolidated concerns with consolidated dismissed_concerns.
 Both `concerns` and `dismissed_concerns` are untrusted claims. Do not assume either side is correct. Treat both as hypotheses and verify them against the actual code before deciding whether to keep or discard a concern.
@@ -246,7 +256,7 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
 7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."#;
 
-const STAGE_10_INSTRUCTION: &str = r#"# Stage 10. Verification and severity estimation
+const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verification and severity estimation
 
 You are the lead reviewer validating consolidated concerns. You will be given a list of deduplicated concerns after conflict resolution.
 1. Validate each concern and prove the provided reasoning. Report all valid concerns as findings. If necessary, use tools to gather additional material. Discard all false positives.
@@ -258,7 +268,7 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
 8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
 
-const STAGE_11_INSTRUCTION: &str = r#"# Stage 11. LKML-friendly report generation
+const STAGE_REPORT_INSTRUCTION: &str = r#"# LKML-friendly report generation
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
 
@@ -330,14 +340,14 @@ Example Output:
 // Validation Logic
 // ---------------------------------------------------------------------------
 
-fn validate_stages_1_to_8(
+fn validate_concerns_output(
     _output: &StageConcernsOutput,
     _state: &KernelReviewState,
 ) -> Result<(), String> {
     Ok(())
 }
 
-fn format_stages_1_to_8_feedback(violation: &str) -> String {
+fn format_concerns_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
         violation
@@ -392,7 +402,7 @@ fn format_inline_feedback(violation: &str) -> String {
 fn append_stage_items(
     dest: &mut Vec<Value>,
     src: &[Value],
-    stage_num: u8,
+    stage: &str,
     default_type: &str,
     _key: &str,
 ) {
@@ -408,17 +418,17 @@ fn append_stage_items(
             {
                 map.insert("type".to_string(), json!(default_type));
             }
-            map.insert("stage".to_string(), json!(stage_num));
+            map.insert("stage".to_string(), json!(stage));
         }
         dest.push(obj);
     }
 }
 
-fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage_num: u8) {
+fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage: &str) {
     for item in src {
         let mut obj = item.clone();
         if let Some(map) = obj.as_object_mut() {
-            map.insert("stage".to_string(), json!(stage_num));
+            map.insert("stage".to_string(), json!(stage));
         }
         dest.push(obj);
     }
@@ -428,8 +438,8 @@ fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage_n
 // Stage Definitions
 // ---------------------------------------------------------------------------
 
-pub fn prescreen_stage() -> Stage<KernelReviewState, Phase0Output> {
-    Stage::builder("stage_0_prescreen")
+pub fn prescreen_stage() -> Stage<KernelReviewState, PrescreenOutput> {
+    Stage::builder(PRESCREEN_STAGE)
         .system_prompt(PromptTemplate::<KernelReviewState>::new(
             "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```",
         ))
@@ -455,33 +465,33 @@ pub fn prescreen_stage() -> Stage<KernelReviewState, Phase0Output> {
             max_turns: 1,
             ..Default::default()
         })
-        .skip_if(|s| s.manual_stages.is_some())
-        .reduce(|state, out: Phase0Output| {
-            let prompts: Vec<String> = out
+        .skip_if(prescreen_skipped)
+        .reduce(|state, out: PrescreenOutput| {
+            let (claimed, shared): (Vec<String>, Vec<String>) = out
                 .selected_prompts
                 .into_iter()
-                .filter(|name| !STAGE_EXCLUSIVE_GUIDES.contains(&name.as_str()))
-                .collect();
-            state.selected_guides = prompts;
+                .partition(|name| is_stage_exclusive_guide(name));
+            state.selected_guides = shared;
+            state.stage_selected_guides = claimed;
         })
         .build()
 }
 
 pub fn planning_stage() -> Stage<KernelReviewState, PlanningOutput> {
-    Stage::builder("stage_planning")
+    Stage::builder(PLANNING_STAGE)
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(PromptTemplate::<KernelReviewState>::new(
             r#"Analyze the provided patch and determine which of the following review stages are relevant and should be executed:
-- Stage 4: Resource management
-- Stage 5: Locking and synchronization
-- Stage 6: Security audit
-- Stage 7: Hardware engineer's review
+- resources: Resource management
+- locking: Locking and synchronization
+- security: Security audit
+- hardware: Hardware engineer's review
 
-CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages 1, 2, and 3 are always run and should not be included in your answer.
+CRITICAL: Always err on the side of running more stages. If you are not absolutely sure, include the stage. If the patch is a trivial typo fix, you may omit some stages. Stages not listed above always run and should not be included in your answer.
 
-You MUST respond with ONLY a JSON object, no other text. Example:
+You MUST respond with ONLY a JSON object, no other text. Use the names exactly as given above. Example:
 ```json
-{"relevant_stages": [4, 5, 6, 7]}
+{"relevant_stages": ["resources", "locking", "security", "hardware"]}
 ```"#,
         ))
         .output_format(OutputFormat::json_with_schema(json!({
@@ -489,7 +499,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             "properties": {
                 "relevant_stages": {
                     "type": "array",
-                    "items": { "type": "integer" }
+                    "items": { "type": "string" }
                 }
             },
             "required": ["relevant_stages"]
@@ -501,10 +511,18 @@ You MUST respond with ONLY a JSON object, no other text. Example:
         })
         .skip_if(|s| s.manual_stages.is_some())
         .reduce(|state, out: PlanningOutput| {
-            let mut stages = vec![1, 2, 3];
-            for n in out.relevant_stages {
-                if (4..=7).contains(&n) && !stages.contains(&n) {
-                    stages.push(n);
+            // The stages the planner is not asked about run regardless. Its
+            // answer is then admitted only where it names an optional stage,
+            // which is what stops a hallucinated name reaching the resolver.
+            let mut stages: Vec<String> = ANALYSIS_STAGES
+                .iter()
+                .filter(|d| !d.optional)
+                .map(|d| d.name.to_string())
+                .collect();
+            for name in out.relevant_stages {
+                let optional = analysis_stage_by_name(&name).is_some_and(|d| d.optional);
+                if optional && !stages.contains(&name) {
+                    stages.push(name);
                 }
             }
             state.planned_stages = stages;
@@ -512,36 +530,297 @@ You MUST respond with ONLY a JSON object, no other text. Example:
         .build()
 }
 
-/// Stages 3 to 6 review the diff hunks alone. Every other stage also needs the
-/// commit message, so it gets the git show output with the changelog injected.
-fn stage_uses_commit_log(stage_num: u8) -> bool {
-    !(3..=6).contains(&stage_num)
+/// One analysis stage: everything that distinguishes it from its siblings.
+///
+/// The workflow already identifies stages by name, so `name` is the whole
+/// identity: it is what `--stages` selects, what the planning stage returns,
+/// what is attached to a concern to say which analyst raised it, and what the
+/// progress display shows. Properties that used to be inferred from a stage's
+/// number live here instead, where they cannot fall out of step with it.
+pub struct AnalysisStage {
+    /// Stable identifier. Lowercase, hyphenated, and never renamed casually:
+    /// it appears in `--stages` and in stored review output.
+    pub name: &'static str,
+    /// Short label for the progress display.
+    pub short: &'static str,
+    pub instruction: &'static str,
+    pub guides: &'static [&'static str],
+    /// Whether the system prompt carries the commit message as well as the
+    /// diff: the git show output with the changelog injected, rather than the
+    /// hunks alone. Stages that judge the change against its stated intent
+    /// need it; those reading the hunks on their own terms do not.
+    pub uses_commit_log: bool,
+    /// Whether the planning stage may leave this one out. The first three
+    /// always run, so the planner is only ever asked about the rest.
+    pub optional: bool,
+    /// Whether the prompt carries the list of patches that follow this one in
+    /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
+    pub wants_series_context: bool,
+    /// Guides this stage loads only when the pre-screen selected them, by file
+    /// name as the index lists them. For guidance that applies to some patches
+    /// and not others, where `guides` applies to all of them. Like `guides`,
+    /// these are never broadcast to the other stages.
+    pub prescreen_guides: &'static [&'static str],
+}
+
+pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
+    AnalysisStage {
+        name: "goal",
+        short: "Goal Analysis",
+        instruction: STAGE_GOAL_INSTRUCTION,
+        guides: &[],
+        uses_commit_log: true,
+        optional: false,
+        wants_series_context: false,
+        prescreen_guides: &[],
+    },
+    AnalysisStage {
+        name: "implementation",
+        short: "Implementation",
+        instruction: STAGE_IMPLEMENTATION_INSTRUCTION,
+        guides: &[],
+        uses_commit_log: true,
+        optional: false,
+        wants_series_context: false,
+        prescreen_guides: &[],
+    },
+    AnalysisStage {
+        name: "execution-flow",
+        short: "Execution Flow",
+        instruction: STAGE_EXECUTION_FLOW_INSTRUCTION,
+        guides: &["callstack.md", "technical-patterns.md"],
+        uses_commit_log: false,
+        optional: false,
+        wants_series_context: false,
+        prescreen_guides: &[],
+    },
+    AnalysisStage {
+        name: "resources",
+        short: "Resource Mgmt",
+        instruction: STAGE_RESOURCES_INSTRUCTION,
+        guides: &[],
+        uses_commit_log: false,
+        optional: true,
+        wants_series_context: false,
+        prescreen_guides: &[],
+    },
+    AnalysisStage {
+        name: "locking",
+        short: "Locking & Sync",
+        instruction: STAGE_LOCKING_INSTRUCTION,
+        guides: &["subsystem/locking.md"],
+        uses_commit_log: false,
+        optional: true,
+        wants_series_context: false,
+        prescreen_guides: &[],
+    },
+    AnalysisStage {
+        name: "security",
+        short: "Security Audit",
+        instruction: STAGE_SECURITY_INSTRUCTION,
+        guides: &[],
+        uses_commit_log: false,
+        optional: true,
+        wants_series_context: false,
+        prescreen_guides: &[],
+    },
+    AnalysisStage {
+        name: "testability",
+        short: "Testability",
+        instruction: STAGE_TESTABILITY_INSTRUCTION,
+        guides: &["subsystem/testing.md"],
+        // Applies only to patches that use these frameworks, so it is left to
+        // the pre-screen to say which patches those are.
+        prescreen_guides: &["kunit.md", "selftests.md"],
+        // Whether a change should have carried a test is a question about what
+        // it claims to do, so this stage needs the commit message.
+        uses_commit_log: true,
+        // A change that should have had a test and does not is the case with
+        // nothing in the diff to match on, so the planner is not asked.
+        optional: false,
+        wants_series_context: true,
+    },
+    AnalysisStage {
+        name: "hardware",
+        short: "Hardware Review",
+        instruction: STAGE_HARDWARE_INSTRUCTION,
+        guides: &[],
+        uses_commit_log: true,
+        optional: true,
+        wants_series_context: false,
+        prescreen_guides: &[],
+    },
+];
+
+/// The consolidation stages, in the order the workflow runs them. They take no
+/// per-stage configuration, so a name and a display label is all there is to
+/// hold, but holding it once keeps the list from being restated wherever a
+/// stage name has to be recognised or shown.
+pub struct ConsolidationStage {
+    pub name: &'static str,
+    pub short: &'static str,
+    /// Whether the prompt carries the list of patches that follow this one in
+    /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
+    pub wants_series_context: bool,
+}
+
+pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
+    name: "deduplication",
+    short: "Deduplication",
+    wants_series_context: false,
+};
+
+pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
+    name: "conflict-resolution",
+    short: "Conflict Resolution",
+    wants_series_context: false,
+};
+
+pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
+    name: "verification",
+    short: "Severity Estimation",
+    wants_series_context: true,
+};
+
+pub static REPORT: ConsolidationStage = ConsolidationStage {
+    name: "report",
+    short: "Report Generation",
+    wants_series_context: false,
+};
+
+/// In the order the workflow runs them. Each builder refers to its own
+/// definition above, so the name a stage registers under is the same string
+/// this list recognises and labels.
+pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
+    &[&DEDUPLICATION, &CONFLICT_RESOLUTION, &VERIFICATION, &REPORT];
+
+/// Marks where a stage's prompt carries the list of patches that follow this
+/// one in the series.
+///
+/// Two kinds of question need it. Where a test belongs in a series is only
+/// answerable from what comes after it, and whether a concern still stands can
+/// depend on a later patch reworking the code it is about. Both are declared in
+/// the stage tables rather than wired up per builder, so the placeholder and
+/// the variable that fills it cannot get separated.
+pub const SERIES_CONTEXT_PLACEHOLDER: &str = "{{follow_up_series_section}}";
+
+fn series_context_placeholder(wants: bool) -> &'static str {
+    if wants {
+        SERIES_CONTEXT_PLACEHOLDER
+    } else {
+        ""
+    }
+}
+
+fn with_series_context(
+    template: PromptTemplate<KernelReviewState>,
+    wants: bool,
+) -> PromptTemplate<KernelReviewState> {
+    if !wants {
+        return template;
+    }
+    template.with_var("follow_up_series_section", |s: &KernelReviewState| {
+        s.follow_up_series_context
+            .as_ref()
+            .map(|ctx| format!("\n\n{}", ctx))
+            .unwrap_or_default()
+    })
+}
+
+pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationStage> {
+    CONSOLIDATION_STAGES
+        .iter()
+        .copied()
+        .find(|s| s.name == name)
+}
+
+/// Display label for any stage the pipeline runs.
+pub fn stage_short_label(name: &str) -> Option<&'static str> {
+    if let Some(def) = analysis_stage_by_name(name) {
+        return Some(def.short);
+    }
+    consolidation_stage_by_name(name).map(|s| s.short)
+}
+
+/// Whether a guide belongs to one stage rather than to the shared context.
+///
+/// The pre-screen offers a guide to the whole review, but a guide some stage
+/// loads for itself would then arrive twice: once in that stage's user prompt
+/// and again in every stage's system prompt. Deriving the answer from the
+/// stage table means a guide claimed in the table is excluded by that fact
+/// alone, with no second list to keep in step.
+pub fn is_stage_exclusive_guide(name: &str) -> bool {
+    ANALYSIS_STAGES
+        .iter()
+        .flat_map(|def| def.guides.iter().chain(def.prescreen_guides))
+        .any(|guide| guide.rsplit('/').next() == Some(name))
+}
+
+pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
+    ANALYSIS_STAGES.iter().find(|s| s.name == name)
+}
+
+/// Nameable in `--stages`, though it is not an analysis stage: asking for it
+/// restores the guide selection that naming stages otherwise skips.
+pub const PRESCREEN_STAGE: &str = "pre-screen";
+/// Not nameable in `--stages`. It chooses which stages run, so naming stages
+/// has already answered it and it is skipped either way.
+pub const PLANNING_STAGE: &str = "planning";
+
+/// Every stage name a review can produce, analysis and consolidation alike,
+/// for validating what a caller or the planner asked for.
+pub fn is_known_stage(name: &str) -> bool {
+    analysis_stage_by_name(name).is_some()
+        || CONSOLIDATION_STAGES.iter().any(|s| s.name == name)
+        || matches!(name, PRESCREEN_STAGE | PLANNING_STAGE)
+}
+
+/// Whether naming stages leaves the pre-screen out.
+///
+/// Naming stages skips the pre-screen, because the point is usually to run
+/// one stage without the rest. A caller who wants the guide selection as well
+/// can ask for it by name. Naming nothing runs everything, pre-screen included.
+fn prescreen_skipped(state: &KernelReviewState) -> bool {
+    state
+        .manual_stages
+        .as_ref()
+        .is_some_and(|names| !names.iter().any(|n| n == PRESCREEN_STAGE))
 }
 
 fn analysis_stage(
-    stage_num: u8,
-    name: &'static str,
-    instruction: &'static str,
-    guides: &[&'static str],
+    def: &'static AnalysisStage,
     max_turns: usize,
     temperature: f32,
 ) -> Box<dyn ExecutableStage<KernelReviewState>> {
     let mut user_template = PromptTemplate::<KernelReviewState>::new(format!(
-        "{}\n\n{}",
-        instruction, STAGE_JSON_SCHEMA_EXAMPLE
+        "{}\n\n{}{}",
+        def.instruction,
+        STAGE_JSON_SCHEMA_EXAMPLE,
+        series_context_placeholder(def.wants_series_context)
     ));
-    for guide in guides {
+    for guide in def.guides {
         user_template = user_template.include_file(*guide);
     }
+    if !def.prescreen_guides.is_empty() {
+        let claimed = def.prescreen_guides;
+        user_template = user_template.include_files_from_state(move |s: &KernelReviewState| {
+            s.stage_selected_guides
+                .iter()
+                .filter(|selected| claimed.contains(&selected.as_str()))
+                .map(|selected| PathBuf::from("subsystem").join(selected))
+                .collect()
+        });
+    }
+    let user_template = with_series_context(user_template, def.wants_series_context);
 
     Box::new(
-        Stage::builder(name)
-            .system_prompt(kernel_system_prompt(stage_uses_commit_log(stage_num)))
+        Stage::builder(def.name)
+            .system_prompt(kernel_system_prompt(def.uses_commit_log))
             .user_prompt(user_template)
             .output_format(
                 OutputFormat::json()
-                    .with_validator(validate_stages_1_to_8)
-                    .with_feedback_formatter(format_stages_1_to_8_feedback),
+                    .with_validator(validate_concerns_output)
+                    .with_feedback_formatter(format_concerns_feedback),
             )
             .policy(StagePolicy {
                 tools: ToolScope::All,
@@ -554,14 +833,14 @@ fn analysis_stage(
                     append_stage_items(
                         &mut state.all_concerns,
                         &out.concerns,
-                        stage_num,
+                        def.name,
                         "General",
                         "description",
                     );
                     append_stage_dismissed_concerns(
                         &mut state.all_dismissed_concerns,
                         &out.dismissed_concerns,
-                        stage_num,
+                        def.name,
                     );
                 },
             )
@@ -574,88 +853,58 @@ pub fn resolve_analysis_stages_with_options(
     max_turns: usize,
     temperature: f32,
 ) -> Vec<Box<dyn ExecutableStage<KernelReviewState>>> {
-    let selected_stages = if let Some(ref manual) = state.manual_stages {
+    let selected_stages: Vec<String> = if let Some(ref manual) = state.manual_stages {
         manual.clone()
     } else if !state.planned_stages.is_empty() {
         state.planned_stages.clone()
     } else {
-        vec![1, 2, 3, 4, 5, 6, 7]
+        ANALYSIS_STAGES.iter().map(|d| d.name.to_string()).collect()
     };
 
     let mut stages = Vec::new();
-    for num in selected_stages {
-        match num {
-            1 => stages.push(analysis_stage(
-                1,
-                "stage_1",
-                STAGE_1_INSTRUCTION,
-                &[],
-                max_turns,
-                temperature,
-            )),
-            2 => stages.push(analysis_stage(
-                2,
-                "stage_2",
-                STAGE_2_INSTRUCTION,
-                &[],
-                max_turns,
-                temperature,
-            )),
-            3 => stages.push(analysis_stage(
-                3,
-                "stage_3",
-                STAGE_3_INSTRUCTION,
-                &["callstack.md", "technical-patterns.md"],
-                max_turns,
-                temperature,
-            )),
-            4 => stages.push(analysis_stage(
-                4,
-                "stage_4",
-                STAGE_4_INSTRUCTION,
-                &[],
-                max_turns,
-                temperature,
-            )),
-            5 => stages.push(analysis_stage(
-                5,
-                "stage_5",
-                STAGE_5_INSTRUCTION,
-                &["subsystem/locking.md"],
-                max_turns,
-                temperature,
-            )),
-            6 => stages.push(analysis_stage(
-                6,
-                "stage_6",
-                STAGE_6_INSTRUCTION,
-                &[],
-                max_turns,
-                temperature,
-            )),
-            7 => stages.push(analysis_stage(
-                7,
-                "stage_7",
-                STAGE_7_INSTRUCTION,
-                &[],
-                max_turns,
-                temperature,
-            )),
-            _ => {}
+    for name in selected_stages {
+        match analysis_stage_by_name(&name) {
+            Some(def) => {
+                // Naming stages by hand skips the pre-screen, so a stage whose
+                // guidance depends on what the pre-screen chose runs without
+                // it. Say so, rather than leaving a thinner review to look
+                // like the stage simply had nothing to report.
+                if prescreen_skipped(state) && !def.prescreen_guides.is_empty() {
+                    tracing::warn!(
+                        "Stage {:?} runs without {:?}: naming stages skips the pre-screen that selects them. Add {:?} to --stages to keep it",
+                        def.name,
+                        def.prescreen_guides,
+                        PRESCREEN_STAGE
+                    );
+                }
+                stages.push(analysis_stage(def, max_turns, temperature));
+            }
+            // The pre-screen is selectable but is not an analysis stage; its
+            // own skip condition reads the same list.
+            None if name == PRESCREEN_STAGE => {}
+            // Naming a stage that always runs, or one the caller cannot
+            // choose, is a mistake worth saying out loud.
+            None if is_known_stage(&name) => tracing::warn!(
+                "Stage {:?} is not an analysis stage and cannot be selected",
+                name
+            ),
+            // Previously an unrecognised entry was dropped in silence, so a
+            // mistyped --stages looked like it had worked.
+            None => tracing::warn!("Ignoring unknown review stage {:?}", name),
         }
     }
     stages
 }
 
-pub fn stage_8_deduplication(
+pub fn deduplication_stage(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<KernelReviewState, StageConcernsOutput> {
-    Stage::builder("stage_8_deduplication")
+    Stage::builder(DEDUPLICATION.name)
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_8_INSTRUCTION}
+                r#"{STAGE_DEDUPLICATION_INSTRUCTION}
 
 Aggregated Concerns:
 {{{{aggregated_concerns}}}}
@@ -716,8 +965,8 @@ Example Output:
         )
         .output_format(
             OutputFormat::json()
-                .with_validator(validate_stages_1_to_8)
-                .with_feedback_formatter(format_stages_1_to_8_feedback),
+                .with_validator(validate_concerns_output)
+                .with_feedback_formatter(format_concerns_feedback),
         )
         .policy(StagePolicy {
             tools: ToolScope::All,
@@ -732,15 +981,15 @@ Example Output:
         .build()
 }
 
-pub fn stage_9_conflict_resolution(
+pub fn conflict_resolution_stage(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, Stage9Output> {
-    Stage::builder("stage_9_conflict_resolution")
+) -> Stage<KernelReviewState, ConflictResolutionOutput> {
+    Stage::builder(CONFLICT_RESOLUTION.name)
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_9_INSTRUCTION}
+                r#"{STAGE_CONFLICT_RESOLUTION_INSTRUCTION}
 
 Consolidated Concerns:
 {{{{deduplicated_concerns}}}}
@@ -788,23 +1037,24 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce(|state, out: Stage9Output| {
+        .reduce(|state, out: ConflictResolutionOutput| {
             state.conflict_resolved_concerns = out.concerns;
         })
         .build()
 }
 
-pub fn stage_10_verification(
+pub fn verification_stage(
     max_turns: usize,
     temperature: f32,
-) -> Stage<KernelReviewState, Stage10Output> {
-    Stage::builder("stage_10_verification")
+) -> Stage<KernelReviewState, VerificationOutput> {
+    let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
+    Stage::builder(VERIFICATION.name)
         .system_prompt(kernel_system_prompt(true))
-        .user_prompt(
+        .user_prompt(with_series_context(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_10_INSTRUCTION}
+                r#"{STAGE_VERIFICATION_INSTRUCTION}
 
-CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{{{{follow_up_series_section}}}}
+CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{series_context}
 
 Consolidated Concerns:
 {{{{conflict_resolved_concerns}}}}
@@ -836,16 +1086,11 @@ Example Output:
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
-            .with_var("follow_up_series_section", |s: &KernelReviewState| {
-                s.follow_up_series_context
-                    .as_ref()
-                    .map(|ctx| format!("\n\n{}", ctx))
-                    .unwrap_or_default()
-            })
             .with_var("conflict_resolved_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.conflict_resolved_concerns).unwrap_or_default()
             }),
-        )
+            VERIFICATION.wants_series_context,
+        ))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {
             tools: ToolScope::All,
@@ -853,21 +1098,18 @@ Example Output:
             temperature,
             ..Default::default()
         })
-        .reduce(|state, out: Stage10Output| {
+        .reduce(|state, out: VerificationOutput| {
             state.findings = out.findings;
         })
         .build()
 }
 
-pub fn stage_11_inline_report(
-    max_turns: usize,
-    temperature: f32,
-) -> Stage<KernelReviewState, String> {
-    Stage::builder("stage_11_report")
+pub fn report_stage(max_turns: usize, temperature: f32) -> Stage<KernelReviewState, String> {
+    Stage::builder(REPORT.name)
         .system_prompt(kernel_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_11_INSTRUCTION}
+                r#"{STAGE_REPORT_INSTRUCTION}
 
 Findings:
 {{{{findings}}}}
@@ -923,22 +1165,22 @@ pub fn build_kernel_review_workflow_with_options(
             |s| s.all_concerns.is_empty(),
             "No concerns raised in initial analysis stages",
         )
-        .stage(stage_8_deduplication(max_turns, temperature))
+        .stage(deduplication_stage(max_turns, temperature))
         .early_exit_if(
             |s| s.deduplicated_concerns.is_empty(),
             "No concerns remaining after deduplication",
         )
-        .stage(stage_9_conflict_resolution(max_turns, temperature))
+        .stage(conflict_resolution_stage(max_turns, temperature))
         .early_exit_if(
             |s| s.conflict_resolved_concerns.is_empty(),
             "No concerns remaining after conflict resolution",
         )
-        .stage(stage_10_verification(max_turns, temperature))
+        .stage(verification_stage(max_turns, temperature))
         .early_exit_if(
             |s| s.findings.is_empty(),
             "No findings validated in verification stage",
         )
-        .stage(stage_11_inline_report(max_turns, temperature))
+        .stage(report_stage(max_turns, temperature))
         .build()
 }
 
@@ -947,20 +1189,224 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_only_stages_3_to_6_review_the_diff_alone() {
-        // Matches ReviewStage::use_log_in_context, which the workflow replaced.
-        for stage in [1, 2, 7] {
+    fn test_each_stage_declares_whether_it_needs_the_commit_message() {
+        // This was a numeric range in a free function, which kept compiling
+        // while meaning something else whenever the stages moved.
+        for name in ["goal", "implementation", "hardware"] {
             assert!(
-                stage_uses_commit_log(stage),
-                "stage {stage} needs the commit message"
+                analysis_stage_by_name(name).unwrap().uses_commit_log,
+                "{name} judges the change against its stated intent"
             );
         }
-        for stage in [3, 4, 5, 6] {
+        for name in ["execution-flow", "resources", "locking", "security"] {
             assert!(
-                !stage_uses_commit_log(stage),
-                "stage {stage} reviews the diff hunks alone"
+                !analysis_stage_by_name(name).unwrap().uses_commit_log,
+                "{name} reads the diff hunks on their own terms"
             );
         }
+    }
+
+    #[test]
+    fn test_stage_names_are_unique_and_resolvable() {
+        let mut seen = std::collections::BTreeSet::new();
+        for def in ANALYSIS_STAGES {
+            assert!(seen.insert(def.name), "duplicate stage name {}", def.name);
+            assert!(is_known_stage(def.name));
+            assert!(std::ptr::eq(analysis_stage_by_name(def.name).unwrap(), def));
+        }
+        assert!(analysis_stage_by_name("nonexistent").is_none());
+        assert!(!is_known_stage("nonexistent"));
+    }
+
+    #[test]
+    fn test_series_context_is_declared_in_the_tables() {
+        // Both tables carry the flag because the need is not particular to
+        // either kind of stage: verification asks whether a later patch
+        // reworks the code a concern is about.
+        assert!(
+            consolidation_stage_by_name("verification")
+                .unwrap()
+                .wants_series_context
+        );
+        for def in CONSOLIDATION_STAGES
+            .iter()
+            .filter(|d| d.name != "verification")
+        {
+            assert!(!def.wants_series_context, "{} does not use it", def.name);
+        }
+        // The placeholder and the variable that fills it travel together, so a
+        // stage that declares the flag cannot end up rendering it literally.
+        assert_eq!(series_context_placeholder(true), SERIES_CONTEXT_PLACEHOLDER);
+        assert_eq!(series_context_placeholder(false), "");
+    }
+
+    #[test]
+    fn test_testability_is_the_only_analysis_stage_wanting_series_context() {
+        for def in ANALYSIS_STAGES.iter().filter(|d| d.name != "testability") {
+            assert!(!def.wants_series_context, "{} does not use it", def.name);
+        }
+    }
+
+    #[test]
+    fn test_a_claimed_guide_is_excluded_from_the_broadcast() {
+        // Synthetic, since no stage claims one yet: whichever way a stage
+        // names a guide, the pre-screen must not also hand it to everyone.
+        let claimed = AnalysisStage {
+            name: "example",
+            short: "Example",
+            instruction: "",
+            guides: &["subsystem/always.md"],
+            uses_commit_log: false,
+            optional: false,
+            wants_series_context: false,
+            prescreen_guides: &["sometimes.md"],
+        };
+        let named = |name: &str| {
+            claimed
+                .guides
+                .iter()
+                .chain(claimed.prescreen_guides)
+                .any(|g| g.rsplit('/').next() == Some(name))
+        };
+        assert!(named("always.md"));
+        assert!(named("sometimes.md"));
+        assert!(!named("elsewhere.md"));
+    }
+
+    #[test]
+    fn test_the_pre_screen_can_be_named_alongside_analysis_stages() {
+        let manual = |names: &[&str]| KernelReviewState {
+            manual_stages: Some(names.iter().map(|n| n.to_string()).collect()),
+            ..Default::default()
+        };
+
+        // Naming stages skips the pre-screen, which is the usual intent.
+        assert!(prescreen_skipped(&manual(&["locking"])));
+        // Unless it is named too, which is how a caller keeps guide selection.
+        assert!(!prescreen_skipped(&manual(&[PRESCREEN_STAGE, "locking"])));
+        // Nothing named at all: the pre-screen runs, as on any full review.
+        assert!(!prescreen_skipped(&KernelReviewState::default()));
+    }
+
+    #[test]
+    fn test_naming_the_pre_screen_selects_no_analysis_stage() {
+        // It is a known stage, so it must not be reported as a typo, and it
+        // must not resolve to an analysis stage either.
+        assert!(is_known_stage(PRESCREEN_STAGE));
+        assert!(analysis_stage_by_name(PRESCREEN_STAGE).is_none());
+
+        let state = KernelReviewState {
+            manual_stages: Some(vec![PRESCREEN_STAGE.to_string(), "locking".to_string()]),
+            ..Default::default()
+        };
+        let names: Vec<&str> = resolve_analysis_stages_with_options(&state, 1, 1.0)
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(names, ["locking"]);
+    }
+
+    #[test]
+    fn test_stage_exclusive_guides_follow_the_stage_table() {
+        // Claimed by a stage, so the pre-screen must not also broadcast them.
+        assert!(is_stage_exclusive_guide("locking.md"));
+        assert!(is_stage_exclusive_guide("callstack.md"));
+        assert!(is_stage_exclusive_guide("technical-patterns.md"));
+
+        // Not claimed by any stage: the pre-screen's to offer.
+        assert!(!is_stage_exclusive_guide("mm-vma.md"));
+        assert!(!is_stage_exclusive_guide("subsystem.md"));
+
+        // Matched on the file name, since that is what the pre-screen returns,
+        // while the table holds the path a stage includes it by.
+        assert!(
+            ANALYSIS_STAGES
+                .iter()
+                .any(|d| d.guides.contains(&"subsystem/locking.md"))
+        );
+        assert!(!is_stage_exclusive_guide("subsystem/locking.md"));
+    }
+
+    #[test]
+    fn test_every_stage_the_workflow_builds_is_a_known_name() {
+        // The builders name their stages with literals; this is what stops one
+        // drifting from the table that has to recognise and display it.
+        for name in [
+            deduplication_stage(1, 1.0).name(),
+            conflict_resolution_stage(1, 1.0).name(),
+            verification_stage(1, 1.0).name(),
+            report_stage(1, 1.0).name(),
+        ] {
+            assert!(is_known_stage(name), "{name} is not in any stage table");
+            assert!(stage_short_label(name).is_some(), "{name} has no label");
+        }
+        assert!(is_known_stage(prescreen_stage().name()));
+        assert!(is_known_stage(planning_stage().name()));
+    }
+
+    #[test]
+    fn test_testability_runs_for_every_patch() {
+        // The case with nothing in the diff to match on -- a change that
+        // should have had a test and does not -- is the one no other stage
+        // looks at, so the planner is never asked whether to skip it.
+        let def = analysis_stage_by_name("testability").expect("stage exists");
+        assert!(!def.optional);
+        assert!(def.uses_commit_log);
+        assert!(def.wants_series_context);
+    }
+
+    #[test]
+    fn test_testing_guides_are_not_broadcast_to_every_stage() {
+        // Claimed by the testability stage, either always or when the
+        // pre-screen offers them. Left in the shared set they would ride along
+        // in every stage's system prompt, which is why locking.md is excluded
+        // too.
+        for guide in ["testing.md", "kunit.md", "selftests.md"] {
+            assert!(
+                is_stage_exclusive_guide(guide),
+                "{guide} would be broadcast to every stage"
+            );
+        }
+    }
+
+    #[test]
+    fn test_testability_takes_its_framework_guides_from_the_pre_screen() {
+        let def = analysis_stage_by_name("testability").unwrap();
+        assert_eq!(def.prescreen_guides, ["kunit.md", "selftests.md"]);
+        // The general guide applies to every patch, so it is not conditional.
+        assert!(def.guides.contains(&"subsystem/testing.md"));
+        assert!(!def.prescreen_guides.contains(&"testing.md"));
+
+        // It is the only stage taking guides this way.
+        for other in ANALYSIS_STAGES.iter().filter(|d| d.name != "testability") {
+            assert!(
+                other.prescreen_guides.is_empty(),
+                "{} claims some",
+                other.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_planner_is_only_asked_about_optional_stages() {
+        // The prompt lists exactly the optional stages, so a name it returns
+        // that is not one of them is a hallucination rather than a choice.
+        let optional: Vec<&str> = ANALYSIS_STAGES
+            .iter()
+            .filter(|d| d.optional)
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(optional, ["resources", "locking", "security", "hardware"]);
+
+        let required: Vec<&str> = ANALYSIS_STAGES
+            .iter()
+            .filter(|d| !d.optional)
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            required,
+            ["goal", "implementation", "execution-flow", "testability"]
+        );
     }
 
     #[test]

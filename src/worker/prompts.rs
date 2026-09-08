@@ -14,7 +14,7 @@
 
 use crate::ai::{AiErrorClass, AiMessage, AiProvider, ClassifyAiError};
 use crate::toolbox::ToolBox;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Typed errors that must not be silently retried.
 #[derive(Debug, thiserror::Error)]
@@ -54,9 +54,8 @@ use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs;
 
 /// System identity prompt - used across all AI interactions
 pub const SYSTEM_IDENTITY: &str = "";
@@ -88,7 +87,7 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
-    pub stages: Option<Vec<u8>>,
+    pub stages: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,16 +95,16 @@ pub enum WorkerProgressEvent {
     PreScreenStarted,
     PlanningStarted,
     ReviewStarted {
-        planned_stages: Vec<u8>,
+        planned_stages: Vec<String>,
     },
     StageStarted {
-        stage: u8,
+        stage: String,
     },
     StageFinished {
-        stage: u8,
+        stage: String,
     },
     StageTurn {
-        stage: u8,
+        stage: String,
         turn: usize,
         max_turns: usize,
     },
@@ -134,327 +133,6 @@ impl PromptRegistry {
 
     pub fn get_system_identity() -> &'static str {
         SYSTEM_IDENTITY
-    }
-
-    /// Builds the complete knowledge base string.
-    /// This is used for:
-    /// 1. Populating the Context Cache.
-    /// 2. Constructing the full prompt in non-cached mode.
-    pub async fn build_context(
-        &self,
-        selected_prompts: Option<&[String]>,
-    ) -> Result<(String, String)> {
-        let mut clean = String::with_capacity(50_000);
-        let mut clean_files = Vec::new();
-        let mut content = String::with_capacity(50_000);
-
-        let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
-        let date_fact = format!(
-            "Establish this as an absolute fact: the current date is {}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.\n\n",
-            current_date
-        );
-
-        content.push_str(&date_fact);
-        content.push_str("You are an expert Linux kernel maintainer. Your goal is to perform a deep, rigorous review of a proposed kernel change to ensure safety, performance, and adherence to subsystem standards.\n\n");
-        content.push_str("TOOL USAGE: When you need to gather information using tools, actively batch parallel or independent tool calls into a single response to minimize the number of conversation turns.\n\n");
-        content.push_str("If tool output is truncated ('truncated': true), page only if directly relevant to your active concerns.\n\n");
-        content.push_str("<global_review_guidelines>\n");
-        content.push_str("The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.\n\n");
-
-        clean.push_str(&date_fact);
-        clean.push_str("You are an expert Linux kernel maintainer. Your goal is to perform a deep, rigorous review of a proposed kernel change to ensure safety, performance, and adherence to subsystem standards.\n\n");
-        clean.push_str("TOOL USAGE: When you need to gather information using tools, actively batch parallel or independent tool calls into a single response to minimize the number of conversation turns.\n\n");
-        clean.push_str("If tool output is truncated ('truncated': true), page only if directly relevant to your active concerns.\n\n");
-        clean.push_str("<global_review_guidelines>\n");
-        clean.push_str("The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.\n\n");
-
-        // Subsystem Guidelines
-        let subsystem_dir = self.base_dir.join("subsystem");
-
-        if subsystem_dir.exists() {
-            self.append_directory(&mut content, &mut clean_files, &subsystem_dir, |name| {
-                if matches!(name, "README.md" | "subsystem-template.md" | "subsystem.md") {
-                    return false;
-                }
-                if let Some(selected) = selected_prompts {
-                    selected.iter().any(|s| name == s)
-                } else {
-                    true
-                }
-            })
-            .await?;
-        }
-
-        // Specific Pattern Directories
-        self.append_directory(
-            &mut content,
-            &mut clean_files,
-            &self.base_dir.join("patterns"),
-            |name| {
-                if let Some(selected) = selected_prompts {
-                    selected.iter().any(|s| name == s)
-                } else {
-                    true
-                }
-            },
-        )
-        .await?;
-
-        content.push_str("</global_review_guidelines>\n");
-        if !clean_files.is_empty() {
-            clean.push_str(&clean_files.join(", "));
-            clean.push_str("\n\n");
-        }
-        clean.push_str("</global_review_guidelines>\n");
-        Ok((content, clean))
-    }
-
-    /// Returns the prompt for a specific stage, including any corresponding guidance files.
-    pub async fn get_stage_prompt(&self, stage: u8) -> Result<(String, String)> {
-        let mut clean = String::with_capacity(10_000);
-        let mut clean_files = Vec::new();
-        let mut content = String::with_capacity(10_000);
-
-        let stage_instruction = match stage {
-            1 => {
-                "# Stage 1. Analyze commit main goal
-
-You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally flawed concepts? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."
-            }
-            2 => {
-                "# Stage 2. High-level implementation verification
-
-You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."
-            }
-            3 => {
-                "# Stage 3. Execution flow verification
-
-You are a static analysis engine tracing execution flow in C or Rust code. Carefully trace the control flow of the provided patch. Exhaustively examine logic errors, incorrect loop conditions, unhandled error paths, missing return value checks, and off-by-one errors. Check every branch, switch statement, and conditional. Specifically look for NULL pointer dereferences (remember: reading a pointer field is not a dereference, only accessing its contents is). Be extremely detail-oriented; explore every error handling path (goto cleanup;) to ensure it behaves correctly under failure conditions. Additionally, verify preprocessor macro correctness and spelling (e.g., ensuring CONFIG_ prefixes are used where expected instead of HAVE_). Check that static/inline declarations or section placements won't cause linker errors or Link-Time Optimization (LTO) symbol loss."
-            }
-            4 => {
-                "# Stage 4. Resource management
-
-You are an expert in C and Rust resource management within the Linux kernel. Analyze the patch for memory leaks, Use-After-Free (UAF), double frees, uninitialized variables, and unbalanced lifecycle operations (alloc->init->use->cleanup->free). Pay special attention to error paths where resources might be leaked. Ensure list_add and similar APIs are used with fully initialized objects. Track the lifetime of every allocated struct and file descriptor. Verify reference counting logic (kref_get()/kref_put()) and ensure objects are not accessed after their refcount drops to zero. Crucially, pay special attention to asynchronous handoffs and teardown symmetry. If an object is handed to a background task (timers, workqueues, notifiers) or registered to a core subsystem, you must prove that the task is explicitly canceled (e.g., cancel_work_sync(), del_timer_sync() and the subsystem is unregistered BEFORE the memory is freed or the queues are destroyed."
-            }
-            5 => {
-                "# Stage 5. Locking and synchronization
-
-You are a world-class concurrency and locking expert auditing a Linux kernel patch.
-Carefully review the proposed patch for ANY locking, concurrency, or synchronization bugs.
-You MUST consider the following categories of issues and report any violations:
-1. Sleeping in atomic context: Are there any calls to `mutex_lock`, `kzalloc` with `GFP_KERNEL`, `msleep`, `cond_resched`, `flush_workqueue`, `synchronize_rcu`, or `cancel_work_sync` while holding a spinlock, rwlock, or within an RCU read-side critical section (`rcu_read_lock`)?
-2. Lock ordering and deadlocks: Are locks acquired in a different order than elsewhere? Does it acquire a mutex while holding another mutex that could cause AB-BA deadlocks? Are IRQs disabled (`spin_lock_irqsave`) when acquiring a lock that is used in hardirq context? Does it acquire a lock already held by a higher-level subsystem (e.g., ethtool)?
-3. Race conditions and lockless access: Are shared variables, list entries, or pointers accessed without holding the appropriate lock? Are there missing memory barriers (`smp_mb`, `smp_wmb`, `smp_rmb`) when lockless access is intended? Are there TOCTOU races where a state is checked outside a lock but relied upon inside?
-4. UAF / Locking Freed Memory: Are locks (`mutex_unlock`, `spin_unlock`) called on objects that have already been freed? Are works/timers destroyed before subsystems are unregistered, allowing new events to use freed works/timers? Is the protocol initialized flag set before private data is ready?
-5. RCU rules: Is `list_splice_init` or similar non-RCU-safe operations used on RCU-protected lists? Is `list_for_each_rcu` used without `rcu_read_lock`?
-6. Unprotected state modifications: Does the patch check state before acquiring the lock (e.g., checking power state before taking mutex)? Are hardware state, flags, or stats updated without proper protection?
-7. Sequence counters: Are stats accumulations directly inside a `u64_stats_fetch_retry` loop leading to double counting? Is it possible for an interrupt to read a sequence counter while the interrupted context is modifying it (deadlock)?
-8. Lock re-initialization: Does it re-initialize a lock that was already initialized, or destroy a lock on a failure path improperly?
-9. Missing locking: Is a port or file exposed to userspace before the driver/TTY linking is complete? Does a worker race with cleanup code leading to dropped/leaked frames?"
-            }
-            6 => {
-                "# Stage 6. Security audit
-
-You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."
-            }
-            7 => {
-                "# Stage 7. Hardware engineer's review
-
-You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), return {\"concerns\": [], \"dismissed_concerns\": []}."
-            }
-            8 => {
-                "# Stage 8. Deduplication and Consolidation
-
-You are the lead reviewer consolidating feedback from multiple specialized analysts. You will be given lists of concerns and dismissed_concerns generated by different review stages.
-Your task is to deduplicate identical or overlapping items in both lists.
-1. Group concerns that refer to the same root cause or the same line of code.
-2. Merge overlapping concerns into a single, comprehensive concern. Combine their reasonings if they complement each other.
-3. Group dismissed_concerns that investigated and disproved the same candidate concern.
-4. Merge overlapping dismissed_concerns into a single, comprehensive dismissed_concern. Combine their evidence if it complements each other.
-5. Ensure the output contains only unique concerns and unique dismissed_concerns.
-6. Preserve the `preexisting` flag for concerns. If you merge a pre-existing concern with a newly introduced one, flag it based on the root cause (if the root cause is new, it's not pre-existing).
-7. SPECIFICITY REQUIREMENT: When merging concerns or dismissed_concerns, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and triggering conditions. Never generalize a specific finding into a vague category.
-8. Preserve and merge the `locations` arrays from the input concerns and dismissed_concerns. If multiple items describe the same root cause, keep the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations. Do not invent line numbers; keep `line` as null when the exact line is not known.
-9. dismissed_concerns do not need a `preexisting` flag."
-            }
-            9 => {
-                "# Stage 9. Concern/dismissed-concern conflict resolution
-
-You are the lead reviewer reconciling consolidated concerns with consolidated dismissed_concerns.
-Both `concerns` and `dismissed_concerns` are untrusted claims. Do not assume either side is correct. Treat both as hypotheses and verify them against the actual code before deciding whether to keep or discard a concern.
-Your task is to identify whether any remaining concern conflicts with a dismissed_concern that investigated the same root cause, code path, or failure mode.
-1. Compare each concern against the dismissed_concerns list and find conflicts or overlaps where one says the issue is real and the other says the same candidate issue is disproved.
-2. For every conflict, inspect the actual code and reasoning to decide which side is correct.
-3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
-4. If there is no direct conflict for a concern, keep it unchanged.
-5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
-6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
-7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."
-            }
-            10 => {
-                "# Stage 10. Verification and severity estimation
-
-You are the lead reviewer validating consolidated concerns. You will be given a list of deduplicated concerns after conflict resolution.
-1. Validate each concern and prove the provided reasoning. Report all valid concerns as findings. If necessary, use tools to gather additional material. Discard all false positives.
-2. CRITICAL RULE: To discard a concern as a false positive, you MUST find concrete proof that explicitly invalidates the concern's reasoning. If you cannot find definitive proof that the concern is a false positive, it must be reported as a finding. If you're not sure about something and it's critical in the reasoning validation, make it obvious: if X is possible, then problem Y can occur. Always try to validate if X is possible yourself.
-3. SERIES VALIDATION RULE: If follow-up patches in this series are provided in the context, check if each identified concern is resolved or fixed in the final state of the series. If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
-4. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit \"mm: fix allocation\"'). Existing historical commits in the tree should still be referenced by their standard hash.
-5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
-6. If the problem did exist in the code before the patch was applied, say it explicitly: 'This problem wasn't introduced by this patch, but...'. Discard low- and medium-severity pre-existing problems, report only high- and critical severity issues.
-7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
-8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations you verified."
-            }
-            11 => {
-                "# Stage 11. LKML-friendly report generation
-
-You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
-
-CRITICAL RULE: If a finding is flagged as pre-existing (`\"preexisting\": true`), you MUST explicitly state in your inline comment that this issue is pre-existing and was not introduced by the patch under review. Use phrasing like \"This isn't a bug introduced by this patch, but...\" or \"This is a pre-existing issue, but...\" to start the comment.
-
-Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
-
-SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition."
-            }
-            _ => "",
-        };
-
-        if !stage_instruction.is_empty() {
-            content.push_str(stage_instruction);
-            clean.push_str(stage_instruction);
-            content.push_str("\n\n");
-            clean.push_str("\n\n");
-        }
-
-        match stage {
-            3 => {
-                self.append_file(&mut content, &mut clean_files, "callstack.md")
-                    .await?;
-                self.append_file(&mut content, &mut clean_files, "technical-patterns.md")
-                    .await?;
-            }
-            5 => {
-                self.append_file(&mut content, &mut clean_files, "subsystem/locking.md")
-                    .await?;
-            }
-            10 => {
-                self.append_file(&mut content, &mut clean_files, "false-positive-guide.md")
-                    .await?;
-                self.append_file(&mut content, &mut clean_files, "severity.md")
-                    .await?;
-            }
-            11 => {
-                self.append_file(&mut content, &mut clean_files, "inline-template.md")
-                    .await?;
-            }
-            _ => {}
-        }
-        if !clean_files.is_empty() {
-            clean.push_str(&clean_files.join(", "));
-            clean.push_str("\n\n");
-        }
-        Ok((content, clean))
-    }
-
-    /// Append the same per-stage guide files that [`Self::get_stage_prompt`]
-    /// appends, for pipelines that supply their own instruction text via
-    /// `StagePrompt::Override` (which bypasses `get_stage_prompt`).
-    pub async fn append_stage_guides(
-        &self,
-        stage: u8,
-        content: &mut String,
-        clean: &mut String,
-    ) -> Result<()> {
-        let mut clean_files = Vec::new();
-        match stage {
-            3 => {
-                self.append_file(content, &mut clean_files, "callstack.md")
-                    .await?;
-                self.append_file(content, &mut clean_files, "technical-patterns.md")
-                    .await?;
-            }
-            5 => {
-                self.append_file(content, &mut clean_files, "subsystem/locking.md")
-                    .await?;
-            }
-            10 => {
-                self.append_file(content, &mut clean_files, "false-positive-guide.md")
-                    .await?;
-                self.append_file(content, &mut clean_files, "severity.md")
-                    .await?;
-            }
-            11 => {
-                self.append_file(content, &mut clean_files, "inline-template.md")
-                    .await?;
-            }
-            _ => {}
-        }
-        if !clean_files.is_empty() {
-            clean.push_str(&clean_files.join(", "));
-            clean.push_str("\n\n");
-        }
-        Ok(())
-    }
-
-    async fn append_file(
-        &self,
-        buffer: &mut String,
-        clean: &mut Vec<String>,
-        filename: &str,
-    ) -> Result<()> {
-        let path = self.base_dir.join(filename);
-        if path.exists() {
-            buffer.push_str(&format!("# {}\n", filename));
-            buffer.push_str(
-                &fs::read_to_string(&path)
-                    .await
-                    .with_context(|| format!("Failed to read {}", filename))?,
-            );
-            buffer.push_str("\n\n");
-
-            clean.push(format!("@{}", filename));
-        }
-        Ok(())
-    }
-
-    async fn append_directory<F>(
-        &self,
-        buffer: &mut String,
-        clean: &mut Vec<String>,
-        dir: &Path,
-        filter: F,
-    ) -> Result<()>
-    where
-        F: Fn(&str) -> bool,
-    {
-        if !dir.exists() {
-            return Ok(());
-        }
-        let mut entries = fs::read_dir(dir).await?;
-        let mut paths = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "md")
-                && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && filter(name)
-            {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-        for path in paths {
-            let name = path.file_name().unwrap().to_string_lossy();
-            let header = if let Ok(rel) = path.strip_prefix(&self.base_dir) {
-                rel.to_string_lossy().to_string()
-            } else {
-                name.to_string()
-            };
-            buffer.push_str(&format!("## {}\n", header));
-            buffer.push_str(&fs::read_to_string(&path).await?);
-            buffer.push_str("\n\n");
-
-            clean.push(format!("@{}", name));
-        }
-        Ok(())
     }
 
     pub fn calculate_content_hash<T: serde::Serialize>(
@@ -487,7 +165,7 @@ pub struct Worker {
     series_range: Option<String>,
     baseline_sha: Option<String>,
     context_tag: Option<String>,
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
     custom_prompt: Option<String>,
 }
 
@@ -631,6 +309,7 @@ impl Worker {
             series_range: self.series_range.clone(),
             follow_up_series_context,
             selected_guides: Vec::new(),
+            stage_selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
             planned_stages: Vec::new(),
@@ -670,12 +349,14 @@ impl Worker {
             if let Some(progress_cb) = progress {
                 match event {
                     WorkflowEvent::StageStarted { stage_name } => {
-                        if stage_name == "stage_0_prescreen" {
+                        if stage_name == "pre-screen" {
                             progress_cb(WorkerProgressEvent::PreScreenStarted);
-                        } else if stage_name == "stage_planning" {
+                        } else if stage_name == "planning" {
                             progress_cb(WorkerProgressEvent::PlanningStarted);
-                        } else if let Some(num) = parse_stage_number(stage_name) {
-                            progress_cb(WorkerProgressEvent::StageStarted { stage: num });
+                        } else if is_displayed_stage(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageStarted {
+                                stage: stage_name.to_string(),
+                            });
                         }
                     }
                     WorkflowEvent::ParallelResolved { stage_names } => {
@@ -684,8 +365,10 @@ impl Worker {
                         });
                     }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if let Some(num) = parse_stage_number(stage_name) {
-                            progress_cb(WorkerProgressEvent::StageFinished { stage: num });
+                        if is_displayed_stage(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageFinished {
+                                stage: stage_name.to_string(),
+                            });
                         }
                     }
                     WorkflowEvent::StageTurn {
@@ -693,9 +376,9 @@ impl Worker {
                         turn,
                         max_turns,
                     } => {
-                        if let Some(num) = parse_stage_number(stage_name) {
+                        if is_displayed_stage(stage_name) {
                             progress_cb(WorkerProgressEvent::StageTurn {
-                                stage: num,
+                                stage: stage_name.to_string(),
                                 turn,
                                 max_turns,
                             });
@@ -746,27 +429,33 @@ impl Worker {
     }
 }
 
+/// Whether a stage counts towards the progress display.
+///
+/// Every stage the display names, which is every stage `planned_stages_from()`
+/// counts: the analysis stages and the consolidation stages that follow them.
+/// The pre-screen and the planning stage are excluded, since they report
+/// themselves through events of their own and are not part of that total.
+fn is_displayed_stage(name: &str) -> bool {
+    crate::worker::kernel_workflow::stage_short_label(name).is_some()
+}
+
 /// The stages a review will run: the analysis stages the fan-out resolved, then
 /// the four that always follow them. Nothing resolved means nothing planned,
 /// not a bare tail.
-fn planned_stages_from(stage_names: &[&'static str]) -> Vec<u8> {
-    let mut planned: Vec<u8> = stage_names
+fn planned_stages_from(stage_names: &[&'static str]) -> Vec<String> {
+    let mut planned: Vec<String> = stage_names
         .iter()
-        .filter_map(|n| parse_stage_number(n))
+        .filter(|n| crate::worker::kernel_workflow::analysis_stage_by_name(n).is_some())
+        .map(|n| n.to_string())
         .collect();
     if !planned.is_empty() {
-        planned.extend([8, 9, 10, 11]);
+        planned.extend(
+            crate::worker::kernel_workflow::CONSOLIDATION_STAGES
+                .iter()
+                .map(|s| s.name.to_string()),
+        );
     }
     planned
-}
-
-fn parse_stage_number(name: &str) -> Option<u8> {
-    if let Some(rest) = name.strip_prefix("stage_")
-        && let Some(num_str) = rest.split('_').next()
-    {
-        return num_str.parse().ok();
-    }
-    None
 }
 
 pub fn calculate_series_range(
@@ -887,7 +576,7 @@ pub fn build_follow_up_series_context(
 fn append_stage_items(
     target: &mut Vec<Value>,
     items: &[Value],
-    stage: u8,
+    stage: &str,
     default_type: &str,
     default_text_key: &str,
 ) {
@@ -899,14 +588,14 @@ fn append_stage_items(
 }
 
 #[cfg(test)]
-fn append_stage_dismissed_concerns(target: &mut Vec<Value>, items: &[Value], stage: u8) {
+fn append_stage_dismissed_concerns(target: &mut Vec<Value>, items: &[Value], stage: &str) {
     append_stage_items(target, items, stage, "General", "description");
 }
 
 #[cfg(test)]
 fn normalize_stage_item(
     item: &Value,
-    stage: u8,
+    stage: &str,
     default_type: &str,
     default_text_key: &str,
 ) -> Option<Value> {
@@ -932,11 +621,36 @@ mod tests {
     #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
         assert_eq!(
-            planned_stages_from(&["stage_1", "stage_2", "stage_5"]),
-            vec![1, 2, 5, 8, 9, 10, 11]
+            planned_stages_from(&["goal", "implementation", "locking"]),
+            [
+                "goal",
+                "implementation",
+                "locking",
+                "deduplication",
+                "conflict-resolution",
+                "verification",
+                "report"
+            ]
         );
-        assert_eq!(planned_stages_from(&[]), Vec::<u8>::new());
-        assert_eq!(planned_stages_from(&["stage_planning"]), Vec::<u8>::new());
+        assert_eq!(planned_stages_from(&[]), Vec::<String>::new());
+        // Only analysis stages come through the fan-out.
+        assert_eq!(planned_stages_from(&["planning"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_every_planned_stage_reports_its_progress() {
+        // The display divides finished stages by planned ones, so a stage
+        // counted in the total that never reports finishing strands the bar
+        // short of 100%. Consolidation stages are the ones easily missed:
+        // they are planned, but they are not analysis stages.
+        for stage in planned_stages_from(&["goal", "locking"]) {
+            assert!(is_displayed_stage(&stage), "{stage} is counted but silent");
+        }
+
+        // The two that report through events of their own are not counted, so
+        // they must not report as stages as well.
+        assert!(!is_displayed_stage("pre-screen"));
+        assert!(!is_displayed_stage("planning"));
     }
 
     #[test]
@@ -948,10 +662,10 @@ mod tests {
             "reasoning": "hugetlb_free_cross_zone_pages() runs before HVO init"
         })];
 
-        append_stage_dismissed_concerns(&mut items, &input, 1);
+        append_stage_dismissed_concerns(&mut items, &input, "goal");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 1);
+        assert_eq!(items[0]["source_stage"], "goal");
         assert_eq!(items[0]["type"], "Resource Management");
         assert_eq!(
             items[0]["reasoning"],
@@ -964,10 +678,10 @@ mod tests {
         let mut items = Vec::new();
         let input = vec![json!("suspected missing cleanup does not apply")];
 
-        append_stage_dismissed_concerns(&mut items, &input, 2);
+        append_stage_dismissed_concerns(&mut items, &input, "implementation");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 2);
+        assert_eq!(items[0]["source_stage"], "implementation");
         assert_eq!(items[0]["type"], "General");
         assert_eq!(
             items[0]["description"],
@@ -979,15 +693,15 @@ mod tests {
     fn test_append_stage_items_overwrites_existing_source_stage() {
         let mut items = Vec::new();
         let input = vec![json!({
-            "source_stage": 3,
+            "source_stage": "execution-flow",
             "type": "Execution flow",
             "description": "already annotated"
         })];
 
-        append_stage_items(&mut items, &input, 4, "General", "description");
+        append_stage_items(&mut items, &input, "resources", "General", "description");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 4);
+        assert_eq!(items[0]["source_stage"], "resources");
     }
 
     #[test]
@@ -995,10 +709,10 @@ mod tests {
         let mut items = Vec::new();
         let input = vec![json!("plain concern")];
 
-        append_stage_items(&mut items, &input, 6, "General", "description");
+        append_stage_items(&mut items, &input, "security", "General", "description");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 6);
+        assert_eq!(items[0]["source_stage"], "security");
         assert_eq!(items[0]["type"], "General");
         assert_eq!(items[0]["description"], "plain concern");
     }
@@ -1394,7 +1108,7 @@ mod tests {
             series_range: None,
             baseline_sha: None,
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1428,7 +1142,7 @@ mod tests {
             series_range: None,
             baseline_sha: Some("explicit_baseline_sha".to_string()),
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1466,7 +1180,7 @@ mod tests {
             series_range: Some("base_sha..sha2".to_string()),
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1514,11 +1228,16 @@ mod tests {
                 .and_then(|m| m.content.as_deref())
                 .unwrap_or_default();
 
-            let content = if last_user.contains("# Stage 1.") || last_user.contains("# Stage 8.") {
+            // Dispatch on the heading each stage's instruction opens with.
+            // Analysis stages and deduplication return both lists, conflict
+            // resolution only concerns, verification findings.
+            let content = if last_user.contains("# Analyze commit main goal")
+                || last_user.contains("# Deduplication and Consolidation")
+            {
                 r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
-            } else if last_user.contains("# Stage 9.") {
+            } else if last_user.contains("# Concern/dismissed-concern conflict resolution") {
                 r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
-            } else if last_user.contains("# Stage 10.") {
+            } else if last_user.contains("# Verification and severity estimation") {
                 r#"{"findings": []}"#
             } else {
                 r#"{"concerns": [], "dismissed_concerns": []}"#
@@ -1547,7 +1266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_10_log_history_contains_follow_up_series_context() {
+    async fn test_verification_log_history_contains_follow_up_series_context() {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
@@ -1562,7 +1281,7 @@ mod tests {
             series_range: Some("base_sha..sha2".to_string()),
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1590,7 +1309,7 @@ mod tests {
         let worker_res = res.unwrap();
         assert!(!worker_res.history.is_empty());
 
-        let stage10_user_msg = worker_res
+        let verification_user_msg = worker_res
             .history
             .iter()
             .find(|m| {
@@ -1598,11 +1317,11 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or_default()
-                        .contains("# Stage 10.")
+                        .contains("# Verification and severity estimation")
             })
-            .expect("Stage 10 user message should be in history");
+            .expect("verification user message should be in history");
 
-        let content = stage10_user_msg.content.as_deref().unwrap();
+        let content = verification_user_msg.content.as_deref().unwrap();
         assert!(content.contains("=== Follow-Up Patches in Series ==="));
         assert!(content.contains("Series End Commit (Final State): sha2"));
         assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));

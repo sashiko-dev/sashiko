@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_directive_for_a_missing_file_is_still_consumed() {
-        // The pre-screen prompt names subsystem.md, which Phase 0 tolerated
+        // The pre-screen prompt names subsystem.md, which the pre-screen tolerated
         // being absent. An unexpanded directive would reach the model as text.
         let temp_dir = tempdir().unwrap();
         let state = TestState {

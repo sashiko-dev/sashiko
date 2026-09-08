@@ -459,7 +459,7 @@ pub struct ReviewSettings {
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
     #[serde(skip)]
-    pub stages: Option<Vec<u8>>,
+    pub stages: Option<Vec<String>>,
 }
 
 fn default_max_total_tokens() -> usize {

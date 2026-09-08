@@ -32,17 +32,32 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 Sashiko uses a multi-stage review protocol to evaluate patches thoroughly from multiple perspectives, mimicking a team of specialized reviewers.
 
 ### Review Stages
-1.  **Stage 1: Analyze commit main goal.** Focuses on the big picture, architectural flaws, UAPI breakages, and conceptual correctness.
-2.  **Stage 2: High-level implementation verification.** Verifies if the code matches the commit message claims, checking for missing pieces, undocumented side-effects, and API contract violations.
-3.  **Stage 3: Execution flow verification.** Traces C code execution flow, checking for logic errors, missing return checks, unhandled error paths, and off-by-one errors.
-4.  **Stage 4: Resource management.** Analyzes memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
-5.  **Stage 5: Locking and synchronization.** Investigates concurrency issues, deadlocks, RCU rule violations, and thread-safety.
-6.  **Stage 6: Security audit.** Audits for buffer overflows, OOB reads/writes, TOCTOU races, and information leaks (like copying uninitialized memory).
-7.  **Stage 7: Hardware engineer's review.** Specifically reviews driver and hardware code for correct register accesses, DMA mapping, memory barriers, and state machine constraints.
-8.  **Stage 8: Deduplication and Consolidation.** Consolidates feedback from stages 1-7, merges duplicates, and groups overlapping issues.
-9.  **Stage 9: Concern/dismissed-concern conflict resolution.** Compares consolidated concerns against consolidated dismissed concerns and keeps only concerns that survive concrete code-based conflict checks.
-10. **Stage 10: Verification and severity estimation.** Validates the remaining concerns, filters false positives, and estimates severity.
-11. **Stage 11: Report generation.** Converts confirmed findings into a polite, standard, inline-commented LKML email reply.
+
+Stages are identified by name. The analysis stages run in parallel; the
+consolidation stages then run in sequence over what they produced.
+
+**Analysis stages.** `goal`, `implementation`, `execution-flow` and
+`testability` always run. The planning stage decides which of the rest a patch
+warrants, and `--stages` overrides that choice by name. Naming stages also
+skips the pre-screen, so any stage whose guides the pre-screen selects will run
+without them; name `pre-screen` alongside them to keep it, as in
+`--stages pre-screen,testability`.
+
+- **goal** -- the big picture: architectural flaws, UAPI breakages, and conceptual correctness.
+- **implementation** -- whether the code matches the commit message's claims, checking for missing pieces, undocumented side-effects, and API contract violations.
+- **execution-flow** -- traces C code execution, checking for logic errors, missing return checks, unhandled error paths, and off-by-one errors.
+- **resources** -- memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
+- **locking** -- concurrency issues, deadlocks, RCU rule violations, and thread-safety.
+- **security** -- buffer overflows, OOB reads/writes, TOCTOU races, and information leaks (like copying uninitialized memory).
+- **testability** -- whether the change should have carried a test, and whether the tests it does carry would fail if the code were wrong.
+- **hardware** -- driver and hardware code: register accesses, DMA mapping, memory barriers, and state machine constraints.
+
+**Consolidation stages**, in order:
+
+- **deduplication** -- consolidates feedback from the analysis stages, merges duplicates, and groups overlapping issues.
+- **conflict-resolution** -- compares consolidated concerns against consolidated dismissed concerns and keeps only concerns that survive concrete code-based conflict checks.
+- **verification** -- validates the remaining concerns, filters false positives, and estimates severity.
+- **report** -- converts confirmed findings into a polite, standard, inline-commented LKML email reply.
 
 
 Also Sashiko is using per-subsystem and generic prompts, initially developed by Chris Mason:

@@ -66,9 +66,9 @@ struct Cli {
     #[arg(long)]
     enable_unsafe_all_submit: bool,
 
-    /// Debug feature: select which stages from 1-7 to run
+    /// Debug feature: run only these analysis stages, by name
     #[arg(long, hide = true, value_delimiter = ',')]
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -133,9 +133,9 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         color: ColorMode,
 
-        /// Select which stages from 1-7 to run
+        /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
-        stages: Option<Vec<u8>>,
+        stages: Option<Vec<String>>,
     },
 
     /// Internal worker mode for JSON-over-stdio review execution
@@ -185,9 +185,9 @@ enum Commands {
         #[arg(long)]
         custom_prompt: Option<String>,
 
-        /// Select which stages from 1-7 to run
+        /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
-        stages: Option<Vec<u8>>,
+        stages: Option<Vec<String>>,
     },
 }
 
@@ -1018,10 +1018,10 @@ struct PatchState {
     index: i64,
     subject: String,
     status: PatchStatus,
-    planned_stages: Vec<u8>,
-    active_stages: std::collections::BTreeSet<u8>,
+    planned_stages: Vec<String>,
+    active_stages: std::collections::BTreeSet<String>,
     completed_stages: usize,
-    active_stage_turns: std::collections::HashMap<u8, usize>,
+    active_stage_turns: std::collections::HashMap<String, usize>,
 }
 
 fn get_terminal_width() -> usize {
@@ -1056,21 +1056,10 @@ struct ProgressState {
     color_choice: ColorChoice,
 }
 
-fn stage_short_name(stage: u8) -> &'static str {
-    match stage {
-        1 => "Goal Analysis",
-        2 => "Implementation",
-        3 => "Execution Flow",
-        4 => "Resource Mgmt",
-        5 => "Locking & Sync",
-        6 => "Security Audit",
-        7 => "Hardware Review",
-        8 => "Deduplication",
-        9 => "Conflict Resolution",
-        10 => "Severity Estimation",
-        11 => "Report Generation",
-        _ => "Unknown",
-    }
+/// Display label for a stage. Held in the stage tables so that adding a stage
+/// needs no edit here.
+fn stage_short_name(stage: &str) -> &'static str {
+    sashiko::worker::kernel_workflow::stage_short_label(stage).unwrap_or("Unknown")
 }
 
 struct TruncatingWriter {
@@ -1149,11 +1138,11 @@ fn render_progress(state: &mut ProgressState) {
                 if p.active_stages.is_empty() {
                     "Reviewing...".to_string()
                 } else {
-                    let mut stages_with_turns: Vec<(u8, usize)> = p
+                    let mut stages_with_turns: Vec<(&String, usize)> = p
                         .active_stages
                         .iter()
-                        .map(|&st| {
-                            let turn = p.active_stage_turns.get(&st).cloned().unwrap_or(0);
+                        .map(|st| {
+                            let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
                             (st, turn)
                         })
                         .collect();
@@ -1227,7 +1216,11 @@ fn render_progress(state: &mut ProgressState) {
             .values()
             .map(|p| {
                 if p.planned_stages.is_empty() {
-                    11
+                    // Nothing resolved yet: assume every stage will run, which
+                    // is what the fan-out settles on when the planner is not
+                    // narrowing it.
+                    sashiko::worker::kernel_workflow::ANALYSIS_STAGES.len()
+                        + sashiko::worker::kernel_workflow::CONSOLIDATION_STAGES.len()
                 } else {
                     p.planned_stages.len()
                 }
@@ -1290,7 +1283,7 @@ async fn handle_review_command(
     prompts: PathBuf,
     format: OutputFormat,
     color: ColorMode,
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let color_choice = match color {
         ColorMode::Always => ColorChoice::Always,
