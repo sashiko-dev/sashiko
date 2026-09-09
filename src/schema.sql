@@ -86,12 +86,16 @@ CREATE TABLE IF NOT EXISTS patchsets (
     embargo_until INTEGER,
     embargo_release_started_at INTEGER,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
+    base_priority INTEGER DEFAULT 500,
+    priority_cap INTEGER,
+    priority INTEGER DEFAULT 500,
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
+CREATE INDEX IF NOT EXISTS idx_patchsets_status_priority_date ON patchsets(status, priority DESC, date ASC);
 
 
 CREATE TABLE IF NOT EXISTS patches (
