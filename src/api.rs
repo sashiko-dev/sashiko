@@ -466,7 +466,7 @@ async fn submit_patch(
                 .db
                 .create_fetching_patchset(
                     &format!("{}@sashiko.local", id),
-                    &format!("Fetching {} from {}...", &sha, repo_display),
+                    &format!("Fetching {} from {}...", sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
                     None,
