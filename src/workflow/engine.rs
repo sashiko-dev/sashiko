@@ -301,6 +301,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let mut state = DummyState::default();
@@ -350,6 +351,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let mut state = DummyState::default();

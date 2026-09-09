@@ -16,6 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use super::token_budget::TokenBudget;
 use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
     AiUsage, ToolCall, classify_ai_error,
@@ -138,10 +139,37 @@ pub trait LlmSession: Send {
 pub struct SessionRunner<'a> {
     provider: &'a dyn AiProvider,
     max_turns: usize,
+    max_input_tokens: Option<usize>,
     max_validation_attempts: usize,
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+}
+
+fn truncate_to_token_budget(content: &str, max_tokens: usize) -> String {
+    if TokenBudget::estimate_tokens(content) <= max_tokens {
+        return content.to_string();
+    }
+    let suffix = "\n[... tool result truncated to fit max_input_tokens ...]";
+    if TokenBudget::estimate_tokens(suffix) > max_tokens {
+        return String::new();
+    }
+
+    let mut low = 0;
+    let mut high = content.len();
+    let mut best = String::new();
+    while low <= high {
+        let middle = (low + high) / 2;
+        let prefix = crate::utils::utf8_prefix(content, middle);
+        let candidate = format!("{}{}", prefix, suffix);
+        if TokenBudget::estimate_tokens(&candidate) <= max_tokens {
+            best = candidate;
+            low = middle + 1;
+        } else {
+            high = middle.saturating_sub(1);
+        }
+    }
+    best
 }
 
 impl<'a> SessionRunner<'a> {
@@ -150,6 +178,7 @@ impl<'a> SessionRunner<'a> {
         Self {
             provider,
             max_turns: 15,
+            max_input_tokens: None,
             max_validation_attempts: 3,
             max_transient_retries: 5,
             max_provider_error_retries: 3,
@@ -166,6 +195,12 @@ impl<'a> SessionRunner<'a> {
     /// Configures the maximum conversational turns.
     pub fn with_max_turns(mut self, turns: usize) -> Self {
         self.max_turns = turns;
+        self
+    }
+
+    /// Configures the maximum estimated input tokens per request.
+    pub fn with_max_input_tokens(mut self, tokens: usize) -> Self {
+        self.max_input_tokens = Some(tokens);
         self
     }
 
@@ -188,6 +223,79 @@ impl<'a> SessionRunner<'a> {
     {
         self.on_turn = Some(Box::new(cb));
         self
+    }
+
+    fn fit_request_to_input_budget(&self, request: &mut AiRequest) -> Result<()> {
+        let Some(limit) = self.max_input_tokens else {
+            return Ok(());
+        };
+        let estimated = self.provider.estimate_tokens(request);
+        if estimated <= limit {
+            return Ok(());
+        }
+
+        let tool_messages: Vec<(usize, usize)> = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == AiRole::Tool)
+            .filter_map(|(index, message)| {
+                message
+                    .content
+                    .as_deref()
+                    .map(TokenBudget::estimate_tokens)
+                    .map(|tokens| (index, tokens))
+            })
+            .collect();
+        let tool_tokens: usize = tool_messages.iter().map(|(_, tokens)| tokens).sum();
+        let fixed_tokens = estimated.saturating_sub(tool_tokens);
+        if tool_messages.is_empty() || fixed_tokens >= limit {
+            anyhow::bail!(
+                "LLM request input (~{} tokens) exceeds max_input_tokens ({}) before tool results can be reduced",
+                estimated,
+                limit
+            );
+        }
+
+        let mut order: Vec<usize> = (0..tool_messages.len()).collect();
+        order.sort_by_key(|&index| tool_messages[index].1);
+        let mut allowed = vec![0; tool_messages.len()];
+        let mut remaining = limit - fixed_tokens;
+        for (position, &index) in order.iter().enumerate() {
+            let fair_share = remaining / (order.len() - position);
+            allowed[index] = tool_messages[index].1.min(fair_share);
+            remaining -= allowed[index];
+        }
+
+        for ((message_index, original_tokens), allowed_tokens) in
+            tool_messages.into_iter().zip(allowed)
+        {
+            if original_tokens <= allowed_tokens {
+                continue;
+            }
+            let content = request.messages[message_index]
+                .content
+                .as_deref()
+                .unwrap_or_default();
+            request.messages[message_index].content =
+                Some(truncate_to_token_budget(content, allowed_tokens));
+        }
+
+        let reduced = self.provider.estimate_tokens(request);
+        if reduced > limit {
+            anyhow::bail!(
+                "LLM request input remains above max_input_tokens after reducing tool results (~{} > {})",
+                reduced,
+                limit
+            );
+        }
+        tracing::warn!(
+            "LLM request input reduced from ~{} to ~{} tokens to honor max_input_tokens ({})",
+            estimated,
+            reduced,
+            limit
+        );
+        Ok(())
     }
 
     /// Runs the session to completion. Returns the validated output and conversation history (for logging).
@@ -230,7 +338,7 @@ impl<'a> SessionRunner<'a> {
                 cb(turns, self.max_turns);
             }
 
-            let request = AiRequest {
+            let mut request = AiRequest {
                 system: Some(session.system_prompt()),
                 messages: history.clone(),
                 tools: session.tools(),
@@ -238,6 +346,7 @@ impl<'a> SessionRunner<'a> {
                 response_format: session.response_format(),
                 context_tag: session.context_tag(),
             };
+            self.fit_request_to_input_budget(&mut request)?;
 
             let resp = match self.provider.generate_content(request).await {
                 Ok(r) => r,
@@ -374,5 +483,131 @@ impl<'a> SessionRunner<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::ProviderCapabilities;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    struct LargeToolSession;
+
+    #[async_trait]
+    impl LlmSession for LargeToolSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "user".to_string()
+        }
+
+        fn tools(&self) -> Option<Vec<AiTool>> {
+            Some(vec![AiTool {
+                name: "tool".to_string(),
+                description: "test tool".to_string(),
+                parameters: json!({"type": "object"}),
+            }])
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(json!({"output": "x".repeat(100_000)}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            response
+                .content
+                .clone()
+                .ok_or_else(|| ValidationError::Fatal("missing final response".to_string()))
+        }
+    }
+
+    struct RecordingProvider {
+        requests: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for RecordingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            if requests.len() == 1 {
+                return Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }]),
+                    usage: None,
+                    truncated: false,
+                });
+            }
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, request: &AiRequest) -> usize {
+            request
+                .system
+                .iter()
+                .chain(
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.content.as_ref()),
+                )
+                .map(|content| TokenBudget::estimate_tokens(content))
+                .sum()
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test".to_string(),
+                context_window_size: 4_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caps_requests_to_the_configured_input_budget() -> Result<()> {
+        let provider = RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+        };
+        SessionRunner::new(&provider)
+            .with_max_turns(2)
+            .with_max_input_tokens(4_000)
+            .run(&mut LargeToolSession)
+            .await?;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| provider.estimate_tokens(request) <= 4_000)
+        );
+        let tool_content = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == AiRole::Tool)
+            .and_then(|message| message.content.as_deref())
+            .unwrap();
+        assert!(tool_content.contains("tool result truncated"));
+        Ok(())
     }
 }

@@ -46,6 +46,7 @@ pub struct WorkflowEnv<'a> {
     pub tools: Arc<ToolBox>,
     pub base_dir: &'a std::path::Path,
     pub context_tag: Option<String>,
+    pub max_input_tokens: usize,
 }
 
 /// A deferred state mutation function returned after isolated stage execution.
@@ -440,6 +441,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
 
             let runner = SessionRunner::new(env.provider.as_ref())
                 .with_max_turns(self.policy.max_turns)
+                .with_max_input_tokens(env.max_input_tokens)
                 .with_max_validation_attempts(self.policy.max_validation_attempts)
                 .with_turn_callback(move |turn, max_turns| {
                     if let Some(cb) = event_cb {
@@ -632,6 +634,7 @@ mod tests {
             tools: Arc::new(toolbox),
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_concurrent")
@@ -658,6 +661,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup")
@@ -702,6 +706,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_turns")
@@ -746,6 +751,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_gap")
@@ -788,6 +794,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_batch")
@@ -820,6 +827,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            max_input_tokens: usize::MAX,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_error")
