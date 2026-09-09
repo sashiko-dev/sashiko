@@ -63,6 +63,35 @@ Do not confuse **mandatory kernel API error-handling** with "defensive programmi
   - The function naming/documentation doesn't clearly indicate usage constraints
   - Similar kernel APIs validate the same preconditions
 
+### 2.1 Symbol Existence and Linkage Claims
+**Before reporting** that a newly referenced function, macro, type, or global is
+undefined or does not exist:
+
+1. Search for the exact identifier across the full review worktree, not only
+   the files touched by the patch. Read the complete `git_grep` summary and all
+   relevant matches before drawing a conclusion.
+2. Inspect matching declarations, definitions, and exports. A declaration in a
+   header or a definition outside the patched subsystem disproves a claim that
+   the symbol does not exist.
+3. Distinguish three different failures: a missing include or declaration at
+   the call site, a definition excluded by Kconfig or Makefile conditions, and
+   a definition that is unavailable across a module boundary. Do not turn one
+   into a generic "undefined symbol" claim.
+4. For a configuration-dependent finding, name the exact configuration and
+   build/link path that excludes the required definition while compiling the
+   new reference.
+
+If the source search is unavailable, fails, or is incomplete, that is not
+evidence that the identifier is absent. Do not report nonexistence as fact
+without a successful whole-tree search and the concrete declaration/build
+analysis above.
+
+*Output Verification:*
+- Exact identifier searched: [ identifier ]
+- Declaration/definition/export matches: [ locations or "none in complete search" ]
+- Relevant include, Kconfig, Makefile, and module boundary: [ evidence ]
+- Proven failure mode: [ compile, link, module load, or "no failure proven" ]
+
 ### 3. Unverifiable Assumptions
 **Assume the author is wrong** and require proof they are correct
 - Untrusted sources (network/user) always need concrete proof of correctness
