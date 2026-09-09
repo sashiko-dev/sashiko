@@ -328,6 +328,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        let mut final_turn_notice_added = false;
 
         loop {
             turns += 1;
@@ -338,10 +339,31 @@ impl<'a> SessionRunner<'a> {
                 cb(turns, self.max_turns);
             }
 
+            if turns == self.max_turns && !final_turn_notice_added {
+                let message = AiMessage {
+                    role: AiRole::User,
+                    content: Some(
+                        "Tool access is now closed. Do not request or emit any tool calls. Return the required final response in the requested format now."
+                            .to_string(),
+                    ),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                history.push(message.clone());
+                log_history.push(message);
+                final_turn_notice_added = true;
+            }
+
             let mut request = AiRequest {
                 system: Some(session.system_prompt()),
                 messages: history.clone(),
-                tools: session.tools(),
+                tools: if turns < self.max_turns {
+                    session.tools()
+                } else {
+                    None
+                },
                 temperature: session.temperature(),
                 response_format: session.response_format(),
                 context_tag: session.context_tag(),
@@ -531,6 +553,52 @@ mod tests {
         requests: Mutex<Vec<AiRequest>>,
     }
 
+    struct ToolUntilClosedProvider {
+        requests: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for ToolUntilClosedProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let tools_available = request.tools.is_some();
+            self.requests.lock().unwrap().push(request);
+            if tools_available {
+                return Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }]),
+                    usage: None,
+                    truncated: false,
+                });
+            }
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test".to_string(),
+                context_window_size: 4_000,
+            }
+        }
+    }
+
     #[async_trait]
     impl AiProvider for RecordingProvider {
         async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -608,6 +676,30 @@ mod tests {
             .and_then(|message| message.content.as_deref())
             .unwrap();
         assert!(tool_content.contains("tool result truncated"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reserves_the_last_turn_for_the_final_response() -> Result<()> {
+        let provider = ToolUntilClosedProvider {
+            requests: Mutex::new(Vec::new()),
+        };
+        let result = SessionRunner::new(&provider)
+            .with_max_turns(2)
+            .run(&mut LargeToolSession)
+            .await?;
+
+        assert_eq!(result.output, "done");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools.is_some());
+        assert!(requests[1].tools.is_none());
+        assert!(requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("Tool access is now closed"))
+        }));
         Ok(())
     }
 }
