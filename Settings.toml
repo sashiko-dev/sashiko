@@ -23,10 +23,11 @@ enabled = false
 # webhook_secret = ""
 
 [subsystems]
-# Regex map: email address pattern -> subsystem name
+# Regex map: email address or changed path pattern -> subsystem name
 # mapping = [
 #     { pattern = ".*linux-kernel@vger.kernel.org.*", name = "LKML" },
 #     { pattern = ".*netdev@vger.kernel.org.*", name = "netdev" },
+#     { pattern = "^fs/smb/server/.*", name = "ksmbd", base_tree = "git://git.samba.org/ksmbd.git", base_branch = "for-next" },
 # ]
 
 [database]
