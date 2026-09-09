@@ -38,6 +38,56 @@ and `pm_runtime_get()`.
 - Returns **0** on successful resume or when an async request was queued
 - Returns negative errno on failure
 
+## Conditional Gets When `CONFIG_PM=n`
+
+Do not treat a negative return from `pm_runtime_get_if_active()` or
+`pm_runtime_get_if_in_use()` as proof that the caller must return early or
+call `pm_runtime_put()`. These helpers have configuration-dependent contracts:
+
+- A positive return means the helper incremented the usage counter. The caller
+  must pair that reference with a put on every subsequent exit path.
+- Zero means the condition was not met and the counter was not incremented.
+  The caller normally skips hardware access and must not put a reference it did
+  not acquire.
+- A negative return also means the counter was not incremented. With
+  `CONFIG_PM=y`, `-EINVAL` reports that Runtime PM is disabled for the device.
+  With `CONFIG_PM=n`, the inline stubs return `-EINVAL`, while
+  `pm_runtime_put()` and the other counter helpers are no-ops.
+
+This makes the following driver pattern potentially intentional:
+
+```c
+int ret = pm_runtime_get_if_active(dev);
+
+if (!ret)
+    return 0;
+
+/* Access hardware. */
+
+pm_runtime_put(dev);
+```
+
+When `CONFIG_PM=n`, the negative stub return falls through so the driver still
+performs its work, and the put is a no-op. Changing the condition to
+`ret <= 0` can incorrectly disable the operation in kernels built without
+Runtime PM.
+
+Before reporting either an unchecked error or an unbalanced put, prove all of
+the following from the exact helper definition and caller lifecycle:
+
+1. Which return values are reachable under each relevant configuration.
+2. Whether Runtime PM can be disabled for the device while this caller runs
+   when `CONFIG_PM=y`.
+3. Whether hardware access is valid and required when `CONFIG_PM=n`.
+4. Whether each positive acquisition is paired with a put for the same device.
+5. Whether any reachable zero or runtime-disabled path performs an unmatched
+   put or accesses hardware that may actually be suspended.
+
+Do not generalize this exception to `pm_runtime_get_sync()` or
+`pm_runtime_resume_and_get()`: those helpers have different usage-counter and
+error contracts. Retain the finding when source or configuration context is
+insufficient to establish the intended balance.
+
 ## Concurrency and Locking
 
 Races between concurrent Runtime PM operations cause confusing error returns
@@ -187,7 +237,9 @@ disabled.
 ```c
 // CORRECT: Check if device is active before hardware access
 int ret = pm_runtime_get_if_active(dev);
-if (ret <= 0)
+// A negative value can be the CONFIG_PM=n stub. The caller lifecycle must
+// exclude runtime-disabled CONFIG_PM=y execution before using this form.
+if (!ret)
     return IRQ_NONE;  // Device not active, not our interrupt
 
 status = readl(base + STATUS_REG);
@@ -218,5 +270,8 @@ IRQ handler is executing mid-flight.
 - **IRQ handler PM access**: IRQ handlers should use
   `pm_runtime_get_if_active()`, not `pm_runtime_get_noresume()`, before
   accessing hardware registers
+- **Conditional gets with `CONFIG_PM=n`**: Do not require an early return or a
+  put for every negative result. Verify the stub behavior, device lifecycle,
+  and whether a positive reference was actually acquired
 - **`synchronize_irq()` in suspend**: Drivers using `IRQF_SHARED` must call
   `synchronize_irq()` in their runtime suspend callback before powering down
