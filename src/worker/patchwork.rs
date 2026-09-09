@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::db::Database;
-use crate::email_policy::EmailPolicyConfig;
+use crate::email_policy::{EmailPolicyConfig, PatchworkPolicy};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -34,19 +34,19 @@ impl PatchworkWorker {
         }
     }
 
-    /// Resolve the patchwork API token for a given api_url by loading
-    /// the email policy config and matching against subsystem policies.
-    /// Tokens are never stored in the database -- they are resolved
-    /// from the config file (and SASHIKO_PATCHWORK_TOKEN env var) at
-    /// delivery time.
-    fn resolve_token(&self, api_url: &str) -> Option<String> {
+    /// Resolve the Patchwork API policy for a given api_url.
+    ///
+    /// Credentials and request identification are deliberately resolved
+    /// from the config at delivery time instead of being stored in the
+    /// outbox.
+    fn resolve_api_policy(&self, api_url: &str) -> Option<PatchworkPolicy> {
         let config = EmailPolicyConfig::load(&self.email_policy_path)
-            .expect("Failed to load email policy for token resolution");
+            .expect("Failed to load email policy for Patchwork delivery");
 
         // Check subsystem policies for a matching api_url
         for sub in config.subsystems.values() {
             if sub.patchwork.enabled && sub.patchwork.api_url.as_deref() == Some(api_url) {
-                return sub.patchwork.token.clone();
+                return Some(sub.patchwork.clone());
             }
         }
 
@@ -54,7 +54,7 @@ impl PatchworkWorker {
         if config.defaults.patchwork.enabled
             && config.defaults.patchwork.api_url.as_deref() == Some(api_url)
         {
-            return config.defaults.patchwork.token.clone();
+            return Some(config.defaults.patchwork);
         }
 
         None
@@ -84,14 +84,18 @@ impl PatchworkWorker {
                         entry.id, entry.patch_msg_id
                     );
 
-                    // Resolve the token from config at delivery time,
-                    // not from the database row.
-                    let token = self.resolve_token(&entry.api_url);
+                    let api_policy = self.resolve_api_policy(&entry.api_url);
+                    let token = api_policy
+                        .as_ref()
+                        .and_then(|policy| policy.token.as_deref());
+                    let user_agent = api_policy
+                        .as_ref()
+                        .and_then(|policy| policy.user_agent.as_deref());
 
                     match crate::patchwork::post_patchwork_check(
                         &client,
                         &entry.api_url,
-                        token.as_deref(),
+                        crate::patchwork::PatchworkApiIdentity { token, user_agent },
                         &entry.patch_msg_id,
                         &entry.check_state,
                         &entry.description,
