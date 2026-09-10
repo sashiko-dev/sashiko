@@ -655,6 +655,26 @@ impl AiProvider for VllmClient {
             context_window_size: self.context_window_size,
         }
     }
+
+    fn cache_identity(&self) -> String {
+        // guided_json and enable_tools change the shape of the reply rather
+        // than its wording: one constrains it to JSON, the other decides
+        // whether it can call tools at all.
+        let max_tokens = self.max_tokens.map(|m| m.to_string());
+        let enable_thinking = self.enable_thinking.map(|v| v.to_string());
+        let guided_json = self.guided_json.to_string();
+        let enable_tools = self.enable_tools.to_string();
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("max_tokens", max_tokens.as_deref()),
+                ("enable_thinking", enable_thinking.as_deref()),
+                ("guided_json", Some(guided_json.as_str())),
+                ("enable_tools", Some(enable_tools.as_str())),
+                ("base_url", Some(self.base_url.as_str())),
+            ],
+        )
+    }
 }
 
 #[cfg(test)]
@@ -662,6 +682,42 @@ mod tests {
     use super::*;
     use crate::ai::{AiErrorClass, AiMessage, ClassifyAiError, DEFAULT_RETRY_AFTER};
     use serde_json::json;
+
+    fn test_client(
+        base_url: &str,
+        enable_thinking: Option<bool>,
+        guided_json: bool,
+        enable_tools: bool,
+    ) -> VllmClient {
+        VllmClient::new(
+            base_url.to_string(),
+            "Qwen3-32B".to_string(),
+            32_768,
+            Some(2048),
+            60,
+            enable_thinking,
+            guided_json,
+            enable_tools,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_identity_tracks_the_knobs_outside_the_request() {
+        let base = test_client("http://localhost:8000/v1", None, false, false);
+
+        let thinking = test_client("http://localhost:8000/v1", Some(false), false, false);
+        assert_ne!(base.cache_identity(), thinking.cache_identity());
+
+        let guided = test_client("http://localhost:8000/v1", None, true, false);
+        assert_ne!(base.cache_identity(), guided.cache_identity());
+
+        let tools = test_client("http://localhost:8000/v1", None, false, true);
+        assert_ne!(base.cache_identity(), tools.cache_identity());
+
+        let elsewhere = test_client("http://gpu-box:8000/v1", None, false, false);
+        assert_ne!(base.cache_identity(), elsewhere.cache_identity());
+    }
 
     fn user_request(content: &str) -> AiRequest {
         AiRequest {

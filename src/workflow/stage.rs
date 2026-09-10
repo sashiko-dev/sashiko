@@ -17,12 +17,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::ai::{
     AiMessage, AiProvider, AiResponse, AiResponseFormat, AiTool, ErrorAction, LlmSession,
-    SessionRunner, ValidationError,
+    SessionRunner, ToolCall, ValidationError,
 };
 use crate::toolbox::ToolBox;
 
@@ -225,6 +225,8 @@ struct StageSession<'a, S, T> {
     log_user_prompt: String,
     context_tag: Option<String>,
     recitation_fallback_active: bool,
+    /// Name and arguments of the last call run, for the duplicate guard below.
+    last_tool_call: Option<(String, Value)>,
 }
 
 #[async_trait]
@@ -285,7 +287,68 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
-        self.tools.call(name, args).await
+        let repeated = self
+            .last_tool_call
+            .as_ref()
+            .is_some_and(|last| last.0 == name && last.1 == args);
+        if repeated {
+            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
+            return Ok(json!({
+                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+            }));
+        }
+        self.last_tool_call = Some((name.to_string(), args.clone()));
+        match self.tools.call(name, args).await {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(json!({ "error": e.to_string() })),
+        }
+    }
+
+    async fn call_tools(&mut self, calls: Vec<ToolCall>) -> Result<Vec<(String, Value)>> {
+        let mut results: Vec<Option<(String, Value)>> = vec![None; calls.len()];
+        let mut to_run = Vec::new();
+
+        for (idx, call) in calls.into_iter().enumerate() {
+            let repeated = self
+                .last_tool_call
+                .as_ref()
+                .is_some_and(|last| last.0 == call.function_name && last.1 == call.arguments);
+            if repeated {
+                tracing::warn!(
+                    "Blocked duplicate tool call: {} with args {:?}",
+                    call.function_name,
+                    call.arguments
+                );
+                results[idx] = Some((
+                    call.id,
+                    json!({
+                        "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+                    }),
+                ));
+            } else {
+                self.last_tool_call = Some((call.function_name.clone(), call.arguments.clone()));
+                to_run.push((idx, call));
+            }
+        }
+
+        let futures = to_run.into_iter().map(|(idx, call)| {
+            let tools = self.tools.clone();
+            async move {
+                // A rejected call is the model's to read and correct. The
+                // trait default propagates the error instead, which ends the
+                // stage and with it the review.
+                let res = match tools.call(&call.function_name, call.arguments).await {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e.to_string() }),
+                };
+                (idx, (call.id, res))
+            }
+        });
+        for (idx, res) in futures::future::join_all(futures).await {
+            results[idx] = Some(res);
+        }
+
+        Ok(results.into_iter().flatten().collect())
     }
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
@@ -372,6 +435,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 log_user_prompt,
                 context_tag: env.context_tag.clone(),
                 recitation_fallback_active: false,
+                last_tool_call: None,
             };
 
             let runner = SessionRunner::new(env.provider.as_ref())
@@ -416,5 +480,375 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         };
 
         Ok((outcome, mutation))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiRequest, AiRole, ProviderCapabilities};
+    use crate::workflow::output::OutputFormat;
+    use crate::workflow::prompt::PromptTemplate;
+    use std::sync::Mutex;
+
+    #[derive(Default, Clone)]
+    struct EmptyState;
+
+    /// Calls a tool on its first turn, then answers. Records every request so a
+    /// test can check what the model was told about the tool call.
+    struct ToolCallingProvider {
+        turn: Mutex<usize>,
+        seen: Mutex<Vec<AiRequest>>,
+        calls: Vec<ToolCall>,
+        calling_turns: usize,
+    }
+
+    impl ToolCallingProvider {
+        /// One call to git_read_files per path, each missing the required
+        /// revision argument, so every one of them is rejected.
+        fn rejecting(paths: &[&str]) -> Self {
+            Self {
+                turn: Mutex::new(0),
+                seen: Mutex::new(Vec::new()),
+                calls: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| ToolCall {
+                        id: format!("call_{i}"),
+                        function_name: "git_read_files".to_string(),
+                        arguments: json!({ "files": [{ "path": path }] }),
+                        thought_signature: None,
+                    })
+                    .collect(),
+                calling_turns: 1,
+            }
+        }
+
+        /// One call to the concurrency probe per index, so the batch carries
+        /// distinct arguments and neither the cache nor the duplicate guard
+        /// collapses it.
+        fn probing(count: usize) -> Self {
+            Self {
+                turn: Mutex::new(0),
+                seen: Mutex::new(Vec::new()),
+                calls: (0..count)
+                    .map(|i| ToolCall {
+                        id: format!("call_{i}"),
+                        function_name: "concurrency_probe".to_string(),
+                        arguments: json!({ "n": i }),
+                        thought_signature: None,
+                    })
+                    .collect(),
+                calling_turns: 1,
+            }
+        }
+
+        /// Emit the same batch again on the next turn, so a test can reach the
+        /// duplicate guard across two call_tools invocations.
+        fn repeated_next_turn(mut self) -> Self {
+            self.calling_turns = 2;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for ToolCallingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.seen.lock().unwrap().push(request);
+            let mut turn = self.turn.lock().unwrap();
+            *turn += 1;
+            if *turn <= self.calling_turns {
+                return Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(self.calls.clone()),
+                    usage: None,
+                    truncated: false,
+                });
+            }
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    /// Blocks until every call in the batch is in flight. Under a sequential
+    /// implementation the first call never returns.
+    struct ConcurrencyProbe {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl crate::toolbox::framework::LlmTool<crate::toolbox::SashikoToolContext> for ConcurrencyProbe {
+        fn name(&self) -> &'static str {
+            "concurrency_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that waits for the rest of its batch."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": { "n": { "type": "integer" } } })
+        }
+
+        async fn call(
+            &self,
+            _args: Value,
+            _context: &crate::toolbox::SashikoToolContext,
+        ) -> Result<Value> {
+            self.barrier.wait().await;
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_batch_of_tool_calls_runs_concurrently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::probing(3));
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        toolbox.register_tool(ConcurrencyProbe {
+            barrier: Arc::new(tokio::sync::Barrier::new(3)),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(toolbox),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_concurrent")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let run = stage.execute_isolated(&env, &EmptyState, None);
+        let (_outcome, _mutation) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the batch must run concurrently; a sequential loop never clears the barrier")
+            .expect("the stage must not end");
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_duplicate_tool_call_is_blocked() {
+        // Loop prevention: the same call twice in a row is answered with a
+        // synthetic error rather than run again.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "a"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_dup")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a duplicate call must not end the stage");
+
+        let seen = provider.seen.lock().unwrap();
+        let replies: Vec<String> = seen[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(
+            !replies[0].contains("Duplicate tool call blocked"),
+            "the first of the pair runs: {}",
+            replies[0]
+        );
+        assert!(
+            replies[1].contains("Duplicate tool call blocked"),
+            "the repeat is blocked: {}",
+            replies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_tool_call_is_blocked_across_turns() {
+        // The guard is per session, not per batch: the repeat here arrives on
+        // the turn after the call it repeats.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a"]).repeated_next_turn());
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_turns")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a duplicate call must not end the stage");
+
+        let seen = provider.seen.lock().unwrap();
+        let replies: Vec<String> = seen[2]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(
+            !replies[0].contains("Duplicate tool call blocked"),
+            "the first turn's call runs: {}",
+            replies[0]
+        );
+        assert!(
+            replies[1].contains("Duplicate tool call blocked"),
+            "the next turn's repeat is blocked: {}",
+            replies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_consecutive_duplicate_tool_call_runs() {
+        // Only a consecutive repeat is blocked, so the second "a" runs because
+        // "b" separates it from the first.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "a"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_gap")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a non-consecutive repeat must not end the stage");
+
+        let seen = provider.seen.lock().unwrap();
+        let replies: Vec<String> = seen[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(replies.len(), 3);
+        assert!(
+            replies
+                .iter()
+                .all(|r| !r.contains("Duplicate tool call blocked")),
+            "none of the three is blocked: {:?}",
+            replies
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batched_tool_results_keep_their_call_order() {
+        // join_all preserves the input order, which is what keeps a tool
+        // result next to its call on the Gemini path, where the result
+        // carries only the function name and not the call id.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "c"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_batch")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a batch of rejected calls must not end the stage");
+
+        let seen = provider.seen.lock().unwrap();
+        let ids: Vec<_> = seen[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.tool_call_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["call_0", "call_1", "call_2"]);
+    }
+
+    #[tokio::test]
+    async fn test_rejected_tool_call_is_reported_to_the_model_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["x"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_error")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a rejected tool call must not end the stage");
+
+        // The model must have been handed the error and given another turn.
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the model should get a second turn");
+        let tool_reply = seen[1]
+            .messages
+            .iter()
+            .find(|m| m.role == AiRole::Tool)
+            .expect("the second request should carry the tool result");
+        assert!(
+            tool_reply
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("error"),
+            "the model should see the tool's error: {:?}",
+            tool_reply.content
+        );
     }
 }

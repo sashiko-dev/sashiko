@@ -66,9 +66,9 @@ struct Cli {
     #[arg(long)]
     enable_unsafe_all_submit: bool,
 
-    /// Debug feature: select which stages from 1-7 to run
+    /// Debug feature: run only these analysis stages, by name
     #[arg(long, hide = true, value_delimiter = ',')]
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -133,9 +133,9 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         color: ColorMode,
 
-        /// Select which stages from 1-7 to run
+        /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
-        stages: Option<Vec<u8>>,
+        stages: Option<Vec<String>>,
     },
 
     /// Internal worker mode for JSON-over-stdio review execution
@@ -185,9 +185,9 @@ enum Commands {
         #[arg(long)]
         custom_prompt: Option<String>,
 
-        /// Select which stages from 1-7 to run
+        /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
-        stages: Option<Vec<u8>>,
+        stages: Option<Vec<String>>,
     },
 }
 
@@ -216,18 +216,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine log level
     // 1. CLI --debug takes precedence (implies "info")
-    // 2. Settings log_level
-    // 3. Fallback to "warn" (if settings failed)
+    // 2. Review command defaults to "warn" (unless --debug)
+    // 3. Settings log_level
+    // 4. Worker command defaults to "info" (worker logs progress on stderr)
+    // 5. Fallback to "warn" (if settings failed)
     let is_review = matches!(cli.command, Some(Commands::Review { .. }));
+    let is_worker = matches!(cli.command, Some(Commands::Worker { .. }));
     let log_level = if cli.debug {
         "info"
     } else if is_review {
         "warn"
+    } else if let Ok(s) = &settings_result {
+        &s.log_level
+    } else if is_worker {
+        "info"
     } else {
-        match &settings_result {
-            Ok(s) => &s.log_level,
-            Err(_) => "warn",
-        }
+        "warn"
     };
 
     // Initialize tracing with EnvFilter
@@ -237,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine formatting features independently
     let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
-    let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal();
+    let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stderr().is_terminal();
 
     let builder = fmt()
         .with_env_filter(env_filter)
@@ -309,6 +313,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 custom_prompt,
                 stages,
             } => {
+                std::panic::set_hook(Box::new(|info| {
+                    eprintln!("CRITICAL ERROR: Panic detected: {}", info);
+                }));
+
                 let result = run_worker_from_stdin(WorkerOptions {
                     settings_path: None,
                     baseline: baseline.clone(),
@@ -325,15 +333,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scratch_clone: false,
                     current_tree: false,
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    serde_json::json!({
-                        "patchset_id": 0,
-                        "error": e.to_string()
-                    })
-                });
-                print_worker_json(&result).map_err(Box::<dyn std::error::Error>::from)?;
-                return Ok(());
+                .await;
+
+                match result {
+                    Ok(val) => {
+                        print_worker_json(&val).map_err(Box::<dyn std::error::Error>::from)?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let err_val = serde_json::json!({
+                            "patchset_id": 0,
+                            "error": e.to_string()
+                        });
+                        let _ = print_worker_json(&err_val);
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }
@@ -832,6 +847,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to ensure submodule config compatibility: {}", e);
     }
 
+    // Auto-maintenance repacks in the background while the sync worker
+    // keeps fetching, which can leave a commit-graph naming objects the
+    // repack removed.
+    if let Err(e) = sashiko::git_ops::ensure_gc_disabled(&repo_path).await {
+        error!("Failed to disable git auto-maintenance: {}", e);
+    }
+
+    // Recover the object store the way the worktrees above are
+    // recovered.  The write brings the graph up to the refs the last
+    // run left behind, and drops a graph that outlived the objects it
+    // names rather than reporting it.
+    //
+    // The walk visits every reachable commit, which runs to minutes
+    // on a tree the size of Linux.  Awaiting it here held the sync
+    // worker and the reviewer off for that long on every restart.
+    // Run it beside those workers instead.  The repack worker
+    // rewrites the pack directory.  Both passes take the object-store
+    // lock, so it cannot run underneath the walk.
+    let graph_repo_path = repo_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) = sashiko::git_ops::write_commit_graph(&graph_repo_path).await {
+            error!("Failed to write the commit-graph: {}", e);
+        }
+    });
+
     if let Some(custom_remotes) = &settings.git.custom_remotes {
         for remote in custom_remotes {
             info!(
@@ -855,6 +895,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Start Repack Worker
+    {
+        let repack_worker = sashiko::worker::repack::RepackWorker::new(repo_path.clone());
+        tokio::spawn(async move {
+            repack_worker.run().await;
+        });
+    }
+
     // Start Reviewer Service
     let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
     tokio::spawn(async move {
@@ -862,6 +910,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let metrics_db = db.clone();
+    let metrics_repo_path = repo_path.clone();
     tokio::spawn(async move {
         loop {
             if let Ok(pending) = metrics_db.count_pending_patches().await {
@@ -875,6 +924,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
                 sashiko::metrics::set_patchsets(patchsets);
+            }
+            match sashiko::git_ops::pack_stats(&metrics_repo_path).await {
+                Ok((packs, bytes)) => sashiko::metrics::set_repo_packs(packs, bytes),
+                Err(e) => warn!("Failed to count packs in the review repository: {}", e),
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
@@ -965,10 +1018,10 @@ struct PatchState {
     index: i64,
     subject: String,
     status: PatchStatus,
-    planned_stages: Vec<u8>,
-    active_stages: std::collections::BTreeSet<u8>,
+    planned_stages: Vec<String>,
+    active_stages: std::collections::BTreeSet<String>,
     completed_stages: usize,
-    active_stage_turns: std::collections::HashMap<u8, usize>,
+    active_stage_turns: std::collections::HashMap<String, usize>,
 }
 
 fn get_terminal_width() -> usize {
@@ -1003,21 +1056,10 @@ struct ProgressState {
     color_choice: ColorChoice,
 }
 
-fn stage_short_name(stage: u8) -> &'static str {
-    match stage {
-        1 => "Goal Analysis",
-        2 => "Implementation",
-        3 => "Execution Flow",
-        4 => "Resource Mgmt",
-        5 => "Locking & Sync",
-        6 => "Security Audit",
-        7 => "Hardware Review",
-        8 => "Deduplication",
-        9 => "Conflict Resolution",
-        10 => "Severity Estimation",
-        11 => "Report Generation",
-        _ => "Unknown",
-    }
+/// Display label for a stage. Held in the stage tables so that adding a stage
+/// needs no edit here.
+fn stage_short_name(stage: &str) -> &'static str {
+    sashiko::worker::kernel_workflow::stage_short_label(stage).unwrap_or("Unknown")
 }
 
 struct TruncatingWriter {
@@ -1096,11 +1138,11 @@ fn render_progress(state: &mut ProgressState) {
                 if p.active_stages.is_empty() {
                     "Reviewing...".to_string()
                 } else {
-                    let mut stages_with_turns: Vec<(u8, usize)> = p
+                    let mut stages_with_turns: Vec<(&String, usize)> = p
                         .active_stages
                         .iter()
-                        .map(|&st| {
-                            let turn = p.active_stage_turns.get(&st).cloned().unwrap_or(0);
+                        .map(|st| {
+                            let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
                             (st, turn)
                         })
                         .collect();
@@ -1174,7 +1216,11 @@ fn render_progress(state: &mut ProgressState) {
             .values()
             .map(|p| {
                 if p.planned_stages.is_empty() {
-                    11
+                    // Nothing resolved yet: assume every stage will run, which
+                    // is what the fan-out settles on when the planner is not
+                    // narrowing it.
+                    sashiko::worker::kernel_workflow::ANALYSIS_STAGES.len()
+                        + sashiko::worker::kernel_workflow::CONSOLIDATION_STAGES.len()
                 } else {
                     p.planned_stages.len()
                 }
@@ -1237,7 +1283,7 @@ async fn handle_review_command(
     prompts: PathBuf,
     format: OutputFormat,
     color: ColorMode,
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let color_choice = match color {
         ColorMode::Always => ColorChoice::Always,

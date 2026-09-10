@@ -1,7 +1,9 @@
 # Sashiko False-Positive Guide
 
-Report only regressions introduced by the patch and supported by a concrete
-triggering path.
+Report newly introduced regressions only when they are supported by a concrete
+triggering path. For behavior that predates the patch, preserve the workflow's
+existing rule: discard Low- and Medium-severity concerns, but retain verified
+High- or Critical-severity concerns and mark them explicitly as pre-existing.
 
 Before reporting:
 

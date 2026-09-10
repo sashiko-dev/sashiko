@@ -18,7 +18,7 @@ pub mod kernel_workflow;
 pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;
-pub mod stage;
+pub mod repack;
 pub mod sync;
 
 pub use prompts::*;

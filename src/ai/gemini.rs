@@ -802,6 +802,11 @@ impl AiProvider for GeminiClient {
             context_window_size: 1_000_000, // Gemini 1.5 Pro default
         }
     }
+
+    fn cache_identity(&self) -> String {
+        // base_url separates two endpoints serving the same model name.
+        crate::ai::cache_identity_with(&self.model, &[("base_url", Some(self.base_url.as_str()))])
+    }
 }
 
 #[cfg(test)]
@@ -812,6 +817,20 @@ mod tests {
         DEFAULT_RETRY_AFTER, ToolCall,
     };
     use serde_json::json;
+
+    #[test]
+    fn cache_identity_tracks_base_url() {
+        let client = |base_url: &str| GeminiClient {
+            model: "gemini-2.5-pro".to_string(),
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            client: RwLock::new(Client::new()),
+        };
+        assert_ne!(
+            client("https://generativelanguage.googleapis.com").cache_identity(),
+            client("https://proxy.invalid").cache_identity()
+        );
+    }
 
     #[test]
     fn test_quota_exceeded_classifies_as_rate_limit() {

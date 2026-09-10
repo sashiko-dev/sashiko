@@ -30,6 +30,10 @@ reachability. State that reasoning before the label.
 - a real but minor usability, diagnostic, documentation, or cold-path
   inefficiency issue with limited operational effect.
 
-Speculation is capped at medium, but uncertainty is not evidence. If the
-trigger cannot be established after reading the relevant path, do not report
-the concern as a finding.
+Severity is determined by demonstrated impact and reachability, not reviewer
+confidence. If the triggering path cannot be established after reading the
+relevant code, do not report the concern as a finding. For an established
+defect, state any residual uncertainty separately; do not lower or raise its
+severity merely because reviewer confidence differs. For this profile, this
+rule supersedes generic stage prose that caps speculative findings at Medium
+or requires an unestablished concern to be retained.

@@ -341,6 +341,12 @@ impl Ingestor {
                 Ok(i) => i,
                 Err(e) => {
                     error!("Failed to select group {}: {}", group_name, e);
+                    if let Ok(new_client) =
+                        NntpClient::connect(&self.settings.nntp.server, self.settings.nntp.port)
+                            .await
+                    {
+                        client = new_client;
+                    }
                     continue;
                 }
             };
@@ -368,6 +374,14 @@ impl Ingestor {
                     "Initialized high-water mark to {} (overlap window: {})",
                     current, overlap
                 );
+            } else if current > info.high {
+                warn!(
+                    "Group {}: high-water mark {} is ahead of server tip {}; resetting to tip with overlap",
+                    group_name, current, info.high
+                );
+                let overlap = 100;
+                current = info.high.saturating_sub(overlap);
+                self.db.update_last_article_num(group_name, current).await?;
             }
 
             // Fetch ALL pending messages
@@ -405,6 +419,14 @@ impl Ingestor {
                             }
                         } else {
                             error!("Failed to fetch article {}: {}", next_id, e);
+                            if let Ok(new_client) = NntpClient::connect(
+                                &self.settings.nntp.server,
+                                self.settings.nntp.port,
+                            )
+                            .await
+                            {
+                                client = new_client;
+                            }
                             break; // Stop and retry later (transient error or connection lost)
                         }
                     }
@@ -1098,5 +1120,20 @@ index bbc440c93e08..1123ef3ccf90 100644
                 "org.kernel.vger.unknown-list".to_string()
             )
         );
+    }
+
+    #[test]
+    fn test_watermark_clamp_when_ahead_of_server_tip() {
+        let current: u64 = 145742;
+        let high: u64 = 144382;
+        assert!(current > high);
+        let recovered = high.saturating_sub(100);
+        assert_eq!(recovered, 144282);
+        assert!(recovered < high);
+
+        // Underflow protection
+        let low_high: u64 = 50;
+        let low_recovered = low_high.saturating_sub(100);
+        assert_eq!(low_recovered, 0);
     }
 }

@@ -89,6 +89,7 @@ mod tests {
         let required = [
             "sashiko/review-core.md",
             "sashiko/project-context.md",
+            "sashiko/subsystem/subsystem.md",
             "sashiko/technical-patterns.md",
             "sashiko/callstack.md",
             "sashiko/false-positive-guide.md",
@@ -109,6 +110,12 @@ mod tests {
                 "missing bundled Sashiko prompt: {required_path}"
             );
         }
+        assert!(
+            !PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(path, _)| *path == "sashiko/README.md"),
+            "the trusted profile bundle must not advertise a candidate-relative prompt path"
+        );
     }
 
     #[test]

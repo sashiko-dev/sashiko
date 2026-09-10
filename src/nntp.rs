@@ -138,6 +138,14 @@ impl NntpClient {
             return Err(anyhow!("Invalid GROUP response format: {}", response));
         }
 
+        if parts[4] != group_name {
+            return Err(anyhow!(
+                "Mismatched GROUP response: expected {}, got {}",
+                group_name,
+                parts[4]
+            ));
+        }
+
         Ok(GroupInfo {
             number: parts[1].parse().unwrap_or(0),
             low: parts[2].parse().unwrap_or(0),
@@ -262,5 +270,43 @@ lf-only \t\n\
             reconstructed.as_bytes(),
             b"normal text\ntrailing space \ntrailing tab\t\n \n\n.payload\n+added \t\n-removed \n context \t\nlf-only \t"
         );
+    }
+
+    #[tokio::test]
+    async fn group_validates_matching_group_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+
+            stream
+                .get_mut()
+                .write_all(b"200 mock server ready\r\n")
+                .await
+                .unwrap();
+
+            let mut command = Vec::new();
+            stream.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, b"GROUP org.kernel.vger.linux-nfs\r\n");
+
+            // Server mistakenly sends response for linux-mm
+            stream
+                .get_mut()
+                .write_all(b"211 500 1 500 org.kvack.linux-mm\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut client = NntpClient::connect("127.0.0.1", address.port())
+            .await
+            .unwrap();
+        let err = client.group("org.kernel.vger.linux-nfs").await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(err.to_string().contains(
+            "Mismatched GROUP response: expected org.kernel.vger.linux-nfs, got org.kvack.linux-mm"
+        ));
     }
 }

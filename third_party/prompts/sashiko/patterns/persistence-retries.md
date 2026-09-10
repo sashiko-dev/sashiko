@@ -6,5 +6,5 @@ that partial failure is atomic, compensated, or safely recoverable.
 
 Retries and duplicate webhooks must not create duplicate patchsets, publish a
 result twice, delete state from a newer attempt, or repeat a non-idempotent
-tool action. Check the identity key and snapshot revalidation used by every
-retry.
+tool action. Check the identity key, and require snapshot revalidation when
+mutable state could make a repeated side effect target stale.

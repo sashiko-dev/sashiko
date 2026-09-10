@@ -417,6 +417,31 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// read_prompt resolves the requested name against its base, so the base
+    /// has to be the prompt directory. Handed a file, every call fails while
+    /// canonicalizing, which is how a caller passing `<prompts>/tool.md` went
+    /// unnoticed: the tool is optional, so its errors look like the model
+    /// simply choosing not to use it.
+    #[test]
+    fn test_read_prompt_base_is_the_prompt_directory() {
+        let (linux_path, prompts_path) = get_test_paths();
+        let rt = Runtime::new().unwrap();
+        // A guide the workflow already loads by name, so it cannot go missing
+        // without breaking the review itself. The nested path also covers the
+        // subdirectory case, which is most of what the tool is asked for.
+        let args = json!({ "name": "subsystem/locking.md" });
+
+        let toolbox = ToolBox::new(linux_path.clone(), Some(prompts_path.clone()));
+        let result = rt
+            .block_on(toolbox.call("read_prompt", args.clone()))
+            .expect("a name under the prompt directory must resolve");
+        assert!(!result["content"].as_str().unwrap_or_default().is_empty());
+
+        // A file as the base cannot resolve anything.
+        let wrong = ToolBox::new(linux_path, Some(prompts_path.join("tool.md")));
+        assert!(rt.block_on(wrong.call("read_prompt", args)).is_err());
+    }
+
     #[test]
     fn test_git_read_files_truncation() {
         let (linux_path, _prompts_path) = get_test_paths();

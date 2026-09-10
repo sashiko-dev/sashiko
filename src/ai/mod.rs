@@ -367,6 +367,37 @@ pub trait AiProvider: Send + Sync {
     fn cache_stats(&self) -> Option<CacheStats> {
         None
     }
+
+    /// Describes the configuration that shapes a response but travels outside
+    /// the request: the model, and any provider knob such as a reasoning
+    /// effort level. The response cache mixes this into its key, so changing
+    /// one of these settings misses the entries recorded under the old one
+    /// instead of replaying them.
+    fn cache_identity(&self) -> String {
+        self.get_capabilities().model_name
+    }
+}
+
+/// Appends the knobs a provider applies outside the request to its model name,
+/// forming the identity `cache_identity` returns. A knob left unset
+/// contributes nothing, so a provider configured with none of them keys its
+/// entries on the bare model name.
+///
+/// Keying on an identity at all invalidates every entry recorded before one
+/// existed, whose hash covered the request alone. That costs one re-run of
+/// the backlog on the first run after the upgrade, and the stale rows age out
+/// with the TTL sweep.
+pub fn cache_identity_with(model: &str, knobs: &[(&str, Option<&str>)]) -> String {
+    let mut identity = model.to_string();
+    for (name, value) in knobs {
+        if let Some(value) = value {
+            identity.push('|');
+            identity.push_str(name);
+            identity.push('=');
+            identity.push_str(value);
+        }
+    }
+    identity
 }
 
 /// Creates an AI provider, optionally wrapping it with a local response cache.
@@ -556,6 +587,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         }
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: ai.model.clone(),
+            effort: ai.codex_cli.as_ref().and_then(|c| c.effort.clone()),
         })),
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
             model: ai.model.clone(),
@@ -606,16 +638,19 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
+pub mod backoff_provider;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod concurrency_limited_provider;
 pub mod copilot_cli;
 pub mod devin_cli;
 pub mod gemini;
 pub mod kiro_cli;
+pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
 pub mod proxy;

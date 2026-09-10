@@ -81,6 +81,11 @@ impl WorkflowEngine {
                     outcome.history.extend(planner_outcome.history);
 
                     let dynamic_stages = resolver(state);
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::ParallelResolved {
+                            stage_names: dynamic_stages.iter().map(|s| s.name()).collect(),
+                        });
+                    }
                     if !dynamic_stages.is_empty() {
                         execute_parallel_batch(
                             &dynamic_stages,
@@ -384,12 +389,20 @@ mod tests {
             )
             .build();
 
-        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+        let resolved = std::sync::Mutex::new(Vec::new());
+        let record = |event: WorkflowEvent| {
+            if let WorkflowEvent::ParallelResolved { stage_names } = event {
+                resolved.lock().unwrap().extend(stage_names);
+            }
+        };
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&record))
             .await
             .unwrap();
 
         assert_eq!(state.selected_stages, vec![4, 5]);
         assert_eq!(state.concerns.len(), 2);
         assert!(!outcome.early_exit);
+        // The plan is reported as resolved, not guessed from the stage list.
+        assert_eq!(*resolved.lock().unwrap(), vec!["stage_4", "stage_5"]);
     }
 }

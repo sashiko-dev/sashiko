@@ -78,8 +78,8 @@ Core AI settings that apply to all providers.
 | `temperature` | float | `1.0` | Sampling temperature. |
 | `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
-| `response_cache` | bool | `false` | Cache AI responses to disk. |
-| `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). |
+| `response_cache` | bool | `false` | Cache AI responses to disk. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. |
+| `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). Entries stranded by a settings change age out on this schedule. |
 
 #### `[ai.claude]`
 
@@ -100,6 +100,14 @@ Settings for the Claude Code CLI provider (`provider = "claude-cli"`).
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `effort` | string | -- | Thinking effort: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
+
+#### `[ai.codex_cli]`
+
+Settings for the Codex CLI provider (`provider = "codex-cli"`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `effort` | string | -- | Reasoning effort: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Passed as `-c model_reasoning_effort=<effort>`, which outranks `~/.codex/config.toml` but not an enterprise-managed requirements layer. A run whose effort that layer substitutes fails. |
 
 #### `[ai.gemini]`
 

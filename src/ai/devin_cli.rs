@@ -162,11 +162,43 @@ impl AiProvider for DevinCliProvider {
             context_window_size: 200_000,
         }
     }
+
+    fn cache_identity(&self) -> String {
+        // Both settings name a file devin reads, so editing one in place
+        // leaves the identity unchanged and the entries recorded under the
+        // old contents still match.
+        crate::ai::cache_identity_with(
+            &self.get_capabilities().model_name,
+            &[
+                ("agent_config", self.agent_config.as_deref()),
+                ("config", self.config.as_deref()),
+            ],
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_provider(agent_config: Option<&str>, config: Option<&str>) -> DevinCliProvider {
+        DevinCliProvider {
+            model: None,
+            agent_config: agent_config.map(str::to_string),
+            config: config.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cache_identity_tracks_the_config_files() {
+        let base = test_provider(None, None);
+
+        let no_tools = test_provider(Some("/etc/sashiko/no-tools.json"), None);
+        assert_ne!(base.cache_identity(), no_tools.cache_identity());
+
+        let deny_all = test_provider(None, Some("/etc/sashiko/deny-all.yaml"));
+        assert_ne!(base.cache_identity(), deny_all.cache_identity());
+    }
 
     #[test]
     fn test_build_args_minimal() {

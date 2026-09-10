@@ -400,6 +400,25 @@ impl AiProvider for OllamaClient {
             context_window_size: self.context_window_size,
         }
     }
+
+    fn cache_identity(&self) -> String {
+        // All four knobs reach translate_ollama_request() from this struct
+        // rather than from the request the cache hashes.  max_tokens caps the
+        // reply, context_window_size becomes num_ctx and decides how much of
+        // the prompt the model sees, think_mode turns reasoning on, and
+        // base_url separates two daemons serving the same model name.
+        let max_tokens = self.max_tokens.to_string();
+        let context_window_size = self.context_window_size.to_string();
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("max_tokens", Some(max_tokens.as_str())),
+                ("num_ctx", Some(context_window_size.as_str())),
+                ("think_mode", self.think_mode.as_deref()),
+                ("base_url", Some(self.base_url.as_str())),
+            ],
+        )
+    }
 }
 
 #[cfg(test)]
@@ -686,5 +705,31 @@ mod tests {
         assert_eq!(options.num_predict, Some(2048));
 
         Ok(())
+    }
+
+    fn test_client(base_url: &str, max_tokens: u32, think_mode: Option<&str>) -> OllamaClient {
+        OllamaClient::new(
+            base_url.to_string(),
+            "qwen3:32b".to_string(),
+            128_000,
+            max_tokens,
+            60,
+            think_mode.map(str::to_string),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_identity_tracks_the_knobs_outside_the_request() {
+        let base = test_client("http://localhost:11434", 2048, None);
+
+        let raised = test_client("http://localhost:11434", 65536, None);
+        assert_ne!(base.cache_identity(), raised.cache_identity());
+
+        let thinking = test_client("http://localhost:11434", 2048, Some("high"));
+        assert_ne!(base.cache_identity(), thinking.cache_identity());
+
+        let elsewhere = test_client("http://gpu-box:11434", 2048, None);
+        assert_ne!(base.cache_identity(), elsewhere.cache_identity());
     }
 }

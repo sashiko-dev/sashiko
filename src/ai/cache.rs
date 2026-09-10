@@ -97,7 +97,7 @@ impl CachingAiProvider {
         })
     }
 
-    fn compute_cache_key(request: &AiRequest) -> String {
+    fn compute_cache_key(&self, request: &AiRequest) -> String {
         let mut val = serde_json::to_value(request).unwrap_or_default();
         // Strip nondeterministic fields
         if let serde_json::Value::Object(ref mut map) = val {
@@ -105,7 +105,14 @@ impl CachingAiProvider {
         }
         super::scrub_thought_signatures(&mut val);
         let canonical = serde_json::to_string(&val).unwrap_or_default();
-        let hash = Sha256::digest(canonical.as_bytes());
+        // The model and the provider's own knobs never appear in the request,
+        // so hash them alongside it. Without them a raised reasoning effort
+        // replays the answer recorded at the lower one.
+        let mut hasher = Sha256::new();
+        hasher.update(self.inner.cache_identity().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(canonical.as_bytes());
+        let hash = hasher.finalize();
         hash.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
@@ -113,7 +120,7 @@ impl CachingAiProvider {
 #[async_trait]
 impl AiProvider for CachingAiProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let hash = Self::compute_cache_key(&request);
+        let hash = self.compute_cache_key(&request);
         let hash_prefix = &hash[..12];
 
         let mut rows = self
@@ -205,6 +212,10 @@ impl AiProvider for CachingAiProvider {
 
     fn get_capabilities(&self) -> ProviderCapabilities {
         self.inner.get_capabilities()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.inner.cache_identity()
     }
 
     fn cache_stats(&self) -> Option<CacheStats> {

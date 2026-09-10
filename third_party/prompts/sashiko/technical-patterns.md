@@ -18,8 +18,9 @@
   output as untrusted input.
 - Verify Git arguments remain separate process arguments and that protocol
   restrictions are preserved on network-facing fetches.
-- Shared repository metadata operations require the existing synchronization.
-  Check concurrent remote changes, worktree creation/removal, and pruning.
+- Mutations of shared repository metadata require the existing synchronization.
+  Check concurrent remote changes, worktree creation/removal, and pruning;
+  do not infer that a read-only Git query needs the same lock.
 - Cleanup may remove only Sashiko-owned paths. Check path derivation, ownership
   markers, temporary-directory lifetimes, and partial-failure behavior.
 - A review must use the intended base and head. Check range direction, SHA

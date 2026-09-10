@@ -250,6 +250,21 @@ For OpenAI's coding-optimized model, use
 - Prompt sent via stdin to avoid `ARG_MAX` issues
 - No tool access -- sandbox is read-only
 
+**Reasoning effort:**
+
+```toml
+[ai.codex_cli]
+effort = "xhigh"    # "none", "minimal", "low", "medium", "high", "xhigh", "max"
+```
+
+Sashiko passes this as `codex exec -c model_reasoning_effort=<effort>`,
+so the setting applies only to a reasoning model such as `gpt-5-codex`.
+A `-c` override outranks `~/.codex/config.toml`. It does not outrank an
+enterprise-managed requirements layer, which substitutes its own value
+whatever the origin. A run whose effort that layer substitutes fails
+rather than record a review at an effort other than the one configured.
+Leave the setting unset to accept the account default.
+
 #### Devin CLI Setup
 
 Sashiko can use a local [Devin for Terminal](https://cli.devin.ai/) install as

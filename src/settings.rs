@@ -318,6 +318,20 @@ pub struct ClaudeCliSettings {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
+pub struct CodexCliSettings {
+    /// Reasoning effort passed as `codex exec -c model_reasoning_effort=<v>`.
+    /// Valid values: "none", "minimal", "low", "medium", "high", "xhigh",
+    /// "max". Leave unset for the account default. A `-c` override outranks
+    /// `~/.codex/config.toml`, but not an enterprise-managed requirements
+    /// layer, which substitutes its own value whatever the origin. A run
+    /// whose effort that layer substitutes fails.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
 pub struct DevinCliSettings {
     /// Path to a Devin declarative agent config file (JSON or YAML) passed via
     /// `--agent-config`. Use this to disable all tools for a strictly
@@ -367,6 +381,7 @@ pub struct AiSettings {
     pub vllm: Option<VllmSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
+    pub codex_cli: Option<CodexCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,
 }
 
@@ -443,12 +458,8 @@ pub struct ReviewSettings {
     /// Conservative default; set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
-    /// Override the review tool binary path. Not read from config; set programmatically
-    /// (e.g. in tests or via environment).
     #[serde(skip)]
-    pub review_tool_override: Option<std::path::PathBuf>,
-    #[serde(skip)]
-    pub stages: Option<Vec<u8>>,
+    pub stages: Option<Vec<String>>,
 }
 
 fn default_max_total_tokens() -> usize {
@@ -521,13 +532,15 @@ fn default_forge() -> ForgeSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewReviewSettings {
-    pub concurrency: Option<usize>,
+    pub concurrency: usize,
+    #[serde(default = "default_review_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewSettings {
     pub ai: AiSettings,
-    pub review: Option<LocalReviewReviewSettings>,
+    pub review: LocalReviewReviewSettings,
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
@@ -616,6 +629,33 @@ mod tests {
             let _ = Settings::from_file("Settings")
                 .expect("Production 'Settings.toml' failed to parse");
         }
+    }
+
+    /// concurrency is required for local reviews exactly as it is for the
+    /// daemon, so an absent [review] section is an error rather than a guess
+    /// at how much machine the review has to itself.
+    #[test]
+    fn test_local_review_requires_a_review_section() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let ai = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n";
+
+        std::fs::write(&path, ai).unwrap();
+        assert!(Settings::local_review_from_file(&path).is_err());
+
+        std::fs::write(&path, format!("{}\n[review]\nconcurrency = 8\n", ai)).unwrap();
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        assert_eq!(settings.review.concurrency, 8);
+        // timeout_seconds keeps a default, as it does for the daemon.
+        assert_eq!(settings.review.timeout_seconds, 3600);
+    }
+
+    /// `sashiko init` writes this template, so it has to satisfy the shape a
+    /// local review reads or the two commands disagree out of the box.
+    #[test]
+    fn test_init_template_satisfies_local_review() {
+        Settings::local_review_from_file("docs/examples/Settings.example.toml")
+            .expect("init template must parse as local review settings");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 Sashiko uses Large Language Models (LLMs) to perform complex multi-stage software engineering tasks, primarily Linux kernel patch review. 
 
-Currently, review stages and orchestration logic are implemented imperatively across multiple modules ([`src/worker/prompts.rs`](file:///usr/local/google/home/kfree/sashiko/src/worker/prompts.rs), [`src/worker/stage.rs`](file:///usr/local/google/home/kfree/sashiko/src/worker/stage.rs), and [`src/pipelines/mod.rs`](file:///usr/local/google/home/kfree/sashiko/src/pipelines/mod.rs)). This results in several architectural pain points:
+Currently, review stages and orchestration logic are implemented imperatively across multiple modules ([`src/worker/prompts.rs`](../src/worker/prompts.rs), [`src/worker/stage.rs`](../src/worker/stage.rs), and [`src/pipelines/mod.rs`](../src/pipelines/mod.rs)). This results in several architectural pain points:
 
 1. **Scattered Stage Logic**: Prompt text, file inclusion rules, validation logic, error feedback, and output reduction are decoupled across disparate files.
 2. **Duplicated Dual-Prompt Tracking**: To conserve token space in review logs and context caches, the codebase manually constructs and threads parallel `(content, clean)` prompt tuples through all layers.

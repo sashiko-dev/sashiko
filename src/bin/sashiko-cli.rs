@@ -1549,8 +1549,8 @@ async fn handle_local(
         let review_json =
             serde_json::to_string(&review_input).context("Failed to serialize review input")?;
 
-        // Locate sashiko-review binary
-        let review_bin = find_review_binary()?;
+        // Locate worker binary
+        let (worker_bin, worker_subcmd) = find_worker_command()?;
 
         // Build subprocess args
         let baseline_ref = if let Some(b) = &baseline {
@@ -1580,7 +1580,11 @@ async fn handle_local(
         eprintln!();
 
         // Spawn review subprocess
-        let mut child = tokio::process::Command::new(&review_bin)
+        let mut cmd = tokio::process::Command::new(&worker_bin);
+        if let Some(subcmd) = worker_subcmd {
+            cmd.arg(subcmd);
+        }
+        let mut child = cmd
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1588,7 +1592,7 @@ async fn handle_local(
             .env("SASHIKO_LOG_PLAIN", "1")
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("Failed to start review binary: {:?}", review_bin))?;
+            .with_context(|| format!("Failed to start worker binary: {:?}", worker_bin))?;
 
         // Write input to stdin
         if let Some(mut stdin) = child.stdin.take() {
@@ -1716,34 +1720,47 @@ fn eprint_phase(current: usize, total: usize, msg: &str) {
     eprint!("[{}/{}] {}", current, total, msg);
 }
 
-fn find_review_binary() -> Result<PathBuf> {
+fn find_worker_command() -> Result<(PathBuf, Option<&'static str>)> {
     // Try same directory as current executable
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        let candidate = dir.join("sashiko");
+        if candidate.exists() {
+            return Ok((candidate, Some("worker")));
+        }
+        if let Some(parent) = dir.parent() {
+            let candidate = parent.join("sashiko");
+            if candidate.exists() {
+                return Ok((candidate, Some("worker")));
+            }
+        }
         let candidate = dir.join("sashiko-review");
         if candidate.exists() {
-            return Ok(candidate);
-        }
-        // Also check for "review" (cargo build output name)
-        let candidate = dir.join("review");
-        if candidate.exists() {
-            return Ok(candidate);
+            return Ok((candidate, None));
         }
     }
 
-    // Try PATH
+    // Try PATH for sashiko
+    if let Ok(output) = std::process::Command::new("which").arg("sashiko").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((PathBuf::from(path), Some("worker")));
+    }
+
+    // Try PATH for sashiko-review
     if let Ok(output) = std::process::Command::new("which")
         .arg("sashiko-review")
         .output()
         && output.status.success()
     {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok(PathBuf::from(path));
+        return Ok((PathBuf::from(path), None));
     }
 
     Err(anyhow::anyhow!(
-        "Cannot find sashiko-review binary.\n\
-         Build it with: cargo build --bin review\n\
+        "Cannot find sashiko binary.\n\
+         Build it with: cargo build --bin sashiko\n\
          Or specify its location in PATH."
     ))
 }

@@ -102,7 +102,10 @@ pub trait LlmSession: Send {
     }
 
     /// Executes multiple tool calls requested by the LLM.
-    /// Default implementation runs them sequentially.
+    /// Default implementation runs them sequentially, and propagates a tool
+    /// error rather than reporting it to the model, which ends the session.
+    /// A session that wants the model to see and correct its own bad calls
+    /// must override this.
     async fn call_tools(&mut self, calls: Vec<ToolCall>) -> Result<Vec<(String, Value)>> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {

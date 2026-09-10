@@ -15,13 +15,26 @@ fn get_bin_path() -> PathBuf {
     let release_path = path.join("release").join("sashiko");
     let debug_path = path.join("debug").join("sashiko");
 
-    if release_path.exists() {
-        release_path
+    // If both exist, choose the most recently modified binary, preferring debug.
+    if debug_path.exists() && release_path.exists() {
+        let debug_mtime = std::fs::metadata(&debug_path)
+            .and_then(|m| m.modified())
+            .ok();
+        let release_mtime = std::fs::metadata(&release_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if release_mtime > debug_mtime {
+            release_path
+        } else {
+            debug_path
+        }
     } else if debug_path.exists() {
         debug_path
+    } else if release_path.exists() {
+        release_path
     } else {
         panic!(
-            "Could not find sashiko binary in target/release or target/debug. Path: {:?}",
+            "Could not find sashiko binary in target/debug or target/release. Path: {:?}",
             path
         );
     }
