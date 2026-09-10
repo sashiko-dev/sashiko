@@ -570,9 +570,8 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                 });
             }
             AiRole::Tool => {
-                // Gemini expects a 'function' role for tool responses
                 contents.push(Content {
-                    role: "function".to_string(),
+                    role: "user".to_string(),
                     parts: vec![Part::FunctionResponse {
                         function_response: FunctionResponse {
                             name: msg
