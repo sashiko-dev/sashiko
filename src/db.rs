@@ -566,6 +566,10 @@ impl Database {
             .await;
         let _ = self.try_add_column("patches", "status", "TEXT").await;
         let _ = self.try_add_column("patches", "apply_error", "TEXT").await;
+        let _ = self.try_add_column("patches", "git_patch_id", "TEXT").await;
+        let _ = self
+            .try_create_index("idx_patches_git_patch_id", "patches", "git_patch_id")
+            .await;
         let _ = self.try_add_column("reviews", "provider", "TEXT").await;
         let _ = self.try_add_column("reviews", "prompts_hash", "TEXT").await;
         let _ = self
@@ -793,15 +797,23 @@ impl Database {
                         diff TEXT,
                         status TEXT,
                         apply_error TEXT,
+                        git_patch_id TEXT,
                         FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
                         FOREIGN KEY(message_id) REFERENCES messages(message_id),
                         UNIQUE(patchset_id, message_id)
                     );
-                    INSERT OR IGNORE INTO patches_new (id, patchset_id, message_id, part_index, diff, status, apply_error)
-                    SELECT id, patchset_id, message_id, part_index, diff, status, apply_error FROM patches;
+                    INSERT OR IGNORE INTO patches_new
+                        (id, patchset_id, message_id, part_index, diff,
+                         status, apply_error, git_patch_id)
+                    SELECT id, patchset_id, message_id, part_index, diff,
+                           status, apply_error, git_patch_id
+                    FROM patches;
                     DROP TABLE patches;
                     ALTER TABLE patches_new RENAME TO patches;
-                    CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);",
+                    CREATE INDEX IF NOT EXISTS idx_patches_patchset_id
+                        ON patches(patchset_id);
+                    CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id
+                        ON patches(git_patch_id);",
                 )
                 .await?;
             let _ = self.conn.execute("PRAGMA foreign_keys = ON", ()).await;
@@ -2338,12 +2350,30 @@ impl Database {
         }
     }
 
+    /// Inserts or updates a patch when no stable Git patch ID is available.
+    ///
+    /// Re-ingesting the same message with an unchanged diff preserves any
+    /// existing Git patch ID. If the diff changed, the old ID is cleared so
+    /// it cannot refer to different patch content.
     pub async fn create_patch(
         &self,
         patchset_id: i64,
         message_id: &str,
         part_index: u32,
         diff: &str,
+    ) -> Result<i64> {
+        self.create_patch_with_git_patch_id(patchset_id, message_id, part_index, diff, None)
+            .await
+    }
+
+    /// Inserts or updates a patch and associates its stable Git patch ID.
+    pub async fn create_patch_with_git_patch_id(
+        &self,
+        patchset_id: i64,
+        message_id: &str,
+        part_index: u32,
+        diff: &str,
+        git_patch_id: Option<&str>,
     ) -> Result<i64> {
         // Check if index collision occurs for this patchset
         let collision_exists: bool = {
@@ -2365,30 +2395,50 @@ impl Database {
             ));
         }
 
-        // Check if patch with same message_id already exists in this patchset
-        let existing_in_patchset: bool = {
+        // Check if the patch exists, preserving its patch ID only when the
+        // decompressed content is unchanged.
+        let old_patch: Option<(String, Option<String>)> = {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT 1 FROM patches WHERE patchset_id = ? AND message_id = ?",
+                    "SELECT diff, git_patch_id FROM patches
+                     WHERE patchset_id = ? AND message_id = ?",
                     libsql::params![patchset_id, message_id],
                 )
                 .await?;
-            rows.next().await.ok().flatten().is_some()
+            if let Ok(Some(row)) = rows.next().await {
+                Some((
+                    crate::compression::get_compressed_string(&row, 0)?,
+                    row.get(1).ok(),
+                ))
+            } else {
+                None
+            }
         };
+        let existing_in_patchset = old_patch.is_some();
+        let git_patch_id = git_patch_id.map(str::to_owned).or_else(|| {
+            old_patch
+                .as_ref()
+                .filter(|(old_diff, _)| old_diff == diff)
+                .and_then(|(_, patch_id)| patch_id.clone())
+        });
 
         // Insert or update within THIS patchset.
         self.conn
             .execute(
-                "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
+                "INSERT INTO patches
+                    (patchset_id, message_id, part_index, diff, git_patch_id)
+                 VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(patchset_id, message_id) DO UPDATE SET
                     part_index=excluded.part_index,
-                    diff=excluded.diff",
+                    diff=excluded.diff,
+                    git_patch_id=excluded.git_patch_id",
                 libsql::params![
                     patchset_id,
                     message_id,
                     part_index,
-                    crate::compression::compress_string_if_needed(diff)
+                    crate::compression::compress_string_if_needed(diff),
+                    git_patch_id
                 ],
             )
             .await?;
@@ -3436,6 +3486,36 @@ impl Database {
             diffs.push((id, index, diff, subject, author, date, message_id));
         }
         Ok(diffs)
+    }
+
+    pub async fn get_patch_by_git_patch_id(
+        &self,
+        git_patch_id: &str,
+    ) -> Result<Option<(String, String, String, String, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.message_id, p.diff, m.subject, m.author, m.date
+                 FROM patches p
+                 JOIN messages m ON p.message_id = m.message_id
+                 WHERE p.git_patch_id = ?
+                 ORDER BY m.date DESC
+                 LIMIT 1",
+                libsql::params![git_patch_id],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(Some((
+                row.get(0)?,
+                crate::compression::get_compressed_string(&row, 1)?,
+                row.get(2).unwrap_or_default(),
+                row.get(3).unwrap_or_default(),
+                row.get(4).unwrap_or(0),
+            )))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
