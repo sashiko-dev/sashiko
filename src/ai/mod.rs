@@ -421,6 +421,44 @@ pub async fn create_provider_cached(
     }
 }
 
+/// The response cache used by callers that have no database to sit beside.
+///
+/// `create_provider_cached` derives its location from `settings.database.url`,
+/// which only the daemon has. Local reviews get an XDG path instead,
+/// overridable with SASHIKO_RESPONSE_CACHE.
+pub fn local_response_cache_path() -> Result<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("SASHIKO_RESPONSE_CACHE") {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    Ok(crate::prompt_bundle::data_home()?
+        .join("sashiko")
+        .join("response_cache.db"))
+}
+
+/// Creates an AI provider from AI settings alone, wrapping it with the local
+/// response cache when enabled.
+///
+/// `create_provider_cached` needs full `Settings` for the cache location, so a
+/// caller holding only `AiSettings`, such as a local review, could not honour
+/// `response_cache` at all.
+pub async fn create_provider_cached_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
+    let provider = create_provider_from_ai(ai)?;
+    if !ai.response_cache {
+        return Ok(provider);
+    }
+    let cache_path = local_response_cache_path()?;
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cached = cache::CachingAiProvider::new(
+        provider,
+        &cache_path.to_string_lossy(),
+        ai.response_cache_ttl_days,
+    )
+    .await?;
+    Ok(Arc::new(cached))
+}
+
 /// Creates an AI provider based on the application settings.
 pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
     create_provider_from_ai(&settings.ai)
@@ -909,6 +947,36 @@ pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::Joi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_local_response_cache_path_prefers_the_env_override() {
+        // Serialised with the XDG case below by running in one test, since
+        // both mutate process environment.
+        unsafe {
+            std::env::set_var("SASHIKO_RESPONSE_CACHE", "/tmp/sashiko-test-cache.db");
+        }
+        let path = local_response_cache_path().unwrap();
+        unsafe {
+            std::env::remove_var("SASHIKO_RESPONSE_CACHE");
+        }
+        assert_eq!(path, std::path::PathBuf::from("/tmp/sashiko-test-cache.db"));
+
+        let old = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "/tmp/sashiko-test-xdg");
+        }
+        let path = local_response_cache_path().unwrap();
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/sashiko-test-xdg/sashiko/response_cache.db")
+        );
+    }
+
     use super::*;
     use crate::worker::prompts::ReviewError;
     use anyhow::anyhow;

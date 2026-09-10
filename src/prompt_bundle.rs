@@ -59,7 +59,8 @@ pub fn prompt_bundle_root() -> Result<PathBuf> {
         .join(PROMPT_BUNDLE_REVISION))
 }
 
-fn data_home() -> Result<PathBuf> {
+/// The XDG data directory, shared with the local response cache.
+pub(crate) fn data_home() -> Result<PathBuf> {
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(data_home));
     }
