@@ -28,7 +28,7 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -1024,19 +1024,22 @@ struct PatchState {
     active_stage_turns: std::collections::HashMap<String, usize>,
 }
 
-fn get_terminal_width() -> usize {
+/// Rows and columns, asked once: a repaint must not shell out to stty.
+fn get_terminal_size() -> (usize, usize) {
     if let Ok(output) = std::process::Command::new("stty").arg("size").output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parts: Vec<&str> = stdout.split_whitespace().collect();
-        if let Some(cols) = parts
-            .get(1)
-            .filter(|_| parts.len() == 2)
-            .and_then(|s| s.parse::<usize>().ok())
+        if parts.len() == 2
+            && let (Ok(rows), Ok(cols)) = (parts[0].parse(), parts[1].parse())
         {
-            return cols;
+            return (rows, cols);
         }
     }
 
+    (24, get_terminal_width())
+}
+
+fn get_terminal_width() -> usize {
     if let Ok(cols) = std::env::var("COLUMNS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1050,7 +1053,14 @@ fn get_terminal_width() -> usize {
 
 struct ProgressState {
     patches: std::collections::BTreeMap<i64, PatchState>,
+    /// The status each patch was last reported with, so the appending display
+    /// speaks only when one of them changes.
+    last_status: std::collections::BTreeMap<i64, String>,
     printed_lines: usize,
+    /// Lines currently reserved at the bottom of the screen for the display,
+    /// zero before the region is set up and after it is given back.
+    reserved: usize,
+    terminal_rows: usize,
     total_turns: usize,
     terminal_width: usize,
     color_choice: ColorChoice,
@@ -1065,20 +1075,16 @@ fn stage_short_name(stage: &str) -> &'static str {
 struct TruncatingWriter {
     limit: usize,
     written: usize,
-    color_choice: ColorChoice,
 }
 
 impl TruncatingWriter {
-    fn new(limit: usize, color_choice: ColorChoice) -> Self {
-        Self {
-            limit,
-            written: 0,
-            color_choice,
-        }
+    fn new(limit: usize) -> Self {
+        Self { limit, written: 0 }
     }
 
     fn write_segment(
         &mut self,
+        out: &mut Buffer,
         text: &str,
         color: Option<Color>,
         bold: bool,
@@ -1095,7 +1101,6 @@ impl TruncatingWriter {
             (text.to_string(), "")
         };
 
-        let mut stderr = StandardStream::stderr(self.color_choice);
         let mut spec = ColorSpec::new();
         if let Some(c) = color {
             spec.set_fg(Some(c));
@@ -1103,68 +1108,130 @@ impl TruncatingWriter {
         if bold {
             spec.set_bold(true);
         }
-        stderr.set_color(&spec)?;
-        write!(&mut stderr, "{}", to_write)?;
+        out.set_color(&spec)?;
+        write!(out, "{}", to_write)?;
 
         self.written += to_write.chars().count();
 
         if !suffix.is_empty() {
-            stderr.reset()?;
-            write!(&mut stderr, "{}", suffix)?;
+            out.reset()?;
+            write!(out, "{}", suffix)?;
             self.written += 3;
         }
 
-        stderr.reset()
+        out.reset()
     }
 }
 
-fn render_progress(state: &mut ProgressState) {
-    if state.printed_lines > 0 {
-        for _ in 0..state.printed_lines {
-            eprint!("\x1b[F\x1b[2K");
-        }
-        let _ = std::io::stderr().flush();
+/// Whether a stream may carry ANSI, asked of the stream itself.
+fn ansi_choice(mode: ColorMode, stream: &impl IsTerminal) -> ColorChoice {
+    match mode {
+        ColorMode::Always => ColorChoice::Always,
+        ColorMode::Never => ColorChoice::Never,
+        ColorMode::Auto if stream.is_terminal() => ColorChoice::Auto,
+        ColorMode::Auto => ColorChoice::Never,
     }
+}
+
+/// Describes what a patch is doing. `with_turns` adds the turn counter, which
+/// changes on every model call and so is only useful to a display that
+/// repaints in place.
+fn status_label(p: &PatchState, with_turns: bool) -> String {
+    match &p.status {
+        PatchStatus::Queued => "Queued".to_string(),
+        PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
+        PatchStatus::Planning => "Planning stages...".to_string(),
+        PatchStatus::Reviewing => {
+            if p.active_stages.is_empty() {
+                "Reviewing...".to_string()
+            } else {
+                let mut stages_with_turns: Vec<(&String, usize)> = p
+                    .active_stages
+                    .iter()
+                    .map(|st| {
+                        let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
+                        (st, turn)
+                    })
+                    .collect();
+                stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
+
+                let (top_stage, top_turn) = stages_with_turns[0];
+                let stage_name = stage_short_name(top_stage);
+                let stage_str = if with_turns && top_turn > 0 {
+                    format!("{} (turn {})", stage_name, top_turn)
+                } else {
+                    stage_name.to_string()
+                };
+
+                if p.active_stages.len() > 1 {
+                    format!("{} (+{} stages)", stage_str, p.active_stages.len() - 1)
+                } else {
+                    stage_str
+                }
+            }
+        }
+        PatchStatus::Finished => "Finished".to_string(),
+    }
+}
+
+/// Appends a line per patch whenever its status changes, without moving the
+/// cursor.
+///
+/// Nothing here is erased or overwritten, so the output survives being
+/// redirected: no escape sequences, and no frame that a later repaint would
+/// have to find again. The overall bar and the turn counter are dropped, both
+/// being things only a repainting display can show without a line per change.
+fn render_progress_plain(state: &mut ProgressState) {
+    for (&idx, p) in &state.patches {
+        let label = status_label(p, false);
+        if state.last_status.get(&idx) == Some(&label) {
+            continue;
+        }
+        state.last_status.insert(idx, label.clone());
+        eprintln!("      [Patch {}] {} | {}", idx, p.subject, label);
+    }
+    let _ = std::io::stderr().flush();
+}
+
+fn render_progress(state: &mut ProgressState) {
+    // The same permission as color: cursor movement is ANSI too, so a stream
+    // that may not carry it is written to a line at a time instead.
+    if state.color_choice == ColorChoice::Never {
+        render_progress_plain(state);
+        return;
+    }
+
+    // Held for the whole repaint. Every write to stderr takes this lock, so
+    // nothing can land between the cursor being saved and restored and be
+    // written into the reserved lines. Reentrant, so the writes below re-enter
+    // it rather than deadlock.
+    let _stderr = std::io::stderr().lock();
+
+    let out = BufferWriter::stderr(state.color_choice);
+
+    // The display occupies one line per patch and one for the overall bar.
+    // Reserving happens once, and again if the count changes, which it does
+    // when the patches first become known.
+    let wanted = state.patches.len() + 1;
+    if wanted != state.reserved {
+        reserve_progress_region(&out, state, wanted);
+    }
+    if state.reserved == 0 {
+        return;
+    }
+
+    let mut frame = out.buffer();
+    // Save the cursor, address the reserved lines outright, and put it back:
+    // ordinary output carries on where it left off, above.
+    let _ = write!(&mut frame, "\x1b7");
+    let top = state.terminal_rows.saturating_sub(state.reserved) + 1;
 
     let mut lines_printed = 0;
     let limit = state.terminal_width.saturating_sub(5);
 
     for (&idx, p) in &state.patches {
-        let status_str = match &p.status {
-            PatchStatus::Queued => "Queued".to_string(),
-            PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
-            PatchStatus::Planning => "Planning stages...".to_string(),
-            PatchStatus::Reviewing => {
-                if p.active_stages.is_empty() {
-                    "Reviewing...".to_string()
-                } else {
-                    let mut stages_with_turns: Vec<(&String, usize)> = p
-                        .active_stages
-                        .iter()
-                        .map(|st| {
-                            let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
-                            (st, turn)
-                        })
-                        .collect();
-                    stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
-
-                    let (top_stage, top_turn) = stages_with_turns[0];
-                    let stage_name = stage_short_name(top_stage);
-                    let stage_str = if top_turn > 0 {
-                        format!("{} (turn {})", stage_name, top_turn)
-                    } else {
-                        stage_name.to_string()
-                    };
-
-                    if p.active_stages.len() > 1 {
-                        format!("{} (+{} stages)", stage_str, p.active_stages.len() - 1)
-                    } else {
-                        stage_str
-                    }
-                }
-            }
-            PatchStatus::Finished => "Finished".to_string(),
-        };
+        let _ = write!(&mut frame, "\x1b[{};1H\x1b[2K", top + lines_printed);
+        let status_str = status_label(p, true);
 
         // Calculate available width for subject to guarantee status is never truncated
         let fixed_overhead = 16 + 3; // "      [Patch X] " + " | "
@@ -1192,10 +1259,10 @@ fn render_progress(state: &mut ProgressState) {
             subject_padded.push_str(&" ".repeat(padding_chars));
         }
 
-        let mut tw = TruncatingWriter::new(limit, state.color_choice);
-        let _ = tw.write_segment(&format!("      [Patch {}] ", idx), None, false);
-        let _ = tw.write_segment(&subject_padded, None, false);
-        let _ = tw.write_segment(" | ", None, false);
+        let mut tw = TruncatingWriter::new(limit);
+        let _ = tw.write_segment(&mut frame, &format!("      [Patch {}] ", idx), None, false);
+        let _ = tw.write_segment(&mut frame, &subject_padded, None, false);
+        let _ = tw.write_segment(&mut frame, " | ", None, false);
 
         let (status_color, status_bold) = match &p.status {
             PatchStatus::Queued => (None, false),
@@ -1203,9 +1270,8 @@ fn render_progress(state: &mut ProgressState) {
             PatchStatus::Reviewing => (Some(Color::Cyan), true),
             PatchStatus::Finished => (Some(Color::Green), true),
         };
-        let _ = tw.write_segment(&status_str, status_color, status_bold);
+        let _ = tw.write_segment(&mut frame, &status_str, status_color, status_bold);
 
-        eprintln!();
         lines_printed += 1;
     }
 
@@ -1231,29 +1297,71 @@ fn render_progress(state: &mut ProgressState) {
         let (display_completed_stages, percent, filled) =
             calculate_progress_metrics(total_stages, completed_stages, width);
 
-        let mut tw = TruncatingWriter::new(limit, state.color_choice);
-        let _ = tw.write_segment("Overall: [", None, true);
+        let _ = write!(&mut frame, "\x1b[{};1H\x1b[2K", top + lines_printed);
+        let mut tw = TruncatingWriter::new(limit);
+        let _ = tw.write_segment(&mut frame, "Overall: [", None, true);
 
         let filled_bar = "█".repeat(filled);
-        let _ = tw.write_segment(&filled_bar, Some(Color::Green), false);
+        let _ = tw.write_segment(&mut frame, &filled_bar, Some(Color::Green), false);
 
         let empty_bar = "░".repeat(width.saturating_sub(filled));
-        let _ = tw.write_segment(&empty_bar, None, false);
+        let _ = tw.write_segment(&mut frame, &empty_bar, None, false);
 
-        let _ = tw.write_segment("] ", None, true);
+        let _ = tw.write_segment(&mut frame, "] ", None, true);
 
         let stats = format!(
             "{}% | {}/{} stages | {} turns",
             percent, display_completed_stages, total_stages, state.total_turns
         );
-        let _ = tw.write_segment(&stats, None, false);
+        let _ = tw.write_segment(&mut frame, &stats, None, false);
 
-        eprintln!();
         lines_printed += 1;
     }
 
     state.printed_lines = lines_printed;
-    let _ = std::io::stderr().flush();
+    let _ = write!(&mut frame, "\x1b8");
+    let _ = out.print(&frame);
+}
+
+/// Reserves `wanted` lines at the bottom of the screen for the display.
+///
+/// Scrolls the screen up to make room, then confines scrolling to everything
+/// above with DECSTBM, so ordinary output can never write there. Deliberately
+/// moves the cursor, which is why it runs outside the save and restore pair a
+/// repaint uses.
+fn reserve_progress_region(out: &BufferWriter, state: &mut ProgressState, wanted: usize) {
+    // A frame taller than the screen has nowhere to go.
+    if wanted + 1 > state.terminal_rows {
+        state.reserved = 0;
+        return;
+    }
+
+    let mut setup = out.buffer();
+    let split = state.terminal_rows - wanted;
+    // Full screen first, so the newlines below scroll everything, including
+    // whatever the previous reservation was holding.
+    let _ = write!(&mut setup, "\x1b[r\x1b[{};1H", state.terminal_rows);
+    for _ in 0..wanted.saturating_sub(state.reserved) {
+        let _ = writeln!(&mut setup);
+    }
+    let _ = write!(&mut setup, "\x1b[1;{split}r\x1b[{split};1H");
+    let _ = out.print(&setup);
+
+    state.reserved = wanted;
+    state.printed_lines = 0;
+}
+
+/// Gives the screen back: scrolling returns to the whole of it and the cursor
+/// lands below the display, so whatever prints next starts on a clean line.
+///
+/// Called before the report rather than left to a destructor, since the review
+/// exits through std::process::exit on findings and destructors do not run.
+fn release_progress_region(state: &mut ProgressState) {
+    if state.reserved == 0 {
+        return;
+    }
+    eprintln!("\x1b[r\x1b[{};1H", state.terminal_rows);
+    state.reserved = 0;
 }
 
 fn calculate_progress_metrics(
@@ -1285,17 +1393,8 @@ async fn handle_review_command(
     color: ColorMode,
     stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let color_choice = match color {
-        ColorMode::Always => ColorChoice::Always,
-        ColorMode::Never => ColorChoice::Never,
-        ColorMode::Auto => {
-            if std::io::stdout().is_terminal() {
-                ColorChoice::Auto
-            } else {
-                ColorChoice::Never
-            }
-        }
-    };
+    let report_ansi = ansi_choice(color, &std::io::stdout());
+    let display_ansi = ansi_choice(color, &std::io::stderr());
 
     let repo_path = current_git_toplevel()?;
     eprintln!("Reviewing: {}", input);
@@ -1305,7 +1404,7 @@ async fn handle_review_command(
         .await
         .unwrap_or(false)
     {
-        eprint_colored(color_choice, Color::Yellow, "WARNING:")?;
+        eprint_colored(display_ansi, Color::Yellow, "WARNING:")?;
         eprintln!(
             " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
         );
@@ -1322,12 +1421,16 @@ async fn handle_review_command(
         }
     }
 
+    let (rows, cols) = get_terminal_size();
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         patches: std::collections::BTreeMap::new(),
+        last_status: std::collections::BTreeMap::new(),
         printed_lines: 0,
         total_turns: 0,
-        terminal_width: get_terminal_width(),
-        color_choice,
+        reserved: 0,
+        terminal_rows: rows,
+        terminal_width: cols,
+        color_choice: display_ansi,
     }));
 
     let progress_state_clone = progress_state.clone();
@@ -1467,12 +1570,17 @@ async fn handle_review_command(
     )
     .await?;
 
+    // Before anything is printed, and before the exits below: the report and
+    // the shell prompt both belong on a screen whose scrolling is its own
+    // again, and std::process::exit runs no destructors.
+    release_progress_region(&mut progress_state.lock().unwrap());
+
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         OutputFormat::Text => {
-            print_review_result(&result, &input, color_choice)?;
+            print_review_result(&result, &input, report_ansi)?;
         }
     }
 
@@ -2388,6 +2496,117 @@ fn identify_subsystems_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress_state(color_choice: ColorChoice) -> ProgressState {
+        ProgressState {
+            patches: std::collections::BTreeMap::new(),
+            last_status: std::collections::BTreeMap::new(),
+            printed_lines: 0,
+            reserved: 0,
+            terminal_rows: 40,
+            total_turns: 0,
+            terminal_width: 100,
+            color_choice,
+        }
+    }
+
+    fn patch_state(status: PatchStatus) -> PatchState {
+        PatchState {
+            index: 1,
+            subject: "a patch".to_string(),
+            status,
+            planned_stages: Vec::new(),
+            active_stages: std::collections::BTreeSet::new(),
+            completed_stages: 0,
+            active_stage_turns: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_each_stream_is_asked_about_itself() {
+        // std::io::IsTerminal cannot be implemented outside std, so these are
+        // real descriptors: a pty master answers yes, /dev/null answers no.
+        let terminal = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
+
+        // "auto" is the only mode that asks a stream anything, and it asks the
+        // one it was handed: a redirected stdout must not silence stderr.
+        assert_eq!(ansi_choice(ColorMode::Auto, &terminal), ColorChoice::Auto);
+        assert_eq!(
+            ansi_choice(ColorMode::Auto, &redirected),
+            ColorChoice::Never
+        );
+
+        // "always" and "never" are answers about the run, so the stream does
+        // not get a say. This is what makes "--color always" work under a
+        // Docker pipe, where the escapes reach the terminal but isatty says no.
+        for stream in [&terminal, &redirected] {
+            assert_eq!(ansi_choice(ColorMode::Always, stream), ColorChoice::Always);
+            assert_eq!(ansi_choice(ColorMode::Never, stream), ColorChoice::Never);
+        }
+    }
+
+    #[test]
+    fn test_a_frame_taller_than_the_screen_reserves_nothing() {
+        // Reserving every line would leave ordinary output nowhere to go, so
+        // the display stands down rather than confining the review to a
+        // scrolling region of zero lines.
+        let out = BufferWriter::stderr(ColorChoice::Never);
+        let mut state = progress_state(ColorChoice::Never);
+        state.terminal_rows = 4;
+
+        reserve_progress_region(&out, &mut state, 8);
+        assert_eq!(state.reserved, 0);
+
+        // One line for the bar and one to scroll in is the least that works.
+        reserve_progress_region(&out, &mut state, 3);
+        assert_eq!(state.reserved, 3);
+
+        // And giving it back leaves nothing reserved, so a second release is
+        // harmless and the report prints on a screen that scrolls normally.
+        release_progress_region(&mut state);
+        assert_eq!(state.reserved, 0);
+        release_progress_region(&mut state);
+        assert_eq!(state.reserved, 0);
+    }
+
+    #[test]
+    fn test_a_redirected_display_appends_without_moving_the_cursor() {
+        // printed_lines drives the erase loop. Left non-zero, a later repaint
+        // would walk the cursor up through whatever the log wrote in between,
+        // and there is no cursor here to walk.
+        let mut state = progress_state(ColorChoice::Never);
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+
+        render_progress(&mut state);
+        assert_eq!(state.printed_lines, 0);
+        assert_eq!(
+            state.last_status.get(&1).map(String::as_str),
+            Some("Queued")
+        );
+
+        // An unchanged status is not appended again, so a turn tick alone does
+        // not produce a line.
+        render_progress(&mut state);
+        assert_eq!(state.last_status.len(), 1);
+
+        state.patches.insert(1, patch_state(PatchStatus::Finished));
+        render_progress(&mut state);
+        assert_eq!(
+            state.last_status.get(&1).map(String::as_str),
+            Some("Finished")
+        );
+    }
+
+    #[test]
+    fn test_status_label_drops_the_turn_counter_when_not_repainting() {
+        let mut p = patch_state(PatchStatus::Reviewing);
+        p.active_stages.insert("locking".to_string());
+        p.active_stage_turns.insert("locking".to_string(), 3);
+
+        assert_eq!(status_label(&p, true), "Locking & Sync (turn 3)");
+        assert_eq!(status_label(&p, false), "Locking & Sync");
+    }
 
     #[test]
     fn test_progress_metrics_clamp_completed_stages_to_total() {
