@@ -160,6 +160,7 @@ pub struct Worker {
     tools: Arc<ToolBox>,
     prompts: PromptRegistry,
     global_history: Vec<AiMessage>,
+    max_input_tokens: usize,
     max_interactions: usize,
     temperature: f32,
     series_range: Option<String>,
@@ -181,6 +182,7 @@ impl Worker {
             tools,
             prompts,
             global_history: Vec::new(),
+            max_input_tokens: config.max_input_tokens,
             max_interactions: config.max_interactions,
             temperature: config.temperature,
             series_range: config.series_range,
@@ -356,6 +358,7 @@ impl Worker {
             tools: self.tools.clone(),
             base_dir: &self.prompts.base_dir,
             context_tag: self.context_tag.clone(),
+            max_input_tokens: self.max_input_tokens,
         };
 
         let event_cb = move |event: WorkflowEvent| {
