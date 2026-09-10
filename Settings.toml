@@ -148,3 +148,13 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+
+# Priority rules for patchset queue ordering (evaluated in order; last match wins).
+# Range is 1 to 999. Default priority is 500. Values > 500 are elevated; values < 500 are deprioritized.
+# [[review.priority_rules]]
+# regex = "(?i)^PRODKERNEL:"
+# priority = 750
+#
+# [[review.priority_rules]]
+# regex = "(?i)security"
+# priority = 999

@@ -531,6 +531,7 @@ impl Database {
         }
 
         self.migrate_patches_unique_constraint_if_needed().await?;
+        self.migrate_priority_columns_if_needed().await?;
 
         Ok(())
     }
@@ -542,6 +543,22 @@ impl Database {
         // let _ = self.conn.execute("UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'", ()).await;
 
         // Manual migrations for existing tables
+        let _ = self
+            .try_add_column("patchsets", "base_priority", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority_cap", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority", "INTEGER DEFAULT 500")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_patchsets_status_priority_date",
+                "patchsets",
+                "status, priority DESC, date ASC",
+            )
+            .await;
         let _ = self
             .try_add_column("messages", "to_recipients", "TEXT")
             .await;
@@ -807,6 +824,26 @@ impl Database {
             let _ = self.conn.execute("PRAGMA foreign_keys = ON", ()).await;
         }
 
+        Ok(())
+    }
+
+    async fn migrate_priority_columns_if_needed(&self) -> Result<()> {
+        let _ = self
+            .try_add_column("patchsets", "base_priority", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority_cap", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "priority", "INTEGER DEFAULT 500")
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_patchsets_status_priority_date",
+                "patchsets",
+                "status, priority DESC, date ASC",
+            )
+            .await;
         Ok(())
     }
 
@@ -1874,6 +1911,49 @@ impl Database {
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
     ) -> Result<Option<i64>> {
+        self.create_patchset_with_priority(
+            thread_id,
+            cover_letter_message_id,
+            message_id,
+            subject,
+            author,
+            date,
+            total_parts,
+            parser_version,
+            to,
+            cc,
+            version,
+            part_index,
+            baseline_id,
+            strict_author,
+            skip_filters,
+            only_filters,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_patchset_with_priority(
+        &self,
+        thread_id: i64,
+        cover_letter_message_id: Option<&str>,
+        message_id: &str,
+        subject: &str,
+        author: &str,
+        date: i64,
+        total_parts: u32,
+        parser_version: i32,
+        to: &str,
+        cc: &str,
+        version: Option<u32>,
+        part_index: u32,
+        baseline_id: Option<i64>,
+        strict_author: bool,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+        priority: Option<i32>,
+    ) -> Result<Option<i64>> {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
@@ -1971,12 +2051,49 @@ impl Database {
                         .await?;
                 }
 
-                // Update subject if this is a better index (e.g. going from placeholder to real subject)
                 if part_index < subject_index {
+                    if is_placeholder {
+                        // A fetch/API placeholder is created at default priority (500)
+                        // before its real subject is known. Apply the rule-based priority
+                        // authoritatively here if provided, or leave at default.
+                        if let Some(prio) = priority {
+                            self.conn
+                                .execute(
+                                    "UPDATE patchsets SET subject = ?, subject_index = ?, base_priority = ?, priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, ?) ELSE ? END WHERE id = ?",
+                                    libsql::params![subject, part_index, prio, prio, prio, id],
+                                )
+                                .await?;
+                        } else {
+                            self.conn
+                                .execute(
+                                    "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                                    libsql::params![subject, part_index, id],
+                                )
+                                .await?;
+                        }
+                    } else if let Some(prio) = priority {
+                        // Back-filling an earlier part of an existing series:
+                        // Update subject/subject_index and elevate/set base_priority.
+                        self.conn
+                            .execute(
+                                "UPDATE patchsets SET subject = ?, subject_index = ?, base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
+                                libsql::params![subject, part_index, prio, prio, prio, prio, prio, prio, id],
+                            )
+                            .await?;
+                    } else {
+                        self.conn
+                            .execute(
+                                "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                                libsql::params![subject, part_index, id],
+                            )
+                            .await?;
+                    }
+                } else if let Some(prio) = priority {
+                    // Even if part_index >= subject_index, elevate/set base_priority if this part has a rule priority.
                     self.conn
                         .execute(
-                            "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
-                            libsql::params![subject, part_index, id],
+                            "UPDATE patchsets SET base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
+                            libsql::params![prio, prio, prio, prio, prio, prio, id],
                         )
                         .await?;
                 }
@@ -2196,6 +2313,28 @@ impl Database {
                 let merge_from_id = *merge_from_id;
                 info!("Merging patchset {} into {}", merge_from_id, target_id);
 
+                // Inherit higher base_priority from merged patchset if present
+                let mut p_rows = self
+                    .conn
+                    .query(
+                        "SELECT base_priority FROM patchsets WHERE id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+                let other_prio: Option<i32> = if let Ok(Some(row)) = p_rows.next().await {
+                    row.get(0).ok()
+                } else {
+                    None
+                };
+                if let Some(other_prio) = other_prio {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
+                            libsql::params![other_prio, other_prio, other_prio, other_prio, other_prio, other_prio, target_id],
+                        )
+                        .await?;
+                }
+
                 // Reassign patches
                 self.conn
                     .execute(
@@ -2267,26 +2406,29 @@ impl Database {
                     .await?;
             }
 
-            // Conditionally update subject
-            // Note: We check against the best index found among all merged sets OR the new part_index
             if part_index < current_subject_index {
+                if let Some(prio) = priority {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET subject = ?, subject_index = ?, base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
+                            libsql::params![subject, part_index, prio, prio, prio, prio, prio, prio, target_id],
+                        )
+                        .await?;
+                } else {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                            libsql::params![subject, part_index, target_id],
+                        )
+                        .await?;
+                }
+            } else if let Some(prio) = priority {
                 self.conn
                     .execute(
-                        "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
-                        libsql::params![subject, part_index, target_id],
+                        "UPDATE patchsets SET base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
+                        libsql::params![prio, prio, prio, prio, prio, prio, target_id],
                     )
                     .await?;
-            } else if matches.len() > 1 {
-                // If we merged, we might need to update the subject index of the target to the best one we found.
-                // But we don't have the subject string from the merged one easily available here.
-                // However, the existing target subject is likely fine unless part_index is better.
-                // Update subject_index to be correct if a better one was merged.
-                // Actually, if matches[i].1 was better, we should have used its subject.
-                // But that's complicated. Assuming the target (oldest) usually has the cover letter or we eventually find it.
-                // Simplification: We only update if CURRENT patch is better.
-                // If we merged a patchset that HAD the cover letter, we ideally want that subject.
-                // But we lost it.
-                // TODO: Optimize merge subject selection. For now, this is better than duplicates.
             }
 
             if let Some(clid) = cover_letter_message_id {
@@ -2320,11 +2462,12 @@ impl Database {
         }
 
         // No match found, create new patchset
+        let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters, base_priority, priority)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone(), priority, eff_priority],
             )
             .await?;
 
@@ -3441,7 +3584,7 @@ impl Database {
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
             "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug
-             FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
+             FROM patchsets WHERE status = 'Pending' ORDER BY priority DESC, date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
 
@@ -3900,6 +4043,7 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        priority: Option<i32>,
     ) -> Result<i64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -3932,10 +4076,17 @@ impl Database {
                     || status == "Failed To Apply"
                     || status == "FailedToApply"
                 {
-                    self.conn.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                        libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
-                    ).await?;
+                    if let Some(prio) = priority {
+                        self.conn.execute(
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, base_priority = ?, priority = ? WHERE id = ?",
+                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, prio, prio, id]
+                        ).await?;
+                    } else {
+                        self.conn.execute(
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
+                            libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
+                        ).await?;
+                    }
                 }
                 return Ok(id);
             }
@@ -3945,11 +4096,12 @@ impl Database {
         let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
 
         // 3. Create the fetching patchset
+        let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, base_priority, priority)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, priority, eff_priority],
             )
             .await?;
 
@@ -3974,6 +4126,181 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Recalculates base_priority and effective priority for pending patchsets based
+    /// on priority rules. This is a utility method for administrative tasks.
+    pub async fn recalculate_patchsets_priority(
+        &self,
+        rules: &[crate::settings::CompiledPriorityRule],
+    ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, subject FROM patchsets WHERE status IN ('Pending', 'Incomplete', 'Fetching')",
+                (),
+            )
+            .await?;
+
+        let mut updates = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let subject: String = row.get(1).unwrap_or_default();
+            let priority = Self::calculate_priority(&subject, rules);
+            updates.push((id, priority));
+        }
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        for (id, priority) in updates {
+            let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET base_priority = ?, priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, ?) ELSE ? END WHERE id = ?",
+                    libsql::params![eff_priority, eff_priority, eff_priority, id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Count patchsets sharing the same `repo_url` (via baselines) whose arrival `date` falls
+    /// within ±window_secs of `date`. A NULL repo_url (email/NNTP) groups with
+    /// other NULLs, so API dumps to different repos never inflate each other.
+    pub async fn count_batch_siblings(
+        &self,
+        repo_url: Option<&str>,
+        date: i64,
+        window_secs: i64,
+    ) -> Result<i64> {
+        let mut rows = if let Some(url) = repo_url {
+            self.conn
+                .query(
+                    "SELECT COUNT(*) FROM patchsets p LEFT JOIN baselines b ON p.baseline_id = b.id WHERE p.date BETWEEN ? AND ? AND b.repo_url = ?",
+                    libsql::params![date - window_secs, date + window_secs, url],
+                )
+                .await?
+        } else {
+            self.conn
+                .query(
+                    "SELECT COUNT(*) FROM patchsets p LEFT JOIN baselines b ON p.baseline_id = b.id WHERE p.date BETWEEN ? AND ? AND (p.baseline_id IS NULL OR b.repo_url IS NULL)",
+                    libsql::params![date - window_secs, date + window_secs],
+                )
+                .await?
+        };
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(row.get(0)?)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Deprioritize patchsets based on how many siblings (same `repo_url`) arrived
+    /// within ±window_secs of it. Sets priority_cap and recomputes
+    /// priority = MIN(base_priority, cap) so that elevated rule priorities are capped
+    /// while preserving base_priority for future series updates.
+    ///
+    /// When a batch threshold is crossed for the first time (`batch_size == min_size`),
+    /// earlier arrivals in the window are retroactively updated in a single batch.
+    /// Subsequent arrivals in the same batch are updated individually (WHERE id = ?),
+    /// keeping database write overhead constant $O(1)$ per patch.
+    pub async fn apply_batch_deprioritization(
+        &self,
+        patchset_id: i64,
+        window_secs: i64,
+        tiers: &[(i64, i32)],
+    ) -> Result<()> {
+        if tiers.is_empty() {
+            return Ok(());
+        }
+
+        // Look up this patchset's own batch key: arrival date + repo_url.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.date, b.repo_url FROM patchsets p LEFT JOIN baselines b ON p.baseline_id = b.id WHERE p.id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let (date, repo_url): (i64, Option<String>) = match rows.next().await? {
+            Some(row) => (row.get(0)?, row.get::<Option<String>>(1).ok().flatten()),
+            None => return Ok(()),
+        };
+
+        let batch_size = self
+            .count_batch_siblings(repo_url.as_deref(), date, window_secs)
+            .await?;
+
+        // Find the applicable tier (order-agnostic).
+        let matched_tier = tiers
+            .iter()
+            .filter(|(min_size, _)| batch_size >= *min_size)
+            .max_by_key(|(min_size, _)| *min_size);
+
+        if let Some(&(min_size, cap)) = matched_tier {
+            // When crossing a tier boundary for the first time, retroactively update all
+            // siblings in the window so early arrivals don't jump ahead. Subsequent arrivals
+            // update only themselves.
+            let is_threshold_crossing = batch_size == min_size;
+            let affected = if is_threshold_crossing {
+                if let Some(url) = repo_url.as_deref() {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET priority_cap = ?, priority = MIN(COALESCE(base_priority, 500), ?) \
+                             WHERE date BETWEEN ? AND ? AND baseline_id IN (SELECT id FROM baselines WHERE repo_url = ?)",
+                            libsql::params![cap, cap, date - window_secs, date + window_secs, url],
+                        )
+                        .await?
+                } else {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET priority_cap = ?, priority = MIN(COALESCE(base_priority, 500), ?) \
+                             WHERE date BETWEEN ? AND ? AND (baseline_id IS NULL OR baseline_id IN (SELECT id FROM baselines WHERE repo_url IS NULL))",
+                            libsql::params![cap, cap, date - window_secs, date + window_secs],
+                        )
+                        .await?
+                }
+            } else {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET priority_cap = ?, priority = MIN(COALESCE(base_priority, 500), ?) WHERE id = ?",
+                        libsql::params![cap, cap, patchset_id],
+                    )
+                    .await?
+            };
+
+            if affected > 0 {
+                tracing::info!(
+                    "Batch deprioritization: patchset {} in batch of {} (±{}s, repo={:?}, retroactive={}) capped {} patchset(s) to priority {}",
+                    patchset_id,
+                    batch_size,
+                    window_secs,
+                    repo_url,
+                    is_threshold_crossing,
+                    affected,
+                    cap
+                );
+            }
+        }
+
+        Ok(())
+    }
+    pub fn calculate_priority(
+        subject: &str,
+        rules: &[crate::settings::CompiledPriorityRule],
+    ) -> Option<i32> {
+        let mut priority = None;
+        for rule in rules {
+            if rule.regex.is_match(subject) {
+                priority = Some(
+                    rule.priority
+                        .clamp(crate::settings::MIN_PRIORITY, crate::settings::MAX_PRIORITY),
+                );
+            }
+        }
+        priority
     }
 
     pub async fn update_patchset_baseline_info(
@@ -4380,6 +4707,1118 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_routing() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        let rules_config = [
+            crate::settings::PriorityRule {
+                regex: "(?i)^PRODKERNEL:".to_string(),
+                priority: 750,
+            },
+            crate::settings::PriorityRule {
+                regex: "security".to_string(),
+                priority: 999,
+            },
+        ];
+        let compiled_rules: Vec<_> = rules_config.iter().map(|r| r.compile().unwrap()).collect();
+
+        assert_eq!(
+            Database::calculate_priority("PRODKERNEL: perf updates", &compiled_rules),
+            Some(750)
+        );
+        assert_eq!(
+            Database::calculate_priority("PRODKERNEL: security leak fix", &compiled_rules),
+            Some(999)
+        );
+        assert_eq!(
+            Database::calculate_priority("staging: standard driver change", &compiled_rules),
+            None
+        );
+
+        let ps_low = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_low",
+                "staging: driver update",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let ps_high = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_high",
+                "PRODKERNEL: fix memory corruption",
+                "Author",
+                2000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                Some(750),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending', received_parts = 1 WHERE id IN (?, ?)",
+                libsql::params![ps_low, ps_high],
+            )
+            .await
+            .unwrap();
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, ps_high);
+        assert_eq!(pending[1].id, ps_low);
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_two_column_and_series_elevation() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        db.create_message(
+            "msg_part1",
+            thread_id,
+            None,
+            "Author",
+            "PRODKERNEL: memory fix",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_cover",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 0/2] series cover",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_part2",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 2/2] minor tweak",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Scenario 1: Patch 1 arrives first (PRODKERNEL: -> 750), Cover 0 arrives second (None)
+        let ps1 = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_part1",
+                "PRODKERNEL: memory fix",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                Some(750),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Cover letter arrives second (unmatched -> None)
+        let ps_cover = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some("msg_cover"),
+                "msg_cover",
+                "[PATCH 0/2] series cover",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps1, ps_cover);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        let prio_cap: Option<i32> = row.get(2).ok();
+        assert_eq!(base_prio, 750);
+        assert_eq!(eff_prio, 750);
+        assert!(prio_cap.is_none());
+
+        // Test priority_cap (e.g. from batch deprioritization)
+        db.conn
+            .execute(
+                "UPDATE patchsets SET priority_cap = 200, priority = 200 WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+
+        // Patch 2 arrives (unmatched -> None). base_priority must remain 750, priority remains capped at 200.
+        db.create_patchset_with_priority(
+            thread_id,
+            Some("msg_cover"),
+            "msg_part2",
+            "[PATCH 2/2] minor tweak",
+            "Author",
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            2,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        let prio_cap: Option<i32> = row.get(2).ok();
+        assert_eq!(base_prio, 750);
+        assert_eq!(eff_prio, 200);
+        assert_eq!(prio_cap, Some(200));
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_series_deprioritization() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        db.create_message(
+            "msg_doc_cover",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 0/2] doc updates",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_doc_part1",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 1/2] doc: fix spelling",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_doc_part2",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 2/2] minor grammar",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Cover letter matches low-priority rule (100)
+        let ps = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some("msg_doc_cover"),
+                "msg_doc_cover",
+                "[PATCH 0/2] doc updates",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Patch 1 arrives (also matches 100)
+        db.create_patchset_with_priority(
+            thread_id,
+            Some("msg_doc_cover"),
+            "msg_doc_part1",
+            "[PATCH 1/2] doc: fix spelling",
+            "Author",
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            1,
+            None,
+            true,
+            None,
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Patch 2 arrives (unmatched -> None). Must NOT elevate series back to 500!
+        db.create_patchset_with_priority(
+            thread_id,
+            Some("msg_doc_cover"),
+            "msg_doc_part2",
+            "[PATCH 2/2] minor grammar",
+            "Author",
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            2,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority FROM patchsets WHERE id = ?",
+                libsql::params![ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        assert_eq!(base_prio, 100, "Deprioritized series must stay at 100");
+        assert_eq!(eff_prio, 100, "Effective priority must stay at 100");
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_series_deprioritization_reverse_arrival() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        db.create_message(
+            "msg_doc_cover",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 0/2] [staging] doc updates",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_doc_part1",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 1/2] fix spelling",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_doc_part2",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 2/2] minor grammar",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Patch 1 arrives FIRST without matching any rule (None -> unclassified)
+        let ps = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_doc_part1",
+                "[PATCH 1/2] fix spelling",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Unclassified patchset defaults to priority 500 in queue, with base_priority NULL
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority FROM patchsets WHERE id = ?",
+                libsql::params![ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: Option<i32> = row.get(0).ok();
+        let eff_prio: i32 = row.get(1).unwrap();
+        assert!(base_prio.is_none());
+        assert_eq!(eff_prio, 500);
+
+        // Cover letter arrives SECOND with low-priority rule (100). Must deprioritize to 100!
+        let ps_cover = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some("msg_doc_cover"),
+                "msg_doc_cover",
+                "[PATCH 0/2] [staging] doc updates",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps, ps_cover);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority FROM patchsets WHERE id = ?",
+                libsql::params![ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        assert_eq!(base_prio, 100, "Deprioritized series must evaluate to 100");
+        assert_eq!(eff_prio, 100, "Effective priority must evaluate to 100");
+
+        // Patch 2 arrives THIRD (unmatched -> None). Must NOT elevate series back!
+        db.create_patchset_with_priority(
+            thread_id,
+            Some("msg_doc_cover"),
+            "msg_doc_part2",
+            "[PATCH 2/2] minor grammar",
+            "Author",
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            2,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority FROM patchsets WHERE id = ?",
+                libsql::params![ps],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        assert_eq!(base_prio, 100, "Deprioritized series must stay at 100");
+        assert_eq!(eff_prio, 100, "Effective priority must stay at 100");
+    }
+
+    #[tokio::test]
+    async fn test_patchset_priority_merge_elevation() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+
+        db.create_message(
+            "msg_part1",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 1/2] minor tweak",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_part2",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 2/2] security fix",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg_cover",
+            thread_id,
+            None,
+            "Author",
+            "[PATCH 0/2] series cover",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Patch 1 arrives first (standard priority 500)
+        let ps1 = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_part1",
+                "[PATCH 1/2] minor tweak",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Patch 2 exists as an independent patchset in the same thread (elevated priority 999)
+        let mut rows = db
+            .conn
+            .query(
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, base_priority, priority)
+                 VALUES (?, NULL, '[PATCH 2/2] security fix', 'Author', 1000, 2, 0, 'Incomplete', 1, '', '', 2, 999, 999) RETURNING id",
+                libsql::params![thread_id],
+            )
+            .await
+            .unwrap();
+        let ps2: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_ne!(ps1, ps2);
+
+        // Cover letter arrives (unmatched -> None) in thread_id, merging both patchsets
+        let ps_merged = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some("msg_cover"),
+                "msg_cover",
+                "[PATCH 0/2] series cover",
+                "Author",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ps_merged, ps1);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: i32 = row.get(0).unwrap();
+        let eff_prio: i32 = row.get(1).unwrap();
+        assert_eq!(
+            base_prio, 999,
+            "Merged patchset must inherit elevated base_priority from merged series"
+        );
+        assert_eq!(
+            eff_prio, 999,
+            "Merged patchset must inherit elevated effective priority from merged series"
+        );
+
+        // Verify that ps2 was deleted during merge
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT count(*) FROM patchsets WHERE id = ?",
+                libsql::params![ps2],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 0, "ps2 must be deleted after merge");
+    }
+
+    #[tokio::test]
+    async fn test_batch_deprioritization_two_column_strategy() {
+        let db = setup_db().await;
+
+        // Create a baseline for repo A
+        let baseline_a = db
+            .create_baseline(Some("https://repo.example/a"), Some("main"), Some("sha_a"))
+            .await
+            .unwrap();
+
+        let tiers = vec![(2, 300), (4, 100)];
+
+        // Ingest 3 patchsets in separate threads within a 10-second window for repo A
+        let mut ps_ids = Vec::new();
+        for i in 0..3 {
+            let thread_id = db
+                .create_thread(&format!("root_a_{}", i), "Test Thread", 1000 + i * 2)
+                .await
+                .unwrap();
+            let msg = format!("msg_a_{}", i);
+            let author = format!("Author {}", i);
+            let subject = format!("PRODKERNEL: high priority patch {}", i);
+            db.create_message(
+                &msg,
+                thread_id,
+                None,
+                &author,
+                &subject,
+                1000 + i * 2,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let ps = db
+                .create_patchset_with_priority(
+                    thread_id,
+                    None,
+                    &msg,
+                    &subject,
+                    &author,
+                    1000 + i * 2,
+                    1,
+                    1,
+                    "",
+                    "",
+                    None,
+                    1,
+                    Some(baseline_a),
+                    true,
+                    None,
+                    None,
+                    Some(999),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+            ps_ids.push(ps);
+        }
+
+        let mut r = db
+            .conn
+            .query(
+                "SELECT baseline_id FROM patchsets WHERE id = ?",
+                libsql::params![ps_ids[0]],
+            )
+            .await
+            .unwrap();
+        let bid: Option<i64> = r
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<Option<i64>>(0)
+            .ok()
+            .flatten();
+        assert_eq!(bid, Some(baseline_a));
+
+        let count = db
+            .count_batch_siblings(Some("https://repo.example/a"), 1000, 30)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+
+        for ps in &ps_ids {
+            db.apply_batch_deprioritization(*ps, 30, &tiers)
+                .await
+                .unwrap();
+        }
+
+        // Each patchset in the batch of 3 should have hit tier (2, 300) -> priority_cap = 300, priority = 300, base_priority = 999
+        for ps in &ps_ids {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                    libsql::params![*ps],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            let base_prio: i32 = row.get(0).unwrap();
+            let eff_prio: i32 = row.get(1).unwrap();
+            let prio_cap: Option<i32> = row.get(2).ok();
+
+            assert_eq!(base_prio, 999);
+            assert_eq!(eff_prio, 300);
+            assert_eq!(prio_cap, Some(300));
+        }
+
+        // Now test email patchsets (repo_url = None). Ingest 1 patchset with priority 500.
+        let thread_email = db
+            .create_thread("root_email", "Email Thread", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_email",
+            thread_email,
+            None,
+            "Author",
+            "email patch",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_email = db
+            .create_patchset_with_priority(
+                thread_email,
+                None,
+                "msg_email",
+                "email patch",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.apply_batch_deprioritization(ps_email, 30, &tiers)
+            .await
+            .unwrap();
+
+        // 1 email patch does not reach min_size 2, so it shouldn't be capped.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps_email],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let base_prio: Option<i32> = row.get(0).ok();
+        let eff_prio: i32 = row.get(1).unwrap();
+        let prio_cap: Option<i32> = row.get(2).ok();
+
+        assert!(base_prio.is_none());
+        assert_eq!(eff_prio, 500);
+        assert!(prio_cap.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_batch_deprioritization_retroactive_on_arrival_sequence() {
+        let db = setup_db().await;
+
+        let baseline_a = db
+            .create_baseline(
+                Some("https://repo.example/retro"),
+                Some("main"),
+                Some("sha_r"),
+            )
+            .await
+            .unwrap();
+
+        // Tiers: min_size 2 -> 300, min_size 4 -> 100 (intentionally unsorted)
+        let tiers = vec![(4, 100), (2, 300)];
+
+        // Patchset 1 arrives (batch size 1)
+        let thread1 = db.create_thread("root_r1", "Thread 1", 1000).await.unwrap();
+        db.create_message(
+            "msg_r1",
+            thread1,
+            None,
+            "Author",
+            "PRODKERNEL: patch 1",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset_with_priority(
+                thread1,
+                None,
+                "msg_r1",
+                "PRODKERNEL: patch 1",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                Some(baseline_a),
+                true,
+                None,
+                None,
+                Some(999),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.apply_batch_deprioritization(ps1, 30, &tiers)
+            .await
+            .unwrap();
+
+        // Patchset 1 arrived alone: not capped yet (priority 999)
+        let mut rows1 = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row1 = rows1.next().await.unwrap().unwrap();
+        assert_eq!(row1.get::<i32>(0).unwrap(), 999);
+        assert_eq!(row1.get::<i32>(1).unwrap(), 999);
+        assert!(row1.get::<Option<i32>>(2).unwrap().is_none());
+
+        // Patchset 2 arrives (batch size 2 -> crosses tier 2)
+        let thread2 = db.create_thread("root_r2", "Thread 2", 1002).await.unwrap();
+        db.create_message(
+            "msg_r2",
+            thread2,
+            None,
+            "Author",
+            "PRODKERNEL: patch 2",
+            1002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps2 = db
+            .create_patchset_with_priority(
+                thread2,
+                None,
+                "msg_r2",
+                "PRODKERNEL: patch 2",
+                "Author",
+                1002,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                Some(baseline_a),
+                true,
+                None,
+                None,
+                Some(999),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.apply_batch_deprioritization(ps2, 30, &tiers)
+            .await
+            .unwrap();
+
+        // Both patchset 1 and patchset 2 must now be capped to 300 retroactively!
+        let mut r1 = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let r1_row = r1.next().await.unwrap().unwrap();
+        assert_eq!(r1_row.get::<i32>(0).unwrap(), 999);
+        assert_eq!(r1_row.get::<i32>(1).unwrap(), 300);
+        assert_eq!(r1_row.get::<Option<i32>>(2).unwrap(), Some(300));
+
+        let mut r2 = db
+            .conn
+            .query(
+                "SELECT base_priority, priority, priority_cap FROM patchsets WHERE id = ?",
+                libsql::params![ps2],
+            )
+            .await
+            .unwrap();
+        let r2_row = r2.next().await.unwrap().unwrap();
+        assert_eq!(r2_row.get::<i32>(0).unwrap(), 999);
+        assert_eq!(r2_row.get::<i32>(1).unwrap(), 300);
+        assert_eq!(r2_row.get::<Option<i32>>(2).unwrap(), Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_migration_v1_to_priority_columns() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+
+        // Manually set up schema version 1 WITHOUT priority columns
+        db.conn
+            .execute_batch(
+                "CREATE TABLE threads (id INTEGER PRIMARY KEY, root_message_id TEXT, subject TEXT, last_updated INTEGER);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, thread_id INTEGER, in_reply_to TEXT, author TEXT, subject TEXT, date INTEGER, body TEXT, to_recipients TEXT, cc_recipients TEXT, git_blob_hash TEXT, mailing_list TEXT, references_hdr TEXT);
+                 CREATE TABLE patchsets (id INTEGER PRIMARY KEY, thread_id INTEGER, cover_letter_message_id TEXT, subject TEXT, author TEXT, date INTEGER, total_parts INTEGER, received_parts INTEGER, status TEXT, parser_version INTEGER, to_recipients TEXT, cc_recipients TEXT, subject_index INTEGER, baseline_id INTEGER, failed_reason TEXT, skip_filters TEXT, only_filters TEXT, target_review_count INTEGER DEFAULT 1, model_name TEXT, prompts_git_hash TEXT, baseline_logs TEXT, mr_url TEXT, mr_title TEXT, mr_number TEXT, slug TEXT, provider TEXT, embargo_until INTEGER, embargo_release_started_at INTEGER);
+                 CREATE TABLE patches (id INTEGER PRIMARY KEY, patchset_id INTEGER NOT NULL, message_id TEXT NOT NULL, part_index INTEGER, diff TEXT, status TEXT, apply_error TEXT, FOREIGN KEY(patchset_id) REFERENCES patchsets(id), FOREIGN KEY(message_id) REFERENCES messages(message_id), UNIQUE(patchset_id, message_id));
+                 PRAGMA user_version = 1;",
+            )
+            .await
+            .unwrap();
+
+        // Run migrate() on existing version 1 DB
+        db.migrate().await.unwrap();
+
+        // Must now be able to query and insert priority-aware patchsets without column errors
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+        let ps_id = db
+            .create_patchset_with_priority(
+                thread_id,
+                None,
+                "msg_m",
+                "Migrated Patch",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                Some(750),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 0);
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending', received_parts = 1 WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, ps_id);
     }
 
     #[tokio::test]
@@ -8668,6 +10107,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -8733,6 +10173,7 @@ mod tests {
         db.create_fetching_patchset(
             &synthetic_id,
             "Fetching placeholder",
+            None,
             None,
             None,
             None,
@@ -8816,12 +10257,20 @@ mod tests {
             db.has_patchset_by_msgid(sha_patch).await.unwrap(),
             "has_patchset_by_msgid should return true for SHA existing in patches table"
         );
+
+        // 3. Non-existent SHA must return false
+        assert!(
+            !db.has_patchset_by_msgid("0000000000000000000000000000000000000000")
+                .await
+                .unwrap(),
+            "has_patchset_by_msgid should return false for unknown SHA"
+        );
     }
 
     /// Verify that has_patchset_by_msgid returns false for Failed and Cancelled
     /// patchsets so that retry submissions can be re-fetched.
     #[tokio::test]
-    async fn test_has_patchset_by_msgid_excludes_failed_and_cancelled() {
+    async fn test_has_patchset_by_msgid_ignores_failed_and_cancelled() {
         let db = setup_db().await;
         let sha_failed = "f00f00f001234567890abcdef1234567890abcdef";
         let synthetic_failed = format!("{}@sashiko.local", sha_failed);
@@ -8831,6 +10280,7 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_failed,
                 "Fetching failed placeholder",
+                None,
                 None,
                 None,
                 None,
@@ -8857,6 +10307,7 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cancelled,
                 "Fetching cancelled placeholder",
+                None,
                 None,
                 None,
                 None,
@@ -9111,6 +10562,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -9178,6 +10630,7 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cover,
                 "Fetching retry",
+                None,
                 None,
                 None,
                 None,
