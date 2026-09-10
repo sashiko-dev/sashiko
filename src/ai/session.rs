@@ -202,6 +202,7 @@ impl<'a> SessionRunner<'a> {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }];
 
         let mut log_history = vec![AiMessage {
@@ -211,6 +212,7 @@ impl<'a> SessionRunner<'a> {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }];
 
         let mut turns = 0;
@@ -281,6 +283,7 @@ impl<'a> SessionRunner<'a> {
                                     thought_signature: None,
                                     tool_calls: None,
                                     tool_call_id: None,
+                                    provider_metadata: None,
                                 };
                                 history.push(msg.clone());
                                 log_history.push(msg);
@@ -310,9 +313,16 @@ impl<'a> SessionRunner<'a> {
                 thought_signature: resp.thought_signature.clone(),
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
+                provider_metadata: resp.provider_metadata.clone(),
             };
             history.push(assistant_msg.clone());
-            log_history.push(assistant_msg);
+            // Provider metadata can include encrypted reasoning items. It is
+            // needed for the in-memory continuation but not for the human
+            // readable history persisted after this session completes.
+            log_history.push(AiMessage {
+                provider_metadata: None,
+                ..assistant_msg
+            });
 
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls {
@@ -325,6 +335,7 @@ impl<'a> SessionRunner<'a> {
                         thought_signature: None,
                         tool_calls: None,
                         tool_call_id: Some(call_id),
+                        provider_metadata: None,
                     };
                     history.push(tool_msg.clone());
                     log_history.push(tool_msg);
@@ -364,6 +375,7 @@ impl<'a> SessionRunner<'a> {
                         thought_signature: None,
                         tool_calls: None,
                         tool_call_id: None,
+                        provider_metadata: None,
                     };
                     history.push(msg.clone());
                     log_history.push(msg);
@@ -374,5 +386,120 @@ impl<'a> SessionRunner<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiProviderMetadata, ProviderCapabilities};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    struct MetadataSession;
+
+    #[async_trait]
+    impl LlmSession for MetadataSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "user".to_string()
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(json!({"ok": true}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            response
+                .content
+                .clone()
+                .ok_or_else(|| ValidationError::Fatal("missing final response".to_string()))
+        }
+    }
+
+    struct MetadataProvider {
+        requests: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for MetadataProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            if requests.len() == 1 {
+                return Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }]),
+                    usage: None,
+                    truncated: false,
+                    provider_metadata: Some(AiProviderMetadata {
+                        provider: "test.provider".to_string(),
+                        version: 1,
+                        data: json!({"encrypted_content": "opaque"}),
+                    }),
+                });
+            }
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+                provider_metadata: None,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test".to_string(),
+                context_window_size: 1,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_metadata_for_continuation_but_not_persisted_history() -> Result<()> {
+        let provider = MetadataProvider {
+            requests: Mutex::new(Vec::new()),
+        };
+        let result = SessionRunner::new(&provider)
+            .run(&mut MetadataSession)
+            .await?;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == AiRole::Assistant)
+            .unwrap();
+        assert_eq!(
+            assistant.provider_metadata.as_ref().unwrap().data["encrypted_content"],
+            "opaque"
+        );
+        assert!(
+            result
+                .history
+                .iter()
+                .all(|message| message.provider_metadata.is_none())
+        );
+        Ok(())
     }
 }

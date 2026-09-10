@@ -355,6 +355,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
             tool_calls: Some(merged_tool_calls),
             usage,
             truncated: false,
+            provider_metadata: None,
         });
     }
 
@@ -368,6 +369,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
             tool_calls: None,
             usage,
             truncated: false,
+            provider_metadata: None,
         });
     }
 
@@ -380,6 +382,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
         tool_calls: None,
         usage,
         truncated: false,
+        provider_metadata: None,
     })
 }
 
@@ -408,6 +411,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
                 tool_calls: Some(tool_calls),
                 usage,
                 truncated: false,
+                provider_metadata: None,
             });
         }
     }
@@ -421,6 +425,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
             tool_calls: None,
             usage,
             truncated: false,
+            provider_metadata: None,
         });
     }
 
@@ -432,6 +437,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
         tool_calls: None,
         usage,
         truncated: false,
+        provider_metadata: None,
     })
 }
 
@@ -489,6 +495,7 @@ mod tests {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }]
     }
 

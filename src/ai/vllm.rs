@@ -587,6 +587,7 @@ fn translate_vllm_response(resp: VllmResponse) -> Result<AiResponse> {
         tool_calls,
         usage,
         truncated,
+        provider_metadata: None,
     })
 }
 
@@ -729,6 +730,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -918,6 +920,7 @@ mod tests {
                     thought_signature: None,
                 }]),
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
