@@ -92,7 +92,7 @@ spec:
                 linux-modules,nouveau,nova-gpu,ntb,selinux,linux-raid,linux-rt-devel,linux-rtc,
                 linux-can,target-devel,linux-hardening,linux-security-module,linux-unionfs,mfd,linux-leds,mhi,
                 linux-mtd,audit,linux-integrity,linux-fscrypt,fsverity,ocfs2-devel,
-                linux-serial
+                linux-serial,virtualization
             - name: SASHIKO__REVIEW__CONCURRENCY
               value: "24"
             - name: SASHIKO__SMTP__SENDER_ADDRESS

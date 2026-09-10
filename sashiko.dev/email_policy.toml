@@ -102,7 +102,7 @@ cc = ["wsa+renesas@sang-engineering.com"]
 [subsystems.rust-for-linux]
 lists = ["rust-for-linux@vger.kernel.org"]
 reply_to_author = true
-cc = ["ojeda@kernel.org"]
+cc = ["ojeda@kernel.org", "gary@garyguo.net"]
 
 [subsystems.sched-ext]
 lists = ["sched-ext@lists.linux.dev"]
@@ -174,6 +174,21 @@ lists = ["linux-nfs@vger.kernel.org"]
 reply_to_author = false
 cc_individuals = false
 cc = ["Chuck Lever <cel@kernel.org>", "Jeff Layton <jlayton@kernel.org>", "Anna Schumaker <anna@kernel.org>"]
+
+[subsystems.kexec]
+lists = ["kexec@lists.infradead.org"]
+reply_to_author = true
+send_positive_review = true
+cc_individuals = true
+cc = ["kexec@lists.infradead.org"]
+
+[subsystems.virtualization]
+lists = ["virtualization@lists.linux.dev"]
+reply_to_author = true
+send_positive_review = true
+cc = ["virtualization@lists.linux.dev",
+      "Michael S. Tsirkin <mst@redhat.com>",
+      "Eugenio Perez <eperezma@redhat.com>"]
 
 [subsystems.kvm]
 lists = ["kvm@vger.kernel.org"]
@@ -299,12 +314,8 @@ cc = ["media-ci@linuxtv.org"]
 
 [subsystems.mtd]
 lists = ["linux-mtd@lists.infradead.org"]
-cc = ["Miquel Raynal <miquel.raynal@bootlin.com>",
-      "Richard Weinberger <richard@nod.at>",
-      "Vignesh Raghavendra <vigneshr@ti.com>",
-      "Pratyush Yadav <pratyush@kernel.org>",
-      "Michael Walle <mwalle@kernel.org>",
-      "Takahiro Kuwano <takahiro.kuwano@infineon.com>"]
+reply_all = true
+reply_to_author = true
 
 [subsystems.audit]
 lists = ["audit@vger.kernel.org"]
@@ -328,3 +339,8 @@ reply_to_author = true
 send_positive_review = true
 cc = ["linux-serial@vger.kernel.org"]
 
+[subsystems.rdma]
+lists = ["linux-rdma@vger.kernel.org"]
+reply_to_author = true
+send_positive_review = true
+cc = ["linux-rdma@vger.kernel.org"]

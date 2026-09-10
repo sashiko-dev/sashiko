@@ -14,7 +14,7 @@ The goal of this design is to:
 
 Currently, AI interactions are split:
 
-1.  **`Worker::run_ai_stage_raw` (in [prompts.rs](file:///usr/local/google/home/kfree/sashiko/src/worker/prompts.rs#L1492))**:
+1.  **`Worker::run_ai_stage_raw` (in [prompts.rs](../src/worker/prompts.rs#L1492))**:
     *   Implements the core loop: sends request to `AiProvider`, executes tools from `ToolBox`, appends results to history, and loops.
     *   Hardcoded to use `ToolBox`.
     *   Does not validate final output format (assumes raw string/JSON is handled by caller).

@@ -397,6 +397,11 @@ async fn submit_patch(
             let id = generate_synthetic_id("inject");
             info!("Received raw mbox injection: {} (len: {})", id, raw.len());
 
+            let submitted_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .ok();
+
             let event = Event::RawMboxSubmitted {
                 raw,
                 submission_id: id.clone(),
@@ -405,6 +410,7 @@ async fn submit_patch(
                 baseline: base_commit,
                 skip_subjects,
                 only_subjects,
+                submitted_at,
             };
 
             if let Err(e) = state.sender.send(event).await {
@@ -614,6 +620,11 @@ async fn fetch_and_inject_thread(
     })
     .await??;
 
+    let submitted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .ok();
+
     let event = Event::RawMboxSubmitted {
         raw,
         submission_id: msgid.to_string(),
@@ -622,6 +633,7 @@ async fn fetch_and_inject_thread(
         baseline: None,
         skip_subjects: None,
         only_subjects: None,
+        submitted_at,
     };
 
     sender.send(event).await?;
@@ -993,6 +1005,8 @@ async fn get_stats(
     let reviewing = crate::metrics::get_reviewing_patches();
     let messages = crate::metrics::get_messages();
     let patchsets = crate::metrics::get_patchsets();
+    let repo_packs = crate::metrics::get_repo_packs();
+    let repo_pack_bytes = crate::metrics::get_repo_pack_bytes();
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -1000,7 +1014,9 @@ async fn get_stats(
         "pending": pending,
         "reviewing": reviewing,
         "messages": messages,
-        "patchsets": patchsets
+        "patchsets": patchsets,
+        "repo_packs": repo_packs,
+        "repo_pack_bytes": repo_pack_bytes
     })))
 }
 
@@ -1220,7 +1236,7 @@ async fn forge_webhook(
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
     let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
 
-    let slug = metadata.pr_url.as_ref().map(|url| {
+    let slug = metadata.repo_url.as_ref().map(|url| {
         let repo = crate::forge::extract_repo_name_from_url(url);
         format!("{}-{}", repo, metadata.pr_number)
     });

@@ -16,10 +16,10 @@ cargo build --release --bin sashiko-cli
 nix profile add github:sashiko-dev/sashiko
 ```
 
-For local reviews the review worker binary is also required:
+For local reviews the main sashiko binary is also required:
 
 ```bash
-cargo build --release --bin review
+cargo build --release --bin sashiko
 ```
 
 ## Global Options
@@ -186,9 +186,9 @@ daemon, no database -- pass `--force-local`.
 
 **Prerequisites for true local review:**
 
-1. The `sashiko-review` (or `review`) binary must be built and findable
+1. The `sashiko` binary must be built and findable
    (looked up next to the CLI binary first, then via `PATH`).
-   Build it with: `cargo build --release --bin review`.
+   Build it with: `cargo build --release --bin sashiko`.
 2. `Settings.toml` must exist and configure at least the `[ai]` section.
 3. An LLM API key must be set via the `LLM_API_KEY` environment variable
    (unless using a CLI-based provider like `claude-cli` or `copilot-cli`).
@@ -236,7 +236,7 @@ Sashiko supports three modes of operation depending on your needs:
 Use `sashiko-cli local --force-local`. This is the simplest setup for
 reviewing your own patches during development.
 
-- **Requires:** `sashiko-review` binary, `Settings.toml` with `[ai]`
+- **Requires:** `sashiko` binary, `Settings.toml` with `[ai]`
   configured, `LLM_API_KEY` set.
 - **Does not require:** a running daemon, database, NNTP, or SMTP.
 - **Results:** printed to stdout/stderr, not persisted.
@@ -312,6 +312,7 @@ model = "gemini-3.1-pro-preview"
 repository_path = "/path/to/your/kernel/tree"
 
 [review]
+concurrency = 4
 worktree_dir = "review_trees"
 ```
 

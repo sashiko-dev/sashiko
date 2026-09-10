@@ -240,11 +240,30 @@ subscription -- no per-token charge, no API key.
 cp docs/examples/Settings.codex-cli.toml Settings.toml
 ```
 
+For OpenAI's coding-optimized model, use
+`docs/examples/Settings.gpt-5-codex.toml` instead (same backend,
+`model = "gpt-5-codex"`).
+
 **What you get:**
 
 - Runs `codex exec --json --sandbox read-only` as a stateless backend
 - Prompt sent via stdin to avoid `ARG_MAX` issues
 - No tool access -- sandbox is read-only
+
+**Reasoning effort:**
+
+```toml
+[ai.codex_cli]
+effort = "xhigh"    # "none", "minimal", "low", "medium", "high", "xhigh", "max"
+```
+
+Sashiko passes this as `codex exec -c model_reasoning_effort=<effort>`,
+so the setting applies only to a reasoning model such as `gpt-5-codex`.
+A `-c` override outranks `~/.codex/config.toml`. It does not outrank an
+enterprise-managed requirements layer, which substitutes its own value
+whatever the origin. A run whose effort that layer substitutes fails
+rather than record a review at an effort other than the one configured.
+Leave the setting unset to accept the account default.
 
 #### Devin CLI Setup
 
@@ -377,3 +396,8 @@ base_url = "https://api.orcarouter.ai/v1"
 context_window_size = 128000
 max_tokens = 16384
 ```
+
+For OpenAI's own API with an API key (rather than a self-hosted
+compatible endpoint), use `docs/examples/Settings.openai-api.toml`:
+set `provider = "openai"`, `model = "gpt-5.6-sol"`, and export
+`OPENAI_API_KEY`.

@@ -497,7 +497,11 @@ impl AiProvider for BedrockClient {
                     tracing::warn!("Bedrock throttled, waiting 30s before retry...");
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 }
-                return Err(anyhow::anyhow!("Bedrock Converse API error: {e:#}"));
+                return Err(anyhow::anyhow!(
+                    "Bedrock Converse API error (model_id={}): {}",
+                    self.model_id,
+                    aws_smithy_types::error::display::DisplayErrorContext(&e)
+                ));
             }
         };
 
@@ -528,6 +532,20 @@ impl AiProvider for BedrockClient {
             model_name: self.model_id.clone(),
             context_window_size: self.context_window_size,
         }
+    }
+
+    fn cache_identity(&self) -> String {
+        // max_tokens is what truncates a response, so a raised limit has to
+        // miss the entry recorded under the lower one rather than replay it.
+        let max_tokens = self.max_tokens.to_string();
+        crate::ai::cache_identity_with(
+            &self.model_id,
+            &[
+                ("thinking", self.thinking.as_deref()),
+                ("effort", self.effort.as_deref()),
+                ("max_tokens", Some(max_tokens.as_str())),
+            ],
+        )
     }
 }
 

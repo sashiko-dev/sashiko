@@ -28,11 +28,13 @@ Therefore, `ffi::c_ulong` is always mapped to `usize` unlike userspace Rust.
 
 ## Inline annotations
 
-Functions using `build_assert!()` that depend on function parameters need to be annotated with `#[inline(always)]`.
+- **`#[inline(always)]`**: Functions using `build_assert!()` whose condition depends on function parameters MUST be annotated with `#[inline(always)]` to ensure the optimizer can perform constant folding and evaluate the assertion at compile time.
+  - *Non-violation note:* Other performance-critical or small functions are also permitted to use `#[inline(always)]` or `#[inline]`. Do NOT report `#[inline(always)]` or `#[inline]` as an issue simply because a function does not use `build_assert!()`.
 
-For abstractions *ONLY*: Functions that are small or forwarding to a binding call should be annotated with `#[inline]`. Leaf crates like drivers are exempt.
+- **`#[inline]` in abstractions vs. leaf crates**: In abstractions (e.g. the `kernel` crate), small functions or functions forwarding to a C binding call SHOULD be annotated with `#[inline]`.
+  - *Non-violation note:* Leaf crates (such as drivers) are exempt from this requirement — they are free to use or omit `#[inline]` as they see fit. Do NOT report the presence or absence of `#[inline]` in driver or leaf crate code as an issue or nit.
 
-**REPORT as nits**: if used incorrectly.
+**REPORT as nits**: if used incorrectly (e.g. an abstraction function forwarding to a binding call missing `#[inline]`, or a function using `build_assert!()` with parameters missing `#[inline(always)]`).
 
 ## Pin initialization
 

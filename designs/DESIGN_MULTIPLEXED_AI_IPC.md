@@ -224,7 +224,7 @@ impl AtomicWriter {
 
 ### 5.2. Parent Process: Concurrent Orchestration & Atomic Stdin Writing
 
-In [src/reviewer.rs:run_review_tool](file:///usr/local/google/home/kfree/sashiko_deploy/src/reviewer.rs#L1456), instead of blocking on `generate_content` sequentially inside the loop, the parent will:
+In [src/reviewer.rs:run_review_tool](../src/reviewer.rs#L1456), instead of blocking on `generate_content` sequentially inside the loop, the parent will:
 
 1.  Maintain an `Arc<Mutex<StdinWriter>>` to allow thread-safe, atomic writes to the child's `stdin`.
 2.  Continuously read lines from `stdout`.

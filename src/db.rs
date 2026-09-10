@@ -567,9 +567,7 @@ impl Database {
         let _ = self.try_add_column("patches", "status", "TEXT").await;
         let _ = self.try_add_column("patches", "apply_error", "TEXT").await;
         let _ = self.try_add_column("reviews", "provider", "TEXT").await;
-        let _ = self
-            .try_add_column("reviews", "prompts_git_hash", "TEXT")
-            .await;
+        let _ = self.try_add_column("reviews", "prompts_hash", "TEXT").await;
         let _ = self
             .try_add_column("reviews", "result_description", "TEXT")
             .await;
@@ -3351,7 +3349,7 @@ impl Database {
             .query(
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
-                        r.provider, r.prompts_git_hash, r.result_description,
+                        r.provider, r.prompts_hash, r.result_description,
                         r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
@@ -5999,6 +5997,113 @@ mod tests {
         .unwrap();
 
         assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_review_details() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "msg1", thread_id, None, "Author", "Subject", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg1"),
+                "msg1",
+                "Subject",
+                "Author",
+                100,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db.create_patch(ps_id, "msg1", 1, "diff").await.unwrap();
+
+        let baseline_id = db
+            .create_baseline(
+                Some("https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"),
+                Some("master"),
+                Some("commit_hash"),
+            )
+            .await
+            .unwrap();
+
+        db.create_ai_interaction(AiInteractionParams {
+            id: "interaction_1",
+            parent_id: None,
+            workflow_id: None,
+            provider: "gemini",
+            model: "gemini-2.5",
+            input: "prompt input",
+            output: "prompt output",
+            tokens_in: 120,
+            tokens_out: 45,
+            tokens_cached: 10,
+        })
+        .await
+        .unwrap();
+
+        let review_id = db
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "gemini",
+                "gemini-2.5",
+                Some(baseline_id),
+                Some("hash123"),
+            )
+            .await
+            .unwrap();
+
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "LGTM",
+            Some("Summary of patch"),
+            Some("interaction_1"),
+            Some("Inline comment"),
+            Some("{\"step\": \"done\"}"),
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_review_details(review_id)
+            .await
+            .unwrap()
+            .expect("review details should exist");
+        assert_eq!(details["id"], review_id);
+        assert_eq!(details["model"], "gemini-2.5");
+        assert_eq!(details["provider"], "gemini");
+        assert_eq!(details["prompts_hash"], "hash123");
+        assert_eq!(details["summary"], "Summary of patch");
+        assert_eq!(details["result"], "LGTM");
+        assert_eq!(details["status"], "Reviewed");
+        assert_eq!(details["inline_review"], "Inline comment");
+        assert_eq!(details["logs"], "{\"step\": \"done\"}");
+        assert_eq!(details["tokens_in"], 120);
+        assert_eq!(details["tokens_out"], 45);
+        assert_eq!(details["tokens_cached"], 10);
+        assert_eq!(details["baseline"]["branch"], "master");
+        assert_eq!(details["baseline"]["commit"], "commit_hash");
+
+        // Non-existent review
+        let none_details = db.get_review_details(99999).await.unwrap();
+        assert!(none_details.is_none());
     }
 
     #[tokio::test]

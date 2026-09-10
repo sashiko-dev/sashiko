@@ -103,6 +103,16 @@ impl ToolBox {
         }
     }
 
+    /// Registers an extra tool. Test-only: the review toolbox is fixed, and
+    /// this exists so a test can drive the tool loop with a tool of its own.
+    #[cfg(test)]
+    pub(crate) fn register_tool(
+        &mut self,
+        tool: impl framework::LlmTool<SashikoToolContext> + 'static,
+    ) {
+        self.registry.register(tool);
+    }
+
     /// Sets the virtual head commit SHA for the current review session.
     pub fn set_virtual_head(&mut self, sha: String) {
         let mut vhead = self.context.virtual_head.write().unwrap();

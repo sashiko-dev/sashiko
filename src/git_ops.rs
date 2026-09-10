@@ -433,6 +433,263 @@ pub async fn ensure_submodule_config_compat(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Turns off git's own maintenance of the shared repository.
+///
+/// Auto-maintenance detaches from the fetch that triggers it and
+/// repacks while the sync worker keeps fetching, so it can discard
+/// objects a later fetch still names.  Nothing runs gc in its place,
+/// so the packs the repository accumulates are the cost of this.
+///
+/// Every key is attempted whatever the ones before it did, since a
+/// key left at its default is a piece of maintenance still running,
+/// and the error names all of them.  The caller logs and carries on
+/// either way, so the rest of the daemon runs whether or not this
+/// took.
+pub async fn ensure_gc_disabled(repo_path: &Path) -> Result<()> {
+    const KEYS: &[(&str, &str)] = &[
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+        ("gc.writeCommitGraph", "false"),
+        ("fetch.writeCommitGraph", "false"),
+    ];
+
+    let mut failures = Vec::new();
+    for (key, value) in KEYS {
+        let output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["config", key, value])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            failures.push(format!(
+                "{} {}: {}",
+                key,
+                value,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(anyhow!("git config failed for {}", failures.join("; ")));
+    }
+
+    Ok(())
+}
+
+/// Locates a directory under the object store.  It follows the object
+/// directory rather than $GIT_DIR, which is why git resolves it
+/// instead of this function joining the two.
+async fn object_dir(repo_path: &Path, name: &str) -> Result<PathBuf> {
+    let relative = format!("objects/{}", name);
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-parse", "--git-path", &relative])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --git-path {} failed: {}",
+            relative,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(repo_path.join(path))
+    }
+}
+
+/// Removes the commit-graph, whole or chained.  The graph is built
+/// from the object database and holds nothing else, so removing it
+/// costs slower revision walks and loses no history.
+///
+/// This takes no object-store lock.  A write ends in a rename, so a
+/// removal racing one leaves either a fresh graph or none, and both
+/// are states the repository is already prepared for.  A fetch
+/// recovering from a stale graph calls here holding a remote lock,
+/// and waiting out a walk under that lock costs more than the race
+/// does.  Callers already holding the lock, such as
+/// write_commit_graph, depend on this staying out.
+pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
+    let info_dir = object_dir(repo_path, "info").await?;
+
+    let graph = info_dir.join("commit-graph");
+    match tokio::fs::remove_file(&graph).await {
+        Ok(()) => info!("Removed commit-graph {:?}", graph),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to remove {:?}: {}", graph, e)),
+    }
+
+    let chain = info_dir.join("commit-graphs");
+    match tokio::fs::remove_dir_all(&chain).await {
+        Ok(()) => info!("Removed commit-graph chain {:?}", chain),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to remove {:?}: {}", chain, e)),
+    }
+
+    Ok(())
+}
+
+/// Runs one `git commit-graph write`, returning git's own output.
+async fn run_commit_graph_write(repo_path: &Path) -> Result<std::process::Output> {
+    Ok(Command::new("git")
+        .current_dir(repo_path)
+        .args(["commit-graph", "write", "--reachable"])
+        .output()
+        .await?)
+}
+
+/// Counts the pack files in the object store and the bytes they take
+/// up.  Reads the pack directory rather than asking git, so the cost
+/// does not follow the number of loose objects.
+pub async fn pack_stats(repo_path: &Path) -> Result<(usize, u64)> {
+    let pack_dir = object_dir(repo_path, "pack").await?;
+
+    let mut entries = match tokio::fs::read_dir(&pack_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(anyhow!("Failed to read {:?}: {}", pack_dir, e)),
+    };
+
+    let mut packs = 0usize;
+    let mut bytes = 0u64;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            packs += 1;
+            if let Ok(meta) = entry.metadata().await {
+                bytes += meta.len();
+            }
+        }
+    }
+
+    Ok((packs, bytes))
+}
+
+/// Rebuilds the commit-graph from the current object database,
+/// dropping a graph that turns the write away and walking again.
+///
+/// The graph records what the object database holds at the moment of
+/// the walk.  A fetch running beside it costs the graph only the
+/// commits that fetch installs.  A repack is what leaves an entry
+/// with no object behind it, and the object-store lock this takes is
+/// what keeps one out.
+///
+/// The walk consults the graph already in place, so one naming lost
+/// objects fails the write the way it fails a fetch.  Nothing else
+/// here needs that graph, so drop it and rebuild from the object
+/// database alone.  This is the only pass that writes a graph, and
+/// git's verify passes a graph that is merely behind the refs, so
+/// the write cannot be made conditional on one.
+pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
+    let lock = get_object_store_lock();
+    let _guard = lock.lock().await;
+
+    info!("Writing commit-graph for {:?}", repo_path);
+    let started = std::time::Instant::now();
+
+    let mut output = run_commit_graph_write(repo_path).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if is_stale_commit_graph(&stderr) {
+            warn!(
+                "Commit-graph in {:?} outlived the objects it names; dropping it",
+                repo_path
+            );
+            drop_commit_graph(repo_path).await?;
+            output = run_commit_graph_write(repo_path).await?;
+        }
+    }
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git commit-graph write failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    info!(
+        "Wrote commit-graph for {:?} in {:.1}s",
+        repo_path,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Rebuilds the commit-graph in the background once a recovery has
+/// removed it.
+///
+/// A recovery leaves the repository walking history with no graph
+/// until something writes one back.  The walk takes minutes and every
+/// caller holds a fetch lock, so none of them can wait for it.  A
+/// rebuild already under way stands in for a later one, since it
+/// reads the object database as it finds it.  Call from a tokio
+/// runtime.
+pub fn schedule_commit_graph_rebuild(repo_path: &Path) {
+    static REBUILD_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    let lock = REBUILD_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone();
+    let repo_path = repo_path.to_path_buf();
+
+    tokio::spawn(async move {
+        let Ok(_guard) = lock.try_lock() else {
+            info!("A commit-graph rebuild is already running; skipping this one");
+            return;
+        };
+        if let Err(e) = write_commit_graph(&repo_path).await {
+            error!("Failed to rebuild the commit-graph: {}", e);
+        }
+    });
+}
+
+/// Rolls the pack directory up into a geometric progression and
+/// writes a multi-pack index over the result.
+///
+/// Loose objects join the rollup.  A fetch carrying fewer objects
+/// than transfer.unpackLimit writes them loose rather than as a pack,
+/// so they are most of what accumulates here.
+///
+/// The pass takes no reachability walk, so it removes no object.  A
+/// commit-graph entry, a worktree, or a scratch clone borrowing from
+/// this store still finds what it named.  Disk goes unreclaimed for
+/// the same reason: an object no ref can reach is rolled up with the
+/// rest.
+pub async fn repack_repository(repo_path: &Path) -> Result<()> {
+    let lock = get_object_store_lock();
+    let _guard = lock.lock().await;
+
+    info!("Repacking {:?}", repo_path);
+    let started = std::time::Instant::now();
+
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["repack", "--geometric=2", "-d", "--write-midx"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git repack failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    info!(
+        "Repacked {:?} in {:.1}s",
+        repo_path,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub async fn cleanup_worktree_dir(worktree_dir: &Path) -> Result<()> {
     if !worktree_dir.exists() {
@@ -508,6 +765,88 @@ fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
     WORKTREE_LOCK
         .get_or_init(|| Arc::new(AsyncMutex::new(())))
         .clone()
+}
+
+/// The lock every pass that walks or rewrites the shared object
+/// store takes: the commit-graph verify, the commit-graph write, and
+/// the repack.  Two writes collide on
+/// objects/info/commit-graph.lock and one of them dies.  A verify
+/// beside a write reads a graph the write is halfway through
+/// replacing.  A walk beside a repack reads the pack directory the
+/// repack is replacing.
+///
+/// Each pass runs to minutes on a tree the size of Linux, so a
+/// caller can wait that long for the lock.  None of them holds a
+/// fetch lock.
+fn get_object_store_lock() -> Arc<AsyncMutex<()>> {
+    static OBJECT_STORE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    OBJECT_STORE_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// Git's two wordings for a commit-graph that names a commit the
+/// object database does not hold.  Fetch-pack's negotiation emits
+/// the first.  The second comes from the generic commit parse, which
+/// ref negotiation, a pruning fetch, and the connectivity check all
+/// reach instead.
+const STALE_COMMIT_GRAPH: &[&str] = &[
+    "in the commit graph file but not in the object database",
+    "exists in commit-graph but not in the object database",
+];
+
+/// True when git turned an operation away over a commit-graph that
+/// outlived the objects it names.  Every path that reads the graph
+/// fails this way until the graph is dropped, so a caller that
+/// fetches has a retry worth making.
+pub fn is_stale_commit_graph(message: &str) -> bool {
+    STALE_COMMIT_GRAPH
+        .iter()
+        .any(|wording| message.contains(wording))
+}
+
+/// The least the retry after a graph drop is given, whatever the
+/// first attempt spent.  Fetch-pack rejects the graph before it opens
+/// a connection, but the wording the commit parse emits can arrive
+/// after a long transfer, which leaves nothing of the shared budget.
+/// A retry handed that reports a timeout instead of the recovery it
+/// was, and the graph outlives the cycle.
+const GRAPH_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Runs one fetch, returning git's complaint rather than an error
+/// value, since the caller decides which failures are worth a retry.
+async fn fetch_remote(
+    repo_path: &Path,
+    name: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    let fetch_future = Command::new("git")
+        .current_dir(repo_path)
+        .args(GIT_PROTOCOL_RESTRICTIONS)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
+
+    match tokio::time::timeout(timeout, fetch_future).await {
+        Ok(Ok(fetch)) => {
+            if fetch.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Failed to fetch remote {}: {}",
+                    name,
+                    String::from_utf8_lossy(&fetch.stderr).trim()
+                ))
+            }
+        }
+        Ok(Err(e)) => Err(format!("Failed to execute git fetch for {}: {}", name, e)),
+        Err(_) => Err(format!(
+            "Git fetch for {} timed out after {} seconds",
+            name,
+            timeout.as_secs()
+        )),
+    }
 }
 
 pub async fn ensure_remote(
@@ -659,13 +998,6 @@ pub async fn ensure_remote(
         }
         fetch_args.push(name);
 
-        let fetch_future = Command::new("git")
-            .current_dir(repo_path)
-            .args(GIT_PROTOCOL_RESTRICTIONS)
-            .args(fetch_args)
-            .kill_on_drop(true)
-            .output();
-
         // Dynamically scale timeout: 30 minutes for heavy initial fetches, 5 minutes for routine updates
         let timeout_duration = if just_added || !head_exists {
             std::time::Duration::from_secs(1800)
@@ -673,28 +1005,49 @@ pub async fn ensure_remote(
             std::time::Duration::from_secs(300)
         };
 
-        match tokio::time::timeout(timeout_duration, fetch_future).await {
-            Ok(Ok(fetch)) => {
-                if fetch.status.success() {
-                    fetch_ok = true;
-                } else {
-                    error_msg = format!(
-                        "Failed to fetch remote {}: {}",
-                        name,
-                        String::from_utf8_lossy(&fetch.stderr).trim()
-                    );
+        let started = std::time::Instant::now();
+        let mut attempt = fetch_remote(repo_path, name, &fetch_args, timeout_duration).await;
+
+        // Git reads the commit-graph before it opens a connection, so
+        // a graph naming lost objects fails every remote in the same
+        // way.  Drop it and let this fetch rebuild the answer from the
+        // object database.
+        let stale_graph = attempt
+            .as_ref()
+            .err()
+            .is_some_and(|message| is_stale_commit_graph(message));
+        if stale_graph {
+            warn!("Fetch for {} found a stale commit-graph; dropping it", name);
+            match drop_commit_graph(repo_path).await {
+                Ok(()) => {
+                    // Both attempts come out of the one budget.  This
+                    // holds the remote's lock, and the sync cycle
+                    // walks the remotes one at a time.  The floor is
+                    // what a first attempt that spent the budget
+                    // before it tripped leaves the retry.
+                    let remaining = timeout_duration
+                        .saturating_sub(started.elapsed())
+                        .max(GRAPH_RETRY_FLOOR);
+                    attempt = fetch_remote(repo_path, name, &fetch_args, remaining).await;
+                    match &attempt {
+                        Ok(()) => info!(
+                            "Fetch for {} succeeded once the commit-graph was gone",
+                            name
+                        ),
+                        Err(message) => warn!(
+                            "Fetch for {} fails with no commit-graph in the way: {}",
+                            name, message
+                        ),
+                    }
+                    schedule_commit_graph_rebuild(repo_path);
                 }
+                Err(e) => warn!("Failed to drop the commit-graph: {}", e),
             }
-            Ok(Err(e)) => {
-                error_msg = format!("Failed to execute git fetch for {}: {}", name, e);
-            }
-            Err(_) => {
-                error_msg = format!(
-                    "Git fetch for {} timed out after {} seconds",
-                    name,
-                    timeout_duration.as_secs()
-                );
-            }
+        }
+
+        match attempt {
+            Ok(()) => fetch_ok = true,
+            Err(message) => error_msg = message,
         }
 
         if !fetch_ok {
@@ -1080,6 +1433,46 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+
+    #[test]
+    fn test_is_stale_commit_graph_matches_both_wordings() {
+        assert!(is_stale_commit_graph(
+            "error: You are attempting to fetch 1a2b3c, which is in the \
+             commit graph file but not in the object database."
+        ));
+        assert!(is_stale_commit_graph(
+            "fatal: commit 1a2b3c exists in commit-graph but not in the \
+             object database"
+        ));
+        assert!(!is_stale_commit_graph("fatal: couldn't find remote ref"));
+    }
+
+    #[tokio::test]
+    async fn test_pack_stats_counts_only_packs() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+
+        // A repository that has never packed reports nothing.
+        assert_eq!(pack_stats(&repo_path).await?, (0, 0));
+
+        let pack_dir = object_dir(&repo_path, "pack").await?;
+        std::fs::create_dir_all(&pack_dir)?;
+        let mut pack = File::create(pack_dir.join("pack-abc.pack"))?;
+        pack.write_all(b"0123456789")?;
+        File::create(pack_dir.join("pack-abc.idx"))?;
+
+        let (packs, bytes) = pack_stats(&repo_path).await?;
+        assert_eq!(packs, 1);
+        assert_eq!(bytes, 10);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_git_ops_extensions() -> Result<()> {

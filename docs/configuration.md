@@ -71,15 +71,15 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compat`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai`, `openai-compatible`. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
 | `temperature` | float | `1.0` | Sampling temperature. |
 | `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
-| `response_cache` | bool | `false` | Cache AI responses to disk. |
-| `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). |
+| `response_cache` | bool | `false` | Cache AI responses to disk. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. |
+| `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). Entries stranded by a settings change age out on this schedule. |
 
 #### `[ai.claude]`
 
@@ -101,6 +101,14 @@ Settings for the Claude Code CLI provider (`provider = "claude-cli"`).
 |-----|------|---------|-------------|
 | `effort` | string | -- | Thinking effort: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
 
+#### `[ai.codex_cli]`
+
+Settings for the Codex CLI provider (`provider = "codex-cli"`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `effort` | string | -- | Reasoning effort: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Passed as `-c model_reasoning_effort=<effort>`, which outranks `~/.codex/config.toml` but not an enterprise-managed requirements layer. A run whose effort that layer substitutes fails. |
+
 #### `[ai.gemini]`
 
 Settings for the Gemini provider (`provider = "gemini"`).
@@ -111,13 +119,13 @@ Settings for the Gemini provider (`provider = "gemini"`).
 
 #### `[ai.openai_compat]`
 
-Settings for OpenAI-compatible providers (`provider = "openai-compat"`).
+Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-compatible"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `base_url` | string | -- | API endpoint URL. |
-| `context_window_size` | integer | -- | Context window size (optional). |
-| `max_tokens` | integer | -- | Max output tokens (optional). |
+| `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
+| `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
+| `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
 
 #### `[ai.kiro_cli]`
 

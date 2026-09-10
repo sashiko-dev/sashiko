@@ -35,7 +35,7 @@ use tracing::{debug, warn};
 
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
-    ProviderCapabilities, ToolCall,
+    ProviderCapabilities, ToolCall, cache_identity_with,
 };
 use crate::utils::utf8_prefix;
 
@@ -181,6 +181,10 @@ impl AiProvider for ClaudeCliProvider {
             model_name: self.model.clone(),
             context_window_size: context_window_for_model(&self.model),
         }
+    }
+
+    fn cache_identity(&self) -> String {
+        cache_identity_with(&self.model, &[("effort", self.effort.as_deref())])
     }
 }
 

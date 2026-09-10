@@ -1,10 +1,10 @@
 #![allow(clippy::type_complexity)]
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tokio::fs;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Point};
 
 /// Parses a unified diff and returns a map of filename -> list of modified line ranges.
@@ -19,6 +19,9 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
             let fname = fname.to_string();
             current_file = Some(fname.clone());
             files.entry(fname).or_insert_with(Vec::new);
+        } else if line.starts_with("+++ ") || line.starts_with("diff --git ") {
+            // Deleted files have no post-image and must not inherit another file's hunks.
+            current_file = None;
         } else if line.starts_with("@@")
             && let Some(fname) = &current_file
             && let Some(caps) = chunk_header_re.captures(line)
@@ -71,7 +74,71 @@ fn add_range(map: &mut LineRangeMap, path: PathBuf, start: usize, end: usize) {
     map.entry(path).or_default().insert((start, end));
 }
 
-pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String> {
+/// Immutable Git revision with a blob cache scoped to this repository and commit.
+struct SourceSnapshot<'a> {
+    repository: &'a Path,
+    sha: String,
+    blobs: HashMap<PathBuf, Arc<str>>,
+}
+
+impl<'a> SourceSnapshot<'a> {
+    async fn new(repository: &'a Path, target_sha: &str) -> Result<Self> {
+        ensure!(
+            matches!(target_sha.len(), 40 | 64)
+                && target_sha.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Prefetch requires a full target commit SHA"
+        );
+        let output = Command::new("git")
+            .current_dir(repository)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{target_sha}^{{commit}}"),
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        ensure!(
+            output.status.success(),
+            "Cannot resolve prefetch commit {target_sha}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(Self {
+            repository,
+            sha: String::from_utf8(output.stdout)?.trim().to_string(),
+            blobs: HashMap::new(),
+        })
+    }
+
+    async fn read(&mut self, path: &Path) -> Result<Arc<str>> {
+        if let Some(content) = self.blobs.get(path) {
+            return Ok(content.clone());
+        }
+        let object = format!("{}:{}", self.sha, path.display());
+        let output = Command::new("git")
+            .current_dir(self.repository)
+            .args(["show", &object])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .with_context(|| format!("Failed to read prefetch blob {object}"))?;
+        ensure!(
+            output.status.success(),
+            "Cannot read prefetch blob {object}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let content: Arc<str> = String::from_utf8(output.stdout)
+            .with_context(|| format!("Prefetch blob {object} is not UTF-8"))?
+            .into();
+        self.blobs.insert(path.to_path_buf(), content.clone());
+        Ok(content)
+    }
+}
+
+/// Gather target-commit source without depending on the physical checkout.
+pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -> Result<String> {
+    let mut snapshot = SourceSnapshot::new(repository, target_sha).await?;
     let file_ranges = parse_diff_ranges(diff);
     let mut range_map: LineRangeMap = BTreeMap::new();
     let mut symbols_to_lookup = HashSet::new();
@@ -83,21 +150,16 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
         if !file.ends_with(".c") && !file.ends_with(".h") {
             continue;
         }
-        let file_path = worktree_path.join(file);
-        if !file_path.exists() {
-            continue;
-        }
-
-        if let Ok(content) = fs::read_to_string(&file_path).await {
-            for &(start, end) in ranges {
-                for (blk_start, blk_end) in overlapping_definitions(&content, start, end) {
-                    add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
-                }
-                already_extracted.extend(extract_defined_names(&content, start, end));
-                symbols_to_lookup.extend(extract_type_names(&content, start, end));
+        let file_path = PathBuf::from(file);
+        let content = snapshot.read(&file_path).await?;
+        for &(start, end) in ranges {
+            for (blk_start, blk_end) in overlapping_definitions(&content, start, end) {
+                add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
             }
-            called_functions.extend(extract_called_functions(&content, ranges));
+            already_extracted.extend(extract_defined_names(&content, start, end));
+            symbols_to_lookup.extend(extract_type_names(&content, start, end));
         }
+        called_functions.extend(extract_called_functions(&content, ranges));
     }
 
     // Remove symbols whose definitions are already in context.
@@ -106,7 +168,7 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     }
 
     // Drop opaque container types.
-    let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, worktree_path).await;
+    let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, &snapshot);
     for sym in &opaque {
         symbols_to_lookup.remove(sym);
     }
@@ -120,7 +182,9 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
     // _ops structs are large vtables (e.g. net_device_ops) — not useful for review.
     symbols_to_lookup.retain(|s| !s.ends_with("_ops"));
 
-    let symbols: Vec<String> = symbols_to_lookup.into_iter().take(50).collect();
+    let mut symbols: Vec<String> = symbols_to_lookup.into_iter().collect();
+    symbols.sort();
+    symbols.truncate(50);
 
     // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
     if !symbols.is_empty() {
@@ -135,42 +199,46 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
             .collect();
 
         let mut cmd = Command::new("git");
-        cmd.current_dir(worktree_path)
+        cmd.current_dir(repository)
             .arg("grep")
+            .arg("--full-name")
+            .arg("--no-color")
+            .arg("-z")
             .arg("-n")
             .arg("-I")
             .arg("-P")
             .arg("-e")
             .arg(&regex_pattern)
+            .arg(&snapshot.sha)
             .arg("--")
             .arg("*.c")
-            .arg("*.h");
+            .arg("*.h")
+            .kill_on_drop(true);
 
         let output = match cmd.output().await {
             Ok(o) => o,
             Err(e) => return Err(anyhow!("Failed to run git grep: {}", e)),
         };
 
-        if !output.status.success() {
+        if !output.status.success() && output.status.code() != Some(1) {
             // git grep returns exit status 1 if no matches are found, which is not a hard error.
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                return Err(anyhow!("git grep failed: {}", stderr));
-            }
+            return Err(anyhow!("git grep failed: {}", stderr));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut candidates: HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)> =
             HashMap::new();
 
+        let revision_prefix = format!("{}:", snapshot.sha);
         for line in stdout.lines() {
-            if let Some((path_str, rest)) = line.split_once(':')
-                && let Some((line_num_str, line_content)) = rest.split_once(':')
+            if let Some(line) = line.strip_prefix(&revision_prefix)
+                && let Some((path_str, rest)) = line.split_once('\0')
+                && let Some((line_num_str, line_content)) = rest.split_once('\0')
                 && let Ok(line_num) = line_num_str.parse::<u64>()
             {
-                let abs_path = worktree_path.join(path_str);
-                let abs_path_str = abs_path.to_string_lossy();
-                if is_noisy_tree(&abs_path_str) {
+                let path = PathBuf::from(path_str);
+                if is_noisy_tree(path_str) {
                     continue;
                 }
 
@@ -188,10 +256,10 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
 
                         if is_priority {
                             if priority.len() < 32 {
-                                priority.push((abs_path.clone(), line_num));
+                                priority.push((path.clone(), line_num));
                             }
                         } else if general.len() < 32 {
-                            general.push((abs_path.clone(), line_num));
+                            general.push((path.clone(), line_num));
                         }
                     }
                 }
@@ -202,14 +270,14 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
             let mut hits = priority;
             hits.extend(general);
             if let Some((path, start, end)) =
-                best_definition_range(&sym, &hits, worktree_path, &caller_dirs).await
+                best_definition_range(&sym, &hits, &mut snapshot, &caller_dirs).await?
             {
                 add_range(&mut range_map, path, start, end);
             }
         }
     }
 
-    render_range_map(&range_map, worktree_path, &file_ranges).await
+    render_range_map(&range_map, &mut snapshot, &file_ranges).await
 }
 
 /// Merge overlapping or adjacent ranges (within `gap` lines).
@@ -233,16 +301,13 @@ fn merge_ranges(ranges: &BTreeSet<(usize, usize)>, gap: usize) -> Vec<(usize, us
 /// Modified files are rendered first (higher priority when nearing budget).
 async fn render_range_map(
     range_map: &LineRangeMap,
-    worktree_path: &Path,
+    snapshot: &mut SourceSnapshot<'_>,
     modified_files: &HashMap<String, Vec<(usize, usize)>>,
 ) -> Result<String> {
     let mut output = String::new();
     let mut current_chars = 0;
 
-    let modified_paths: HashSet<PathBuf> = modified_files
-        .keys()
-        .map(|f| worktree_path.join(f))
-        .collect();
+    let modified_paths: HashSet<PathBuf> = modified_files.keys().map(PathBuf::from).collect();
 
     // Render modified files first, then definition-only files.
     let mut ordered_files: Vec<&PathBuf> = range_map.keys().collect();
@@ -252,14 +317,9 @@ async fn render_range_map(
         let Some(ranges) = range_map.get(file_path) else {
             continue;
         };
-        let Ok(content) = fs::read_to_string(file_path).await else {
-            continue;
-        };
+        let content = snapshot.read(file_path).await?;
         let lines: Vec<&str> = content.lines().collect();
-        let relative = file_path
-            .strip_prefix(worktree_path)
-            .unwrap_or(file_path)
-            .to_string_lossy();
+        let relative = file_path.to_string_lossy();
 
         let merged = merge_ranges(ranges, 3);
 
@@ -267,6 +327,10 @@ async fn render_range_map(
             let clamped_end = std::cmp::min(end, lines.len().saturating_sub(1));
 
             let names = extract_defined_names(&content, start, clamped_end);
+            if output.is_empty() {
+                output.push_str(&format!("Source revision: {}\n\n", snapshot.sha));
+                current_chars = output.len();
+            }
             let header = if names.len() == 1 {
                 let name = names.into_iter().next().unwrap();
                 format!("--- {}:{} ({}) ---\n", relative, start + 1, name)
@@ -383,7 +447,7 @@ pub fn extract_enclosing_block(
 }
 
 // ---------------------------------------------------------------------------
-// Ripgrep + tree-sitter symbol lookup
+// Git grep + tree-sitter symbol lookup
 // ---------------------------------------------------------------------------
 
 // These directories contain userspace reimplementations of kernel primitives
@@ -391,13 +455,13 @@ pub fn extract_enclosing_block(
 // definitions and provide no signal for patch review.
 fn is_noisy_tree(path_str: &str) -> bool {
     const NOISY_PREFIXES: &[&str] = &[
-        "/tools/",
-        "/samples/",
-        "/Documentation/",
-        "/scripts/",
-        "/LICENSES/",
+        "tools/",
+        "samples/",
+        "Documentation/",
+        "scripts/",
+        "LICENSES/",
     ];
-    NOISY_PREFIXES.iter().any(|p| path_str.contains(p))
+    NOISY_PREFIXES.iter().any(|p| path_str.starts_with(p))
 }
 
 fn line_matches_symbol(line: &str, sym: &str) -> bool {
@@ -478,14 +542,14 @@ fn typedef_names_match(node: Node<'_>, sym: &str, source: &[u8]) -> bool {
     false
 }
 
-/// Pick the highest-scoring definition across all ripgrep candidates for `sym`.
+/// Pick the highest-scoring definition across all Git grep candidates for `sym`.
 /// Total score = definition kind score + proximity score.
 async fn best_definition_range(
     sym: &str,
     hits: &[(PathBuf, u64)],
-    worktree_path: &Path,
+    snapshot: &mut SourceSnapshot<'_>,
     caller_dirs: &HashSet<&str>,
-) -> Option<(PathBuf, usize, usize)> {
+) -> Result<Option<(PathBuf, usize, usize)>> {
     let mut seen = HashSet::new();
     let mut best: Option<(i32, PathBuf, usize, usize)> = None;
 
@@ -493,9 +557,7 @@ async fn best_definition_range(
         if !seen.insert(path.clone()) {
             continue;
         }
-        let Ok(content) = fs::read_to_string(path).await else {
-            continue;
-        };
+        let content = snapshot.read(path).await?;
         let Some((def_score, is_static, start, end)) = score_best_in_file_for_sym(&content, sym)
         else {
             continue;
@@ -503,17 +565,14 @@ async fn best_definition_range(
         if def_score == 0 {
             continue;
         }
-        let rel_path = path
-            .strip_prefix(worktree_path)
-            .unwrap_or(path)
-            .to_string_lossy();
+        let rel_path = path.to_string_lossy();
         let score = def_score + proximity_score(&rel_path, is_static, caller_dirs);
         match &best {
             Some((best_score, _, _, _)) if *best_score >= score => {}
             _ => best = Some((score, path.clone(), start, end)),
         }
     }
-    best.map(|(_, p, s, e)| (p, s, e))
+    Ok(best.map(|(_, p, s, e)| (p, s, e)))
 }
 
 fn proximity_score(def_path: &str, is_static: bool, caller_dirs: &HashSet<&str>) -> i32 {
@@ -623,10 +682,10 @@ fn is_common_c_word(word: &str) -> bool {
 /// A type is "opaque" if, across all modified files:
 ///   - no variable of that type is ever dereferenced (`var->member`), OR
 ///   - every dereferenced member name contains "priv"
-async fn find_opaque_types(
+fn find_opaque_types(
     types: &HashSet<String>,
     file_ranges: &HashMap<String, Vec<(usize, usize)>>,
-    worktree_path: &Path,
+    snapshot: &SourceSnapshot<'_>,
 ) -> HashSet<String> {
     if types.is_empty() {
         return HashSet::new();
@@ -640,13 +699,12 @@ async fn find_opaque_types(
     let decl_re = Regex::new(r"struct\s+(\w+)\s+\*(\w+)").unwrap();
 
     for file in file_ranges.keys() {
-        let file_path = worktree_path.join(file);
-        let Ok(content) = fs::read_to_string(&file_path).await else {
+        let Some(content) = snapshot.blobs.get(Path::new(file)) else {
             continue;
         };
 
         let mut var_to_type: Vec<(String, String)> = Vec::new();
-        for cap in decl_re.captures_iter(&content) {
+        for cap in decl_re.captures_iter(content) {
             let type_name = cap[1].to_string();
             let var_name = cap[2].to_string();
             if type_members.contains_key(type_name.as_str()) {
@@ -657,7 +715,7 @@ async fn find_opaque_types(
         for (var, typ) in &var_to_type {
             let pattern = format!(r"{}\s*->\s*(\w+)", regex::escape(var));
             if let Ok(re) = Regex::new(&pattern) {
-                for cap in re.captures_iter(&content) {
+                for cap in re.captures_iter(content) {
                     let member = cap[1].to_string();
                     type_members.get_mut(typ.as_str()).unwrap().insert(member);
                 }
@@ -832,6 +890,9 @@ pub fn extract_type_names(
     walk(scope, source_code.as_bytes(), &mut types, bounds);
     types
 }
+
+#[cfg(test)]
+mod revision_tests;
 
 #[cfg(test)]
 mod tests {

@@ -17,6 +17,9 @@ Direct discussions and feedback from the Linux kernel community.
 > "I read through the AI debug logs. What steps it took to reason that the fix is correct, and it convinced me that I'm wrong. Applied."
 > — *[Alexei Starovoitov](https://lore.kernel.org/lkml/CAADnVQ+NMQMpkG8gZPnwBD1MMPsH+uJ65C9bMeGf_YH5Cchxpg@mail.gmail.com/)*
 
+> "fixes tag is necessary indeed, but please drop 'Reported-by: Sashiko'. If we start doing such things every patch will have it."
+> — *[Alexei Starovoitov](https://lore.kernel.org/bpf/DIISYMB87J47.2N64UTCAGDXFA@gmail.com/)*
+
 ## LWN (Linux Weekly News)
 In-depth coverage from the premier Linux news source.
 * [Development tools: Sashiko, b4 review, and API specification](https://lwn.net/Articles/1063303/)

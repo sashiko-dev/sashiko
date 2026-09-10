@@ -609,6 +609,29 @@ impl AiProvider for OpenAiCompatClient {
             context_window_size: self.context_window_size,
         }
     }
+
+    fn cache_identity(&self) -> String {
+        // The endpoint and the output cap shape the reply but travel outside
+        // the request, so the bare model name cannot distinguish them. A
+        // gpt-5.x call that hit the 4096 default comes back empty with
+        // finish_reason "length"; raising max_tokens has to miss that entry
+        // rather than replay it. base_url separates two endpoints serving
+        // the same model name, and provider_type decides whether the request
+        // carries max_tokens or max_completion_tokens.
+        let max_tokens = self.max_tokens.to_string();
+        let provider_type = match self.provider_type {
+            OpenAiProviderType::OpenAi => "openai",
+            OpenAiProviderType::OpenAiCompatible => "openai-compatible",
+        };
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("max_tokens", Some(max_tokens.as_str())),
+                ("base_url", Some(self.base_url.as_str())),
+                ("provider_type", Some(provider_type)),
+            ],
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1490,5 +1513,27 @@ mod tests {
         );
         // Test strings completely lacking a valid protocol scheme format
         assert!(OpenAiCompatClient::normalize_base_url("completely-broken-input-string").is_err());
+    }
+
+    fn test_client(base_url: &str, max_tokens: u32) -> OpenAiCompatClient {
+        OpenAiCompatClient::new(
+            base_url.to_string(),
+            OpenAiProviderType::OpenAi,
+            "gpt-5.1".to_string(),
+            400_000,
+            max_tokens,
+            60,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_identity_tracks_max_tokens_and_base_url() {
+        let capped = test_client("https://api.openai.com/v1", 4096);
+        let raised = test_client("https://api.openai.com/v1", 65536);
+        assert_ne!(capped.cache_identity(), raised.cache_identity());
+
+        let elsewhere = test_client("http://localhost:1234/v1", 4096);
+        assert_ne!(capped.cache_identity(), elsewhere.cache_identity());
     }
 }

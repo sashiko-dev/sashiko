@@ -135,16 +135,7 @@ impl Reviewer {
         .await
         .expect("Failed to create AI provider");
 
-        // Mathematically derived from Sashiko's review pipeline stage composition:
-        // Stages 1-7 run in parallel (7 slots), while Stages 8-11 run sequentially (1 slot).
-        // On average, an active patch review consumes ~3 LLM slots over its execution lifetime.
-        // Thus, the global LLM request semaphore is scaled to (concurrency * 3) to fully
-        // saturate LLM capacity while gating local processes/worktrees strictly to `concurrency`.
-        let llm_concurrency = if concurrency < 2 {
-            1
-        } else {
-            std::cmp::max(1, concurrency * 3)
-        };
+        let llm_concurrency = crate::ai::concurrency_limited_provider::llm_permits(concurrency);
 
         Self {
             db,
@@ -346,6 +337,7 @@ impl Reviewer {
                 .unwrap_or(&review.patch_message_id);
             Self::queue_notifications(
                 ctx,
+                patchset.id,
                 review.patch_id,
                 &review.patch_message_id,
                 ps_msg_id,
@@ -563,7 +555,10 @@ impl Reviewer {
 
                 // Opt-out logic
                 if skip_regexes.iter().any(|re| re.is_match(_subj)) {
-                    info!("Skipping patch {} (subject matches skip filter)", patch_id);
+                    info!(
+                        "Skipping patch {}/{} (subject matches skip filter)",
+                        patchset_id, index
+                    );
                     should_skip = true;
                 }
 
@@ -573,8 +568,8 @@ impl Reviewer {
                     && !only_regexes.iter().any(|re| re.is_match(_subj))
                 {
                     info!(
-                        "Skipping patch {} (subject does not match any only filter)",
-                        patch_id
+                        "Skipping patch {}/{} (subject does not match any only filter)",
+                        patchset_id, index
                     );
                     should_skip = true;
                 }
@@ -597,8 +592,8 @@ impl Reviewer {
                         || patch_files_count > ctx.settings.review.max_files_touched
                     {
                         info!(
-                            "Skipping patch {} (exceeds size limits: {} lines, {} files)",
-                            patch_id, patch_lines_changed, patch_files_count
+                            "Skipping patch {}/{} (exceeds size limits: {} lines, {} files)",
+                            patchset_id, index, patch_lines_changed, patch_files_count
                         );
                         should_skip = true;
                     }
@@ -1377,8 +1372,8 @@ impl Reviewer {
                                         let mut skip_notify = false;
                                         if let Some(until) = embargo_until.filter(|&u| u > now) {
                                             info!(
-                                                "Review completed but embargoed until {} for patch {}",
-                                                until, patch_id
+                                                "Review completed but embargoed until {} for patch {}/{}",
+                                                until, patchset_id, index
                                             );
                                             skip_notify = true;
                                         }
@@ -1398,6 +1393,7 @@ impl Reviewer {
 
                                             if let Err(e) = Self::queue_notifications(
                                                 ctx,
+                                                patchset_id,
                                                 patch_id,
                                                 patch_msg_id,
                                                 patchset_msg_id,
@@ -1409,17 +1405,21 @@ impl Reviewer {
                                             .await
                                             {
                                                 error!(
-                                                    "Failed to queue email for patch {}: {}",
-                                                    patch_id, e
+                                                    "Failed to queue email for patch {}/{} (ID: {}): {}",
+                                                    patchset_id, index, patch_id, e
                                                 );
-                                                db_success = false;
                                             }
                                         }
                                     }
                                 }
-                                if db_success {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Reviewed").await;
+                                if !db_success {
+                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                                    return Ok(PatchResult::ReviewFailed);
                                 }
+                                // Failing the patchset over a notification
+                                // would strand it: get_pending_patchsets()
+                                // selects only Pending rows.
+                                let _ = ctx.db.update_patch_status(patch_id, "Reviewed").await;
                                 return Ok(PatchResult::Success);
                             } else if ctx.settings.ai.no_ai {
                                 info!(
@@ -1599,28 +1599,78 @@ async fn run_review_tool(
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
 ) -> Result<serde_json::Value> {
+    let cmd = default_worker_command()?;
+    run_review_tool_with_cmd(
+        cmd,
+        patchset_id,
+        input_payload,
+        settings,
+        db,
+        baseline,
+        review_index,
+        review_commit,
+        quota_manager,
+        review_id,
+        worktree_path,
+        provider,
+        llm_semaphore,
+    )
+    .await
+}
+
+fn default_worker_command() -> Result<Command> {
+    let exe_path = std::env::current_exe()?;
+    let bin_dir = exe_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let is_test_runner = bin_dir.file_name().and_then(|f| f.to_str()) == Some("deps");
+
+    let mut c = if !is_test_runner {
+        Command::new(exe_path)
+    } else if let Some(parent) = bin_dir.parent()
+        && parent.join("sashiko").exists()
+    {
+        Command::new(parent.join("sashiko"))
+    } else if bin_dir.join("sashiko").exists() {
+        Command::new(bin_dir.join("sashiko"))
+    } else {
+        warn!("Running in test runner without compiled sashiko binary, falling back to cargo run");
+        let mut c = Command::new("cargo");
+        c.args(["run", "--bin", "sashiko", "--"]);
+        c
+    };
+    c.arg("worker");
+    Ok(c)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_review_tool_with_cmd(
+    mut cmd: Command,
+    patchset_id: i64,
+    input_payload: &serde_json::Value,
+    settings: &Settings,
+    db: Arc<Database>,
+    baseline: &str,
+    review_index: Option<i64>,
+    review_commit: Option<String>,
+    quota_manager: Arc<QuotaManager>,
+    review_id: i64,
+    worktree_path: Option<&Path>,
+    provider: Arc<dyn AiProvider>,
+    llm_semaphore: Arc<Semaphore>,
+) -> Result<serde_json::Value> {
     let prompts_path = resolve_review_prompts_path(settings.review.prompts_path.as_deref())?;
 
-    let mut cmd = if let Some(ref override_bin) = settings.review.review_tool_override {
-        Command::new(override_bin)
-    } else {
-        let exe_path = std::env::current_exe()?;
-        let bin_dir = exe_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let review_bin = bin_dir.join("review");
-        if review_bin.exists() {
-            Command::new(review_bin)
-        } else {
-            warn!(
-                "Could not find review binary at {:?}, falling back to cargo run",
-                review_bin
-            );
-            let mut c = Command::new("cargo");
-            c.args(["run", "--bin", "review", "--"]);
-            c
-        }
-    };
+    // Cap concurrent model calls with the shared limiter instead of taking the
+    // semaphore by hand around each call. This also releases the permit as soon
+    // as the call returns, so a request that is backing off no longer occupies
+    // a slot while it sleeps.
+    let provider: Arc<dyn AiProvider> = Arc::new(
+        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+            provider,
+            llm_semaphore.clone(),
+        ),
+    );
 
     configure_review_command(
         &mut cmd,
@@ -1690,7 +1740,7 @@ async fn run_review_tool(
 
     let stdin_writer = Arc::new(tokio::sync::Mutex::new(stdin));
 
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::Instant as TokioInstant;
     use tokio::time::{timeout, timeout_at};
@@ -1699,6 +1749,19 @@ async fn run_review_tool(
     let deadline = Arc::new(std::sync::Mutex::new(
         TokioInstant::now() + Duration::from_secs(settings.review.timeout_seconds),
     ));
+
+    // Retry rate-limited and transient failures with the shared limiter rather
+    // than an open-coded loop. A review is bounded by its activity deadline
+    // rather than an attempt count, and time spent waiting out a rate limit is
+    // credited back so it does not consume that budget.
+    let provider: Arc<dyn AiProvider> =
+        Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+            provider,
+            quota_manager.clone(),
+            Some(Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
+                deadline.clone(),
+            ))),
+        ));
 
     let mut spawned_tasks = Vec::new();
     let interaction_result =
@@ -1719,7 +1782,6 @@ async fn run_review_tool(
             let ai_started = Arc::new(AtomicBool::new(false));
             let total_tokens_used = Arc::new(AtomicUsize::new(0));
             let total_output_tokens_used = Arc::new(AtomicUsize::new(0));
-            let turn_count = Arc::new(AtomicU32::new(0));
 
             let (abort_tx, mut abort_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
 
@@ -1773,15 +1835,11 @@ async fn run_review_tool(
 
                                         let db_clone = db.clone();
                                         let provider_clone = provider.clone();
-                                        let quota_clone = quota_manager.clone();
                                         let settings_clone = settings.clone();
                                         let stdin_clone = stdin_writer.clone();
-                                        let deadline_clone = deadline.clone();
-                                        let turn_count_clone = turn_count.clone();
                                         let total_tokens_used_clone = total_tokens_used.clone();
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
-                                        let llm_semaphore_clone = llm_semaphore.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let req: AiRequest = match serde_json::from_value(payload) {
@@ -1821,78 +1879,10 @@ async fn run_review_tool(
                                                 }
                                             }
 
-                                            let mut local_turn = turn_count_clone.fetch_add(1, Ordering::SeqCst);
-                                            local_turn += 1;
-
-                                            if settings_clone.ai.log_turns {
-                                                let n_msgs = req.messages.len();
-                                                let last = req.messages.last();
-                                                let role_str = last.map(|m| format!("{:?}", m.role).to_lowercase()).unwrap_or_default();
-                                                let content_preview = last.and_then(|m| m.content.as_deref()).unwrap_or("(no text content)");
-                                                let preview: String = content_preview.chars().take(300).collect();
-                                                let ellipsis = if content_preview.chars().count() > 300 { "…" } else { "" };
-                                                if let Some(tool_calls) = last.and_then(|m| m.tool_calls.as_ref()) {
-                                                    let names: Vec<&str> = tool_calls.iter().map(|t| t.function_name.as_str()).collect();
-                                                    info!("→ Turn {} ({} msgs): [{role_str}] tool_calls={:?}", local_turn, n_msgs, names);
-                                                } else {
-                                                    info!("→ Turn {} ({} msgs): [{role_str}] {}{}", local_turn, n_msgs, preview, ellipsis);
-                                                }
-                                            }
-
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
-                                            let resp_payload = crate::ai::LOG_CONTEXT.scope(ctx_tag, async {
-                                                let mut local_transient_errors = 0;
-                                                loop {
-                                                    let slept = quota_clone.wait_for_access().await;
-                                                    {
-                                                        let mut d = deadline_clone.lock().unwrap();
-                                                        *d += slept;
-                                                    }
-
-                                                    let current_deadline = {
-                                                        let d = deadline_clone.lock().unwrap();
-                                                        *d
-                                                    };
-
-                                                    if TokioInstant::now() > current_deadline {
-                                                        return Err(anyhow::anyhow!(
-                                                            "Review tool timed out (active time exceeded)"
-                                                        ));
-                                                    }
-
-                                                    let _permit = llm_semaphore_clone.acquire().await?;
-
-                                                    match provider_clone.generate_content(req.clone()).await {
-                                                        Ok(resp) => {
-                                                            quota_clone.report_success().await;
-                                                            break Ok(resp);
-                                                        }
-                                                        Err(e) => {
-                                                            match classify_ai_error(&e) {
-                                                                AiErrorClass::RateLimit { retry_after } => {
-                                                                    quota_clone
-                                                                        .report_quota_error(retry_after)
-                                                                        .await;
-                                                                    continue;
-                                                                }
-                                                                AiErrorClass::Transient { retry_after } => {
-                                                                    local_transient_errors += 1;
-                                                                    let backoff_secs = (1.0 * (2.0_f64.powi(local_transient_errors - 1))).min(60.0);
-                                                                    let backoff = std::time::Duration::from_secs_f64(backoff_secs).max(retry_after);
-                                                                    tracing::warn!(
-                                                                        "AI provider transient error (streak: {}). Locally backing off for {:.2}s",
-                                                                        local_transient_errors,
-                                                                        backoff.as_secs_f64()
-                                                                    );
-                                                                    tokio::time::sleep(backoff).await;
-                                                                    continue;
-                                                                }
-                                                                AiErrorClass::Fatal => break Err(e),
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }).await;
+                                            let resp_payload = crate::ai::LOG_CONTEXT
+                                                .scope(ctx_tag, provider_clone.generate_content(req.clone()))
+                                                .await;
 
                                             let reply = match resp_payload {
                                                 Ok(p) => {
@@ -1943,27 +1933,6 @@ async fn run_review_tool(
 
                                                             let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
                                                             return;
-                                                        }
-                                                    }
-
-                                                    if settings_clone.ai.log_turns {
-                                                        if let Some(content) = &p.content {
-                                                            let preview: String = content.chars().take(500).collect();
-                                                            let ellipsis = if content.chars().count() > 500 { "…" } else { "" };
-                                                            info!("← Turn {} text: {}{}", local_turn, preview, ellipsis);
-                                                        }
-                                                        if let Some(tool_calls) = &p.tool_calls {
-                                                            for call in tool_calls {
-                                                                let args_str = call.arguments.to_string();
-                                                                let args_preview: String = args_str.chars().take(200).collect();
-                                                                let ellipsis = if args_str.chars().count() > 200 { "…" } else { "" };
-                                                                info!("← Turn {} tool_call: {}({}{})", local_turn, call.function_name, args_preview, ellipsis);
-                                                            }
-                                                        }
-                                                        if let Some(usage) = &p.usage {
-                                                            info!("← Turn {} tokens: in={} out={} cached={}",
-                                                                local_turn, usage.prompt_tokens, usage.completion_tokens,
-                                                                usage.cached_tokens.unwrap_or(0));
                                                         }
                                                     }
 
@@ -2145,6 +2114,7 @@ impl Reviewer {
     #[allow(clippy::too_many_arguments)]
     async fn queue_notifications(
         ctx: &ReviewContext,
+        patchset_id: i64,
         patch_id: i64,
         patch_message_id: &str,
         patchset_message_id: &str,
@@ -2356,7 +2326,10 @@ impl Reviewer {
             }
 
             if !sent_positive_review {
-                info!("No issues found for patch {}, skipping email.", patch_id);
+                info!(
+                    "No issues found for patch {}/{} (ID: {}), skipping email.",
+                    patchset_id, index, patch_id
+                );
                 ctx.db
                     .insert_email_outbox(
                         patch_id,
@@ -2375,7 +2348,10 @@ impl Reviewer {
 
         match action {
             EmailAction::Mute => {
-                info!("Email policy muted email for patch {}", patch_id);
+                info!(
+                    "Email policy muted email for patch {}/{} (ID: {})",
+                    patchset_id, index, patch_id
+                );
                 ctx.db
                     .insert_email_outbox(
                         patch_id,
@@ -2501,7 +2477,10 @@ impl Reviewer {
                     )
                     .await?;
 
-                info!("Queued email for patch {}", patch_id);
+                info!(
+                    "Queued email for patch {}/{} (ID: {})",
+                    patchset_id, index, patch_id
+                );
             }
         }
         Ok(())
@@ -2629,7 +2608,6 @@ mod tests {
 
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
-        settings.review.review_tool_override = Some(bin_path);
         settings.review.timeout_seconds = 5;
         settings.review.prompts_path = prompts_path.map(Path::to_path_buf);
 
@@ -2666,7 +2644,8 @@ mod tests {
             .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
             .await?;
 
-        run_review_tool(
+        run_review_tool_with_cmd(
+            Command::new(&bin_path),
             ps_id,
             &json!({}),
             &settings,
@@ -2914,7 +2893,6 @@ sleep 30
 
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
-        settings.review.review_tool_override = Some(bin_path);
         settings.review.timeout_seconds = 1;
 
         let db = Arc::new(Database::new(&settings.database).await?);
@@ -2953,7 +2931,8 @@ sleep 30
 
         let completed = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            run_review_tool(
+            run_review_tool_with_cmd(
+                Command::new(&bin_path),
                 ps_id,
                 &json!({}),
                 &settings,
@@ -3003,16 +2982,9 @@ fi
 
     #[tokio::test]
     async fn test_skip_ignored_files() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let bin_path = temp_dir.path().join("mock_review");
-        std::fs::write(&bin_path, "#!/bin/sh\nexit 0")?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))?;
-
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.review.ignore_files = vec!["ignored.txt".to_string(), "ignore_dir/".to_string()];
-        settings.review.review_tool_override = Some(bin_path);
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -3244,10 +3216,7 @@ fi
         }
     }
 
-    async fn run_two_request_mock(
-        mut settings: Settings,
-        provider: Arc<dyn AiProvider>,
-    ) -> Result<()> {
+    async fn run_two_request_mock(settings: Settings, provider: Arc<dyn AiProvider>) -> Result<()> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
@@ -3263,7 +3232,6 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 "#;
         std::fs::write(&bin_path, mock_script)?;
         std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
-        settings.review.review_tool_override = Some(bin_path.clone());
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -3298,7 +3266,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
             .await?;
 
-        run_review_tool(
+        run_review_tool_with_cmd(
+            Command::new(&bin_path),
             ps_id,
             &json!({}),
             &settings,
@@ -3454,6 +3423,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3520,6 +3490,7 @@ inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchse
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",
@@ -3573,6 +3544,7 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_3,
             "msg_id_p3",
             "msg_id_1",
@@ -3677,6 +3649,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_1,
             "msg_id_p1",
             "msg_id_1",
@@ -3721,6 +3694,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Reviewer::queue_notifications(
             &ctx,
+            ps_id,
             p_id_2,
             "msg_id_p2",
             "msg_id_1",
@@ -3744,6 +3718,20 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(in_reply_to, "msg_id_p2");
         assert_eq!(references_hdr, "msg_id_1 msg_id_p2");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_worker_command() -> Result<()> {
+        let cmd = default_worker_command()?;
+        let program = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert!(program.contains("sashiko") || program == "cargo");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"worker".to_string()));
         Ok(())
     }
 }

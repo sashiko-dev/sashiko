@@ -425,6 +425,12 @@ impl AiProvider for KiroCliProvider {
             context_window_size: self.context_window_size,
         }
     }
+
+    fn cache_identity(&self) -> String {
+        // context_window_size stays out. Unlike ollama's num_ctx it never
+        // reaches the wire; it only budgets the prompt the cache hashes.
+        crate::ai::cache_identity_with(&self.model, &[("agent", self.agent.as_deref())])
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +438,23 @@ mod tests {
     use super::*;
     use crate::ai::{AiMessage, AiRole, AiTool, create_provider};
     use crate::settings::Settings;
+
+    fn test_provider(agent: Option<&str>) -> KiroCliProvider {
+        KiroCliProvider {
+            model: "claude-sonnet-4-6".to_string(),
+            binary: "kiro-cli".to_string(),
+            agent: agent.map(str::to_string),
+            context_window_size: 200_000,
+            timeout_secs: 60,
+        }
+    }
+
+    #[test]
+    fn cache_identity_tracks_agent() {
+        let base = test_provider(None);
+        let named = test_provider(Some("reviewer"));
+        assert_ne!(base.cache_identity(), named.cache_identity());
+    }
 
     fn sample_request() -> AiRequest {
         AiRequest {

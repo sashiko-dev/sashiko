@@ -1,0 +1,19 @@
+# Direct OpenAI API backend: HTTP calls to https://api.openai.com/v1/chat/completions,
+# no codex CLI. Billed per token against an API key rather than a Codex
+# subscription.
+#
+# The key comes from the environment; there is no TOML field for it:
+#   export OPENAI_API_KEY=sk-...     # LLM_API_KEY is also accepted
+[ai]
+provider = "openai"        # official API path; sends max_completion_tokens
+model = "gpt-5.6-sol"      # the "gpt-5.6" alias resolves here; "gpt-5.6-terra" is cheaper
+
+# The openai provider reads this table too. base_url and context_window_size
+# are optional; set max_tokens as well. It is sent as max_completion_tokens,
+# which on a reasoning model covers reasoning tokens as well as the reply, and
+# it falls back to 4096 when this table is absent. That leaves a reasoning
+# model little room for a reply once it has spent part of the budget thinking.
+[ai.openai_compat]
+max_tokens = 65536             # output cap, sent as max_completion_tokens
+# base_url = "https://api.openai.com/v1/chat/completions"  # auto-derived from model; set only to override
+# context_window_size = 128000   # generic fallback for gpt-5.x; raise to the model's real window

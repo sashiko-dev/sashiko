@@ -12,9 +12,9 @@ requests with project-specific guidance.
 Forge webhooks normalize a pull request into a repository URL and a
 `base..head` range. `FetchAgent` fetches the commits into the configured Git
 repository and emits patches. The reviewer applies those patches in a
-worktree, then starts the `review` subprocess. The subprocess already accepts
-`--prompts`, but the daemon does not pass it, so the subprocess installs and
-uses the bundled kernel profile.
+worktree, then starts a hidden `sashiko worker` subprocess. The worker already
+accepts `--prompts`, but the daemon does not pass it, so the worker installs
+and uses the bundled kernel profile.
 
 ## Proposed Change
 
@@ -25,7 +25,7 @@ Add an optional `prompts_path` key to `[review]`. When a daemon review starts:
 2. If `prompts_path` is present, use that local directory exactly.
 3. Validate that the selected path is a directory containing
    `review-core.md`.
-4. Pass the resolved path to the existing review subprocess with `--prompts`.
+4. Pass the resolved path to the hidden worker subprocess with `--prompts`.
 
 An invalid explicit path returns an error. It never falls back to the kernel
 profile.
@@ -33,13 +33,13 @@ profile.
 ## Compatibility
 
 The new setting is optional and uses Serde's default for old configuration
-files. The default profile is the same path currently selected by the review
-binary. Review stages, tools, AI providers, output protocol, Git baselines,
+files. The default profile is the same path currently selected by the worker.
+Review stages, tools, AI providers, output protocol, Git baselines,
 worktrees, forge ingestion, NNTP ingestion, and webhook validation are not
 changed.
 
-Existing CLI review commands keep their current `--prompts` handling. This
-change only connects daemon configuration to the already-supported review
+Existing direct review commands keep their current `--prompts` handling. This
+change only connects daemon configuration to the hidden worker's existing
 subprocess argument.
 
 ## Validation
@@ -51,7 +51,7 @@ Deterministic tests will verify:
 - an explicit local profile is preserved exactly;
 - missing and malformed explicit profiles return errors;
 - subprocess arguments contain the resolved `--prompts` value;
-- a mock review subprocess receives the configured path without an AI call.
+- a mock worker subprocess receives the configured path without an AI call.
 
 ## Non-goals
 
@@ -70,5 +70,5 @@ prompt selection seam needed for incremental project support.
 
 The new validation treats `review-core.md` as the profile entry-point marker,
 matching all currently bundled project profiles. Validation runs before the
-review subprocess is spawned, so configuration errors fail the affected
+hidden worker is spawned, so configuration errors fail the affected
 review clearly without a panic or model request.
