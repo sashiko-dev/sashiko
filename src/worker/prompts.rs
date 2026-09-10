@@ -48,7 +48,7 @@ impl ClassifyAiError for ReviewError {
 }
 
 use crate::worker::kernel_workflow::{
-    KernelReviewState, build_kernel_review_workflow_with_options, kernel_system_prompt,
+    KernelReviewState, build_kernel_review_workflow_with_options, kernel_system_prompt_for_profile,
 };
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use serde::{Deserialize, Serialize};
@@ -337,7 +337,8 @@ impl Worker {
         };
 
         if self.global_history.is_empty() {
-            let sys_template = kernel_system_prompt(true);
+            let include_project_context = self.prompts.base_dir.join("project-context.md").exists();
+            let sys_template = kernel_system_prompt_for_profile(true, include_project_context);
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
                 role: crate::ai::AiRole::System,
@@ -633,6 +634,7 @@ mod prefetch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
@@ -667,6 +669,312 @@ mod tests {
         // of that total.
         assert!(!is_counted_stage("pre-screen"));
         assert!(!is_counted_stage("planning"));
+    }
+
+    fn materialize_embedded_profile(root: &Path, profile: &str) -> PathBuf {
+        let profile_prefix = format!("{profile}/");
+        let profile_path = root.join(profile);
+
+        for &(relative, content) in crate::prompt_bundle::PROMPT_BUNDLE_FILES {
+            let Some(profile_relative) = relative.strip_prefix(&profile_prefix) else {
+                continue;
+            };
+            let destination = profile_path.join(profile_relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(destination, content).unwrap();
+        }
+
+        profile_path
+    }
+
+    struct RecordingWorkflowProvider {
+        requests: std::sync::Mutex<Vec<crate::ai::AiRequest>>,
+    }
+
+    impl RecordingWorkflowProvider {
+        fn new() -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    fn request_has_user_text(request: &crate::ai::AiRequest, needle: &str) -> bool {
+        request.messages.iter().any(|message| {
+            message.role == crate::ai::AiRole::User
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains(needle))
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for RecordingWorkflowProvider {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            let has_sashiko_context = request
+                .system
+                .as_deref()
+                .is_some_and(|system| system.contains("The project under review is Sashiko"));
+            let last_user = request
+                .messages
+                .iter()
+                .rfind(|message| message.role == crate::ai::AiRole::User)
+                .and_then(|message| message.content.as_deref())
+                .unwrap_or_default();
+            let content = if last_user.contains("<subsystem_guide_index>") {
+                if has_sashiko_context {
+                    r#"{"selected_prompts": ["async-concurrency.md", "git-subprocess.md", "webhook-security.md", "persistence-retries.md", "ai-boundaries.md"]}"#
+                } else {
+                    r#"{"selected_prompts": []}"#
+                }
+            } else if last_user.contains("determine which of the following review stages") {
+                r#"{"relevant_stages": []}"#
+            } else if (has_sashiko_context && last_user.contains("# Analyze commit main goal"))
+                || last_user.contains("# Deduplication and Consolidation")
+            {
+                r#"{"concerns":[{"type":"Correctness","description":"sashiko_fixture accepts the deterministic failure trigger","reasoning":"The added function has no guard for the fixture's invalid state, so the trigger reaches the failure path.","preexisting":false,"locations":[{"file":"src/lib.rs","function_or_symbol":"sashiko_fixture","line":1,"code_snippet":"fn sashiko_fixture() {}","why_this_location_matters":"The new function is the reachable source of the deterministic fixture defect."}]}],"dismissed_concerns":[]}"#
+            } else if last_user.contains("# Concern/dismissed-concern conflict resolution") {
+                r#"{"concerns":[{"type":"Correctness","description":"sashiko_fixture accepts the deterministic failure trigger","reasoning":"The added function has no guard for the fixture's invalid state, so the trigger reaches the failure path.","preexisting":false,"locations":[{"file":"src/lib.rs","function_or_symbol":"sashiko_fixture","line":1,"code_snippet":"fn sashiko_fixture() {}","why_this_location_matters":"The new function is the reachable source of the deterministic fixture defect."}]}]}"#
+            } else if last_user.contains("# Verification and severity estimation") {
+                r#"{"findings":[{"problem":"sashiko_fixture accepts the deterministic failure trigger","severity":"Medium","severity_explanation":"The invalid state deterministically reaches the newly added unguarded function and causes a recoverable failed review.","preexisting":false,"locations":[{"file":"src/lib.rs","function_or_symbol":"sashiko_fixture","line":1,"code_snippet":"fn sashiko_fixture() {}","why_this_location_matters":"The new function is the reachable source of the deterministic fixture defect."}]}]}"#
+            } else if last_user.contains("# LKML-friendly report generation") {
+                "commit target-sha\nAuthor: Fixture Author\nSubject: deterministic fixture\n\n> +fn sashiko_fixture() {}\n\n[Severity: Medium]\nIn src/lib.rs, sashiko_fixture accepts the deterministic failure trigger and can cause a recoverable failed review.\n"
+            } else {
+                r#"{"concerns": [], "dismissed_concerns": []}"#
+            };
+
+            self.requests.lock().unwrap().push(request);
+            Ok(crate::ai::AiResponse {
+                content: Some(content.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "recording-workflow-provider".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    async fn run_recorded_workflow(
+        worktree_path: &Path,
+        profile_path: PathBuf,
+    ) -> (WorkerResult, Vec<crate::ai::AiRequest>) {
+        let provider = std::sync::Arc::new(RecordingWorkflowProvider::new());
+        let tools = crate::toolbox::ToolBox::new(worktree_path.to_path_buf(), None);
+        let prompts = PromptRegistry::new(profile_path);
+        let config = WorkerConfig {
+            max_input_tokens: 100_000,
+            max_interactions: 2,
+            temperature: 0.0,
+            series_range: Some("base-sha..target-sha".to_string()),
+            baseline_sha: Some("base-sha".to_string()),
+            custom_prompt: None,
+            stages: None,
+        };
+        let mut worker = Worker::new(
+            provider.clone(),
+            std::sync::Arc::new(tools),
+            prompts,
+            config,
+        );
+        let patchset = json!({
+            "id": 4242,
+            "patch_index": 1,
+            "patches": [{
+                "index": 1,
+                "subject": "deterministic fixture",
+                "commit_id": "target-sha",
+                "diff": "diff --git a/src/lib.rs b/src/lib.rs\n+fn sashiko_fixture() {}"
+            }]
+        });
+
+        let result = worker.run(patchset, None).await.unwrap();
+        let requests = provider.requests.lock().unwrap().clone();
+        (result, requests)
+    }
+
+    #[tokio::test]
+    async fn test_absent_project_context_preserves_provider_requests() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (result, requests) =
+            run_recorded_workflow(temp_dir.path(), temp_dir.path().to_path_buf()).await;
+
+        assert_eq!(requests.len(), 5, "the real multi-stage workflow must run");
+        assert!(requests.iter().all(|request| {
+            !request
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("The project under review is Sashiko")
+        }));
+        let compact_system = result
+            .history
+            .first()
+            .and_then(|message| message.content.as_deref())
+            .expect("compact system history");
+        assert!(
+            !compact_system.contains("@project-context.md"),
+            "an absent optional profile file must not change compact history bytes"
+        );
+        assert_eq!(result.output.unwrap()["review_inline"], "No issues found.");
+    }
+
+    #[tokio::test]
+    async fn test_sashiko_context_reaches_actual_provider_requests() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let profile_path = materialize_embedded_profile(temp_dir.path(), "sashiko");
+        let marker = "The project under review is Sashiko";
+
+        for required in [
+            "review-core.md",
+            "project-context.md",
+            "subsystem/subsystem.md",
+            "technical-patterns.md",
+            "callstack.md",
+            "false-positive-guide.md",
+            "severity.md",
+            "inline-template.md",
+            "patterns/async-concurrency.md",
+            "patterns/git-subprocess.md",
+            "patterns/webhook-security.md",
+            "patterns/persistence-retries.md",
+            "patterns/ai-boundaries.md",
+        ] {
+            assert!(
+                profile_path.join(required).is_file(),
+                "missing materialized profile file: {required}"
+            );
+        }
+
+        let (result, requests) = run_recorded_workflow(temp_dir.path(), profile_path).await;
+
+        assert_eq!(
+            requests.len(),
+            9,
+            "the active workflow must reach analysis and finalization stages"
+        );
+        assert!(requests.iter().all(|request| {
+            request.system.as_deref().is_some_and(|system| {
+                system.contains(marker)
+                    && system.contains("take precedence over generic Linux-kernel roles")
+            })
+        }));
+        assert!(requests.iter().skip(1).all(|request| {
+            request.system.as_deref().is_some_and(|system| {
+                system.contains("Async and Concurrency Boundaries")
+                    && system.contains("Git, Filesystem, and Subprocess Boundaries")
+                    && system.contains("Webhook and Repository Security Boundaries")
+                    && system.contains("Persistence, Retry, and Recovery Boundaries")
+                    && system.contains("AI Provider and Cost Boundaries")
+            })
+        }));
+        let prescreen = requests
+            .iter()
+            .find(|request| request_has_user_text(request, "<subsystem_guide_index>"))
+            .expect("prescreen provider request");
+        assert!(request_has_user_text(prescreen, "Sashiko Guide Index"));
+        let execution_flow = requests
+            .iter()
+            .find(|request| request_has_user_text(request, "# Execution flow verification"))
+            .expect("execution-flow provider request");
+        assert!(request_has_user_text(
+            execution_flow,
+            "Sashiko Call-Path Analysis"
+        ));
+        assert!(request_has_user_text(
+            execution_flow,
+            "Sashiko Technical Review Patterns"
+        ));
+
+        for stage in [
+            "# Analyze commit main goal",
+            "# Deduplication and Consolidation",
+            "# Concern/dismissed-concern conflict resolution",
+            "# Verification and severity estimation",
+            "# LKML-friendly report generation",
+        ] {
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request_has_user_text(request, stage)),
+                "missing provider request for {stage}"
+            );
+        }
+
+        let verification = requests
+            .iter()
+            .find(|request| {
+                request_has_user_text(request, "# Verification and severity estimation")
+            })
+            .expect("verification provider request");
+        assert!(request_has_user_text(
+            verification,
+            "Sashiko False-Positive Guide"
+        ));
+        assert!(request_has_user_text(
+            verification,
+            "Sashiko Severity Levels"
+        ));
+        assert!(request_has_user_text(
+            verification,
+            "Severity is determined by demonstrated impact and reachability"
+        ));
+
+        let report = requests
+            .iter()
+            .find(|request| request_has_user_text(request, "# LKML-friendly report generation"))
+            .expect("report provider request");
+        assert!(request_has_user_text(
+            report,
+            "Sashiko Inline Review Format"
+        ));
+        for required in [
+            "Start with `commit <hash>`",
+            "the lowercase word `commit`",
+            "exactly one",
+            "space, then the reviewed commit hash, with no colon",
+        ] {
+            assert!(
+                request_has_user_text(report, required),
+                "missing inline-format rule: {required}"
+            );
+        }
+
+        let compact_system = result
+            .history
+            .first()
+            .and_then(|message| message.content.as_deref())
+            .expect("compact system history");
+        assert!(compact_system.contains("@project-context.md"));
+
+        let output = result.output.expect("structured worker output");
+        assert_eq!(output["concerns_count"], 1);
+        assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(output["findings"][0]["severity"], "Medium");
+        assert!(
+            output["review_inline"]
+                .as_str()
+                .unwrap()
+                .starts_with("commit target-sha\nAuthor: Fixture Author")
+        );
+        assert_ne!(output["review_inline"], "No issues found.");
     }
 
     #[test]

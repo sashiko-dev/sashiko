@@ -107,4 +107,38 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_prompt_bundle_contains_complete_sashiko_profile() {
+        let required = [
+            "sashiko/review-core.md",
+            "sashiko/project-context.md",
+            "sashiko/subsystem/subsystem.md",
+            "sashiko/technical-patterns.md",
+            "sashiko/callstack.md",
+            "sashiko/false-positive-guide.md",
+            "sashiko/severity.md",
+            "sashiko/inline-template.md",
+            "sashiko/patterns/async-concurrency.md",
+            "sashiko/patterns/git-subprocess.md",
+            "sashiko/patterns/webhook-security.md",
+            "sashiko/patterns/persistence-retries.md",
+            "sashiko/patterns/ai-boundaries.md",
+        ];
+
+        for required_path in required {
+            assert!(
+                PROMPT_BUNDLE_FILES
+                    .iter()
+                    .any(|(path, _)| *path == required_path),
+                "missing bundled Sashiko prompt: {required_path}"
+            );
+        }
+        assert!(
+            !PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(path, _)| *path == "sashiko/README.md"),
+            "the trusted profile bundle must not advertise a candidate-relative prompt path"
+        );
+    }
 }

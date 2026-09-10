@@ -46,6 +46,10 @@ fn main() {
 
     let mut files = Vec::new();
     collect_files(&prompts_dir, &prompts_dir, &mut files).unwrap();
+    // The Sashiko README documents source-checkout usage. It is not runtime
+    // guidance and must not advertise candidate-relative paths from the
+    // installed trusted profile. Existing profile documentation is unchanged.
+    files.retain(|(relative, _)| relative != "sashiko/README.md");
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let revision = fs::read_to_string(prompts_dir.join("REVISION"))

@@ -114,14 +114,34 @@ pub struct VerificationOutput {
 // ---------------------------------------------------------------------------
 
 pub fn kernel_system_prompt(use_log: bool) -> PromptTemplate<KernelReviewState> {
+    kernel_system_prompt_for_profile(use_log, true)
+}
+
+pub(crate) fn kernel_system_prompt_for_profile(
+    use_log: bool,
+    include_project_context: bool,
+) -> PromptTemplate<KernelReviewState> {
     let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
+    kernel_system_prompt_with_project_context(use_log, include_project_context, &current_date)
+}
+
+fn kernel_system_prompt_with_project_context(
+    use_log: bool,
+    include_project_context: bool,
+    current_date: &str,
+) -> PromptTemplate<KernelReviewState> {
     let diff_var = if use_log {
         "{{target_commit_diff}}"
     } else {
         "{{target_commit_diff_only}}"
     };
+    let project_context_directive = if include_project_context {
+        "@include(\"project-context.md\")"
+    } else {
+        ""
+    };
 
-    PromptTemplate::<KernelReviewState>::new(format!(
+    let template = PromptTemplate::<KernelReviewState>::new(format!(
         r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.
 
 You are an expert Linux kernel maintainer. Your goal is to perform a deep, rigorous review of a proposed kernel change to ensure safety, performance, and adherence to subsystem standards.
@@ -132,7 +152,7 @@ If tool output is truncated ('truncated': true), page only if directly relevant 
 
 <global_review_guidelines>
 The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.
-@includes
+{project_context_directive}@includes
 </global_review_guidelines>
 
 === Active Git Metadata ===
@@ -167,8 +187,13 @@ Target Commit:
         s.custom_prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()).map_or_else(String::new, |p| {
             format!("\n\n<custom_instructions>\n{p}\n</custom_instructions>")
         })
-    })
-    .include_files_from_state(|s: &KernelReviewState| {
+    });
+    let template = if include_project_context {
+        template.include_file("project-context.md")
+    } else {
+        template
+    };
+    template.include_files_from_state(|s: &KernelReviewState| {
         let mut paths = Vec::new();
         if !s.selected_guides.is_empty() {
             for guide in &s.selected_guides {
@@ -432,11 +457,25 @@ fn append_stage_dismissed_concerns(dest: &mut Vec<Value>, src: &[Value], stage: 
 // Stage Definitions
 // ---------------------------------------------------------------------------
 
+fn prescreen_system_prompt(include_project_context: bool) -> PromptTemplate<KernelReviewState> {
+    let project_context_directive = if include_project_context {
+        "@include(\"project-context.md\")"
+    } else {
+        ""
+    };
+    let template = PromptTemplate::<KernelReviewState>::new(format!(
+        "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}}\n```{project_context_directive}",
+    ));
+    if include_project_context {
+        template.include_file("project-context.md")
+    } else {
+        template
+    }
+}
+
 pub fn prescreen_stage() -> Stage<KernelReviewState, PrescreenOutput> {
     Stage::builder("pre-screen")
-        .system_prompt(PromptTemplate::<KernelReviewState>::new(
-            "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```",
-        ))
+        .system_prompt(prescreen_system_prompt(true))
         .user_prompt(
             PromptTemplate::<KernelReviewState>::new(
                 "<subsystem_guide_index>\n@include(\"subsystem/subsystem.md\")\n</subsystem_guide_index>\n\n<patch>\n{{target_commit_diff}}\n</patch>",
@@ -1125,6 +1164,33 @@ pub fn build_kernel_review_workflow_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_absent_project_context_preserves_active_system_prompt_bytes() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let state = KernelReviewState::default();
+        let current_date = "Monday, January 01, 2001";
+
+        let rendered = kernel_system_prompt_with_project_context(true, true, current_date)
+            .render_for_model(&state, base_dir.path())
+            .await
+            .unwrap();
+        let legacy = kernel_system_prompt_with_project_context(true, false, current_date)
+            .render_for_model(&state, base_dir.path())
+            .await
+            .unwrap();
+        assert_eq!(rendered.as_bytes(), legacy.as_bytes());
+
+        let rendered_prescreen = prescreen_system_prompt(true)
+            .render_for_model(&state, base_dir.path())
+            .await
+            .unwrap();
+        let legacy_prescreen = prescreen_system_prompt(false)
+            .render_for_model(&state, base_dir.path())
+            .await
+            .unwrap();
+        assert_eq!(rendered_prescreen.as_bytes(), legacy_prescreen.as_bytes());
+    }
 
     #[test]
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {
