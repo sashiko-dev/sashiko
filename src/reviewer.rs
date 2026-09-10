@@ -23,6 +23,7 @@ use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
+use crate::prompt_bundle::resolve_review_prompts_path;
 use crate::settings::Settings;
 use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
@@ -1531,6 +1532,59 @@ impl Reviewer {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn configure_review_command(
+    cmd: &mut Command,
+    settings: &Settings,
+    baseline: &str,
+    prompts_path: &Path,
+    review_index: Option<i64>,
+    review_commit: Option<&str>,
+    worktree_path: Option<&Path>,
+) {
+    cmd.args([
+        "--json",
+        "--baseline",
+        baseline,
+        "--worktree-dir",
+        &settings.review.worktree_dir,
+        "--ai-provider",
+        match settings.ai.provider.as_str() {
+            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli" => {
+                "stdio-claude"
+            }
+            _ => "stdio-gemini",
+        },
+    ]);
+
+    if let Some(idx) = review_index {
+        cmd.arg("--review-patch-index").arg(idx.to_string());
+    }
+
+    if let Some(commit) = review_commit {
+        cmd.arg("--review-commit").arg(commit);
+    }
+
+    if settings.ai.no_ai {
+        cmd.arg("--no-ai");
+    }
+
+    if let Some(path) = worktree_path {
+        cmd.arg("--reuse-worktree").arg(path);
+    }
+
+    if let Some(stages) = &settings.review.stages {
+        let stages_str = stages
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        cmd.arg("--stages").arg(stages_str);
+    }
+
+    cmd.arg("--prompts").arg(prompts_path);
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_review_tool(
     patchset_id: i64,
     input_payload: &serde_json::Value,
@@ -1605,6 +1659,8 @@ async fn run_review_tool_with_cmd(
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
 ) -> Result<serde_json::Value> {
+    let prompts_path = resolve_review_prompts_path(settings.review.prompts_path.as_deref())?;
+
     // Cap concurrent model calls with the shared limiter instead of taking the
     // semaphore by hand around each call. This also releases the permit as soon
     // as the call returns, so a request that is backing off no longer occupies
@@ -1615,20 +1671,16 @@ async fn run_review_tool_with_cmd(
             llm_semaphore.clone(),
         ),
     );
-    cmd.args([
-        "--json",
-        "--baseline",
+
+    configure_review_command(
+        &mut cmd,
+        settings,
         baseline,
-        "--worktree-dir",
-        &settings.review.worktree_dir,
-        "--ai-provider",
-        match settings.ai.provider.as_str() {
-            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli" => {
-                "stdio-claude"
-            }
-            _ => "stdio-gemini",
-        },
-    ]);
+        &prompts_path,
+        review_index,
+        review_commit.as_deref(),
+        worktree_path,
+    );
 
     cmd.env_clear();
 
@@ -1649,31 +1701,6 @@ async fn run_review_tool_with_cmd(
         if key.starts_with("SASHIKO_") {
             cmd.env(&key, &value);
         }
-    }
-
-    if let Some(idx) = review_index {
-        cmd.arg("--review-patch-index").arg(idx.to_string());
-    }
-
-    if let Some(commit) = review_commit {
-        cmd.arg("--review-commit").arg(commit);
-    }
-
-    if settings.ai.no_ai {
-        cmd.arg("--no-ai");
-    }
-
-    if let Some(path) = worktree_path {
-        cmd.arg("--reuse-worktree").arg(path);
-    }
-
-    if let Some(stages) = &settings.review.stages {
-        let stages_str = stages
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        cmd.arg("--stages").arg(stages_str);
     }
 
     cmd.stdin(Stdio::piped());
@@ -2571,6 +2598,7 @@ mod tests {
     async fn run_single_ai_request_mock(
         mock_script: &str,
         provider: Arc<dyn AiProvider>,
+        prompts_path: Option<&Path>,
     ) -> Result<Value> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
@@ -2581,6 +2609,7 @@ mod tests {
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.review.timeout_seconds = 5;
+        settings.review.prompts_path = prompts_path.map(Path::to_path_buf);
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -2631,6 +2660,100 @@ mod tests {
             Arc::new(Semaphore::new(56)),
         )
         .await
+    }
+
+    #[test]
+    fn test_review_command_contains_resolved_prompts_path() -> Result<()> {
+        let settings = Settings::new()?;
+        let prompts_path = Path::new("/tmp/sashiko-prompts");
+        let mut command = Command::new("review");
+
+        configure_review_command(
+            &mut command,
+            &settings,
+            "HEAD^",
+            prompts_path,
+            Some(2),
+            Some("deadbeef"),
+            None,
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let prompts_index = args
+            .iter()
+            .position(|arg| arg == "--prompts")
+            .expect("review command must contain --prompts");
+        assert_eq!(args[prompts_index + 1], prompts_path.to_string_lossy());
+        assert!(args.windows(2).any(|args| args == ["--baseline", "HEAD^"]));
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--review-patch-index", "2"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--review-commit", "deadbeef"])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configured_prompts_reach_review_subprocess() -> Result<()> {
+        let prompts_root = tempdir()?;
+        let prompts_path = prompts_root
+            .path()
+            .join("profile; $(not-a-command) with spaces");
+        std::fs::create_dir(&prompts_path)?;
+        std::fs::write(prompts_path.join("review-core.md"), "# Sashiko review\n")?;
+
+        let mock_script = r#"#!/bin/bash
+prompts=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--prompts" ]; then
+        prompts="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+read -r input
+printf '{"patchset_id":1,"prompts":"%s","patches":[{"index":1,"status":"applied"}]}\n' "$prompts"
+"#;
+
+        let result =
+            run_single_ai_request_mock(mock_script, Arc::new(MockProvider), Some(&prompts_path))
+                .await?;
+
+        assert_eq!(result["prompts"], prompts_path.to_string_lossy().as_ref());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_invalid_prompts_do_not_spawn_review_subprocess() -> Result<()> {
+        let temp = tempdir()?;
+        let missing = temp.path().join("missing-profile");
+        let sentinel = temp.path().join("subprocess-was-spawned");
+        let mock_script = format!(
+            "#!/bin/bash\ntouch '{}'\nprintf '{{\"patchset_id\":1,\"patches\":[]}}\\n'\n",
+            sentinel.display()
+        );
+
+        let error =
+            run_single_ai_request_mock(&mock_script, Arc::new(MockProvider), Some(&missing))
+                .await
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured prompts path is not a directory")
+        );
+        assert!(!sentinel.exists());
+        Ok(())
     }
 
     #[tokio::test]
@@ -2749,7 +2872,8 @@ else
 fi
 "#;
 
-        let result = run_single_ai_request_mock(mock_script, Arc::new(FailingProvider)).await?;
+        let result =
+            run_single_ai_request_mock(mock_script, Arc::new(FailingProvider), None).await?;
 
         assert_eq!(result["patches"][0]["status"], "typed_fatal");
         Ok(())
@@ -2849,7 +2973,7 @@ fi
         });
         let provider_for_tool: Arc<dyn AiProvider> = provider.clone();
 
-        let result = run_single_ai_request_mock(mock_script, provider_for_tool).await?;
+        let result = run_single_ai_request_mock(mock_script, provider_for_tool, None).await?;
 
         assert_eq!(result["patches"][0]["status"], "applied");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
