@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -53,11 +54,34 @@ fn main() {
         .trim()
         .to_string();
 
+    // The extracted prompt tree is keyed on this digest rather than on REVISION: local
+    // prompt edits land without bumping REVISION, so a REVISION-keyed cache serves them
+    // stale forever.
+    let mut hasher = Sha256::new();
+    for (relative, absolute) in &files {
+        let bytes = fs::read(absolute).unwrap();
+        hasher.update(relative.as_bytes());
+        hasher.update(b"\0");
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
     let mut generated_bytes = Vec::new();
     writeln!(
         generated_bytes,
         "pub const PROMPT_BUNDLE_REVISION: &str = {:?};",
         revision
+    )
+    .unwrap();
+    writeln!(
+        generated_bytes,
+        "pub const PROMPT_BUNDLE_DIGEST: &str = {:?};",
+        digest
     )
     .unwrap();
     writeln!(

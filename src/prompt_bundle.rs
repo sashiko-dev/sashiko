@@ -47,6 +47,8 @@ pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
+    // The directory is named by content digest, so the marker is the only place an
+    // extracted tree records which upstream revision it came from.
     std::fs::write(&marker, PROMPT_BUNDLE_REVISION)
         .with_context(|| format!("failed to write {}", marker.display()))?;
 
@@ -56,7 +58,7 @@ pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
 pub fn prompt_bundle_root() -> Result<PathBuf> {
     Ok(data_home()?
         .join("sashiko/prompts")
-        .join(PROMPT_BUNDLE_REVISION))
+        .join(PROMPT_BUNDLE_DIGEST))
 }
 
 fn data_home() -> Result<PathBuf> {
@@ -74,6 +76,25 @@ fn data_home() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn test_prompt_bundle_digest_tracks_bundle_content() {
+        let mut hasher = Sha256::new();
+        for (relative, content) in PROMPT_BUNDLE_FILES {
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            hasher.update((content.len() as u64).to_le_bytes());
+            hasher.update(content);
+        }
+        let expected: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        assert_eq!(PROMPT_BUNDLE_DIGEST, expected);
+    }
 
     #[test]
     fn test_prompt_bundle_contains_kernel_review_core() {
@@ -96,7 +117,7 @@ mod tests {
             prompt_bundle_root().unwrap(),
             temp.path()
                 .join("sashiko/prompts")
-                .join(PROMPT_BUNDLE_REVISION)
+                .join(PROMPT_BUNDLE_DIGEST)
         );
 
         unsafe {
