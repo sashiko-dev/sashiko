@@ -85,6 +85,30 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_bundle_root_uses_xdg_data_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", temp.path());
+        }
+
+        assert_eq!(
+            prompt_bundle_root().unwrap(),
+            temp.path()
+                .join("sashiko/prompts")
+                .join(PROMPT_BUNDLE_REVISION)
+        );
+
+        unsafe {
+            if let Some(value) = old_xdg {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
+    }
+
+    #[test]
     fn test_prompt_bundle_contains_complete_sashiko_profile() {
         let required = [
             "sashiko/review-core.md",
@@ -116,29 +140,5 @@ mod tests {
                 .any(|(path, _)| *path == "sashiko/README.md"),
             "the trusted profile bundle must not advertise a candidate-relative prompt path"
         );
-    }
-
-    #[test]
-    fn test_prompt_bundle_root_uses_xdg_data_home() {
-        let temp = tempfile::tempdir().unwrap();
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", temp.path());
-        }
-
-        assert_eq!(
-            prompt_bundle_root().unwrap(),
-            temp.path()
-                .join("sashiko/prompts")
-                .join(PROMPT_BUNDLE_REVISION)
-        );
-
-        unsafe {
-            if let Some(value) = old_xdg {
-                std::env::set_var("XDG_DATA_HOME", value);
-            } else {
-                std::env::remove_var("XDG_DATA_HOME");
-            }
-        }
     }
 }
