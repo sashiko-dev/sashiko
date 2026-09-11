@@ -308,6 +308,36 @@ fn default_kiro_cli_context_window() -> usize {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
+pub struct GooseCliSettings {
+    #[serde(default = "default_goose_cli_binary")]
+    pub binary: String,
+    /// Backend goose itself talks to, passed as GOOSE_PROVIDER. Use "openai"
+    /// with an OPENAI_HOST override for a local vLLM server.
+    #[serde(default = "default_goose_cli_provider")]
+    pub goose_provider: String,
+    /// Environment overrides for the goose child process, e.g. OPENAI_HOST.
+    /// goose inherits Sashiko's environment; these entries win.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_goose_cli_context_window")]
+    pub context_window_size: usize,
+}
+
+fn default_goose_cli_binary() -> String {
+    "goose".to_string()
+}
+
+fn default_goose_cli_provider() -> String {
+    "openai".to_string()
+}
+
+fn default_goose_cli_context_window() -> usize {
+    128_000
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
 pub struct ClaudeCliSettings {
     /// Effort level passed to `claude --effort`. Valid values per Claude Code:
     /// "low", "medium", "high", "xhigh", "max". Leave unset for the model default.
@@ -380,6 +410,7 @@ pub struct AiSettings {
     pub ollama: Option<OllamaSettings>,
     pub vllm: Option<VllmSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
+    pub goose_cli: Option<GooseCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
     pub codex_cli: Option<CodexCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,

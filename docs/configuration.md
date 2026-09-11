@@ -137,6 +137,17 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | `agent` | string | -- | Custom agent name (optional). |
 | `context_window_size` | integer | `200000` | Context window size. |
 
+#### `[ai.goose_cli]`
+
+Settings for the goose provider (`provider = "goose"`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `binary` | string | `"goose"` | Path to the goose binary. |
+| `goose_provider` | string | `"openai"` | Backend goose itself talks to, passed as GOOSE_PROVIDER. |
+| `env` | table | `{}` | Environment overrides for the goose child process, e.g. `OPENAI_HOST`. goose inherits Sashiko's environment; these entries win. |
+| `context_window_size` | integer | `128000` | Context window size. goose adds roughly 5k tokens of its own prompt, so keep `max_input_tokens` well below this. |
+
 ### `[server]`
 
 | Key | Type | Default | Description |

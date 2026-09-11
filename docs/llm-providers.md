@@ -226,6 +226,64 @@ cp docs/examples/Settings.kiro-cli.toml Settings.toml
 - An isolated temporary agent with a deny-all hook prevents accidental
   tool execution
 
+## goose
+
+Uses [goose](https://goose-docs.ai/) as the completion backend.
+goose speaks the Agent Client Protocol on stdio, and it fronts any backend
+goose itself supports, which makes this the shortest path to a fully local
+review: goose in front of a vLLM or Ollama server.
+
+Like Sashiko, goose is a Linux Foundation project -- it sits under the
+[Agentic AI Foundation (AAIF)](https://aaif.io/).
+
+**Prerequisites:** Install `goose` and make sure the backend it points at is
+reachable.
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.goose-cli.toml Settings.toml
+```
+
+**What you get:**
+
+- Runs `goose acp` as a stateless completion backend
+- Each request gets a throwaway `XDG_CONFIG_HOME` whose `config.yaml` pins
+  goose to chat mode, so goose never runs a tool of its own and Sashiko's
+  tool protocol stays the only tool layer
+- The throwaway config also keeps the user's own goose configuration,
+  extensions and session history out of a review
+- Token usage is taken from goose's own `session/prompt` accounting rather
+  than estimated
+
+**Pointing goose at a local model:**
+
+```toml
+[ai]
+provider = "goose"
+model = "qwen3-8b-ov"
+
+[ai.goose_cli]
+goose_provider = "openai"
+context_window_size = 32768
+
+[ai.goose_cli.env]
+OPENAI_HOST = "http://localhost:8000"
+OPENAI_BASE_PATH = "v1/chat/completions"
+OPENAI_API_KEY = "dummy"
+```
+
+`goose_provider` accepts any goose provider id (`openai`, `ollama`,
+`anthropic`, `google`, ...). The `[ai.goose_cli.env]` table is passed to the
+goose child process; goose inherits Sashiko's environment, so exported
+variables work too and the table only overrides them. Keep real API keys in
+the environment rather than in the settings file.
+
+goose prepends its own system prompt and platform tool schemas to every
+request, which costs roughly 5k tokens before Sashiko's prompt is even
+counted. Set `max_input_tokens` well below `context_window_size` so a review
+prompt plus that overhead still fits.
+
 ## Codex CLI
 
 Uses a local [Codex CLI](https://github.com/openai/codex) (OpenAI)

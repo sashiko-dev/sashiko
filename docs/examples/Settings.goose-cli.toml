@@ -1,0 +1,29 @@
+[ai]
+provider = "goose"
+# Model identifier the goose backend serves. For a local vLLM server this is
+# the --served-model-name value.
+model = "qwen3-8b-ov"
+api_timeout_secs = 1800
+# goose prepends its own system prompt and platform tool schemas (~5k tokens)
+# to every request, so leave headroom below the server's context length.
+max_input_tokens = 4000
+max_interactions = 50
+
+[ai.goose_cli]
+binary = "goose"
+# Backend goose itself talks to. Any goose provider id works: "openai",
+# "ollama", "anthropic", "google", ...
+goose_provider = "openai"
+context_window_size = 32768
+
+# Environment for the goose child process. goose inherits Sashiko's
+# environment; these entries win. Point the OpenAI-compatible client at a
+# local vLLM server:
+[ai.goose_cli.env]
+OPENAI_HOST = "http://localhost:8000"
+OPENAI_BASE_PATH = "v1/chat/completions"
+OPENAI_API_KEY = "dummy"
+
+[review]
+concurrency = 1
+timeout_seconds = 7200
