@@ -82,12 +82,14 @@ fn generate_interaction_id_at(epoch_millis: u128) -> String {
 }
 
 fn is_xfstests_patch(diff: &str) -> bool {
+    const XFSTESTS_ROOTS: [&str; 4] = ["tests", "common", "src", "m4"];
     let files = extract_files_from_diff(diff);
 
     !files.is_empty()
         && files.iter().all(|file| {
-            let mut components = file.split('/').filter(|part| !part.is_empty());
-            components.next() == Some("tests") && components.count() >= 2
+            file.split('/')
+                .find(|part| !part.is_empty())
+                .is_some_and(|root| XFSTESTS_ROOTS.contains(&root))
         })
 }
 
@@ -415,6 +417,62 @@ impl Reviewer {
             {
                 error!(
                     "Failed to mark xfstests patch {} as skipped: {}",
+                    patch_id, e
+                );
+            }
+
+            let review_id = match ctx
+                .db
+                .get_pending_review_id(patchset_id, Some(*patch_id))
+                .await
+            {
+                Ok(Some(id)) => Some(id),
+                Ok(None) => match ctx
+                    .db
+                    .create_review(
+                        patchset_id,
+                        Some(*patch_id),
+                        &ctx.settings.ai.provider,
+                        &ctx.settings.ai.model,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        error!(
+                            "Failed to create skipped xfstests review for patch {}: {}",
+                            patch_id, e
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    error!(
+                        "Failed to find pending xfstests review for patch {}: {}",
+                        patch_id, e
+                    );
+                    None
+                }
+            };
+
+            if let Some(review_id) = review_id
+                && let Err(e) = ctx
+                    .db
+                    .complete_review(
+                        review_id,
+                        ReviewStatus::Skipped.as_str(),
+                        "Skipped: patch contains only xfstests files",
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            {
+                error!(
+                    "Failed to record xfstests skip reason for patch {}: {}",
                     patch_id, e
                 );
             }
@@ -2596,6 +2654,22 @@ new file mode 100644
     }
 
     #[test]
+    fn detects_xfstests_patches_with_shared_helpers() {
+        let diff = "\
+diff --git a/tests/ext4/065 b/tests/ext4/065
+new file mode 100755
+diff --git a/common/rc b/common/rc
+index 1111111..2222222 100644
+diff --git a/src/t_mmap_collision.c b/src/t_mmap_collision.c
+index 1111111..2222222 100644
+diff --git a/m4/package_libcdev.m4 b/m4/package_libcdev.m4
+index 1111111..2222222 100644
+";
+
+        assert!(is_xfstests_patch(diff));
+    }
+
+    #[test]
     fn does_not_misclassify_kernel_or_mixed_patches() {
         let kernel_selftest = "\
 diff --git a/tools/testing/selftests/filesystems/ext4/new_test.sh b/tools/testing/selftests/filesystems/ext4/new_test.sh
@@ -2725,13 +2799,18 @@ new file mode 100644
         let mut review_rows = db
             .conn
             .query(
-                "SELECT COUNT(*) FROM reviews WHERE patchset_id = ?",
-                libsql::params![patchset_id],
+                "SELECT status, result_description FROM reviews WHERE patchset_id = ? AND patch_id = ?",
+                libsql::params![patchset_id, patch_id],
             )
             .await?;
-        let review_row = review_rows.next().await?.expect("Expected review count");
-        let review_count: i64 = review_row.get(0)?;
-        assert_eq!(review_count, 0);
+        let review_row = review_rows.next().await?.expect("Expected skipped review");
+        let review_status: String = review_row.get(0)?;
+        let result_description: String = review_row.get(1)?;
+        assert_eq!(review_status, ReviewStatus::Skipped.as_str());
+        assert_eq!(
+            result_description,
+            "Skipped: patch contains only xfstests files"
+        );
 
         Ok(())
     }
