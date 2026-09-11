@@ -19,23 +19,18 @@
 //! This makes the provider a pure completion backend: Sashiko's own ToolBox
 //! remains the only tool execution layer.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::{Value, json};
-use std::process::Stdio;
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::debug;
 
+use super::acp::AcpProcess;
 use super::claude_cli::{build_prompt, parse_inner_response};
 use super::token_budget::TokenBudget;
 use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities};
-use crate::utils::redact_secret;
 
 pub struct KiroCliProvider {
     pub model: String,
@@ -44,9 +39,6 @@ pub struct KiroCliProvider {
     pub context_window_size: usize,
     pub timeout_secs: u64,
 }
-
-type StderrPreview = Arc<Mutex<String>>;
-const STDERR_PREVIEW_LIMIT: usize = 4096;
 
 /// Agent JSON for the isolated no-tool Sashiko provider agent.
 const AGENT_JSON: &str = r#"{
@@ -105,170 +97,6 @@ fn create_isolated_workspace() -> Result<TempDir> {
     Ok(tmp)
 }
 
-async fn write_rpc(stdin: &mut ChildStdin, id: u64, method: &str, params: Value) -> Result<()> {
-    let msg = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
-    let mut line = serde_json::to_string(&msg)?;
-    line.push('\n');
-    stdin.write_all(line.as_bytes()).await?;
-    stdin.flush().await?;
-    Ok(())
-}
-
-async fn write_rpc_checked(
-    stdin: &mut ChildStdin,
-    id: u64,
-    method: &str,
-    params: Value,
-    stderr_preview: &StderrPreview,
-) -> Result<()> {
-    if let Err(e) = write_rpc(stdin, id, method, params).await {
-        anyhow::bail!(
-            "kiro-cli ACP write failed for {}: {}{}",
-            method,
-            e,
-            stderr_context(stderr_preview).await
-        );
-    }
-    Ok(())
-}
-
-async fn read_rpc_response(
-    lines: &mut Lines<BufReader<ChildStdout>>,
-    target_id: u64,
-    stderr_preview: &StderrPreview,
-    mut chunks: Option<&mut Vec<String>>,
-) -> Result<Value> {
-    loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => {
-                anyhow::bail!(
-                    "kiro-cli ACP exited before response {}{}",
-                    target_id,
-                    stderr_context(stderr_preview).await
-                );
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "kiro-cli ACP stdout read failed before response {}: {}{}",
-                    target_id,
-                    e,
-                    stderr_context(stderr_preview).await
-                );
-            }
-        };
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(msg) => msg,
-            Err(e) => {
-                debug!("Ignoring malformed ACP stdout line: {} ({})", line, e);
-                continue;
-            }
-        };
-
-        if msg.get("id").and_then(Value::as_u64) == Some(target_id) {
-            if let Some(error) = msg.get("error") {
-                let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown ACP error");
-                anyhow::bail!(
-                    "kiro-cli ACP error {}: {}{}",
-                    code,
-                    message,
-                    stderr_context(stderr_preview).await
-                );
-            }
-            return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
-        }
-
-        if let Some(text) = extract_acp_text_chunk(&msg)
-            && let Some(chunks) = chunks.as_deref_mut()
-        {
-            chunks.push(text);
-        }
-    }
-}
-
-async fn record_stderr_line(stderr_preview: &StderrPreview, line: &str) {
-    let redacted = redact_secret(line);
-    debug!("[kiro-cli acp stderr] {}", redacted);
-
-    if redacted.trim().is_empty() {
-        return;
-    }
-
-    let mut preview = stderr_preview.lock().await;
-    if !preview.is_empty() {
-        preview.push('\n');
-    }
-    preview.push_str(redacted.trim_end());
-    trim_stderr_preview(&mut preview);
-}
-
-fn trim_stderr_preview(preview: &mut String) {
-    if preview.len() <= STDERR_PREVIEW_LIMIT {
-        return;
-    }
-
-    let excess = preview.len() - STDERR_PREVIEW_LIMIT;
-    let drain_to = preview
-        .char_indices()
-        .find_map(|(idx, _)| (idx >= excess).then_some(idx))
-        .unwrap_or(preview.len());
-    preview.drain(..drain_to);
-}
-
-async fn stderr_context(stderr_preview: &StderrPreview) -> String {
-    let preview = stderr_preview.lock().await.trim().to_string();
-    if preview.is_empty() {
-        String::new()
-    } else {
-        format!("; stderr: {}", preview)
-    }
-}
-
-fn extract_acp_text_chunk(msg: &Value) -> Option<String> {
-    if msg.get("method")?.as_str()? != "session/update" {
-        return None;
-    }
-
-    let update = msg.get("params")?.get("update")?;
-    let update_type = update
-        .get("sessionUpdate")
-        .or_else(|| update.get("type"))?
-        .as_str()?;
-    if !matches!(update_type, "AgentMessageChunk" | "agent_message_chunk") {
-        return None;
-    }
-
-    extract_text_content(update.get("content")?)
-}
-
-fn extract_text_content(content: &Value) -> Option<String> {
-    match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Object(map) => map
-            .get("text")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        Value::Array(items) => {
-            let text = items
-                .iter()
-                .filter_map(extract_text_content)
-                .collect::<Vec<_>>()
-                .join("");
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
 impl KiroCliProvider {
     async fn run_acp_prompt(
         &self,
@@ -276,104 +104,16 @@ impl KiroCliProvider {
         agent_name: &str,
         isolated_workspace: Option<&TempDir>,
     ) -> Result<String> {
-        let args = build_args(&self.model, agent_name);
-
-        let mut cmd = Command::new(&self.binary);
-        cmd.args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        if let Some(tmp) = isolated_workspace {
-            cmd.current_dir(tmp.path());
-        }
-
-        cmd.kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn kiro-cli ACP: {}. Is it installed?", e)
-        })?;
-
-        let stderr_preview = Arc::new(Mutex::new(String::new()));
-        if let Some(stderr) = child.stderr.take() {
-            let stderr_preview = stderr_preview.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    record_stderr_line(&stderr_preview, &line).await;
-                }
-            });
-        }
-
-        let mut stdin = child.stdin.take().context("kiro-cli ACP stdin missing")?;
-        let stdout = child.stdout.take().context("kiro-cli ACP stdout missing")?;
-        let mut lines = BufReader::new(stdout).lines();
-        let mut next_id = 0u64;
-
-        write_rpc_checked(
-            &mut stdin,
-            next_id,
-            "initialize",
-            json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {},
-                "clientInfo": {
-                    "name": "sashiko",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-            }),
-            &stderr_preview,
-        )
-        .await?;
-        read_rpc_response(&mut lines, next_id, &stderr_preview, None).await?;
-        next_id += 1;
-
-        write_rpc_checked(
-            &mut stdin,
-            next_id,
-            "session/new",
-            json!({
-                "cwd": ".",
-                "mcpServers": [],
-            }),
-            &stderr_preview,
-        )
-        .await?;
-        let session = read_rpc_response(&mut lines, next_id, &stderr_preview, None).await?;
-        let session_id = match session.get("sessionId").and_then(Value::as_str) {
-            Some(session_id) => session_id.to_string(),
-            None => {
-                anyhow::bail!(
-                    "kiro-cli ACP session/new response missing sessionId{}",
-                    stderr_context(&stderr_preview).await
-                );
-            }
+        let process = AcpProcess {
+            label: "kiro-cli ACP".to_string(),
+            binary: self.binary.clone(),
+            args: build_args(&self.model, agent_name),
+            working_dir: isolated_workspace.map(|tmp| tmp.path().to_path_buf()),
+            env: BTreeMap::new(),
+            session_cwd: ".".to_string(),
         };
-        next_id += 1;
 
-        write_rpc_checked(
-            &mut stdin,
-            next_id,
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    }
-                ],
-            }),
-            &stderr_preview,
-        )
-        .await?;
-        let mut chunks = Vec::new();
-        read_rpc_response(&mut lines, next_id, &stderr_preview, Some(&mut chunks)).await?;
-
-        drop(stdin);
-        let _ = child.kill().await;
-
-        Ok(chunks.join(""))
+        Ok(process.run_prompt(prompt).await?.text)
     }
 }
 
@@ -559,54 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_acp_text_chunk_snake_case() {
-        let input = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "s1",
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "hello"}
-                }
-            }
-        });
-        assert_eq!(extract_acp_text_chunk(&input).as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn test_extract_acp_text_chunk_camel_case() {
-        let input = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "s1",
-                "update": {
-                    "sessionUpdate": "AgentMessageChunk",
-                    "content": [
-                        {"type": "text", "text": "hel"},
-                        {"type": "text", "text": "lo"}
-                    ]
-                }
-            }
-        });
-        assert_eq!(extract_acp_text_chunk(&input).as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn test_extract_acp_ignores_tool_updates() {
-        let input = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "s1",
-                "update": {"sessionUpdate": "tool_call", "content": {"text": "ignored"}}
-            }
-        });
-        assert!(extract_acp_text_chunk(&input).is_none());
-    }
-
-    #[test]
     fn test_parse_tool_calls_json() {
         let text = r#"{"tool_calls":[{"id":"c1","function_name":"read_file","arguments":{"path":"README.md"}}]}"#;
         let resp = parse_inner_response(text, None).unwrap();
@@ -727,11 +419,5 @@ exit 2
         assert!(err.contains("kiro-cli ACP exited before response 0"));
         assert!(err.contains("stderr: authentication failed token=[REDACTED]"));
         assert!(!err.contains("abc123"));
-    }
-
-    #[test]
-    fn test_redact_secret_available_for_error_previews() {
-        let redacted = redact_secret("kiro failed with token=abc123");
-        assert_eq!(redacted, "kiro failed with token=[REDACTED]");
     }
 }
