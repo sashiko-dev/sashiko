@@ -24,7 +24,7 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 - **Automated Ingestion**: Monitors mailing lists (`lore.kernel.org`), GitHub PRs, and GitLab MRs for new patch submissions.
 - **Manual Ingestion**: Can ingest patches from local git repositories or specific PRs/MRs.
 - **Forge Integration** *(Experimental)*: Automatic PR/MR review via GitHub and GitLab webhooks. This feature is unofficial and unsupported — use at your own risk.
-- **Self-contained**: Doesn't depend on 3rd-party tools and works with multiple LLM providers (Gemini, Claude, and GitHub Copilot CLI are currently supported).
+- **Self-contained**: Doesn't depend on 3rd-party tools and works with multiple LLM providers (Gemini, Claude, GitHub Copilot CLI and goose are currently supported).
 - **Web interface and CLI**: Provides a web interface for monitoring and a CLI tool for local development. Email support will be added soon.
 
 ## Prompts
@@ -133,7 +133,7 @@ to print the template or `sashiko init --path <file>` to choose a different
 location.
 
 For Claude, Claude Code CLI, GitHub Copilot CLI, AWS Bedrock, Vertex AI,
-Kiro CLI, Devin CLI, and OpenAI-compatible endpoints, see the
+Kiro CLI, Devin CLI, goose, and OpenAI-compatible endpoints, see the
 [LLM Provider Configuration Guide](docs/llm-providers.md).
 
 #### 3.  **Build**:

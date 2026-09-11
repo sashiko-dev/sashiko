@@ -604,6 +604,21 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 timeout_secs: ai.api_timeout_secs,
             }))
         }
+        "goose" | "goose-cli" => {
+            let cfg = ai.goose_cli.as_ref();
+            Ok(Arc::new(goose_cli::GooseCliProvider {
+                model: ai.model.clone(),
+                binary: cfg
+                    .map(|c| c.binary.clone())
+                    .unwrap_or_else(|| "goose".to_string()),
+                goose_provider: cfg
+                    .map(|c| c.goose_provider.clone())
+                    .unwrap_or_else(|| "openai".to_string()),
+                env: cfg.map(|c| c.env.clone()).unwrap_or_default(),
+                context_window_size: cfg.map(|c| c.context_window_size).unwrap_or(128_000),
+                timeout_secs: ai.api_timeout_secs,
+            }))
+        }
         #[cfg(feature = "vertex")]
         "vertex" => {
             let model = ai.model.clone();
@@ -638,6 +653,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
+pub mod acp;
 pub mod backoff_provider;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
@@ -649,6 +665,7 @@ pub mod concurrency_limited_provider;
 pub mod copilot_cli;
 pub mod devin_cli;
 pub mod gemini;
+pub mod goose_cli;
 pub mod kiro_cli;
 pub mod logging_provider;
 pub mod ollama;
