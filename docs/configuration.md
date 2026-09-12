@@ -57,13 +57,26 @@ Optional. If omitted, no review emails are sent. Even when present,
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `server` | string | -- | SMTP server hostname. |
-| `port` | integer | -- | SMTP server port. |
+| `transport` | string | `smtp` | Delivery method: `smtp` or `sendmail`. |
+| `server` | string | -- | SMTP server hostname. Required for `smtp`. |
+| `port` | integer | -- | SMTP server port. Required for `smtp`. |
 | `username` | string | -- | SMTP username (optional). |
 | `password` | string | -- | SMTP password (optional). |
+| `sendmail_path` | string | `/usr/sbin/sendmail` | Sendmail binary to invoke. |
 | `sender_address` | string | -- | From address for review emails. |
 | `reply_to` | string | -- | Reply-To address (optional). |
 | `dry_run` | bool | `true` | When true, emails are logged but not sent. |
+
+The `smtp` transport connects over implicit TLS, so it cannot reach a
+submission service that offers only cleartext. The `sendmail`
+transport pipes the message to the local MTA instead, which leaves
+transport security and queueing to the host's mail configuration. It
+ignores `server`, `port`, and the credentials; supplying credentials
+alongside it is rejected at startup.
+
+A message the local MTA accepts is queued, not delivered. Sashiko
+records it as sent once sendmail exits zero, so a later rejection
+arrives as a bounce that only the host mail configuration sees.
 
 ### `[ai]`
 
