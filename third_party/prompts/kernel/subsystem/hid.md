@@ -192,6 +192,90 @@ static void custom_remove(struct hid_device *hdev)
 See `__hid_device_probe()` and `hid_device_remove()` in
 `drivers/hid/hid-core.c`.
 
+### Input Gating During Probe and Remove (`hid_device_io_start`)
+
+The HID core deliberately blocks the incoming report path while `probe()` and
+`remove()` run. Misunderstanding this gating is a common source of **false
+positive** race-condition reports.
+
+*   **Core Behavior**: `hid_device_probe()` takes `hdev->driver_input_lock`
+    (a semaphore) before calling the driver's `probe()`, and
+    `hid_device_remove()` takes it before calling `remove()`. The input path
+    (`__hid_input_report()`) uses `down_trylock()` on the same semaphore and
+    simply drops reports while it is held.
+*   **Documented Contract**: As stated in the `struct hid_driver` documentation
+    in `include/linux/hid.h`: *"During probe, input will not be passed to
+    raw_event unless `hid_device_io_start` is called."* The same holds for
+    `event()`, `report()`, and the hid-input/hidraw paths, which are all fed
+    from the same report path.
+*   **Opting In**: A driver that needs to receive replies or spontaneous
+    reports during `probe()` (e.g., a firmware handshake, a feature/output
+    request whose answer arrives on the interrupt endpoint) must call
+    `hid_device_io_start(hdev)` explicitly. `hid_device_io_stop(hdev)` re-blocks
+    the path. These may only be called by the thread running `probe()`/
+    `remove()`, and calls must not be nested (the core emits an "io already
+    started/stopped" warning otherwise).
+*   **Automatic Release**: The driver does NOT need to balance
+    `hid_device_io_start()` before returning from `probe()`/`remove()`. The core
+    checks `hdev->io_started` and releases the lock itself if the driver left
+    I/O blocked. Reports flow normally once `probe()` returns successfully.
+*   **False Positive Guidance**: Do NOT report the following as bugs:
+    *   A driver that calls `hid_hw_start()` (or `hid_hw_open()`) in `probe()`
+        and only initializes `raw_event()`/`event()` state afterwards. Those
+        callbacks cannot run until `probe()` returns or
+        `hid_device_io_start()` is called, so there is no race against the
+        report path.
+    *   A driver that calls `hid_device_io_start()` without a matching
+        `hid_device_io_stop()` before returning from `probe()`.
+    *   A `remove()` callback that tears down `raw_event()` state without
+        additional locking against the report path.
+*   **REPORT as bugs**: Drivers that rely on receiving reports during `probe()`
+    (e.g., waiting on a completion that is only signalled from `raw_event()`)
+    **without** calling `hid_device_io_start()` first: such a wait will time out
+    or hang. Also report nested/unbalanced `hid_device_io_start()` /
+    `hid_device_io_stop()` sequences, and calls to either helper from outside
+    the `probe()`/`remove()` thread.
+
+```c
+// CORRECT (Driver needs device replies during probe)
+static int custom_probe(struct hid_device *hdev, const struct hid_device_id *id)
+{
+	int ret;
+
+	ret = hid_parse(hdev);
+	if (ret)
+		return ret;
+
+	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+	if (ret)
+		return ret;
+
+	ret = hid_hw_open(hdev);
+	if (ret)
+		goto err_stop;
+
+	/* Allow raw_event() to run so the handshake reply is delivered. */
+	hid_device_io_start(hdev);
+	ret = custom_firmware_handshake(hdev); /* waits for raw_event() */
+	hid_device_io_stop(hdev);
+	if (ret)
+		goto err_close;
+
+	hid_hw_close(hdev);
+	return 0;
+
+err_close:
+	hid_hw_close(hdev);
+err_stop:
+	hid_hw_stop(hdev);
+	return ret;
+}
+```
+
+See `hid_device_probe()`, `hid_device_remove()`, and `__hid_input_report()` in
+`drivers/hid/hid-core.c`, and `hid_device_io_start()` / `hid_device_io_stop()`
+in `include/linux/hid.h`.
+
 ### Report Descriptor Fixups (`report_fixup`)
 
 Memory leaks occur if a HID driver dynamically allocates a replacement report
@@ -301,12 +385,13 @@ usages into Linux input events.
         input-specific setup (e.g., renaming, setting specific input bits).
 *   **Startup Race (Gotcha)**: As soon as `hid_hw_start()` is called with
     `HID_CONNECT_HIDINPUT`, the input device is registered and visible to
-    userspace. While within `probe()`, an I/O lock blocks incoming hardware HID
-    events until `hid_device_io_start()` runs (automatically called by the core
-    after `probe()` returns). However, userspace can immediately open the input
-    device or make requests (such as toggling LEDs or ioctls) as soon as it is
-    registered. **All driver private data needed by userspace callbacks must be
-    complete BEFORE calling `hid_hw_start()`.**
+    userspace. While within `probe()`, the core's I/O lock blocks incoming
+    hardware HID events (see "Input Gating During Probe and Remove"); the core
+    releases that lock once `probe()` returns, unless the driver opted in
+    earlier via `hid_device_io_start()`. However, userspace can immediately open
+    the input device or make requests (such as toggling LEDs or ioctls) as soon
+    as it is registered. **All driver private data needed by userspace callbacks
+    must be complete BEFORE calling `hid_hw_start()`.**
 *   **Silent Usage Hiding**: Returning a positive value from `input_mapping()`
     without setting `usage->type`, `usage->code`, or capability bits in
     `input_dev` is the standard pattern used by drivers to silently hide or
@@ -387,6 +472,11 @@ See `hid_device_remove()` and `__hid_input_report()` in
     zero for generic). Do not flag positive returns without mapped bits as bugs.
 *   **Driver Initialization Order**: Verify all driver private data and state
     are fully initialized *before* calling `hid_hw_start()`.
+*   **Probe-Time Input Gating**: Remember that `raw_event()`, `event()`, and
+    `report()` cannot run during `probe()`/`remove()` unless the driver calls
+    `hid_device_io_start()`. Do not flag races between `probe()` and the report
+    path on that basis. Conversely, if `probe()` waits for data that only
+    arrives via `raw_event()`, verify `hid_device_io_start()` was called.
 *   **USB Transport Guard**: Verify the driver calls `hid_is_usb(hdev)` before
     calling USB-specific parent device accessors.
 *   **Devres Stop Dummy `remove`**: If using devres for hardware stop, verify
