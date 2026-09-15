@@ -50,6 +50,7 @@ send_positive_review = false
 # enabled = true
 # api_url = "https://patchwork.kernel.org/api/1.3"
 # token = "your-api-token"
+# user_agent = "your-service/1.0 (contact@example.org)"
 
 # Email mode: sends a structured notification email that a local script
 # (e.g. pw_tools) can parse and use to post the check.
