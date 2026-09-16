@@ -45,12 +45,25 @@ port = 119
 # Sashiko can easily generate and send a large volume of automated emails to
 # public mailing lists, potentially causing disruption or being marked as spam.
 # Ensure your filters and dry_run settings are correctly configured before use.
-# server = "smtp.example.com"
-# port = 587
-# username = "user@example.com"
-# password = "your_password"
 # sender_address = "sashiko@example.com"
 # dry_run = true
+#
+# Both transports share the two keys above. Add the keys for one
+# transport below, not both.
+#
+# smtp connects to a submission service directly. It requires
+# implicit TLS, so name the submissions port rather than the
+# STARTTLS port.
+# transport = "smtp"
+# server = "smtp.example.com"
+# port = 465
+# username = "user@example.com"
+# password = "your_password"
+#
+# sendmail hands the message to the local MTA and lets it relay.
+# Use it where the submission service offers only cleartext.
+# transport = "sendmail"
+# sendmail_path = "/usr/sbin/sendmail"
 
 [ai]
 provider = "gemini"
