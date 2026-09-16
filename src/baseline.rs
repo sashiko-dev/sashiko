@@ -407,6 +407,12 @@ impl BaselineRegistry {
             return Vec::new();
         }
 
+        // Intel Wired LAN series are queued on dev-queue of Tony's trees,
+        // never on the trees' default branches.
+        if let Some(url) = Self::iwl_queue_tree(subject, &tree_counts) {
+            return vec![self.resolve_url(&url, Some("dev-queue".to_string()))];
+        }
+
         let mut candidates: Vec<(&(String, Option<String>), &usize)> = tree_counts.iter().collect();
         candidates.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.0.cmp(&b.0.0)));
 
@@ -534,6 +540,30 @@ impl BaselineRegistry {
         }
 
         unique_filtered
+    }
+
+    /// URL of the Tony Nguyen queue tree matching an iwl-net/iwl-next tag in
+    /// the subject, picked from the MAINTAINERS trees the touched files voted
+    /// for. Returns None when the subject carries no iwl tag or none of those
+    /// trees is the matching queue.
+    fn iwl_queue_tree(
+        subject: &str,
+        tree_counts: &HashMap<(String, Option<String>), usize>,
+    ) -> Option<String> {
+        let subject_lower = subject.to_lowercase();
+        let queue = if subject_lower.contains("iwl-next") {
+            "next-queue"
+        } else if subject_lower.contains("iwl-net") {
+            "net-queue"
+        } else {
+            return None;
+        };
+
+        tree_counts
+            .keys()
+            .map(|(url, _)| url)
+            .find(|url| url.contains(queue))
+            .cloned()
     }
 
     fn resolve_url(&self, url: &str, branch: Option<String>) -> BaselineResolution {
@@ -770,6 +800,70 @@ F: patterns/
         } else {
             panic!("Expected linux-next");
         }
+    }
+
+    fn iwl_registry() -> BaselineRegistry {
+        let entries = vec![MaintainersEntry {
+            subsystem: "INTEL ETHERNET DRIVERS".to_string(),
+            trees: vec![
+                (
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/net-queue.git"
+                        .to_string(),
+                    None,
+                ),
+                (
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/next-queue.git"
+                        .to_string(),
+                    None,
+                ),
+            ],
+            patterns: vec!["drivers/net/ethernet/intel/".to_string()],
+        }];
+
+        BaselineRegistry {
+            entries,
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_iwl_tags_pick_dev_queue() {
+        let registry = iwl_registry();
+        let files = vec!["drivers/net/ethernet/intel/ice/ice_main.c".to_string()];
+
+        for (subject, expected_repo) in [
+            ("[PATCH iwl-net v2 1/3] ice: fix something", "net-queue"),
+            ("[PATCH IWL-NEXT] ice: add something", "next-queue"),
+        ] {
+            let candidates = registry.resolve_candidates(&files, subject, None).await;
+
+            match &candidates[0] {
+                BaselineResolution::RemoteTarget { url, branch, .. } => {
+                    assert!(url.contains(expected_repo), "{} -> {}", subject, url);
+                    assert_eq!(branch.as_deref(), Some("dev-queue"));
+                }
+                other => panic!("Expected dev-queue RemoteTarget, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_intel_without_iwl_tag_keeps_heuristic() {
+        let registry = iwl_registry();
+        let files = vec!["drivers/net/ethernet/intel/ice/ice_main.c".to_string()];
+
+        let candidates = registry
+            .resolve_candidates(&files, "[PATCH net] ice: fix something", None)
+            .await;
+
+        let has_dev_queue = candidates.iter().any(|c| {
+            matches!(c, BaselineResolution::RemoteTarget { branch, .. }
+                if branch.as_deref() == Some("dev-queue"))
+        });
+        assert!(!has_dev_queue, "dev-queue requires an iwl tag");
     }
 
     #[tokio::test]
