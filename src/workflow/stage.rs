@@ -175,6 +175,12 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         self
     }
 
+    /// Configures an optional suffix appended to the environment context tag for this stage.
+    pub fn context_tag_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.policy.context_tag_suffix = Some(suffix.into());
+        self
+    }
+
     /// Defines how the stage output `T` mutates the workflow state `&mut S`.
     pub fn reduce<F>(mut self, reducer: F) -> Self
     where
@@ -252,6 +258,9 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     fn tools(&self) -> Option<Vec<AiTool>> {
+        if self.recitation_fallback_active {
+            return None;
+        }
         match &self.stage.policy.tools {
             ToolScope::None => None,
             ToolScope::All => Some(self.tools.get_declarations_generic()),
@@ -353,6 +362,20 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
         let text = response.content.as_deref().unwrap_or("");
+        if self.recitation_fallback_active
+            && matches!(self.stage.output_format, OutputFormat::Text { .. })
+        {
+            if text.trim().is_empty() {
+                return Err(ValidationError::FormatViolation(
+                    "Free-form recitation fallback response cannot be empty.".to_string(),
+                ));
+            }
+            return self
+                .stage
+                .output_format
+                .validate(text, self.state)
+                .map_err(ValidationError::FormatViolation);
+        }
         match self.stage.output_format.validate(text, self.state) {
             Ok(parsed) => Ok(parsed),
             Err(violation) => Err(ValidationError::FormatViolation(violation)),
@@ -425,6 +448,18 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         let log_user_prompt = self.user_prompt.render_for_log(state);
 
         let stage_name = self.name;
+        let context_tag = match (&env.context_tag, &self.policy.context_tag_suffix) {
+            (Some(prefix), Some(suffix)) => {
+                if let Some(stripped) = prefix.trim_end().strip_suffix(']') {
+                    Some(format!("{stripped} {suffix}] "))
+                } else {
+                    Some(format!("{prefix} {suffix}] "))
+                }
+            }
+            (Some(prefix), None) => Some(prefix.clone()),
+            (None, _) => None,
+        };
+        let stage_history = std::sync::Mutex::new(Vec::new());
         let result = {
             let mut session = StageSession {
                 stage: self,
@@ -433,7 +468,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 system_prompt,
                 user_prompt,
                 log_user_prompt,
-                context_tag: env.context_tag.clone(),
+                context_tag,
                 recitation_fallback_active: false,
                 last_tool_call: None,
             };
@@ -441,6 +476,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             let runner = SessionRunner::new(env.provider.as_ref())
                 .with_max_turns(self.policy.max_turns)
                 .with_max_validation_attempts(self.policy.max_validation_attempts)
+                .with_log_buffer(&stage_history)
                 .with_turn_callback(move |turn, max_turns| {
                     if let Some(cb) = event_cb {
                         cb(WorkflowEvent::StageTurn {
@@ -846,5 +882,124 @@ mod tests {
             "the model should see the tool's error: {:?}",
             tool_reply.content
         );
+    }
+
+    #[tokio::test]
+    async fn test_context_tag_suffix_multibyte_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider {
+            turn: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+            calls: Vec::new(),
+            calling_turns: 0,
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: Some("[author:Søren—]".to_string()),
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("test_utf8")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .context_tag_suffix("s:1")
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .unwrap();
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen[0].context_tag.as_deref(), Some("[author:Søren— s:1] "));
+    }
+
+    #[tokio::test]
+    async fn test_recitation_fallback_to_free_form_validates_text_and_disables_tools() {
+        struct RecitationProvider {
+            turn: Mutex<usize>,
+            tools_seen: Mutex<Vec<Option<Vec<AiTool>>>>,
+        }
+
+        #[async_trait]
+        impl AiProvider for RecitationProvider {
+            async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+                self.tools_seen.lock().unwrap().push(request.tools);
+                let mut turn = self.turn.lock().unwrap();
+                *turn += 1;
+                if *turn == 1 {
+                    anyhow::bail!("Generation blocked due to RECITATION");
+                }
+                Ok(AiResponse {
+                    content: Some("Valid free-form summary".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 100_000,
+                }
+            }
+        }
+
+        #[derive(Default, Clone)]
+        struct OutputState(String);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecitationProvider {
+            turn: Mutex::new(0),
+            tools_seen: Mutex::new(Vec::new()),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<OutputState, String> = Stage::builder("recitation_text_stage")
+            .user_prompt(PromptTemplate::new("review patch"))
+            .tools(ToolScope::All)
+            .output_format(OutputFormat::text_with_validator(
+                |text, _| {
+                    if text.contains("Valid") {
+                        Ok(())
+                    } else {
+                        Err("Output must contain 'Valid'".to_string())
+                    }
+                },
+                |v| format!("Validation failed: {v}"),
+            ))
+            .on_recitation(RecitationPolicy::FallbackToFreeForm {
+                reminder: "Rewrite in free-form without quoting.".to_string(),
+            })
+            .reduce(|state: &mut OutputState, out: String| {
+                state.0 = out;
+            })
+            .build();
+
+        let mut state = OutputState::default();
+        let outcome = stage
+            .execute(&env, &mut state, None)
+            .await
+            .expect("recitation fallback to free-form should validate text and succeed");
+
+        assert_eq!(state.0, "Valid free-form summary");
+        assert!(!outcome.history.is_empty());
+
+        let tools = provider.tools_seen.lock().unwrap();
+        assert_eq!(tools.len(), 2);
+        // Turn 1 had tools enabled
+        assert!(tools[0].is_some());
+        // Turn 2 (recitation fallback active) had tools disabled
+        assert!(tools[1].is_none());
     }
 }

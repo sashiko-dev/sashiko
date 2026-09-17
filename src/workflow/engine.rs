@@ -196,6 +196,14 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                             stage.name(),
                             err
                         );
+                        if let Some(cb) = event_cb {
+                            cb(WorkflowEvent::StageFinished {
+                                stage_name: stage.name(),
+                                tokens_in: 0,
+                                tokens_out: 0,
+                                tokens_cached: 0,
+                            });
+                        }
                     }
                 }
             }
@@ -400,5 +408,67 @@ mod tests {
         assert!(!outcome.early_exit);
         // The plan is reported as resolved, not guessed from the stage list.
         assert_eq!(*resolved.lock().unwrap(), vec!["stage_4", "stage_5"]);
+    }
+
+    #[tokio::test]
+    async fn test_best_effort_parallel_failure_emits_stage_finished() {
+        // One stage receives valid JSON, one stage fails with invalid response
+        let provider = Arc::new(MockProvider::queued(vec![
+            r#"{"items": ["ok"]}"#.to_string(),
+            r#"not-json"#.to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+
+        let workflow = Workflow::builder("best_effort_flow")
+            .parallel(
+                vec![
+                    Box::new(
+                        Stage::builder("stage_ok")
+                            .user_prompt(PromptTemplate::new("run ok"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                    Box::new(
+                        Stage::builder("stage_fail")
+                            .user_prompt(PromptTemplate::new("run fail"))
+                            .output_format(OutputFormat::json())
+                            .max_turns(1)
+                            .reduce(|_: &mut DummyState, _: DummyConcernsOutput| {})
+                            .build(),
+                    ),
+                ],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let finished_stages = std::sync::Mutex::new(Vec::new());
+        let record = |event: WorkflowEvent| {
+            if let WorkflowEvent::StageFinished { stage_name, .. } = event {
+                finished_stages.lock().unwrap().push(stage_name);
+            }
+        };
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&record))
+            .await
+            .unwrap();
+
+        assert_eq!(state.concerns, vec!["ok"]);
+        assert!(!outcome.early_exit);
+
+        let finished = finished_stages.lock().unwrap();
+        assert!(finished.contains(&"stage_ok"));
+        assert!(finished.contains(&"stage_fail"));
     }
 }

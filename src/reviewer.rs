@@ -1757,7 +1757,20 @@ async fn run_review_tool_with_cmd(
     cmd.env_clear();
 
     // Only restore critical, non-sensitive system variables
-    for var in &["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM"] {
+    for var in &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "GEMINI_API_KEY",
+        "LLM_API_KEY",
+        "GEMINI_BASE_URL",
+        "GOOGLE_GEMINI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+    ] {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }

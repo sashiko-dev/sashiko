@@ -22,6 +22,7 @@ use super::{
 };
 
 /// The unified result of executing an [`LlmSession`].
+#[derive(Debug)]
 pub struct SessionResult<T> {
     /// The validated output of the session.
     pub output: T,
@@ -144,6 +145,7 @@ pub struct SessionRunner<'a> {
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+    log_buffer: Option<&'a std::sync::Mutex<Vec<AiMessage>>>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -156,7 +158,15 @@ impl<'a> SessionRunner<'a> {
             max_transient_retries: 5,
             max_provider_error_retries: 3,
             on_turn: None,
+            log_buffer: None,
         }
+    }
+
+    /// Configures an external log buffer to capture conversation history as it occurs,
+    /// ensuring history is retained even if the session ends in an error.
+    pub fn with_log_buffer(mut self, buffer: &'a std::sync::Mutex<Vec<AiMessage>>) -> Self {
+        self.log_buffer = Some(buffer);
+        self
     }
 
     /// Configures the maximum validation retries.
@@ -215,6 +225,22 @@ impl<'a> SessionRunner<'a> {
             tool_call_id: None,
         }];
 
+        if let Some(buf) = self.log_buffer {
+            let mut guard = buf.lock().unwrap();
+            guard.clear();
+            guard.extend(log_history.clone());
+        }
+
+        macro_rules! push_log {
+            ($msg:expr) => {{
+                let m = $msg;
+                if let Some(buf) = self.log_buffer {
+                    buf.lock().unwrap().push(m.clone());
+                }
+                log_history.push(m);
+            }};
+        }
+
         let mut turns = 0;
         let mut validation_attempts = 0;
         let mut transient_retries = 0;
@@ -222,6 +248,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        let mut final_turn_prompt_injected = false;
 
         loop {
             turns += 1;
@@ -233,20 +260,25 @@ impl<'a> SessionRunner<'a> {
             }
 
             let is_final_turn = turns == self.max_turns;
-            if is_final_turn && turns > 1 {
+            if is_final_turn && turns > 1 && !final_turn_prompt_injected {
+                final_turn_prompt_injected = true;
+                let verdict_instruction = if session.response_format().is_none() {
+                    "Synthesize your final verdict now based on the evidence gathered so far."
+                } else {
+                    "Synthesize your final JSON verdict now based on the evidence gathered so far."
+                };
                 let final_prompt = AiMessage {
                     role: AiRole::User,
-                    content: Some(
-                        "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. Synthesize your final JSON verdict now based on the evidence gathered so far."
-                            .to_string(),
-                    ),
+                    content: Some(format!(
+                        "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. {verdict_instruction}"
+                    )),
                     thought: None,
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                 };
                 history.push(final_prompt.clone());
-                log_history.push(final_prompt);
+                push_log!(final_prompt);
             }
 
             let tools = if is_final_turn { None } else { session.tools() };
@@ -304,7 +336,7 @@ impl<'a> SessionRunner<'a> {
                                     tool_call_id: None,
                                 };
                                 history.push(msg.clone());
-                                log_history.push(msg);
+                                push_log!(msg);
                                 turns = turns.saturating_sub(1);
                                 continue;
                             }
@@ -324,39 +356,44 @@ impl<'a> SessionRunner<'a> {
                 total_cached_tokens += usage.cached_tokens.unwrap_or(0);
             }
 
+            let tool_calls = if is_final_turn {
+                if resp.tool_calls.is_some() {
+                    tracing::warn!(
+                        "Model emitted tool calls on final turn; ignoring tools to force validation."
+                    );
+                }
+                None
+            } else {
+                resp.tool_calls.clone()
+            };
+
             let assistant_msg = AiMessage {
                 role: AiRole::Assistant,
                 content: resp.content.clone(),
                 thought: resp.thought.clone(),
                 thought_signature: resp.thought_signature.clone(),
-                tool_calls: resp.tool_calls.clone(),
+                tool_calls: tool_calls.clone(),
                 tool_call_id: None,
             };
             history.push(assistant_msg.clone());
-            log_history.push(assistant_msg);
+            push_log!(assistant_msg);
 
             // Handle Tool Calls
-            if let Some(tool_calls) = &resp.tool_calls {
-                if is_final_turn {
-                    tracing::warn!(
-                        "Model emitted tool calls on final turn; ignoring tools to force validation."
-                    );
-                } else {
-                    let results = session.call_tools(tool_calls.clone()).await?;
-                    for (call_id, result) in results {
-                        let tool_msg = AiMessage {
-                            role: AiRole::Tool,
-                            content: Some(result.to_string()),
-                            thought: None,
-                            thought_signature: None,
-                            tool_calls: None,
-                            tool_call_id: Some(call_id),
-                        };
-                        history.push(tool_msg.clone());
-                        log_history.push(tool_msg);
-                    }
-                    continue; // Loop again to feed tool results back to LLM
+            if let Some(tool_calls) = &tool_calls {
+                let results = session.call_tools(tool_calls.clone()).await?;
+                for (call_id, result) in results {
+                    let tool_msg = AiMessage {
+                        role: AiRole::Tool,
+                        content: Some(result.to_string()),
+                        thought: None,
+                        thought_signature: None,
+                        tool_calls: None,
+                        tool_call_id: Some(call_id),
+                    };
+                    history.push(tool_msg.clone());
+                    push_log!(tool_msg);
                 }
+                continue; // Loop again to feed tool results back to LLM
             }
 
             // No tool calls: validate response
@@ -393,7 +430,7 @@ impl<'a> SessionRunner<'a> {
                         tool_call_id: None,
                     };
                     history.push(msg.clone());
-                    log_history.push(msg);
+                    push_log!(msg);
                     turns = turns.saturating_sub(1);
                 }
                 Result::Err(ValidationError::Fatal(err)) => {
@@ -413,19 +450,22 @@ mod tests {
 
     struct MockProvider {
         responses: Mutex<VecDeque<AiResponse>>,
+        requests: Mutex<Vec<AiRequest>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<AiResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl AiProvider for MockProvider {
-        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.requests.lock().unwrap().push(request);
             let mut q = self.responses.lock().unwrap();
             q.pop_front()
                 .ok_or_else(|| anyhow::anyhow!("No more mock responses"))
@@ -583,5 +623,234 @@ mod tests {
                     .contains("TURN BUDGET EXHAUSTED")
         });
         assert!(exhausted_msg.is_some());
+    }
+
+    struct RetryValidationSession {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmSession for RetryValidationSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            let n = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                Err(ValidationError::FormatViolation(
+                    "invalid format".to_string(),
+                ))
+            } else {
+                Ok(response.content.clone().unwrap_or_default())
+            }
+        }
+
+        fn format_validation_feedback(&self, violation: &str) -> String {
+            format!("Fix: {violation}")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_strips_tool_calls_on_final_turn() {
+        let responses = vec![
+            // Turn 1 (max turns = 1): model returns content AND tool calls, fails validation
+            AiResponse {
+                content: Some("First invalid answer".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_ignored".to_string(),
+                    function_name: "ok_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            // Turn 1 retry: valid output
+            AiResponse {
+                content: Some("Final answer".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider).with_max_turns(1);
+        let mut session = RetryValidationSession {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "Final answer");
+
+        // The assistant message in history must have tool_calls stripped (None)
+        let assistant_msg = res
+            .history
+            .iter()
+            .find(|m| m.role == AiRole::Assistant)
+            .expect("assistant message should be in history");
+        assert!(assistant_msg.tool_calls.is_none());
+
+        // The retry request sent to the provider must also contain the assistant message with tool_calls stripped
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let retry_assistant_msg = requests[1]
+            .messages
+            .iter()
+            .find(|m| m.role == AiRole::Assistant)
+            .expect("retry request must contain previous assistant message");
+        assert!(retry_assistant_msg.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_guards_final_turn_prompt_injection_on_retry() {
+        let responses = vec![
+            // Turn 1: tool call
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "ok_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            // Turn 2 (max turns): invalid output triggers validation retry
+            AiResponse {
+                content: Some("first attempt at final turn".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+            // Turn 2 retry: valid output
+            AiResponse {
+                content: Some("second attempt at final turn".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider).with_max_turns(2);
+        let mut session = RetryValidationSession {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "second attempt at final turn");
+
+        // Verify "TURN BUDGET EXHAUSTED" was only injected once into history
+        let budget_messages: Vec<_> = res
+            .history
+            .iter()
+            .filter(|m| {
+                m.role == AiRole::User
+                    && m.content
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("TURN BUDGET EXHAUSTED")
+            })
+            .collect();
+        assert_eq!(budget_messages.len(), 1);
+
+        // Also check prompt text when response_format is None
+        assert!(
+            budget_messages[0].content.as_ref().unwrap().contains(
+                "Synthesize your final verdict now based on the evidence gathered so far."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_captures_log_buffer_on_error() {
+        struct AlwaysFailsValidation;
+        #[async_trait]
+        impl LlmSession for AlwaysFailsValidation {
+            type Output = String;
+            fn system_prompt(&self) -> String {
+                "system".to_string()
+            }
+            fn initial_user_prompt(&self) -> String {
+                "start".to_string()
+            }
+            fn validate(
+                &mut self,
+                _response: &AiResponse,
+            ) -> Result<Self::Output, ValidationError> {
+                Err(ValidationError::FormatViolation("bad schema".to_string()))
+            }
+            fn format_validation_feedback(&self, violation: &str) -> String {
+                format!("Retry: {violation}")
+            }
+        }
+
+        let responses = vec![
+            AiResponse {
+                content: Some("first try".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+            AiResponse {
+                content: Some("second try".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let log_buffer = Mutex::new(Vec::new());
+        let runner = SessionRunner::new(&provider)
+            .with_max_turns(5)
+            .with_max_validation_attempts(2)
+            .with_log_buffer(&log_buffer);
+        let mut session = AlwaysFailsValidation;
+
+        let err = runner.run(&mut session).await.unwrap_err();
+        assert!(err.to_string().contains("validation attempts"));
+
+        drop(runner);
+        let history = log_buffer.into_inner().unwrap();
+        // Should contain: initial prompt, first response, validation feedback, second response
+        assert!(history.len() >= 3);
+        assert_eq!(history[0].role, AiRole::User);
+        assert_eq!(history[0].content.as_deref(), Some("start"));
+        assert_eq!(history[1].role, AiRole::Assistant);
+        assert_eq!(history[1].content.as_deref(), Some("first try"));
+        assert_eq!(history[2].role, AiRole::User);
+        assert!(
+            history[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("Retry: bad schema")
+        );
     }
 }

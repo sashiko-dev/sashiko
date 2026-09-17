@@ -60,6 +60,8 @@ pub struct StagePolicy {
     pub tools: ToolScope,
     /// Policy for handling recitation errors.
     pub recitation_policy: RecitationPolicy,
+    /// Optional suffix appended to the environment context tag for this stage.
+    pub context_tag_suffix: Option<String>,
 }
 
 impl Default for StagePolicy {
@@ -76,6 +78,7 @@ impl Default for StagePolicy {
                  quote only short snippets (1-2 lines). Re-emit your JSON output now."
                     .to_string(),
             ),
+            context_tag_suffix: None,
         }
     }
 }
