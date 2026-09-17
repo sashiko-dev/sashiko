@@ -1887,27 +1887,56 @@ async fn forge_webhook(
     if !has_secret && !presents_local_token(&headers, &state) && !state.allow_all_submit {
         info!(
             "Refused {} webhook from {}: configure webhook_secret or use --enable-unsafe-all-submit",
-            provider, addr
+            crate::forge::loggable(&provider),
+            addr
         );
         return Err(StatusCode::FORBIDDEN);
     }
 
     let forge = state.forge_registry.get(&provider).ok_or_else(|| {
-        warn!("Unknown forge provider: {}", provider);
+        warn!(
+            "Unknown forge provider: {}",
+            crate::forge::loggable(&provider)
+        );
         StatusCode::NOT_FOUND
     })?;
 
-    let event = forge.validate_event(&headers, &body, webhook_secret)?;
+    // A rejected delivery is reported by the forge as a bare status code, so
+    // the log line is the only place an administrator can learn which event
+    // was refused and why.
+    let event = forge
+        .validate_event(&headers, &body, webhook_secret)
+        .inspect_err(|status| {
+            warn!(
+                "Rejected {} webhook event {} from {}: {}",
+                forge.name(),
+                crate::forge::event_label(&headers),
+                addr,
+                status
+            );
+        })?;
 
     if event == crate::forge::ForgeEvent::Handshake {
-        info!("{} webhook handshake from {} acknowledged", provider, addr);
+        info!(
+            "{} webhook handshake from {} acknowledged",
+            forge.name(),
+            addr
+        );
         return Ok(Json(serde_json::json!({
             "status": "ok",
             "message": format!("{} webhook endpoint is configured", forge.name())
         })));
     }
 
-    let (action, metadata) = forge.parse_payload(&body)?;
+    let (action, metadata) = forge.parse_payload(&body).inspect_err(|status| {
+        warn!(
+            "Rejected {} webhook payload from {}: {} ({} bytes)",
+            forge.name(),
+            addr,
+            status,
+            body.len()
+        );
+    })?;
 
     info!(
         "{} {}: {} - {}",

@@ -179,6 +179,32 @@ pub enum ForgeEvent {
     Handshake,
 }
 
+/// Longest caller supplied value echoed into a log line.
+const MAX_LOGGED_LEN: usize = 32;
+
+/// Echo a caller supplied string into a log line only when it is short and
+/// printable. A webhook sender controls both the event header and the
+/// provider path segment, and a raw value could carry newlines that forge
+/// whole log entries.
+pub fn loggable(value: &str) -> &str {
+    let printable = !value.is_empty()
+        && value.len() <= MAX_LOGGED_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '));
+    if printable { value } else { "(invalid)" }
+}
+
+/// Name the event a webhook carried, for diagnostics only. Validation never
+/// consults this: it reads the provider specific header directly.
+pub fn event_label(headers: &HeaderMap) -> &str {
+    ["x-github-event", "x-gitlab-event"]
+        .into_iter()
+        .find_map(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+        .map(loggable)
+        .unwrap_or("(none)")
+}
+
 /// Trait for forge provider implementations
 pub trait ForgeProvider: Send + Sync {
     /// Provider name (e.g., "GitHub", "GitLab")
@@ -1001,6 +1027,34 @@ mod tests {
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         let body = Bytes::from("{}");
         assert!(forge.validate_event(&headers, &body, None).is_ok());
+    }
+
+    #[test]
+    fn test_loggable_passes_plain_values() {
+        assert_eq!(loggable("pull_request"), "pull_request");
+        assert_eq!(loggable("Merge Request Hook"), "Merge Request Hook");
+        assert_eq!(loggable("github"), "github");
+    }
+
+    #[test]
+    fn test_loggable_rejects_forged_log_lines() {
+        assert_eq!(loggable("ping\nRejected nothing"), "(invalid)");
+        assert_eq!(loggable("ping\r\n"), "(invalid)");
+        assert_eq!(loggable(""), "(invalid)");
+        assert_eq!(loggable(&"a".repeat(MAX_LOGGED_LEN + 1)), "(invalid)");
+    }
+
+    #[test]
+    fn test_event_label_reports_the_event_header() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(event_label(&headers), "(none)");
+
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        assert_eq!(event_label(&headers), "ping");
+
+        let mut gitlab = HeaderMap::new();
+        gitlab.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        assert_eq!(event_label(&gitlab), "Merge Request Hook");
     }
 
     /// Build the header value GitHub sends for a given body and secret.
