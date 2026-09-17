@@ -15,7 +15,6 @@
 use crate::bug_access::{BugAccess, BugPrincipal, OptionalBugPrincipal, SectionTitle};
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
-use crate::fetcher::FetchRequest;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -237,7 +236,6 @@ pub struct AppState {
     pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
     pub sender: mpsc::Sender<Event>,
-    pub fetch_sender: mpsc::Sender<FetchRequest>,
     pub forge_registry: Arc<crate::forge::ForgeRegistry>,
     pub read_only: bool,
     pub allow_all_submit: bool,
@@ -407,7 +405,6 @@ pub fn build_router(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
-    fetch_sender: mpsc::Sender<FetchRequest>,
     options: ServerOptions,
 ) -> Router {
     let forge_registry = Arc::new(crate::forge::ForgeRegistry::new());
@@ -417,7 +414,6 @@ pub fn build_router(
         settings: settings.clone(),
         db,
         sender,
-        fetch_sender,
         read_only,
         forge_registry,
         allow_all_submit: options.allow_all_submit,
@@ -484,10 +480,9 @@ pub async fn run_server(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
-    fetch_sender: mpsc::Sender<FetchRequest>,
     options: ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = build_router(settings.clone(), db, sender, fetch_sender, options);
+    let app = build_router(settings.clone(), db, sender, options);
 
     let bind_addr = format!("{}:{}", settings.server.host, settings.server.port);
     let addrs: Vec<SocketAddr> = bind_addr
@@ -628,34 +623,46 @@ async fn submit_patch(
             }
 
             // Create a placeholder record in the DB so the user can track status
-            if let Err(e) = state
+            let cover_id = format!("{}@sashiko.local", id);
+            let patchset_id = match state
                 .db
                 .create_fetching_patchset(
-                    &format!("{}@sashiko.local", id),
-                    &format!("Fetching {} from {}...", sha, repo_display),
+                    &cover_id,
+                    &format!("Fetching {} from {}...", &sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
                     None,
                     None,
                     None,
                     None,
+                    repo.as_deref(),
+                    None,
                 )
                 .await
             {
-                error!("Failed to create placeholder patchset: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-
-            let req = FetchRequest {
-                repo_url: repo,
-                commit_hash: sha,
-                mr_url: None,
-                mr_title: None,
-                mr_number: None,
+                Ok(pid) => pid,
+                Err(e) => {
+                    error!("Failed to create placeholder patchset: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
             };
 
-            if let Err(e) = state.fetch_sender.send(req).await {
-                error!("Failed to send fetch request to queue: {}", e);
+            // Persist the fetch durably; the FetchWorker will pick it up.
+            if let Err(e) = state
+                .db
+                .enqueue_fetch(
+                    Some(patchset_id),
+                    Some(&cover_id),
+                    repo.as_deref(),
+                    &sha,
+                    None,
+                    None,
+                    None,
+                    500,
+                )
+                .await
+            {
+                error!("Failed to enqueue fetch request: {}", e);
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
 
@@ -693,6 +700,8 @@ async fn submit_patch(
                 .create_fetching_patchset(
                     &clean_msgid,
                     &format!("Fetching thread {}...", clean_msgid),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -1920,7 +1929,7 @@ async fn forge_webhook(
         format!("{}-{}", repo, metadata.pr_number)
     });
 
-    state
+    let patchset_id = state
         .db
         .create_fetching_patchset(
             &placeholder_id,
@@ -1931,6 +1940,8 @@ async fn forge_webhook(
             Some(subject),
             Some(metadata.pr_number),
             slug.as_deref(),
+            metadata.repo_url.as_deref(),
+            None,
         )
         .await
         .map_err(|e| {
@@ -1938,18 +1949,24 @@ async fn forge_webhook(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let req = FetchRequest {
-        repo_url: metadata.repo_url,
-        commit_hash: commit_range,
-        mr_url: metadata.pr_url,
-        mr_title: metadata.pr_title,
-        mr_number: Some(metadata.pr_number),
-    };
-
-    state.fetch_sender.send(req).await.map_err(|e| {
-        error!("Failed to send fetch request to queue: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Persist the fetch durably; the FetchWorker will pick it up.
+    state
+        .db
+        .enqueue_fetch(
+            Some(patchset_id),
+            Some(&placeholder_id),
+            metadata.repo_url.as_deref(),
+            &commit_range,
+            metadata.pr_url.as_deref(),
+            metadata.pr_title.as_deref(),
+            Some(metadata.pr_number),
+            500,
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to enqueue fetch request: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(serde_json::json!({
         "status": "accepted",
@@ -2409,12 +2426,10 @@ mod tests {
 
         let local_token = crate::auth::LocalToken::generate().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 local_token: Some(local_token.clone()),
                 ..Default::default()
@@ -2565,14 +2580,7 @@ mod tests {
         settings.server.testing_mode = true;
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
-        let app = build_router(
-            settings,
-            db.clone(),
-            event_tx,
-            fetch_tx,
-            ServerOptions::default(),
-        );
+        let app = build_router(settings, db.clone(), event_tx, ServerOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2699,7 +2707,6 @@ mod tests {
 
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
 
         // The capability assertions further down turn on this, since an
         // identity in the security list holds no capability of its own.
@@ -2709,7 +2716,6 @@ mod tests {
             settings.clone(),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 dry_run: true,
                 local_token: Some(local_token.clone()),
@@ -3146,13 +3152,11 @@ mod tests {
 
         let settings = Arc::new(base_settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
 
         let app = build_router(
             settings.clone(),
             db.clone(),
             event_tx.clone(),
-            fetch_tx.clone(),
             ServerOptions {
                 dry_run: true,
                 ..Default::default()
@@ -3305,7 +3309,6 @@ mod tests {
             settings: settings.clone(),
             db: db.clone(),
             sender: event_tx,
-            fetch_sender: fetch_tx,
             read_only: false,
             forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
             allow_all_submit: false,
@@ -3373,12 +3376,10 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -3466,12 +3467,10 @@ mod tests {
             .push("blocklisted@example.com".to_string());
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -3624,12 +3623,10 @@ mod tests {
             .push("maintainer@example.org".to_string());
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -3693,12 +3690,10 @@ mod tests {
             // not a revocation.
             settings.server.acl.blocklist = vec![" Blocked@Example.ORG ".to_string()];
             let (event_tx, _event_rx) = mpsc::channel(10);
-            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
             Arc::new(AppState {
                 settings: Arc::new(settings),
                 db: db.clone(),
                 sender: event_tx,
-                fetch_sender: fetch_tx,
                 read_only: false,
                 forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
                 allow_all_submit,
@@ -3759,12 +3754,10 @@ mod tests {
             let mut settings = crate::settings::Settings::new().unwrap();
             settings.server.testing_mode = false;
             let (event_tx, _event_rx) = mpsc::channel(10);
-            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
             Arc::new(AppState {
                 settings: Arc::new(settings),
                 db: db.clone(),
                 sender: event_tx,
-                fetch_sender: fetch_tx,
                 read_only: false,
                 forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
                 allow_all_submit: false,
@@ -3892,12 +3885,10 @@ mod tests {
         }
         let settings = Arc::new(crate::settings::Settings::new().unwrap());
         let (sender, _) = mpsc::channel(1);
-        let (fetch_sender, _) = mpsc::channel(1);
         let state = Arc::new(AppState {
             settings,
             db,
             sender,
-            fetch_sender,
             read_only: false,
             allow_all_submit: false,
             smtp_enabled: false,
@@ -4004,12 +3995,10 @@ mod tests {
         let settings = Arc::new(settings);
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings.clone(),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 dry_run: true,
                 ..Default::default()
