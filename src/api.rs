@@ -1897,7 +1897,15 @@ async fn forge_webhook(
         StatusCode::NOT_FOUND
     })?;
 
-    forge.validate_event(&headers, &body, webhook_secret)?;
+    let event = forge.validate_event(&headers, &body, webhook_secret)?;
+
+    if event == crate::forge::ForgeEvent::Handshake {
+        info!("{} webhook handshake from {} acknowledged", provider, addr);
+        return Ok(Json(serde_json::json!({
+            "status": "ok",
+            "message": format!("{} webhook endpoint is configured", forge.name())
+        })));
+    }
 
     let (action, metadata) = forge.parse_payload(&body)?;
 

@@ -168,6 +168,17 @@ pub struct ForgeMetadata {
     pub pr_url: Option<String>,
 }
 
+/// Classification of a webhook request that passed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeEvent {
+    /// A pull or merge request carrying commits to review.
+    ChangeRequest,
+    /// A provider handshake sent to confirm the endpoint is reachable. It
+    /// carries nothing to review and must be acknowledged without side
+    /// effects.
+    Handshake,
+}
+
 /// Trait for forge provider implementations
 pub trait ForgeProvider: Send + Sync {
     /// Provider name (e.g., "GitHub", "GitLab")
@@ -177,14 +188,14 @@ pub trait ForgeProvider: Send + Sync {
     /// configured. When `secret` is `None`, only event-type validation is
     /// performed and the request is treated as unauthenticated — callers
     /// must enforce their own access control before calling this method.
-    /// Returns `UNAUTHORIZED` if the signature is missing or invalid,
-    /// `BAD_REQUEST` if the event type is wrong.
+    /// Returns the kind of event on success, `UNAUTHORIZED` if the signature
+    /// is missing or invalid, `BAD_REQUEST` if the event type is wrong.
     fn validate_event(
         &self,
         headers: &HeaderMap,
         body: &Bytes,
         secret: Option<&str>,
-    ) -> Result<(), StatusCode>;
+    ) -> Result<ForgeEvent, StatusCode>;
 
     /// Parse webhook payload and extract metadata
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode>;
@@ -203,15 +214,21 @@ impl ForgeProvider for GitHubForge {
         headers: &HeaderMap,
         body: &Bytes,
         secret: Option<&str>,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<ForgeEvent, StatusCode> {
         let event = headers
             .get("x-github-event")
             .and_then(|v| v.to_str().ok())
             .ok_or(StatusCode::BAD_REQUEST)?;
 
-        if event != "pull_request" {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+        // A ping is what GitHub sends the moment a webhook is saved, and its
+        // delivery status is what an administrator checks to confirm the
+        // endpoint works. Rejecting it reports a broken integration that is
+        // in fact correctly configured.
+        let kind = match event {
+            "pull_request" => ForgeEvent::ChangeRequest,
+            "ping" => ForgeEvent::Handshake,
+            _ => return Err(StatusCode::BAD_REQUEST),
+        };
 
         if let Some(secret) = secret {
             let sig = headers
@@ -223,7 +240,7 @@ impl ForgeProvider for GitHubForge {
             }
         }
 
-        Ok(())
+        Ok(kind)
     }
 
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode> {
@@ -299,12 +316,14 @@ impl ForgeProvider for GitLabForge {
         headers: &HeaderMap,
         body: &Bytes,
         secret: Option<&str>,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<ForgeEvent, StatusCode> {
         let event = headers
             .get("x-gitlab-event")
             .and_then(|v| v.to_str().ok())
             .ok_or(StatusCode::BAD_REQUEST)?;
 
+        // GitLab has no handshake event: its Test button replays a real hook,
+        // so a merge request is the only thing worth accepting here.
         if event != "Merge Request Hook" {
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -323,7 +342,7 @@ impl ForgeProvider for GitLabForge {
                 if !verify_standard_webhook_signature(secret, msg_id, timestamp, body, sig) {
                     return Err(StatusCode::UNAUTHORIZED);
                 }
-                return Ok(());
+                return Ok(ForgeEvent::ChangeRequest);
             }
 
             // Fallback: legacy secret token (X-Gitlab-Token)
@@ -331,14 +350,14 @@ impl ForgeProvider for GitLabForge {
                 if !verify_secret_token(secret, token) {
                     return Err(StatusCode::UNAUTHORIZED);
                 }
-                return Ok(());
+                return Ok(ForgeEvent::ChangeRequest);
             }
 
             // Secret configured but no auth header present
             return Err(StatusCode::UNAUTHORIZED);
         }
 
-        Ok(())
+        Ok(ForgeEvent::ChangeRequest)
     }
 
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode> {
@@ -982,6 +1001,100 @@ mod tests {
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         let body = Bytes::from("{}");
         assert!(forge.validate_event(&headers, &body, None).is_ok());
+    }
+
+    /// Build the header value GitHub sends for a given body and secret.
+    fn github_signature(secret: &str, body: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let mut hex = String::from("sha256=");
+        for b in mac.finalize().into_bytes() {
+            let _ = write!(hex, "{:02x}", b);
+        }
+        hex
+    }
+
+    #[test]
+    fn test_github_validate_event_classifies_ping_as_handshake() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        let body = Bytes::from(r#"{"zen":"Design for failure."}"#);
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap(),
+            ForgeEvent::Handshake
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_classifies_pull_request_as_change_request() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap(),
+            ForgeEvent::ChangeRequest
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_accepts_signed_ping() {
+        let forge = GitHubForge;
+        let body = Bytes::from(r#"{"zen":"Design for failure."}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature("my-secret", &body).parse().unwrap(),
+        );
+        assert_eq!(
+            forge
+                .validate_event(&headers, &body, Some("my-secret"))
+                .unwrap(),
+            ForgeEvent::Handshake
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_rejects_unsigned_ping() {
+        // A handshake is acknowledged with 200, so it must prove the sender
+        // just like any other event when a secret is configured.
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        let body = Bytes::from(r#"{"zen":"Design for failure."}"#);
+        assert_eq!(
+            forge
+                .validate_event(&headers, &body, Some("my-secret"))
+                .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_rejects_unrelated_event() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "push".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_gitlab_validate_event_rejects_ping() {
+        let forge = GitLabForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "ping".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
