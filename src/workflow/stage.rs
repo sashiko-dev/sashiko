@@ -91,7 +91,7 @@ pub struct Stage<S, T> {
     pub system_prompt: Option<PromptTemplate<S>>,
     pub user_prompt: PromptTemplate<S>,
     pub output_format: OutputFormat<S, T>,
-    pub policy: StagePolicy,
+    pub policy: StagePolicy<S>,
     pub reducer: StageReducer<S, T>,
     pub skip_if: Option<StageCondition<S>>,
 }
@@ -109,7 +109,7 @@ pub struct StageBuilder<S, T> {
     system_prompt: Option<PromptTemplate<S>>,
     user_prompt: Option<PromptTemplate<S>>,
     output_format: Option<OutputFormat<S, T>>,
-    policy: StagePolicy,
+    policy: StagePolicy<S>,
     reducer: Option<StageReducer<S, T>>,
     skip_if: Option<StageCondition<S>>,
 }
@@ -146,7 +146,10 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
     }
 
     /// Sets the stage execution policy.
-    pub fn policy(mut self, policy: StagePolicy) -> Self {
+    pub fn policy(mut self, mut policy: StagePolicy<S>) -> Self {
+        if policy.on_validation_exhausted.is_none() {
+            policy.on_validation_exhausted = self.policy.on_validation_exhausted;
+        }
         self.policy = policy;
         self
     }
@@ -175,6 +178,20 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         self
     }
 
+    /// Configures an optional suffix appended to the environment context tag for this stage.
+    pub fn context_tag_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.policy.context_tag_suffix = Some(suffix.into());
+        self
+    }
+
+    /// Configures a fallback state mutation callback if validation retries are exhausted.
+    pub fn on_validation_exhausted<F>(mut self, fallback: F) -> Self
+    where
+        F: Fn(&mut S) + Send + Sync + 'static,
+    {
+        self.policy.on_validation_exhausted = Some(Arc::new(fallback));
+        self
+    }
     /// Defines how the stage output `T` mutates the workflow state `&mut S`.
     pub fn reduce<F>(mut self, reducer: F) -> Self
     where
@@ -353,6 +370,22 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
         let text = response.content.as_deref().unwrap_or("");
+        if self.recitation_fallback_active
+            && matches!(self.stage.output_format, OutputFormat::Text { .. })
+        {
+            if text.trim().is_empty() {
+                return Err(ValidationError::FormatViolation(
+                    "Free-form recitation fallback response cannot be empty.".to_string(),
+                ));
+            }
+            let boxed_any: Box<dyn std::any::Any> = Box::new(text.to_string());
+            return boxed_any
+                .downcast::<Self::Output>()
+                .map(|val| *val)
+                .map_err(|_| {
+                    ValidationError::FormatViolation("Failed to downcast text output".to_string())
+                });
+        }
         match self.stage.output_format.validate(text, self.state) {
             Ok(parsed) => Ok(parsed),
             Err(violation) => Err(ValidationError::FormatViolation(violation)),
@@ -424,8 +457,60 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             .await?;
         let log_user_prompt = self.user_prompt.render_for_log(state);
 
+        struct UsageTrackingProvider<'a> {
+            inner: &'a dyn AiProvider,
+            tokens_in: std::sync::atomic::AtomicU32,
+            tokens_out: std::sync::atomic::AtomicU32,
+            tokens_cached: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait]
+        impl<'a> AiProvider for UsageTrackingProvider<'a> {
+            async fn generate_content(&self, request: crate::ai::AiRequest) -> Result<AiResponse> {
+                let resp = self.inner.generate_content(request).await?;
+                if let Some(usage) = &resp.usage {
+                    self.tokens_in.fetch_add(
+                        usage.prompt_tokens as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.tokens_out.fetch_add(
+                        usage.completion_tokens as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.tokens_cached.fetch_add(
+                        usage.cached_tokens.unwrap_or(0) as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Ok(resp)
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                self.inner.get_capabilities()
+            }
+        }
+
+        let tracker = UsageTrackingProvider {
+            inner: env.provider.as_ref(),
+            tokens_in: std::sync::atomic::AtomicU32::new(0),
+            tokens_out: std::sync::atomic::AtomicU32::new(0),
+            tokens_cached: std::sync::atomic::AtomicU32::new(0),
+        };
+
         let stage_name = self.name;
-        let result = {
+        let context_tag = match (&env.context_tag, &self.policy.context_tag_suffix) {
+            (Some(prefix), Some(suffix)) => {
+                if let Some(stripped) = prefix.trim_end().strip_suffix(']') {
+                    Some(format!("{stripped} {suffix}] "))
+                } else {
+                    Some(format!("{prefix} {suffix}] "))
+                }
+            }
+            (Some(prefix), None) => Some(prefix.clone()),
+            (None, _) => None,
+        };
+        let stage_history = std::sync::Mutex::new(Vec::new());
+        let run_result = {
             let mut session = StageSession {
                 stage: self,
                 state,
@@ -433,14 +518,15 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 system_prompt,
                 user_prompt,
                 log_user_prompt,
-                context_tag: env.context_tag.clone(),
+                context_tag,
                 recitation_fallback_active: false,
                 last_tool_call: None,
             };
 
-            let runner = SessionRunner::new(env.provider.as_ref())
+            let runner = SessionRunner::new(&tracker)
                 .with_max_turns(self.policy.max_turns)
                 .with_max_validation_attempts(self.policy.max_validation_attempts)
+                .with_log_buffer(&stage_history)
                 .with_turn_callback(move |turn, max_turns| {
                     if let Some(cb) = event_cb {
                         cb(WorkflowEvent::StageTurn {
@@ -451,35 +537,80 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     }
                 });
 
-            runner.run(&mut session).await?
+            runner.run(&mut session).await
         };
 
-        let tokens_in = result.usage.prompt_tokens as u32;
-        let tokens_out = result.usage.completion_tokens as u32;
-        let tokens_cached = result.usage.cached_tokens.unwrap_or(0) as u32;
+        match run_result {
+            Ok(result) => {
+                let tokens_in = result.usage.prompt_tokens as u32;
+                let tokens_out = result.usage.completion_tokens as u32;
+                let tokens_cached = result.usage.cached_tokens.unwrap_or(0) as u32;
 
-        if let Some(cb) = event_cb {
-            cb(WorkflowEvent::StageFinished {
-                stage_name: self.name,
-                tokens_in,
-                tokens_out,
-                tokens_cached,
-            });
+                if let Some(cb) = event_cb {
+                    cb(WorkflowEvent::StageFinished {
+                        stage_name: self.name,
+                        tokens_in,
+                        tokens_out,
+                        tokens_cached,
+                    });
+                }
+
+                let reducer = self.reducer.clone();
+                let mutation: StateMutation<S> = Box::new(move |s: &mut S| {
+                    reducer(s, result.output);
+                });
+
+                let outcome = StageOutcome {
+                    tokens_in,
+                    tokens_out,
+                    tokens_cached,
+                    history: result.history,
+                };
+
+                Ok((outcome, mutation))
+            }
+            Err(err) => {
+                let is_validation_exhausted = err.to_string().contains("validation attempts");
+                if is_validation_exhausted
+                    && let Some(ref fallback) = self.policy.on_validation_exhausted
+                {
+                    let tokens_in = tracker.tokens_in.load(std::sync::atomic::Ordering::Relaxed);
+                    let tokens_out = tracker
+                        .tokens_out
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let tokens_cached = tracker
+                        .tokens_cached
+                        .load(std::sync::atomic::Ordering::Relaxed);
+
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageFinished {
+                            stage_name: self.name,
+                            tokens_in,
+                            tokens_out,
+                            tokens_cached,
+                        });
+                    }
+
+                    let fb = fallback.clone();
+                    let mutation: StateMutation<S> = Box::new(move |s: &mut S| {
+                        fb(s);
+                    });
+
+                    let history = stage_history
+                        .into_inner()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let outcome = StageOutcome {
+                        tokens_in,
+                        tokens_out,
+                        tokens_cached,
+                        history,
+                    };
+
+                    return Ok((outcome, mutation));
+                }
+                Err(err)
+            }
         }
-
-        let reducer = self.reducer.clone();
-        let mutation: StateMutation<S> = Box::new(move |s: &mut S| {
-            reducer(s, result.output);
-        });
-
-        let outcome = StageOutcome {
-            tokens_in,
-            tokens_out,
-            tokens_cached,
-            history: result.history,
-        };
-
-        Ok((outcome, mutation))
     }
 }
 
