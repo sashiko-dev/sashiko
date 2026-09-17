@@ -639,6 +639,8 @@ pub struct ServerSettings {
     pub read_only: bool,
     #[serde(default)]
     pub testing_mode: bool,
+    #[serde(default = "default_true")]
+    pub login_enabled: bool,
     pub jwt_secret: Option<String>,
     /// Prints sign-in links in full to the log.
     ///
@@ -1252,6 +1254,7 @@ mod tests {
             public_base_url: Some("https://sashiko.example.org/".to_string()),
             read_only: false,
             testing_mode: false,
+            login_enabled: true,
             jwt_secret: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
@@ -1351,5 +1354,15 @@ mod tests {
         let omitted: AclSettings = serde_json::from_str("{}").unwrap();
         assert!(omitted.admins.is_empty());
         assert!(!omitted.is_admin(""));
+    }
+
+    #[test]
+    fn test_login_enabled_defaults_to_true_and_can_be_disabled() {
+        let server: ServerSettings = toml::from_str("host = \"::\"\nport = 8080").unwrap();
+        assert!(server.login_enabled);
+
+        let disabled: ServerSettings =
+            toml::from_str("host = \"::\"\nport = 8080\nlogin_enabled = false").unwrap();
+        assert!(!disabled.login_enabled);
     }
 }
