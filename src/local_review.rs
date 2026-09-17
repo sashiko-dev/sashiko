@@ -50,6 +50,8 @@ pub struct WorkerOptions {
     pub stages: Option<Vec<String>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
+    /// Alternate review workflow selector. `None` = default patch review.
+    pub review_context: Option<crate::review_kind::ReviewKind>,
 }
 
 impl Default for WorkerOptions {
@@ -70,6 +72,7 @@ impl Default for WorkerOptions {
             stages: None,
             scratch_clone: false,
             current_tree: false,
+            review_context: None,
         }
     }
 }
@@ -569,6 +572,7 @@ async fn review_single_patch(
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
+                review_context: options.review_context.clone(),
             },
         );
 

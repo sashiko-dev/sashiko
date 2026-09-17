@@ -16,6 +16,7 @@ use crate::bug_access::{BugAccess, BugPrincipal, OptionalBugPrincipal, SectionTi
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
 use crate::fetcher::FetchRequest;
+use crate::review_kind::ReviewKind;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -372,6 +373,15 @@ pub enum SubmitRequest {
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
     },
+    #[serde(rename = "cherry-pick")]
+    CherryPick {
+        sha: String,
+        original_sha: String,
+        base_sha: Option<String>,
+        repo: Option<String>,
+        skip_subjects: Option<Vec<String>>,
+        only_subjects: Option<Vec<String>>,
+    },
     Thread {
         msgid: String,
     },
@@ -521,6 +531,13 @@ fn generate_synthetic_id(prefix: &str) -> String {
     )
 }
 
+fn is_valid_git_ref(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~' | '^'))
+}
+
 async fn submit_patch(
     auth: crate::auth::OptionalAuthUser,
     // Logged on a refusal to give an operator something to grep for. It is
@@ -649,6 +666,123 @@ async fn submit_patch(
             let req = FetchRequest {
                 repo_url: repo,
                 commit_hash: sha,
+                supporting_commits: vec![],
+                mr_url: None,
+                mr_title: None,
+                mr_number: None,
+            };
+
+            if let Err(e) = state.fetch_sender.send(req).await {
+                error!("Failed to send fetch request to queue: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+
+            Ok(Json(SubmitResponse {
+                status: "accepted".to_string(),
+                id,
+            }))
+        }
+        SubmitRequest::CherryPick {
+            sha,
+            original_sha,
+            base_sha,
+            repo,
+            skip_subjects,
+            only_subjects,
+        } => {
+            if !is_valid_git_ref(&sha) || !is_valid_git_ref(&original_sha) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let base_sha = base_sha.filter(|s| !s.is_empty());
+            if let Some(ref b) = base_sha
+                && !is_valid_git_ref(b)
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+
+            let id = sha.clone();
+            match state.db.has_patchset_by_msgid(&id).await {
+                Ok(true) => {
+                    info!(
+                        "Cherry-pick fetch request for already ingested SHA {}, skipping placeholder and fetch",
+                        id
+                    );
+                    return Ok(Json(SubmitResponse {
+                        status: "accepted".to_string(),
+                        id,
+                    }));
+                }
+                Err(e) => {
+                    error!("Failed to check if patchset exists: {}", e);
+                }
+                _ => {}
+            }
+
+            let repo_display = repo.as_deref().unwrap_or("local");
+            info!(
+                "Received cherry-pick review request: {} (original {}) from {}",
+                sha, original_sha, repo_display
+            );
+
+            // Create a placeholder record so the user can track status.
+            let cover_id = format!("{}@sashiko.local", id);
+            let patchset_id = match state
+                .db
+                .create_fetching_patchset(
+                    &cover_id,
+                    &format!("Fetching cherry-pick {} from {}...", sha, repo_display),
+                    skip_subjects.as_ref(),
+                    only_subjects.as_ref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(pid) => pid,
+                Err(e) => {
+                    error!("Failed to create placeholder patchset: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+
+            // The original (and base) commits live on divergent history and are
+            // not reachable from the resolution commit, so git will not pull
+            // them transitively. Fetch them explicitly as supporting commits so
+            // the workflow can hydrate the full three-commit context at review
+            // time; they are fetched but never ingested as separate patches.
+            let mut supporting_commits: Vec<String> = vec![original_sha.clone()];
+            if let Some(ref base) = base_sha {
+                supporting_commits.push(base.clone());
+            }
+
+            // Persist the minimal cherry-pick selector; the reviewer forwards it
+            // to the workflow, which hydrates the rest of the context from git.
+            let review_context = ReviewKind::CherryPick {
+                original_sha,
+                base_sha,
+            };
+            match serde_json::to_string(&review_context) {
+                Ok(json) => {
+                    if let Err(e) = state.db.set_review_context(patchset_id, &json).await {
+                        error!(
+                            "Failed to persist review_context for {}: {}",
+                            patchset_id, e
+                        );
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize review_context: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+
+            let req = FetchRequest {
+                repo_url: repo,
+                commit_hash: sha,
+                supporting_commits,
                 mr_url: None,
                 mr_title: None,
                 mr_number: None,
@@ -1941,6 +2075,7 @@ async fn forge_webhook(
     let req = FetchRequest {
         repo_url: metadata.repo_url,
         commit_hash: commit_range,
+        supporting_commits: vec![],
         mr_url: metadata.pr_url,
         mr_title: metadata.pr_title,
         mr_number: Some(metadata.pr_number),
@@ -2389,6 +2524,15 @@ mod tests {
         let id = generate_synthetic_id("test");
         assert!(id.starts_with("sashiko-test-"));
         assert!(id.ends_with("@sashiko.local"));
+    }
+
+    #[test]
+    fn test_is_valid_git_ref() {
+        assert!(!is_valid_git_ref(""));
+        assert!(!is_valid_git_ref("-upload-pack=sh"));
+        assert!(!is_valid_git_ref("--output=/tmp/x"));
+        assert!(is_valid_git_ref("abc1234"));
+        assert!(is_valid_git_ref("v1.0~1"));
     }
 
     #[tokio::test]

@@ -1514,7 +1514,32 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 8", ()).await?;
         }
 
-        info!("Database schema is up to date at version 8.");
+        if current_version < 9 {
+            let has_column = {
+                let mut rows = self.conn.query("PRAGMA table_info(patchsets)", ()).await?;
+                let mut found = false;
+                while let Some(row) = rows.next().await? {
+                    let col_name: String = row.get(1)?;
+                    if col_name == "review_context" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_column {
+                info!("Applying database migration version 9 (review_context)...");
+                let tx = self.conn.transaction().await?;
+                tx.execute_batch(include_str!("migrations/009_review_context.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 9", ()).await?;
+                tx.commit().await?;
+            } else {
+                self.conn.execute("PRAGMA user_version = 9", ()).await?;
+            }
+        }
+
+        info!("Database schema is up to date at version 9.");
 
         Ok(())
     }
@@ -7163,6 +7188,32 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn get_review_context(&self, id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT review_context FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get::<Option<String>>(0).ok().flatten())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persist the serialized alternate-pipeline selector for a patchset.
+    pub async fn set_review_context(&self, id: i64, review_context: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET review_context = ? WHERE id = ?",
+                libsql::params![review_context, id],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
@@ -17024,5 +17075,49 @@ mod tests {
             rotated_v1["subject"].as_str(),
             Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
         );
+    }
+
+    #[tokio::test]
+    async fn test_review_context_migration_and_crud() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
+        db.create_message(
+            "msg1", thread_id, None, "Author A", "Patch 1", 1000, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg1",
+                "Patch 1",
+                "Author A",
+                1000,
+                1,
+                1,
+                "to",
+                "cc",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Default should be None
+        let initial = db.get_review_context(patchset_id).await.unwrap();
+        assert_eq!(initial, None);
+
+        let context = r#"{"type":"cherry-pick","original_sha":"abcdef123456"}"#;
+        db.set_review_context(patchset_id, context).await.unwrap();
+
+        let updated = db.get_review_context(patchset_id).await.unwrap();
+        assert_eq!(updated.as_deref(), Some(context));
     }
 }

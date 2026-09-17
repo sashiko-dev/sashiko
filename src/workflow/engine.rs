@@ -135,6 +135,10 @@ impl WorkflowEngine {
                         break;
                     }
                 }
+
+                WorkflowStep::Step(f) => {
+                    f(state);
+                }
             }
         }
 
@@ -400,5 +404,123 @@ mod tests {
         assert!(!outcome.early_exit);
         // The plan is reported as resolved, not guessed from the stage list.
         assert_eq!(*resolved.lock().unwrap(), vec!["stage_4", "stage_5"]);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_pure_rust_step_and_early_exit() {
+        let provider = Arc::new(MockProvider::single(r#"{"items": ["minor note"]}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+
+        let workflow = Workflow::builder("step_flow")
+            .stage(
+                Stage::builder("stage_1")
+                    .user_prompt(PromptTemplate::new("Analyze"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .step(|s: &mut DummyState| {
+                s.concerns.retain(|c| !c.contains("minor"));
+            })
+            .early_exit_if(|s| s.concerns.is_empty(), "filtered out all concerns")
+            .stage(
+                Stage::builder("stage_2")
+                    .user_prompt(PromptTemplate::new("Never reached"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.findings.extend(out.items);
+                    })
+                    .build(),
+            )
+            .build();
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.early_exit);
+        assert_eq!(outcome.early_exit_reason, Some("filtered out all concerns"));
+        assert!(state.concerns.is_empty());
+        assert!(state.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stage_validation_exhausted_fallback() {
+        struct InvalidJsonProvider;
+
+        #[async_trait::async_trait]
+        impl AiProvider for InvalidJsonProvider {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                Ok(AiResponse {
+                    content: Some("this is definitely not valid json".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: Some(crate::ai::AiUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        total_tokens: 15,
+                        cached_tokens: Some(2),
+                    }),
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let provider = Arc::new(InvalidJsonProvider);
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+
+        let workflow = Workflow::builder("fallback_flow")
+            .stage(
+                Stage::builder("planner")
+                    .user_prompt(PromptTemplate::new("Plan stages"))
+                    .output_format(OutputFormat::json())
+                    .on_validation_exhausted(|s: &mut DummyState| {
+                        s.selected_stages = vec![1, 2, 3];
+                    })
+                    .reduce(|s: &mut DummyState, out: DummyPlanningOutput| {
+                        s.selected_stages = out.stages;
+                    })
+                    .build(),
+            )
+            .build();
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect("workflow should succeed via validation fallback closure");
+
+        assert_eq!(state.selected_stages, vec![1, 2, 3]);
+        assert!(!outcome.history.is_empty());
+        // 3 validation attempts * 10 prompt_tokens = 30
+        assert_eq!(outcome.tokens_in, 30);
+        assert_eq!(outcome.tokens_out, 15);
+        assert_eq!(outcome.tokens_cached, 6);
     }
 }

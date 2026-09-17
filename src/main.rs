@@ -195,6 +195,11 @@ enum Commands {
         /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<String>>,
+
+        /// Alternate review workflow selector as JSON (e.g. the cherry-pick review
+        /// context). Absent selects the default patch-review workflow.
+        #[arg(long)]
+        review_context: Option<String>,
     },
 }
 
@@ -328,10 +333,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ai_provider,
                 custom_prompt,
                 stages,
+                review_context,
             } => {
                 std::panic::set_hook(Box::new(|info| {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
+
+                let review_context = review_context
+                    .as_deref()
+                    .map(serde_json::from_str::<sashiko::review_kind::ReviewKind>)
+                    .transpose()
+                    .map_err(Box::<dyn std::error::Error>::from)?;
 
                 let result = run_worker_from_stdin(WorkerOptions {
                     project,
@@ -349,6 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages: stages.clone(),
                     scratch_clone: false,
                     current_tree: false,
+                    review_context,
                 })
                 .await;
 

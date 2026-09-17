@@ -14,6 +14,7 @@
 
 use crate::project::ProjectId;
 
+pub mod cherry_pick_review;
 pub mod guard;
 pub mod linux_bug;
 pub mod linux_patch_review;

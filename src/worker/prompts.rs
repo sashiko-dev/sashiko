@@ -84,7 +84,7 @@ pub struct ReviewInput {
     pub patches: Vec<PatchInput>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WorkerConfig {
     pub project: ProjectId,
     pub max_input_tokens: usize,
@@ -94,6 +94,7 @@ pub struct WorkerConfig {
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
     pub stages: Option<Vec<String>>,
+    pub review_context: Option<crate::review_kind::ReviewKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +175,7 @@ pub struct Worker {
     context_tag: Option<String>,
     stages: Option<Vec<String>>,
     custom_prompt: Option<String>,
+    review_context: Option<crate::review_kind::ReviewKind>,
 }
 
 impl Worker {
@@ -196,6 +198,7 @@ impl Worker {
             context_tag: None,
             stages: config.stages,
             custom_prompt: config.custom_prompt,
+            review_context: config.review_context,
         }
     }
 
@@ -252,6 +255,37 @@ impl Worker {
             {
                 target_commit_sha = sha.to_string();
             }
+        }
+
+        if let Some(ref review_kind) = self.review_context {
+            let env = crate::workflows::cherry_pick_review::CherryPickWorkflowEnv {
+                provider: self.provider.clone(),
+                tools: self.tools.clone(),
+                prompts: &self.prompts,
+                temperature: self.temperature,
+                max_interactions: self.max_interactions,
+                context_tag: self.context_tag.clone(),
+                stages: None,
+                series_range: self.series_range.clone(),
+            };
+            return match review_kind {
+                crate::review_kind::ReviewKind::CherryPick { .. } => {
+                    let resolution_sha = if target_commit_sha == "unknown" {
+                        String::new()
+                    } else {
+                        target_commit_sha
+                    };
+                    let workflow =
+                        crate::workflows::cherry_pick_review::CherryPickReviewWorkflow::from_review_kind(
+                            review_kind,
+                            resolution_sha,
+                        );
+                    crate::workflows::cherry_pick_review::execute_workflow(
+                        &workflow, &env, patchset, progress,
+                    )
+                    .await
+                }
+            };
         }
 
         if let Some(patches) = patchset["patches"].as_array() {
@@ -1006,6 +1040,7 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: None,
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1153,6 +1188,7 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1188,6 +1224,7 @@ mod tests {
             baseline_sha: Some("explicit_baseline_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1227,6 +1264,7 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1325,6 +1363,7 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

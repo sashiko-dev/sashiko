@@ -1,0 +1,202 @@
+[
+  {
+    "stage_id": "planning",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "planning"
+      }
+    ],
+    "response_content": "{\"relevant_stages\": [4, 5, 6, 7]}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_1",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 1 turn 1"
+      }
+    ],
+    "response_content": null,
+    "response_tool_calls": [
+      {
+        "id": "call_read_1",
+        "function_name": "read_files",
+        "arguments": {
+          "file_paths": [
+            "fs/sample_cache.c"
+          ],
+          "start_line": 1,
+          "end_line": 50
+        }
+      }
+    ],
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_1",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 1 turn 2"
+      }
+    ],
+    "response_content": "{\"concerns\": [{\"title\": \"intent changed in merge\", \"severity\": \"high\", \"description\": \"Ensure sample_cache_insert validates non-null pointer\", \"file\": \"fs/sample_cache.c\", \"line\": 20}], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_2",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 2 turn 1"
+      }
+    ],
+    "response_content": null,
+    "response_tool_calls": [
+      {
+        "id": "call_grep_1",
+        "function_name": "git_grep",
+        "arguments": {
+          "pattern": "sample_cache_lock"
+        }
+      }
+    ],
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_2",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 2 turn 2"
+      }
+    ],
+    "response_content": "{\"concerns\": [{\"title\": \"null check dropped\", \"severity\": \"high\", \"description\": \"Missing null check in sample_cache_insert\", \"file\": \"fs/sample_cache.c\", \"line\": 20}], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_3",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 3"
+      }
+    ],
+    "response_content": "{\"concerns\": [], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_4",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 4"
+      }
+    ],
+    "response_content": "{\"concerns\": [], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_5",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 5"
+      }
+    ],
+    "response_content": "{\"concerns\": [], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_6",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 6"
+      }
+    ],
+    "response_content": "{\"concerns\": [], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_7",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 7"
+      }
+    ],
+    "response_content": "{\"concerns\": [], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_8",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 8"
+      }
+    ],
+    "response_content": "{\"concerns\": [{\"title\": \"intent changed in merge\", \"severity\": \"high\", \"description\": \"Ensure sample_cache_insert validates non-null pointer\", \"file\": \"fs/sample_cache.c\", \"line\": 20}, {\"title\": \"null check dropped\", \"severity\": \"high\", \"description\": \"Missing null check in sample_cache_insert\", \"file\": \"fs/sample_cache.c\", \"line\": 20}], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_9",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 9"
+      }
+    ],
+    "response_content": "{\"concerns\": [{\"title\": \"intent changed in merge\", \"severity\": \"high\", \"description\": \"Ensure sample_cache_insert validates non-null pointer\", \"file\": \"fs/sample_cache.c\", \"line\": 20}, {\"title\": \"null check dropped\", \"severity\": \"high\", \"description\": \"Missing null check in sample_cache_insert\", \"file\": \"fs/sample_cache.c\", \"line\": 20}], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "stage_10",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "stage 10"
+      }
+    ],
+    "response_content": "{\"findings\": [{\"title\": \"intent changed in merge\", \"severity\": \"high\", \"description\": \"Ensure sample_cache_insert validates non-null pointer\", \"origin\": \"resolution_introduced\"}, {\"title\": \"null check dropped\", \"severity\": \"high\", \"description\": \"Missing null check in sample_cache_insert\", \"origin\": \"resolution_introduced\"}], \"dismissed_concerns\": []}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "origin_classification",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "origin"
+      }
+    ],
+    "response_content": "{\"findings\": [{\"title\": \"intent changed in merge\", \"severity\": \"high\", \"description\": \"Ensure sample_cache_insert validates non-null pointer\", \"origin\": \"resolution_introduced\"}, {\"title\": \"null check dropped\", \"severity\": \"high\", \"description\": \"Missing null check in sample_cache_insert\", \"origin\": \"resolution_introduced\"}]}",
+    "response_tool_calls": null,
+    "response_usage": null
+  },
+  {
+    "stage_id": "conflict_report",
+    "request_messages": [
+      {
+        "role": "User",
+        "content": "report"
+      }
+    ],
+    "response_content": "commit 3333333333333333333333333333333333333333\nAuthor: Alice Developer <alice@example.com>\nSubject: fs: sample_cache: implement buffer cache pool and purge\n\n> if (!entry)\n>     return -EINVAL;\n\nFinding: intent changed in merge\nSeverity: high\n\nFinding: null check dropped\nSeverity: high\n",
+    "response_tool_calls": null,
+    "response_usage": null
+  }
+]

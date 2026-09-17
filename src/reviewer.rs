@@ -1783,6 +1783,13 @@ async fn run_review_tool_with_cmd(
         cmd.arg("--review-commit").arg(commit);
     }
 
+    // Forward the alternate-workflow selector (e.g. cherry-pick review) if the
+    // patchset was submitted with one; absent selects the default workflow.
+    let review_context = db.get_review_context(patchset_id).await?;
+    if let Some(rc) = review_context {
+        cmd.arg("--review-context").arg(rc);
+    }
+
     if settings.ai.no_ai {
         cmd.arg("--no-ai");
     }

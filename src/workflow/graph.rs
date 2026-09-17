@@ -52,6 +52,9 @@ pub enum WorkflowStep<S: Send + Sync> {
         condition: Box<dyn Fn(&S) -> bool + Send + Sync>,
         reason: &'static str,
     },
+
+    /// Pure-Rust state transformation step executed between stages.
+    Step(Box<dyn Fn(&mut S) + Send + Sync>),
 }
 
 /// A declarative workflow graph operating over state `S`.
@@ -79,6 +82,15 @@ impl<S: Send + Sync + 'static> WorkflowBuilder<S> {
             name,
             steps: Vec::new(),
         }
+    }
+
+    /// Appends a pure-Rust state transformation step to the workflow.
+    pub fn step<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut S) + Send + Sync + 'static,
+    {
+        self.steps.push(WorkflowStep::Step(Box::new(f)));
+        self
     }
 
     /// Appends a stage to the workflow.

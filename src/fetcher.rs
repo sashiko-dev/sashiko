@@ -26,6 +26,7 @@ use tracing::{error, info, warn};
 pub struct FetchRequest {
     pub repo_url: Option<String>,
     pub commit_hash: String,
+    pub supporting_commits: Vec<String>,
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
@@ -37,6 +38,7 @@ pub struct FetchAgent {
     main_tx: mpsc::Sender<Event>,
     #[allow(clippy::type_complexity)]
     mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
+    supporting_commits: HashMap<String, Vec<String>>,
     gitlab_token: Option<String>,
 }
 
@@ -53,6 +55,7 @@ impl FetchAgent {
                 rx,
                 main_tx,
                 mr_metadata: HashMap::new(),
+                supporting_commits: HashMap::new(),
                 gitlab_token,
             },
             tx,
@@ -73,6 +76,12 @@ impl FetchAgent {
                             (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
                         );
                     }
+                    if !req.supporting_commits.is_empty() {
+                        self.supporting_commits.insert(
+                            req.commit_hash.clone(),
+                            req.supporting_commits,
+                        );
+                    }
                     queue.entry(req.repo_url)
                         .or_default()
                         .insert(req.commit_hash);
@@ -86,7 +95,7 @@ impl FetchAgent {
         }
     }
 
-    async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
+    async fn process_queue(&mut self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
         info!("Processing fetch queue with {} repos", queue.len());
 
         for (url_opt, commits) in queue.drain() {
@@ -129,9 +138,9 @@ impl FetchAgent {
                     "All commits present locally, skipping fetch for {}",
                     url_display
                 );
-            } else if let Some(url) = url_opt {
+            } else if let Some(ref url) = url_opt {
                 // Remote fetch logic
-                let remote_name = self.get_remote_name(&url);
+                let remote_name = self.get_remote_name(url);
 
                 // Check if repo is local (same as self.repo_path)
                 let is_local = {
@@ -153,7 +162,7 @@ impl FetchAgent {
                     );
                     // Do not continue here; let it fall through to Step 3 where it will fail individually
                 } else {
-                    if let Err(e) = self.ensure_remote(&remote_name, &url).await {
+                    if let Err(e) = self.ensure_remote(&remote_name, url).await {
                         error!("Failed to ensure remote {}: {}", url, e);
                         for commit in &missing_commits {
                             let _ = self
@@ -284,6 +293,29 @@ impl FetchAgent {
                             continue;
                         }
                     };
+
+                    if let Some(supporting) = self.supporting_commits.remove(&commit_or_range) {
+                        for sup in supporting {
+                            if !self.is_present(&sup).await
+                                && let Some(ref url) = url_opt
+                            {
+                                let remote_name = self.get_remote_name(url);
+                                if self.ensure_remote(&remote_name, url).await.is_ok()
+                                    && let Err(e) = self
+                                        .fetch_commits(&remote_name, std::slice::from_ref(&sup))
+                                        .await
+                                {
+                                    warn!(
+                                        "Optimistic fetch of supporting commit {} failed: {}. Falling back to full fetch.",
+                                        sup, e
+                                    );
+                                    if let Err(e2) = self.fetch_all(&remote_name).await {
+                                        warn!("Failed to fetch supporting commit {}: {}", sup, e2);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     let (mr_url, mr_title, mr_number) = self
                         .mr_metadata
@@ -452,7 +484,7 @@ impl FetchAgent {
     }
 
     async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
-        let mut args = vec![remote];
+        let mut args = vec![remote, "--"];
         args.extend(commits.iter().map(String::as_str));
 
         let output = self.fetch_with_graph_retry(&args).await?;
