@@ -934,7 +934,9 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
                 tool_calls.push(ToolCall {
                     id: function_call.name.clone(), // Gemini doesn't have explicit call IDs in v1beta
                     function_name: function_call.name.clone(),
-                    arguments: function_call.args.clone(),
+                    arguments: crate::toolbox::utils::normalize_json_numbers(
+                        function_call.args.clone(),
+                    ),
                     thought_signature: thought_signature.clone(),
                 });
             }

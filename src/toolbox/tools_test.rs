@@ -582,4 +582,28 @@ mod tests {
         assert_eq!(res["content"].as_str().unwrap(), "");
         assert_eq!(res["total_lines"].as_u64().unwrap(), 0);
     }
+
+    #[test]
+    fn test_git_read_files_with_float_line_ranges() {
+        let (linux_path, _prompts_path) = get_test_paths();
+        let toolbox = ToolBox::new(linux_path, None);
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({
+            "revision": "HEAD",
+            "files": [
+                {
+                    "path": "README.md",
+                    "start_line": 3.0,
+                    "end_line": 6.0
+                }
+            ]
+        });
+
+        let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["start_line"].as_u64().unwrap(), 3);
+        assert_eq!(results[0]["end_line"].as_u64().unwrap(), 6);
+    }
 }

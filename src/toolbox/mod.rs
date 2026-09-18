@@ -156,6 +156,7 @@ impl ToolBox {
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let name_normalized = name.trim().to_lowercase();
         let should_cache = name_normalized != "todowrite";
+        let args = utils::normalize_json_numbers(args);
 
         let normalized_args = self.registry.normalize_tool_args(&name_normalized, &args);
 

@@ -228,6 +228,42 @@ fn get_priority_score(path: &str, active_files: &[String]) -> u32 {
     4
 }
 
+/// Recursively converts integral floating-point JSON numbers (e.g. `4475.0`) into integer
+/// JSON numbers (`4475`). Protobuf-to-JSON proxies represent all numbers as IEEE-754 doubles,
+/// which serialize with a trailing `.0` and cause `serde_json::Value::as_u64()` to return `None`.
+pub fn normalize_json_numbers(val: serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Number(n) => {
+            if n.as_i64().is_some() || n.as_u64().is_some() {
+                serde_json::Value::Number(n)
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 {
+                    if f >= 0.0 && f <= u64::MAX as f64 {
+                        serde_json::Value::Number(serde_json::Number::from(f as u64))
+                    } else if f >= i64::MIN as f64 && f < 0.0 {
+                        serde_json::Value::Number(serde_json::Number::from(f as i64))
+                    } else {
+                        serde_json::Value::Number(n)
+                    }
+                } else {
+                    serde_json::Value::Number(n)
+                }
+            } else {
+                serde_json::Value::Number(n)
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(normalize_json_numbers).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, normalize_json_numbers(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +288,30 @@ mod tests {
         let formatted = format_git_grep_output(&stdout, "HEAD", &active_files);
         assert!(formatted.starts_with("Matches found across 15 files (15 total matches):"));
         assert!(formatted.contains(", ... and 5 more files"));
+    }
+
+    #[test]
+    fn test_normalize_json_numbers() {
+        let input = serde_json::json!({
+            "files": [
+                {
+                    "path": "mm/memcontrol.c",
+                    "start_line": 4475.0,
+                    "end_line": 4505.0
+                }
+            ],
+            "limit": 5.0,
+            "offset": -10.0,
+            "temperature": 0.75
+        });
+
+        let normalized = normalize_json_numbers(input);
+        let file = &normalized["files"][0];
+        assert_eq!(file["start_line"].as_u64(), Some(4475));
+        assert_eq!(file["end_line"].as_u64(), Some(4505));
+        assert_eq!(normalized["limit"].as_u64(), Some(5));
+        assert_eq!(normalized["offset"].as_i64(), Some(-10));
+        assert_eq!(normalized["temperature"].as_f64(), Some(0.75));
+        assert_eq!(normalized["temperature"].as_u64(), None);
     }
 }
