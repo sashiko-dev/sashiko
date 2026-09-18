@@ -1953,8 +1953,8 @@ async fn handle_review_command(
             " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
         );
         if std::io::stdin().is_terminal() {
-            print!("Do you want to proceed? [y/N]: ");
-            std::io::stdout().flush()?;
+            eprint!("Do you want to proceed? [y/N]: ");
+            std::io::stderr().flush()?;
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             let trimmed = input.trim().to_lowercase();
