@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
@@ -478,6 +478,7 @@ async fn review_single_patch(
     all_patches: &[PatchInput],
     rich_patches: &[Value],
     patch_shas: &HashMap<i64, String>,
+    patch_files: &HashMap<i64, Vec<String>>,
     options: &WorkerOptions,
     baseline_sha: &str,
     llm_semaphore: &Arc<Semaphore>,
@@ -517,24 +518,7 @@ async fn review_single_patch(
         // The directory itself: read_prompt resolves a name against it.
         let prompts_tool_path = Some(options.prompts.clone());
 
-        let mut patch_files = Vec::new();
-        if let Some(sha) = patch_shas.get(&p.index) {
-            let output = crate::git_cmd::in_dir_async(&worktree.path)
-                .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
-                .output()
-                .await;
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                let file_list = String::from_utf8_lossy(&out.stdout);
-                for file in file_list.lines() {
-                    let trimmed = file.trim().to_string();
-                    if !trimmed.is_empty() {
-                        patch_files.push(trimmed);
-                    }
-                }
-            }
-        }
+        let patch_files = patch_files.get(&p.index).cloned().unwrap_or_default();
         info!(
             "Active patch files gathered for patch {}: {:?}",
             p.index, patch_files
@@ -715,6 +699,55 @@ fn build_review_output(
         "concerns_count": concerns_count,
         "dismissed_concerns_count": dismissed_concerns_count
     })
+}
+
+/// The files a commit touches, or nothing when git cannot say.
+async fn commit_changed_files(worktree: &GitWorktree, sha: &str) -> Vec<String> {
+    let output = crate::git_cmd::in_dir_async(&worktree.path)
+        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Attributes each finding to the patch its locations point at.
+///
+/// A review pass is not confined to its own patch's code, so the pass index
+/// stamped on a finding answers "which pass produced this", not "which patch
+/// contains this". The caller keeps it in `review_pass_index`; here
+/// `patch_index` and `patch_subject` become the one patch whose files the
+/// finding's locations name. A finding with no locations, in files no patch
+/// touches, or in files several patches touch, keeps the pass index: none can
+/// be settled from file names.
+fn attribute_findings_to_patches(
+    findings: &mut [Value],
+    patch_files: &HashMap<i64, Vec<String>>,
+    patch_subjects: &HashMap<i64, String>,
+) {
+    for finding in findings.iter_mut() {
+        let files: Vec<&str> = finding["locations"]
+            .as_array()
+            .map(|locs| locs.iter().filter_map(|l| l["file"].as_str()).collect())
+            .unwrap_or_default();
+        let candidates: Vec<i64> = patch_files
+            .iter()
+            .filter(|(_, changed)| files.iter().any(|f| changed.iter().any(|c| c == f)))
+            .map(|(idx, _)| *idx)
+            .collect();
+        if let [owner] = candidates[..] {
+            finding["patch_index"] = json!(owner);
+            finding["patch_subject"] =
+                json!(patch_subjects.get(&owner).cloned().unwrap_or_default());
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -902,6 +935,11 @@ async fn run_worker_in_worktree(
         })
         .collect();
 
+    let mut patch_files: HashMap<i64, Vec<String>> = HashMap::new();
+    for (idx, sha) in &patch_shas {
+        patch_files.insert(*idx, commit_changed_files(worktree, sha).await);
+    }
+
     // Cap in-flight model calls across the whole run. The patch fan-out below
     // is bounded by `concurrency`; each patch then fans its stages out
     // concurrently on top of that, so without a shared ceiling the number of
@@ -915,6 +953,7 @@ async fn run_worker_in_worktree(
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
+        let patch_files = &patch_files;
         let options = &options;
         let subject_clone = subject.clone();
         let all_patches = &patches;
@@ -930,6 +969,7 @@ async fn run_worker_in_worktree(
                 all_patches,
                 &rich_patches,
                 patch_shas,
+                patch_files,
                 options,
                 baseline_sha,
                 llm_semaphore,
@@ -983,22 +1023,31 @@ async fn run_worker_in_worktree(
                     combined_summary.push_str(summary.trim());
                 }
             }
-            if let Some(findings) = review.get("findings").and_then(|v| v.as_array()) {
-                for f in findings {
-                    let mut finding_val = f.clone();
-                    finding_val["patch_index"] = json!(p_idx);
-                    finding_val["patch_subject"] = json!(patch_subject);
-                    combined_findings.push(finding_val);
+            // The pass is stamped on findings and concerns alike. The stage
+            // validators reject a non-object element before it gets here; a
+            // result that arrived without them (the daemon's stdio path, an
+            // older worker) is warned about and the element dropped, since
+            // indexing it would panic.
+            let stamp = |key: &str, dest: &mut Vec<Value>| {
+                if let Some(items) = review.get(key).and_then(|v| v.as_array()) {
+                    for item in items {
+                        if !item.is_object() {
+                            warn!(
+                                "patch {}: dropping a non-object element of {}: {}",
+                                p_idx, key, item
+                            );
+                            continue;
+                        }
+                        let mut val = item.clone();
+                        val["patch_index"] = json!(p_idx);
+                        val["patch_subject"] = json!(patch_subject);
+                        val["review_pass_index"] = json!(p_idx);
+                        dest.push(val);
+                    }
                 }
-            }
-            if let Some(concerns) = review.get("concerns").and_then(|v| v.as_array()) {
-                for c in concerns {
-                    let mut concern_val = c.clone();
-                    concern_val["patch_index"] = json!(p_idx);
-                    concern_val["patch_subject"] = json!(patch_subject);
-                    combined_concerns.push(concern_val);
-                }
-            }
+            };
+            stamp("findings", &mut combined_findings);
+            stamp("concerns", &mut combined_concerns);
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
             }
@@ -1045,6 +1094,12 @@ async fn run_worker_in_worktree(
         total_tokens_out += res["tokens_out"].as_u64().unwrap_or(0);
         total_tokens_cached += res["tokens_cached"].as_u64().unwrap_or(0);
     }
+
+    let patch_subjects: HashMap<i64, String> = patches
+        .iter()
+        .map(|p| (p.index, p.subject.clone().unwrap_or_default()))
+        .collect();
+    attribute_findings_to_patches(&mut combined_findings, &patch_files, &patch_subjects);
 
     let review_output = build_review_output(
         combined_summary,
@@ -1928,6 +1983,67 @@ mod tests {
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_findings_are_attributed_to_the_patch_their_files_belong_to() {
+        let patch_files: HashMap<i64, Vec<String>> = HashMap::from([
+            (1, vec!["arch/arm64/include/asm/sysreg.h".to_string()]),
+            (2, vec!["arch/arm64/kvm/vgic/vgic-v5.c".to_string()]),
+            (
+                3,
+                vec![
+                    "arch/arm64/kvm/vgic/vgic-v5.c".to_string(),
+                    "Documentation/x.rst".to_string(),
+                ],
+            ),
+        ]);
+        let patch_subjects: HashMap<i64, String> = HashMap::from([
+            (1, "sysreg: add".to_string()),
+            (2, "vgic-v5: init".to_string()),
+            (3, "vgic-v5: docs".to_string()),
+        ]);
+        let loc = |file: &str| json!([{"file": file, "line": 1}]);
+        // Shaped as the aggregation loop stamps them: pass in both fields.
+        let stamped = |pass: i64, subject: &str, locations: Option<Value>| {
+            let mut v =
+                json!({"patch_index": pass, "review_pass_index": pass, "patch_subject": subject});
+            if let Some(locs) = locations {
+                v["locations"] = locs;
+            }
+            v
+        };
+        let mut findings = vec![
+            // Pass 1 roamed into a file only patch 3 touches.
+            stamped(1, "sysreg: add", Some(loc("Documentation/x.rst"))),
+            // Pass 2 reported on its own patch's file, which patch 3 also touches.
+            stamped(
+                2,
+                "vgic-v5: init",
+                Some(loc("arch/arm64/kvm/vgic/vgic-v5.c")),
+            ),
+            // Pass 1 reported on a file two other patches touch: undecidable.
+            stamped(1, "sysreg: add", Some(loc("arch/arm64/kvm/vgic/vgic-v5.c"))),
+            // No locations at all.
+            stamped(2, "vgic-v5: init", None),
+            // A file no patch in the series touches: pre-existing or misplaced.
+            stamped(3, "vgic-v5: docs", Some(loc("kernel/sched/core.c"))),
+        ];
+
+        attribute_findings_to_patches(&mut findings, &patch_files, &patch_subjects);
+
+        assert_eq!(findings[0]["patch_index"], 3);
+        assert_eq!(findings[0]["patch_subject"], "vgic-v5: docs");
+        assert_eq!(findings[0]["review_pass_index"], 1);
+        assert_eq!(findings[1]["patch_index"], 2);
+        assert_eq!(findings[1]["review_pass_index"], 2);
+        assert_eq!(findings[2]["patch_index"], 1);
+        assert_eq!(findings[2]["review_pass_index"], 1);
+        assert_eq!(findings[3]["patch_index"], 2);
+        assert_eq!(findings[3]["review_pass_index"], 2);
+        assert_eq!(findings[4]["patch_index"], 3);
+        assert_eq!(findings[4]["patch_subject"], "vgic-v5: docs");
+        assert_eq!(findings[4]["review_pass_index"], 3);
     }
 
     #[test]

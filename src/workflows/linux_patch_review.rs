@@ -339,14 +339,53 @@ Example Output:
 // Validation Logic
 // ---------------------------------------------------------------------------
 
-fn validate_concerns_output(
-    _output: &StageConcernsOutput,
-    _state: &LinuxPatchReviewState,
-) -> Result<(), String> {
-    Ok(())
+/// Rejects an array element that is not a JSON object, naming it, so the
+/// engine hands the violation back to the model instead of passing a string
+/// or null on to the stages and the aggregation that index into it.
+fn non_object_element(array: &str, items: &[Value]) -> Result<(), String> {
+    match items.iter().position(|v| !v.is_object()) {
+        Some(i) => Err(format!("'{array}[{i}]' is not a JSON object")),
+        None => Ok(()),
+    }
 }
 
-fn format_concerns_feedback(violation: &str) -> String {
+pub(crate) fn validate_concerns_output(
+    output: &StageConcernsOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    non_object_element("concerns", &output.concerns)?;
+    non_object_element("dismissed_concerns", &output.dismissed_concerns)
+}
+
+pub(crate) fn validate_conflict_resolution_output(
+    output: &ConflictResolutionOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    non_object_element("concerns", &output.concerns)
+}
+
+pub(crate) fn validate_verification_output(
+    output: &VerificationOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    non_object_element("findings", &output.findings)
+}
+
+pub(crate) fn format_conflict_resolution_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing a 'concerns' array whose every element is an object.",
+        violation
+    )
+}
+
+pub(crate) fn format_verification_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing a 'findings' array whose every element is an object with the keys listed above.",
+        violation
+    )
+}
+
+pub(crate) fn format_concerns_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
         violation
@@ -968,7 +1007,11 @@ Example Output:
                 serde_json::to_string_pretty(&s.deduplicated_dismissed_concerns).unwrap_or_default()
             }),
         )
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_conflict_resolution_output)
+                .with_feedback_formatter(format_conflict_resolution_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1043,7 +1086,11 @@ Example Output:
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_verification_output)
+                .with_feedback_formatter(format_verification_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1256,6 +1303,41 @@ mod tests {
         }
         assert!(is_known_stage(prescreen_stage().name()));
         assert!(is_known_stage(planning_stage().name()));
+    }
+
+    #[test]
+    fn test_stage_validators_reject_a_non_object_element() {
+        let state = LinuxPatchReviewState::default();
+        let ok = StageConcernsOutput {
+            concerns: vec![json!({"description": "a"})],
+            dismissed_concerns: vec![],
+        };
+        assert!(validate_concerns_output(&ok, &state).is_ok());
+
+        let bad = StageConcernsOutput {
+            concerns: vec![json!({"description": "a"}), json!("not an object")],
+            dismissed_concerns: vec![],
+        };
+        assert_eq!(
+            validate_concerns_output(&bad, &state).unwrap_err(),
+            "'concerns[1]' is not a JSON object"
+        );
+
+        let bad = VerificationOutput {
+            findings: vec![Value::Null],
+        };
+        assert_eq!(
+            validate_verification_output(&bad, &state).unwrap_err(),
+            "'findings[0]' is not a JSON object"
+        );
+
+        let bad = ConflictResolutionOutput {
+            concerns: vec![json!(42)],
+        };
+        assert_eq!(
+            validate_conflict_resolution_output(&bad, &state).unwrap_err(),
+            "'concerns[0]' is not a JSON object"
+        );
     }
 
     #[test]
