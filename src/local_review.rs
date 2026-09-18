@@ -823,15 +823,18 @@ async fn commit_changed_files(worktree: &GitWorktree, sha: &str) -> Vec<String> 
     }
 }
 
-/// Attributes each finding to the patch its locations point at.
+/// Attributes each finding to the patch that introduced it.
 ///
 /// A review pass is not confined to its own patch's code, so the pass index
 /// stamped on a finding answers "which pass produced this", not "which patch
 /// contains this". The caller keeps it in `review_pass_index`; here
-/// `patch_index` and `patch_subject` become the one patch whose files the
-/// finding's locations name. A finding with no locations, in files no patch
-/// touches, or in files several patches touch, keeps the pass index: none can
-/// be settled from file names.
+/// `patch_index` and `patch_subject` become the introducing patch, decided
+/// from two pieces of evidence: the patches whose files the finding's
+/// locations name, and the patch the verification stage named in
+/// `introduced_in_patch`. The stage's answer settles a choice the files
+/// leave open and is taken only where the files allow it: it must be a
+/// series patch and, when any patch touches the cited files, one of those.
+/// A finding the two cannot settle keeps the pass index.
 fn attribute_findings_to_patches(
     findings: &mut [Value],
     patch_files: &HashMap<i64, Vec<String>>,
@@ -847,7 +850,16 @@ fn attribute_findings_to_patches(
             .filter(|(_, changed)| files.iter().any(|f| changed.iter().any(|c| c == f)))
             .map(|(idx, _)| *idx)
             .collect();
-        if let [owner] = candidates[..] {
+        let named = finding["introduced_in_patch"]
+            .as_i64()
+            .filter(|n| patch_subjects.contains_key(n));
+        let owner = match (named, &candidates[..]) {
+            (Some(n), []) => Some(n),
+            (Some(n), c) if c.contains(&n) => Some(n),
+            (_, [only]) => Some(*only),
+            _ => None,
+        };
+        if let Some(owner) = owner {
             finding["patch_index"] = json!(owner);
             finding["patch_subject"] =
                 json!(patch_subjects.get(&owner).cloned().unwrap_or_default());
@@ -2326,6 +2338,51 @@ mod tests {
         assert_eq!(findings[4]["patch_index"], 3);
         assert_eq!(findings[4]["patch_subject"], "vgic-v5: docs");
         assert_eq!(findings[4]["review_pass_index"], 3);
+    }
+
+    #[test]
+    fn test_the_patch_the_verification_stage_names_settles_what_files_leave_open() {
+        let patch_files: HashMap<i64, Vec<String>> = HashMap::from([
+            (1, vec!["a.c".to_string()]),
+            (2, vec!["a.c".to_string()]),
+            (3, vec!["b.c".to_string()]),
+        ]);
+        let patch_subjects: HashMap<i64, String> = HashMap::from([
+            (1, "one".to_string()),
+            (2, "two".to_string()),
+            (3, "three".to_string()),
+        ]);
+        let f = |named: Value, file: &str| {
+            json!({"patch_index": 1, "review_pass_index": 1, "patch_subject": "one",
+                   "introduced_in_patch": named, "locations": [{"file": file}]})
+        };
+        let mut findings = vec![
+            // a.c is touched by patches 1 and 2; the stage settles it as 2.
+            f(json!(2), "a.c"),
+            // The stage names a patch that does not touch b.c; the one patch
+            // that does wins.
+            f(json!(2), "b.c"),
+            // The stage names a patch outside the series: files decide.
+            f(json!(9), "b.c"),
+            // null: files alone, which cannot decide a.c.
+            f(Value::Null, "a.c"),
+            // A file no patch touches: the stage's answer is all there is.
+            f(json!(3), "kernel/sched/core.c"),
+            // The stage names a patch outside the candidates for an
+            // ambiguous file: undecided, the pass index stays.
+            f(json!(3), "a.c"),
+        ];
+
+        attribute_findings_to_patches(&mut findings, &patch_files, &patch_subjects);
+
+        assert_eq!(findings[0]["patch_index"], 2);
+        assert_eq!(findings[0]["patch_subject"], "two");
+        assert_eq!(findings[1]["patch_index"], 3);
+        assert_eq!(findings[2]["patch_index"], 3);
+        assert_eq!(findings[3]["patch_index"], 1);
+        assert_eq!(findings[4]["patch_index"], 3);
+        assert_eq!(findings[5]["patch_index"], 1);
+        assert_eq!(findings[5]["review_pass_index"], 1);
     }
 
     #[test]
