@@ -158,6 +158,13 @@ struct PatchworkCheckRequest {
     context: String,
 }
 
+/// Headers that identify Sashiko to a Patchwork API instance.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PatchworkApiIdentity<'a> {
+    pub token: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
 /// Post a check result to the Patchwork REST API for a given patch.
 ///
 /// Looks up the patch by message-ID, then POSTs the check. Returns Ok
@@ -166,7 +173,7 @@ struct PatchworkCheckRequest {
 pub async fn post_patchwork_check(
     client: &Client,
     api_url: &str,
-    token: Option<&str>,
+    identity: PatchworkApiIdentity<'_>,
     msgid: &str,
     status: &str,
     description: &str,
@@ -184,8 +191,11 @@ pub async fn post_patchwork_check(
     debug!("Fetching Patchwork patch by msgid: {}", clean_msgid);
 
     let mut get_req = client.get(patches_url);
-    if let Some(token) = token {
+    if let Some(token) = identity.token {
         get_req = get_req.header(header::AUTHORIZATION, format!("Token {}", token));
+    }
+    if let Some(user_agent) = identity.user_agent {
+        get_req = get_req.header(header::USER_AGENT, user_agent);
     }
 
     let resp = get_req
@@ -231,8 +241,11 @@ pub async fn post_patchwork_check(
     debug!("Posting check to Patchwork: {} {:?}", check_url, payload);
 
     let mut post_req = client.post(&check_url).json(&payload);
-    if let Some(token) = token {
+    if let Some(token) = identity.token {
         post_req = post_req.header(header::AUTHORIZATION, format!("Token {}", token));
+    }
+    if let Some(user_agent) = identity.user_agent {
+        post_req = post_req.header(header::USER_AGENT, user_agent);
     }
 
     let post_resp = post_req
@@ -276,6 +289,8 @@ pub fn compose_patchwork_email(
 mod tests {
     use super::*;
     use crate::email_policy::PatchworkPolicy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn finding(severity: &str, preexisting: bool) -> Value {
         serde_json::json!({"severity": severity, "problem": "test", "preexisting": preexisting})
@@ -291,6 +306,40 @@ mod tests {
 
     fn default_policy() -> PatchworkPolicy {
         PatchworkPolicy::default()
+    }
+
+    async fn capture_request(listener: &TcpListener, response: &str) -> String {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+
+        loop {
+            let bytes_read = stream.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before request headers");
+            request.extend_from_slice(&buffer[..bytes_read]);
+
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = request_header(&headers, "content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+
+        stream.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8(request).unwrap()
+    }
+
+    fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().skip(1).find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
     }
 
     // -- PatchworkCheckResult tests --
@@ -459,6 +508,55 @@ mod tests {
         let findings = vec![finding_new("Critical"), finding_new("Medium")];
         let result = PatchworkCheckResult::from_policy(&default_policy(), &findings);
         assert!(result.description.contains("\u{00b7}")); // middle dot
+    }
+
+    #[tokio::test]
+    async fn test_patchwork_user_agent_sent_on_lookup_and_check() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let lookup = capture_request(
+                &listener,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n[{\"id\":7}]",
+            )
+            .await;
+            let check = capture_request(
+                &listener,
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            (lookup, check)
+        });
+
+        let api_url = format!("http://{address}/api/1.3");
+        post_patchwork_check(
+            &Client::new(),
+            &api_url,
+            PatchworkApiIdentity {
+                token: Some("test-token"),
+                user_agent: Some("sashiko-test/1.0 (test@example.org)"),
+            },
+            "<patch@example.org>",
+            "success",
+            "No regressions",
+            "https://sashiko.dev/review/7",
+        )
+        .await
+        .unwrap();
+
+        let (lookup, check) = server.await.unwrap();
+        assert!(lookup.starts_with("GET /api/1.3/patches/?msgid=patch%40example.org HTTP/1.1"));
+        assert!(check.starts_with("POST /api/1.3/patches/7/checks/ HTTP/1.1"));
+        for request in [&lookup, &check] {
+            assert_eq!(
+                request_header(request, "user-agent"),
+                Some("sashiko-test/1.0 (test@example.org)")
+            );
+            assert_eq!(
+                request_header(request, "authorization"),
+                Some("Token test-token")
+            );
+        }
     }
 
     // -- compose_patchwork_email tests --
