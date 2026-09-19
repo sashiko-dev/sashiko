@@ -678,7 +678,8 @@ pub fn prescreen_stage() -> Stage<SashikoPatchReviewState, PrescreenOutput> {
                     "items": { "type": "string" }
                 }
             },
-            "required": ["selected_prompts"]
+            "required": ["selected_prompts"],
+            "additionalProperties": false
         })))
         .policy(StagePolicy {
             tools: ToolScope::None,
@@ -726,7 +727,8 @@ pub fn planning_stage() -> Stage<SashikoPatchReviewState, PlanningOutput> {
                     "items": { "type": "string" }
                 }
             },
-            "required": ["relevant_stages"]
+            "required": ["relevant_stages"],
+            "additionalProperties": false
         })))
         .policy(StagePolicy {
             tools: ToolScope::None,

@@ -17,10 +17,11 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::settings::{AiSettings, Settings};
+use crate::settings::{AiSettings, OpenAiTokenLimitField, Settings};
 
 /// Represents the role of a message in an AI conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +35,50 @@ pub enum AiRole {
     Assistant,
     /// Message containing the result of a tool execution.
     Tool,
+}
+
+/// Opaque provider-specific data that must accompany a conversation item on a
+/// later turn.
+///
+/// Providers use this for protocol state that cannot be represented by the
+/// common message fields. Consumers must retain it verbatim, but providers
+/// other than the named one must ignore it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiProviderMetadata {
+    /// The provider that owns [`Self::data`].
+    pub provider: String,
+    /// Provider-defined schema version for [`Self::data`].
+    #[serde(default = "default_provider_metadata_version")]
+    pub version: u32,
+    /// Opaque, provider-defined JSON data.
+    pub data: serde_json::Value,
+}
+
+fn default_provider_metadata_version() -> u32 {
+    1
+}
+
+pub(crate) const MAX_PROVIDER_METADATA_BYTES: usize = 16 * 1024 * 1024;
+
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::FileTooLarge, "serialized size overflow")
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn provider_metadata_size(metadata: &AiProviderMetadata) -> Result<usize> {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, metadata)?;
+    Ok(counter.0)
 }
 
 /// A single message in an AI conversation.
@@ -55,6 +100,9 @@ pub struct AiMessage {
     /// Optional ID matching a tool call (required for Tool role).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Opaque provider-specific data required when replaying this message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<AiProviderMetadata>,
 }
 
 /// Represents a request from the AI to call a specific tool/function.
@@ -176,6 +224,9 @@ pub struct AiResponse {
     /// Whether the response was truncated by the provider (e.g., hit max tokens).
     #[serde(default)]
     pub truncated: bool,
+    /// Opaque provider-specific data required when replaying this response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<AiProviderMetadata>,
 }
 
 /// Classifies a remote AI error using the typed stdio protocol payload.
@@ -256,7 +307,8 @@ pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErro
         reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {
             retry_after: DEFAULT_RETRY_AFTER,
         }),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        reqwest::StatusCode::REQUEST_TIMEOUT
+        | reqwest::StatusCode::INTERNAL_SERVER_ERROR
         | reqwest::StatusCode::BAD_GATEWAY
         | reqwest::StatusCode::SERVICE_UNAVAILABLE
         | reqwest::StatusCode::GATEWAY_TIMEOUT => Some(AiErrorClass::Transient {
@@ -275,6 +327,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<openai::OpenAiCompatError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<openai_responses::OpenAiError>() {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<claude::ClaudeError>() {
@@ -467,6 +522,34 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
     create_provider_from_ai(&settings.ai)
 }
 
+fn create_openai_compat_provider(
+    ai: &AiSettings,
+    token_limit_field: Option<OpenAiTokenLimitField>,
+) -> Result<Arc<dyn AiProvider>> {
+    let openai_compat = ai.openai_compat.as_ref();
+    let base_url = openai_compat
+        .and_then(|settings| settings.base_url.clone())
+        .unwrap_or_else(|| openai::OpenAiCompatClient::default_base_url_for_model(&ai.model));
+    let context_window = openai_compat
+        .and_then(|settings| settings.context_window_size)
+        .unwrap_or_else(|| openai::OpenAiCompatClient::default_context_window_for_model(&ai.model));
+    let max_tokens = openai_compat
+        .and_then(|settings| settings.max_tokens)
+        .unwrap_or(4096);
+    let token_limit_field = token_limit_field
+        .or_else(|| openai_compat.map(|settings| settings.token_limit_field))
+        .unwrap_or_default();
+
+    Ok(Arc::new(openai::OpenAiCompatClient::new(
+        base_url,
+        ai.model.clone(),
+        context_window,
+        max_tokens,
+        token_limit_field,
+        ai.api_timeout_secs,
+    )?))
+}
+
 /// Creates an AI provider based on AI settings only.
 pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
     match ai.provider.to_lowercase().as_str() {
@@ -518,45 +601,49 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         }
         #[cfg(not(feature = "bedrock"))]
         "bedrock" => bail!("bedrock provider requires the 'bedrock' feature"),
-        "openai" | "openai-compatible" => {
-            let provider_type = match ai.provider.to_lowercase().as_str() {
-                "openai" => openai::OpenAiProviderType::OpenAi,
-                _ => openai::OpenAiProviderType::OpenAiCompatible,
-            };
+        "openai" => {
+            if ai.openai.is_none() {
+                tracing::warn!(
+                    "provider = \"openai\" without [ai.openai] is deprecated; preserving \
+                     the legacy Chat Completions API behavior. Use provider = \
+                     \"openai-compatible\" explicitly, or add [ai.openai] to use the \
+                     Responses API"
+                );
+                return create_openai_compat_provider(
+                    ai,
+                    Some(OpenAiTokenLimitField::MaxCompletionTokens),
+                );
+            }
 
-            let base_url = ai
-                .openai_compat
-                .as_ref()
+            let openai = ai.openai.as_ref();
+            let base_url = openai
                 .and_then(|c| c.base_url.clone())
-                .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
-                });
+                .unwrap_or_else(openai_responses::OpenAiClient::default_base_url);
 
-            let context_window = ai
-                .openai_compat
-                .as_ref()
+            let context_window = openai
                 .and_then(|c| c.context_window_size)
                 .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_context_window_for_model(&ai.model)
+                    openai_responses::OpenAiClient::default_context_window_for_model(&ai.model)
                 });
 
-            let max_tokens = ai
-                .openai_compat
-                .as_ref()
+            let max_tokens = openai
                 .and_then(|c| c.max_tokens)
-                .unwrap_or(4096);
+                .unwrap_or(openai_responses::DEFAULT_MAX_OUTPUT_TOKENS);
 
-            let provider = openai::OpenAiCompatClient::new(
+            let reasoning_effort = openai.and_then(|c| c.reasoning_effort.clone());
+
+            let provider = openai_responses::OpenAiClient::new(
                 base_url,
-                provider_type,
                 ai.model.clone(),
                 context_window,
                 max_tokens,
+                reasoning_effort,
                 ai.api_timeout_secs,
             )?;
 
             Ok(Arc::new(provider))
         }
+        "openai-compatible" => create_openai_compat_provider(ai, None),
         "ollama" => {
             let model = ai.model.clone();
             let base_url = ai
@@ -714,6 +801,7 @@ pub mod kiro_cli;
 pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
+pub mod openai_responses;
 pub mod proxy;
 pub mod quota;
 pub mod session;
@@ -726,13 +814,20 @@ pub mod vllm;
 pub use session::{ErrorAction, LlmSession, SessionRunner, ValidationError};
 
 /// Recursively removes `thought_signature` and `thoughtSignature` fields from a JSON value.
+///
+/// Opaque provider metadata is deliberately not traversed: it can contain
+/// provider-issued continuation state whose signature fields must be replayed
+/// verbatim. Human-readable session logs exclude that metadata before they are
+/// persisted.
 pub fn scrub_thought_signatures(val: &mut serde_json::Value) {
     match val {
         serde_json::Value::Object(map) => {
             map.remove("thought_signature");
             map.remove("thoughtSignature");
-            for (_, v) in map.iter_mut() {
-                scrub_thought_signatures(v);
+            for (key, value) in map.iter_mut() {
+                if key != "provider_metadata" {
+                    scrub_thought_signatures(value);
+                }
             }
         }
         serde_json::Value::Array(arr) => {
@@ -1058,6 +1153,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: Some(0.5),
@@ -1096,6 +1192,15 @@ mod tests {
                         "thought_signature": "sig_123"
                     }
                 ],
+                "provider_metadata": {
+                    "provider": "openai.responses",
+                    "version": 1,
+                    "data": [{
+                        "id": "rsn_1",
+                        "type": "reasoning",
+                        "encrypted_content": "opaque"
+                    }]
+                },
                 "usage": {
                     "prompt_tokens": 100,
                     "completion_tokens": 50,
@@ -1118,6 +1223,10 @@ mod tests {
         assert_eq!(tool_calls[0].function_name, "my_tool");
         assert_eq!(tool_calls[0].arguments["a"], 1);
         assert_eq!(tool_calls[0].thought_signature.as_deref(), Some("sig_123"));
+        assert_eq!(
+            payload.provider_metadata.as_ref().unwrap().data[0]["encrypted_content"],
+            "opaque"
+        );
 
         let usage = payload.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 100);
@@ -1125,6 +1234,25 @@ mod tests {
         assert_eq!(usage.total_tokens, 150);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_scrub_thought_signatures_preserves_provider_metadata() {
+        let mut value = json!({
+            "thought_signature": "transient",
+            "provider_metadata": {
+                "provider": "openai.responses",
+                "data": {"thought_signature": "opaque"}
+            }
+        });
+
+        scrub_thought_signatures(&mut value);
+
+        assert!(value.get("thought_signature").is_none());
+        assert_eq!(
+            value["provider_metadata"]["data"]["thought_signature"],
+            "opaque"
+        );
     }
 
     fn assert_remote_ai_error_payload_wire_format(
@@ -1381,6 +1509,16 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_status_code_request_timeout() {
+        assert_eq!(
+            classify_status_code(reqwest::StatusCode::REQUEST_TIMEOUT),
+            Some(AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            })
+        );
+    }
+
+    #[test]
     fn test_classify_status_code_not_implemented_is_fatal() {
         assert_eq!(
             classify_status_code(reqwest::StatusCode::NOT_IMPLEMENTED),
@@ -1403,14 +1541,117 @@ mod tests {
 
         settings.ai.provider = "openai".to_string();
         settings.ai.model = "gpt-4o".to_string();
+        settings.ai.openai = Some(crate::settings::OpenAiSettings {
+            base_url: None,
+            context_window_size: None,
+            max_tokens: None,
+            reasoning_effort: None,
+        });
         let provider = create_provider(&settings)?;
         assert_eq!(provider.get_capabilities().model_name, "gpt-4o");
+        assert!(
+            provider
+                .cache_identity()
+                .contains("provider_type=openai-responses")
+        );
 
         settings.ai.provider = "unknown".to_string();
         let result = create_provider(&settings);
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    // Settings does not implement Default (and partial Settings deserialization
+    // does not work — see Task 1's notes), so AiSettings is constructed
+    // directly here rather than going through Settings.
+    #[test]
+    fn test_openai_provider_uses_responses_client() {
+        let ai = AiSettings {
+            provider: "openai".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            max_input_tokens: 150_000,
+            max_interactions: 100,
+            temperature: 1.0,
+            api_timeout_secs: 300,
+            no_ai: false,
+            log_turns: false,
+            response_cache: false,
+            response_cache_ttl_days: 7,
+            claude: None,
+            gemini: None,
+            #[cfg(feature = "bedrock")]
+            bedrock: None,
+            #[cfg(feature = "vertex")]
+            vertex: None,
+            // It is valid to keep settings for another provider while the
+            // dedicated OpenAI provider is active. Only a configuration that
+            // has no [ai.openai] section is the legacy combination.
+            openai_compat: Some(crate::settings::OpenAiCompatSettings {
+                base_url: Some("http://localhost:8080/v1".to_string()),
+                context_window_size: Some(32_768),
+                max_tokens: Some(1024),
+                token_limit_field: Default::default(),
+            }),
+            openai: Some(crate::settings::OpenAiSettings {
+                base_url: None,
+                context_window_size: None,
+                max_tokens: Some(16_384),
+                reasoning_effort: Some("medium".to_string()),
+            }),
+            ollama: None,
+            vllm: None,
+            kiro_cli: None,
+            claude_cli: None,
+            codex_cli: None,
+            devin_cli: None,
+            goose_cli: None,
+        };
+
+        let provider = create_provider_from_ai(&ai).unwrap();
+        assert_eq!(provider.get_capabilities().model_name, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn test_openai_provider_preserves_legacy_compat_settings() {
+        let legacy_ai: AiSettings = toml::from_str(
+            r#"
+provider = "openai"
+model = "gpt-5.6-sol"
+
+[openai_compat]
+base_url = "http://localhost:8080/v1"
+context_window_size = 32768
+max_tokens = 1024
+"#,
+        )
+        .unwrap();
+
+        let provider = create_provider_from_ai(&legacy_ai).unwrap();
+        let identity = provider.cache_identity();
+        assert_eq!(provider.get_capabilities().context_window_size, 32_768);
+        assert!(identity.contains("provider_type=openai-compatible"));
+        assert!(identity.contains("base_url=http://localhost:8080/v1/chat/completions"));
+        assert!(identity.contains("max_tokens=1024"));
+        assert!(identity.contains("token_limit_field=max_completion_tokens"));
+    }
+
+    #[test]
+    fn test_openai_provider_preserves_tableless_legacy_settings() {
+        let legacy_ai: AiSettings = toml::from_str(
+            r#"
+provider = "openai"
+model = "gpt-5.6-sol"
+"#,
+        )
+        .unwrap();
+
+        let provider = create_provider_from_ai(&legacy_ai).unwrap();
+        let identity = provider.cache_identity();
+        assert!(identity.contains("provider_type=openai-compatible"));
+        assert!(identity.contains("base_url=https://api.openai.com/v1/chat/completions"));
+        assert!(identity.contains("max_tokens=4096"));
+        assert!(identity.contains("token_limit_field=max_completion_tokens"));
     }
 
     // Providers built for concurrent reviews share one tx_id namespace.
