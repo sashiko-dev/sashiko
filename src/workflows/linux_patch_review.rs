@@ -339,14 +339,62 @@ Example Output:
 // Validation Logic
 // ---------------------------------------------------------------------------
 
-fn validate_concerns_output(
-    _output: &StageConcernsOutput,
-    _state: &LinuxPatchReviewState,
-) -> Result<(), String> {
-    Ok(())
+/// Rejects an array element that is not a JSON object, naming it, so the
+/// engine hands the violation back to the model instead of passing a string
+/// or null on to the stages and the aggregation that index into it.
+fn non_object_element(array: &str, items: &[Value]) -> Result<(), String> {
+    match items.iter().position(|v| !v.is_object()) {
+        Some(i) => Err(format!("'{array}[{i}]' is not a JSON object")),
+        None => Ok(()),
+    }
 }
 
-fn format_concerns_feedback(violation: &str) -> String {
+pub(crate) fn validate_concerns_output(
+    output: &StageConcernsOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    non_object_element("concerns", &output.concerns)?;
+    non_object_element("dismissed_concerns", &output.dismissed_concerns)
+}
+
+pub(crate) fn validate_conflict_resolution_output(
+    output: &ConflictResolutionOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    non_object_element("concerns", &output.concerns)
+}
+
+pub(crate) fn validate_verification_output(
+    output: &VerificationOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    non_object_element("findings", &output.findings)?;
+    match output.findings.iter().position(|f| {
+        f.get("introduced_in_patch")
+            .is_some_and(|v| !(v.is_null() || v.is_i64()))
+    }) {
+        Some(i) => Err(format!(
+            "'findings[{i}].introduced_in_patch' must be an integer patch number or null"
+        )),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn format_conflict_resolution_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing a 'concerns' array whose every element is an object.",
+        violation
+    )
+}
+
+pub(crate) fn format_verification_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing a 'findings' array whose every element is an object with the keys listed above.",
+        violation
+    )
+}
+
+pub(crate) fn format_concerns_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
         violation
@@ -968,7 +1016,11 @@ Example Output:
                 serde_json::to_string_pretty(&s.deduplicated_dismissed_concerns).unwrap_or_default()
             }),
         )
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_conflict_resolution_output)
+                .with_feedback_formatter(format_conflict_resolution_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1011,7 +1063,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "introduced_in_patch" (an integer or null: the series position, as in "[Patch N of M]", of the patch whose change first made the problem present, chosen from the series block (the patch under review on its header line, the preceding and subsequent lists below it): an earlier patch when the problem was already present in the tree this patch was applied to, the one whose change made it so, not merely the last to touch the code; the patch under review when its own diff introduces the problem; a subsequent patch when only that patch's change makes it a problem; null when "preexisting" is true, that is, the code came from before the series, or you cannot tell), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
 ```json
@@ -1022,6 +1074,7 @@ Example Output:
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
       "preexisting": false,
+      "introduced_in_patch": 1,
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -1043,7 +1096,11 @@ Example Output:
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_verification_output)
+                .with_feedback_formatter(format_verification_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1256,6 +1313,57 @@ mod tests {
         }
         assert!(is_known_stage(prescreen_stage().name()));
         assert!(is_known_stage(planning_stage().name()));
+    }
+
+    #[test]
+    fn test_stage_validators_reject_a_non_object_element() {
+        let state = LinuxPatchReviewState::default();
+        let ok = StageConcernsOutput {
+            concerns: vec![json!({"description": "a"})],
+            dismissed_concerns: vec![],
+        };
+        assert!(validate_concerns_output(&ok, &state).is_ok());
+
+        let bad = StageConcernsOutput {
+            concerns: vec![json!({"description": "a"}), json!("not an object")],
+            dismissed_concerns: vec![],
+        };
+        assert_eq!(
+            validate_concerns_output(&bad, &state).unwrap_err(),
+            "'concerns[1]' is not a JSON object"
+        );
+
+        let bad = VerificationOutput {
+            findings: vec![Value::Null],
+        };
+        assert_eq!(
+            validate_verification_output(&bad, &state).unwrap_err(),
+            "'findings[0]' is not a JSON object"
+        );
+
+        let bad = ConflictResolutionOutput {
+            concerns: vec![json!(42)],
+        };
+        assert_eq!(
+            validate_conflict_resolution_output(&bad, &state).unwrap_err(),
+            "'concerns[0]' is not a JSON object"
+        );
+
+        let bad = VerificationOutput {
+            findings: vec![json!({"problem": "p", "introduced_in_patch": "abc123"})],
+        };
+        assert_eq!(
+            validate_verification_output(&bad, &state).unwrap_err(),
+            "'findings[0].introduced_in_patch' must be an integer patch number or null"
+        );
+        let ok = VerificationOutput {
+            findings: vec![
+                json!({"problem": "p", "introduced_in_patch": 3}),
+                json!({"problem": "q", "introduced_in_patch": null}),
+                json!({"problem": "r"}),
+            ],
+        };
+        assert!(validate_verification_output(&ok, &state).is_ok());
     }
 
     #[test]
