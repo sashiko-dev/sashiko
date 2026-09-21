@@ -3,7 +3,7 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 
 # Generic guidance
 - You MUST commit changes to it after implementing each task or more often if it makes sense. Try to commit as often as possible. Every consistent and self-sufficient change must be committed.
-- Sign all commits using the user's git configuration. Every commit **MUST** include a `Signed-off-by` line (e.g., using `git commit -s` which automatically uses the user's `user.name` and `user.email`). **NO EXCEPTIONS.** Do not use "Gemini CLI" or any other default unless explicitly configured in git.
+- Sign all commits using the user's git configuration. Every commit **MUST** include a `Signed-off-by` line (e.g., using `git commit -s` which automatically uses the user's `user.name` and `user.email`). **NO EXCEPTIONS.** Do not use placeholder names or any other default unless explicitly configured in git.
 - Make sure no lines in the commit message exceed 72 characters. Hard-wrap the commit message body to enforce this length.
 - **Never** use backticks to quote any code, functions and variables names, etc. in the commit message.
 - **Never** include metadata tags like `TAG` or `CONV` in commit messages. Only include standard git trailers (like `Signed-off-by`).

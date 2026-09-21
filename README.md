@@ -235,29 +235,19 @@ git commit -s
 
 ## Development
 
-This project was built using Gemini CLI. If you're using other development agents, make sure they follow the guidance in GEMINI.md.
-Please, make sure your code is working before sending PR. Make sure it can be built without warnings, all tests pass, run cargo fmt and clippy.
-If you're changing AI-related parts, please, run at least several code reviews.
+Development agents working on this repository should follow the guidance in `GEMINI.md`.
+Please make sure your code builds cleanly without warnings, all tests pass, and `cargo fmt` and `cargo clippy` succeed before sending a pull request.
+If you are changing AI-related parts, please run at least several code reviews.
 Development got much faster these days, but testing is as important as ever.
 
-### Gemini CLI Skills
+### Agent Skills
 
-For users of the [Gemini CLI](https://github.com/google/gemini-cli), we provide specialized skills to automate development workflows:
+We provide specialized skills under `skills/` to automate development workflows:
 
 - **`review-pr`**: Performs deep, scrutinizing code reviews against `GEMINI.md` and design documents. Detects relevant design files automatically and generates categorized findings with ready-to-paste diffs.
 - **`sashiko-feature`**: A meta-skill for implementing new features. It handles design document matching, codebase investigation, and ensures adherence to SOLID/DRY principles in Rust, while iteratively running `make` checks.
 
-#### Installing Skills
-
-To install these skills in your local workspace:
-
-```bash
-gemini skills install ./skills/review-pr.skill --scope workspace
-gemini skills install ./skills/sashiko-feature.skill --scope workspace
-/skills reload
-```
-
-For users of other agent interfaces (e.g., OpenCode, Claude Code), we recommend following your interface's specific settings to symlink or copy the skill configurations (the `SKILL.md` and `references/` files) into your agent's custom instruction path.
+Follow your agent interface's settings (e.g., Antigravity, OpenCode, Claude Code) to symlink or copy the skill configurations (the `SKILL.md` and `references/` files) into your agent's custom skill or instruction path.
 
 ## License
 
