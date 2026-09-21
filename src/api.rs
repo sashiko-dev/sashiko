@@ -1963,6 +1963,21 @@ async fn forge_webhook(
         })));
     }
 
+    if let Some(ref author) = metadata.author
+        && crate::forge::is_dependabot_author(author)
+    {
+        info!(
+            "{} PR #{} by {} is from Dependabot, skipping review",
+            forge.name(),
+            metadata.pr_number,
+            crate::forge::loggable(author)
+        );
+        return Ok(Json(serde_json::json!({
+            "status": "ignored",
+            "message": "Dependabot pull requests are not reviewed"
+        })));
+    }
+
     let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
 

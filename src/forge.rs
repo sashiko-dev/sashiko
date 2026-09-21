@@ -166,6 +166,14 @@ pub struct ForgeMetadata {
     pub pr_number: i64,
     pub pr_title: Option<String>,
     pub pr_url: Option<String>,
+    pub author: Option<String>,
+}
+
+/// Returns true if the authenticated forge username belongs to Dependabot
+/// (`dependabot[bot]` or `dependabot`).
+pub fn is_dependabot_author(author: &str) -> bool {
+    let lower = author.trim().to_ascii_lowercase();
+    lower == "dependabot" || lower == "dependabot[bot]"
 }
 
 /// Classification of a webhook request that passed validation.
@@ -191,7 +199,7 @@ pub fn loggable(value: &str) -> &str {
         && value.len() <= MAX_LOGGED_LEN
         && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '));
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '[' | ']'));
     if printable { value } else { "(invalid)" }
 }
 
@@ -320,6 +328,10 @@ impl ForgeProvider for GitHubForge {
 
         let pr_title = pr["title"].as_str().map(|s| s.to_string());
         let pr_url = pr["html_url"].as_str().map(|s| s.to_string());
+        let author = pr["user"]["login"]
+            .as_str()
+            .or_else(|| payload["sender"]["login"].as_str())
+            .map(|s| s.to_string());
 
         let repo_url = payload["repository"]["clone_url"]
             .as_str()
@@ -338,6 +350,7 @@ impl ForgeProvider for GitHubForge {
             pr_number,
             pr_title,
             pr_url,
+            author,
         };
 
         Ok((action, metadata))
@@ -447,6 +460,7 @@ impl ForgeProvider for GitLabForge {
 
         let pr_title = attrs["title"].as_str().map(|s| s.to_string());
         let pr_url = attrs["url"].as_str().map(|s| s.to_string());
+        let author = payload["user"]["username"].as_str().map(|s| s.to_string());
 
         let repo_url = payload["project"]["git_http_url"]
             .as_str()
@@ -465,6 +479,7 @@ impl ForgeProvider for GitLabForge {
             pr_number,
             pr_title,
             pr_url,
+            author,
         };
 
         Ok((action, metadata))
@@ -1605,7 +1620,42 @@ vRhmLOXl0vII56CnpropnclhFsabquqMRVtR50PobQKBgBhRj6Wi9QDQ/6/kk5VG\n\
 NS77VgBQLugIAhcS11DAtF4vd29/Jc1kDsQQ30Or5ONNGjMe0x0WN+uGRzrmLI6U\n\
 bfBnKqGjJguuHd5ta5Vh5B51\n\
 -----END PRIVATE KEY-----";
+
         let jwt = mint_github_app_jwt(4982337, test_pem).expect("should sign JWT");
         assert_eq!(jwt.split('.').count(), 3);
+    }
+
+    #[test]
+    fn test_is_dependabot_author_and_github_payload() {
+        assert!(is_dependabot_author("dependabot[bot]"));
+        assert!(is_dependabot_author("dependabot"));
+        assert_eq!(loggable("dependabot[bot]"), "dependabot[bot]");
+        assert!(!is_dependabot_author("kfree"));
+        assert!(!is_dependabot_author(
+            "Roman Gushchin <roman.gushchin@linux.dev>"
+        ));
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "action": "opened",
+                "pull_request": {
+                    "number": 42,
+                    "title": "Bump tokio from 1.40.0 to 1.41.0",
+                    "html_url": "https://github.com/sashiko-dev/sashiko/pull/42",
+                    "user": { "login": "dependabot[bot]" },
+                    "head": { "sha": "1111111111111111111111111111111111111111" },
+                    "base": { "sha": "2222222222222222222222222222222222222222" }
+                },
+                "repository": {
+                    "clone_url": "https://github.com/sashiko-dev/sashiko.git"
+                }
+            })
+            .to_string(),
+        );
+
+        let forge = GitHubForge;
+        let (_action, metadata) = forge.parse_payload(&body).expect("valid payload");
+        assert_eq!(metadata.author.as_deref(), Some("dependabot[bot]"));
+        assert!(metadata.author.as_deref().is_some_and(is_dependabot_author));
     }
 }
