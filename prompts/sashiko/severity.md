@@ -118,9 +118,12 @@ never is.
     - Missing documentation.
     - Negligible performance differences.
 
-> Rust source code formatting, import ordering, and anything `cargo fmt` or
-> `cargo clippy` reports on source files are not findings at all. They are
-> caught deterministically by `make lint` before a human ever sees them.
+> Build/compilation errors (syntax, missing imports, unresolved symbols/types,
+> type mismatches, borrow-checker/lifetime errors, missing trait bounds, or
+> non-exhaustive `match` arms on closed enums), Rust source formatting, import
+> ordering, and anything `cargo check`, `cargo test`, `cargo fmt`, or `cargo
+> clippy` reports on source files are not findings at all. They are verified
+> deterministically before a human ever sees them — never vibe-guess build bugs.
 > However, commit message issues (missing real-name `Signed-off-by`, missing
 > description of what/why, unwrapped prose lines > 85 chars, backticks in commit
 > message) are NOT checked by `cargo fmt` and MUST be reported.

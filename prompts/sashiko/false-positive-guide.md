@@ -42,11 +42,28 @@ code, compiler/log output, URLs, or file paths).
   `max_input_tokens` is already the binding constraint" — a consequence, not a
   style preference.
 
-### 2. The compiler already ran
+### 2. The compiler already ran — never vibe-guess build bugs
 
-Type errors, missing match arms on a closed enum, borrow errors, unused
-variables: none of these can reach review. If your finding would have been a
-compile error, you have misread the code. Re-read it.
+Build and compilation checks (`cargo check`, `cargo test`, `cargo clippy`) are
+100% deterministic. Never vibe-guess whether Rust code compiles, links, or
+passes borrow checking. None of the following can reach review and none of them
+are valid LLM findings:
+- Syntax errors, macro expansion errors, or unclosed delimiters.
+- Missing or unresolved imports (`use ...`), missing crate dependencies or
+  feature flags in `Cargo.toml`, module visibility (`pub` / `pub(crate)`), or
+  unresolved symbols/types/methods/functions.
+- Type mismatches, wrong function arity/signatures, missing struct fields, or
+  unsatisfied trait bounds (`Send`, `Sync`, `'static`, etc.).
+- Borrow-checker, move, mutability (`mut`), or lifetime errors.
+- Non-exhaustive `match` arms on closed enums (note: wildcard `_ =>` catch-all
+  arms that silently do the wrong thing at runtime *are* valid logic bugs
+  because they compile cleanly).
+- Unused variables, dead code, or compiler/clippy warnings.
+
+If your finding claims the patch "fails to compile", "breaks the build", or
+"causes a borrow/type/import error", you have misread the code (or missed a
+re-export, macro expansion, trait blanket impl, or deref coercion). Drop the
+concern immediately.
 
 ### 3. "Add a check for safety"
 
@@ -122,10 +139,13 @@ or non-Unix portability issues (such as `tokio::signal::unix`, `rustix`,
 ### 11. Unnecessary demands for validation or benchmark data
 
 Do not ask authors to add manual test procedures, validation logs, or benchmark
-numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits. Only
-demand benchmark validation when a change can meaningfully affect overall AI
-review quality across the board (prompts, stage instructions, workflow graph,
-planner rules, or verification/deduplication logic) — and when such a change
+numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits, nor
+for changes to Sashiko's own self-review prompts (`prompts/sashiko/`,
+`sashiko_patch_review.rs`) since `benchmarks/` only covers Linux kernel reviews.
+Only demand benchmark validation when a change can meaningfully affect overall
+Linux AI review quality across the board (`third_party/prompts/`,
+`linux_patch_review.rs`, `linux_bug.rs`, generic workflow graph, model
+parameters, or shared verification/deduplication logic) — and when such a change
 lacks benchmark backing, classify it as **High** severity.
 
 ## Before you report

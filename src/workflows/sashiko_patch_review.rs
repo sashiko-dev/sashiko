@@ -131,8 +131,9 @@ You are a principal engineer evaluating the high-level intent, architectural sou
   2. No Unrelated Changes (Single Responsibility): Does the commit contain unrelated changes, drive-by edits, or mixed concerns? It must NOT — each commit must implement one consistent, self-sufficient change. Flag commits that bundle unrelated changes that should be split into separate commits.
   3. Problem Validity & Worth: Is the problem real and worth solving? Flag over-engineered solutions to hypothetical or non-existent problems, or changes whose complexity outweighs their benefit.
   4. Solution Optimality & Alternatives: Is the chosen solution the best engineering approach, or are there obviously simpler, safer, or more idiomatic alternatives? If a clearly superior alternative exists, raise a concern explaining why.
-- Benchmark Backing for Review-Quality Changes (HIGH Severity): Do NOT demand benchmark data, measurements, or manual test procedures in commit messages for ordinary code, CLI, UI, or bug-fix commits where correctness is clear. However, if a change can meaningfully affect the overall quality of AI reviews across the board (such as global prompts, stage instructions, workflow graph structure, planner logic, model parameters, or verification/deduplication rules), it MUST be backed up by benchmark evaluation data (`benchmarks/`). If a review-quality-affecting change lacks benchmark validation or risks degrading detection rate or precision, flag it as a High severity issue.
+- Benchmark Backing for Linux Review-Quality Changes (HIGH Severity): Do NOT demand benchmark data, measurements, or manual test procedures in commit messages for ordinary code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`) since `benchmarks/` only covers Linux kernel reviews. However, if a change can meaningfully affect overall Linux AI review quality across the board (such as `third_party/prompts/`, `linux_patch_review.rs`, `linux_bug.rs`, generic workflow graph structure, model parameters, or shared verification/deduplication rules), it MUST be backed up by benchmark evaluation data (`benchmarks/`). If such a Linux review-quality change lacks benchmark validation or risks degrading detection rate or precision, flag it as a High severity issue.
 - Unix-Only Target Environment: Sashiko exclusively targets Linux/Unix environments. NEVER report non-Unix or Windows compilation/portability issues (such as `tokio::signal::unix`, `rustix`, `/dev/ptmx`, `libc`, or POSIX signals/paths) as concerns.
+- Never Vibe-Guess Build or Compilation Bugs: Build verification (`cargo check`, `cargo test`, `cargo clippy`) is deterministic. NEVER report alleged build failures, syntax errors, missing imports (`use`), unresolved symbols/types/methods/macros, type mismatches, missing trait bounds, borrow-checker/lifetime errors, or Cargo build issues.
 - Global UX & Regressions: If the change can affect the user experience globally (CLI ergonomics, review output clarity/false-positive rate, progress display, or web UI/API behavior), apply maximum scrutiny and reject regressions.
 - Architectural Boundaries: Check whether the change violates instance isolation, leaks project-specific assumptions into generic engines, or introduces subtle regressions in daemon/worker coordination.
 - Commit Message Audit (Mandatory): Inspect the commit message header, body, and trailers in the patch:
@@ -143,7 +144,7 @@ You are a principal engineer evaluating the high-level intent, architectural sou
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# Verify implementation against intent
 
 Verify that the code changes faithfully and completely implement what the commit message and design claim.
-- Check for incomplete refactors: if a new enum variant, CLI flag, or configuration field is added, verify every match arm, subprocess boundary (`reviewer.rs`, `sashiko-cli`), and serialization path handles it.
+- Check for incomplete refactors at runtime boundaries: if a new enum variant, CLI flag, or configuration field is added, verify that wildcard/catch-all match arms (`_ => ...`), subprocess boundaries (`reviewer.rs`, `sashiko-cli`), and serialization paths handle it properly. Do NOT vibe-guess compile-time errors (such as non-exhaustive match arms on closed enums, missing imports, unresolved symbols/types, type mismatches, or borrow-checker errors) — build verification is deterministic.
 - Check edge cases: empty inputs, missing optional fields, zero/boundary values, and fallback behavior.
 - Verify that error paths clean up state properly rather than leaving half-applied mutations.
 - Never report Windows or non-Unix portability concerns; Sashiko is strictly a Linux/Unix system."#;
@@ -153,7 +154,8 @@ const STAGE_EXECUTION_FLOW_INSTRUCTION: &str = r#"# Trace execution flow and pan
 Trace the execution paths through every modified function and caller.
 - Audit strictly for panic vectors on untrusted or runtime inputs: `.unwrap()`, `.expect()`, direct slice/array indexing (`[i]`), or string slicing (`&s[..n]`) that could land inside a multi-byte UTF-8 character.
 - Audit for silently swallowed errors (`let _ = ...`, `.ok()`, `.unwrap_or_default()`) on critical operations such as database status updates, worktree cleanup, or structured LLM output parsing.
-- Check numeric casts (`as`) and arithmetic for potential truncation or underflow/overflow."#;
+- Check numeric casts (`as`) and arithmetic for potential truncation or underflow/overflow.
+- Never vibe-guess or report compile-time/build errors (borrow-checker, lifetime/move, type mismatch, unresolved import/symbol, or missing trait bound errors); focus strictly on runtime behavior and panics."#;
 
 const STAGE_CONCURRENCY_INSTRUCTION: &str = r#"# Audit async Tokio discipline and concurrency
 
@@ -219,6 +221,7 @@ Compare the consolidated concerns against the consolidated dismissed concerns.
 const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verify remaining concerns and calibrate severity
 
 For each remaining concern, use the available Git and file tools to inspect the actual code in the worktree and verify whether the defect is real.
+- Drop any concern that alleges a build, compilation, syntax, type-checking, borrow-checker, lifetime, missing-import, unresolved-symbol, missing-trait-bound, or linter error. Build correctness is verified deterministically by the compiler; LLMs must never vibe-guess build failures.
 - If concrete code proves the concern is a false positive, drop it.
 - For each verified issue, assign an accurate severity (`Critical`, `High`, `Medium`, or `Low`) strictly following `severity.md`, and formulate a concise bug title (`problem`) under 80 characters starting with a Sashiko component prefix (e.g. `workflow:`, `db:`, `reviewer:`, `toolbox:`, `api:`, `cli:`)."#;
 

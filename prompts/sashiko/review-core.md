@@ -89,15 +89,18 @@ design. Any path where untrusted input can influence *which files are read*
 prompts are loaded* (`sanitize_guide_name`), or bypass API/webhook
 authentication is a security boundary.
 
-**5. Benchmark Backing for Review-Quality Changes (HIGH Severity).**
+**5. Benchmark Backing for Linux Review-Quality Changes (HIGH Severity).**
 Do not demand benchmark data, measurements, or manual test procedures for ordinary
-code, CLI, UI, or bug-fix commits where correctness is clear. However, any change
-that can meaningfully affect overall AI review quality across the board — such as
-global prompts (`review-core.md`, `severity.md`), stage instructions, workflow
-graph structure, planner rules, model parameters, or verification/deduplication
-logic — must be backed up by benchmark data (`benchmarks/`). Flag review-quality
-changes that lack benchmark validation or risk silent regressions in detection
-rate or precision as **High** severity.
+code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
+Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`)
+since `benchmarks/` only covers Linux kernel reviews. However, any change that
+can meaningfully affect overall Linux AI review quality across the board — such as
+Linux prompts (`third_party/prompts/`), Linux stage instructions
+(`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph structure,
+model parameters, or shared verification/deduplication logic — must be backed up
+by benchmark data (`benchmarks/`). Flag such Linux review-quality changes that
+lack benchmark validation or risk silent regressions in detection rate or
+precision as **High** severity.
 
 **6. Zero Regressions and No Silent Failures.**
 Avoid regressions in CLI flags, `Settings.toml` parsing, or API contracts.
@@ -143,10 +146,18 @@ Evaluate every change for fundamental engineering soundness:
   for the area the diff touches and check every invariant. Do not give code the
   benefit of the doubt: if a check is removed or weakened, verify the caller
   with tools rather than assuming safety.
-- **`cargo` and `clippy` have already run on Rust source code.** Rust source
-  formatting, unused imports, and compiler/clippy lints are not findings.
-  However, *commit message* defects (missing/nickname SOB, missing rationale,
-  unwrapped prose lines > 85 chars, backticks in commit message) are NOT caught by
+- **Never vibe-guess or report build, compilation, or linter bugs.** Whether
+  Rust code compiles, type-checks, borrow-checks, and passes lints is verified
+  deterministically (`cargo check`, `cargo test`, `cargo clippy`, `cargo fmt`).
+  Never report alleged build failures — including syntax errors, missing
+  imports (`use`), unresolved symbols/types/methods/macros, module visibility
+  (`pub`), type mismatches, missing trait bounds (`Send`, `Sync`, `'static`),
+  borrow-checker/ownership/lifetime errors, non-exhaustive `match` arms on
+  closed enums, Cargo dependency/feature issues, or compiler/clippy lints. If
+  you think a patch fails to compile, you have misread the code or missed a
+  definition, re-export, macro, or trait impl — do NOT report it. However,
+  *commit message* defects (missing/nickname SOB, missing rationale, unwrapped
+  prose lines > 85 chars, backticks in commit message) are NOT caught by
   `cargo fmt` and MUST be reported.
 - **Prefer one proven finding to three speculative ones.** Every false positive
   spends the author's trust.
