@@ -32,6 +32,12 @@ Use `make` to run common development tasks:
 - `make check-all`: Run the complete suite including integration tests and database invariants (`check-pr`, `check-integration`, `check-db-invariants`).
 - `make check-db-invariants`: Run lightweight database invariant checks.
 
+## 3. Self-Review (Sashiko for Sashiko)
+Sashiko can review changes to its own repository using the `--project sashiko` profile:
+- **Workflow & Prompts:** Defined by `src/workflows/sashiko_patch_review.rs` and first-party prompt guides under `prompts/sashiko/` (distinct from the vendored upstream prompts in `third_party/prompts/`).
+- **Running Local Self-Review:** Run `cargo run --bin sashiko -- review --project sashiko <commit>` to execute the multi-stage Sashiko self-review pipeline against a commit in a temporary worktree.
+- **Scope:** Audits Sashiko-specific invariants across subsystems (`prompts/sashiko/subsystem/*.md`) and cross-cutting patterns (`prompts/sashiko/patterns/*.md`), including UX, SQLite migrations and query scaling, email delivery safety, untrusted input boundaries, Tokio/async discipline, and commit message hygiene. Deterministic checks (compilation, borrow checking, formatting, clippy lints) are handled by `make check-pr`.
+
 # Rust Coding Standards
 
 ## 1. Idiomatic Rust
@@ -86,6 +92,7 @@ Use `make` to run common development tasks:
 - `lib.rs`: Shared library code.
 - `worker/`: Background worker implementations (Review, Security, AI).
 - `workflow/`: The core state-machine workflow engine.
+- `workflows/`: Declarative review pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`).
 - `toolbox/`: Tooling and capabilities for agents.
 - `ai/`: Artificial Intelligence integration logic.
 - `ingestor.rs`: Ingests patches/emails.
@@ -100,13 +107,15 @@ Use `make` to run common development tasks:
 - `db.rs`: Database interactions.
 - `api.rs`: API endpoints.
 - `settings.rs`: Application settings management.
+- `project.rs`: Target project profile selection (`linux`, `sashiko`, etc.).
 - `events.rs`: Event handling system.
 - `baseline.rs`: Baseline detection logic.
 
 ## Configuration & Assets
 - `Settings.toml`: Main application configuration.
 - `email_policy.toml`: Email policy configuration.
-- `third_party/prompts/`: Markdown templates/prompts for AI reviews.
+- `prompts/sashiko/`: First-party review prompts, subsystem invariants, and pattern guides for reviewing Sashiko itself (`--project sashiko`).
+- `third_party/prompts/`: Markdown templates/prompts for AI reviews of upstream projects (Linux kernel, systemd, iproute).
 - `skills/`: Agent skills directory.
 - `static/`: Web assets (HTML, images).
 
