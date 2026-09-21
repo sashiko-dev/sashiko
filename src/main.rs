@@ -921,7 +921,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_fetch_tx = fetch_tx.clone();
     let local_token_path = settings.local_token_path();
     let local_token = publish_local_token(&local_token_path);
-    let server_options = sashiko::api::ServerOptions {
+    let server_options = sashiko::server::ServerOptions {
         allow_all_submit: cli.enable_unsafe_all_submit,
         smtp_enabled: settings.smtp.is_some(),
         dry_run: settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false),
@@ -929,7 +929,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let api_handle = tokio::spawn(async move {
         if let Err(e) =
-            sashiko::api::run_server(api_settings, api_db, api_tx, api_fetch_tx, server_options)
+            sashiko::server::run_server(api_settings, api_db, api_tx, api_fetch_tx, server_options)
                 .await
         {
             error!("Web API fatal error: {}", e);

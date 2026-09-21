@@ -328,12 +328,12 @@ impl Principal {
 /// naming this extractor in its signature, so forgetting the check does not
 /// compile into an open route. The local token accepted by `is_authorized` is
 /// deliberately not consulted here.
-impl FromRequestParts<Arc<crate::api::AppState>> for Principal {
+impl FromRequestParts<Arc<crate::server::AppState>> for Principal {
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &Arc<crate::api::AppState>,
+        state: &Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
         if state.settings.server.testing_mode {
             return Ok(Principal::testing_operator());
@@ -373,12 +373,12 @@ impl FromRequestParts<Arc<crate::api::AppState>> for Principal {
 /// embedded bugs are filtered out rather than the whole page being refused.
 pub struct OptionalPrincipal(pub Principal);
 
-impl FromRequestParts<Arc<crate::api::AppState>> for OptionalPrincipal {
+impl FromRequestParts<Arc<crate::server::AppState>> for OptionalPrincipal {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &Arc<crate::api::AppState>,
+        state: &Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
         match Principal::from_request_parts(parts, state).await {
             Ok(principal) => Ok(OptionalPrincipal(principal)),
@@ -480,14 +480,14 @@ impl TranscriptPrincipal {
     }
 }
 
-impl FromRequestParts<Arc<crate::api::AppState>> for TranscriptPrincipal {
+impl FromRequestParts<Arc<crate::server::AppState>> for TranscriptPrincipal {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &Arc<crate::api::AppState>,
+        state: &Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let local_operator = crate::api::presents_local_token(&parts.headers, state);
+        let local_operator = crate::server::presents_local_token(&parts.headers, state);
         let principal = match Principal::from_request_parts(parts, state).await {
             Ok(principal) => principal,
             Err(_) => Principal::anonymous(),

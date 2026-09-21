@@ -241,12 +241,12 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::e
     .map(|data| data.claims)
 }
 
-impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
+impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for AuthUser {
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &std::sync::Arc<crate::api::AppState>,
+        state: &std::sync::Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
         let auth_header = parts
             .headers
@@ -310,12 +310,12 @@ impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
 
 pub struct OptionalAuthUser(pub Option<AuthUser>);
 
-impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for OptionalAuthUser {
+impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for OptionalAuthUser {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &std::sync::Arc<crate::api::AppState>,
+        state: &std::sync::Arc<crate::server::AppState>,
     ) -> Result<Self, Self::Rejection> {
         match AuthUser::from_request_parts(parts, state).await {
             Ok(user) => Ok(OptionalAuthUser(Some(user))),

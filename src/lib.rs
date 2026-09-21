@@ -15,7 +15,7 @@ pub mod metrics;
 
 pub mod access;
 pub mod ai;
-pub use server as api;
+pub mod api;
 pub mod auth;
 pub mod backfill;
 pub mod baseline;
