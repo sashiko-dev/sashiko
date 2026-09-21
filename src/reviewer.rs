@@ -1423,6 +1423,7 @@ impl Reviewer {
                                             .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
                                         let locations = f.get("locations").cloned();
+                                        let stages = f.get("stages").cloned();
 
                                         ctx.db
                                             .create_finding(Finding {
@@ -1431,6 +1432,7 @@ impl Reviewer {
                                                 severity_explanation,
                                                 problem,
                                                 preexisting,
+                                                stages,
                                                 locations,
                                             })
                                             .await?;
@@ -2613,6 +2615,7 @@ impl Reviewer {
 
                     sorted_findings.sort_by(sort_by_severity);
 
+                    let project = ctx.settings.project.kind.unwrap_or_default();
                     let format_finding = |f: &Value| {
                         let problem = f
                             .get("problem")
@@ -2623,7 +2626,12 @@ impl Reviewer {
                             .get("severity")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Unknown");
-                        format!("- [{}] {}\n", severity, problem)
+                        format!(
+                            "- [{}] {}{}\n",
+                            severity,
+                            problem,
+                            crate::workflows::finding_stage_suffix(project, f)
+                        )
                     };
 
                     for f in &sorted_findings {

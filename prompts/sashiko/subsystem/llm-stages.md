@@ -42,7 +42,22 @@ followed by consolidation stages (`deduplication` -> `conflict-resolution` ->
   They return a deferred `StateMutation` closure (`stage.rs:execute_isolated`)
   that appends items tagged with the stage name (`append_stage_items`).
 
-### 1.4 Negative Data Tracking (`dismissed_concerns`)
+### 1.4 Provenance (`stage` -> `stages`)
+`append_stage_items` tags each item with the stage that raised it, and that tag
+has to survive consolidation so a finding can say where it came from. Each
+consolidation prompt asks for it back as a `stages` array — `deduplication`
+merges the arrays of the items it groups, `conflict-resolution` and
+`verification` carry them through unchanged — and each of those reducers then
+calls `keep_stages_that_raised`, which drops any name no analysis stage tagged.
+- **Why this matters**: the model transcribes provenance, it does not decide
+  it. A stage name the fan-out never produced is a transcription error, and
+  reporting it would credit a stage that did not run.
+- **Violation**: a consolidation stage that rewrites concerns without carrying
+  `stages`, or a reducer that trusts the returned names without filtering them
+  against the tags. Adding a stage that reads `stages` for anything but
+  reporting is also wrong: it is a record, not an input to analysis.
+
+### 1.5 Negative Data Tracking (`dismissed_concerns`)
 When an analysis stage investigates a plausible defect and proves it is safe,
 it must output that item in `dismissed_concerns` with concrete evidence in
 `reasoning`.
@@ -54,7 +69,7 @@ it must output that item in `dismissed_concerns` with concrete evidence in
   `dismissed_concerns` before `conflict-resolution` breaks negative data
   tracking.
 
-### 1.5 Early Exits (Short-Circuiting)
+### 1.6 Early Exits (Short-Circuiting)
 Workflows must defensively bail out as soon as further processing is unnecessary
 using `WorkflowBuilder::early_exit_if`.
 - **Required Checkpoints**:
@@ -65,7 +80,7 @@ using `WorkflowBuilder::early_exit_if`.
 - **Why**: Running consolidation or report generation on empty arrays wastes
   tokens and tempts the LLM to hallucinate findings to satisfy its prompt.
 
-### 1.6 No Dead Outputs
+### 1.7 No Dead Outputs
 Every field produced by a stage's JSON output schema must be stored by its
 reducer and consumed by a subsequent stage or persisted in the final output.
 - **Violation**: Adding a field to `StageConcernsOutput` or a custom stage
@@ -128,3 +143,6 @@ to `max_validation_attempts`).
 5. **Security Sanitization**: If model output selects files or stages (like
    `prescreen` or `planning`), does the reducer filter against path traversal
    (`/`, `\`, `..`) and unknown stage names?
+6. **Provenance**: Does every consolidation prompt that rewrites concerns ask
+   for `stages` back, and does its reducer pass the result through
+   `keep_stages_that_raised` rather than trusting the names returned?

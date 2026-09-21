@@ -78,7 +78,7 @@ Do not ask for defensive validation unless you can show all three:
   root, and reaches `include_file` — a name containing `..` would escape the
   prompt directory."
 
-### 4. `unwrap` and `expect` are not automatically bugs
+### 4. `unwrap`, `expect`, and indexing are not automatically bugs
 
 The project's rule is that they need a proof they cannot panic, and many in
 this tree have one. Before reporting, check whether the invariant holds:
@@ -91,6 +91,15 @@ this tree have one. Before reporting, check whether the invariant holds:
 Also check *where* it is. A panic in the worker subprocess is recovered by the
 reviewer and retried; a panic in the daemon's main loop is not. The same
 `unwrap` has different severity in different modules.
+
+Indexing needs the same check, and `serde_json::Value` is where this guide's
+readers get it wrong most often. `value["key"]` reads as `Null` when the key is
+absent and *inserts* the key when assigned to; it panics only where the
+receiver is neither an object nor null, such as a string. Reporting it as a
+missing-key panic is `HashMap` intuition: that is the type whose index panics
+on a key it does not have, and it has no indexed assignment at all. To report
+one of these, name the value and show a path on which it arrives as a type that
+cannot hold the index.
 
 ### 5. Assuming a caller does not handle it
 

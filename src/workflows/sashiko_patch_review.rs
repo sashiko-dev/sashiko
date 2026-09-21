@@ -29,7 +29,7 @@ use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
     PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput,
+    VerificationOutput, keep_stages_that_raised, stages_that_raised,
 };
 
 /// State container for a Sashiko patch review run.
@@ -210,20 +210,23 @@ const STAGE_DEDUPLICATION_INSTRUCTION: &str = r#"# Deduplicate concerns and dism
 You are consolidating the independent findings from parallel Sashiko review stages.
 1. Merge duplicate concerns that describe the same underlying defect into a single, comprehensive concern, preserving the most precise file/line locations and combining complementary reasoning.
 2. Merge duplicate dismissed concerns.
-3. Do not discard distinct concerns or invent new locations."#;
+3. Do not discard distinct concerns or invent new locations.
+4. PROVENANCE: every input item carries a `stage` naming the review stage that raised it. Report it as a `stages` array naming every stage whose item went into what you report, so a concern two stages raised independently lists both. Copy the names exactly as given, and never name a stage that did not raise the item. An item whose inputs carry no stage has none to report: leave the key out rather than inventing one."#;
 
 const STAGE_CONFLICT_RESOLUTION_INSTRUCTION: &str = r#"# Resolve conflicts between concerns and dismissed concerns
 
 Compare the consolidated concerns against the consolidated dismissed concerns.
 - If stage A raised a concern and stage B explicitly investigated the exact same code path and proved with concrete code evidence that it is safe (a dismissed concern), evaluate both arguments rigorously.
-- Only drop a concern if the dismissed concern provides concrete, verifiable proof from the codebase that the issue cannot occur. Do NOT give code the benefit of the doubt."#;
+- Only drop a concern if the dismissed concern provides concrete, verifiable proof from the codebase that the issue cannot occur. Do NOT give code the benefit of the doubt.
+- Carry each retained concern's `stages` array through unchanged. It records which review stages raised the concern, which is not yours to decide again. A concern that arrives without one leaves the key out."#;
 
 const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verify remaining concerns and calibrate severity
 
 For each remaining concern, use the available Git and file tools to inspect the actual code in the worktree and verify whether the defect is real.
 - Drop any concern that alleges a build, compilation, syntax, type-checking, borrow-checker, lifetime, missing-import, unresolved-symbol, missing-trait-bound, or linter error. Build correctness is verified deterministically by the compiler; LLMs must never vibe-guess build failures.
 - If concrete code proves the concern is a false positive, drop it.
-- For each verified issue, assign an accurate severity (`Critical`, `High`, `Medium`, or `Low`) strictly following `severity.md`, and formulate a concise bug title (`problem`) under 80 characters starting with a Sashiko component prefix (e.g. `workflow:`, `db:`, `reviewer:`, `toolbox:`, `api:`, `cli:`)."#;
+- For each verified issue, assign an accurate severity (`Critical`, `High`, `Medium`, or `Low`) strictly following `severity.md`, and formulate a concise bug title (`problem`) under 80 characters starting with a Sashiko component prefix (e.g. `workflow:`, `db:`, `reviewer:`, `toolbox:`, `api:`, `cli:`).
+- Carry the concern's `stages` array into the finding exactly as given. It records which review stages raised the concern: do not add to it, drop from it, or rename anything in it. A concern that arrives without one leaves the key out of its finding."#;
 
 const STAGE_REPORT_INSTRUCTION: &str = r#"# Generate plain-text inline review report
 
@@ -240,9 +243,9 @@ Provide a concise 1-2 sentence plain-text summary explaining what this commit/ch
 - Summarize the change itself (do not list review findings or issues here)."#;
 
 const CONCERN_JSON_SCHEMA_EXAMPLE: &str = r#"Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
-Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
-Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations".
-Do not invent line numbers; use null when exact values are unknown.
+Each object in the 'concerns' array MUST use these keys and no others: "type", "description", "reasoning", "preexisting", "locations".
+Each object in the 'dismissed_concerns' array MUST use these keys and no others: "type", "description", "reasoning", "locations".
+Do not invent line numbers; use null when exact values are unknown.@PROVENANCE@
 
 Example Output:
 ```json
@@ -252,7 +255,7 @@ Example Output:
       "type": "Concurrency Hazard",
       "description": "std::sync::MutexGuard held across .await in Worker::run",
       "reasoning": "1. lock() is acquired on line 42.\n2. async_call().await is invoked on line 45 while guard is still in scope.",
-      "preexisting": false,
+      "preexisting": false,@STAGES_CONCERN@
       "locations": [
         {
           "file": "src/worker/prompts.rs",
@@ -268,7 +271,7 @@ Example Output:
     {
       "type": "Error Handling",
       "description": "Potential UTF-8 slice panic in format_subject",
-      "reasoning": "Verified that char_indices() is used on line 88 to find a valid char boundary before slicing.",
+      "reasoning": "Verified that char_indices() is used on line 88 to find a valid char boundary before slicing.",@STAGES_DISMISSED@
       "locations": [
         {
           "file": "src/bin/sashiko-cli.rs",
@@ -282,6 +285,37 @@ Example Output:
   ]
 }
 ```"#;
+
+/// The concern schema, asking for provenance only where it is the caller's to
+/// report.
+///
+/// The mandatory key list is the same either way, and the provenance variant
+/// adds "stages" to it in a sentence of its own. The analysis stages have their
+/// own name recorded for them in code, so asking them for it would invite a
+/// stage to name itself wrongly; a consolidation stage has to report what it
+/// merged.
+///
+/// The key stays out of the mandatory list because it is not mandatory: an item
+/// whose inputs carry no stage has no provenance to report. A list that says
+/// "exactly these keys", names "stages" among them, and then asks for it to be
+/// omitted is a rule a model cannot satisfy either way, and what it does about
+/// that is invent an array.
+fn concern_json_schema_example(provenance: bool) -> String {
+    let (concern, dismissed, note) = if provenance {
+        (
+            "\n      \"stages\": [\"concurrency\", \"security\"],",
+            "\n      \"stages\": [\"security\"],",
+            "\nAdd \"stages\" alongside those keys, an array naming the review stages that raised the item. Take the names from the stage each input item carries, copy them exactly, and merge them when you merge items. Leave the key out entirely for an item whose inputs carry no stage rather than inventing one.",
+        )
+    } else {
+        ("", "", "")
+    };
+
+    CONCERN_JSON_SCHEMA_EXAMPLE
+        .replace("@STAGES_CONCERN@", concern)
+        .replace("@STAGES_DISMISSED@", dismissed)
+        .replace("@PROVENANCE@", note)
+}
 
 // ---------------------------------------------------------------------------
 // Stage Table Definitions
@@ -764,7 +798,9 @@ fn analysis_stage(
     let series_context = series_context_placeholder(def.wants_series_context);
     let mut user_template = PromptTemplate::<SashikoPatchReviewState>::new(format!(
         "{}{}\n\n{}",
-        def.instruction, series_context, CONCERN_JSON_SCHEMA_EXAMPLE
+        def.instruction,
+        series_context,
+        concern_json_schema_example(false)
     ));
 
     for guide in def.guides {
@@ -829,6 +865,7 @@ pub fn deduplication_stage(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<SashikoPatchReviewState, StageConcernsOutput> {
+    let schema = concern_json_schema_example(true);
     Stage::builder(DEDUPLICATION.name)
         .system_prompt(sashiko_system_prompt(true))
         .user_prompt(
@@ -841,7 +878,7 @@ Aggregated Concerns:
 Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
-{CONCERN_JSON_SCHEMA_EXAMPLE}"#
+{schema}"#
             ))
             .with_var("aggregated_concerns", |s: &SashikoPatchReviewState| {
                 serde_json::to_string_pretty(&s.all_concerns).unwrap_or_default()
@@ -866,8 +903,11 @@ Aggregated Dismissed Concerns:
         })
         .skip_if(|s| s.all_concerns.is_empty())
         .reduce(|state, out: StageConcernsOutput| {
+            let raised = stages_that_raised(&[&state.all_concerns, &state.all_dismissed_concerns]);
             state.deduplicated_concerns = out.concerns;
             state.deduplicated_dismissed_concerns = out.dismissed_concerns;
+            keep_stages_that_raised(&mut state.deduplicated_concerns, &raised);
+            keep_stages_that_raised(&mut state.deduplicated_dismissed_concerns, &raised);
         })
         .build()
 }
@@ -888,7 +928,7 @@ Consolidated Concerns:
 Consolidated Dismissed Concerns:
 {{{{deduplicated_dismissed_concerns}}}}
 
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations"."#
+Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use these keys and no others: "type", "description", "reasoning", "preexisting", "locations". Add "stages" alongside them for a concern that arrived with one, carried through unchanged, and leave it out for a concern that arrived without one. Do not invent line numbers; use null for line when the exact value is unknown."#
             ))
             .with_var("deduplicated_concerns", |s: &SashikoPatchReviewState| {
                 serde_json::to_string_pretty(&s.deduplicated_concerns).unwrap_or_default()
@@ -910,6 +950,7 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
         })
         .skip_if(|s| s.deduplicated_concerns.is_empty())
         .reduce(|state, out: ConflictResolutionOutput| {
+            let raised = stages_that_raised(&[&state.all_concerns, &state.all_dismissed_concerns]);
             let mut new_concerns = Vec::new();
             let mut preexisting = Vec::new();
             for concern in out.concerns {
@@ -925,6 +966,8 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
             }
             state.patch_concerns = new_concerns;
             state.concerns = preexisting;
+            keep_stages_that_raised(&mut state.patch_concerns, &raised);
+            keep_stages_that_raised(&mut state.concerns, &raised);
         })
         .build()
 }
@@ -945,7 +988,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters)."#
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use these keys and no others: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Add "stages" alongside them for a finding whose concern carried one, copying that array of review stage names across unchanged, and leave the key out for a finding whose concern carried none. Do not invent line numbers; use null for line when the exact value is unknown."#
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
@@ -963,6 +1006,10 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
         })
         .skip_if(|s| s.patch_concerns.is_empty())
         .reduce(|state, out: VerificationOutput| {
+            let raised = stages_that_raised(&[&state.all_concerns, &state.all_dismissed_concerns]);
+            let mut out = out;
+            keep_stages_that_raised(&mut out.findings, &raised);
+
             let mut new_findings = Vec::new();
             for finding in out.findings {
                 let is_preexisting = finding
@@ -970,13 +1017,20 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if is_preexisting {
-                    let concern = json!({
+                    let mut concern = json!({
                         "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
                         "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
                         "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
                         "preexisting": true,
                         "locations": finding.get("locations").cloned().unwrap_or(json!([])),
                     });
+                    // As in the kernel workflow: only where the finding has it, so
+                    // an empty array never claims the concern came from no stage.
+                    // Indexing a key the object does not have inserts it, unlike
+                    // HashMap's index, which panics on one.
+                    if let Some(stages) = finding.get("stages") {
+                        concern["stages"] = stages.clone();
+                    }
                     state.concerns.push(concern);
                 }
                 new_findings.push(finding);
@@ -1000,7 +1054,13 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             ))
             .include_file("github-summary-template.md")
             .with_var("findings", |s: &SashikoPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                // Labels rather than stage names, as in the kernel workflow: the
+                // report quotes these to a reader.
+                let shown = crate::workflows::findings_for_report(
+                    crate::project::ProjectId::Sashiko,
+                    &s.findings,
+                );
+                serde_json::to_string_pretty(&shown).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -1210,5 +1270,105 @@ mod tests {
         );
         // Idempotent when already separated by empty lines
         assert_eq!(format_sashiko_inline_findings(&formatted), formatted);
+    }
+
+    #[test]
+    fn test_only_a_consolidation_stage_is_asked_for_provenance() {
+        // An analysis stage is never told to report a stage name. A
+        // consolidation stage is asked for the array in a sentence of its own,
+        // and never inside the list of keys it is told to use and no others:
+        // a mandatory key it is also told to leave out is a rule it cannot
+        // satisfy, and what it does about that is invent an array.
+        let analysis = concern_json_schema_example(false);
+        assert!(!analysis.contains("stages"), "{analysis}");
+
+        let consolidation = concern_json_schema_example(true);
+        assert!(
+            consolidation.contains(r#""preexisting", "locations""#),
+            "{consolidation}"
+        );
+        assert!(
+            !consolidation.contains(r#""stages", "locations""#),
+            "{consolidation}"
+        );
+        assert!(
+            consolidation.contains(r#"Add "stages" alongside those keys"#),
+            "{consolidation}"
+        );
+        assert!(
+            consolidation.contains("Leave the key out entirely"),
+            "{consolidation}"
+        );
+        assert!(
+            consolidation.contains(r#""stages": ["concurrency", "security"],"#),
+            "{consolidation}"
+        );
+        assert!(
+            consolidation.contains("copy them exactly"),
+            "{consolidation}"
+        );
+
+        // No placeholder survives into a prompt either way.
+        for text in [&analysis, &consolidation] {
+            assert!(!text.contains('@'), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_sashiko_consolidation_carries_provenance_it_can_account_for() {
+        let mut state = SashikoPatchReviewState {
+            all_concerns: vec![
+                json!({"description": "guard across await", "stage": "concurrency"}),
+                json!({"description": "unchecked index", "stage": "security"}),
+            ],
+            ..Default::default()
+        };
+
+        let dedup = deduplication_stage(20, 0.0);
+        (dedup.reducer)(
+            &mut state,
+            StageConcernsOutput {
+                concerns: vec![
+                    json!({"description": "guard across await",
+                           "stages": ["concurrency", "security"]}),
+                    // No sashiko stage by this name raised anything here.
+                    json!({"description": "unchecked index", "stages": ["llm-pipeline"]}),
+                ],
+                dismissed_concerns: Vec::new(),
+            },
+        );
+        assert_eq!(
+            state.deduplicated_concerns[0]["stages"],
+            json!(["concurrency", "security"])
+        );
+        assert!(state.deduplicated_concerns[1].get("stages").is_none());
+
+        let verification = verification_stage(20, 0.0);
+        (verification.reducer)(
+            &mut state,
+            VerificationOutput {
+                findings: vec![json!({"problem": "db: unchecked index", "severity": "High",
+                                      "preexisting": true, "severity_explanation": "predates it",
+                                      "stages": ["security"]})],
+            },
+        );
+        assert_eq!(state.findings[0]["stages"], json!(["security"]));
+        assert_eq!(
+            state.concerns.last().expect("a rebuilt concern")["stages"],
+            json!(["security"])
+        );
+
+        // And a finding naming no stage rebuilds a concern that says nothing,
+        // rather than one claiming it came from nowhere.
+        (verification.reducer)(
+            &mut state,
+            VerificationOutput {
+                findings: vec![json!({"problem": "db: no provenance", "severity": "Low",
+                                      "preexisting": true,
+                                      "severity_explanation": "older than the patch"})],
+            },
+        );
+        let rebuilt = state.concerns.last().expect("a rebuilt concern");
+        assert!(rebuilt.get("stages").is_none(), "{rebuilt:?}");
     }
 }

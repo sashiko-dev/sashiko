@@ -22,6 +22,7 @@ We propose shifting to **versioned, incremental migrations using `PRAGMA user_ve
    - Iterate chronologically through embedded migration SQL scripts starting from index `$version`.
    - Run the script as a single batch execution.
    - Immediately bump `PRAGMA user_version` inside the transaction.
+   - Expect every script to run more than once, and write it so that it can. The runner replays the whole ladder above whatever `user_version` holds, and a repair migration's test rewinds that number on purpose to exercise itself, so a script that fails against a schema it has already changed strands the database at that version and blocks every migration after it. `CREATE TABLE` and `CREATE INDEX` say `IF NOT EXISTS`; `ALTER TABLE ... ADD COLUMN` cannot, and asks whether the column is there instead, from inside the transaction so that two migrators cannot both decide to add it.
 
 ## 3. Implementation Plan
 ### Step 1: Migration Scripts Restructuring

@@ -15,9 +15,25 @@ Migrations live in `src/migrations/NNN_name.sql` and are applied sequentially in
   *must* open a transaction (`let tx = self.conn.transaction().await?`), run
   `tx.execute_batch(...)`, update `tx.execute("PRAGMA user_version = N", ())`,
   and commit atomically.
+- **Read-Then-Write Needs `Immediate`**: A step that asks about the schema before
+  changing it (`pragma_table_info`, `sqlite_master`) must ask on `tx` rather than
+  `self.conn`, and must open that transaction with
+  `transaction_with_behavior(TransactionBehavior::Immediate)`. The default is
+  `Deferred`, which takes no lock until its first statement: two migrators would
+  then both read under a shared lock and both try to upgrade, and SQLite fails
+  the second outright instead of waiting, because an upgrade cannot be retried
+  while the other reader holds its lock. Taking the write lock at `BEGIN` makes
+  the second migrator wait its turn.
+- **Re-application Safety**: Every migration added from here on must survive
+  running twice. `test_migration_retires_folded_bugs_left_in_the_pipeline`
+  rewinds `PRAGMA user_version` to 3 and applies the ladder again, so any step
+  you write runs a second time against a schema it has already changed.
 - **Defect to Catch**:
   - Executing migration DDL outside a transaction (leaving a half-applied schema
     if a statement fails while `user_version` remains `N-1`).
+  - An `ALTER TABLE` step with no existence check; a check performed before the
+    transaction opens rather than inside it; or a step that reads and then writes
+    inside a `Deferred` transaction.
   - Editing an already-shipped migration file (`001`..`005`) instead of adding
     a new numbered migration (`006_...`). Existing databases with `user_version >= N`
     will never re-run modified SQL in migration `N`.

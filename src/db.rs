@@ -370,6 +370,11 @@ pub struct Finding {
     pub severity_explanation: Option<String>,
     pub problem: String,
     pub preexisting: Option<bool>,
+    /// The review stages that raised this finding, as the review reported them.
+    ///
+    /// `None` where the review said nothing about it, which is every finding
+    /// recorded before there was provenance to record.
+    pub stages: Option<serde_json::Value>,
     pub locations: Option<serde_json::Value>,
 }
 
@@ -1565,7 +1570,44 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 10", ()).await?;
         }
 
-        info!("Database schema is up to date at version 10.");
+        if current_version < 11 {
+            info!("Applying database migration version 11 (finding stages)...");
+            // Immediate rather than the deferred default, because this step reads
+            // before it writes. A deferred transaction takes no lock until its
+            // first statement, so two migrators would both read under a shared
+            // lock and then both try to upgrade, and SQLite fails the second
+            // outright rather than waiting: an upgrade cannot be retried while
+            // the other reader holds its lock. Taking the write lock at BEGIN
+            // makes the second one wait for the first to finish, after which it
+            // sees the column and skips.
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+
+            // Asked at all because ALTER TABLE has no IF NOT EXISTS, and asked
+            // inside the transaction so the answer cannot go stale before it is
+            // used. Any migration runs twice, since rewinding user_version and
+            // replaying the ladder is how the repair migrations are exercised,
+            // and a step that fails on a schema it has already changed leaves the
+            // version behind forever.
+            let mut present = tx
+                .query(
+                    "SELECT 1 FROM pragma_table_info('findings') WHERE name = 'stages'",
+                    (),
+                )
+                .await?;
+            let already_there = present.next().await?.is_some();
+
+            if !already_there {
+                tx.execute_batch(include_str!("migrations/011_findings_stages.sql"))
+                    .await?;
+            }
+            tx.execute("PRAGMA user_version = 11", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 11.");
 
         Ok(())
     }
@@ -1889,16 +1931,21 @@ impl Database {
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
+        let stages_val = finding
+            .stages
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
         self.conn
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, stages, locations)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
                     finding.review_id,
                     finding.severity as i32,
                     finding.severity_explanation,
                     finding.problem,
                     val,
+                    stages_val,
                     locations_val,
                 ],
             )
@@ -7361,7 +7408,7 @@ impl Database {
         for (review_id, patch_id, inline_review, summary, patch_message_id, index) in temp_reviews {
             // Fetch findings for this review
             let mut findings_rows = self.conn.query(
-                "SELECT severity, problem, severity_explanation, preexisting, locations FROM findings WHERE review_id = ?",
+                "SELECT severity, problem, severity_explanation, preexisting, locations, stages FROM findings WHERE review_id = ?",
                 libsql::params![review_id],
             ).await?;
 
@@ -7382,14 +7429,26 @@ impl Database {
                 let locations_str: Option<String> = f_row.get(4).ok();
                 let locations =
                     locations_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                // Typed, so a NULL reads as None while a failure to read the
+                // column at all is an error rather than a finding that quietly
+                // forgets where it came from.
+                let stages_str: Option<String> = f_row.get(5)?;
+                let stages =
+                    stages_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
-                findings.push(json!({
+                let mut finding = json!({
                     "severity": severity,
                     "problem": problem,
                     "severity_explanation": severity_explanation,
                     "preexisting": preexisting,
                     "locations": locations,
-                }));
+                });
+                // Only where the row has it, so a finding recorded before this
+                // column existed reads as it always did.
+                if let Some(stages) = stages {
+                    finding["stages"] = stages;
+                }
+                findings.push(finding);
             }
 
             reviews.push(ReleaseReview {
@@ -9967,6 +10026,7 @@ mod tests {
             severity_explanation: None,
             problem: "Pre-existing issue".to_string(),
             preexisting: Some(true),
+            stages: None,
             locations: None,
         })
         .await
@@ -14071,6 +14131,146 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// A finding's provenance survives the round trip, and the column it needs
+    /// can be added twice without failing the ladder.
+    #[tokio::test]
+    async fn test_a_findings_stages_survive_the_database() {
+        let db = setup_db().await;
+
+        // Applied again from a version below 11, as a rewind would: ALTER TABLE
+        // cannot say IF NOT EXISTS, so the step has to ask first.
+        db.conn
+            .execute("PRAGMA user_version = 4", ())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+
+        let mut version = db.conn.query("PRAGMA user_version", ()).await.unwrap();
+        let row = version.next().await.unwrap().expect("a version");
+        assert_eq!(row.get::<i64>(0).unwrap(), 11);
+
+        // And the provenance a review reports is what comes back out. A finding
+        // read from the database feeds the mail for a delayed or embargoed
+        // patchset, so a column that dropped it would quietly unname every stage
+        // in that mail.
+        let thread_id = db
+            .create_thread("stages-thread", "Stages", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "stages-cover",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Stages",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "stages-cover",
+                "Stages",
+                "Author <author@example.com>",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "stages-cover", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "mm: leak".to_string(),
+            preexisting: Some(false),
+            stages: Some(json!(["locking", "resources"])),
+            locations: None,
+        })
+        .await
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT stages FROM findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("the finding");
+        let stored: String = row.get(0).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+            json!(["locking", "resources"])
+        );
+
+        // And out again the way a delayed or embargoed patchset gets it, which is
+        // the path that builds the later mail. A finding with provenance carries
+        // it; one without says nothing rather than carrying an empty array.
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "mm: unnamed".to_string(),
+            preexisting: Some(false),
+            stages: None,
+            locations: None,
+        })
+        .await
+        .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Review completed.",
+            Some("issues"),
+            None,
+            Some("Inline."),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let released = db.get_completed_reviews_for_release(ps_id).await.unwrap();
+        let findings = &released.first().expect("a review").findings;
+        assert_eq!(findings.len(), 2);
+        let named = findings
+            .iter()
+            .find(|f| f["problem"] == "mm: leak")
+            .expect("the finding with provenance");
+        assert_eq!(named["stages"], json!(["locking", "resources"]));
+        let unnamed = findings
+            .iter()
+            .find(|f| f["problem"] == "mm: unnamed")
+            .expect("the finding without");
+        assert!(unnamed.get("stages").is_none(), "{unnamed:?}");
     }
 
     /// The repair renames the patchset that borrowed a message id after its

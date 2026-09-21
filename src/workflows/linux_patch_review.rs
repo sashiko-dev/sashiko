@@ -240,7 +240,8 @@ Your task is to deduplicate identical or overlapping items in both lists.
 6. Preserve the `preexisting` flag for concerns. If you merge a pre-existing concern with a newly introduced one, flag it based on the root cause (if the root cause is new, it's not pre-existing).
 7. SPECIFICITY REQUIREMENT: When merging concerns or dismissed_concerns, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and triggering conditions. Never generalize a specific finding into a vague category.
 8. Preserve and merge the `locations` arrays from the input concerns and dismissed_concerns. If multiple items describe the same root cause, keep the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations. Do not invent line numbers; keep `line` as null when the exact line is not known.
-9. dismissed_concerns do not need a `preexisting` flag."#;
+9. dismissed_concerns do not need a `preexisting` flag.
+10. PROVENANCE: every input item carries a `stage` naming the review stage that raised it. Report it on the output item as a `stages` array naming every stage you merged into that item, so a concern two stages raised independently lists both, e.g. `"stages": ["locking", "security"]`. Copy these names exactly as they appear in the input, and never name a stage that did not raise the item you are reporting. An item whose inputs carry no stage has no provenance to report: leave the key out rather than inventing one."#;
 
 const STAGE_CONFLICT_RESOLUTION_INSTRUCTION: &str = r#"# Concern/dismissed-concern conflict resolution
 
@@ -252,7 +253,7 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
 4. If there is no direct conflict for a concern, keep it unchanged.
 5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
-6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
+6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, `stages`, and `locations` fields. The `stages` array names the review stages that raised the concern; carry it through unchanged rather than deciding it again. A concern that arrives without one has none to carry, and leaves the key out.
 7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."#;
 
 const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verification and severity estimation
@@ -265,7 +266,8 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
 6. If the problem is determined to have already existed in the code before the patch was applied, mark `"preexisting": true`. Pre-existing issues will be routed to a dedicated pipeline and separate review.
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
-8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
+8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+9. Carry forward the `stages` array from the validated concern into each finding, exactly as given. It names the review stages that raised the concern, which is a record of where the finding came from rather than a judgment of yours: do not add to it, drop from it, or rename anything in it. A concern that arrives without one leaves the key out of its finding."#;
 
 pub const STAGE_REPORT_INSTRUCTION: &str = r#"# LKML-friendly report generation
 
@@ -420,6 +422,101 @@ fn append_stage_items(
             map.insert("stage".to_string(), json!(stage));
         }
         dest.push(obj);
+    }
+}
+
+/// The stages that raised something, taken from what the analysis fan-out
+/// tagged: the only names a consolidation stage may claim provenance from.
+pub(crate) fn stages_that_raised(tagged: &[&[Value]]) -> std::collections::BTreeSet<String> {
+    tagged
+        .iter()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| item.get("stage").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Rewrites each item's provenance into a `stages` array naming only stages in
+/// `raised`.
+///
+/// A consolidation stage transcribes provenance rather than deciding it, so a
+/// name that no analysis stage tagged is a transcription error, not a finding
+/// about the patch, and saying nothing is better than crediting a stage that
+/// never ran. Accepts the `stage` string the analysis stages write as well, so
+/// an item that came through untouched still ends up with the array.
+pub(crate) fn keep_stages_that_raised(
+    items: &mut [Value],
+    raised: &std::collections::BTreeSet<String>,
+) {
+    let items_seen = items.len();
+    let mut unaccounted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut malformed = 0usize;
+
+    for item in items {
+        let Some(map) = item.as_object_mut() else {
+            continue;
+        };
+
+        // A bare string is read as the one name it plainly is, whichever key it
+        // came under: the analysis stages write `stage` that way, and a model
+        // answering `stages` with a string has still said something unambiguous.
+        // Anything else that is there but unreadable is noted below rather than
+        // quietly discarded.
+        let mut unreadable = false;
+        let claimed: Vec<String> = match (map.remove("stages"), map.remove("stage")) {
+            (Some(Value::Array(names)), _) => {
+                let named: Vec<String> = names
+                    .iter()
+                    .filter_map(|n| n.as_str())
+                    .map(str::to_string)
+                    .collect();
+                unreadable = named.len() != names.len();
+                named
+            }
+            (Some(Value::String(name)), _) | (None, Some(Value::String(name))) => vec![name],
+            (None, None) => Vec::new(),
+            (_, _) => {
+                unreadable = true;
+                Vec::new()
+            }
+        };
+
+        // Order as given, duplicates dropped wherever they sit: `dedup` alone
+        // would keep a name repeated non-adjacently.
+        let mut kept: Vec<&str> = Vec::new();
+        for name in &claimed {
+            if raised.contains(name) && !kept.contains(&name.as_str()) {
+                kept.push(name);
+            }
+        }
+
+        for name in &claimed {
+            if !raised.contains(name) {
+                unaccounted.insert(name.clone());
+            }
+        }
+        malformed += usize::from(unreadable);
+
+        if !kept.is_empty() {
+            map.insert("stages".to_string(), json!(kept));
+        }
+    }
+
+    // Warned rather than whispered, because a review that goes quiet is this
+    // project's worst failure mode, and a model naming stages that never ran is
+    // a prompt that needs work. Once for the batch rather than once per item, so
+    // a model having a bad day cannot bury the display it prints over.
+    //
+    // Not an error, though: the findings themselves are what the reader came for
+    // and they are intact. Provenance is a record of where they came from, worth
+    // reporting as missing and not worth failing a review over.
+    if !unaccounted.is_empty() || malformed > 0 {
+        tracing::warn!(
+            named_but_never_raised = ?unaccounted,
+            unreadable_items = malformed,
+            items = items_seen,
+            "A consolidation stage reported provenance that the stages which ran cannot account for"
+        );
     }
 }
 
@@ -851,8 +948,8 @@ Aggregated Dismissed Concerns:
 {{{{aggregated_dismissed_concerns}}}}
 
 Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
-Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
-Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations".
+Each object in the 'concerns' array MUST use these keys and no others: "type", "description", "reasoning", "preexisting", "locations". Add "stages" alongside them for an item whose inputs name a stage, and leave it out entirely for an item whose inputs name none.
+Each object in the 'dismissed_concerns' array MUST use these keys and no others: "type", "description", "reasoning", "locations", with "stages" added on the same terms.
 Preserve the most precise location details from the input. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
@@ -864,6 +961,7 @@ Example Output:
       "description": "Memory leak in function X",
       "reasoning": "1. X is called.\n2. Y is allocated but not freed on error path.",
       "preexisting": false,
+      "stages": ["resources", "security"],
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -880,6 +978,7 @@ Example Output:
       "type": "Resource Management",
       "description": "Possible missing cleanup when foo_init() fails after bar_alloc().",
       "reasoning": "The concrete code path or ordering that proves this candidate concern does not apply.",
+      "stages": ["resources"],
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -913,8 +1012,11 @@ Example Output:
             ..Default::default()
         })
         .reduce(|state, out: StageConcernsOutput| {
+            let raised = stages_that_raised(&[&state.all_concerns, &state.all_dismissed_concerns]);
             state.deduplicated_concerns = out.concerns;
             state.deduplicated_dismissed_concerns = out.dismissed_concerns;
+            keep_stages_that_raised(&mut state.deduplicated_concerns, &raised);
+            keep_stages_that_raised(&mut state.deduplicated_dismissed_concerns, &raised);
         })
         .build()
 }
@@ -935,7 +1037,7 @@ Consolidated Concerns:
 Consolidated Dismissed Concerns:
 {{{{deduplicated_dismissed_concerns}}}}
 
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
+Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use these keys and no others: "type", "description", "reasoning", "preexisting", "locations". Add "stages" alongside them for a concern that arrived with one, carried through unchanged, and leave it out for a concern that arrived without one.
 Preserve the most precise locations from the retained concerns. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
@@ -947,6 +1049,7 @@ Example Output:
       "description": "Memory leak in function X",
       "reasoning": "1. X is called.\n2. Y is allocated but not freed on error path.",
       "preexisting": false,
+      "stages": ["resources", "security"],
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -976,6 +1079,7 @@ Example Output:
             ..Default::default()
         })
         .reduce(|state, out: ConflictResolutionOutput| {
+            let raised = stages_that_raised(&[&state.all_concerns, &state.all_dismissed_concerns]);
             let mut new_concerns = Vec::new();
             let mut preexisting = Vec::new();
             for concern in out.concerns {
@@ -991,6 +1095,8 @@ Example Output:
             }
             state.patch_concerns = new_concerns;
             state.concerns = preexisting;
+            keep_stages_that_raised(&mut state.patch_concerns, &raised);
+            keep_stages_that_raised(&mut state.concerns, &raised);
         })
         .build()
 }
@@ -1011,7 +1117,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use these keys and no others: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Add "stages" alongside them for a finding whose validated concern carried one, copying that array of review stage names across unchanged, and leave the key out for a finding whose concern carried none. Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
 ```json
@@ -1022,6 +1128,7 @@ Example Output:
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
       "preexisting": false,
+      "stages": ["resources"],
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -1051,6 +1158,10 @@ Example Output:
             ..Default::default()
         })
         .reduce(|state, out: VerificationOutput| {
+            let raised = stages_that_raised(&[&state.all_concerns, &state.all_dismissed_concerns]);
+            let mut out = out;
+            keep_stages_that_raised(&mut out.findings, &raised);
+
             let mut new_findings = Vec::new();
             for finding in out.findings {
                 let is_preexisting = finding
@@ -1058,13 +1169,25 @@ Example Output:
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if is_preexisting {
-                    let concern = json!({
+                    let mut concern = json!({
                         "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
                         "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
                         "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
                         "preexisting": true,
                         "locations": finding.get("locations").cloned().unwrap_or(json!([])),
                     });
+                    // Only where the finding has it: an empty array would say the
+                    // concern came from no stage, where no key says nothing about
+                    // where it came from.
+                    //
+                    // Indexing a key the object does not have inserts it. Unlike
+                    // HashMap, whose index panics on a missing key, serde_json
+                    // panics only where the value is not an object at all, and
+                    // this one came from a json! object literal. Pinned by
+                    // test_assigning_provenance_inserts_a_key_that_was_not_there.
+                    if let Some(stages) = finding.get("stages") {
+                        concern["stages"] = stages.clone();
+                    }
                     state.concerns.push(concern);
                 }
                 new_findings.push(finding);
@@ -1088,7 +1211,13 @@ Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                // Labels rather than stage names: the report quotes these to a
+                // reader, and the spelling is the label table's to decide.
+                let shown = crate::workflows::findings_for_report(
+                    crate::project::ProjectId::Linux,
+                    &s.findings,
+                );
+                serde_json::to_string_pretty(&shown).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -1459,5 +1588,133 @@ mod tests {
         assert_eq!(state.concerns[0]["description"], "Old race condition");
         assert_eq!(state.concerns[1]["description"], "another pre-existing");
         assert_eq!(state.findings.len(), 2);
+    }
+
+    /// Assigning provenance onto an object that does not carry the key yet is
+    /// how both reducers add it, and serde_json inserts rather than refusing.
+    ///
+    /// Pinned because the syntax looks like HashMap's, which panics on a key it
+    /// does not have. serde_json panics only where the value is not an object at
+    /// all, and a concern or finding here is always the object a json! literal
+    /// built.
+    #[test]
+    fn test_assigning_provenance_inserts_a_key_that_was_not_there() {
+        let mut concern = json!({"type": "Leak", "preexisting": true});
+        assert!(concern.get("stages").is_none());
+
+        concern["stages"] = json!(["locking"]);
+
+        assert_eq!(concern["stages"], json!(["locking"]));
+        assert_eq!(concern["type"], "Leak");
+    }
+
+    /// State as it stands when a consolidation stage runs: two analysis stages
+    /// raised something, and the tags they wrote are the whole truth about where
+    /// a concern can have come from.
+    fn state_with_raised_concerns() -> LinuxPatchReviewState {
+        LinuxPatchReviewState {
+            all_concerns: vec![
+                json!({"type": "Deadlock", "description": "ab/ba", "stage": "locking"}),
+                json!({"type": "Overflow", "description": "len math", "stage": "resources"}),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_consolidation_keeps_only_provenance_a_stage_actually_raised() {
+        let stage = deduplication_stage(20, 0.0);
+        let mut state = state_with_raised_concerns();
+
+        (stage.reducer)(
+            &mut state,
+            StageConcernsOutput {
+                concerns: vec![
+                    // Merged from both, which is the case worth reporting.
+                    json!({"description": "ab/ba", "stages": ["locking", "resources"]}),
+                    // A stage that raised nothing here: transcription, not
+                    // provenance, so the claim goes rather than misleading a
+                    // reader about which stage found this.
+                    json!({"description": "len math", "stages": ["security"]}),
+                    // Untouched from an analysis stage, still carrying the
+                    // singular tag that stage wrote.
+                    json!({"description": "third", "stage": "locking"}),
+                    // Repeated names, and not adjacently.
+                    json!({"description": "fourth",
+                           "stages": ["locking", "resources", "locking"]}),
+                    // A bare string where an array was asked for: unambiguous,
+                    // so it is read as the one name it is.
+                    json!({"description": "fifth", "stages": "locking"}),
+                    // There, but unreadable, so nothing is claimed for it.
+                    json!({"description": "sixth", "stages": 7}),
+                ],
+                dismissed_concerns: vec![json!({"description": "no", "stages": ["resources"]})],
+            },
+        );
+
+        let stages = |c: &Value| c.get("stages").cloned().unwrap_or(json!(null));
+        assert_eq!(
+            stages(&state.deduplicated_concerns[0]),
+            json!(["locking", "resources"])
+        );
+        assert_eq!(stages(&state.deduplicated_concerns[1]), json!(null));
+        assert_eq!(stages(&state.deduplicated_concerns[2]), json!(["locking"]));
+        assert_eq!(
+            stages(&state.deduplicated_concerns[3]),
+            json!(["locking", "resources"])
+        );
+        assert_eq!(
+            stages(&state.deduplicated_dismissed_concerns[0]),
+            json!(["resources"])
+        );
+
+        // And the singular key never reaches the output beside the array, so a
+        // reader downstream has one place to look.
+        assert!(state.deduplicated_concerns[2].get("stage").is_none());
+
+        // A bare string is read; a number is not, and neither claims a stage the
+        // fan-out did not tag.
+        assert_eq!(stages(&state.deduplicated_concerns[4]), json!(["locking"]));
+        assert_eq!(stages(&state.deduplicated_concerns[5]), json!(null));
+    }
+
+    #[test]
+    fn test_a_finding_carries_the_stages_that_raised_it() {
+        let stage = verification_stage(20, 0.0);
+        let mut state = state_with_raised_concerns();
+
+        (stage.reducer)(
+            &mut state,
+            VerificationOutput {
+                findings: vec![
+                    json!({"problem": "mm: leak", "severity": "High", "preexisting": false,
+                           "stages": ["resources"]}),
+                    json!({"problem": "mm: old race", "severity": "Medium", "preexisting": true,
+                           "severity_explanation": "predates the patch", "stages": ["locking"]}),
+                ],
+            },
+        );
+
+        assert_eq!(state.findings[0]["stages"], json!(["resources"]));
+        // A pre-existing finding is rebuilt as a concern for the separate
+        // pipeline, and it has to take its provenance with it.
+        assert_eq!(state.concerns[0]["stages"], json!(["locking"]));
+
+        // Where a finding names no stage, the concern rebuilt from it says
+        // nothing, rather than claiming it came from nowhere.
+        let mut bare = state_with_raised_concerns();
+        (stage.reducer)(
+            &mut bare,
+            VerificationOutput {
+                findings: vec![json!({"problem": "mm: no provenance", "severity": "Low",
+                                      "preexisting": true,
+                                      "severity_explanation": "older than the patch"})],
+            },
+        );
+        assert!(
+            bare.concerns[0].get("stages").is_none(),
+            "{:?}",
+            bare.concerns[0]
+        );
     }
 }

@@ -43,6 +43,26 @@ domain error enums) rather than crashing the process.
     `s.floor_char_boundary(max_len)` (if available in the target Rust version)
     before slicing strings for truncation or snippet extraction.
 
+### `serde_json::Value` indexing is not map indexing
+
+Sashiko carries LLM output around as `serde_json::Value`, so `value["key"]`
+appears throughout `src/workflow/` and `src/workflows/`. It does *not* behave
+like `HashMap` indexing, and reporting it as if it did is a false positive:
+
+- **Reading a key that is absent returns `Value::Null`.** `Index` never panics;
+  a missing key, or a string key on an array or a number, yields `Null`.
+- **Assigning to a key that is absent inserts it.** `IndexMut` adds the key, and
+  it first replaces a `Value::Null` receiver with an empty map. Building an
+  object field by field with `v["a"] = ...` is the documented use.
+- **`IndexMut` panics only where the receiver cannot hold the index at all**:
+  a string key on a value that is neither an object nor null (the message is
+  `cannot access key "a" in JSON string`), or a `usize` past the end of an
+  array. To report one, name the value and show a path on which it arrives as
+  some other type.
+- `HashMap` and `BTreeMap` are the opposite: `map["key"]` panics with `no entry
+  found for key` when the key is absent, and they implement no `IndexMut` at
+  all. Do not carry that intuition across.
+
 ---
 
 ## 2. Swallowed errors (`let _ = ...`, `.ok()`, `.unwrap_or_default()`)

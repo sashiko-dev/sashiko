@@ -2093,7 +2093,10 @@ fn print_findings_summary(
         };
 
         print_colored(color, &format!("  {}[{}] ", location, sev));
-        println!("{}", desc);
+        println!(
+            "{desc}{}",
+            sashiko::workflows::finding_stage_suffix(project(), f)
+        );
         if !fix.is_empty() {
             println!("    Fix: {}", fix);
         }

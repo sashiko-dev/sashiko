@@ -234,6 +234,7 @@ Create a note for these items, all of which your report should include:
   front of your new text.
 - [ ] Place your questions as close as possible to the buggy section of code.
 - [ ] Place a severity tag in square brackets on its own line right above each inline comment block, exactly in this format: `[Severity: <level>]` (where <level> is Critical, High, Medium, or Low).
+  - [ ] Where the finding carries a `stages` array, name those stages after the severity, in parentheses, on the same line, copying the entries exactly and separating them with a comma: `[Severity: Low] (Resource Mgmt)`, or `[Severity: High] (Locking & Sync, Security Audit)` where more than one stage raised the finding. Add nothing when the finding has no `stages`, and never name a stage the finding does not list.
 - [ ] Snip portions of the quoted content unrelated to your review
   - [ ] Check every hunk to see if it is relevant to the review comments.
   - [ ] ensure diff headers are retained for the files owning any hunks keep
@@ -286,7 +287,7 @@ mm, swap: only scan one cluster in fragment list
 > -			atomic_long_dec(&si->frag_cluster_nr[order]);
                         ^^^^
 
-[Severity: High]
+[Severity: High] (Resource Mgmt, Locking & Sync)
 Is it ok to remove this atomic_long_dec()?  It looks like the counter
 updates are getting lost.
 
@@ -306,7 +307,7 @@ updates are getting lost.
 > +		 * allocation will surely success, and large allocation
 > +		 * allocation will surely success, and large allocation
                  ^^^^^^^^
-[Severity: Low]
+[Severity: Low] (Implementation)
                  this isn't a bug, but you've duplicated this line
 
 > +		 * failure is not critical. Scanning one cluster still

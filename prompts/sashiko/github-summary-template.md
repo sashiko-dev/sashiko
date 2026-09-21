@@ -25,6 +25,10 @@ Produce a plain-text inline review report based on the findings provided.
   Do not omit any finding.
 - **Order findings by severity** from highest (`[CRITICAL]`) to lowest
   (`[LOW]`).
+- **Name the stages that raised each finding.** Where a finding carries a
+  `stages` array, put those entries in parentheses right after the severity,
+  copied exactly and comma-separated. Add nothing when a finding has no
+  `stages`, and never name a stage a finding does not list.
 - **Empty line between findings.** Separate individual findings with a single
   empty line so each finding stands out clearly.
 
@@ -33,13 +37,17 @@ Produce a plain-text inline review report based on the findings provided.
 When findings are present, output ONLY a bulleted list where every bullet starts
 with `- [<SEVERITY>]` and individual findings are separated by an empty line:
 
-- [<SEVERITY>] <short, conscious problem description naming file and symbol>
+- [<SEVERITY>] (<stages>) <short, conscious problem description naming
+  file and symbol>
 
-- [<SEVERITY>] <short, conscious problem description naming file and symbol>
+- [<SEVERITY>] (<stages>) <short, conscious problem description naming
+  file and symbol>
 
 Where `<SEVERITY>` is strictly one of `CRITICAL`, `HIGH`, `MEDIUM`, or `LOW` in
-uppercase square brackets. If a finding is pre-existing (not introduced by this
-patch), note `(pre-existing)` at the start of its description.
+uppercase square brackets, and `(<stages>)` is the finding's `stages`
+entries, omitted entirely when it has none. If a finding is pre-existing
+(not introduced by this patch), note `(pre-existing)` at the start of its
+description, after the stages.
 
 If there are no findings at all, output exactly:
 
@@ -47,17 +55,20 @@ No issues found.
 
 ## Example (findings present)
 
-- [CRITICAL] In src/worker/sync.rs (GitSyncWorker::sync_all_remotes), holding
-  the synchronous std::sync::MutexGuard across the async fetch_remote() call
-  can deadlock Tokio worker threads when multiple remotes sync concurrently.
+- [CRITICAL] (Concurrency & Async, DB & Persistence) In src/worker/sync.rs
+  (GitSyncWorker::sync_all_remotes), holding the synchronous
+  std::sync::MutexGuard across the async fetch_remote() call can deadlock
+  Tokio worker threads when multiple remotes sync concurrently.
 
-- [HIGH] In src/worker/sync.rs (GitSyncWorker::sync_all_remotes), unredacted
-  git fetch stderr is logged via warn! and error! when remote URLs fail,
-  leaking embedded authentication tokens into application logs.
+- [HIGH] (Security Audit) In src/worker/sync.rs
+  (GitSyncWorker::sync_all_remotes), unredacted git fetch stderr is logged
+  via warn! and error! when remote URLs fail, leaking embedded
+  authentication tokens into application logs.
 
-- [MEDIUM] In src/api.rs (forge_webhook), the placeholder cover letter message
-  ID omits the @sashiko.local domain suffix expected by resolve_root_msg_id(),
-  causing git fetch ingestion to create a duplicate patchset row.
+- [MEDIUM] (Interfaces & Compat) In src/api.rs (forge_webhook), the
+  placeholder cover letter message ID omits the @sashiko.local domain suffix
+  expected by resolve_root_msg_id(), causing git fetch ingestion to create a
+  duplicate patchset row.
 
 - [LOW] Commit message body contains unwrapped single-line paragraphs exceeding
   100 characters and quotes function names in backticks.
