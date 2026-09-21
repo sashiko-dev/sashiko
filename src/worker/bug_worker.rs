@@ -1,7 +1,7 @@
 use crate::ai::AiProvider;
+use crate::api::BugInput;
 use crate::db::{AttributedSubsystem, Database, SubsystemSource};
 use crate::toolbox::ToolBox;
-use crate::workflows::linux_bug::BugInput;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;

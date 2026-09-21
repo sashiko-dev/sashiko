@@ -142,10 +142,114 @@ pub struct SubmitResponse {
     pub id: String,
 }
 
+/// Input payload representing a candidate Linux kernel defect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BugInput {
+    pub problem: String,
+    pub reasoning: String,
+    pub locations: Option<serde_json::Value>,
+    #[serde(default)]
+    pub subsystems: Vec<crate::db::AttributedSubsystem>,
+    pub source_files: Vec<String>,
+    pub commit_sha: Option<String>,
+    pub patchset_id: Option<i64>,
+    pub patch_id: Option<i64>,
+    pub baseline_sha: Option<String>,
+    #[serde(default)]
+    pub review_id: Option<i64>,
+}
+
+/// The result of processing a candidate Linux kernel bug through the pipeline.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BugOutcome {
+    /// The candidate bug was discarded (invalid, false positive, or Low/Medium severity).
+    Discarded {
+        reason: String,
+        logs: Option<String>,
+    },
+    /// The bug was confirmed as an identical duplicate of a known Linux kernel bug.
+    Duplicate {
+        existing_bug: crate::db::Bug,
+        reasoning: String,
+        logs: Option<String>,
+    },
+    /// The bug was confirmed as a newly discovered Linux kernel bug.
+    NewlyDiscovered { bug: crate::db::Bug },
+}
+
+impl std::fmt::Display for BugOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BugOutcome::NewlyDiscovered { bug } => {
+                write!(
+                    f,
+                    "newly discovered bug {} ({}) [severity: {}]",
+                    bug.id,
+                    bug.bugid,
+                    bug.severity()
+                )
+            }
+            BugOutcome::Duplicate {
+                existing_bug,
+                reasoning,
+                ..
+            } => {
+                write!(
+                    f,
+                    "duplicate of bug {} ({}) - {}",
+                    existing_bug.id, existing_bug.bugid, reasoning
+                )
+            }
+            BugOutcome::Discarded { reason, .. } => {
+                write!(f, "discarded - {}", reason)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BugOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BugOutcome::Discarded { reason, logs } => f
+                .debug_struct("Discarded")
+                .field("reason", reason)
+                .field(
+                    "logs",
+                    &logs.as_ref().map(|l| format!("<{} bytes>", l.len())),
+                )
+                .finish(),
+            BugOutcome::Duplicate {
+                existing_bug,
+                reasoning,
+                logs,
+            } => f
+                .debug_struct("Duplicate")
+                .field("existing_bug_id", &existing_bug.id)
+                .field("existing_bug_bugid", &existing_bug.bugid)
+                .field("reasoning", reasoning)
+                .field(
+                    "logs",
+                    &logs.as_ref().map(|l| format!("<{} bytes>", l.len())),
+                )
+                .finish(),
+            BugOutcome::NewlyDiscovered { bug } => f
+                .debug_struct("NewlyDiscovered")
+                .field("id", &bug.id)
+                .field("bugid", &bug.bugid)
+                .field("lifecycle_status", &bug.lifecycle_status)
+                .field("pipeline_state", &bug.pipeline_state)
+                .field("problem", &bug.problem())
+                .field("severity", &bug.severity())
+                .finish(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct AnalyzeBugPayload {
     #[serde(flatten)]
-    pub input: crate::workflows::linux_bug::BugInput,
+    pub input: BugInput,
     pub tool: Option<String>,
     pub model: Option<String>,
 }

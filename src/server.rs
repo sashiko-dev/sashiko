@@ -1274,7 +1274,7 @@ async fn analyze_bug(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AnalyzeBugPayload>,
-) -> Result<Json<crate::workflows::linux_bug::BugOutcome>, (StatusCode, String)> {
+) -> Result<Json<BugOutcome>, (StatusCode, String)> {
     if state.read_only {
         return Err((
             StatusCode::FORBIDDEN,

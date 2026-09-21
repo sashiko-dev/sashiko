@@ -1839,7 +1839,7 @@ impl Reviewer {
                                             .map(crate::db::AttributedSubsystem::from_maintainers)
                                             .collect();
 
-                                        let input = crate::workflows::linux_bug::BugInput {
+                                        let input = crate::api::BugInput {
                                             problem,
                                             reasoning,
                                             locations,
