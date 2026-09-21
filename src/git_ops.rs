@@ -1515,7 +1515,7 @@ pub async fn extract_patch_metadata(repo_path: &Path, commit: &str) -> Result<Pa
 pub async fn is_dirty(repo_path: &Path) -> Result<bool> {
     let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
         .await?;
 
@@ -1619,6 +1619,44 @@ mod tests {
         // Test git_status
         let status = git_status(&repo_path).await?;
         assert!(status.contains("nothing to commit, working tree clean"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_is_dirty_ignores_untracked_files() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test User"],
+        ] {
+            crate::git_cmd::in_dir_async(&repo_path)
+                .args(&args)
+                .output()
+                .await?;
+        }
+        let tracked = repo_path.join("tracked.txt");
+        writeln!(File::create(&tracked)?, "one")?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "tracked.txt"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "-m", "Initial commit"])
+            .output()
+            .await?;
+        assert!(!is_dirty(&repo_path).await?);
+
+        // A build log or a stray patch directory is not a change to the
+        // files under review.
+        writeln!(File::create(repo_path.join("build.log"))?, "noise")?;
+        assert!(!is_dirty(&repo_path).await?);
+
+        writeln!(File::create(&tracked)?, "two")?;
+        assert!(is_dirty(&repo_path).await?);
 
         Ok(())
     }
