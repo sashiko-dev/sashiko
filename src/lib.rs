@@ -15,7 +15,7 @@ pub mod metrics;
 
 pub mod access;
 pub mod ai;
-pub mod api;
+pub use server as api;
 pub mod auth;
 pub mod backfill;
 pub mod baseline;
@@ -39,6 +39,7 @@ pub mod prerequisites;
 pub mod project;
 pub mod prompt_bundle;
 pub mod reviewer;
+pub mod server;
 pub mod settings;
 pub mod toolbox;
 pub mod utils;
