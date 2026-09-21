@@ -29,7 +29,9 @@ use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
     PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput,
+    VerificationOutput, format_concerns_feedback, format_conflict_resolution_feedback,
+    format_verification_feedback, validate_concerns_output, validate_conflict_resolution_output,
+    validate_verification_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -479,20 +481,6 @@ pub fn is_known_stage(name: &str) -> bool {
 // Validators and Helpers
 // ---------------------------------------------------------------------------
 
-fn validate_concerns_output(
-    _output: &StageConcernsOutput,
-    _state: &SashikoPatchReviewState,
-) -> Result<(), String> {
-    Ok(())
-}
-
-fn format_concerns_feedback(violation: &str) -> String {
-    format!(
-        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
-        violation
-    )
-}
-
 fn validate_github_summary_format(
     content: &str,
     state: &SashikoPatchReviewState,
@@ -901,7 +889,11 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
                 },
             ),
         )
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_conflict_resolution_output)
+                .with_feedback_formatter(format_conflict_resolution_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -954,7 +946,11 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_verification_output)
+                .with_feedback_formatter(format_verification_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
