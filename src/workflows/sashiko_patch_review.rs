@@ -29,7 +29,9 @@ use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
     PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput,
+    VerificationOutput, format_concerns_feedback, format_conflict_resolution_feedback,
+    format_verification_feedback, validate_concerns_output, validate_conflict_resolution_output,
+    validate_verification_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -479,20 +481,6 @@ pub fn is_known_stage(name: &str) -> bool {
 // Validators and Helpers
 // ---------------------------------------------------------------------------
 
-fn validate_concerns_output(
-    _output: &StageConcernsOutput,
-    _state: &SashikoPatchReviewState,
-) -> Result<(), String> {
-    Ok(())
-}
-
-fn format_concerns_feedback(violation: &str) -> String {
-    format!(
-        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
-        violation
-    )
-}
-
 fn validate_github_summary_format(
     content: &str,
     state: &SashikoPatchReviewState,
@@ -901,7 +889,11 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
                 },
             ),
         )
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_conflict_resolution_output)
+                .with_feedback_formatter(format_conflict_resolution_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -945,7 +937,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters)."#
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "introduced_in_patch" (an integer or null: the series position, as in "[Patch N of M]", of the commit whose change first made the problem present, chosen from the series block (the commit under review on its header line, the preceding and subsequent lists below it): an earlier one when the problem was already present in the tree this commit was applied to, the one whose change made it so, not merely the last to touch the code; the one under review when its own diff introduces the problem; a subsequent one when only its change makes it a problem; null when "preexisting" is true or you cannot tell), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters)."#
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
@@ -954,7 +946,11 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_verification_output)
+                .with_feedback_formatter(format_verification_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,

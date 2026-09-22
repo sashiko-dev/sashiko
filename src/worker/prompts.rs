@@ -520,44 +520,65 @@ pub fn build_follow_up_series_context(
         .and_then(|p| p["subject"].as_str())
         .unwrap_or("unknown");
 
+    let mut preceding = Vec::new();
     let mut follow_ups = Vec::new();
     for p in patches {
         let idx = p["index"].as_i64().unwrap_or(0);
-        if idx > current_idx {
-            let subj = p["subject"].as_str().unwrap_or("");
-            let commit_id = p["commit_id"].as_str();
+        let subj = p["subject"].as_str().unwrap_or("");
+        let commit_id = p["commit_id"].as_str();
+        if idx < current_idx {
+            preceding.push((idx, commit_id, subj));
+        } else if idx > current_idx {
             follow_ups.push((idx, commit_id, subj));
         }
     }
 
-    if follow_ups.is_empty() {
+    if preceding.is_empty() && follow_ups.is_empty() {
         return None;
     }
 
+    preceding.sort_by_key(|(idx, _, _)| *idx);
     follow_ups.sort_by_key(|(idx, _, _)| *idx);
 
     let mut block = String::new();
-    block.push_str("\n\n=== Follow-Up Patches in Series ===\n");
+    block.push_str("\n\n=== Patch Series Context ===\n");
     block.push_str(&format!(
         "Current Patch Under Review: [Patch {} of {}] - {}\n",
         current_idx, total_patches, current_subject
     ));
     block.push_str(&format!("Series End Commit (Final State): {}\n\n", end_sha));
-    block.push_str("Subsequent patches in this series:\n");
 
-    for (idx, commit_id, subj) in follow_ups {
-        if let Some(sha) = commit_id {
-            block.push_str(&format!(
-                "- [Patch {} of {}] (commit {}): {}\n",
-                idx, total_patches, sha, subj
-            ));
-        } else {
-            block.push_str(&format!(
-                "- [Patch {} of {}]: {}\n",
-                idx, total_patches, subj
-            ));
+    // Both halves of the series are listed so a stage can name any patch by
+    // its position: the preceding ones are already in the tree it reviews.
+    let list = |block: &mut String, heading: &str, items: &[(i64, Option<&str>, &str)]| {
+        if items.is_empty() {
+            return;
         }
-    }
+        block.push_str(heading);
+        for (idx, commit_id, subj) in items {
+            if let Some(sha) = commit_id {
+                block.push_str(&format!(
+                    "- [Patch {} of {}] (commit {}): {}\n",
+                    idx, total_patches, sha, subj
+                ));
+            } else {
+                block.push_str(&format!(
+                    "- [Patch {} of {}]: {}\n",
+                    idx, total_patches, subj
+                ));
+            }
+        }
+    };
+    list(
+        &mut block,
+        "Preceding patches in this series:\n",
+        &preceding,
+    );
+    list(
+        &mut block,
+        "Subsequent patches in this series:\n",
+        &follow_ups,
+    );
 
     let diff_directive = if target_commit_sha != "unknown" && !target_commit_sha.is_empty() {
         format!(
@@ -899,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_follow_up_series_context_none_when_last_patch() {
+    fn test_build_follow_up_series_context_lists_preceding_patches_for_the_last() {
         let patchset = serde_json::json!({
             "patch_index": 2,
             "patches": [
@@ -907,8 +928,23 @@ mod tests {
                 { "index": 2, "subject": "Patch 2", "commit_id": "sha2" }
             ]
         });
+        let content = build_follow_up_series_context(Some("base..sha2"), &patchset, "sha2")
+            .expect("the last patch still has preceding patches to list");
+        assert!(content.contains("Preceding patches in this series:"));
+        assert!(content.contains("- [Patch 1 of 2] (commit sha1): Patch 1"));
+        assert!(!content.contains("Subsequent patches in this series:"));
+    }
+
+    #[test]
+    fn test_build_follow_up_series_context_none_for_a_single_patch() {
+        let patchset = serde_json::json!({
+            "patch_index": 1,
+            "patches": [
+                { "index": 1, "subject": "Patch 1", "commit_id": "sha1" }
+            ]
+        });
         assert_eq!(
-            build_follow_up_series_context(Some("base..sha2"), &patchset, "sha2"),
+            build_follow_up_series_context(Some("base..sha1"), &patchset, "sha1"),
             None
         );
     }
@@ -1368,7 +1404,7 @@ mod tests {
             .expect("verification user message should be in history");
 
         let content = verification_user_msg.content.as_deref().unwrap();
-        assert!(content.contains("=== Follow-Up Patches in Series ==="));
+        assert!(content.contains("=== Patch Series Context ==="));
         assert!(content.contains("Series End Commit (Final State): sha2"));
         assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
         assert!(content.contains("SERIES VERIFICATION DIRECTIVE:"));
