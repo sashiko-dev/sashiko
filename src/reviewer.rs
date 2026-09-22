@@ -56,6 +56,7 @@ struct ReviewContext {
 enum PatchResult {
     Success,
     ReviewFailed,
+    Cancelled,
 }
 
 #[derive(Serialize)]
@@ -210,17 +211,24 @@ impl Reviewer {
             let permit = self.semaphore.clone().acquire_owned().await?;
             let target_review_count = patchset.target_review_count.unwrap_or(1) as usize;
 
-            // Mark status as 'In Review' in the DB immediately to prevent double-fetching
-            if let Err(e) = self
-                .db
-                .update_patchset_status(patchset.id, ReviewStatus::InReview.as_str())
-                .await
-            {
-                error!(
-                    "Failed to update status to In Review for {}: {}",
-                    patchset.id, e
-                );
-                continue;
+            // Atomically claim only if still Pending (avoids reopening a patchset
+            // that was cancelled while waiting for a semaphore permit)
+            match self.db.claim_patchset_for_review(patchset.id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(
+                        "Skipping patchset {} as it is no longer Pending (likely cancelled)",
+                        patchset.id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to update status to In Review for {}: {}",
+                        patchset.id, e
+                    );
+                    continue;
+                }
             }
             patchset.status = Some(ReviewStatus::InReview.as_str().to_string());
 
@@ -452,6 +460,21 @@ impl Reviewer {
 
     async fn review_patchset_task(ctx: ReviewContext, patchset: PatchsetRow) {
         let patchset_id = patchset.id;
+        if ctx
+            .db
+            .get_patchset_status(patchset_id)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(ReviewStatus::Cancelled.as_str())
+        {
+            info!(
+                "Patchset {} was cancelled before review started, skipping",
+                patchset_id
+            );
+            return;
+        }
         info!("Starting review for patchset {}", patchset_id);
 
         if let Err(e) = ctx
@@ -545,7 +568,29 @@ impl Reviewer {
 
         // Save findings to patchset
         if let Some((resolution, baseline_id, worktree)) = found_baseline {
-            let _ = ctx
+            if ctx
+                .db
+                .get_patchset_status(patchset_id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(ReviewStatus::Cancelled.as_str())
+            {
+                info!(
+                    "Patchset {} was cancelled during baseline preparation, aborting",
+                    patchset_id
+                );
+                if let Err(e) = worktree.remove().await {
+                    warn!(
+                        "Failed to remove worktree after patchset {} cancellation: {}",
+                        patchset_id, e
+                    );
+                }
+                return;
+            }
+
+            if let Err(e) = ctx
                 .db
                 .update_patchset_baseline_info(
                     patchset_id,
@@ -555,7 +600,13 @@ impl Reviewer {
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )
-                .await;
+                .await
+            {
+                warn!(
+                    "Failed to update baseline info for patchset {}: {}",
+                    patchset_id, e
+                );
+            }
 
             // patches_json for input payload (contains all patches)
             let patches_json: Vec<_> = diffs
@@ -696,7 +747,12 @@ impl Reviewer {
                 }
 
                 if should_skip {
-                    let _ = ctx.db.update_patch_status(*patch_id, "Skipped").await;
+                    if let Err(e) = ctx.db.update_patch_status(*patch_id, "Skipped").await {
+                        warn!(
+                            "Failed to mark patch {} as Skipped for patchset {}: {}",
+                            patch_id, patchset_id, e
+                        );
+                    }
                     continue;
                 }
                 let commit_sha = patch_commits.get(index).cloned();
@@ -732,6 +788,18 @@ impl Reviewer {
                     let handle = tokio::spawn(async move {
                         let mut failed = 0;
                         loop {
+                            if ctx_clone
+                                .db
+                                .get_patchset_status(patchset_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .as_deref()
+                                == Some(ReviewStatus::Cancelled.as_str())
+                            {
+                                queue.lock().await.clear();
+                                break;
+                            }
                             let job = {
                                 let mut q = queue.lock().await;
                                 q.pop()
@@ -754,6 +822,10 @@ impl Reviewer {
                                 .await
                                 {
                                     Ok(PatchResult::Success) => {}
+                                    Ok(PatchResult::Cancelled) => {
+                                        queue.lock().await.clear();
+                                        break;
+                                    }
                                     _ => failed += 1,
                                 }
                             } else {
@@ -779,6 +851,18 @@ impl Reviewer {
             // Main worker loop uses the existing worktree
             let mut main_failed = 0;
             loop {
+                if ctx
+                    .db
+                    .get_patchset_status(patchset_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(ReviewStatus::Cancelled.as_str())
+                {
+                    valid_jobs_queue.lock().await.clear();
+                    break;
+                }
                 let job = {
                     let mut q = valid_jobs_queue.lock().await;
                     q.pop()
@@ -801,6 +885,10 @@ impl Reviewer {
                     .await
                     {
                         Ok(PatchResult::Success) => {}
+                        Ok(PatchResult::Cancelled) => {
+                            valid_jobs_queue.lock().await.clear();
+                            break;
+                        }
                         _ => main_failed += 1,
                     }
                 } else {
@@ -824,7 +912,12 @@ impl Reviewer {
             }
 
             // Cleanup worktree here since we kept it alive for reuse
-            let _ = worktree.remove().await;
+            if let Err(e) = worktree.remove().await {
+                warn!(
+                    "Failed to remove worktree for patchset {}: {}",
+                    patchset_id, e
+                );
+            }
 
             let current_status = ctx.db.get_patchset_status(patchset_id).await.ok().flatten();
             if current_status.as_deref() == Some(ReviewStatus::Cancelled.as_str()) {
@@ -839,10 +932,16 @@ impl Reviewer {
                     ReviewStatus::Failed.as_str().to_string()
                 };
 
-                let _ = ctx
+                if let Err(e) = ctx
                     .db
                     .update_patchset_status(patchset_id, &final_status)
-                    .await;
+                    .await
+                {
+                    warn!(
+                        "Failed to update patchset {} status to {}: {}",
+                        patchset_id, final_status, e
+                    );
+                }
 
                 if review_success {
                     if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await {
@@ -1321,6 +1420,45 @@ impl Reviewer {
             .await?;
 
         loop {
+            if ctx
+                .db
+                .get_patchset_status(patchset_id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(ReviewStatus::Cancelled.as_str())
+            {
+                info!(
+                    "Patchset {} was cancelled before reviewing patch {}/{}",
+                    patchset_id, patchset_id, index
+                );
+                if let Some(rid) = existing_pending_review_id.take()
+                    && let Err(e) = ctx
+                        .db
+                        .complete_review(
+                            rid,
+                            ReviewStatus::Cancelled.as_str(),
+                            "Cancelled because patchset was superseded or cancelled",
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                {
+                    warn!("Failed to mark review {} as Cancelled: {}", rid, e);
+                }
+                if let Err(e) = ctx
+                    .db
+                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
+                    .await
+                {
+                    warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
+                }
+                return Ok(PatchResult::Cancelled);
+            }
+
             let review_id = if let Some(id) = existing_pending_review_id.take() {
                 id
             } else {
@@ -1336,10 +1474,16 @@ impl Reviewer {
                     .await?
             };
 
-            let _ = ctx
+            if let Err(e) = ctx
                 .db
                 .update_review_status(review_id, ReviewStatus::InReview.as_str(), None)
-                .await;
+                .await
+            {
+                warn!(
+                    "Failed to update review {} status to In Review: {}",
+                    review_id, e
+                );
+            }
 
             let result = run_review_tool(
                 patchset_id,
@@ -1356,6 +1500,44 @@ impl Reviewer {
                 ctx.llm_semaphore.clone(),
             )
             .await;
+
+            if ctx
+                .db
+                .get_patchset_status(patchset_id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(ReviewStatus::Cancelled.as_str())
+            {
+                info!(
+                    "Patchset {} was cancelled while reviewing patch {}/{}",
+                    patchset_id, patchset_id, index
+                );
+                if let Err(e) = ctx
+                    .db
+                    .complete_review(
+                        review_id,
+                        ReviewStatus::Cancelled.as_str(),
+                        "Cancelled because patchset was superseded or cancelled",
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    warn!("Failed to mark review {} as Cancelled: {}", review_id, e);
+                }
+                if let Err(e) = ctx
+                    .db
+                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
+                    .await
+                {
+                    warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
+                }
+                return Ok(PatchResult::Cancelled);
+            }
 
             match result {
                 Ok(json_output) => {
@@ -1754,6 +1936,37 @@ impl Reviewer {
                     }
                 }
                 Err(e) => {
+                    if e.downcast_ref::<ReviewError>()
+                        .is_some_and(|re| matches!(re, ReviewError::Cancelled))
+                    {
+                        info!(
+                            "Review cancelled for patchset {} patch {}",
+                            patchset_id, index
+                        );
+                        if let Err(err) = ctx
+                            .db
+                            .complete_review(
+                                review_id,
+                                ReviewStatus::Cancelled.as_str(),
+                                "Cancelled because patchset was superseded or cancelled",
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            warn!("Failed to mark review {} as Cancelled: {}", review_id, err);
+                        }
+                        if let Err(err) = ctx
+                            .db
+                            .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
+                            .await
+                        {
+                            warn!("Failed to mark patch {} as Cancelled: {}", patch_id, err);
+                        }
+                        return Ok(PatchResult::Cancelled);
+                    }
                     error!("Review execution failed for {}: {}", patchset_id, e);
                     let _ = ctx
                         .db
@@ -2010,6 +2223,8 @@ async fn run_review_tool_with_cmd(
             let total_output_tokens_used = Arc::new(AtomicUsize::new(0));
 
             let (abort_tx, mut abort_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
+            let mut cancel_interval = tokio::time::interval(Duration::from_secs(2));
+            cancel_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 let current_deadline = {
@@ -2020,6 +2235,17 @@ async fn run_review_tool_with_cmd(
                 tokio::select! {
                     Some(err) = abort_rx.recv() => {
                         return Err(err);
+                    }
+                    _ = cancel_interval.tick() => {
+                        if let Ok(Some(status)) = db.get_patchset_status(patchset_id).await
+                            && status == ReviewStatus::Cancelled.as_str()
+                        {
+                            info!(
+                                "Patchset {} was cancelled during active review; aborting worker",
+                                patchset_id
+                            );
+                            return Err(ReviewError::Cancelled.into());
+                        }
                     }
                     line_res = timeout_at(current_deadline, lines.next_line()) => {
                         let line_result = match line_res {
@@ -2045,6 +2271,16 @@ async fn run_review_tool_with_cmd(
                             if let Some(type_str) = json_msg.get("type").and_then(|v| v.as_str()) {
                                 match type_str {
                                     "ai_request" | "ai_request_with_cache" => {
+                                        if let Ok(Some(status)) = db.get_patchset_status(patchset_id).await
+                                            && status == ReviewStatus::Cancelled.as_str()
+                                        {
+                                            info!(
+                                                "Patchset {} was cancelled before AI request; aborting worker",
+                                                patchset_id
+                                            );
+                                            return Err(ReviewError::Cancelled.into());
+                                        }
+
                                         if !ai_started.load(Ordering::SeqCst) {
                                             let _ = db
                                                 .update_review_status(
@@ -2274,11 +2510,24 @@ async fn run_review_tool_with_cmd(
             .contains("Review tool timed out (active time exceeded)"),
         Ok(_) => false,
     };
+    let cancelled = match &interaction_result {
+        Err(e) => e
+            .downcast_ref::<ReviewError>()
+            .is_some_and(|re| matches!(re, ReviewError::Cancelled)),
+        Ok(_) => false,
+    };
 
     if timed_out {
         error!(
             "Review tool timed out after {} active seconds. Killing process.",
             settings.review.timeout_seconds
+        );
+        let _ = child.start_kill();
+        let _ = timeout(Duration::from_secs(5), child.wait()).await;
+    } else if cancelled {
+        info!(
+            "Review tool aborted because patchset {} was cancelled. Killing process.",
+            patchset_id
         );
         let _ = child.start_kill();
         let _ = timeout(Duration::from_secs(5), child.wait()).await;

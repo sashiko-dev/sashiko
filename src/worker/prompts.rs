@@ -34,6 +34,9 @@ pub enum ReviewError {
     /// The AI response was truncated by the provider (e.g., hit max tokens).
     #[error("AI response truncated by provider limit")]
     OutputTruncated,
+    /// The review was cancelled (e.g., superseded by a newer patchset version).
+    #[error("Review cancelled")]
+    Cancelled,
 }
 
 impl ClassifyAiError for ReviewError {
@@ -43,6 +46,7 @@ impl ClassifyAiError for ReviewError {
             ReviewError::BudgetExceeded(_) => AiErrorClass::Fatal,
             ReviewError::FormatRejection(_) => AiErrorClass::Fatal,
             ReviewError::OutputTruncated => AiErrorClass::Fatal,
+            ReviewError::Cancelled => AiErrorClass::Fatal,
         }
     }
 }

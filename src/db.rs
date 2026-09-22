@@ -1565,7 +1565,16 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 10", ()).await?;
         }
 
-        info!("Database schema is up to date at version 10.");
+        if current_version < 11 {
+            info!("Applying database migration version 11 (index patchsets mr_number)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/011_index_patchsets_mr_number.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 11", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 11.");
 
         Ok(())
     }
@@ -5125,6 +5134,57 @@ impl Database {
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
     ) -> Result<Option<i64>> {
+        let res = self
+            .create_patchset_inner(
+                thread_id,
+                cover_letter_message_id,
+                message_id,
+                subject,
+                author,
+                date,
+                total_parts,
+                parser_version,
+                to,
+                cc,
+                version,
+                part_index,
+                baseline_id,
+                strict_author,
+                skip_filters,
+                only_filters,
+            )
+            .await?;
+
+        if let Some(id) = res {
+            self.reconcile_superseded_series_patchsets(
+                id, author, subject, part_index, version, date,
+            )
+            .await?;
+        }
+
+        Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_patchset_inner(
+        &self,
+        thread_id: i64,
+        cover_letter_message_id: Option<&str>,
+        message_id: &str,
+        subject: &str,
+        author: &str,
+        date: i64,
+        total_parts: u32,
+        parser_version: i32,
+        to: &str,
+        cc: &str,
+        version: Option<u32>,
+        part_index: u32,
+        baseline_id: Option<i64>,
+        strict_author: bool,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+    ) -> Result<Option<i64>> {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
 
@@ -5178,18 +5238,23 @@ impl Database {
                 let existing_received: u32 = row.get(8).unwrap_or(0);
 
                 let is_duplicate = self.patchset_holds_message(id, message_id).await?;
+                let is_synthetic_series = clid.ends_with("@sashiko.local");
 
                 if Self::is_closed_to_new_parts(&existing_status, existing_received, existing_total)
                 {
                     if is_duplicate {
                         return Ok(Some(id));
                     }
-                    continue;
+                    if !(is_synthetic_series
+                        && existing_status == ReviewStatus::Cancelled.as_str()
+                        && existing_received < existing_total)
+                    {
+                        continue;
+                    }
                 }
 
                 let is_placeholder =
                     existing_subject == "(placeholder)" || existing_status == "Fetching";
-                let is_synthetic_series = clid.ends_with("@sashiko.local");
 
                 let existing_version = crate::patch::parse_subject_version(&existing_subject);
                 let same_thread = existing_thread_id == Some(thread_id);
@@ -6133,6 +6198,8 @@ impl Database {
                  WHERE id = ?",
                 libsql::params![mr_url, mr_title, mr_number, slug, id],
             )
+            .await?;
+        self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
         Ok(())
     }
@@ -7444,13 +7511,33 @@ impl Database {
     }
 
     pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
-        self.conn
+        if status == ReviewStatus::Cancelled.as_str() {
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ?",
+                    libsql::params![status, id],
+                )
+                .await?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
+                    libsql::params![status, id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn claim_patchset_for_review(&self, id: i64) -> Result<bool> {
+        let count = self
+            .conn
             .execute(
-                "UPDATE patchsets SET status = ? WHERE id = ?",
-                libsql::params![status, id],
+                "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND status = 'Pending'",
+                libsql::params![id],
             )
             .await?;
-        Ok(())
+        Ok(count > 0)
     }
 
     pub async fn update_patch_status(&self, patch_id: i64, status: &str) -> Result<()> {
@@ -7478,14 +7565,284 @@ impl Database {
         }
     }
 
+    pub async fn cancel_outbox_for_patchset(&self, id: i64, reason: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE patchset_id = ? AND status IN ('Pending', 'Embargoed')",
+                libsql::params![reason.to_string(), id],
+            )
+            .await?;
+
+        self.conn
+            .execute(
+                "UPDATE email_outbox
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE status IN ('Pending', 'Embargoed')
+                   AND patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)",
+                libsql::params![reason.to_string(), id],
+            )
+            .await?;
+
+        self.conn
+            .execute(
+                "UPDATE patchwork_outbox
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE status = 'Pending'
+                   AND patch_msg_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)",
+                libsql::params![reason.to_string(), id],
+            )
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
-        let query = if force {
-            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete', 'In Review')"
+        let allowed_statuses = if force {
+            "('Fetching', 'Pending', 'Incomplete', 'In Review')"
         } else {
-            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete')"
+            "('Fetching', 'Pending', 'Incomplete')"
         };
-        let count = self.conn.execute(query, libsql::params![id]).await?;
-        Ok(count > 0)
+        // Atomically transition patchsets.status to 'Cancelled' first so any
+        // concurrent worker calling update_patchset_status (which guards with
+        // status != 'Cancelled') is immediately blocked from marking the
+        // patchset as 'Reviewed'.
+        let count = self
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN {}",
+                    allowed_statuses
+                ),
+                libsql::params![id],
+            )
+            .await?;
+        if count == 0 {
+            return Ok(false);
+        }
+
+        self.conn
+            .execute(
+                "UPDATE reviews SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review')",
+                libsql::params![id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE patches SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review', 'Reviewing')",
+                libsql::params![id],
+            )
+            .await?;
+        self.cancel_outbox_for_patchset(id, "Cancelled because patchset was cancelled")
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn reconcile_superseded_pr_patchsets(
+        &self,
+        _current_id: i64,
+        mr_url: Option<&str>,
+        mr_number: Option<i64>,
+    ) -> Result<usize> {
+        let Some(num) = mr_number else {
+            return Ok(0);
+        };
+
+        let target_repo = mr_url.and_then(crate::forge::extract_owner_repo_from_mr_url);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, subject, mr_url FROM patchsets WHERE mr_number = ? ORDER BY id ASC LIMIT 200",
+                libsql::params![num],
+            )
+            .await?;
+
+        let mut matching: Vec<(i64, u32)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let row_id: i64 = row.get(0)?;
+            let row_subj: String = row.get(1).unwrap_or_default();
+            let row_mr_url: Option<String> = row.get(2).ok();
+
+            let same_repo = match (target_repo.as_deref(), row_mr_url.as_deref()) {
+                (Some(target), Some(r_url)) => {
+                    crate::forge::extract_owner_repo_from_mr_url(r_url).as_deref() == Some(target)
+                }
+                (None, Some(r_url)) => mr_url == Some(r_url),
+                (None, None) => mr_url.is_none(),
+                (Some(_), None) => false,
+            };
+            if !same_repo {
+                continue;
+            }
+
+            let ver = crate::forge::extract_mr_version_from_subject(Some(&row_subj), num)
+                .or_else(|| crate::patch::parse_subject_version(&row_subj))
+                .unwrap_or(1);
+            matching.push((row_id, ver));
+        }
+        drop(rows);
+
+        if matching.len() <= 1 {
+            return Ok(0);
+        }
+
+        let latest_id = matching
+            .iter()
+            .max_by_key(|(id, ver)| (*ver, *id))
+            .map(|(id, _)| *id)
+            .unwrap();
+
+        let mut cancelled_count = 0;
+        for (old_id, old_ver) in matching {
+            if old_id == latest_id {
+                continue;
+            }
+            if self.cancel_patchset(old_id, true).await? {
+                cancelled_count += 1;
+                info!(
+                    "Cancelled superseded PR #{} v{} patchset {} (superseded by patchset {})",
+                    num, old_ver, old_id, latest_id
+                );
+            }
+            self.cancel_outbox_for_patchset(old_id, "Cancelled: superseded by newer PR version")
+                .await?;
+        }
+
+        Ok(cancelled_count)
+    }
+
+    pub async fn reconcile_superseded_series_patchsets(
+        &self,
+        current_id: i64,
+        author: &str,
+        subject: &str,
+        part_index: u32,
+        version: Option<u32>,
+        date: i64,
+    ) -> Result<usize> {
+        let trimmed = subject.trim_start();
+        if part_index == 0
+            && trimmed
+                .get(..3)
+                .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
+        {
+            return Ok(0);
+        }
+
+        let clean_curr = crate::patch::clean_subject(subject);
+        if clean_curr.is_empty() {
+            return Ok(0);
+        }
+
+        let curr_ver = version
+            .or_else(|| crate::patch::parse_subject_version(subject))
+            .unwrap_or(1);
+        let curr_prefixes = crate::patch::get_subject_prefixes(subject);
+
+        let window_start = date.saturating_sub(86400 * 30);
+        let window_end = date.saturating_add(86400 * 30);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, author, subject, subject_index, total_parts
+                 FROM patchsets
+                 WHERE id != ?
+                   AND status IN ('Fetching', 'Incomplete', 'Pending', 'In Review')
+                   AND date BETWEEN ? AND ?
+                 ORDER BY date DESC, id DESC
+                 LIMIT 100",
+                libsql::params![current_id, window_start, window_end],
+            )
+            .await?;
+
+        let mut candidates: Vec<(i64, String, String, u32, u32)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let cand_id: i64 = row.get(0)?;
+            let cand_author: String = row.get(1).unwrap_or_default();
+            let cand_subject: String = row.get(2).unwrap_or_default();
+            let cand_subject_index: u32 = row.get(3).unwrap_or(9999);
+            let cand_total_parts: u32 = row.get(4).unwrap_or(1);
+            candidates.push((
+                cand_id,
+                cand_author,
+                cand_subject,
+                cand_subject_index,
+                cand_total_parts,
+            ));
+        }
+        drop(rows);
+
+        let mut cancelled_count = 0;
+        for (cand_id, cand_author, cand_subject, cand_subject_index, cand_total_parts) in candidates
+        {
+            let cand_ver = crate::patch::parse_subject_version(&cand_subject).unwrap_or(1);
+            if cand_ver == curr_ver {
+                continue;
+            }
+
+            if !crate::patch::authors_match(&cand_author, author) {
+                continue;
+            }
+
+            if crate::patch::get_subject_prefixes(&cand_subject) != curr_prefixes {
+                continue;
+            }
+
+            let mut series_matches = (cand_subject_index == part_index || cand_total_parts == 1)
+                && crate::patch::clean_subject(&cand_subject) == clean_curr;
+
+            if !series_matches {
+                let mut p_rows = self
+                    .conn
+                    .query(
+                        "SELECT m.subject FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND p.part_index = ? LIMIT 1",
+                        libsql::params![cand_id, part_index],
+                    )
+                    .await?;
+                if let Some(p_row) = p_rows.next().await? {
+                    let p_subj: String = p_row.get(0).unwrap_or_default();
+                    if crate::patch::clean_subject(&p_subj) == clean_curr {
+                        series_matches = true;
+                    }
+                }
+                drop(p_rows);
+            }
+
+            if !series_matches {
+                continue;
+            }
+
+            if cand_ver < curr_ver {
+                if self.cancel_patchset(cand_id, true).await? {
+                    cancelled_count += 1;
+                    info!(
+                        "Cancelled superseded patchset {} (v{}) after ingesting patchset {} (v{})",
+                        cand_id, cand_ver, current_id, curr_ver
+                    );
+                }
+                self.cancel_outbox_for_patchset(
+                    cand_id,
+                    "Cancelled: superseded by newer patchset version",
+                )
+                .await?;
+            } else if cand_ver > curr_ver {
+                if self.cancel_patchset(current_id, true).await? {
+                    cancelled_count += 1;
+                    info!(
+                        "Cancelled older patchset {} (v{}) because newer patchset {} (v{}) already exists",
+                        current_id, curr_ver, cand_id, cand_ver
+                    );
+                }
+                self.cancel_outbox_for_patchset(
+                    current_id,
+                    "Cancelled: superseded by newer patchset version",
+                )
+                .await?;
+            }
+        }
+
+        Ok(cancelled_count)
     }
 
     pub async fn rerun_patchset(&self, id: i64) -> Result<()> {
@@ -7640,6 +7997,7 @@ impl Database {
             if let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
                 let status: String = row.get(1).unwrap_or_default();
+                drop(rows);
 
                 // Only reset to Fetching if it failed or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
@@ -7657,6 +8015,8 @@ impl Database {
                         libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
                     ).await?;
                 }
+                self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
+                    .await?;
                 return Ok(id);
             }
         }
@@ -7678,7 +8038,11 @@ impl Database {
             .await?;
 
         if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
+            let id: i64 = row.get(0)?;
+            drop(rows);
+            self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
+                .await?;
+            Ok(id)
         } else {
             Err(anyhow::anyhow!("Failed to get patchset ID"))
         }
@@ -7832,6 +8196,22 @@ impl Database {
     }
 
     pub async fn lock_pending_email(&self) -> Result<Option<EmailOutboxRow>> {
+        self.conn
+            .execute(
+                "UPDATE email_outbox
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled because patchset was cancelled',
+                     locked_at = NULL
+                 WHERE status IN ('Pending', 'Embargoed')
+                   AND EXISTS (
+                       SELECT 1 FROM patches p
+                       JOIN patchsets ps ON ps.id = p.patchset_id
+                       WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+                   )",
+                (),
+            )
+            .await?;
+
         let now = chrono::Utc::now().timestamp();
         let mut rows = self.conn.query(
             "UPDATE email_outbox 
@@ -7943,6 +8323,22 @@ impl Database {
     }
 
     pub async fn lock_pending_patchwork(&self) -> Result<Option<PatchworkOutboxRow>> {
+        self.conn
+            .execute(
+                "UPDATE patchwork_outbox
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled because patchset was cancelled',
+                     locked_at = NULL
+                 WHERE status = 'Pending'
+                   AND EXISTS (
+                       SELECT 1 FROM patches p
+                       JOIN patchsets ps ON ps.id = p.patchset_id
+                       WHERE p.message_id = patchwork_outbox.patch_msg_id AND ps.status = 'Cancelled'
+                   )",
+                (),
+            )
+            .await?;
+
         let now = chrono::Utc::now().timestamp();
         let mut rows = self
             .conn
@@ -8053,6 +8449,40 @@ impl Database {
         target_url: &str,
         status: &str,
     ) -> Result<()> {
+        if self.get_patchset_status(patchset_id).await?.as_deref()
+            == Some(ReviewStatus::Cancelled.as_str())
+        {
+            info!(
+                "Skipping forge outbox insertion for cancelled patchset {}",
+                patchset_id
+            );
+            return Ok(());
+        }
+
+        let mut newer_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchsets
+                 WHERE mr_number = ?
+                   AND id > ?
+                   AND mr_url IS NOT NULL
+                   AND (
+                       mr_url LIKE '%/' || ? || '/pull/%'
+                       OR mr_url LIKE '%/' || ? || '/-/merge_requests/%'
+                       OR mr_url LIKE '%/' || ? || '/merge_requests/%'
+                   )
+                 LIMIT 1",
+                libsql::params![pr_number, patchset_id, repo, repo, repo],
+            )
+            .await?;
+        if newer_rows.next().await?.is_some() {
+            info!(
+                "Skipping forge outbox insertion for patchset {} (PR #{} has a newer revision)",
+                patchset_id, pr_number
+            );
+            return Ok(());
+        }
+
         let mut rows = self
             .conn
             .query(
@@ -8090,6 +8520,34 @@ impl Database {
     }
 
     pub async fn lock_pending_forge_outbox(&self) -> Result<Option<ForgeOutboxRow>> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: patchset was cancelled or superseded by a newer PR version',
+                     locked_at = NULL
+                 WHERE status IN ('Pending', 'Embargoed')
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM patchsets ps
+                           WHERE ps.id = forge_outbox.patchset_id AND ps.status = 'Cancelled'
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM patchsets ps2
+                           WHERE ps2.mr_number = forge_outbox.pr_number
+                             AND ps2.id > forge_outbox.patchset_id
+                             AND ps2.mr_url IS NOT NULL
+                             AND (
+                                 ps2.mr_url LIKE '%/' || forge_outbox.repo || '/pull/%'
+                                 OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/-/merge_requests/%'
+                                 OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/merge_requests/%'
+                             )
+                       )
+                   )",
+                (),
+            )
+            .await?;
+
         let now = chrono::Utc::now().timestamp();
         let mut rows = self
             .conn
@@ -17750,5 +18208,460 @@ mod tests {
 
         db.mark_forge_outbox_sent(retried.id).await.unwrap();
         assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_superseded_pr_versions_cancel_all_previous_and_outbox() {
+        let db = setup_db().await;
+        let mr_url = "https://github.com/sashiko-dev/sashiko/pull/515";
+
+        // v1 (Incomplete), v2 (Pending), v3 (Reviewed with unsent outbox), v4 (In Review)
+        let v1 = db
+            .create_fetching_patchset(
+                "1111111111111111111111111111111111111111@sashiko.local",
+                "[PR #515 v1] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v1, "Incomplete").await.unwrap();
+
+        let v2 = db
+            .create_fetching_patchset(
+                "2222222222222222222222222222222222222222@sashiko.local",
+                "[PR #515 v2] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v2, "Pending").await.unwrap();
+
+        let v3 = db
+            .create_fetching_patchset(
+                "3333333333333333333333333333333333333333@sashiko.local",
+                "[PR #515 v3] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v3, "Reviewed").await.unwrap();
+        db.insert_forge_outbox(
+            v3,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("3333333333333333333333333333333333333333"),
+            "### Sashiko review v3\n\nStale v3 comment",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515-v3",
+            "Pending",
+        )
+        .await
+        .unwrap();
+        let mut v3_id_rows = db
+            .conn
+            .query(
+                "SELECT id FROM forge_outbox WHERE patchset_id = ?",
+                libsql::params![v3],
+            )
+            .await
+            .unwrap();
+        let v3_outbox_id: i64 = v3_id_rows.next().await.unwrap().unwrap().get(0).unwrap();
+
+        let v4 = db
+            .create_fetching_patchset(
+                "4444444444444444444444444444444444444444@sashiko.local",
+                "[PR #515 v4] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v4, "In Review").await.unwrap();
+        let v4_review_id = db
+            .create_review(v4, None, "gemini", "pro", None, None)
+            .await
+            .unwrap();
+        db.update_review_status(v4_review_id, "In Review", None)
+            .await
+            .unwrap();
+
+        // Now ingest v5 while v4 is In Review
+        let v5 = db
+            .create_fetching_patchset(
+                "5555555555555555555555555555555555555555@sashiko.local",
+                "[PR #515 v5] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_status(v1).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        assert_eq!(
+            db.get_patchset_status(v2).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        // v3 had already completed review, so its patchset status stays Reviewed,
+        // but its unsent forge_outbox comment MUST be cancelled so v3 never posts after v4/v5.
+        assert_eq!(
+            db.get_patchset_status(v3).await.unwrap().as_deref(),
+            Some("Reviewed")
+        );
+        assert_eq!(
+            db.get_patchset_status(v4).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        assert_eq!(
+            db.get_patchset_status(v5).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+
+        // Verify v4's active review was marked Cancelled
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status FROM reviews WHERE id = ?",
+                libsql::params![v4_review_id],
+            )
+            .await
+            .unwrap();
+        let review_status: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(review_status, "Cancelled");
+
+        // Verify v3's pending outbox row was cancelled and cannot be locked
+        let mut outbox_rows = db
+            .conn
+            .query(
+                "SELECT status FROM forge_outbox WHERE id = ?",
+                libsql::params![v3_outbox_id],
+            )
+            .await
+            .unwrap();
+        let outbox_status: String = outbox_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(outbox_status, "Cancelled");
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        // Even if an in-flight v3 outbox row failed with 502 and set_forge_outbox_retry_at
+        // moved it back to Pending, lock_pending_forge_outbox must cancel it and return None.
+        db.set_forge_outbox_retry_at(v3_outbox_id, 0, "502 Bad Gateway")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        // Attempting to insert a new forge_outbox entry for v4 (cancelled) or v3 (superseded)
+        // is skipped altogether.
+        db.insert_forge_outbox(
+            v4,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("4444444444444444444444444444444444444444"),
+            "### Sashiko review v4\n\nLate v4 comment",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515-v4",
+            "Pending",
+        )
+        .await
+        .unwrap();
+        let mut v4_outbox_rows = db
+            .conn
+            .query(
+                "SELECT status FROM forge_outbox WHERE patchset_id = ?",
+                libsql::params![v4],
+            )
+            .await
+            .unwrap();
+        assert!(
+            v4_outbox_rows.next().await.unwrap().is_none(),
+            "superseded/cancelled v4 should not insert a forge_outbox row"
+        );
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        // Meanwhile v5 (the latest version) can enqueue and lock its comment normally.
+        db.update_patchset_status(v5, "Reviewed").await.unwrap();
+        db.insert_forge_outbox(
+            v5,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("5555555555555555555555555555555555555555"),
+            "### Sashiko review v5\n\nLatest v5 comment",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515",
+            "Pending",
+        )
+        .await
+        .unwrap();
+        let locked = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("v5 outbox should lock");
+        assert_eq!(locked.patchset_id, v5);
+    }
+
+    #[tokio::test]
+    async fn test_superseded_series_versions_cancel_previous_versions() {
+        let db = setup_db().await;
+        let author = "Kernel Dev <kdev@example.com>";
+
+        let t3 = db
+            .create_thread("msg_v3_0", "[PATCH v3 0/2] net: foo: fix race", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_v3_0",
+            t3,
+            None,
+            author,
+            "[PATCH v3 0/2] net: foo: fix race",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v3 = db
+            .create_patchset(
+                t3,
+                Some("msg_v3_0"),
+                "msg_v3_0",
+                "[PATCH v3 0/2] net: foo: fix race",
+                author,
+                1000,
+                2,
+                3,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(ps_v3, "In Review").await.unwrap();
+
+        let t4 = db
+            .create_thread("msg_v4_0", "[PATCH v4 0/2] net: foo: fix race", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_v4_0",
+            t4,
+            None,
+            author,
+            "[PATCH v4 0/2] net: foo: fix race",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v4 = db
+            .create_patchset(
+                t4,
+                Some("msg_v4_0"),
+                "msg_v4_0",
+                "[PATCH v4 0/2] net: foo: fix race",
+                author,
+                2000,
+                2,
+                4,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(ps_v3).await.unwrap().as_deref(),
+            Some("Cancelled"),
+            "v3 should be cancelled when v4 arrives"
+        );
+        db.update_patchset_status(ps_v4, "In Review").await.unwrap();
+
+        // Unrelated series by the same author
+        let t_other = db
+            .create_thread("msg_other", "[PATCH v1 1/1] mm: bar: unrelated fix", 2500)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_other",
+            t_other,
+            None,
+            author,
+            "[PATCH v1 1/1] mm: bar: unrelated fix",
+            2500,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_other = db
+            .create_patchset(
+                t_other,
+                None,
+                "msg_other",
+                "[PATCH v1 1/1] mm: bar: unrelated fix",
+                author,
+                2500,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(ps_other, "Pending")
+            .await
+            .unwrap();
+
+        // Now ingest v5 of net: foo: fix race
+        let t5 = db
+            .create_thread("msg_v5_0", "[PATCH v5 0/2] net: foo: fix race", 3000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_v5_0",
+            t5,
+            None,
+            author,
+            "[PATCH v5 0/2] net: foo: fix race",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v5 = db
+            .create_patchset(
+                t5,
+                Some("msg_v5_0"),
+                "msg_v5_0",
+                "[PATCH v5 0/2] net: foo: fix race",
+                author,
+                3000,
+                2,
+                5,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_status(ps_v4).await.unwrap().as_deref(),
+            Some("Cancelled"),
+            "v4 should be cancelled when v5 arrives"
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_v5).await.unwrap().as_deref(),
+            Some("Incomplete"),
+            "v5 should remain active"
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_other).await.unwrap().as_deref(),
+            Some("Pending"),
+            "unrelated series by same author must not be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_patchset_not_reopened_by_claim_or_status_update() {
+        let db = setup_db().await;
+        let ps_id = db
+            .create_fetching_patchset(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@sashiko.local",
+                "[PR #600] Test claim guard",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/600"),
+                Some("Test claim guard"),
+                Some(600),
+                Some("sashiko-600"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Pending").await.unwrap();
+
+        // Cancel the patchset while it is waiting in the Pending queue
+        assert!(db.cancel_patchset(ps_id, false).await.unwrap());
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+
+        // Attempting to claim for review or overwrite status to In Review / Reviewed must fail
+        assert!(!db.claim_patchset_for_review(ps_id).await.unwrap());
+        db.update_patchset_status(ps_id, "In Review").await.unwrap();
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
     }
 }
