@@ -925,7 +925,7 @@ async fn fetch_remote(
                 Err(format!(
                     "Failed to fetch remote {}: {}",
                     name,
-                    String::from_utf8_lossy(&fetch.stderr).trim()
+                    crate::utils::redact_secret(String::from_utf8_lossy(&fetch.stderr).trim())
                 ))
             }
         }
