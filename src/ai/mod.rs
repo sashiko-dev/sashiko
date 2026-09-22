@@ -298,22 +298,6 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     AiErrorClass::Fatal
 }
 
-/// Decodes a single line of the stdio AI protocol into an [`AiResponse`].
-///
-/// Typed error payloads surface as [`RemoteAiError`].
-#[allow(dead_code)]
-pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
-    let resp_msg: serde_json::Value = serde_json::from_str(line)?;
-    match resp_msg["type"].as_str() {
-        Some("ai_response") => Ok(serde_json::from_value(resp_msg["payload"].clone())?),
-        Some("error") => {
-            let payload: RemoteAiErrorPayload =
-                serde_json::from_value(resp_msg["payload"].clone())?;
-            Err(payload.into_error().into())
-        }
-        _ => bail!("Unexpected response type: {:?}", resp_msg["type"]),
-    }
-}
 
 /// Token usage statistics for an AI interaction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1195,75 +1179,6 @@ mod tests {
         assert!(err.to_string().contains("retry_after_secs"));
     }
 
-    fn assert_typed_stdio_error_downcasts(class: AiErrorClass) -> Result<()> {
-        let raw_json = json!({
-            "type": "error",
-            "payload": RemoteAiErrorPayload::new("typed failure".to_string(), class)
-        });
-        let serialized = serde_json::to_string(&raw_json)?;
-
-        let err = decode_stdio_ai_response(&serialized).unwrap_err();
-        let remote = err
-            .downcast_ref::<RemoteAiError>()
-            .expect("typed payload should downcast to RemoteAiError");
-
-        assert_eq!(remote.message, "typed failure");
-        assert_eq!(remote.class, class);
-        assert_eq!(err.to_string(), "Remote AI Error: typed failure");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_decode_stdio_ai_response_typed_rate_limit_error_payload() -> Result<()> {
-        assert_typed_stdio_error_downcasts(AiErrorClass::RateLimit {
-            retry_after: Duration::from_secs(60),
-        })
-    }
-
-    #[test]
-    fn test_decode_stdio_ai_response_typed_transient_error_payload() -> Result<()> {
-        assert_typed_stdio_error_downcasts(AiErrorClass::Transient {
-            retry_after: Duration::from_secs(5),
-        })
-    }
-
-    #[test]
-    fn test_decode_stdio_ai_response_typed_fatal_error_payload() -> Result<()> {
-        assert_typed_stdio_error_downcasts(AiErrorClass::Fatal)
-    }
-
-    #[test]
-    fn test_decode_stdio_ai_response_rejects_non_object_error_payload() -> Result<()> {
-        let raw_json = json!({
-            "type": "error",
-            "payload": "Rate limit exceeded, retry after 60s"
-        });
-        let serialized = serde_json::to_string(&raw_json)?;
-
-        let err = decode_stdio_ai_response(&serialized).unwrap_err();
-
-        assert!(err.to_string().contains("invalid type"));
-        assert!(err.downcast_ref::<RemoteAiError>().is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_decode_stdio_ai_response_malformed_typed_error_payload() -> Result<()> {
-        let raw_json = json!({
-            "type": "error",
-            "payload": {
-                "message": "try again later",
-                "class": "transient"
-            }
-        });
-        let serialized = serde_json::to_string(&raw_json)?;
-
-        let err = decode_stdio_ai_response(&serialized).unwrap_err();
-
-        assert!(err.to_string().contains("retry_after_secs"));
-        Ok(())
-    }
 
     #[test]
     fn test_remote_ai_error_classifies_from_payload_class() {
