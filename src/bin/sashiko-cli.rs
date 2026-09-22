@@ -65,6 +65,10 @@ struct Cli {
     /// The codebase to review (default: the configured project, else linux)
     #[arg(long, global = true, env = "SASHIKO_PROJECT")]
     project: Option<ProjectId>,
+
+    /// Bearer token for authenticating API requests
+    #[arg(long, global = true, env = "SASHIKO_API_TOKEN")]
+    token: Option<String>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -212,6 +216,90 @@ enum Commands {
         #[arg(long)]
         interactive: bool,
     },
+    /// Query and triage bugs in the Sashiko bug repository
+    Bugs {
+        #[command(subcommand)]
+        action: BugCommands,
+    },
+    /// Mint stateless API tokens for AI agents and automation
+    Token {
+        #[command(subcommand)]
+        action: TokenCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum BugCommands {
+    /// List bugs matching filters
+    List {
+        /// Filter by subsystem title
+        #[arg(long)]
+        subsystem: Option<String>,
+
+        /// Filter by minimum severity (low, medium, high, critical)
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Filter by lifecycle status (new, confirmed, fixed, dismissed, duplicate)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Full-text search query
+        #[arg(long, short = 'q')]
+        query: Option<String>,
+
+        /// Page number
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+
+        /// Items per page
+        #[arg(long, default_value_t = 20)]
+        per_page: usize,
+    },
+    /// Show full details of a bug by ID
+    Show {
+        /// Bug ID
+        id: i64,
+    },
+    /// Perform a triage action or add a comment on a bug
+    Action {
+        /// Bug ID
+        id: i64,
+
+        /// Action to perform (comment, close, dismiss, assign, mark_duplicate)
+        #[arg(long)]
+        action: String,
+
+        /// Comment text to attach
+        #[arg(long)]
+        comment: Option<String>,
+
+        /// Assignee email (for assign action)
+        #[arg(long)]
+        assignee: Option<String>,
+
+        /// Canonical bug ID (for mark_duplicate action)
+        #[arg(long)]
+        duplicate_of: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommands {
+    /// Mint a stateless API token
+    Create {
+        /// Target email address (operators only; defaults to caller's email)
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Maximum bug access level: read (default), comment, or manage
+        #[arg(long, default_value = "read")]
+        access: String,
+
+        /// Token validity in days (1..=90)
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -270,7 +358,7 @@ async fn main() -> Result<()> {
         .set(cli.project.or(configured_project).unwrap_or_default())
         .expect("project is set exactly once, here");
 
-    let client = build_client();
+    let client = build_client(cli.token.as_deref())?;
 
     if let Err(e) = run_command(cli.command, &client, &base_url, cli.format).await {
         print_colored(Color::Red, "Error: ");
@@ -295,30 +383,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Builds the HTTP client, presenting the local server's token when one is
-/// readable.
+/// Builds the HTTP client, presenting an explicit bearer token if supplied or
+/// the local server's token when one is readable.
 ///
-/// The token is attached as a default header rather than at each call site,
-/// because every mutating command needs it and the ones that forget only fail
-/// once a server stops trusting the loopback interface by itself.
-///
-/// A server elsewhere ignores the header, and a missing or stale file is not
-/// worth a word: the request may still be authorized for another reason, and
-/// the refusal that follows otherwise says so.
-fn build_client() -> Client {
-    let token = Settings::new()
-        .ok()
-        .and_then(|settings| LocalToken::read_from(&settings.local_token_path()).ok());
-
-    let Some(token) = token else {
-        return Client::new();
+/// When `explicit_token` is `Some(...)`, the local operator token file is
+/// never consulted: passing `--token ""` intentionally sheds privileges and
+/// builds an unauthenticated client, and invalid header characters fail fast.
+fn build_client(explicit_token: Option<&str>) -> Result<Client> {
+    let bearer = match explicit_token {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(Client::new());
+            }
+            Some(trimmed.to_owned())
+        }
+        None => Settings::new()
+            .ok()
+            .and_then(|settings| LocalToken::read_from(&settings.local_token_path()).ok())
+            .map(|t| t.secret().to_owned()),
     };
 
-    let Ok(mut value) =
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.secret()))
-    else {
-        return Client::new();
+    let Some(secret) = bearer else {
+        return Ok(Client::new());
     };
+
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", secret))
+        .context("Invalid bearer token: contains non-ASCII or control characters")?;
     value.set_sensitive(true);
 
     let mut headers = reqwest::header::HeaderMap::new();
@@ -327,7 +418,21 @@ fn build_client() -> Client {
     Client::builder()
         .default_headers(headers)
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .context("Failed to construct HTTP client")
+}
+
+async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let detail = body.trim();
+    if detail.is_empty() {
+        anyhow::bail!("HTTP {}", status);
+    } else {
+        anyhow::bail!("HTTP {}: {}", status, detail);
+    }
 }
 
 async fn run_command(
@@ -408,6 +513,239 @@ async fn run_command(
                 format,
             )
             .await
+        }
+        Commands::Bugs { action } => handle_bugs(client, base_url, action, format).await,
+        Commands::Token { action } => handle_token(client, base_url, action, format).await,
+    }
+}
+
+async fn handle_bugs(
+    client: &Client,
+    base_url: &str,
+    action: BugCommands,
+    format: OutputFormat,
+) -> Result<()> {
+    match action {
+        BugCommands::List {
+            subsystem,
+            severity,
+            status,
+            query,
+            page,
+            per_page,
+        } => {
+            let mut req = client.get(format!("{}/api/bugs", base_url)).query(&[
+                ("page", page.to_string()),
+                ("per_page", per_page.to_string()),
+            ]);
+            if let Some(sub) = subsystem {
+                req = req.query(&[("subsystem", sub)]);
+            }
+            if let Some(sev) = severity {
+                req = req.query(&[("min_severity", sev)]);
+            }
+            if let Some(st) = status {
+                req = req.query(&[("lifecycle_status", st)]);
+            }
+            if let Some(q) = query {
+                req = req.query(&[("q", q)]);
+            }
+            let resp = check_response(req.send().await?).await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    let bugs = body
+                        .get("items")
+                        .or_else(|| body.get("bugs"))
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("API response missing 'items' array"))?;
+                    let total = body["total"].as_u64().unwrap_or(bugs.len() as u64);
+                    println!("Bugs ({} total):", total);
+                    for bug in bugs {
+                        let id = bug["internal_id"]
+                            .as_i64()
+                            .or_else(|| bug["id"].as_i64())
+                            .unwrap_or_default();
+                        let sev = bug["severity"].as_str().unwrap_or("unknown");
+                        let st = bug["lifecycle_status"].as_str().unwrap_or("unknown");
+                        let title = bug["title"].as_str().unwrap_or("(untitled)");
+                        println!("  #{:<6} [{:<8}] ({:<9}) {}", id, sev, st, title);
+                    }
+                }
+            }
+            Ok(())
+        }
+        BugCommands::Show { id } => {
+            let resp = check_response(
+                client
+                    .get(format!("{}/api/bug", base_url))
+                    .query(&[("id", id.to_string())])
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    let bug_id = body["internal_id"]
+                        .as_i64()
+                        .or_else(|| body["id"].as_i64())
+                        .unwrap_or(id);
+                    let title = body["title"].as_str().unwrap_or("(untitled)");
+                    let sev = body["severity"].as_str().unwrap_or("unknown");
+                    let st = body["lifecycle_status"].as_str().unwrap_or("unknown");
+                    println!("Bug #{}: {}", bug_id, title);
+                    println!("Severity: {} | Status: {}", sev, st);
+                    if let Some(desc) = body["description"]
+                        .as_str()
+                        .or_else(|| body["report"].as_str())
+                    {
+                        println!("\n{}", desc);
+                    }
+                }
+            }
+            Ok(())
+        }
+        BugCommands::Action {
+            id,
+            action,
+            comment,
+            assignee,
+            duplicate_of,
+        } => {
+            let mut map = serde_json::Map::new();
+            map.insert("action".to_string(), Value::String(action.clone()));
+            match action.as_str() {
+                "comment" => {
+                    if assignee.is_some() || duplicate_of.is_some() {
+                        anyhow::bail!(
+                            "Action 'comment' does not accept --assignee or --duplicate-of"
+                        );
+                    }
+                    let text = comment.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+                        anyhow::anyhow!("Action 'comment' requires non-empty --comment")
+                    })?;
+                    map.insert("content".to_string(), Value::String(text));
+                }
+                "close" | "dismiss" => {
+                    if assignee.is_some() || duplicate_of.is_some() {
+                        anyhow::bail!(
+                            "Action '{}' does not accept --assignee or --duplicate-of",
+                            action
+                        );
+                    }
+                    if let Some(c) = comment {
+                        map.insert("reason".to_string(), Value::String(c));
+                    }
+                }
+                "mark_duplicate" => {
+                    if assignee.is_some() {
+                        anyhow::bail!("Action 'mark_duplicate' does not accept --assignee");
+                    }
+                    let dup = duplicate_of.ok_or_else(|| {
+                        anyhow::anyhow!("Action 'mark_duplicate' requires --duplicate-of <ID>")
+                    })?;
+                    map.insert("duplicate_of_id".to_string(), Value::from(dup));
+                    if let Some(c) = comment {
+                        map.insert("reasoning".to_string(), Value::String(c));
+                    }
+                }
+                "assign" => {
+                    if duplicate_of.is_some() {
+                        anyhow::bail!("Action 'assign' does not accept --duplicate-of");
+                    }
+                    let raw = assignee.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Action 'assign' requires --assignee <EMAIL> (or --assignee \"\" to unassign)"
+                        )
+                    })?;
+                    let assignee_val = if raw.trim().is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(raw)
+                    };
+                    map.insert("assignee".to_string(), assignee_val);
+                    if let Some(c) = comment {
+                        map.insert("reason".to_string(), Value::String(c));
+                    }
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Unsupported bug action '{}'. Valid actions: comment, close, dismiss, mark_duplicate, assign",
+                        action
+                    );
+                }
+            }
+            let resp = check_response(
+                client
+                    .post(format!("{}/api/bug/action", base_url))
+                    .query(&[("id", id.to_string())])
+                    .json(&Value::Object(map))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    println!("Bug #{} updated ({}).", id, action);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_token(
+    client: &Client,
+    base_url: &str,
+    action: TokenCommands,
+    format: OutputFormat,
+) -> Result<()> {
+    match action {
+        TokenCommands::Create {
+            email,
+            access,
+            days,
+        } => {
+            let mut map = serde_json::Map::new();
+            map.insert("max_bug_access".to_string(), Value::String(access));
+            map.insert("expires_in_days".to_string(), Value::from(days));
+            if let Some(em) = email {
+                map.insert("email".to_string(), Value::String(em));
+            }
+            let resp = check_response(
+                client
+                    .post(format!("{}/api/auth/token", base_url))
+                    .json(&Value::Object(map))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    let token = body
+                        .get("token")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("API response missing 'token' field"))?;
+                    println!("{}", token);
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -2211,5 +2549,53 @@ mod tests {
             "output": "{\"findings\": [{\"severity\": \"High\", \"preexisting\": true}, {\"severity\": \"Low\", \"preexisting\": false}]}"
         });
         assert!(review_has_new_issues(&r_mixed));
+    }
+
+    #[test]
+    fn test_cli_bugs_and_token_subcommand_parsing() {
+        let parsed = Cli::try_parse_from([
+            "sashiko-cli",
+            "--token",
+            "jwt-token",
+            "bugs",
+            "list",
+            "--subsystem",
+            "BTRFS FILE SYSTEM",
+            "--severity",
+            "high",
+        ])
+        .unwrap();
+        assert_eq!(parsed.token.as_deref(), Some("jwt-token"));
+        assert!(matches!(
+            parsed.command,
+            Commands::Bugs {
+                action: BugCommands::List { .. }
+            }
+        ));
+
+        let show = Cli::try_parse_from(["sashiko-cli", "bugs", "show", "42"]).unwrap();
+        assert!(matches!(
+            show.command,
+            Commands::Bugs {
+                action: BugCommands::Show { id: 42 }
+            }
+        ));
+
+        let token_cmd = Cli::try_parse_from([
+            "sashiko-cli",
+            "token",
+            "create",
+            "--access",
+            "comment",
+            "--days",
+            "14",
+        ])
+        .unwrap();
+        assert!(matches!(
+            token_cmd.command,
+            Commands::Token {
+                action: TokenCommands::Create { days: 14, .. }
+            }
+        ));
     }
 }
