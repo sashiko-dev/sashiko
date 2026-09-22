@@ -454,6 +454,7 @@ pub fn build_router(
         .route("/api/auth/request-link", post(request_link))
         .route("/api/auth/verify", get(verify_link))
         .route("/api/auth/refresh", post(refresh_token))
+        .route("/api/auth/token", post(create_auth_token))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
@@ -2479,6 +2480,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_api_token_endpoint_minting_and_attenuation() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let jwt_secret = "unit-test-jwt-secret".to_string();
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some(jwt_secret.clone());
+        settings.server.acl = crate::settings::AclSettings {
+            admins: vec!["operator@example.org".to_string()],
+            security: vec!["security@example.org".to_string()],
+            blocklist: vec!["revoked-sid-999".to_string()],
+            ..Default::default()
+        };
+        let settings = Arc::new(settings);
+
+        let local_token = crate::auth::LocalToken::generate().unwrap();
+        let local_token_secret = local_token.secret().to_string();
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db,
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                local_token: Some(local_token),
+                ..Default::default()
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let op_session = crate::auth::create_token(
+            "operator@example.org",
+            &jwt_secret,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+        let sec_session = crate::auth::create_token(
+            "security@example.org",
+            &jwt_secret,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        // Mint default read-only token for self.
+        let resp = client
+            .post(format!("http://{}/api/auth/token", addr))
+            .bearer_auth(&op_session)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["email"], "operator@example.org");
+        assert_eq!(body["max_bug_access"], "read");
+        assert_eq!(body["expires_in_days"], 30);
+        let minted_token = body["token"].as_str().unwrap().to_string();
+
+        // Minted api_token can list bugs.
+        let list_resp = client
+            .get(format!("http://{}/api/bugs", addr))
+            .bearer_auth(&minted_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+
+        // Minted api_token cannot be refreshed at /api/auth/refresh.
+        let refresh_resp = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .bearer_auth(&minted_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refresh_resp.status(), StatusCode::FORBIDDEN);
+
+        // Minted api_token cannot mint another token at /api/auth/token.
+        let re_mint_resp = client
+            .post(format!("http://{}/api/auth/token", addr))
+            .bearer_auth(&minted_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(re_mint_resp.status(), StatusCode::FORBIDDEN);
+
+        // Non-operator cannot mint token for another email.
+        let cross_resp = client
+            .post(format!("http://{}/api/auth/token", addr))
+            .bearer_auth(&sec_session)
+            .json(&serde_json::json!({ "email": "operator@example.org" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cross_resp.status(), StatusCode::FORBIDDEN);
+
+        // Operator CAN mint token for another email.
+        let op_cross_resp = client
+            .post(format!("http://{}/api/auth/token", addr))
+            .bearer_auth(&op_session)
+            .json(&serde_json::json!({
+                "email": "security@example.org",
+                "max_bug_access": "comment",
+                "expires_in_days": 7
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(op_cross_resp.status(), StatusCode::OK);
+
+        // Local operator token (sashiko-cli auth token) CAN mint token for an email without a JWT session.
+        let local_op_resp = client
+            .post(format!("http://{}/api/auth/token", addr))
+            .bearer_auth(&local_token_secret)
+            .json(&serde_json::json!({
+                "email": "security@example.org",
+                "max_bug_access": "read",
+                "expires_in_days": 30
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(local_op_resp.status(), StatusCode::OK);
+
+        // Revoked sid in acl.blocklist is rejected by refresh_token and is_authorized.
+        let revoked_session = crate::auth::create_token_with_session(
+            "operator@example.org",
+            &jwt_secret,
+            Some("session".to_string()),
+            3600,
+            Some(100),
+            Some("revoked-sid-999".to_string()),
+        )
+        .unwrap();
+        let revoked_refresh = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .bearer_auth(&revoked_session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked_refresh.status(), StatusCode::FORBIDDEN);
+        let revoked_cancel = client
+            .post(format!("http://{}/api/patchset/cancel?id=1", addr))
+            .bearer_auth(&revoked_session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked_cancel.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn test_local_token_authorizes_ingest_but_grants_no_identity() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
@@ -4301,8 +4472,20 @@ pub fn is_authorized(
     // person who omits their credential and presents the local token instead
     // has proved only that they share the server's machine, which grants no
     // authority over a bug.
-    if auth.is_some_and(|user| state.settings.server.acl.is_blocklisted(&user.email)) {
-        return false;
+    if let Some(user) = auth {
+        if state.settings.server.acl.is_blocklisted(&user.email) {
+            return false;
+        }
+        if user
+            .sid
+            .as_deref()
+            .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
+        {
+            return false;
+        }
+        if user.typ.as_deref() == Some("api_token") {
+            return false;
+        }
     }
     if state.settings.server.testing_mode {
         return true;
@@ -4551,7 +4734,18 @@ async fn refresh_token(
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
     if let Some(secret) = resolve_jwt_secret(&state) {
         if let Some(user) = auth.0 {
-            if state.settings.server.acl.is_blocklisted(&user.email) {
+            if user.typ.as_deref() != Some("session") {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Only interactive session tokens can be refreshed",
+                ));
+            }
+            if state.settings.server.acl.is_blocklisted(&user.email)
+                || user
+                    .sid
+                    .as_deref()
+                    .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
+            {
                 return Err((StatusCode::FORBIDDEN, "User is blocklisted"));
             }
             let now = std::time::SystemTime::now()
@@ -4590,4 +4784,111 @@ async fn refresh_token(
     } else {
         Err((StatusCode::NOT_IMPLEMENTED, "JWT not configured"))
     }
+}
+
+#[derive(Deserialize)]
+pub struct CreateApiTokenRequest {
+    pub email: Option<String>,
+    pub max_bug_access: Option<String>,
+    pub expires_in_days: Option<u64>,
+}
+
+async fn create_auth_token(
+    headers: axum::http::HeaderMap,
+    auth: crate::auth::OptionalAuthUser,
+    OptionalPrincipal(principal): crate::access::OptionalPrincipal,
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(req): Json<CreateApiTokenRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let is_local_operator = presents_local_token(&headers, &state);
+    let (caller_email, is_operator) = match auth.0.as_ref() {
+        Some(user) => {
+            if user.typ.as_deref() != Some("session") {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Only interactive sessions may mint API tokens",
+                ));
+            }
+            if state.settings.server.acl.is_blocklisted(&user.email)
+                || user
+                    .sid
+                    .as_deref()
+                    .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
+            {
+                return Err((StatusCode::FORBIDDEN, "Caller is blocklisted"));
+            }
+            (
+                user.email.as_str(),
+                principal.is_operator() || is_local_operator,
+            )
+        }
+        None if is_local_operator => ("", true),
+        None => return Err((StatusCode::UNAUTHORIZED, "Authentication required")),
+    };
+    let secret =
+        resolve_jwt_secret(&state).ok_or((StatusCode::NOT_IMPLEMENTED, "JWT not configured"))?;
+
+    let target_email = match req.email.as_deref().map(str::trim) {
+        Some(email) if !email.is_empty() && !email.eq_ignore_ascii_case(caller_email) => {
+            if !is_operator {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Only operators may mint tokens for another address",
+                ));
+            }
+            email
+        }
+        _ => caller_email,
+    };
+
+    if target_email.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Target email address is required"));
+    }
+    if state.settings.server.acl.is_blocklisted(target_email) {
+        return Err((StatusCode::FORBIDDEN, "Target user is blocklisted"));
+    }
+
+    let raw_access = req.max_bug_access.as_deref().unwrap_or("read");
+    let level = crate::access::BugAccess::parse(raw_access).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Invalid max_bug_access; expected none, read, comment, or manage",
+    ))?;
+    let canonical_access = match level {
+        crate::access::BugAccess::Read => "read",
+        crate::access::BugAccess::Comment => "comment",
+        crate::access::BugAccess::Manage => "manage",
+        crate::access::BugAccess::None => "none",
+    };
+
+    let expires_in_days = req.expires_in_days.unwrap_or(30);
+    if !(1..=90).contains(&expires_in_days) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "expires_in_days must be between 1 and 90",
+        ));
+    }
+
+    let token = crate::auth::create_api_token(
+        target_email,
+        &secret,
+        expires_in_days * 86400,
+        Some(canonical_access.to_string()),
+    )
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create API token",
+        )
+    })?;
+    let token_id = crate::auth::verify_token(&token, &secret)
+        .ok()
+        .and_then(|c| c.sid);
+
+    Ok(Json(serde_json::json!({
+        "token": token,
+        "token_id": token_id,
+        "email": target_email,
+        "max_bug_access": canonical_access,
+        "expires_in_days": expires_in_days,
+    })))
 }
