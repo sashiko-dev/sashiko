@@ -303,6 +303,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "implementation",
@@ -312,6 +313,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "execution-flow",
@@ -321,6 +323,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "concurrency",
@@ -330,6 +333,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "persistence",
@@ -339,6 +343,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "llm-pipeline",
@@ -352,6 +357,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "security",
@@ -366,6 +372,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "interfaces-compat",
@@ -375,6 +382,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "tests",
@@ -384,6 +392,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        wants_threat_model: false,
     },
 ];
 
@@ -391,30 +400,35 @@ pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
     name: "deduplication",
     short: "Deduplication",
     wants_series_context: false,
+    wants_threat_model: false,
 };
 
 pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
     name: "conflict-resolution",
     short: "Conflict Resolution",
     wants_series_context: false,
+    wants_threat_model: false,
 };
 
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Severity Estimation",
     wants_series_context: true,
+    wants_threat_model: false,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
     wants_series_context: false,
+    wants_threat_model: false,
 };
 
 pub static SUMMARY: ConsolidationStage = ConsolidationStage {
     name: "summary",
     short: "Change Summary",
     wants_series_context: false,
+    wants_threat_model: false,
 };
 
 pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[

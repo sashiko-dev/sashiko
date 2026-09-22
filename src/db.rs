@@ -2928,6 +2928,65 @@ impl Database {
         Ok(true)
     }
 
+    /// Resets a bug to be re-analyzed by the full bug workflow (`BugWorker`).
+    ///
+    /// Resets `lifecycle_status` to `'new'`, clears any `duplicate_of_id` link,
+    /// resets `pipeline_state` to `'pending'` and `attempt_count` to `0`, and
+    /// releases any existing worker lease so `claim_pending_bug` will pick up
+    /// the bug and run the full `Normalization -> Verification -> Deduplication
+    /// -> OriginTracing -> SeverityAssessment -> ReportGeneration` pipeline.
+    pub async fn requeue_bug_for_analysis(&self, id: i64, reason: Option<&str>) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction().await?;
+        let updated = tx
+            .execute(
+                "UPDATE bugs
+                    SET lifecycle_status = 'new',
+                        duplicate_of_id = NULL,
+                        pipeline_state = 'pending',
+                        attempt_count = 0,
+                        locked_by = NULL,
+                        lease_expires_at = NULL,
+                        last_error = NULL,
+                        updated_at = ?1,
+                        audit_author = ?2,
+                        audit_tool = ?3,
+                        audit_model = ?4
+                  WHERE id = ?5",
+                libsql::params![
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                    id,
+                ],
+            )
+            .await?;
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let comment = reason
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Queued bug for full workflow re-analysis");
+        tx.execute(
+            "INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content)
+             VALUES (?1, 'comment', ?2, ?3, ?4, ?5, ?6)",
+            libsql::params![
+                id,
+                self.bug_tool.as_str(),
+                self.bug_actor.as_str(),
+                self.bug_model.clone(),
+                now,
+                comment,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
         let mut rows = self
             .conn
@@ -3897,6 +3956,11 @@ impl Database {
         tx.execute(
             "DELETE FROM bug_reviews WHERE bug_id = ?",
             libsql::params![params.ephemeral_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE bugs SET duplicate_of_id = ?1 WHERE duplicate_of_id = ?2",
+            libsql::params![params.canonical_id, params.ephemeral_id],
         )
         .await?;
 

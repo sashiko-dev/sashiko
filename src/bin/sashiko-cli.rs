@@ -266,21 +266,52 @@ enum BugCommands {
         /// Bug ID
         id: i64,
 
-        /// Action to perform (comment, close, dismiss, assign, mark_duplicate)
+        /// Action to perform (comment, close, dismiss, assign, mark_duplicate, reanalyze, rerate)
         #[arg(long)]
         action: String,
 
-        /// Comment text to attach
+        /// Comment text or reason for action
         #[arg(long)]
         comment: Option<String>,
 
-        /// Assignee email (for assign action)
+        /// Assignee email (for 'assign' action)
         #[arg(long)]
         assignee: Option<String>,
 
-        /// Canonical bug ID (for mark_duplicate action)
+        /// Canonical bug ID (for 'mark_duplicate' action)
         #[arg(long)]
         duplicate_of: Option<i64>,
+    },
+    /// Re-analyze existing bugs by re-running the entire Linux bug workflow (admin only)
+    #[command(visible_alias = "re-analyze", visible_alias = "rerate")]
+    Reanalyze {
+        /// Optional single bug ID to re-analyze (if omitted, re-analyzes matching bugs)
+        #[arg(long)]
+        id: Option<i64>,
+
+        /// Filter by subsystem title when re-analyzing in batch
+        #[arg(long)]
+        subsystem: Option<String>,
+
+        /// Filter by current minimum severity (low, medium, high, critical)
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Filter by lifecycle status (default: open)
+        #[arg(long, default_value = "open")]
+        status: String,
+
+        /// Maximum number of bugs to re-analyze in batch
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        /// Optional audit reason for re-analyzing the bug(s)
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Wait synchronously for the full workflow to finish instead of queuing for BugWorker
+        #[arg(long)]
+        sync: bool,
     },
 }
 
@@ -633,7 +664,7 @@ async fn handle_bugs(
                     })?;
                     map.insert("content".to_string(), Value::String(text));
                 }
-                "close" | "dismiss" => {
+                "close" | "dismiss" | "reanalyze" | "re-analyze" | "rerate" => {
                     if assignee.is_some() || duplicate_of.is_some() {
                         anyhow::bail!(
                             "Action '{}' does not accept --assignee or --duplicate-of",
@@ -677,7 +708,7 @@ async fn handle_bugs(
                 }
                 _ => {
                     anyhow::bail!(
-                        "Unsupported bug action '{}'. Valid actions: comment, close, dismiss, mark_duplicate, assign",
+                        "Unsupported bug action '{}'. Valid actions: comment, close, dismiss, mark_duplicate, assign, reanalyze, rerate",
                         action
                     );
                 }
@@ -699,6 +730,130 @@ async fn handle_bugs(
                 OutputFormat::Text => {
                     println!("Bug #{} updated ({}).", id, action);
                 }
+            }
+            Ok(())
+        }
+        BugCommands::Reanalyze {
+            id,
+            subsystem,
+            severity,
+            status,
+            limit,
+            reason,
+            sync,
+        } => {
+            let mut action_payload = serde_json::json!({
+                "action": "reanalyze",
+                "sync": sync,
+            });
+            if let Some(ref r) = reason {
+                action_payload["reason"] = Value::String(r.clone());
+            }
+
+            if let Some(bug_id) = id {
+                let resp = check_response(
+                    client
+                        .post(format!("{}/api/bug/action", base_url))
+                        .query(&[("id", bug_id.to_string())])
+                        .json(&action_payload)
+                        .send()
+                        .await?,
+                )
+                .await?;
+                let body: Value = resp.json().await?;
+                match format {
+                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+                    OutputFormat::Text => {
+                        let st = body["status"].as_str().unwrap_or("queued");
+                        if st == "queued" {
+                            println!(
+                                "Bug #{} queued for full workflow re-analysis (pipeline_state: pending)",
+                                bug_id
+                            );
+                        } else {
+                            let new_sev = body["severity"].as_str().unwrap_or("Unknown");
+                            let dismissed = body["dismissed"].as_bool().unwrap_or(false);
+                            println!(
+                                "Bug #{} re-analyzed -> Severity: {} (dismissed: {})",
+                                bug_id, new_sev, dismissed
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            let mut req = client.get(format!("{}/api/bugs", base_url)).query(&[
+                ("page", "1".to_string()),
+                ("per_page", limit.to_string()),
+                ("status", status),
+            ]);
+            if let Some(sub) = subsystem {
+                req = req.query(&[("subsystem", sub)]);
+            }
+            if let Some(sev) = severity {
+                req = req.query(&[("severity", sev)]);
+            }
+            let resp = check_response(req.send().await?).await?;
+            let list_body: Value = resp.json().await?;
+            let bugs = list_body
+                .get("items")
+                .or_else(|| list_body.get("bugs"))
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| anyhow::anyhow!("API response missing 'items' array"))?;
+
+            let mut results = Vec::new();
+            for bug in bugs.iter().take(limit) {
+                let bug_id = bug["internal_id"]
+                    .as_i64()
+                    .or_else(|| bug["id"].as_i64())
+                    .unwrap_or_default();
+                let old_sev = bug["severity"].as_str().unwrap_or("unknown");
+                let title = bug["title"].as_str().unwrap_or("(untitled)");
+                let action_resp = check_response(
+                    client
+                        .post(format!("{}/api/bug/action", base_url))
+                        .query(&[("id", bug_id.to_string())])
+                        .json(&action_payload)
+                        .send()
+                        .await?,
+                )
+                .await?;
+                let action_body: Value = action_resp.json().await?;
+                let st = action_body["status"].as_str().unwrap_or("queued");
+                if matches!(format, OutputFormat::Text) {
+                    if st == "queued" {
+                        println!(
+                            "  #{:<6} [queued for re-analysis] ({}) {}",
+                            bug_id, old_sev, title
+                        );
+                    } else {
+                        let new_sev = action_body["severity"].as_str().unwrap_or("Unknown");
+                        let dismissed = action_body["dismissed"].as_bool().unwrap_or(false);
+                        println!(
+                            "  #{:<6} [{} -> {}]{} {}",
+                            bug_id,
+                            old_sev,
+                            new_sev,
+                            if dismissed { " (DISMISSED)" } else { "" },
+                            title
+                        );
+                    }
+                }
+                results.push(serde_json::json!({
+                    "id": bug_id,
+                    "title": title,
+                    "status": st,
+                    "old_severity": old_sev,
+                    "new_severity": action_body.get("severity"),
+                    "dismissed": action_body.get("dismissed"),
+                }));
+            }
+            if matches!(format, OutputFormat::Json) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "reanalyzed": results }))?
+                );
             }
             Ok(())
         }

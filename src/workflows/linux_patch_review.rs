@@ -78,6 +78,9 @@ pub struct LinuxPatchReviewState {
     pub review_inline: String,
     /// Fix suggestions.
     pub fixes: String,
+    /// Official Linux Kernel threat model (`Documentation/process/threat-model.rst`)
+    /// loaded directly from the kernel git repository.
+    pub threat_model_doc: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +225,9 @@ You MUST consider the following categories of issues and report any violations:
 
 const STAGE_SECURITY_INSTRUCTION: &str = r#"# Security audit
 
-You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."#;
+You are a Red Team security researcher auditing a Linux kernel patch against the official Linux Kernel threat model (`Documentation/process/threat-model.rst`, provided below in `<linux_kernel_threat_model>`). Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries defined by the Linux Kernel threat model:
+1. EXPLOITABLE TRUST-BOUNDARY VIOLATIONS: Flag issues where input crossing an actual Linux Kernel threat model boundary—such as an unprivileged local user, an unprivileged user namespace/container (`CONFIG_USER_NS`) escaping restrictions into the initial namespace, an untrusted remote network peer, unprivileged syscalls/ioctls/netlink/bpf/io_uring inputs, or an untrusted external USB/PCIe peripheral when IOMMU or explicit driver hardening applies—can violate user isolation, bypass capability checks (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`), corrupt kernel memory, leak sensitive cross-user data, or cause a kernel panic/hang/DoS.
+2. NON-EXPLOITABLE / OUT-OF-SCOPE THREAT MODEL CLAIMS: Under the Linux Kernel threat model (`Documentation/process/threat-model.rst`), the kernel assumes conforming hardware and trusted administrators (`root` / `CAP_SYS_ADMIN`). Issues that are NOT exploitable across a kernel trust boundary—such as requiring trusted hardware to violate its specification (when the driver is not documented as hardened against hostile hardware), requiring `root` or initial capabilities (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_RAWIO`, `CAP_SYS_MODULE`) to abuse privileged configuration interfaces (`debugfs`, privileged `sysfs`/`configfs` knobs, module parameters, or mounting corrupted block filesystem images), theoretical lab-only timing attacks, or kernel address/pointer and small structure padding leaks with no cross-boundary exploit path—are NOT kernel security vulnerabilities. If a candidate concern is framed solely as a security vulnerability when no bug exists under conforming operation, record it in `dismissed_concerns` citing the Linux Kernel threat model. If a real functional or hardening defect exists without untrusted exploitability, frame it strictly as a non-security functional/hardening bug rather than an exploitable security vulnerability."#;
 
 const STAGE_HARDWARE_INSTRUCTION: &str = r#"# Hardware engineer's review
 
@@ -262,7 +267,10 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 2. CRITICAL RULE: To discard a concern as a false positive, you MUST find concrete proof that explicitly invalidates the concern's reasoning. If you cannot find definitive proof that the concern is a false positive, it must be reported as a finding. If you're not sure about something and it's critical in the reasoning validation, make it obvious: if X is possible, then problem Y can occur. Always try to validate if X is possible yourself.
 3. SERIES VALIDATION RULE: If follow-up patches in this series are provided in the context, check if each identified concern is resolved or fixed in the final state of the series. If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
 4. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit "mm: fix allocation"'). Existing historical commits in the tree should still be referenced by their standard hash.
-5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
+5. Assign a severity (Low, Medium, High, Critical) to each remaining valid finding, following the calibration guidance in `severity.md` and the official Linux Kernel threat model (`Documentation/process/threat-model.rst`, provided below in `<linux_kernel_threat_model>`): reason through consequence, triggering path, and threat-model reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable:
+   - RAISE SEVERITY (`Critical` or `High`) for bugs exploitable across an actual Linux Kernel threat model trust boundary (e.g., unprivileged local user, unprivileged user namespace/container under `CONFIG_USER_NS` escaping into the initial namespace, untrusted remote network peer, unprivileged syscall/ioctl/netlink input, or untrusted external USB/PCIe peripheral when IOMMU/driver hardening applies) that cause memory corruption, privilege escalation, cross-user data/IPC exposure, or kernel panic/DoS.
+   - DISMISS OR LOWER SEVERITY (`Medium` or `Low`) for issues that are NOT exploitable under the Linux Kernel threat model (e.g., requiring trusted hardware to violate specifications without a threat-model exception, requiring `root` or `CAP_SYS_ADMIN` administrator abuse of privileged configuration interfaces such as `sysfs`, `debugfs`, `procfs`, or module parameters, mounting corrupted block filesystem images as root, or crossing no actual kernel trust boundary). Dismiss the concern if it is framed solely as a security vulnerability when no functional bug exists under conforming operation, or lower its severity (`Medium` or `Low`) if a benign functional or hardening defect exists without untrusted exploitability.
+   - Do not lower a genuine functional bug simply because reachability cannot be determined from the diff alone. A finding you can only state speculatively is capped at Medium.
 6. If the problem is determined to have already existed in the code before the patch was applied, mark `"preexisting": true`. Pre-existing issues will be routed to a dedicated pipeline and separate review.
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
 8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
@@ -569,6 +577,9 @@ pub struct AnalysisStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Whether the prompt carries the Linux Kernel threat model directly from
+    /// the kernel git repository (`Documentation/process/threat-model.rst`).
+    pub wants_threat_model: bool,
 }
 
 pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
@@ -580,6 +591,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "implementation",
@@ -589,6 +601,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "execution-flow",
@@ -598,6 +611,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "resources",
@@ -607,6 +621,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "locking",
@@ -616,6 +631,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: false,
     },
     AnalysisStage {
         name: "security",
@@ -625,6 +641,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: true,
     },
     AnalysisStage {
         name: "hardware",
@@ -634,6 +651,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: false,
+        wants_threat_model: false,
     },
 ];
 
@@ -647,30 +665,37 @@ pub struct ConsolidationStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Whether the prompt carries the Linux Kernel threat model directly from
+    /// the kernel git repository (`Documentation/process/threat-model.rst`).
+    pub wants_threat_model: bool,
 }
 
 pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
     name: "deduplication",
     short: "Deduplication",
     wants_series_context: false,
+    wants_threat_model: false,
 };
 
 pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
     name: "conflict-resolution",
     short: "Conflict Resolution",
     wants_series_context: false,
+    wants_threat_model: false,
 };
 
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Severity Estimation",
     wants_series_context: true,
+    wants_threat_model: true,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
     wants_series_context: false,
+    wants_threat_model: false,
 };
 
 /// In the order the workflow runs them. Each builder refers to its own
@@ -689,12 +714,21 @@ pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
 /// the variable that fills it cannot get separated.
 pub const SERIES_CONTEXT_PLACEHOLDER: &str = "{{follow_up_series_section}}";
 
+/// Marks where a stage's prompt carries the official Linux Kernel threat model
+/// (`Documentation/process/threat-model.rst`) read directly from the kernel git
+/// repository.
+pub const THREAT_MODEL_PLACEHOLDER: &str = "{{threat_model_section}}";
+
 fn series_context_placeholder(wants: bool) -> &'static str {
     if wants {
         SERIES_CONTEXT_PLACEHOLDER
     } else {
         ""
     }
+}
+
+fn threat_model_placeholder(wants: bool) -> &'static str {
+    if wants { THREAT_MODEL_PLACEHOLDER } else { "" }
 }
 
 fn with_series_context(
@@ -709,6 +743,25 @@ fn with_series_context(
             .as_ref()
             .map(|ctx| format!("\n\n{}", ctx))
             .unwrap_or_default()
+    })
+}
+
+fn with_threat_model(
+    template: PromptTemplate<LinuxPatchReviewState>,
+    wants: bool,
+) -> PromptTemplate<LinuxPatchReviewState> {
+    if !wants {
+        return template;
+    }
+    template.with_var("threat_model_section", |s: &LinuxPatchReviewState| {
+        if s.threat_model_doc.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<linux_kernel_threat_model path=\"Documentation/process/threat-model.rst\">\n{}\n</linux_kernel_threat_model>",
+                s.threat_model_doc.trim()
+            )
+        }
     })
 }
 
@@ -764,14 +817,16 @@ fn analysis_stage(
     temperature: f32,
 ) -> Box<dyn ExecutableStage<LinuxPatchReviewState>> {
     let mut user_template = PromptTemplate::<LinuxPatchReviewState>::new(format!(
-        "{}\n\n{}{}",
+        "{}{}\n\n{}{}",
         def.instruction,
+        threat_model_placeholder(def.wants_threat_model),
         STAGE_JSON_SCHEMA_EXAMPLE,
         series_context_placeholder(def.wants_series_context)
     ));
     for guide in def.guides {
         user_template = user_template.include_file(*guide);
     }
+    let user_template = with_threat_model(user_template, def.wants_threat_model);
     let user_template = with_series_context(user_template, def.wants_series_context);
 
     Box::new(
@@ -1000,11 +1055,13 @@ pub fn verification_stage(
     temperature: f32,
 ) -> Stage<LinuxPatchReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
+    let threat_model = threat_model_placeholder(VERIFICATION.wants_threat_model);
     Stage::builder(VERIFICATION.name)
         .system_prompt(linux_system_prompt(true))
-        .user_prompt(with_series_context(
-            PromptTemplate::<LinuxPatchReviewState>::new(format!(
-                r#"{STAGE_VERIFICATION_INSTRUCTION}
+        .user_prompt(with_threat_model(
+            with_series_context(
+                PromptTemplate::<LinuxPatchReviewState>::new(format!(
+                    r#"{STAGE_VERIFICATION_INSTRUCTION}{threat_model}
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{series_context}
 
@@ -1035,13 +1092,15 @@ Example Output:
   ]
 }}
 ```"#
-            ))
-            .include_file("false-positive-guide.md")
-            .include_file("severity.md")
-            .with_var("patch_concerns", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
-            }),
-            VERIFICATION.wants_series_context,
+                ))
+                .include_file("false-positive-guide.md")
+                .include_file("severity.md")
+                .with_var("patch_concerns", |s: &LinuxPatchReviewState| {
+                    serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
+                }),
+                VERIFICATION.wants_series_context,
+            ),
+            VERIFICATION.wants_threat_model,
         ))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {
@@ -1239,6 +1298,76 @@ mod tests {
                 .any(|d| d.guides.contains(&"subsystem/locking.md"))
         );
         assert!(!is_stage_exclusive_guide("subsystem/locking.md"));
+    }
+
+    #[tokio::test]
+    async fn test_security_and_verification_stages_include_linux_threat_model_directly() {
+        let sec_def = analysis_stage_by_name("security").expect("security stage must exist");
+        assert!(
+            sec_def.wants_threat_model,
+            "security stage must declare wants_threat_model"
+        );
+        assert!(
+            sec_def
+                .instruction
+                .contains("Documentation/process/threat-model.rst"),
+            "STAGE_SECURITY_INSTRUCTION must reference Documentation/process/threat-model.rst"
+        );
+        assert!(
+            sec_def.instruction.contains("dismissed_concerns"),
+            "STAGE_SECURITY_INSTRUCTION must instruct dismissing non-exploitable threat model claims"
+        );
+        assert!(
+            consolidation_stage_by_name("verification")
+                .unwrap()
+                .wants_threat_model,
+            "verification stage must declare wants_threat_model"
+        );
+
+        let kernel_repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third_party/linux");
+        let threat_model_doc = crate::git_ops::load_linux_threat_model(&kernel_repo)
+            .expect("must load Documentation/process/threat-model.rst directly from kernel repo");
+        let state = LinuxPatchReviewState {
+            threat_model_doc,
+            ..Default::default()
+        };
+
+        let ver_stage = verification_stage(20, 0.0);
+        let ver_log = ver_stage.user_prompt.render_for_log(&state);
+        assert!(
+            ver_log.contains(
+                "<linux_kernel_threat_model path=\"Documentation/process/threat-model.rst\">"
+            ),
+            "verification stage prompt must inject <linux_kernel_threat_model> directly from git"
+        );
+        assert!(
+            ver_log.contains("The Linux Kernel threat model"),
+            "verification stage prompt must contain threat-model.rst text"
+        );
+        assert!(
+            ver_log.contains("@severity.md"),
+            "verification stage prompt log must include @severity.md"
+        );
+        assert!(
+            ver_log.contains("RAISE SEVERITY"),
+            "verification stage must instruct raising severity for exploitable threat-model violations"
+        );
+        assert!(
+            ver_log.contains("DISMISS OR LOWER SEVERITY"),
+            "verification stage must instruct dismissing or lowering severity for non-exploitable issues"
+        );
+
+        let kernel_prompts_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third_party/prompts/kernel");
+        let rendered_ver = ver_stage
+            .user_prompt
+            .render_for_model(&state, &kernel_prompts_dir)
+            .await
+            .expect("verification prompt should render with kernel prompt directory");
+        assert!(
+            rendered_ver.contains("Linux Kernel Threat Model"),
+            "verification prompt rendered for model must include threat-model.rst content"
+        );
     }
 
     #[test]

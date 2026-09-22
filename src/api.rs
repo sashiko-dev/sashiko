@@ -2268,6 +2268,21 @@ pub enum BugAction {
         assignee: Option<String>,
         reason: Option<String>,
     },
+    /// Re-runs the entire Linux kernel bug workflow (`Normalization` -> `Verification`
+    /// -> `Deduplication` -> `OriginTracing` -> `SeverityAssessment` -> `ReportGeneration`)
+    /// on an existing bug. Gated strictly to Sashiko administrators.
+    #[serde(alias = "re-analyze")]
+    Reanalyze {
+        reason: Option<String>,
+        #[serde(default)]
+        sync: bool,
+    },
+    /// Re-evaluates the bug's severity (and dismisses it if excluded as a non-bug)
+    /// using the official Linux Kernel threat model (`Documentation/process/threat-model.rst`).
+    /// Gated strictly to Sashiko administrators.
+    Rerate {
+        reason: Option<String>,
+    },
 }
 
 /// Checks that a string looks like an email address.
@@ -2299,7 +2314,9 @@ fn required_access(action: &BugAction) -> BugAccess {
         BugAction::Close { .. }
         | BugAction::Dismiss { .. }
         | BugAction::MarkDuplicate { .. }
-        | BugAction::Assign { .. } => BugAccess::Manage,
+        | BugAction::Assign { .. }
+        | BugAction::Reanalyze { .. }
+        | BugAction::Rerate { .. } => BugAccess::Manage,
     }
 }
 
@@ -2328,6 +2345,19 @@ async fn bug_action(
         return Err((
             StatusCode::FORBIDDEN,
             "Server is running in read-only mode.".into(),
+        ));
+    }
+
+    // Re-running AI analysis workflows on existing bugs is restricted to
+    // Sashiko administrators (`acl.admins`).
+    if matches!(
+        payload.action,
+        BugAction::Reanalyze { .. } | BugAction::Rerate { .. }
+    ) && !principal.can_administer()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This action requires Sashiko administrator authority.".into(),
         ));
     }
 
@@ -2463,6 +2493,73 @@ async fn bug_action(
             db.assign_bug(bug.id, assignee, reason.as_deref())
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        BugAction::Reanalyze { reason, sync } => {
+            if !sync {
+                db.requeue_bug_for_analysis(bug.id, reason.as_deref())
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                return Ok(Json(serde_json::json!({
+                    "status": "queued",
+                    "id": bug.id,
+                    "bugid": bug.bugid,
+                    "pipeline_state": "pending",
+                })));
+            }
+            let provider = crate::ai::create_provider(&state.settings)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let repo_path = std::path::PathBuf::from(&state.settings.git.repository_path);
+            let tools = repo_path
+                .exists()
+                .then(|| std::sync::Arc::new(crate::toolbox::ToolBox::new(repo_path, None)));
+            let outcome = crate::workflows::linux_bug::reanalyze_bug_workflow(
+                provider.as_ref(),
+                tools,
+                &db,
+                &bug,
+                reason.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let updated = db
+                .get_bug(bug.id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .unwrap_or(bug);
+            return Ok(Json(serde_json::json!({
+                "status": "success",
+                "id": updated.id,
+                "bugid": updated.bugid,
+                "outcome": format!("{}", outcome),
+                "lifecycle_status": updated.lifecycle_status.as_str(),
+                "pipeline_state": updated.pipeline_state.as_str(),
+                "severity": updated.severity().as_str(),
+                "severity_explanation": updated.severity_explanation(),
+                "dismissed": updated.lifecycle_status == crate::db::BugLifecycleStatus::Dismissed,
+            })));
+        }
+        BugAction::Rerate { reason } => {
+            let provider = crate::ai::create_provider(&state.settings)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let repo_path = std::path::PathBuf::from(&state.settings.git.repository_path);
+            let tools = repo_path
+                .exists()
+                .then(|| std::sync::Arc::new(crate::toolbox::ToolBox::new(repo_path, None)));
+            let out = crate::workflows::linux_bug::reassess_bug_severity(
+                provider.as_ref(),
+                tools,
+                &db,
+                &bug,
+                reason.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok(Json(serde_json::json!({
+                "status": "success",
+                "severity": out.severity,
+                "severity_explanation": out.severity_explanation,
+                "dismissed": out.dismiss_as_non_bug,
+            })));
         }
     }
 
@@ -2647,6 +2744,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked_cancel.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_bug_reanalyze_requires_sashiko_admin_and_requeues_workflow() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let bug_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-reanalyze-1".to_string(),
+                title: "drivers/foo: sysfs race".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "FOO SUBSYSTEM",
+                )],
+            })
+            .await
+            .unwrap();
+
+        let jwt_secret = "unit-test-reanalyze-secret".to_string();
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some(jwt_secret.clone());
+        settings.server.acl = crate::settings::AclSettings {
+            admins: vec!["operator@example.org".to_string()],
+            security: vec!["security@example.org".to_string()],
+            ..Default::default()
+        };
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions::default(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let op_session = crate::auth::create_token(
+            "operator@example.org",
+            &jwt_secret,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+        let sec_session = crate::auth::create_token(
+            "security@example.org",
+            &jwt_secret,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+        let read_only_op_token = crate::auth::create_api_token(
+            "operator@example.org",
+            &jwt_secret,
+            3600,
+            Some("read".to_string()),
+        )
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let action_url = format!("http://{}/api/bug/action?id={}", addr, bug_id);
+
+        // Non-admin (security@example.org) is rejected with 403 Forbidden.
+        let non_admin_resp = client
+            .post(&action_url)
+            .bearer_auth(&sec_session)
+            .json(&serde_json::json!({ "action": "reanalyze" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(non_admin_resp.status(), StatusCode::FORBIDDEN);
+
+        // Admin with attenuated read-only API token is rejected with 403 Forbidden.
+        let attenuated_resp = client
+            .post(&action_url)
+            .bearer_auth(&read_only_op_token)
+            .json(&serde_json::json!({ "action": "reanalyze" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(attenuated_resp.status(), StatusCode::FORBIDDEN);
+
+        // Sashiko admin (operator@example.org) succeeds and queues full workflow re-analysis.
+        let admin_resp = client
+            .post(&action_url)
+            .bearer_auth(&op_session)
+            .json(&serde_json::json!({
+                "action": "reanalyze",
+                "reason": "Re-analyze with Linux Kernel threat model"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admin_resp.status(), StatusCode::OK);
+        let body: serde_json::Value = admin_resp.json().await.unwrap();
+        assert_eq!(body["status"], "queued");
+        assert_eq!(body["pipeline_state"], "pending");
+
+        let refreshed = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(
+            refreshed.lifecycle_status,
+            crate::db::BugLifecycleStatus::New
+        );
+        assert_eq!(
+            refreshed.pipeline_state,
+            crate::db::BugPipelineState::Pending
+        );
+        let claimed = db
+            .claim_pending_bug("worker-test", 300, 3)
+            .await
+            .unwrap()
+            .expect("re-queued bug must be claimable by BugWorker");
+        assert_eq!(claimed.id, bug_id);
     }
 
     #[tokio::test]

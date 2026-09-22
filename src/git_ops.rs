@@ -1533,11 +1533,82 @@ pub async fn is_dirty(repo_path: &Path) -> Result<bool> {
     Ok(!stdout.trim().is_empty())
 }
 
+/// Reads `Documentation/process/threat-model.rst` directly from the Linux
+/// kernel git repository at the head of Linus's tree (`origin/master`,
+/// falling back to `master`, `HEAD`, or the working tree copy).
+pub fn load_linux_threat_model(repo_path: &Path) -> Option<String> {
+    const THREAT_MODEL_PATH: &str = "Documentation/process/threat-model.rst";
+    if !repo_path.exists() {
+        return None;
+    }
+
+    for rev in ["origin/master", "master", "HEAD"] {
+        let spec = format!("{rev}:{THREAT_MODEL_PATH}");
+        if let Ok(output) = crate::git_cmd::in_dir(repo_path)
+            .args(["show", &spec])
+            .output()
+            && output.status.success()
+            && let Ok(text) = String::from_utf8(output.stdout)
+        {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(text) = std::fs::read_to_string(repo_path.join(THREAT_MODEL_PATH)) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+
+    #[test]
+    fn test_load_linux_threat_model_reads_directly_from_git_repo() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir(&repo_path)
+            .args(["init", "-b", "master"])
+            .output()?;
+        crate::git_cmd::in_dir(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()?;
+        crate::git_cmd::in_dir(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()?;
+
+        let doc_dir = repo_path.join("Documentation/process");
+        std::fs::create_dir_all(&doc_dir)?;
+        std::fs::write(
+            doc_dir.join("threat-model.rst"),
+            "The Linux Kernel threat model\n=============================\n",
+        )?;
+
+        crate::git_cmd::in_dir(&repo_path)
+            .args(["add", "Documentation/process/threat-model.rst"])
+            .output()?;
+        crate::git_cmd::in_dir(&repo_path)
+            .args(["commit", "-m", "Add threat model"])
+            .output()?;
+
+        // Delete working tree file to prove it reads from git revision history (master/HEAD)
+        std::fs::remove_file(doc_dir.join("threat-model.rst"))?;
+
+        let doc = load_linux_threat_model(&repo_path).expect("should load from git commit");
+        assert!(doc.contains("The Linux Kernel threat model"));
+        Ok(())
+    }
 
     #[test]
     fn test_is_stale_commit_graph_matches_both_wordings() {

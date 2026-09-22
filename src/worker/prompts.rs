@@ -330,6 +330,13 @@ impl Worker {
             ),
         };
 
+        let threat_model_doc = match self.project {
+            ProjectId::Linux => {
+                crate::git_ops::load_linux_threat_model(worktree_path).unwrap_or_default()
+            }
+            ProjectId::Sashiko => String::new(),
+        };
+
         let mut state = LinuxPatchReviewState {
             ps_id,
             p_id,
@@ -355,6 +362,7 @@ impl Worker {
             summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
+            threat_model_doc,
         };
 
         if self.global_history.is_empty() {
