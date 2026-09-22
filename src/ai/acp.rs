@@ -250,7 +250,7 @@ impl AcpProcess {
                         "{} error {}: {}{}",
                         self.label,
                         code,
-                        message,
+                        crate::utils::redact_secret(message),
                         stderr_context(stderr_preview).await
                     );
                 }
