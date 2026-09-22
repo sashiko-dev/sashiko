@@ -941,12 +941,33 @@ impl Reviewer {
                 Ok(sha) => sha,
                 Err(e) => {
                     if let BaselineResolution::Commit(sha_str) = candidate {
+                        // Guard against flag and refspec injection from untrusted headers.
+                        let is_hex_sha = (4..=64).contains(&sha_str.len())
+                            && sha_str.bytes().all(|b| b.is_ascii_hexdigit());
+                        if !is_hex_sha {
+                            let msg = format!(
+                                "Failed to resolve baseline ref {} (invalid hex SHA): {}\n",
+                                baseline_ref, e
+                            );
+                            current_log.push_str(&msg);
+                            attempts.push(BaselineAttempt {
+                                baseline: baseline_ref.clone(),
+                                status: current_status,
+                                log: current_log,
+                            });
+                            continue;
+                        }
                         // Attempt to fetch the missing commit from the
                         // mainline remote.
-                        let _ = crate::git_cmd::in_dir_async(&repo_path)
-                            .args(["fetch", mainline_remote, sha_str])
-                            .output()
-                            .await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(120),
+                            crate::git_cmd::in_dir_async(&repo_path)
+                                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+                                .args(["fetch", mainline_remote, sha_str])
+                                .kill_on_drop(true)
+                                .output(),
+                        )
+                        .await;
                         // Retry resolving
                         match get_commit_hash(&repo_path, &baseline_ref).await {
                             Ok(sha) => sha,
@@ -956,10 +977,15 @@ impl Reviewer {
                                 // v7.2-rc2). Those aren't fetchable by SHA,
                                 // so pull tags from the mainline remote and
                                 // retry.
-                                let _ = crate::git_cmd::in_dir_async(&repo_path)
-                                    .args(["fetch", mainline_remote, "--tags"])
-                                    .output()
-                                    .await;
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(120),
+                                    crate::git_cmd::in_dir_async(&repo_path)
+                                        .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+                                        .args(["fetch", mainline_remote, "--tags"])
+                                        .kill_on_drop(true)
+                                        .output(),
+                                )
+                                .await;
                                 match get_commit_hash(&repo_path, &baseline_ref).await {
                                     Ok(sha) => sha,
                                     Err(e2) => {
