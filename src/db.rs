@@ -5233,6 +5233,12 @@ impl Database {
                     total_parts
                 };
 
+                let trimmed = subject.trim_start();
+                let is_reply_msg = part_index == 0
+                    && trimmed
+                        .get(..3)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
+
                 let final_author = if is_placeholder
                     || part_index <= subject_index
                     || existing_author.is_empty()
@@ -5244,12 +5250,25 @@ impl Database {
                 };
 
                 // We proceed to update this record with the full metadata
-                self.conn.execute(
-                    "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                    libsql::params![thread_id, final_author, final_total, parser_version, to, cc, id],
-                ).await?;
+                if is_reply_msg {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET thread_id = ?, parser_version = ? WHERE id = ?",
+                            libsql::params![thread_id, parser_version, id],
+                        )
+                        .await?;
+                } else {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
+                            libsql::params![thread_id, final_author, final_total, parser_version, to, cc, id],
+                        )
+                        .await?;
+                }
 
-                if let Some(real_clid) = cover_letter_message_id {
+                if let Some(real_clid) = cover_letter_message_id
+                    && !is_reply_msg
+                {
                     self.adopt_series_identity(id, real_clid, part_index, is_own_part_id)
                         .await?;
                 }
@@ -5260,7 +5279,7 @@ impl Database {
                 }
 
                 // Update subject if this is a better index (e.g. going from placeholder to real subject)
-                if part_index < subject_index {
+                if !is_reply_msg && part_index < subject_index {
                     self.conn
                         .execute(
                             "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
@@ -5666,11 +5685,28 @@ impl Database {
                 }
             }
 
+            let trimmed = subject.trim_start();
+            let is_reply_msg = part_index == 0
+                && trimmed
+                    .get(..3)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
+
             // Update the target patchset
-            self.conn.execute(
-                "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                libsql::params![author, total_parts, parser_version, to, cc, target_id],
-            ).await?;
+            if is_reply_msg {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET parser_version = ? WHERE id = ?",
+                        libsql::params![parser_version, target_id],
+                    )
+                    .await?;
+            } else {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
+                        libsql::params![author, total_parts, parser_version, to, cc, target_id],
+                    )
+                    .await?;
+            }
 
             if skip_filters_json.is_some() || only_filters_json.is_some() {
                 self.conn.execute(
@@ -5686,13 +5722,15 @@ impl Database {
 
             // Adopt identity before updating subject_index so adopt_series_identity
             // sees whether target_id already had a 0/N cover letter prior to this message.
-            if let Some(clid) = cover_letter_message_id {
+            if let Some(clid) = cover_letter_message_id
+                && !is_reply_msg
+            {
                 self.adopt_series_identity(target_id, clid, part_index, is_own_part_id)
                     .await?;
             }
 
             // Conditionally update subject if the newly arrived message has an even better index
-            if part_index < current_subject_index {
+            if !is_reply_msg && part_index < current_subject_index {
                 self.conn
                     .execute(
                         "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
@@ -5770,7 +5808,7 @@ impl Database {
             .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
                  VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && subject.trim_start().get(..3).is_some_and(|p| p.eq_ignore_ascii_case("re:")) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
             )
             .await?;
 
