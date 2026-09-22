@@ -153,6 +153,7 @@ impl AiProvider for CachingAiProvider {
                 return Ok(resp);
             }
         }
+        drop(rows);
 
         debug!("Cache miss [{}]", hash_prefix);
 
