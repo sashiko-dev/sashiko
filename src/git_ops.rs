@@ -838,6 +838,9 @@ fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
     let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = map_mutex.lock().unwrap();
+    if map.len() >= 64 {
+        map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
     map.entry(name.to_string())
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))
         .clone()
