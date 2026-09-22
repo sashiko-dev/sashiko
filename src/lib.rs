@@ -13,32 +13,47 @@ pub mod metrics;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "server")]
 pub mod access;
 pub mod ai;
 pub mod api;
 pub mod auth;
+#[cfg(feature = "server")]
 pub mod backfill;
 pub mod baseline;
+#[cfg(feature = "server")]
 pub mod compression;
 pub mod db;
+#[cfg(feature = "server")]
 pub mod email_policy;
+#[cfg(feature = "server")]
 pub mod email_router;
+#[cfg(feature = "server")]
 pub mod events;
+#[cfg(feature = "server")]
 pub mod fetcher;
+#[cfg(feature = "server")]
 pub mod forge;
 pub mod git_cmd;
 pub mod git_ops;
+#[cfg(feature = "server")]
 pub mod ingestor;
 pub mod local_review;
 pub mod maintainers;
+#[cfg(feature = "server")]
 pub mod mbox;
+#[cfg(feature = "server")]
 pub mod nntp;
 pub mod patch;
+#[cfg(feature = "server")]
 pub mod patchwork;
+#[cfg(feature = "server")]
 pub mod prerequisites;
 pub mod project;
 pub mod prompt_bundle;
+#[cfg(feature = "server")]
 pub mod reviewer;
+#[cfg(feature = "server")]
 pub mod server;
 pub mod settings;
 pub mod toolbox;

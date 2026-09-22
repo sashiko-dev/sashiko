@@ -1,8 +1,11 @@
+#[cfg(feature = "server")]
 use axum::{
     extract::FromRequestParts,
     http::{StatusCode, request::Parts},
 };
+#[cfg(feature = "server")]
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+#[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io;
@@ -122,6 +125,7 @@ fn is_token_shaped(value: &str) -> bool {
     value.len() == LOCAL_TOKEN_BYTES * 2 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+#[cfg(feature = "server")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -136,6 +140,7 @@ pub struct Claims {
     pub max_bug_access: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub email: String,
@@ -145,6 +150,7 @@ pub struct AuthUser {
     pub max_bug_access: Option<String>,
 }
 
+#[cfg(feature = "server")]
 impl AuthUser {
     pub fn new(email: impl Into<String>) -> Self {
         Self {
@@ -157,6 +163,7 @@ impl AuthUser {
     }
 }
 
+#[cfg(feature = "server")]
 pub fn create_token(
     email: &str,
     secret: &str,
@@ -166,6 +173,7 @@ pub fn create_token(
     create_token_with_session(email, secret, typ, expiration_secs, None, None)
 }
 
+#[cfg(feature = "server")]
 pub fn create_api_token(
     email: &str,
     secret: &str,
@@ -193,6 +201,7 @@ pub fn create_api_token(
     )
 }
 
+#[cfg(feature = "server")]
 pub fn create_token_with_session(
     email: &str,
     secret: &str,
@@ -231,6 +240,7 @@ pub fn create_token_with_session(
     )
 }
 
+#[cfg(feature = "server")]
 pub fn verify_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
     let validation = Validation::new(jsonwebtoken::Algorithm::HS256);
     decode::<Claims>(
@@ -241,6 +251,7 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::e
     .map(|data| data.claims)
 }
 
+#[cfg(feature = "server")]
 impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for AuthUser {
     type Rejection = (StatusCode, &'static str);
 
@@ -308,8 +319,10 @@ impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for AuthUser {
     }
 }
 
+#[cfg(feature = "server")]
 pub struct OptionalAuthUser(pub Option<AuthUser>);
 
+#[cfg(feature = "server")]
 impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for OptionalAuthUser {
     type Rejection = std::convert::Infallible;
 
@@ -326,8 +339,10 @@ impl FromRequestParts<std::sync::Arc<crate::server::AppState>> for OptionalAuthU
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "server")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_create_and_verify_token() {
         let email = "test@example.com";
@@ -349,6 +364,7 @@ mod tests {
         assert!(claims.exp <= now + 24 * 3600);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_verify_token_invalid_secret() {
         let email = "test@example.com";
@@ -357,6 +373,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_session_token_generates_iat_and_sid() {
         let email = "test@example.com";
@@ -368,6 +385,7 @@ mod tests {
         assert_eq!(claims.sid.as_ref().unwrap().len(), 32);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_verify_token_rejects_unpinned_algorithm() {
         let email = "test@example.com";
@@ -392,6 +410,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_create_and_verify_api_token_with_max_bug_access() {
         let email = "agent@example.com";
@@ -458,6 +477,7 @@ mod tests {
 
     /// Both credentials arrive in the Authorization header, so a session token
     /// must never be able to pass as the local one.
+    #[cfg(feature = "server")]
     #[test]
     fn test_local_token_does_not_match_a_session_jwt() {
         let token = LocalToken::generate().unwrap();

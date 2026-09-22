@@ -39,9 +39,29 @@ path = "src/bin/sashiko-cli.rs"
 name = "benchmark"
 path = "src/bin/benchmark.rs"
 test = false
+required-features = ["server"]
 
 [features]
-default = []
+default = ["server"]
+server = [
+    "cache",
+    "dep:libsql",
+    "dep:flate2",
+    "dep:axum",
+    "dep:tower-http",
+    "dep:jsonwebtoken",
+    "dep:hmac",
+    "dep:base64",
+    "dep:url",
+    "dep:percent-encoding",
+    "dep:bytes",
+    "dep:lettre",
+    "dep:mail-parser",
+    "dep:rustls-native-certs",
+    "dep:tokio-rustls",
+    "dep:tokio-util",
+]
+cache = ["dep:libsql"]
 bedrock = ["aws-config", "aws-sdk-bedrockruntime", "aws-smithy-types"]
 vertex = ["google-cloud-auth"]
 
@@ -51,22 +71,22 @@ async-trait = "0.1.89"
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 aws-sdk-bedrockruntime = { version = "1", optional = true }
 aws-smithy-types = { version = "1", optional = true }
-axum = "0.8.9"
-bytes = "1.9"
+axum = { version = "0.8.9", optional = true }
+bytes = { version = "1.9", optional = true }
 chrono = "0.4.43"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 config = "0.15.23"
 google-cloud-auth = { version = "1.10", optional = true }
 fastrand = "2.4.1"
-flate2 = "1.1.9"
+flate2 = { version = "1.1.9", optional = true }
 futures = "0.3.31"
-lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
-libsql = "0.9.29"
-mail-parser = "0.11.3"
+lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
+libsql = { version = "0.9.29", optional = true }
+mail-parser = { version = "0.11.3", optional = true }
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json", "query"] }
 rustix = { version = "1.1.4", features = ["termios"] }
-rustls-native-certs = "0.8.4"
+rustls-native-certs = { version = "0.8.4", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
@@ -75,21 +95,21 @@ termcolor = "1.4.1"
 terminfo = "0.9.0"
 thiserror = "2.0.17"
 tokio = { version = "1.52.3", features = ["full"] }
-tokio-rustls = "0.26.4"
-tokio-util = { version = "0.7.17", features = ["codec", "io"] }
+tokio-rustls = { version = "0.26.4", optional = true }
+tokio-util = { version = "0.7.17", features = ["codec", "io"], optional = true }
 toml = "1.0"
-tower-http = { version = "0.7.0", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7.0", features = ["cors", "fs", "trace"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tree-sitter = "0.27.0"
 tree-sitter-c = "0.24.2"
-hmac = "0.13"
-base64 = "0.23"
+hmac = { version = "0.13", optional = true }
+base64 = { version = "0.23", optional = true }
 subtle = "2"
-url = "2.5.8"
-percent-encoding = "2.3.2"
-uuid = "1.23.4"
-jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+url = { version = "2.5.8", optional = true }
+percent-encoding = { version = "2.3.2", optional = true }
+uuid = { version = "1.23.4", features = ["v4"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"], optional = true }
 
 [dev-dependencies]
 rcgen = "0.14"

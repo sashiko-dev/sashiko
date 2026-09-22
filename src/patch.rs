@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "server")]
 use anyhow::{Result, anyhow};
+#[cfg(feature = "server")]
 use mail_parser::{HeaderValue, MessageParser};
 use regex::Regex;
 use std::sync::OnceLock;
@@ -45,6 +47,7 @@ pub struct Patch {
     pub part_index: u32,
 }
 
+#[cfg(feature = "server")]
 pub fn extract_received_date(raw_email: &[u8]) -> Option<i64> {
     let header_end = raw_email
         .windows(4)
@@ -84,6 +87,7 @@ pub fn extract_received_date(raw_email: &[u8]) -> Option<i64> {
     None
 }
 
+#[cfg(feature = "server")]
 pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)> {
     let received_date = extract_received_date(raw_email);
 
@@ -555,6 +559,7 @@ mod tests {
         assert_eq!(extract_email("Invalid < Format"), "Invalid < Format");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_extract_received_date() {
         let email = b"Received: from mail.example.com ([192.0.2.1])\r\n \
@@ -599,6 +604,7 @@ Body";
         assert_eq!(clean_subject("回复：回复：[PATCH] Fix bug"), "Fix bug");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_chinese_reply() {
         let raw =
@@ -611,6 +617,7 @@ Body";
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_author_parsing() {
         let raw =
@@ -629,6 +636,7 @@ Body";
         assert_eq!(meta3.author, "\"fqr\" <unknown@localhost>");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_b4_relay_author_parsing() {
         let raw = b"Message-ID: <b4-relay-test>\r\n\
@@ -639,6 +647,7 @@ Body";
         assert_eq!(meta.author, "\"Real Author\" <author@example.com>");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_b4_relay_mismatch_fallback() {
         // Verification: If From is a B4 Relay alias, but X-Original-From is a completely
@@ -654,6 +663,7 @@ Body";
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_recipient_parsing() {
         let raw = b"Message-ID: <1>\r\nFrom: a@b.com\r\nTo: \"Valid User\" <valid@example.com>, invalid_no_at, <another@test.com>\r\nCc: Bad <bad>, \"Good\" <good@example.com>\r\nSubject: Test\r\n\r\nBody";
@@ -665,6 +675,7 @@ Body";
         assert_eq!(meta.cc, "\"Good\" <good@example.com>");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_reply_with_diff_is_not_patchset() {
         // A message that starts with Re: but contains diff --git
@@ -679,6 +690,7 @@ Body";
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_diff_without_patch_tag_ignored() {
         let raw = b"Message-ID: <diffnopatch>\r\nSubject: Random fix\r\n\r\ndiff --git a/file b/file\nindex...";
@@ -689,6 +701,7 @@ Body";
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_normal_patch() {
         let raw = b"Message-ID: <456>\r\nSubject: [PATCH] fix bug\r\n\r\ndiff --git a/file b/file\nindex...";
@@ -696,6 +709,7 @@ Body";
         assert!(meta.is_patch_or_cover);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_single_patch_no_diff_ignored() {
         let raw =
@@ -707,6 +721,7 @@ Body";
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_cover_letter() {
         let raw = b"Message-ID: <789>\r\nSubject: [PATCH 0/5] fix bug\r\n\r\nCover letter body";
@@ -715,6 +730,7 @@ Body";
         assert!(patch.is_none());
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_cover_letter_with_diff() {
         let raw = b"Message-ID: <cover_with_diff>\r\nSubject: [PATCH 0/5] fix bug\r\n\r\nExplanation:\ndiff --git a/file b/file\nindex...";
@@ -726,6 +742,7 @@ Body";
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_pure_reply() {
         let raw = b"Message-ID: <abc>\r\nSubject: Re: [PATCH] fix bug\r\n\r\nLGTM";
@@ -782,6 +799,7 @@ Body";
         assert_eq!(total, 2);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_missed_cover_letter_parsing() {
         let subject = "[PATCH 6.18 000/430] 6.18.3-rc1 review";
@@ -794,6 +812,7 @@ Body";
         assert!(meta.is_patch_or_cover, "Should be detected as patch/cover");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_forwarded_reply_is_not_patch() {
         // "Forwarded: Re: ..." should be treated as reply/skip if it has no diff,
@@ -869,6 +888,7 @@ Body";
         assert_eq!(get_subject_prefixes("[PATCH]"), Vec::<String>::new());
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_parse_email_author_quoting() {
         let raw = b"From: Thomas Richard (TI) <thomas.richard@bootlin.com>\r\nMessage-ID: <123>\r\nSubject: Test\r\n\r\nDiff:\n--- a\n+++ b\n@@ -1 +1 @@";

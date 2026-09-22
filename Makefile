@@ -1,6 +1,6 @@
 # Sashiko Development and CI Tasks
 
-.PHONY: help build fmt lint test clean
+.PHONY: help build fmt lint lint-local lint-local-cache test test-local test-local-cache clean
 .PHONY: check-pr check-integration check-all sob integration-test check-db-invariants
 
 # Default target
@@ -14,7 +14,11 @@ help:
 	@echo "    build             - Build release binary"
 	@echo "    fmt               - Auto-format Rust code"
 	@echo "    lint              - Run all linters (clippy, fmt --check, yamllint)"
+	@echo "    lint-local        - Run clippy on local-review profile (no cache)"
+	@echo "    lint-local-cache  - Run clippy on local-review profile with cache"
 	@echo "    test              - Run unit tests"
+	@echo "    test-local        - Run tests on local-review profile (no cache)"
+	@echo "    test-local-cache  - Run tests on local-review profile with cache"
 	@echo "    clean             - Remove build artifacts"
 	@echo ""
 	@echo "  CI Suites:"
@@ -42,9 +46,25 @@ lint:
 	@cargo fmt --all -- --check
 	-@yamllint .
 
+# Run clippy on local-review feature profile (without cache)
+lint-local:
+	@cargo clippy --all-targets --no-default-features -- -D warnings
+
+# Run clippy on local-review feature profile with cache
+lint-local-cache:
+	@cargo clippy --all-targets --no-default-features --features cache -- -D warnings
+
 # Run unit tests
 test:
 	@cargo test --all-features
+
+# Run tests on local-review feature profile (without cache)
+test-local:
+	@cargo test --no-default-features
+
+# Run tests on local-review feature profile with cache
+test-local-cache:
+	@cargo test --no-default-features --features cache
 
 # Remove build artifacts
 clean:
@@ -53,7 +73,7 @@ clean:
 # ── CI Suites ────────────────────────────────────────────
 
 # [PR Suite] Run all checks required for a Pull Request (SOB, Lint, Unit Tests)
-check-pr: sob lint test
+check-pr: sob lint lint-local lint-local-cache test test-local test-local-cache
 
 # [Integration Suite] Run #[ignore]-tagged integration tests (server + API)
 check-integration: integration-test

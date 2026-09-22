@@ -12,14 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "server")]
 pub mod bug_worker;
+#[cfg(feature = "server")]
 pub mod compressor;
+#[cfg(feature = "server")]
 pub mod email;
+#[cfg(feature = "server")]
 pub mod forge;
+#[cfg(feature = "server")]
 pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;
+#[cfg(feature = "server")]
 pub mod repack;
+#[cfg(feature = "server")]
 pub mod sync;
 
 pub use prompts::*;

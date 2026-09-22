@@ -1606,6 +1606,7 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn temperature_fallback_retries_once_and_remembers_rejection() -> Result<()> {
         use axum::{Json, Router, http::StatusCode, routing::post};
@@ -1666,6 +1667,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn temperature_fallback_does_not_retry_other_requests() -> Result<()> {
         use axum::{Json, Router, http::StatusCode, routing::post};

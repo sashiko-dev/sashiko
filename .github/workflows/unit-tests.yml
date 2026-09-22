@@ -15,3 +15,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run cargo-test via Makefile
         run: make test
+      - name: Run local profile tests via Makefile
+        run: make test-local
+      - name: Run local cache profile tests via Makefile
+        run: make test-local-cache

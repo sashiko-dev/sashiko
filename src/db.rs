@@ -12,28 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "server")]
 use crate::ReviewStatus;
+#[cfg(feature = "server")]
 use crate::settings::DatabaseSettings;
-use anyhow::{Context, Result, bail};
+#[cfg(feature = "server")]
+use anyhow::Context;
+use anyhow::{Result, bail};
+#[cfg(feature = "server")]
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "server")]
 use serde_json::json;
+#[cfg(feature = "server")]
 use std::str::FromStr;
+#[cfg(feature = "server")]
 use std::sync::Arc;
+#[cfg(feature = "server")]
 use tracing::{info, warn};
 
 /// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
 /// that have to ask the question of a row they are updating. The two must
 /// answer alike, which a test below checks.
+#[cfg(feature = "server")]
 const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
       OR (status IN ('Reviewed', 'Failed', 'Failed To Apply')
           AND received_parts >= total_parts))";
 
+#[cfg(feature = "server")]
 fn get_required_text(row: &libsql::Row, index: i32) -> Result<String> {
     get_optional_text(row, index)?
         .ok_or_else(|| anyhow::anyhow!("database column {index} is unexpectedly NULL"))
 }
 
+#[cfg(feature = "server")]
 fn get_optional_text(row: &libsql::Row, index: i32) -> Result<Option<String>> {
     match row.get::<libsql::Value>(index)? {
         libsql::Value::Null => Ok(None),
@@ -42,6 +54,7 @@ fn get_optional_text(row: &libsql::Row, index: i32) -> Result<Option<String>> {
     }
 }
 
+#[cfg(feature = "server")]
 fn get_optional_integer(row: &libsql::Row, index: i32) -> Result<Option<i64>> {
     match row.get::<libsql::Value>(index)? {
         libsql::Value::Null => Ok(None),
@@ -50,18 +63,22 @@ fn get_optional_integer(row: &libsql::Row, index: i32) -> Result<Option<i64>> {
     }
 }
 
+#[cfg(feature = "server")]
 const PATCH_WRITE_MAX_ATTEMPTS: usize = 3;
 
+#[cfg(feature = "server")]
 struct StoredPatchState {
     diff: Arc<libsql::Value>,
     git_patch_id: Option<String>,
 }
 
+#[cfg(feature = "server")]
 enum PatchWriteOutcome {
     Written(i64),
     SnapshotChanged,
 }
 
+#[cfg(feature = "server")]
 async fn get_stored_patch_state(
     conn: &libsql::Connection,
     patchset_id: i64,
@@ -84,6 +101,7 @@ async fn get_stored_patch_state(
     }))
 }
 
+#[cfg(feature = "server")]
 async fn select_git_patch_id(
     old_patch: Option<&StoredPatchState>,
     diff: Arc<str>,
@@ -109,6 +127,7 @@ async fn select_git_patch_id(
     Ok(unchanged.then_some(old_patch_id))
 }
 
+#[cfg(feature = "server")]
 async fn write_patch_if_unchanged(
     conn: &libsql::Connection,
     old_patch: Option<StoredPatchState>,
@@ -160,6 +179,7 @@ async fn write_patch_if_unchanged(
         .map(|patch_id| (patch_id, existing_in_patchset)))
 }
 
+#[cfg(feature = "server")]
 pub struct Database {
     pub conn: libsql::Connection,
     bug_actor: String,
@@ -169,6 +189,7 @@ pub struct Database {
 }
 
 /// Ownership of one analysis attempt, separate from its audit attribution.
+#[cfg(feature = "server")]
 #[derive(Clone)]
 struct BugAnalysisClaim {
     bug_id: i64,
@@ -234,6 +255,7 @@ pub enum PatchsetReviewOutcome {
     Incomplete,
 }
 
+#[cfg(feature = "server")]
 const CLEAN_PATCHSET_PREDICATE: &str = "
     EXISTS (
         SELECT 1 FROM reviews r
@@ -866,6 +888,7 @@ impl SubsystemSource {
 /// already present. Rewriting the provenance matters: a name that used to be
 /// caller supplied and is later matched out of MAINTAINERS has to start
 /// conferring authority, and a name that stops matching has to stop.
+#[cfg(feature = "server")]
 const UPSERT_BUG_SUBSYSTEM_SQL: &str = "INSERT INTO bug_subsystems (bug_id, subsystem, source) \
      VALUES (?, ?, ?) \
      ON CONFLICT(bug_id, subsystem) DO UPDATE SET source = excluded.source";
@@ -875,6 +898,7 @@ const UPSERT_BUG_SUBSYSTEM_SQL: &str = "INSERT INTO bug_subsystems (bug_id, subs
 /// name into a string that already carries a column named `source`, and the
 /// one thing that must never be interpolated here is which table decides who
 /// may read a transcript.
+#[cfg(feature = "server")]
 const UPSERT_PATCHSET_SECTION_SQL: &str = "INSERT INTO patchset_maintainer_sections (patchset_id, subsystem, source) \
      VALUES (?, ?, ?) \
      ON CONFLICT(patchset_id, subsystem) DO UPDATE SET source = excluded.source";
@@ -957,6 +981,7 @@ fn default_now() -> i64 {
 /// previously omitted the bug's state entirely, which left the badge on the
 /// patchset detail card permanently reading Open regardless of the bug's
 /// actual triage or analysis state.
+#[cfg(feature = "server")]
 fn bug_reference_json(bug: &Bug, is_newly_discovered: bool) -> serde_json::Value {
     serde_json::json!({
         "id": bug.id,
@@ -976,6 +1001,7 @@ fn bug_reference_json(bug: &Bug, is_newly_discovered: bool) -> serde_json::Value
     })
 }
 
+#[cfg(feature = "server")]
 const BUG_ROW_COLUMNS: &str = "id, bugid, title, lifecycle_status, pipeline_state,
      reporter, reported_at, assignee, assigned_at,
      discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit,
@@ -1156,6 +1182,7 @@ pub struct ForgeOutboxRow {
     pub created_at: i64,
 }
 
+#[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
         self.bug_actor != "system" || self.bug_tool != "sashiko"
@@ -8477,6 +8504,7 @@ impl Database {
     }
 }
 
+#[cfg(feature = "server")]
 impl Database {
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_email_outbox(
@@ -9070,7 +9098,7 @@ impl Database {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests {
     /// The message id lookup behind /api/patchset must seek an index.
     ///

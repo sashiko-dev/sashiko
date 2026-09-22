@@ -90,6 +90,16 @@ Running an automated review system like Sashiko can be computationally expensive
 cargo install sashiko
 ```
 
+For local review (`sashiko review`) and `sashiko-cli` without the server or database dependencies:
+
+```bash
+# Minimal build (no server, no libsql)
+cargo install sashiko --no-default-features
+
+# Minimal build with local SQLite AI response caching
+cargo install sashiko --no-default-features --features cache
+```
+
 ### From source
 
 #### 1.  **Clone the repository**:

@@ -30,7 +30,7 @@ Use `make` to run common development tasks:
 - `make test`: Run unit tests.
 - `make integration-test`: Run the full integration smoke tests (starts server, runs benchmark, cleans up).
 - `make sob`: Validate Signed-off-by tags for a commit range.
-- `make check-pr`: Run all checks required for a Pull Request (`sob`, `lint`, `test`).
+- `make check-pr`: Run all checks required for a Pull Request (`sob`, `lint`, `lint-local`, `lint-local-cache`, `test`, `test-local`, `test-local-cache`).
 - `make check-all`: Run the complete suite including integration tests and database invariants (`check-pr`, `check-integration`, `check-db-invariants`).
 - `make check-db-invariants`: Run lightweight database invariant checks.
 
@@ -109,12 +109,18 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `patch.rs`: Patch parsing and manipulation.
 - `forge.rs`: Webhook integration and parsing for external forges (GitHub, GitLab).
 - `email_router.rs` & `email_policy.rs`: Email routing and policy enforcement.
-- `db.rs`: Database interactions.
-- `api.rs`: API endpoints.
+- `db.rs`: Database interactions and shared wire models (`#[cfg(feature = "server")]` for `Database`).
+- `api.rs`: Shared HTTP protocol request/response types (unconditional).
+- `server.rs`: Axum HTTP API server handlers (`#[cfg(feature = "server")]`).
 - `settings.rs`: Application settings management.
 - `project.rs`: Target project profile selection (`linux`, `sashiko`, etc.).
 - `events.rs`: Event handling system.
 - `baseline.rs`: Baseline detection logic.
+
+## Cargo Feature Profiles
+- `server` (enabled by default): Full daemon, HTTP API (`axum`), NNTP/forge ingestion, email delivery (`lettre`), SQLite/libsql persistence (`Database`), and `cache`.
+- `cache`: Local SQLite AI response caching (`ai.response_cache` / `CachingAiProvider`).
+- `--no-default-features`: Minimal build for `sashiko` local review (`sashiko init`, `sashiko review`) and `sashiko-cli` without `libsql`, `axum`, `lettre`, or `jsonwebtoken` (`--features cache` adds the local AI response cache).
 
 ## Configuration & Assets
 - `Settings.toml`: Main application configuration.

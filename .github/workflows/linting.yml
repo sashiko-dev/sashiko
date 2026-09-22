@@ -21,3 +21,7 @@ jobs:
         run: pip install yamllint
       - name: Run Linters via Makefile
         run: make lint
+      - name: Run Local Profile Linters via Makefile
+        run: make lint-local
+      - name: Run Local Cache Profile Linters via Makefile
+        run: make lint-local-cache

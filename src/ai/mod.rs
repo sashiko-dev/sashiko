@@ -219,6 +219,7 @@ pub(crate) struct RemoteAiErrorPayload {
 }
 
 impl RemoteAiErrorPayload {
+    #[cfg(any(feature = "server", test))]
     pub fn new(message: String, class: AiErrorClass) -> Self {
         Self { message, class }
     }
@@ -297,7 +298,6 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     }
     AiErrorClass::Fatal
 }
-
 
 /// Token usage statistics for an AI interaction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -397,6 +397,7 @@ pub fn cache_identity_with(model: &str, knobs: &[(&str, Option<&str>)]) -> Strin
 ///
 /// One rule rather than one per caller, so the file cannot end up named or
 /// placed differently depending on who asked for it.
+#[cfg(feature = "cache")]
 fn response_cache_path(database: Option<&str>, data_home: &std::path::Path) -> std::path::PathBuf {
     // A remote database has no directory for the cache to sit beside, and its
     // URL is not a path: deriving one would put the cache somewhere meaningless,
@@ -424,7 +425,7 @@ fn response_cache_path(database: Option<&str>, data_home: &std::path::Path) -> s
 /// for the cache to sit beside.
 pub async fn create_provider_cached(
     ai: &AiSettings,
-    database: Option<&str>,
+    #[cfg_attr(not(feature = "cache"), allow(unused_variables))] database: Option<&str>,
 ) -> Result<Arc<dyn AiProvider>> {
     let provider = create_provider_from_ai(ai)?;
     // A daemon-spawned worker reaches the model through a stdio provider, and
@@ -433,17 +434,24 @@ pub async fn create_provider_cached(
     if !ai.response_cache || ai.provider.starts_with("stdio-") {
         return Ok(provider);
     }
-    let cache_path = response_cache_path(database, &crate::utils::data_home()?);
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    #[cfg(feature = "cache")]
+    {
+        let cache_path = response_cache_path(database, &crate::utils::data_home()?);
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let cached = cache::CachingAiProvider::new(
+            provider,
+            &cache_path.to_string_lossy(),
+            ai.response_cache_ttl_days,
+        )
+        .await?;
+        Ok(Arc::new(cached))
     }
-    let cached = cache::CachingAiProvider::new(
-        provider,
-        &cache_path.to_string_lossy(),
-        ai.response_cache_ttl_days,
-    )
-    .await?;
-    Ok(Arc::new(cached))
+    #[cfg(not(feature = "cache"))]
+    {
+        bail!("ai.response_cache requires the 'cache' feature")
+    }
 }
 
 /// Creates an AI provider based on the application settings.
@@ -688,6 +696,7 @@ pub mod acp;
 pub mod backoff_provider;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
+#[cfg(feature = "cache")]
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;
@@ -701,11 +710,13 @@ pub mod kiro_cli;
 pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
+#[cfg(feature = "server")]
 pub mod proxy;
 pub mod quota;
 pub mod session;
 pub mod token_budget;
 pub mod truncator;
+#[cfg(feature = "server")]
 pub mod vector_search;
 #[cfg(feature = "vertex")]
 pub mod vertex;
@@ -975,6 +986,7 @@ mod tests {
         assert!(provider.cache_stats().is_none());
     }
 
+    #[cfg(feature = "cache")]
     #[test]
     fn test_the_response_cache_follows_the_database_or_the_data_directory() {
         // Composition only, taking the data directory as an argument: reading
@@ -1178,7 +1190,6 @@ mod tests {
 
         assert!(err.to_string().contains("retry_after_secs"));
     }
-
 
     #[test]
     fn test_remote_ai_error_classifies_from_payload_class() {

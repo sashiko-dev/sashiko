@@ -13,8 +13,11 @@
 // limitations under the License.
 
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "server")]
 use sashiko::db::Database;
+#[cfg(feature = "server")]
 use sashiko::events::{Event, MessageSource, ParsedArticle};
+#[cfg(feature = "server")]
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
     ProgressEvent, ReviewOptions, WorkerOptions, format_agent_review_output, print_worker_json,
@@ -22,6 +25,7 @@ use sashiko::local_review::{
 };
 use sashiko::project::ProjectId;
 use sashiko::prompt_bundle;
+#[cfg(feature = "server")]
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
 use serde_json::Value;
@@ -32,8 +36,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::signal::unix::{SignalKind, signal};
+#[cfg(feature = "server")]
 use tokio::sync::{Semaphore, mpsc};
-use tracing::{error, info, warn};
+#[cfg(feature = "server")]
+use tracing::error;
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 const DEFAULT_SETTINGS: &str = include_str!("../docs/examples/Settings.example.toml");
@@ -221,6 +228,7 @@ enum ColorMode {
     Never,
 }
 
+#[cfg(feature = "server")]
 const PARSER_VERSION: i32 = 2;
 
 #[tokio::main]
@@ -384,6 +392,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    #[cfg(feature = "server")]
+    {
+        run_daemon(cli, settings_result, project).await
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        let _ = (cli, settings_result, project);
+        Err("this build has no daemon; rebuild with --features server".into())
+    }
+}
+
+#[cfg(feature = "server")]
+async fn run_daemon(
+    cli: Cli,
+    settings_result: Result<Settings, config::ConfigError>,
+    project: ProjectId,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Now handle settings result properly
     let mut settings = match settings_result {
         Ok(s) => {
@@ -1157,6 +1182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// directory is a legitimate deployment, and the server remains fully usable
 /// through sign-in links. Only the convenience of local tooling is lost, so it
 /// says so plainly rather than refusing to start.
+#[cfg(feature = "server")]
 fn publish_local_token(path: &Path) -> Option<sashiko::auth::LocalToken> {
     let token = match sashiko::auth::LocalToken::generate() {
         Ok(token) => token,
@@ -2491,11 +2517,13 @@ fn eprint_colored(color_choice: ColorChoice, color: Color, text: &str) -> std::i
     stderr.reset()
 }
 
+#[cfg(feature = "server")]
 enum ProcessStatus {
     Ingested,
     Error,
 }
 
+#[cfg(feature = "server")]
 async fn process_parsed_article(
     worker_db: &Database,
     article: ParsedArticle,
@@ -3005,6 +3033,7 @@ async fn process_parsed_article(
     }
 }
 
+#[cfg(feature = "server")]
 async fn process_recipients(
     db: &Database,
     message_id: i64,
@@ -3062,6 +3091,7 @@ async fn process_recipients(
     }
 }
 
+#[cfg(feature = "server")]
 fn extract_subject_prefixes(subject: &str) -> Vec<String> {
     let mut prefixes = Vec::new();
     let mut in_bracket = false;
@@ -3103,6 +3133,7 @@ fn extract_subject_prefixes(subject: &str) -> Vec<String> {
 }
 
 // Helper function to map To/Cc to Subsystems
+#[cfg(feature = "server")]
 fn calculate_embargo_hours(
     subject: &str,
     subsystems: &[(String, String)],
@@ -3155,6 +3186,7 @@ fn calculate_embargo_hours(
     }
 }
 
+#[cfg(feature = "server")]
 fn resolve_root_msg_id(source: MessageSource, article_id: &str) -> String {
     match source {
         MessageSource::Nntp
@@ -3167,6 +3199,7 @@ fn resolve_root_msg_id(source: MessageSource, article_id: &str) -> String {
     }
 }
 
+#[cfg(feature = "server")]
 fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
     match source {
         MessageSource::GitImport | MessageSource::GitArchive => false,
@@ -3177,6 +3210,7 @@ fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
     }
 }
 
+#[cfg(feature = "server")]
 fn identify_subsystems(
     to: &str,
     cc: &str,
@@ -3235,6 +3269,7 @@ fn identify_subsystems(
     subsystems
 }
 
+#[cfg(feature = "server")]
 fn identify_subsystems_from_paths(
     paths: &[String],
     mapping: &[sashiko::settings::SubsystemMapping],
@@ -3263,6 +3298,7 @@ fn identify_subsystems_from_paths(
     subsystems
 }
 
+#[cfg(feature = "server")]
 fn should_start_nntp_ingestor(settings: &Settings) -> bool {
     settings.has_nntp_config() && !(settings.forge.enabled && settings.forge.disable_nntp)
 }
@@ -4228,6 +4264,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_identify_subsystems() {
         // Test known subsystem
@@ -4267,6 +4304,7 @@ mod tests {
         assert!(subsystems.contains(&("linux-mm".to_string(), "linux-mm@kvack.org".to_string())));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_identify_subsystems_custom_and_fallback() {
         let custom_mapping = vec![sashiko::settings::SubsystemMapping {
@@ -4286,6 +4324,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_identify_subsystems_from_paths() {
         let mapping = vec![sashiko::settings::SubsystemMapping {
@@ -4303,6 +4342,7 @@ mod tests {
         assert!(subsystems.contains(&("usb".to_string(), "usb@forge.local".to_string())));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_calculate_embargo_hours() {
         use sashiko::email_policy::{EmailPolicyConfig, SubsystemPolicy};
@@ -4384,6 +4424,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_nntp_ingestor_enabled_with_forge() {
         let mut settings = Settings::new().unwrap();
@@ -4392,6 +4433,7 @@ mod tests {
         assert!(should_start_nntp_ingestor(&settings));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_nntp_ingestor_disabled_by_default_with_forge() {
         let mut settings = Settings::new().unwrap();
@@ -4400,6 +4442,7 @@ mod tests {
         assert!(!should_start_nntp_ingestor(&settings));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_nntp_ingestor_disabled_when_nntp_config_omitted() {
         let mut settings = Settings::new().unwrap();
@@ -4408,6 +4451,7 @@ mod tests {
         assert!(!should_start_nntp_ingestor(&settings));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_resolve_root_msg_id() {
         assert_eq!(
@@ -4436,6 +4480,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_is_strict_author() {
         assert!(is_strict_author(MessageSource::Nntp, 1));
@@ -4451,6 +4496,7 @@ mod tests {
         assert!(!is_strict_author(MessageSource::ApiInject, 6)); // Lenient for series
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_format_mr_subject() {
         assert_eq!(
