@@ -350,10 +350,17 @@ impl FetchAgent {
     }
 
     async fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
-        // Inject GitLab token if available
+        // Inject GitLab token via parsed url::Url to prevent parser differentials.
         let authenticated_url = if let Some(token) = &self.gitlab_token {
-            if url.contains("gitlab.com") && url.starts_with("https://") {
-                url.replace("https://", &format!("https://oauth2:{}@", token))
+            if let Ok(mut parsed) = url::Url::parse(url)
+                && parsed.scheme() == "https"
+                && parsed
+                    .host_str()
+                    .is_some_and(|h| h.eq_ignore_ascii_case("gitlab.com"))
+            {
+                let _ = parsed.set_username("oauth2");
+                let _ = parsed.set_password(Some(token));
+                parsed.to_string()
             } else {
                 url.to_string()
             }
@@ -406,7 +413,7 @@ impl FetchAgent {
             if !output.status.success() {
                 return Err(anyhow!(
                     "Failed to add remote: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    redact_secret(String::from_utf8_lossy(&output.stderr).trim())
                 ));
             }
         }
@@ -459,7 +466,7 @@ impl FetchAgent {
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                redact_secret(String::from_utf8_lossy(&output.stderr).trim())
             ));
         }
         Ok(())
@@ -471,7 +478,7 @@ impl FetchAgent {
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch all failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                redact_secret(String::from_utf8_lossy(&output.stderr).trim())
             ));
         }
         Ok(())

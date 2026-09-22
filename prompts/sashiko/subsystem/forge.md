@@ -218,13 +218,22 @@ particular are not covered by any validator here.
 ## 5. Secrets in URLs and logs
 
 `FetchAgent::ensure_remote` injects the configured forge token into the clone
-URL:
+URL after parsing the URL and verifying `scheme == "https"` and `host_str() == Some("gitlab.com")`:
 
 ```rust
 let authenticated_url = if let Some(token) = &self.gitlab_token {
-    if url.contains("gitlab.com") && url.starts_with("https://") {
-        url.replace("https://", &format!("https://oauth2:{}@", token))
-    } else { url.to_string() }
+    if let Ok(mut parsed) = url::Url::parse(url)
+        && parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("gitlab.com"))
+    {
+        let _ = parsed.set_username("oauth2");
+        let _ = parsed.set_password(Some(token));
+        parsed.to_string()
+    } else {
+        url.to_string()
+    }
 } else { url.to_string() };
 ```
 
@@ -243,12 +252,12 @@ here:
   `authenticated_url`, must be wrapped. The regex only matches
   `scheme://user:pass@`; a token in a path segment or a non-matching query
   parameter name is not redacted.
-- **`git`'s own stderr is not redacted on this path.** `fetch_commits` and
-  `fetch_all` build `anyhow!("Fetch failed: {}", String::from_utf8_lossy(&output.stderr))`,
-  and `process_queue` puts that string into `Event::IngestionFailed { error }`,
-  which is persisted and surfaced. git error text can quote the remote URL it
+- **`git`'s own stderr must also be passed through `redact_secret`.** `ensure_remote`,
+  `fetch_commits`, and `fetch_all` pass `redact_secret(String::from_utf8_lossy(&output.stderr).trim())`
+  before constructing errors, because `process_queue` puts that string into
+  `Event::IngestionFailed { error }` and git error text can quote the remote URL it
   failed on. Treat any new use of raw git stderr in a user-visible or persisted
-  message as a potential token leak, and prefer `redact_secret`.
+  message as a potential token leak, and pass it through `redact_secret`.
 
 Transport hardening is separate and lives in
 `crate::git_ops::GIT_PROTOCOL_RESTRICTIONS` (`6b631bc53b8b`):
@@ -296,12 +305,10 @@ a remote must pass `GIT_PROTOCOL_RESTRICTIONS`.**
 - If the new consumer performs network I/O, does it pass
   `GIT_PROTOCOL_RESTRICTIONS`?
 - Does the new code compare the URL against a host with `contains()`? That is
-  the mistake `c36b518bba15` fixed in `is_safe_repo_url`, and
-  `ensure_remote`'s `url.contains("gitlab.com")` still has that shape: it
-  matches `https://gitlab.com.example.net/x.git` and
-  `https://example.net/gitlab.com/x.git`, either of which would receive the
-  configured token. Any diff extending token injection to more hosts, or
-  copying this predicate, should parse the host instead.
+  the mistake `c36b518bba15` fixed in `is_safe_repo_url`. Always parse the URL
+  with `url::Url::parse` and compare `parsed.host_str()` rather than using
+  substring matching (`url.contains(...)`), which would match subdomains or
+  path segments (`https://gitlab.com.example.net/x.git`).
 - Does any new log line, database column, event payload or HTTP response carry
   the URL after `ensure_remote` may have added credentials?
 
