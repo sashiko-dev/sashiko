@@ -552,7 +552,15 @@ async fn submit_patch(
             skip_subjects,
             only_subjects,
         } => {
-            if raw.trim().is_empty() {
+            if raw.trim().is_empty()
+                || base_commit.as_deref().is_some_and(|b| {
+                    b.is_empty()
+                        || b.chars().any(char::is_whitespace)
+                        || b.starts_with('-')
+                        || b.starts_with('+')
+                        || b.contains(':')
+                })
+            {
                 return Err(StatusCode::BAD_REQUEST);
             }
             // Basic guardrail
@@ -601,6 +609,16 @@ async fn submit_patch(
             skip_subjects,
             only_subjects,
         } => {
+            let has_invalid_ref = sha.trim_matches('.').is_empty()
+                || sha.chars().any(char::is_whitespace)
+                || sha.split("..").count() > 2
+                || sha.split("..").any(|part| {
+                    let part = part.trim_start_matches('.');
+                    part.starts_with('-') || part.starts_with('+') || part.contains(':')
+                });
+            if has_invalid_ref {
+                return Err(StatusCode::BAD_REQUEST);
+            }
             let id = sha.clone();
             let repo_display = repo.as_deref().unwrap_or("local");
             info!(

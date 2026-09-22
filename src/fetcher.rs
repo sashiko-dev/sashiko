@@ -109,8 +109,14 @@ impl FetchAgent {
                 if commit_or_range.contains("..") {
                     let parts: Vec<&str> = commit_or_range.split("..").collect();
                     if parts.len() == 2 {
-                        commits_to_check.push(parts[0].to_string());
-                        commits_to_check.push(parts[1].to_string());
+                        let base = parts[0];
+                        let head = parts[1].trim_start_matches('.');
+                        if !base.is_empty() {
+                            commits_to_check.push(base.to_string());
+                        }
+                        if !head.is_empty() {
+                            commits_to_check.push(head.to_string());
+                        }
                     }
                 } else {
                     commits_to_check.push(commit_or_range.clone());
@@ -460,7 +466,21 @@ impl FetchAgent {
 
     async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
         let mut args = vec![remote];
-        args.extend(commits.iter().map(String::as_str));
+        for commit in commits {
+            if commit.is_empty()
+                || commit.chars().any(char::is_whitespace)
+                || commit.starts_with('-')
+                || commit.starts_with('+')
+                || commit.contains(':')
+            {
+                warn!("Skipping invalid commit ref in fetch batch: {}", commit);
+                continue;
+            }
+            args.push(commit.as_str());
+        }
+        if args.len() == 1 {
+            return Err(anyhow!("No valid commit refs to fetch"));
+        }
 
         let output = self.fetch_with_graph_retry(&args).await?;
         if !output.status.success() {
