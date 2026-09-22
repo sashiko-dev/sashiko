@@ -134,6 +134,17 @@ impl BugAccess {
         self >= BugAccess::Manage
     }
 
+    /// Parses a bug access level name (`"none"`, `"read"`, `"comment"`, `"manage"`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(BugAccess::None),
+            "read" => Some(BugAccess::Read),
+            "comment" => Some(BugAccess::Comment),
+            "manage" => Some(BugAccess::Manage),
+            _ => None,
+        }
+    }
+
     /// Names the level for a refusal message. Only meaningful for a level that
     /// was demanded and not met, so the caller already knows the bug exists.
     pub fn describe(self) -> &'static str {
@@ -166,6 +177,8 @@ pub struct Principal {
     maintained_sections: HashSet<SectionTitle>,
     /// May file a new bug over HTTP.
     may_create: bool,
+    /// Optional privilege ceiling imposed by a scoped API token.
+    max_access: Option<BugAccess>,
 }
 
 impl Principal {
@@ -197,7 +210,25 @@ impl Principal {
             // Operators can always file bugs; the list exists to admit tools
             // in addition to them.
             may_create: operator || acl.is_bug_reporter(email),
+            max_access: None,
         }
+    }
+
+    /// Imposes an upper bound on the bug access level this principal may
+    /// exercise, used when authenticating with a scoped API token.
+    pub fn with_max_access(mut self, max: Option<BugAccess>) -> Self {
+        self.max_access = max;
+        if let Some(limit) = max
+            && limit < BugAccess::Manage
+        {
+            self.may_create = false;
+        }
+        self
+    }
+
+    /// Whether this principal is a configured Sashiko operator.
+    pub fn is_operator(&self) -> bool {
+        self.operator
     }
 
     /// The address this principal was resolved from.
@@ -213,19 +244,22 @@ impl Principal {
     /// only those matches no maintainer and stays invisible to them, which is
     /// the intended outcome for a bug nobody could classify.
     pub fn access_to(&self, attributed: &[SectionTitle]) -> BugAccess {
-        if self.operator || self.global_maintainer {
-            return BugAccess::Manage;
-        }
-        if attributed
-            .iter()
-            .any(|title| self.maintained_sections.contains(title))
+        let base = if self.operator
+            || self.global_maintainer
+            || attributed
+                .iter()
+                .any(|title| self.maintained_sections.contains(title))
         {
-            return BugAccess::Manage;
+            BugAccess::Manage
+        } else if self.security {
+            BugAccess::Comment
+        } else {
+            BugAccess::None
+        };
+        match self.max_access {
+            Some(limit) => base.min(limit),
+            None => base,
         }
-        if self.security {
-            return BugAccess::Comment;
-        }
-        BugAccess::None
     }
 
     /// Whether this principal can read every bug regardless of subsystem.
@@ -237,7 +271,8 @@ impl Principal {
     /// rest of the model maintains. For a principal who can already read every
     /// bug it discloses nothing new.
     pub fn has_global_bug_visibility(&self) -> bool {
-        self.operator || self.security || self.global_maintainer
+        (self.operator || self.security || self.global_maintainer)
+            && self.max_access.is_none_or(|m| m.can_read())
     }
 
     /// Whether this principal may file a new bug.
@@ -261,7 +296,9 @@ impl Principal {
     /// How much of the bug database this principal may list, as a database
     /// filter.
     pub fn visibility<'a>(&self, scope: &'a [String]) -> crate::db::BugVisibility<'a> {
-        if self.has_global_bug_visibility() {
+        if self.max_access.is_some_and(|m| !m.can_read()) {
+            crate::db::BugVisibility::Sections(&[])
+        } else if self.has_global_bug_visibility() {
             crate::db::BugVisibility::Unrestricted
         } else {
             crate::db::BugVisibility::Sections(scope)
@@ -302,11 +339,31 @@ impl FromRequestParts<Arc<crate::api::AppState>> for Principal {
             return Ok(Principal::testing_operator());
         }
         let user = crate::auth::AuthUser::from_request_parts(parts, state).await?;
+        if user
+            .sid
+            .as_deref()
+            .is_some_and(|sid| state.settings.server.acl.is_blocklisted(sid))
+        {
+            return Err((StatusCode::UNAUTHORIZED, "Token has been revoked."));
+        }
+        let max_access = match user.max_bug_access.as_deref() {
+            Some(s) => match BugAccess::parse(s) {
+                Some(level) => Some(level),
+                None => {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid max_bug_access claim in token.",
+                    ));
+                }
+            },
+            None => None,
+        };
         Ok(Principal::resolve(
             &user.email,
             &state.settings.server.acl,
             crate::maintainers::get_global_maintainers().as_deref(),
-        ))
+        )
+        .with_max_access(max_access))
     }
 }
 
@@ -397,7 +454,13 @@ impl TranscriptPrincipal {
         attributed: &[SectionTitle],
         author: Option<&str>,
     ) -> TranscriptAccess {
-        if self.local_operator || self.principal.has_global_bug_visibility() {
+        if self.local_operator {
+            return TranscriptAccess::Granted;
+        }
+        if self.principal.max_access.is_some_and(|m| !m.can_read()) {
+            return TranscriptAccess::Denied;
+        }
+        if self.principal.has_global_bug_visibility() {
             return TranscriptAccess::Granted;
         }
         if attributed
@@ -707,6 +770,53 @@ F:	*/
         // Blocklisted maintainer and author still gets Denied.
         assert_eq!(
             blocklisted.access_to_patchset(&btrfs(), Some("Chris Mason <clm@fb.com>")),
+            TranscriptAccess::Denied
+        );
+    }
+
+    #[test]
+    fn test_bug_access_parse() {
+        assert_eq!(BugAccess::parse("read"), Some(BugAccess::Read));
+        assert_eq!(BugAccess::parse("COMMENT"), Some(BugAccess::Comment));
+        assert_eq!(BugAccess::parse(" manage "), Some(BugAccess::Manage));
+        assert_eq!(BugAccess::parse("invalid"), None);
+    }
+
+    #[test]
+    fn test_principal_with_max_access_attenuates_never_elevates() {
+        let idx = index();
+        // Operator with read ceiling gets Read on everything and cannot create bugs.
+        let op_read = Principal::resolve("operator@example.org", &acl(), Some(&idx))
+            .with_max_access(Some(BugAccess::Read));
+        assert_eq!(op_read.access_to(&btrfs()), BugAccess::Read);
+        assert_eq!(op_read.access_to(&[]), BugAccess::Read);
+        assert!(!op_read.may_create());
+
+        // Subsystem maintainer with read ceiling gets Read on own subsystem and None elsewhere.
+        let davem_read = Principal::resolve("davem@davemloft.net", &acl(), Some(&idx))
+            .with_max_access(Some(BugAccess::Read));
+        assert_eq!(
+            davem_read.access_to(&[SectionTitle::new("NETWORKING [GENERAL]")]),
+            BugAccess::Read
+        );
+        assert_eq!(davem_read.access_to(&btrfs()), BugAccess::None);
+
+        // Stranger with manage ceiling still gets None (never elevates).
+        let stranger = Principal::resolve("stranger@example.org", &acl(), Some(&idx))
+            .with_max_access(Some(BugAccess::Manage));
+        assert_eq!(stranger.access_to(&btrfs()), BugAccess::None);
+
+        // Operator or maintainer with None ceiling gets None visibility and Denied transcript access.
+        let op_none = Principal::resolve("operator@example.org", &acl(), Some(&idx))
+            .with_max_access(Some(BugAccess::None));
+        assert!(!op_none.has_global_bug_visibility());
+        assert_eq!(
+            op_none.visibility(&["BTRFS FILE SYSTEM".to_string()]),
+            crate::db::BugVisibility::Sections(&[])
+        );
+        let tp_none = TranscriptPrincipal::new(op_none, false);
+        assert_eq!(
+            tp_none.access_to_patchset(&btrfs(), Some("operator@example.org")),
             TranscriptAccess::Denied
         );
     }

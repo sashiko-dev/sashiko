@@ -132,6 +132,8 @@ pub struct Claims {
     pub sid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typ: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bug_access: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +141,8 @@ pub struct AuthUser {
     pub email: String,
     pub iat: Option<usize>,
     pub sid: Option<String>,
+    pub typ: Option<String>,
+    pub max_bug_access: Option<String>,
 }
 
 impl AuthUser {
@@ -147,6 +151,8 @@ impl AuthUser {
             email: email.into(),
             iat: None,
             sid: None,
+            typ: None,
+            max_bug_access: None,
         }
     }
 }
@@ -158,6 +164,33 @@ pub fn create_token(
     expiration_secs: u64,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     create_token_with_session(email, secret, typ, expiration_secs, None, None)
+}
+
+pub fn create_api_token(
+    email: &str,
+    secret: &str,
+    expiration_secs: u64,
+    max_bug_access: Option<String>,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs();
+
+    let claims = Claims {
+        sub: email.to_owned(),
+        exp: (now + expiration_secs) as usize,
+        iat: Some(now as usize),
+        sid: Some(format!("{:032x}", fastrand::u128(..))),
+        typ: Some("api_token".to_string()),
+        max_bug_access,
+    };
+
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_ref()),
+    )
 }
 
 pub fn create_token_with_session(
@@ -188,6 +221,7 @@ pub fn create_token_with_session(
         iat: Some(issued_at),
         sid: session_id,
         typ,
+        max_bug_access: None,
     };
 
     encode(
@@ -249,16 +283,21 @@ impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
 
         match verify_token(token, &secret) {
             Ok(claims) => {
-                if claims.typ.as_deref() != Some("session") {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        "Invalid token type. Only session tokens are accepted.",
-                    ));
+                match claims.typ.as_deref() {
+                    Some("session") | Some("api_token") => {}
+                    _ => {
+                        return Err((
+                            StatusCode::UNAUTHORIZED,
+                            "Invalid token type. Only session or API tokens are accepted.",
+                        ));
+                    }
                 }
                 Ok(AuthUser {
                     email: claims.sub,
                     iat: claims.iat,
                     sid: claims.sid,
+                    typ: claims.typ,
+                    max_bug_access: claims.max_bug_access,
                 })
             }
             Err(_) => Err((
@@ -339,6 +378,7 @@ mod tests {
             iat: None,
             sid: None,
             typ: Some("session".to_string()),
+            max_bug_access: None,
         };
         // Encode with HS384 instead of HS256
         let token = encode(
@@ -350,6 +390,18 @@ mod tests {
 
         let result = verify_token(&token, secret);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_and_verify_api_token_with_max_bug_access() {
+        let email = "agent@example.com";
+        let secret = "super_secret_key";
+        let token = create_api_token(email, secret, 3600, Some("read".to_string())).unwrap();
+        let claims = verify_token(&token, secret).unwrap();
+        assert_eq!(claims.sub, email);
+        assert_eq!(claims.typ.as_deref(), Some("api_token"));
+        assert_eq!(claims.max_bug_access.as_deref(), Some("read"));
+        assert!(claims.sid.as_deref().is_some_and(|s| s.len() == 32));
     }
 
     #[test]
