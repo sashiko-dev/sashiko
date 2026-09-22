@@ -4993,7 +4993,7 @@ impl Database {
                 libsql::params![identity, patchset_id],
             )
             .await?;
-        if owner_rows.next().await.ok().flatten().is_some() {
+        if owner_rows.next().await?.is_some() {
             return Ok(());
         }
 
@@ -5078,7 +5078,7 @@ impl Database {
                     libsql::params![patchset_id, candidate.clone(), patchset_id, candidate],
                 )
                 .await?;
-            if rows.next().await.ok().flatten().is_some() {
+            if rows.next().await?.is_some() {
                 return Ok(true);
             }
         }
@@ -5218,7 +5218,7 @@ impl Database {
                             libsql::params![id, part_index, message_id],
                         )
                         .await?;
-                    p_rows.next().await.ok().flatten().is_some()
+                    p_rows.next().await?.is_some()
                 };
 
                 if index_collision || (!is_placeholder && !versions_compatible) {
@@ -5348,7 +5348,7 @@ impl Database {
                         libsql::params![id, part_index, message_id],
                     )
                     .await?;
-                p_rows.next().await.ok().flatten().is_some()
+                p_rows.next().await?.is_some()
             };
 
             let mut existing_msgid_prefix = None;
@@ -5381,7 +5381,7 @@ impl Database {
                         libsql::params![id, message_id],
                     )
                     .await?;
-                p_rows.next().await.ok().flatten().is_some()
+                p_rows.next().await?.is_some()
             } else {
                 false
             };
@@ -5734,7 +5734,7 @@ impl Database {
                     libsql::params![clid.as_str()],
                 )
                 .await?;
-            if owner_rows.next().await.ok().flatten().is_some() {
+            if owner_rows.next().await?.is_some() {
                 if clid != message_id {
                     let mut self_owner = self
                         .conn
@@ -5743,7 +5743,7 @@ impl Database {
                             libsql::params![message_id],
                         )
                         .await?;
-                    if self_owner.next().await.ok().flatten().is_none() {
+                    if self_owner.next().await?.is_none() {
                         info!(
                             "Message {} belongs to a series named {}, which another patchset holds; naming the new series after itself",
                             message_id, clid
@@ -5800,7 +5800,7 @@ impl Database {
                     libsql::params![patchset_id, part_index, message_id],
                 )
                 .await?;
-            rows.next().await.ok().flatten().is_some()
+            rows.next().await?.is_some()
         };
 
         if collision_exists {
@@ -5820,7 +5820,7 @@ impl Database {
                     libsql::params![patchset_id, message_id],
                 )
                 .await?;
-            rows.next().await.ok().flatten().is_some()
+            rows.next().await?.is_some()
         };
 
         // Insert or update within THIS patchset.
@@ -7544,7 +7544,7 @@ impl Database {
                     libsql::params![clid.clone()],
                 )
                 .await?;
-            if p_rows.next().await.ok().flatten().is_some() {
+            if p_rows.next().await?.is_some() {
                 return Ok(true);
             }
         }
