@@ -313,11 +313,18 @@ impl Worker {
             }
         };
 
-        let follow_up_series_context = build_follow_up_series_context(
-            self.series_range.as_deref(),
-            &patchset,
-            &target_commit_sha,
-        );
+        let follow_up_series_context = match self.project {
+            ProjectId::Linux => build_follow_up_series_context(
+                self.series_range.as_deref(),
+                &patchset,
+                &target_commit_sha,
+            ),
+            ProjectId::Sashiko => build_sashiko_series_context(
+                self.series_range.as_deref(),
+                &patchset,
+                &target_commit_sha,
+            ),
+        };
 
         let mut state = LinuxPatchReviewState {
             ps_id,
@@ -575,6 +582,122 @@ pub fn build_follow_up_series_context(
     block.push_str(&format!(
         "Verify if any candidate concern raised against this patch is fixed, refactored, or resolved in the subsequent patches listed above. {} If a concern is resolved by follow-up patches in this series, discard it as a false positive.\n",
         diff_directive
+    ));
+    block.push_str("===================================\n");
+
+    Some(block)
+}
+
+pub fn build_sashiko_series_context(
+    series_range: Option<&str>,
+    patchset: &Value,
+    target_commit_sha: &str,
+) -> Option<String> {
+    let patches = patchset["patches"].as_array()?;
+    let total_patches = patches.len();
+    if total_patches <= 1 {
+        return None;
+    }
+
+    let current_idx = patchset["patch_index"].as_i64().unwrap_or(1);
+    let current_subject = patches
+        .iter()
+        .find(|p| p["index"].as_i64() == Some(current_idx))
+        .and_then(|p| p["subject"].as_str())
+        .unwrap_or("unknown");
+
+    let mut preceding = Vec::new();
+    let mut follow_ups = Vec::new();
+    for p in patches {
+        let idx = p["index"].as_i64().unwrap_or(0);
+        let subj = p["subject"].as_str().unwrap_or("");
+        let commit_id = p["commit_id"].as_str();
+        if idx > 0 && idx < current_idx {
+            preceding.push((idx, commit_id, subj));
+        } else if idx > current_idx {
+            follow_ups.push((idx, commit_id, subj));
+        }
+    }
+
+    if preceding.is_empty() && follow_ups.is_empty() {
+        return None;
+    }
+
+    preceding.sort_by_key(|(idx, _, _)| *idx);
+    follow_ups.sort_by_key(|(idx, _, _)| *idx);
+
+    let end_sha = series_range
+        .and_then(|r| r.split("..").nth(1))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            patches
+                .iter()
+                .max_by_key(|p| p["index"].as_i64().unwrap_or(0))
+                .and_then(|p| p["commit_id"].as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or(target_commit_sha);
+
+    let mut block = String::new();
+    block.push_str("\n\n=== Patch Series Context ===\n");
+    block.push_str(&format!(
+        "Current Patch Under Review: [Patch {} of {}] - {}\n",
+        current_idx, total_patches, current_subject
+    ));
+    if !end_sha.is_empty() && end_sha != "unknown" {
+        block.push_str(&format!("Series End Commit (Final State): {}\n", end_sha));
+    }
+
+    if !preceding.is_empty() {
+        block.push_str(
+            "\nPreceding patches in this series (already applied in HEAD / current revision):\n",
+        );
+        for (idx, commit_id, subj) in &preceding {
+            if let Some(sha) = commit_id {
+                block.push_str(&format!(
+                    "- [Patch {} of {}] (commit {}): {}\n",
+                    idx, total_patches, sha, subj
+                ));
+            } else {
+                block.push_str(&format!(
+                    "- [Patch {} of {}]: {}\n",
+                    idx, total_patches, subj
+                ));
+            }
+        }
+    }
+
+    if !follow_ups.is_empty() {
+        block.push_str("\nSubsequent patches in this series:\n");
+        for (idx, commit_id, subj) in &follow_ups {
+            if let Some(sha) = commit_id {
+                block.push_str(&format!(
+                    "- [Patch {} of {}] (commit {}): {}\n",
+                    idx, total_patches, sha, subj
+                ));
+            } else {
+                block.push_str(&format!(
+                    "- [Patch {} of {}]: {}\n",
+                    idx, total_patches, subj
+                ));
+            }
+        }
+    }
+
+    let end_ref = if !end_sha.is_empty() && end_sha != "unknown" {
+        end_sha
+    } else {
+        "HEAD"
+    };
+
+    block.push_str("\nSERIES VERIFICATION DIRECTIVE:\n");
+    block.push_str(&format!(
+        "1. If this patch introduces foundational types, helpers, schema changes, or configuration fields whose callers, endpoints, or CLI flags are wired up in subsequent patches of this series, or if a candidate concern is fixed or refactored by the end of the series, inspect the final code state at revision \"{}\" (e.g., using git_read_files with revision=\"{}\" or git_diff with target_revision=\"{}\") and discard the concern as a false positive.\n",
+        end_ref, end_ref, end_ref
+    ));
+    block.push_str(&format!(
+        "2. If this patch adds or updates documentation or a design document (such as designs/*.md) describing changes implemented in other patches of this series, verify any code snippets or architectural claims against the actual Rust implementation in src/ at revision \"{}\" before reporting an issue. If the actual Rust implementation is sound, discard concerns about abbreviated documentation snippets.\n",
+        end_ref
     ));
     block.push_str("===================================\n");
 
@@ -1372,5 +1495,54 @@ mod tests {
         assert!(content.contains("Series End Commit (Final State): sha2"));
         assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
         assert!(content.contains("SERIES VERIFICATION DIRECTIVE:"));
+    }
+
+    #[test]
+    fn test_build_sashiko_series_context_includes_preceding_and_subsequent_patches() {
+        let patchset_first = serde_json::json!({
+            "id": 300,
+            "patch_index": 1,
+            "patches": [
+                {
+                    "index": 1,
+                    "subject": "auth: add max_bug_access claim",
+                    "commit_id": "sha1"
+                },
+                {
+                    "index": 2,
+                    "subject": "api: enforce max_bug_access on token minting",
+                    "commit_id": "sha2"
+                },
+                {
+                    "index": 3,
+                    "subject": "docs: add design document for agent bug access",
+                    "commit_id": "sha3"
+                }
+            ]
+        });
+
+        let ctx_first =
+            build_sashiko_series_context(Some("base..sha3"), &patchset_first, "sha1").unwrap();
+        assert!(ctx_first.contains("Current Patch Under Review: [Patch 1 of 3]"));
+        assert!(ctx_first.contains("Series End Commit (Final State): sha3"));
+        assert!(!ctx_first.contains("Preceding patches in this series"));
+        assert!(ctx_first.contains("Subsequent patches in this series:"));
+        assert!(ctx_first.contains("- [Patch 2 of 3] (commit sha2): api: enforce max_bug_access"));
+        assert!(ctx_first.contains("- [Patch 3 of 3] (commit sha3): docs: add design document"));
+
+        let patchset_last = serde_json::json!({
+            "id": 300,
+            "patch_index": 3,
+            "patches": patchset_first["patches"].clone()
+        });
+
+        // Even when series_range is None on the final patch, preceding patches and end_sha are provided
+        let ctx_last = build_sashiko_series_context(None, &patchset_last, "sha3").unwrap();
+        assert!(ctx_last.contains("Current Patch Under Review: [Patch 3 of 3]"));
+        assert!(ctx_last.contains("Series End Commit (Final State): sha3"));
+        assert!(ctx_last.contains("Preceding patches in this series"));
+        assert!(ctx_last.contains("- [Patch 1 of 3] (commit sha1): auth: add max_bug_access"));
+        assert!(ctx_last.contains("- [Patch 2 of 3] (commit sha2): api: enforce max_bug_access"));
+        assert!(!ctx_last.contains("Subsequent patches in this series:"));
     }
 }

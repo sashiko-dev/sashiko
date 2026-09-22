@@ -762,6 +762,11 @@ async fn run_worker_in_worktree(
         true
     } else if let Some(commit_hash) = &options.review_commit {
         info!("Directly reviewing commit {}", commit_hash);
+        for p in &patches {
+            if let Some(sha) = &p.commit_id {
+                patch_shas.insert(p.index, sha.clone());
+            }
+        }
         if let Some(idx) = options.review_patch_index {
             patch_shas.insert(idx, commit_hash.clone());
             if let Ok(show) = worktree.get_commit_show(commit_hash).await {
@@ -897,7 +902,7 @@ async fn run_worker_in_worktree(
                 "author": p.author,
                 "date_string": date_str,
                 "diff": p.diff,
-                "commit_id": patch_shas.get(&p.index).cloned(),
+                "commit_id": patch_shas.get(&p.index).cloned().or_else(|| p.commit_id.clone()),
                 "git_show": patch_shows.get(&p.index).cloned(),
                 "commit_message_full": patch_messages.get(&p.index).cloned()
             })

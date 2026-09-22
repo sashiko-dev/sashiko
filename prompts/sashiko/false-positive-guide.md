@@ -116,9 +116,12 @@ misinterpretation it permits and what the model would do instead.
 
 ### 8. Pre-existing issues
 
-If the problem existed before this change, it is still worth reporting, but
-mark `preexisting: true`. Do not present unchanged code as something the patch
-broke. Check the surrounding context, not just the `+` lines.
+If the problem existed in the codebase before this commit/series was applied,
+you MUST mark `preexisting: true` so the workflow routes it exclusively to the
+bugs database rather than reporting it alongside new patch findings. Never mark
+an issue in unchanged code (or an existing defect merely exposed or moved by a
+refactor) as `preexisting: false`. Check the parent revision (`HEAD~1` or
+`Baseline SHA`) when in doubt, not just the `+` lines.
 
 ### 9. Test code
 
@@ -148,6 +151,30 @@ Linux AI review quality across the board (`third_party/prompts/`,
 parameters, or shared verification/deduplication logic) — and when such a change
 lacks benchmark backing, classify it as **High** severity.
 
+### 12. Patch series false positive removal and design documents
+
+Large changes are split into small, self-contained commits (`Patch 1 of N`,
+`Patch 2 of N`, ..., `Patch N of N`) so each logical layer is easier to review:
+- Example valid series:
+  - `Patch 1`: add foundational types, struct fields, or database helpers
+  - `Patch 2`: wire HTTP API endpoints and middleware to use the new helpers
+  - `Patch 3`: wire CLI subcommands and integration tests
+  - `Patch 4`: add or update architecture/design documentation (`designs/*.md`)
+
+Do not second-guess how a feature is divided across commits in a series:
+- **Work completed later in the series is not a bug:** If a candidate concern on
+  `Patch k` is simply incomplete wiring, unused helpers, or missing callers/CLI
+  integration that are completed in `Patch k+1..N`, inspect the final state of
+  the series (`Series End Commit` via `git_read_files` or `git_diff`) and
+  discard the concern as a false positive.
+- **Design and documentation commits (`designs/*.md`):** Illustrative code
+  snippets, pseudo-code, or abbreviated struct definitions in `designs/*.md` or
+  `README.md` are documentation, not compiled code. Before reporting that a
+  struct or snippet in a design document is missing `#[serde(default)]`, bounds
+  validation, or an authorization check, inspect the actual Rust implementation
+  in `src/` at the series head (`Series End Commit` / `HEAD`). If the actual
+  Rust code enforces the invariant, discard the concern.
+
 ## Before you report
 
 For each finding, confirm you can answer all of these. If you cannot answer
@@ -158,3 +185,6 @@ question you could not answer.
 2. What concrete input or sequence triggers it?
 3. What is the observable consequence?
 4. What code did you read that rules out the obvious reason this would be safe?
+5. If this commit is part of a multi-patch series, does the defect still exist at
+   the `Series End Commit` (and in the actual `src/` implementation rather than
+   an abbreviated `designs/*.md` snippet)?
