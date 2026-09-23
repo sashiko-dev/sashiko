@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::settings::CustomRemoteSettings;
+use crate::settings::{CustomRemoteSettings, SubsystemMapping};
 use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
@@ -249,6 +249,7 @@ impl BaselineRegistry {
         files: &[String],
         subject: &str,
         body: Option<&str>,
+        subsystem_mapping: &[SubsystemMapping],
     ) -> Vec<BaselineResolution> {
         let mut candidates = Vec::new();
 
@@ -275,11 +276,14 @@ impl BaselineRegistry {
             }
         }
 
-        // 2. Subsystem Heuristic
+        // 2. Explicit per-subsystem baseline configuration
+        candidates.extend(self.resolve_configured_subsystem_baselines(files, subsystem_mapping));
+
+        // 3. MAINTAINERS subsystem heuristic
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
         candidates.extend(heuristic_candidates);
 
-        // 3. Custom Remotes
+        // 4. Custom Remotes
         // Ahead of linux-next because the first candidate that applies wins,
         // and a topic-branch series usually applies to linux-next too -- but
         // against a stale snapshot: a daily build behind, and sharing no SHAs
@@ -330,11 +334,11 @@ impl BaselineRegistry {
             }
         }
 
-        // 4. Linux Next
+        // 5. Linux Next
         let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
         candidates.push(self.resolve_url(linux_next_url, None));
 
-        // 5. Mainline
+        // 6. Mainline
         // Use the identified mainline remote (Linus tree or origin) as a
         // RemoteTarget so that ensure_remote fetches it before use. A bare
         // LocalRef("HEAD") would resolve to the local checkout, which nothing
@@ -360,6 +364,41 @@ impl BaselineRegistry {
         }
 
         unique_candidates
+    }
+
+    fn resolve_configured_subsystem_baselines(
+        &self,
+        files: &[String],
+        subsystem_mapping: &[SubsystemMapping],
+    ) -> Vec<BaselineResolution> {
+        let lower_files: Vec<String> = files.iter().map(|file| file.to_lowercase()).collect();
+        let mut candidates = Vec::new();
+
+        for mapping in subsystem_mapping {
+            let Some(url) = mapping.base_tree.as_deref() else {
+                continue;
+            };
+
+            let regex = match Regex::new(&mapping.pattern) {
+                Ok(regex) => regex,
+                Err(e) => {
+                    warn!(
+                        "Ignoring invalid subsystem pattern for {}: {}",
+                        mapping.name, e
+                    );
+                    continue;
+                }
+            };
+
+            if lower_files.iter().any(|file| regex.is_match(file)) {
+                let candidate = self.resolve_url(url, mapping.base_branch.clone());
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+
+        candidates
     }
 
     fn resolve_subsystem_heuristic(
@@ -671,7 +710,7 @@ mod tests {
         let body = "Some text\nbase-commit: 1234567890123456789012345678901234567890\n";
 
         let candidates = registry
-            .resolve_candidates(&files, "Subject", Some(body))
+            .resolve_candidates(&files, "Subject", Some(body), &[])
             .await;
 
         assert_eq!(candidates.len(), 4); // Base, Subsystem, Next, Head
@@ -685,6 +724,59 @@ mod tests {
             BaselineResolution::RemoteTarget { name, .. } => assert_eq!(name, "net-next"),
             _ => panic!("Expected RemoteTarget net-next"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_configured_subsystem_baseline_precedes_maintainers() {
+        let registry = create_registry();
+        let files = vec!["net/core.c".to_string()];
+        let mappings = vec![SubsystemMapping {
+            pattern: "^net/.*".to_string(),
+            name: "networking".to_string(),
+            base_tree: Some("git://example.com/networking.git".to_string()),
+            base_branch: Some("for-next".to_string()),
+        }];
+
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, &mappings)
+            .await;
+
+        assert_eq!(
+            candidates[0],
+            BaselineResolution::RemoteTarget {
+                url: "git://example.com/networking.git".to_string(),
+                name: "networking".to_string(),
+                branch: Some("for-next".to_string()),
+            }
+        );
+        assert!(
+            candidates.iter().any(|candidate| matches!(
+                candidate,
+                BaselineResolution::RemoteTarget { name, .. } if name == "net-next"
+            )),
+            "MAINTAINERS-derived candidates should remain as fallbacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subsystem_mapping_without_base_tree_keeps_existing_order() {
+        let registry = create_registry();
+        let files = vec!["net/core.c".to_string()];
+        let mappings = vec![SubsystemMapping {
+            pattern: "^net/.*".to_string(),
+            name: "networking".to_string(),
+            base_tree: None,
+            base_branch: None,
+        }];
+
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, &mappings)
+            .await;
+
+        assert!(matches!(
+            &candidates[0],
+            BaselineResolution::RemoteTarget { name, .. } if name == "net-next"
+        ));
     }
 
     #[tokio::test]
@@ -705,7 +797,7 @@ mod tests {
             )),
         };
 
-        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidates = registry.resolve_candidates(&[], "Subject", None, &[]).await;
 
         // The mainline candidate should be a RemoteTarget for origin/master,
         // not a LocalRef("HEAD").
@@ -737,7 +829,7 @@ mod tests {
             mainline_remote: None,
         };
 
-        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidates = registry.resolve_candidates(&[], "Subject", None, &[]).await;
 
         let has_head = candidates
             .iter()
@@ -787,7 +879,9 @@ F: patterns/
         };
 
         let files = vec!["mm/memory.c".to_string()];
-        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, &[])
+            .await;
 
         // Expected order:
         // 1. mm-new (Subsystem Heuristic 1)
@@ -1025,7 +1119,9 @@ F: patterns/
         };
 
         let files = vec!["tools/perf/builtin-report.c".to_string()];
-        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+        let candidates = registry
+            .resolve_candidates(&files, "Subject", None, &[])
+            .await;
 
         // Current implementation likely only returns ONE of the trees (arbitrarily or first)
         // plus linux-next and HEAD.
@@ -1074,7 +1170,7 @@ F: patterns/
 
         // With "next" in subject
         let candidates_next = registry
-            .resolve_candidates(&files, "[PATCH net-next] something", None)
+            .resolve_candidates(&files, "[PATCH net-next] something", None, &[])
             .await;
         let names_next: Vec<String> = candidates_next
             .iter()
@@ -1091,7 +1187,7 @@ F: patterns/
 
         // Without "next" in subject
         let candidates_nonext = registry
-            .resolve_candidates(&files, "[PATCH net] something", None)
+            .resolve_candidates(&files, "[PATCH net] something", None, &[])
             .await;
         let names_nonext: Vec<String> = candidates_nonext
             .iter()
@@ -1136,7 +1232,7 @@ F: patterns/
             mainline_remote: None,
         };
 
-        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidates = registry.resolve_candidates(&[], "Subject", None, &[]).await;
 
         let candidate_names: Vec<String> = candidates
             .iter()
@@ -1174,7 +1270,7 @@ F: patterns/
             mainline_remote: None,
         };
 
-        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let candidates = registry.resolve_candidates(&[], "Subject", None, &[]).await;
         let names: Vec<String> = candidates
             .iter()
             .filter_map(|c| match c {
