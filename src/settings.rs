@@ -1056,22 +1056,29 @@ fn default_forge() -> ForgeSettings {
 }
 
 impl Settings {
-    /// Loads the settings for this process.
+    /// The settings file this process reads, in order: the path a caller
+    /// names, then SASHIKO_CONFIG, then Settings.toml in the working directory,
+    /// then the user's configuration file.
     ///
-    /// One routine for every command, so the daemon and a review cannot read
-    /// different files and disagree about what they say. In order: the path a
-    /// caller names, then SASHIKO_CONFIG, then Settings.toml in the working
-    /// directory, then the user's configuration file. Environment variables
-    /// prefixed SASHIKO are layered over whichever file wins.
-    pub fn load(named: Option<&Path>) -> Result<Self, ConfigError> {
-        let path = match named {
+    /// Separate from `load` so a caller can name the file in an error when it
+    /// fails to load.
+    pub fn resolve_path(named: Option<&Path>) -> PathBuf {
+        match named {
             Some(path) => path.to_path_buf(),
             None => match std::env::var_os("SASHIKO_CONFIG") {
                 Some(from_env) => PathBuf::from(from_env),
                 None => Self::local_review_path(),
             },
-        };
-        Self::from_file(&path)
+        }
+    }
+
+    /// Loads the settings for this process from the file `resolve_path`
+    /// chooses, with environment variables prefixed SASHIKO layered over it.
+    ///
+    /// One routine for every command, so the daemon and a review cannot read
+    /// different files and disagree about what they say.
+    pub fn load(named: Option<&Path>) -> Result<Self, ConfigError> {
+        Self::from_file(Self::resolve_path(named))
     }
 
     pub fn new() -> Result<Self, ConfigError> {

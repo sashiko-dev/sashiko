@@ -242,13 +242,32 @@ enum ColorMode {
 #[cfg(feature = "server")]
 const PARSER_VERSION: i32 = 2;
 
+/// Ends a worker that failed, reporting why on stdout, where the daemon reads
+/// a worker's result whether it succeeded or not.
+fn exit_worker_with_error(error: String) -> ! {
+    let _ = print_worker_json(&serde_json::json!({
+        "patchset_id": 0,
+        "error": error
+    }));
+    std::process::exit(1);
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let cli = Cli::parse();
 
-    // Load settings early to determine log level, but don't fail yet
-    let settings_result = Settings::new();
+    // This process's only read of the settings file: every command works from
+    // what comes back, and nothing below reads it again. A subcommand that names
+    // a file is honored here, before dispatch, so the log level comes from the
+    // same file the command works from. A failure is not fatal yet, because most
+    // commands only talk to a running server and need no settings file at all.
+    let named_settings = match &cli.command {
+        Some(Commands::Review { settings, .. }) => settings.clone(),
+        _ => None,
+    };
+    let settings_path = Settings::resolve_path(named_settings.as_deref());
+    let settings_result = Settings::load(Some(&settings_path));
 
     // Determine log level
     // 1. CLI --debug takes precedence (implies "info")
@@ -317,10 +336,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 handle_init_command(path.clone(), *force, *print, *prompts)?;
                 return Ok(());
             }
+            // What this arm passes down, and no more: --settings was read above,
+            // before dispatch, into settings_result.
             Commands::Review {
                 input,
                 baseline,
-                settings,
                 no_ai,
                 report_preexisting,
                 custom_prompt,
@@ -330,12 +350,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 agent,
                 color,
                 stages,
+                ..
             } => {
+                // The settings themselves, not the path they came from: a review
+                // does not read them again.
+                let settings = anyhow::Context::with_context(settings_result, || {
+                    format!("Failed to load settings from {}", settings_path.display())
+                })?;
                 return handle_review_command(
                     project,
                     input.clone(),
                     baseline.clone(),
-                    settings.clone(),
+                    settings,
                     *no_ai,
                     *report_preexisting,
                     custom_prompt.clone(),
@@ -348,8 +374,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await;
             }
+            // What this arm passes down, and no more. --json says nothing: a
+            // worker's input is always JSON on stdin.
             Commands::Worker {
-                json: _,
                 baseline,
                 repo,
                 worktree_dir,
@@ -363,30 +390,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stages,
                 agent,
                 report_preexisting,
+                ..
             } => {
                 std::panic::set_hook(Box::new(|info| {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
 
-                let result = run_worker_from_stdin(WorkerOptions {
-                    project,
-                    settings_path: None,
-                    baseline: baseline.clone(),
-                    repo: repo.clone(),
-                    worktree_dir: worktree_dir.clone(),
-                    prompts: resolve_prompts_path(prompts.clone(), project)?,
-                    review_patch_index: *review_patch_index,
-                    review_commit: review_commit.clone(),
-                    no_ai: *no_ai,
-                    reuse_worktree: reuse_worktree.clone(),
-                    ai_provider: ai_provider.clone(),
-                    custom_prompt: custom_prompt.clone(),
-                    stages: stages.clone(),
-                    scratch_clone: false,
-                    current_tree: false,
-                    agent: *agent,
-                    report_preexisting: *report_preexisting,
-                })
+                // Read above. A worker the daemon spawns keeps its SASHIKO_
+                // variables and working directory, so it finds the daemon's file.
+                let settings = match settings_result {
+                    Ok(settings) => settings,
+                    Err(e) => exit_worker_with_error(format!(
+                        "Failed to load settings from {}: {e}",
+                        settings_path.display()
+                    )),
+                };
+
+                let result = run_worker_from_stdin(
+                    WorkerOptions {
+                        project,
+                        baseline: baseline.clone(),
+                        repo: repo.clone(),
+                        worktree_dir: worktree_dir.clone(),
+                        prompts: resolve_prompts_path(prompts.clone(), project)?,
+                        review_patch_index: *review_patch_index,
+                        review_commit: review_commit.clone(),
+                        no_ai: *no_ai,
+                        reuse_worktree: reuse_worktree.clone(),
+                        ai_provider: ai_provider.clone(),
+                        custom_prompt: custom_prompt.clone(),
+                        stages: stages.clone(),
+                        scratch_clone: false,
+                        current_tree: false,
+                        agent: *agent,
+                        report_preexisting: *report_preexisting,
+                    },
+                    &settings,
+                )
                 .await;
 
                 match result {
@@ -394,14 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         print_worker_json(&val).map_err(Box::<dyn std::error::Error>::from)?;
                         return Ok(());
                     }
-                    Err(e) => {
-                        let err_val = serde_json::json!({
-                            "patchset_id": 0,
-                            "error": e.to_string()
-                        });
-                        let _ = print_worker_json(&err_val);
-                        std::process::exit(1);
-                    }
+                    Err(e) => exit_worker_with_error(e.to_string()),
                 }
             }
         }
@@ -2202,7 +2235,7 @@ async fn handle_review_command(
     project: ProjectId,
     input: String,
     baseline: Option<String>,
-    settings_path: Option<PathBuf>,
+    settings: Settings,
     no_ai: bool,
     report_preexisting: bool,
     custom_prompt: Option<String>,
@@ -2426,7 +2459,6 @@ async fn handle_review_command(
         ReviewOptions {
             project,
             baseline,
-            settings_path,
             prompts,
             no_ai,
             ai_provider,
@@ -2435,6 +2467,7 @@ async fn handle_review_command(
             agent,
             report_preexisting,
         },
+        &settings,
         Some(&progress),
     )
     .await;

@@ -33,10 +33,12 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::{error, info};
 
+/// What a worker is asked to do. Like `ReviewOptions`, it carries no settings
+/// path: the settings arrive as themselves, read once by whoever started the
+/// process.
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
     pub project: crate::project::ProjectId,
-    pub settings_path: Option<PathBuf>,
     pub baseline: Option<String>,
     pub repo: Option<PathBuf>,
     pub worktree_dir: Option<PathBuf>,
@@ -58,7 +60,6 @@ impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
             project: crate::project::ProjectId::Linux,
-            settings_path: None,
             baseline: None,
             repo: None,
             worktree_dir: None,
@@ -79,10 +80,11 @@ impl Default for WorkerOptions {
 }
 
 #[derive(Clone, Debug)]
+/// What a local review is asked to do. The settings it works from arrive
+/// separately, already read by the process that starts it.
 pub struct ReviewOptions {
     pub project: crate::project::ProjectId,
     pub baseline: Option<String>,
-    pub settings_path: Option<PathBuf>,
     pub prompts: PathBuf,
     pub no_ai: bool,
     pub ai_provider: Option<String>,
@@ -97,7 +99,6 @@ impl Default for ReviewOptions {
         Self {
             project: crate::project::ProjectId::Linux,
             baseline: None,
-            settings_path: None,
             prompts: PathBuf::from("third_party/prompts/kernel"),
             no_ai: false,
             ai_provider: None,
@@ -259,6 +260,7 @@ pub async fn run_git_review(
     repo_path: PathBuf,
     input: String,
     options: ReviewOptions,
+    settings: &Settings,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     let (review_input, shas) = build_review_input_from_git(&repo_path, &input, progress).await?;
@@ -271,10 +273,6 @@ pub async fn run_git_review(
         review_input,
         WorkerOptions {
             project: options.project,
-            // Passed along as it came, rather than resolved to a path here: an
-            // unnamed file is `Settings::load`'s to find, and it consults
-            // SASHIKO_CONFIG on the way, which naming a path would skip.
-            settings_path: options.settings_path,
             baseline,
             prompts: options.prompts,
             no_ai: options.no_ai,
@@ -287,6 +285,7 @@ pub async fn run_git_review(
             ..WorkerOptions::default()
         },
         Some(repo_path),
+        settings,
         progress,
     )
     .await
@@ -296,25 +295,19 @@ pub async fn run_worker(
     input: ReviewInput,
     options: WorkerOptions,
     repo_override: Option<PathBuf>,
+    settings: &Settings,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    // One load, through the routine every command uses. There used to be three
-    // branches here, differing in which loader they reached for and therefore in
-    // which file they could end up reading.
-    let settings =
-        Settings::load(options.settings_path.as_deref()).with_context(|| {
-            match &options.settings_path {
-                Some(path) => format!("Failed to load settings from {}", path.display()),
-                None => "Failed to load settings".to_string(),
-            }
-        })?;
-    let mut ai = settings.ai;
+    // Handed in, because the process read them once already. Nothing here opens
+    // the settings file: a review and the command that started it are one
+    // process, and one process has one set of settings.
+    let mut ai = settings.ai.clone();
     let concurrency = settings.review.concurrency;
     let timeout_seconds = settings.review.timeout_seconds;
     // The tree named by the settings file, which is how a daemon's worker finds
     // one. A caller that brought its own repository overrides this below, which
     // is every local review: it reviews the tree it was run in.
-    let configured_repo_path = Some(settings.git.repository_path)
+    let configured_repo_path = Some(settings.git.repository_path.as_str())
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from);
 
@@ -1172,14 +1165,21 @@ async fn run_worker_in_worktree(
     Ok(combined_result)
 }
 
-pub async fn run_worker_from_stdin(options: WorkerOptions) -> Result<Value> {
+pub async fn run_worker_from_stdin(options: WorkerOptions, settings: &Settings) -> Result<Value> {
     let mut buffer = String::new();
     if std::io::stdin().read_line(&mut buffer)? == 0 {
         return Err(anyhow!("No input provided on stdin"));
     }
     let input: ReviewInput = serde_json::from_str(&buffer)?;
     let repo_override = options.repo.clone();
-    run_worker(input, options, repo_override, Some(&progress_to_stderr)).await
+    run_worker(
+        input,
+        options,
+        repo_override,
+        settings,
+        Some(&progress_to_stderr),
+    )
+    .await
 }
 
 /// The line prefix `progress_to_stderr` writes and `sashiko-cli local` keys
