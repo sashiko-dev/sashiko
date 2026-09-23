@@ -270,6 +270,10 @@ pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErro
     }
 }
 
+pub(crate) fn is_permanent_transport_error(e: &reqwest::Error) -> bool {
+    e.is_builder() || e.is_redirect()
+}
+
 /// Classifies AI errors through typed provider and stdio error downcasts.
 pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<RemoteAiError>() {
@@ -714,6 +718,8 @@ pub mod openai;
 pub mod proxy;
 pub mod quota;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod test_http;
 pub mod token_budget;
 pub mod truncator;
 #[cfg(feature = "server")]
