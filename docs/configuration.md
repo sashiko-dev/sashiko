@@ -227,6 +227,11 @@ Optional array of additional git remotes to track.
 | `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` is also true, these are appended to the full branch list rather than replacing it. |
 
 Baselines are tried in order and the first one the series applies to wins.
+A tree taken from a MAINTAINERS `T:` entry without a branch resolves to the
+remote's HEAD. When that HEAD is a strict ancestor of the local mainline ref,
+it is tried after every other candidate instead of in its usual place: it has
+no commit that mainline lacks, and on some trees HEAD points to a commit dated
+years ago.
 Custom remotes are tried after any `base-commit:` trailer and the MAINTAINERS
 subsystem heuristic, but **before** linux-next and mainline. A subsystem topic
 branch is where a series was actually developed, whereas linux-next carries a

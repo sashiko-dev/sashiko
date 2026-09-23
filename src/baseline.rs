@@ -21,6 +21,38 @@ use std::path::Path;
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
+pub const LINUX_NEXT_URL: &str =
+    "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
+
+/// Limit on waiting for each git command of the ancestry check; the check
+/// runs two. With a commit-graph each takes milliseconds even on a kernel
+/// repository.
+const OFFLINE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A git command for a local query. In a partial clone git otherwise
+/// fetches a missing object from the promisor remote; GIT_NO_LAZY_FETCH
+/// stops that in git versions that support it.  Versions without it,
+/// such as 2.44.0, ignore it; 2.43.5 has it as a backport.
+fn offline_git(repo_path: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut cmd = crate::git_cmd::in_dir_async(repo_path);
+    cmd.env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    cmd
+}
+
+/// Runs offline_git(), giving up on the wait after OFFLINE_GIT_TIMEOUT;
+/// kill_on_drop then asks for the child to be killed. None on spawn
+/// failure or timeout.
+async fn run_offline_git(repo_path: &Path, args: &[&str]) -> Option<std::process::Output> {
+    tokio::time::timeout(OFFLINE_GIT_TIMEOUT, offline_git(repo_path, args).output())
+        .await
+        .ok()?
+        .ok()
+}
+
 #[derive(Debug, Clone)]
 pub struct MaintainersEntry {
     pub subsystem: String,
@@ -140,6 +172,53 @@ impl BaselineRegistry {
             .as_ref()
             .map(|(_, name)| name.as_str())
             .unwrap_or("origin")
+    }
+
+    /// Whether a candidate is a remote's default HEAD that resolved to a
+    /// strict ancestor of the local mainline ref.
+    ///
+    /// A MAINTAINERS T: entry without a branch yields the remote's HEAD,
+    /// a branch nobody chose for patch application. On some trees it
+    /// points to a commit dated years ago (tytso/ext4.git, whose HEAD is a
+    /// merge from 2020), and a small patch still applies there with an
+    /// offset, so the review would run against old code.
+    ///
+    /// Such a HEAD has no commit that mainline lacks. The caller tries it
+    /// after the other candidates rather than dropping it. This is not a
+    /// test of whether the tree is abandoned: a live tree's branch can
+    /// also sit on a mainline commit for a while after a merge window, and
+    /// is then tried after linux-next and mainline too.
+    ///
+    /// Explicit branches, base-commit trailers, version tags and
+    /// linux-next are left alone. Git runs with GIT_NO_LAZY_FETCH set and
+    /// a timeout on each wait, and any error means "do not defer".
+    pub async fn is_merged_default_head(&self, candidate: &BaselineResolution, sha: &str) -> bool {
+        match candidate {
+            BaselineResolution::RemoteTarget {
+                url, branch: None, ..
+            } if url != LINUX_NEXT_URL => {}
+            _ => return false,
+        }
+
+        let mainline_ref = format!("{}/master^{{commit}}", self.mainline_remote_name());
+        let tip = match run_offline_git(
+            &self.repo_path,
+            &["rev-parse", "--verify", "--quiet", "--end-of-options", &mainline_ref],
+        )
+        .await
+        {
+            Some(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            _ => return false,
+        };
+        if tip == sha {
+            return false;
+        }
+
+        run_offline_git(&self.repo_path, &["merge-base", "--is-ancestor", sha, &tip])
+            .await
+            .is_some_and(|out| out.status.success())
     }
 
     fn read_file_from_git(repo_path: &Path, rev: &str, file_path: &str) -> Result<String> {
@@ -331,8 +410,7 @@ impl BaselineRegistry {
         }
 
         // 4. Linux Next
-        let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
-        candidates.push(self.resolve_url(linux_next_url, None));
+        candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
 
         // 5. Mainline
         // Use the identified mainline remote (Linus tree or origin) as a
@@ -1147,6 +1225,137 @@ F: patterns/
             .collect();
 
         assert!(candidate_names.contains(&"dummy-repo".to_string()));
+    }
+
+    /// Runs git in the test repository and returns its trimmed stdout.
+    async fn git(repo: &Path, args: &[&str]) -> String {
+        let out = crate::git_cmd::in_dir_async(repo)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repository whose mainline remote "origin" has the history
+    /// old -> mid -> tip, plus a commit "side" that branches off mid and
+    /// is not in mainline. Returns the registry and the four SHAs.
+    async fn merged_head_fixture(dir: &Path) -> (BaselineRegistry, String, String, String, String) {
+        git(dir, &["init", "--quiet"]).await;
+        git(dir, &["config", "user.email", "test@example.com"]).await;
+        git(dir, &["config", "user.name", "Test User"]).await;
+        let mut shas = Vec::new();
+        for msg in ["old", "mid", "tip"] {
+            git(dir, &["commit", "--quiet", "--allow-empty", "-m", msg]).await;
+            shas.push(git(dir, &["rev-parse", "HEAD"]).await);
+        }
+        git(dir, &["update-ref", "refs/remotes/origin/master", &shas[2]]).await;
+        git(dir, &["checkout", "--quiet", "--detach", &shas[1]]).await;
+        git(dir, &["commit", "--quiet", "--allow-empty", "-m", "side"]).await;
+        let side = git(dir, &["rev-parse", "HEAD"]).await;
+
+        let url = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git";
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: dir.to_path_buf(),
+            mainline_remote: Some((url.to_string(), "origin".to_string())),
+        };
+        let [old, mid, tip]: [String; 3] = shas.try_into().unwrap();
+        (registry, old, mid, tip, side)
+    }
+
+    fn default_head(name: &str) -> BaselineResolution {
+        BaselineResolution::RemoteTarget {
+            url: format!("git://git.kernel.org/pub/scm/linux/kernel/git/{}.git", name),
+            name: name.to_string(),
+            branch: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merged_default_head_is_detected() {
+        // tytso/ext4.git: the T: entry names no branch and HEAD is a
+        // master that mainline passed years ago.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, old, mid, _, _) = merged_head_fixture(dir.path()).await;
+
+        let ext4 = default_head("tytso/ext4");
+        assert!(registry.is_merged_default_head(&ext4, &old).await);
+        assert!(registry.is_merged_default_head(&ext4, &mid).await);
+    }
+
+    #[tokio::test]
+    async fn test_current_default_head_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, _, tip, side) = merged_head_fixture(dir.path()).await;
+
+        let tree = default_head("some/tree");
+        // Level with mainline: nothing is stale yet.
+        assert!(!registry.is_merged_default_head(&tree, &tip).await);
+        // Carries work mainline does not have.
+        assert!(!registry.is_merged_default_head(&tree, &side).await);
+    }
+
+    #[tokio::test]
+    async fn test_chosen_baselines_are_never_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, old, _, _, _) = merged_head_fixture(dir.path()).await;
+
+        let explicit_branch = BaselineResolution::RemoteTarget {
+            url: "git://git.kernel.org/pub/scm/linux/kernel/git/tytso/ext4.git".to_string(),
+            name: "ext4".to_string(),
+            branch: Some("dev".to_string()),
+        };
+        let base_commit = BaselineResolution::Commit(old.clone());
+        let version_tag = BaselineResolution::LocalRef("v5.10".to_string());
+        for candidate in [explicit_branch, base_commit, version_tag] {
+            assert!(
+                !registry.is_merged_default_head(&candidate, &old).await,
+                "{:?} was chosen by someone and must not be deferred",
+                candidate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_linux_next_is_never_deferred() {
+        // linux-next is also a candidate without a branch.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, old, _, _, _) = merged_head_fixture(dir.path()).await;
+
+        let next = BaselineResolution::RemoteTarget {
+            url: LINUX_NEXT_URL.to_string(),
+            name: "linux-next".to_string(),
+            branch: None,
+        };
+        assert!(!registry.is_merged_default_head(&next, &old).await);
+    }
+
+    #[test]
+    fn test_offline_git_disables_lazy_fetch() {
+        let cmd = offline_git(Path::new("."), &["rev-parse", "HEAD"]);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("GIT_NO_LAZY_FETCH"),
+            Some(std::ffi::OsStr::new("1"))
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_merged_default_head_without_mainline_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut registry, old, _, _, _) = merged_head_fixture(dir.path()).await;
+
+        // No mainline ref to compare against: keep the old behaviour.
+        registry.mainline_remote = Some(("unused".to_string(), "nosuch".to_string()));
+        assert!(
+            !registry
+                .is_merged_default_head(&default_head("tytso/ext4"), &old)
+                .await
+        );
     }
 
     #[tokio::test]

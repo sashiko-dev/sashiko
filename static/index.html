@@ -3591,6 +3591,8 @@
                              let statusBadge = '';
                              if (item.status === 'Applied') {
                                  statusBadge = '<span class="status-badge status-Applied">Applied</span>';
+                             } else if (item.status === 'Skipped') {
+                                 statusBadge = '<span class="status-badge status-Skipped">Skipped</span>';
                              } else {
                                  statusBadge = '<span class="status-badge status-Failed">Failed</span>';
                              }

@@ -1015,7 +1015,12 @@ impl Reviewer {
         let mainline_remote = ctx.baseline_registry.mainline_remote_name();
         let mut tested_shas = std::collections::HashSet::new();
 
-        for candidate in candidates {
+        // A candidate already merged into mainline goes to the back of the
+        // queue, flagged so that it is not deferred a second time.
+        let mut queue: std::collections::VecDeque<(&BaselineResolution, bool)> =
+            candidates.iter().map(|c| (c, false)).collect();
+
+        while let Some((candidate, deferred)) = queue.pop_front() {
             let baseline_ref = candidate.as_str();
             let mut current_log = format!("Trying baseline: {}\n", baseline_ref);
             let mut current_status = "Failed".to_string();
@@ -1116,6 +1121,26 @@ impl Reviewer {
                     }
                 }
             };
+
+            if !deferred
+                && ctx
+                    .baseline_registry
+                    .is_merged_default_head(candidate, &baseline_sha)
+                    .await
+            {
+                current_log.push_str(&format!(
+                    "{} is already merged into {}/master; deferring it until \
+                     the other candidates have been tried.\n",
+                    baseline_sha, mainline_remote
+                ));
+                attempts.push(BaselineAttempt {
+                    baseline: format!("{} ({})", baseline_ref, baseline_sha),
+                    status: "Skipped".to_string(),
+                    log: current_log,
+                });
+                queue.push_back((candidate, true));
+                continue;
+            }
 
             if !tested_shas.insert(baseline_sha.clone()) {
                 info!("Skipping duplicate baseline SHA {}", baseline_sha);
@@ -3325,6 +3350,190 @@ fi
 
         assert_eq!(result["patches"][0]["status"], "applied");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// Runs git in a test directory and fails the test if it fails.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = crate::git_cmd::in_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+    }
+
+    /// A review repository with two remotes: "origin", mainline, whose
+    /// history is old -> tip, and "stale", whose HEAD is still at old.
+    /// Between old and tip, mainline rewrites mainline.txt and leaves
+    /// shared.txt alone.
+    fn stale_head_fixture(root: &Path) -> PathBuf {
+        let upstream = root.join("linux.git");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git_in(&upstream, &["init", "--quiet", "--initial-branch=master"]);
+        git_in(&upstream, &["config", "user.email", "test@example.com"]);
+        git_in(&upstream, &["config", "user.name", "Test User"]);
+        std::fs::write(upstream.join("shared.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(upstream.join("mainline.txt"), "old\n").unwrap();
+        git_in(&upstream, &["add", "shared.txt", "mainline.txt"]);
+        git_in(&upstream, &["commit", "--quiet", "-m", "old"]);
+        git_in(&upstream, &["branch", "stale-master"]);
+        std::fs::write(upstream.join("mainline.txt"), "new\n").unwrap();
+        git_in(&upstream, &["commit", "--quiet", "--all", "-m", "tip"]);
+
+        let stale = root.join("stale.git");
+        let stale_str = stale.to_str().unwrap();
+        git_in(
+            root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                "--branch=stale-master",
+                upstream.to_str().unwrap(),
+                stale_str,
+            ],
+        );
+
+        let repo = root.join("review");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "--quiet"]);
+        git_in(
+            &repo,
+            &["remote", "add", "origin", upstream.to_str().unwrap()],
+        );
+        git_in(&repo, &["remote", "add", "stale", stale_str]);
+        for remote in ["origin", "stale"] {
+            git_in(&repo, &["fetch", "--quiet", remote]);
+            git_in(&repo, &["remote", "set-head", remote, "--auto"]);
+        }
+        repo
+    }
+
+    async fn stale_head_context(root: &Path, repo: &Path) -> Result<ReviewContext> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.git.repository_path = repo.to_str().unwrap().to_string();
+        settings.review.worktree_dir = root.join("worktrees").to_str().unwrap().to_string();
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        Ok(ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db,
+            settings,
+            baseline_registry: Arc::new(BaselineRegistry::new(repo, None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        })
+    }
+
+    fn stale_head_candidates(repo: &Path) -> Vec<BaselineResolution> {
+        let url = |name: &str| {
+            repo.parent()
+                .unwrap()
+                .join(name)
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        vec![
+            BaselineResolution::RemoteTarget {
+                url: url("stale.git"),
+                name: "stale".to_string(),
+                branch: None,
+            },
+            BaselineResolution::RemoteTarget {
+                url: url("linux.git"),
+                name: "origin".to_string(),
+                branch: Some("master".to_string()),
+            },
+        ]
+    }
+
+    fn one_patch(diff: &str) -> Vec<(i64, i64, String, String, String, i64, String)> {
+        vec![(
+            1,
+            1,
+            diff.to_string(),
+            "[PATCH] test".to_string(),
+            "Test User <test@example.com>".to_string(),
+            1_000_000_000,
+            "msg@example.com".to_string(),
+        )]
+    }
+
+    fn attempt_statuses(logs_json: &str) -> Vec<(String, String)> {
+        let logs: Vec<Value> = serde_json::from_str(logs_json).unwrap();
+        logs.iter()
+            .map(|a| {
+                let name = a["baseline"].as_str().unwrap();
+                let name = name.split(' ').next().unwrap().to_string();
+                (name, a["status"].as_str().unwrap().to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_merged_default_head_is_tried_after_mainline() -> Result<()> {
+        // tytso/ext4.git: HEAD is a master mainline passed years ago,
+        // and the patch applies there as well as to mainline.
+        let root = tempdir()?;
+        let repo = stale_head_fixture(root.path());
+        let ctx = stale_head_context(root.path(), &repo).await?;
+        let diff = "diff --git a/shared.txt b/shared.txt\n\
+                    --- a/shared.txt\n\
+                    +++ b/shared.txt\n\
+                    @@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+
+        let (chosen, _, logs) = Reviewer::prepare_baseline_worktree(
+            &ctx,
+            1,
+            &stale_head_candidates(&repo),
+            &one_patch(diff),
+        )
+        .await;
+
+        let (candidate, _, worktree) = chosen.expect("mainline should apply");
+        assert_eq!(candidate.as_str(), "origin/master");
+        assert_eq!(
+            attempt_statuses(&logs),
+            vec![
+                ("stale/HEAD".to_string(), "Skipped".to_string()),
+                ("origin/master".to_string(), "Applied".to_string()),
+            ]
+        );
+        worktree.remove().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merged_default_head_is_still_tried_last() -> Result<()> {
+        // A series that applies only to the merged HEAD is still reviewed.
+        let root = tempdir()?;
+        let repo = stale_head_fixture(root.path());
+        let ctx = stale_head_context(root.path(), &repo).await?;
+        let diff = "diff --git a/mainline.txt b/mainline.txt\n\
+                    --- a/mainline.txt\n\
+                    +++ b/mainline.txt\n\
+                    @@ -1 +1 @@\n-old\n+older\n";
+
+        let (chosen, _, logs) = Reviewer::prepare_baseline_worktree(
+            &ctx,
+            1,
+            &stale_head_candidates(&repo),
+            &one_patch(diff),
+        )
+        .await;
+
+        let (candidate, _, worktree) = chosen.expect("the merged HEAD should apply");
+        assert_eq!(candidate.as_str(), "stale/HEAD");
+        assert_eq!(
+            attempt_statuses(&logs),
+            vec![
+                ("stale/HEAD".to_string(), "Skipped".to_string()),
+                ("origin/master".to_string(), "Failed".to_string()),
+                ("stale/HEAD".to_string(), "Applied".to_string()),
+            ]
+        );
+        worktree.remove().await?;
         Ok(())
     }
 
