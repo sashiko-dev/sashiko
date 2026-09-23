@@ -198,7 +198,8 @@ cc = ["kvm@vger.kernel.org"]
 [subsystems.linux-modules]
 lists = ["linux-modules@vger.kernel.org"]
 reply_to_author = true
-cc = ["linux-modules@vger.kernel.org"]
+cc = ["linux-modules@vger.kernel.org",
+      "Petr Pavlu <petr.pavlu@suse.com>"]
 
 [subsystems.nova-gpu]
 lists = ["nova-gpu@lists.linux.dev"]
