@@ -646,12 +646,24 @@ impl Reviewer {
                 })
                 .unwrap_or_default();
 
-            let input_payload = json!({
-                "id": patchset_id,
-                "message_id": patchset_msg_id,
-                "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
-                "patches": patches_json
-            });
+            let cover_letter = match ctx.db.get_cover_letter_body(patchset_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "Failed to look up the cover letter for patchset {}: {}",
+                        patchset_id, e
+                    );
+                    None
+                }
+            };
+
+            let input_payload = build_input_payload(
+                patchset_id,
+                &patchset_msg_id,
+                patchset.subject.as_deref().unwrap_or("Unknown"),
+                patches_json,
+                cover_letter,
+            );
 
             let skip_filters: Vec<String> = patchset
                 .skip_filters
@@ -2943,6 +2955,28 @@ impl Reviewer {
     }
 }
 
+/// The JSON a review worker reads from stdin; it deserialises as
+/// [`crate::worker::ReviewInput`]. `cover_letter` is left out when there is
+/// none, so the payload stays as it was for series without one.
+fn build_input_payload(
+    patchset_id: i64,
+    message_id: &str,
+    subject: &str,
+    patches: Vec<Value>,
+    cover_letter: Option<String>,
+) -> Value {
+    let mut payload = json!({
+        "id": patchset_id,
+        "message_id": message_id,
+        "subject": subject,
+        "patches": patches
+    });
+    if let Some(cover_letter) = cover_letter {
+        payload["cover_letter"] = json!(cover_letter);
+    }
+    payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4161,5 +4195,56 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .collect();
         assert!(args.contains(&"worker".to_string()));
         Ok(())
+    }
+
+    fn one_patch() -> Vec<Value> {
+        vec![json!({
+            "index": 1,
+            "diff": "diff --git a/f.c b/f.c\n+int x;",
+            "subject": "[PATCH 1/1] f: add x",
+            "author": "A <a@example.com>",
+            "date": 1000,
+            "message_id": "p1@example.com",
+            "commit_id": null
+        })]
+    }
+
+    #[test]
+    fn test_input_payload_carries_the_cover_letter_to_the_worker() {
+        let letter = "Why this series exists.\n";
+        let payload = build_input_payload(
+            7,
+            "cover@example.com",
+            "[PATCH 0/1] f: add x",
+            one_patch(),
+            Some(letter.to_string()),
+        );
+        let input: crate::worker::ReviewInput =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert_eq!(input.id, 7);
+        assert_eq!(input.patches.len(), 1);
+        assert_eq!(input.cover_letter.as_deref(), Some(letter));
+    }
+
+    #[test]
+    fn test_input_payload_without_cover_letter_is_unchanged() {
+        let payload =
+            build_input_payload(7, "p1@example.com", "[PATCH] f: add x", one_patch(), None);
+        assert!(payload.get("cover_letter").is_none());
+        let input: crate::worker::ReviewInput =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert_eq!(input.cover_letter, None);
+        // Serialising it again must not grow a null field either.
+        let again = serde_json::to_value(&input).unwrap();
+        assert!(again.get("cover_letter").is_none());
+    }
+
+    #[test]
+    fn test_worker_accepts_payload_from_before_cover_letters() {
+        // A payload as the daemon wrote it before the field existed.
+        let old = r#"{"id":3,"message_id":"m@example.com","subject":"s","patches":[]}"#;
+        let input: crate::worker::ReviewInput = serde_json::from_str(old).unwrap();
+        assert_eq!(input.id, 3);
+        assert_eq!(input.cover_letter, None);
     }
 }

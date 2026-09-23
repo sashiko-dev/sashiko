@@ -1367,6 +1367,43 @@ impl Database {
         }
     }
 
+    /// Body of the cover letter of `patchset_id`, if it has one.
+    ///
+    /// `cover_letter_message_id` names the series, not necessarily a cover
+    /// letter: for a single patch or a series posted without one it is a
+    /// patch's own Message-ID, and for a git-fetched series it is synthetic.
+    /// A reply such as "Re: [PATCH 0/3]" can end up there too. Only a message
+    /// that announces part 0, has no reply prefix and comes from the series'
+    /// author counts, and only once it has been ingested with a non-empty
+    /// body. A "(was: ...)" note does not disqualify it, since a renamed
+    /// series' cover letter carries one.
+    pub async fn get_cover_letter_body(&self, patchset_id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT m.subject, m.author, ps.author, m.body FROM patchsets ps
+                 JOIN messages m ON m.message_id = ps.cover_letter_message_id
+                 WHERE ps.id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let subject: String = row.get(0).unwrap_or_default();
+        let message_author: String = row.get(1).unwrap_or_default();
+        let series_author: String = row.get(2).unwrap_or_default();
+        if crate::patch::parse_subject_index(&subject).0 != 0
+            || crate::patch::has_reply_prefix(&subject)
+            || !crate::patch::authors_match(&message_author, &series_author)
+        {
+            return Ok(None);
+        }
+        let body = crate::compression::get_compressed_string_opt(&row, 3)?;
+        Ok(body.filter(|b| !b.trim().is_empty()))
+    }
+
     pub async fn new(settings: &DatabaseSettings) -> Result<Self> {
         info!(
             "Connecting to database at {}",
@@ -14330,6 +14367,127 @@ mod tests {
                 .unwrap(),
             "a message that was never ingested announces nothing"
         );
+    }
+
+    /// The daemon shows a series' cover letter to the reviewer, so only a
+    /// real, ingested part 0 from the series' author may come back, never a
+    /// patch standing in as the series identity or somebody's reply.
+    #[tokio::test]
+    async fn test_get_cover_letter_body_only_returns_a_real_cover_letter() {
+        let db = setup_db().await;
+        let author = "Author <a@example.com>";
+        let add_message_from =
+            |from: &'static str, id: &'static str, subject: &'static str, body: &'static str| {
+                let db = db.clone();
+                async move {
+                    let t = db.create_thread(id, subject, 1000).await.unwrap();
+                    db.create_message(id, t, None, from, subject, 1000, body, "", "", None, None)
+                        .await
+                        .unwrap();
+                    t
+                }
+            };
+        let add_message = |id: &'static str, subject: &'static str, body: &'static str| {
+            add_message_from(author, id, subject, body)
+        };
+        let stored_cover_id = |ps: i64| {
+            let db = db.clone();
+            async move {
+                let mut rows = db
+                    .conn
+                    .query(
+                        "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
+                        libsql::params![ps],
+                    )
+                    .await
+                    .unwrap();
+                let row = rows.next().await.unwrap().unwrap();
+                row.get::<String>(0).unwrap()
+            }
+        };
+        let add_patchset = |t: i64, cover: &'static str, subject: &'static str, total: u32| {
+            let db = db.clone();
+            async move {
+                db.create_patchset(
+                    t,
+                    Some(cover),
+                    cover,
+                    subject,
+                    author,
+                    1000,
+                    total,
+                    0,
+                    "",
+                    "",
+                    None,
+                    0,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+
+        // A series with a cover letter.
+        let letter = "Patch 2 relies on the helper patch 1 adds.\n";
+        let t = add_message("cover@example.com", "[PATCH 0/2] f: add x", letter).await;
+        let ps = add_patchset(t, "cover@example.com", "[PATCH 0/2] f: add x", 2).await;
+        assert_eq!(
+            db.get_cover_letter_body(ps).await.unwrap().as_deref(),
+            Some(letter)
+        );
+
+        // A single patch names the series after itself.
+        let t = add_message("single@example.com", "[PATCH] f: add y", "Adds y.\n").await;
+        let ps = add_patchset(t, "single@example.com", "[PATCH] f: add y", 1).await;
+        db.create_patch(ps, "single@example.com", 1, "diff")
+            .await
+            .unwrap();
+        assert_eq!(db.get_cover_letter_body(ps).await.unwrap(), None);
+
+        // A cover letter with nothing in it says nothing.
+        let t = add_message("empty@example.com", "[PATCH 0/3] f: add z", "  \n").await;
+        let ps = add_patchset(t, "empty@example.com", "[PATCH 0/3] f: add z", 3).await;
+        assert_eq!(db.get_cover_letter_body(ps).await.unwrap(), None);
+
+        // A reply to a cover letter announces part 0 too, but it is not one.
+        let subject = "Re: [PATCH 0/3] f: add w";
+        let t = add_message("reply@example.com", subject, "Looks fine to me.\n").await;
+        let ps = add_patchset(t, "reply@example.com", subject, 3).await;
+        assert_eq!(stored_cover_id(ps).await, "reply@example.com");
+        assert_eq!(db.get_cover_letter_body(ps).await.unwrap(), None);
+
+        // A renamed series says what it was called; that is still its cover
+        // letter.
+        let subject = "[PATCH v2 0/2] f: add u (was: f: add t)";
+        let renamed = "Renamed since v1.\n";
+        let t = add_message("renamed@example.com", subject, renamed).await;
+        let ps = add_patchset(t, "renamed@example.com", subject, 2).await;
+        assert_eq!(stored_cover_id(ps).await, "renamed@example.com");
+        assert_eq!(
+            db.get_cover_letter_body(ps).await.unwrap().as_deref(),
+            Some(renamed)
+        );
+
+        // Nor is a part 0 written by somebody other than the series' author.
+        let subject = "[PATCH 0/2] f: add v";
+        let t = add_message_from(
+            "Other <o@example.com>",
+            "other@example.com",
+            subject,
+            "Not the author's account.\n",
+        )
+        .await;
+        let ps = add_patchset(t, "other@example.com", subject, 2).await;
+        assert_eq!(stored_cover_id(ps).await, "other@example.com");
+        assert_eq!(db.get_cover_letter_body(ps).await.unwrap(), None);
+
+        // A patchset that does not exist.
+        assert_eq!(db.get_cover_letter_body(ps + 1000).await.unwrap(), None);
     }
 
     /// A series posted into somebody else's thread is named after its own

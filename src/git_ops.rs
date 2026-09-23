@@ -1514,6 +1514,178 @@ pub async fn resolve_git_range(repo_path: &Path, range: &str) -> Result<Vec<Stri
     Ok(shas)
 }
 
+/// The line `b4 prep` writes into the empty commit that holds a series' cover
+/// letter, separating the letter from b4's own tracking data.
+pub const B4_COVER_MARKER: &str = "--- b4-submit-tracking ---";
+
+/// A commit range split into the commits to review and the series' cover
+/// letter, when the range carries one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeSeries {
+    /// The commits to review, in the order the range listed them.
+    pub shas: Vec<String>,
+    /// The cover letter's text, trimmed; never blank.
+    pub cover_letter: Option<String>,
+}
+
+async fn git_stdout(repo_path: &Path, args: &[&str]) -> Result<String> {
+    let output = crate::git_cmd::in_dir_async(repo_path)
+        .args(args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn commit_parents(repo_path: &Path, sha: &str) -> Result<Vec<String>> {
+    let line = git_stdout(repo_path, &["rev-list", "--parents", "--max-count=1", sha]).await?;
+    Ok(line
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect())
+}
+
+async fn commit_body(repo_path: &Path, sha: &str) -> Result<String> {
+    git_stdout(repo_path, &["show", "--no-patch", "--format=%B", sha]).await
+}
+
+/// The cover letter in a `b4 prep` cover commit: an empty commit with one
+/// parent whose message has the b4 marker on a line of its own, followed by
+/// b4's tracking data, a JSON object with a "series" object in it. The letter
+/// is the message above the marker, and there must be one.
+async fn b4_cover_letter(repo_path: &Path, sha: &str) -> Result<Option<String>> {
+    let parents = commit_parents(repo_path, sha).await?;
+    let [parent] = parents.as_slice() else {
+        return Ok(None);
+    };
+    let trees = git_stdout(
+        repo_path,
+        &[
+            "rev-parse",
+            &format!("{sha}^{{tree}}"),
+            &format!("{parent}^{{tree}}"),
+        ],
+    )
+    .await?;
+    let mut trees = trees.lines();
+    if trees.next() != trees.next() {
+        return Ok(None);
+    }
+    let body = commit_body(repo_path, sha).await?;
+    let mut letter = Vec::new();
+    let mut lines = body.lines();
+    for line in lines.by_ref() {
+        if line.trim_end() == B4_COVER_MARKER {
+            break;
+        }
+        letter.push(line);
+    }
+    // b4 writes a comment line after the marker and then the JSON; it reads
+    // the data back from the first brace on, and so does this.
+    let tracking: String = lines.collect::<Vec<_>>().join("\n");
+    let Some(start) = tracking.find('{') else {
+        return Ok(None);
+    };
+    let is_b4_tracking = serde_json::from_str::<serde_json::Value>(&tracking[start..])
+        .ok()
+        .and_then(|v| v.get("series").map(serde_json::Value::is_object))
+        .unwrap_or(false);
+    if !is_b4_tracking {
+        return Ok(None);
+    }
+    Ok(non_blank(letter.join("\n")))
+}
+
+fn non_blank(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The message of `tip` when it is a merge that git would have made on its
+/// own: two parents, and a tree equal to what `git merge-tree` produces for
+/// them without conflicts. A merge that resolved conflicts or carries
+/// changes of its own does not qualify, nor does one that cannot be checked.
+async fn clean_merge_message(repo_path: &Path, tip: &str) -> Option<(String, String, String)> {
+    let parents = commit_parents(repo_path, tip).await.ok()?;
+    let [first, second] = parents.as_slice() else {
+        return None;
+    };
+    let merged = git_stdout(repo_path, &["merge-tree", "--write-tree", first, second])
+        .await
+        .ok()?;
+    let tree = git_stdout(repo_path, &["rev-parse", &format!("{tip}^{{tree}}")])
+        .await
+        .ok()?;
+    if merged.lines().next()?.trim() != tree.trim() {
+        return None;
+    }
+    let message = commit_body(repo_path, tip).await.ok()?;
+    Some((first.clone(), second.clone(), message))
+}
+
+/// Find the cover letter a commit range carries, and take the commit that
+/// holds it out of the review.
+///
+/// Two conventions are recognised, and nothing else:
+///
+/// - The range ends in a merge commit with two parents, every other commit in
+///   the range is on the merged side, `tip^1..tip^2`, and the merge's tree is
+///   the one git's automatic merge of the parents gives. This is the shape of
+///   a series merged with `--no-ff`, whose merge message is its cover letter,
+///   as kernel trees record a series' or a pull's text. A merge with changes
+///   of its own, conflict resolutions included, stays in the review.
+/// - The first or last commit of the range is a `b4 prep` cover commit: empty,
+///   with one parent, and carrying b4's marker and tracking data. The letter
+///   is the text above the marker; the tracking data is not shown.
+///
+/// A merge's message wins if a range has both. A range where neither applies,
+/// or where taking the commit out would leave nothing to review, is returned
+/// unchanged and without a cover letter.
+pub async fn split_range_cover_letter(repo_path: &Path, shas: &[String]) -> Result<RangeSeries> {
+    let mut rest: Vec<String> = shas.to_vec();
+    let mut cover_letter = None;
+
+    if rest.len() >= 2 {
+        let tip = rest[rest.len() - 1].clone();
+        if let Some((first, second, message)) = clean_merge_message(repo_path, &tip).await {
+            let mut merged = resolve_git_range(repo_path, &format!("{first}..{second}"))
+                .await
+                .unwrap_or_default();
+            merged.sort();
+            let mut others = rest[..rest.len() - 1].to_vec();
+            others.sort();
+            if !merged.is_empty() && merged == others {
+                rest.pop();
+                cover_letter = non_blank(message);
+            }
+        }
+    }
+
+    if rest.len() >= 2 {
+        let first = rest[0].clone();
+        let last = rest[rest.len() - 1].clone();
+        if let Some(letter) = b4_cover_letter(repo_path, &first).await? {
+            rest.remove(0);
+            cover_letter = cover_letter.or(Some(letter));
+        } else if let Some(letter) = b4_cover_letter(repo_path, &last).await? {
+            rest.pop();
+            cover_letter = cover_letter.or(Some(letter));
+        }
+    }
+
+    Ok(RangeSeries {
+        shas: rest,
+        cover_letter,
+    })
+}
+
 /// Extract patch metadata from a commit using `git show`.
 pub async fn extract_patch_metadata(repo_path: &Path, commit: &str) -> Result<PatchMetadata> {
     // Resolve parent to use as base_commit
