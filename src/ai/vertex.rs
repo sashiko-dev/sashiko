@@ -98,7 +98,7 @@ fn build_endpoint_url(region: &str, project_id: &str, model: &str, info: &Endpoi
     );
 
     match region {
-        "global" => format!("https://global-aiplatform.googleapis.com/{path}"),
+        "global" => format!("https://aiplatform.googleapis.com/{path}"),
         "us" | "eu" => {
             format!("https://aiplatform.{region}.rep.googleapis.com/{path}")
         }
@@ -324,7 +324,7 @@ mod tests {
         let url = build_endpoint_url("global", "my-project", "claude-sonnet-4-6", &info);
         assert_eq!(
             url,
-            "https://global-aiplatform.googleapis.com/v1/projects/my-project/locations/global/publishers/anthropic/models/claude-sonnet-4-6:rawPredict"
+            "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/publishers/anthropic/models/claude-sonnet-4-6:rawPredict"
         );
     }
 

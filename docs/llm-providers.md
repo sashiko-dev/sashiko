@@ -190,7 +190,7 @@ gcloud auth application-default login
 
 ```bash
 export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"
-export CLOUD_ML_REGION="us-east5"  # "global" endpoint not currently supported
+export CLOUD_ML_REGION="us-east5"  # Or "global" for dynamic routing
 ```
 
 **Apply the example config:**

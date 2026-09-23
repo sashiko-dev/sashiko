@@ -114,7 +114,7 @@ Vertex AI offers three endpoint types, with pricing implications:
 
 | Type | Region value | URL pattern | Premium |
 |------|-------------|-------------|---------|
-| Global (recommended) | `"global"` | `https://global-aiplatform.googleapis.com/...` | None |
+| Global (recommended) | `"global"` | `https://aiplatform.googleapis.com/...` | None |
 | Multi-region | `"us"` or `"eu"` | `https://aiplatform.{region}.rep.googleapis.com/...` | 10% |
 | Regional | e.g. `"us-east5"` | `https://{region}-aiplatform.googleapis.com/...` | 10% |
 
@@ -145,15 +145,14 @@ that the `google-cloud-auth` crate discovers automatically.
 
 ```bash
 export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"
-export CLOUD_ML_REGION="us-east5"  # Regional endpoint (recommended)
+export CLOUD_ML_REGION="us-east5"  # Regional endpoint, or "global"
 ```
 
 These can alternatively be set in `[ai.vertex]` in Settings.toml.
 
-**Note on endpoint selection**: Regional endpoints (e.g., `us-east5`) are
-recommended over `global`. The global endpoint may not be available for all
-projects or models and can return 404 even when the model is enabled.
-Regional endpoints have a 10% pricing premium but provide reliable routing.
+**Note on endpoint selection**: `global` routes dynamically and carries no
+pricing premium. Regional endpoints (e.g., `us-east5`) pin traffic to one
+geography for data residency or provisioned throughput, at a 10% premium.
 
 ### Settings.toml Configuration
 
@@ -185,7 +184,7 @@ cargo build --features vertex --release
 | 403 Forbidden | Model not enabled | Enable model in Vertex AI Model Garden console |
 | 403 Permission denied | Missing IAM role | Grant `roles/aiplatform.user` to your principal |
 | "Unsupported model family" | Model prefix not recognized | Check model name starts with `claude-` |
-| 404 Not Found on global endpoint | Global endpoint not available for project/model | Use a regional endpoint (e.g., `us-east5`) instead of `"global"`. Global endpoint availability depends on project configuration and model enablement. |
+| 404 Not Found on global endpoint | Model not offered at the global location, or not enabled for the project | Enable the model in Model Garden, or use a regional endpoint (e.g., `us-east5`) |
 | 404 with `@version` suffix in model name | Versioned model IDs not supported for all endpoints | Use the base model name without version suffix (e.g., `claude-sonnet-4-6` not `claude-sonnet-4-6@20250514`) |
 | "quota_exceeded" or "API not enabled" after ADC warning | ADC account lacks `serviceusage.services.use` on project | Run `gcloud auth application-default set-quota-project PROJECT_ID` or grant the permission |
 
@@ -284,13 +283,14 @@ Requires GCP credentials. Manual testing steps:
 
 End-to-end integration test performed on 2026-05-07:
 
-- **Region**: `us-east5` (regional endpoint; `global` returned 404 for this project)
+- **Region**: `us-east5` (regional endpoint; `global` returned 404 at the time)
 - **Model**: `claude-sonnet-4-6` (no version suffix)
 - **Auth**: `google-cloud-auth` ADC via `gcloud auth application-default login`
 - **Result**: Full multi-stage review completed successfully
 
 Key observations:
-- Global endpoint (`global-aiplatform.googleapis.com`) returned 404; regional
+- Global endpoint returned 404 because the request went to
+  `global-aiplatform.googleapis.com`, which serves no Vertex AI API; regional
   endpoint (`us-east5-aiplatform.googleapis.com`) worked immediately
 - Model name with `@version` suffix (e.g., `claude-sonnet-4-6@20250514`) also
   returned 404; bare model name worked
