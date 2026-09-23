@@ -778,6 +778,11 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                         });
                     }
                 }
+                // Gemini rejects a Content with an empty parts array, and a
+                // turn with nothing in it carries no information anyway.
+                if parts.is_empty() {
+                    continue;
+                }
                 contents.push(Content {
                     role: "model".to_string(),
                     parts,
@@ -1560,6 +1565,50 @@ mod tests {
             Part::FunctionResponse { .. }
         ));
         assert!(matches!(gemini_req.contents[0].parts[1], Part::Text { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_request_drops_empty_assistant_turn() -> Result<()> {
+        let request = AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("Review this.".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::Assistant,
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("Now continue.".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert!(gemini_req.contents.iter().all(|c| !c.parts.is_empty()));
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "user");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
         Ok(())
     }
 
