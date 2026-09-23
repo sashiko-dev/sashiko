@@ -10,6 +10,15 @@ All settings can also be overridden via environment variables using the
 `SASHIKO` prefix with `__` (double underscore) as the separator (e.g.
 `SASHIKO__AI__PROVIDER=gemini`).
 
+Every command reads one file, the first of `--settings`, `$SASHIKO_CONFIG`,
+`Settings.toml` in the working directory, and `~/.config/sashiko.toml` (or
+`$XDG_CONFIG_HOME/sashiko.toml`).
+
+The daemon and `sashiko review` read the same shape, so one file serves both.
+`[database]`, `[server]`, and `[git]` are optional, since a local review has
+none of them; the daemon refuses to start without `[database] url`,
+`[git] repository_path`, and `[review] worktree_dir`.
+
 For LLM provider-specific setup (API keys, auth, provider features), see
 the [LLM Provider Configuration Guide](llm-providers.md).
 
@@ -260,7 +269,7 @@ pass.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `concurrency` | integer | -- | Number of concurrent reviews. |
-| `worktree_dir` | string | -- | Directory for git worktrees used during review. |
+| `worktree_dir` | string | -- | Directory for git worktrees used during daemon reviews. The daemon empties it on startup, so it must hold nothing else. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
 | `max_retries` | integer | `3` | Retry count on transient failures. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |

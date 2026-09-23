@@ -271,9 +271,10 @@ pub async fn run_git_review(
         review_input,
         WorkerOptions {
             project: options.project,
-            settings_path: options
-                .settings_path
-                .or_else(|| Some(Settings::local_review_path())),
+            // Passed along as it came, rather than resolved to a path here: an
+            // unnamed file is `Settings::load`'s to find, and it consults
+            // SASHIKO_CONFIG on the way, which naming a path would skip.
+            settings_path: options.settings_path,
             baseline,
             prompts: options.prompts,
             no_ai: options.no_ai,
@@ -297,36 +298,25 @@ pub async fn run_worker(
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency, timeout_seconds) =
-        if let Some(path) = &options.settings_path {
-            let local_settings = Settings::local_review_from_file(path)
-                .with_context(|| format!("Failed to load settings from {}", path.display()))?;
-            let review = local_settings.review;
-            (
-                local_settings.ai,
-                None,
-                review.concurrency,
-                review.timeout_seconds,
-            )
-        } else if repo_override.is_some() {
-            let local_settings = Settings::local_review_settings()
-                .context("Failed to load local review settings")?;
-            let review = local_settings.review;
-            (
-                local_settings.ai,
-                None,
-                review.concurrency,
-                review.timeout_seconds,
-            )
-        } else {
-            let settings = Settings::new().context("Failed to load settings")?;
-            (
-                settings.ai,
-                Some(PathBuf::from(settings.git.repository_path)),
-                settings.review.concurrency,
-                settings.review.timeout_seconds,
-            )
-        };
+    // One load, through the routine every command uses. There used to be three
+    // branches here, differing in which loader they reached for and therefore in
+    // which file they could end up reading.
+    let settings =
+        Settings::load(options.settings_path.as_deref()).with_context(|| {
+            match &options.settings_path {
+                Some(path) => format!("Failed to load settings from {}", path.display()),
+                None => "Failed to load settings".to_string(),
+            }
+        })?;
+    let mut ai = settings.ai;
+    let concurrency = settings.review.concurrency;
+    let timeout_seconds = settings.review.timeout_seconds;
+    // The tree named by the settings file, which is how a daemon's worker finds
+    // one. A caller that brought its own repository overrides this below, which
+    // is every local review: it reviews the tree it was run in.
+    let configured_repo_path = Some(settings.git.repository_path)
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from);
 
     if let Some(provider) = &options.ai_provider {
         ai.provider = provider.clone();

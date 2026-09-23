@@ -90,3 +90,42 @@ fn test_review_subcommand_shows_info_logs_with_debug() {
         stderr
     );
 }
+
+/// A review reads the file SASHIKO_CONFIG names, ahead of ./Settings.toml.
+/// The variable is not itself taken for a setting: those are spelled
+/// SASHIKO__SECTION__KEY, so a file that refuses unknown keys still loads.
+#[test]
+fn test_review_reads_the_file_sashiko_config_names() {
+    let bin_path = get_bin_path();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("named.toml");
+    let settings = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\n\
+                    [review]\nconcurrency = 1\n";
+
+    std::fs::write(&path, settings).unwrap();
+    let output = Command::new(&bin_path)
+        .args(["review", "HEAD", "--no-ai"])
+        .env("SASHIKO_CONFIG", &path)
+        .output()
+        .expect("Failed to execute sashiko binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "review failed: {}", stderr);
+
+    std::fs::write(&path, format!("{settings}mistyped = 1\n")).unwrap();
+    let output = Command::new(&bin_path)
+        .args(["review", "HEAD", "--no-ai"])
+        .env("SASHIKO_CONFIG", &path)
+        .output()
+        .expect("Failed to execute sashiko binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "review ignored {}",
+        path.display()
+    );
+    assert!(
+        stderr.contains("mistyped"),
+        "stderr does not name the key mistyped in that file: {}",
+        stderr
+    );
+}

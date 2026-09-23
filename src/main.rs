@@ -123,7 +123,8 @@ enum Commands {
         #[arg(long)]
         baseline: Option<String>,
 
-        /// Settings file (default: ./Settings.toml, then ~/.config/sashiko.toml)
+        /// Settings file (default: SASHIKO_CONFIG, then ./Settings.toml, then
+        /// ~/.config/sashiko.toml)
         #[arg(long)]
         settings: Option<PathBuf>,
 
@@ -460,6 +461,14 @@ async fn run_daemon(
     if let Some(stages) = cli.stages {
         settings.review.stages = Some(stages.clone());
         info!("Selected stages via --stages flag: {:?}", stages);
+    }
+
+    // The sections only a daemon reads parse as optional, because a local review
+    // reads the same file shape and has none of them. Asked for here, where a
+    // missing one is reported as itself rather than as a failed connection.
+    if let Err(reason) = settings.validate_for_daemon() {
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
     }
 
     if let Err(reason) = settings.validate_sign_in_delivery() {
@@ -1104,10 +1113,13 @@ async fn run_daemon(
     });
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 
-    // Clean up stale worktree directories on disk first
-    let worktree_path = std::path::PathBuf::from(&settings.review.worktree_dir);
-    if let Err(e) = sashiko::git_ops::cleanup_worktree_dir(&worktree_path).await {
-        error!("Failed to clean up stale worktree directories: {}", e);
+    // Clean up stale worktree directories on disk first. validate_for_daemon
+    // required the directory above, so this only unwraps it.
+    if let Some(configured) = settings.review.worktree_dir.as_deref() {
+        let worktree_path = std::path::PathBuf::from(configured);
+        if let Err(e) = sashiko::git_ops::cleanup_worktree_dir(&worktree_path).await {
+            error!("Failed to clean up stale worktree directories: {}", e);
+        }
     }
 
     // Prune stale worktrees on startup to prevent "bad object" fetch failures

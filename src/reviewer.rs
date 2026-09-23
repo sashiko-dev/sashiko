@@ -186,22 +186,24 @@ impl Reviewer {
             .initialized
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            let worktree_dir = PathBuf::from(&self.settings.review.worktree_dir);
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                if worktree_dir.exists() {
-                    info!(
-                        "Cleaning up previous worktree directory: {:?}",
-                        worktree_dir
-                    );
-                    if let Err(e) = std::fs::remove_dir_all(&worktree_dir) {
-                        error!("Failed to cleanup worktree directory: {}", e);
+            // The daemon is required to name a worktree directory, so this
+            // only unwraps what validate_for_daemon checked.
+            if let Some(worktree_dir) = self.settings.review.worktree_dir.clone().map(PathBuf::from)
+                && let Err(e) = tokio::task::spawn_blocking(move || {
+                    if worktree_dir.exists() {
+                        info!(
+                            "Cleaning up previous worktree directory: {:?}",
+                            worktree_dir
+                        );
+                        if let Err(e) = std::fs::remove_dir_all(&worktree_dir) {
+                            error!("Failed to cleanup worktree directory: {}", e);
+                        }
                     }
-                }
-                if let Err(e) = std::fs::create_dir_all(&worktree_dir) {
-                    error!("Failed to create worktree directory: {}", e);
-                }
-            })
-            .await
+                    if let Err(e) = std::fs::create_dir_all(&worktree_dir) {
+                        error!("Failed to create worktree directory: {}", e);
+                    }
+                })
+                .await
             {
                 error!("Worktree directory initialization task failed: {}", e);
             }
@@ -1393,7 +1395,7 @@ impl Reviewer {
             let worktree = match GitWorktree::new(
                 &repo_path,
                 &baseline_sha,
-                Some(Path::new(&ctx.settings.review.worktree_dir)),
+                ctx.settings.review.worktree_dir.as_deref().map(Path::new),
             )
             .await
             {
@@ -2393,12 +2395,16 @@ async fn run_review_tool_with_cmd(
             llm_semaphore.clone(),
         ),
     );
+    // Always, in practice: the daemon is required to name one. Without the flag
+    // a worker puts its worktree under the system temporary directory.
+    if let Some(dir) = settings.review.worktree_dir.as_deref() {
+        cmd.arg("--worktree-dir").arg(dir);
+    }
+
     cmd.args([
         "--json",
         "--baseline",
         baseline,
-        "--worktree-dir",
-        &settings.review.worktree_dir,
         // The worker is a fresh process with a cleared environment, so it
         // would otherwise fall back to the default project and load the
         // kernel prompts no matter what this daemon was started for.
@@ -3409,11 +3415,13 @@ mod tests {
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.git.repository_path = repo.to_string_lossy().into_owned();
-        settings.review.worktree_dir = temp_dir
-            .path()
-            .join("worktrees")
-            .to_string_lossy()
-            .into_owned();
+        settings.review.worktree_dir = Some(
+            temp_dir
+                .path()
+                .join("worktrees")
+                .to_string_lossy()
+                .into_owned(),
+        );
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -3569,11 +3577,13 @@ mod tests {
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.git.repository_path = repo.to_string_lossy().into_owned();
-        settings.review.worktree_dir = temp_dir
-            .path()
-            .join("worktrees")
-            .to_string_lossy()
-            .into_owned();
+        settings.review.worktree_dir = Some(
+            temp_dir
+                .path()
+                .join("worktrees")
+                .to_string_lossy()
+                .into_owned(),
+        );
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -4075,7 +4085,7 @@ fi
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.git.repository_path = repo.to_str().unwrap().to_string();
-        settings.review.worktree_dir = root.join("worktrees").to_str().unwrap().to_string();
+        settings.review.worktree_dir = Some(root.join("worktrees").to_str().unwrap().to_string());
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
         Ok(ReviewContext {

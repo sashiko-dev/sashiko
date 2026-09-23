@@ -126,8 +126,24 @@ fn default_true() -> bool {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct DatabaseSettings {
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub token: String,
+}
+
+/// An empty url, which is no database at all.
+///
+/// The section is optional because a local review has none and never asks. The
+/// daemon cannot run without one, which `validate_for_daemon` reports rather
+/// than letting an empty string reach a connection attempt.
+impl Default for DatabaseSettings {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -680,7 +696,9 @@ impl AclSettings {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ServerSettings {
+    #[serde(default = "default_server_host")]
     pub host: String,
+    #[serde(default = "default_server_port")]
     pub port: u16,
     /// The URL the service is reachable at from outside, without a trailing
     /// slash.
@@ -706,6 +724,31 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub acl: AclSettings,
+}
+
+fn default_server_host() -> String {
+    "::".to_string()
+}
+
+fn default_server_port() -> u16 {
+    8080
+}
+
+/// The host and port the shipped Settings.toml names, so a file that omits the
+/// section binds where one that spelled it out would.
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            host: default_server_host(),
+            port: default_server_port(),
+            public_base_url: None,
+            read_only: false,
+            testing_mode: false,
+            jwt_secret: None,
+            log_sign_in_links: false,
+            acl: AclSettings::default(),
+        }
+    }
 }
 
 impl ServerSettings {
@@ -761,8 +804,21 @@ pub struct CustomRemoteSettings {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GitSettings {
+    #[serde(default)]
     pub repository_path: String,
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+}
+
+/// No repository. A local review has none to configure, since it reviews the
+/// checkout it was run in, and `main` writes that path here. The daemon must be
+/// given one, which `validate_for_daemon` checks.
+impl Default for GitSettings {
+    fn default() -> Self {
+        Self {
+            repository_path: String::new(),
+            custom_remotes: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -770,7 +826,14 @@ pub struct GitSettings {
 #[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
-    pub worktree_dir: String,
+    /// Parent directory for the worktrees a review worker checks patches out
+    /// into, or None for one under the system temporary directory.
+    ///
+    /// Not read by `sashiko review`, which reviews commits in the checkout it
+    /// was run in and makes no worktree. The daemon must name one, because it
+    /// empties the directory on startup; `validate_for_daemon` enforces that.
+    #[serde(default)]
+    pub worktree_dir: Option<String>,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_retries")]
@@ -904,6 +967,12 @@ pub struct Settings {
     pub subsystems: SubsystemsSettings,
     #[serde(default = "default_forge")]
     pub forge: ForgeSettings,
+    /// Defaulted, like the other sections only the daemon reads. A local review
+    /// has no database and no server, so requiring those sections would mean one
+    /// file shape for the daemon and a second for a review, and two shapes can
+    /// disagree. The daemon asks for what it needs through
+    /// `validate_for_daemon` instead.
+    #[serde(default)]
     pub database: DatabaseSettings,
     #[serde(default)]
     pub nntp: NntpSettings,
@@ -911,14 +980,56 @@ pub struct Settings {
     #[serde(default)]
     pub mailing_lists: MailingListsSettings,
     pub ai: AiSettings,
+    #[serde(default)]
     pub server: ServerSettings,
+    #[serde(default)]
     pub git: GitSettings,
+    /// Not defaulted: concurrency has no answer worth guessing, since it says
+    /// how much of the machine a review may take.
     pub review: ReviewSettings,
     #[serde(default, alias = "bugs")]
     pub linux_bug: LinuxBugSettings,
 }
 
 impl Settings {
+    /// Refuses a configuration that names no database, no repository, or no
+    /// worktree directory.
+    ///
+    /// All three are optional to parse, because a local review needs none of
+    /// them and reads the same file shape. The daemon cannot work without them,
+    /// and an empty one reaching a connection attempt or a git command produces
+    /// an error far from its cause.
+    pub fn validate_for_daemon(&self) -> Result<(), String> {
+        if self.database.url.trim().is_empty() {
+            return Err(
+                "[database] url must be set: the daemon keeps every patchset, review and \
+                 finding there"
+                    .to_string(),
+            );
+        }
+        if self.git.repository_path.trim().is_empty() {
+            return Err(
+                "[git] repository_path must be set: the daemon reviews patches against a \
+                 checkout, and has no working directory to fall back on"
+                    .to_string(),
+            );
+        }
+        if self
+            .review
+            .worktree_dir
+            .as_deref()
+            .is_none_or(|dir| dir.trim().is_empty())
+        {
+            return Err(
+                "[review] worktree_dir must be set: the daemon makes a worktree per review and \
+                 empties that directory when it starts, so it needs one of its own rather than \
+                 the temporary directory a single review would use"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Whether NNTP server and tracked mailing lists are configured.
     pub fn has_nntp_config(&self) -> bool {
         !self.nntp.server.trim().is_empty() && !self.mailing_lists.track.is_empty()
@@ -944,22 +1055,27 @@ fn default_forge() -> ForgeSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct LocalReviewReviewSettings {
-    pub concurrency: usize,
-    #[serde(default = "default_review_timeout")]
-    pub timeout_seconds: u64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct LocalReviewSettings {
-    pub ai: AiSettings,
-    pub review: LocalReviewReviewSettings,
-}
 impl Settings {
+    /// Loads the settings for this process.
+    ///
+    /// One routine for every command, so the daemon and a review cannot read
+    /// different files and disagree about what they say. In order: the path a
+    /// caller names, then SASHIKO_CONFIG, then Settings.toml in the working
+    /// directory, then the user's configuration file. Environment variables
+    /// prefixed SASHIKO are layered over whichever file wins.
+    pub fn load(named: Option<&Path>) -> Result<Self, ConfigError> {
+        let path = match named {
+            Some(path) => path.to_path_buf(),
+            None => match std::env::var_os("SASHIKO_CONFIG") {
+                Some(from_env) => PathBuf::from(from_env),
+                None => Self::local_review_path(),
+            },
+        };
+        Self::from_file(&path)
+    }
+
     pub fn new() -> Result<Self, ConfigError> {
-        let path = std::env::var("SASHIKO_CONFIG").unwrap_or_else(|_| "Settings".to_string());
-        Self::from_file(path)
+        Self::load(None)
     }
 
     /// Refuses a configuration that would mail sign-in links nobody can open.
@@ -1051,39 +1167,6 @@ impl Settings {
 
         dir.join(LOCAL_TOKEN_FILE_NAME)
     }
-
-    pub fn local_review() -> Result<Self, ConfigError> {
-        Self::from_file(Self::local_review_path())
-    }
-
-    pub fn local_review_settings() -> Result<LocalReviewSettings, ConfigError> {
-        Self::local_review_from_file(Self::local_review_path())
-    }
-
-    pub fn local_review_from_file(
-        path: impl AsRef<Path>,
-    ) -> Result<LocalReviewSettings, ConfigError> {
-        let s = Config::builder()
-            .add_source(File::from(path.as_ref()))
-            .add_source(Environment::with_prefix("SASHIKO").separator("__"))
-            .build()?;
-
-        s.try_deserialize()
-    }
-
-    pub fn local_review_ai() -> Result<AiSettings, ConfigError> {
-        Self::ai_from_file(Self::local_review_path())
-    }
-
-    pub fn ai_from_file(path: impl AsRef<Path>) -> Result<AiSettings, ConfigError> {
-        let s = Config::builder()
-            .add_source(File::from(path.as_ref()))
-            .add_source(Environment::with_prefix("SASHIKO").separator("__"))
-            .build()?;
-
-        let settings: LocalReviewSettings = s.try_deserialize()?;
-        Ok(settings.ai)
-    }
 }
 
 #[cfg(test)]
@@ -1118,31 +1201,106 @@ mod tests {
         assert_eq!(toml_attr.attribution(), "custom-team");
     }
 
-    /// concurrency is required for local reviews exactly as it is for the
-    /// daemon, so an absent [review] section is an error rather than a guess
-    /// at how much machine the review has to itself.
+    /// A file with no database, server, or repository is what a local review
+    /// has, and it parses: one shape serves the daemon and a review both.
+    /// concurrency is still required.
     #[test]
-    fn test_local_review_requires_a_review_section() {
+    fn test_one_shape_reads_a_file_with_no_daemon_sections() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("Settings.toml");
         let ai = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n";
 
         std::fs::write(&path, ai).unwrap();
-        assert!(Settings::local_review_from_file(&path).is_err());
+        assert!(
+            Settings::load(Some(&path)).is_err(),
+            "[review] is still required"
+        );
 
         std::fs::write(&path, format!("{}\n[review]\nconcurrency = 8\n", ai)).unwrap();
-        let settings = Settings::local_review_from_file(&path).unwrap();
+        let settings = Settings::load(Some(&path)).expect("a local review's file parses");
         assert_eq!(settings.review.concurrency, 8);
-        // timeout_seconds keeps a default, as it does for the daemon.
+        // Defaults, as they do for the daemon.
         assert_eq!(settings.review.timeout_seconds, 3600);
+        assert_eq!(settings.server.port, 8080);
+        // And the sections it does not have read as absent rather than as an
+        // error. The daemon checks for them itself.
+        assert!(settings.database.url.is_empty());
+        assert!(settings.git.repository_path.is_empty());
+        assert!(settings.validate_for_daemon().is_err());
     }
 
-    /// `sashiko init` writes this template, so it has to satisfy the shape a
-    /// local review reads or the two commands disagree out of the box.
+    /// A local review's own reduced shape ignored keys it did not know, so a
+    /// mistyped one did nothing and said nothing. The one shape refuses an
+    /// unknown key or section by name, for a review as for the daemon.
     #[test]
-    fn test_init_template_satisfies_local_review() {
-        Settings::local_review_from_file("docs/examples/Settings.example.toml")
-            .expect("init template must parse as local review settings");
+    fn test_a_local_review_refuses_what_it_does_not_know() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let ai = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n";
+
+        for (unknown, extra) in [
+            (
+                "concurency",
+                "\n[review]\nconcurrency = 8\nconcurency = 8\n",
+            ),
+            ("bogus", "\n[review]\nconcurrency = 8\n\n[bogus]\nx = 1\n"),
+        ] {
+            std::fs::write(&path, format!("{ai}{extra}")).unwrap();
+            let error = Settings::load(Some(&path)).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("unknown field `{unknown}`")),
+                "{error}"
+            );
+        }
+    }
+
+    /// The daemon cannot run on a file a local review is happy with, and says so
+    /// at startup rather than failing later at a connection or a git command.
+    #[test]
+    fn test_the_daemon_asks_for_what_only_it_needs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let base = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\
+                    \n[review]\nconcurrency = 8\n";
+
+        std::fs::write(&path, format!("{base}\n[database]\nurl = \"sashiko.db\"\n")).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(
+            settings.validate_for_daemon().is_err(),
+            "a database without a repository is not enough"
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "{base}\n[database]\nurl = \"sashiko.db\"\n\n[git]\nrepository_path = \"linux\"\n"
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(
+            settings.validate_for_daemon().is_err(),
+            "and a worktree directory is required as it was before, since the daemon empties it"
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "{base}worktree_dir = \"review_trees\"\n\
+                 \n[database]\nurl = \"sashiko.db\"\n\n[git]\nrepository_path = \"linux\"\n"
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(settings.validate_for_daemon().is_ok());
+    }
+
+    /// `sashiko init` writes this template, so it has to parse or the command
+    /// disagrees with itself out of the box.
+    #[test]
+    fn test_init_template_parses() {
+        Settings::load(Some(Path::new("docs/examples/Settings.example.toml")))
+            .expect("init template must parse");
     }
 
     #[test]
