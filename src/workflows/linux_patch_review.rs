@@ -72,6 +72,9 @@ pub struct LinuxPatchReviewState {
     /// Verified findings from the verification stage.
     pub findings: Vec<Value>,
 
+    /// Independent reachability checks, including rejected findings.
+    pub reachability_checks: Vec<Value>,
+
     /// Concise plain-text summary of the change generated at the end of review.
     pub summary: String,
     /// Generated LKML plain-text review from the report stage.
@@ -271,7 +274,10 @@ pub const STAGE_REPORT_INSTRUCTION: &str = r#"# LKML-friendly report generation
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
 
-CRITICAL RULE: If a finding is flagged as pre-existing (`"preexisting": true`), you MUST explicitly state in your inline comment that this issue is pre-existing and was not introduced by the patch under review. Use phrasing like "This isn't a bug introduced by this patch, but..." or "This is a pre-existing issue, but..." to start the comment.
+CRITICAL RULE: Apply the applicable finding qualifier at the start of each inline comment:
+- If `"preexisting": true`, explicitly state that the issue already existed and was not introduced by this patch. Start with "This is a pre-existing issue, but...".
+- Otherwise, if `"currently_unreachable": true`, explicitly state that current in-tree paths cannot trigger the issue. Start with "Currently unreachable in-tree, but..." and use the supplied reachability evidence to explain the future extension or out-of-tree caller needed to trigger it. The severity describes the potential consequence if that condition becomes reachable.
+Add the applicable prefix when rendering the report; the finding's problem text need not contain it. Missing or false reachability attributes do not by themselves prove a currently reachable failure.
 
 Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
 
@@ -667,6 +673,12 @@ pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     wants_series_context: true,
 };
 
+pub static REACHABILITY: ConsolidationStage = ConsolidationStage {
+    name: "reachability",
+    short: "Reachability Check",
+    wants_series_context: false,
+};
+
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
@@ -676,8 +688,13 @@ pub static REPORT: ConsolidationStage = ConsolidationStage {
 /// In the order the workflow runs them. Each builder refers to its own
 /// definition above, so the name a stage registers under is the same string
 /// this list recognises and labels.
-pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
-    &[&DEDUPLICATION, &CONFLICT_RESOLUTION, &VERIFICATION, &REPORT];
+pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[
+    &DEDUPLICATION,
+    &CONFLICT_RESOLUTION,
+    &VERIFICATION,
+    &REACHABILITY,
+    &REPORT,
+];
 
 /// Marks where a stage's prompt carries the list of patches that follow this
 /// one in the series.
@@ -1083,12 +1100,39 @@ pub fn report_stage(max_turns: usize, temperature: f32) -> Stage<LinuxPatchRevie
 
 Findings:
 {{{{findings}}}}
+{{{{unreachable_context}}}}
 
 Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+            })
+            .with_var("unreachable_context", |s: &LinuxPatchReviewState| {
+                let checks: Vec<_> = s
+                    .reachability_checks
+                    .iter()
+                    .filter(|check| {
+                        check["currently_unreachable"] == true
+                            && check["finding"]["preexisting"] != true
+                            && check["rejected"] == false
+                            && check["policy_filtered"] == false
+                    })
+                    .map(|check| {
+                        json!({
+                            "finding": check["finding"],
+                            "response": check["response"],
+                        })
+                    })
+                    .collect();
+                if checks.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nReachability evidence for currently unreachable findings:\n{}\n",
+                        serde_json::to_string_pretty(&checks).unwrap_or_default()
+                    )
+                }
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -1149,6 +1193,14 @@ pub fn build_linux_patch_review_workflow_with_options(
         .early_exit_if(
             |s| s.findings.is_empty(),
             "No findings validated in verification stage",
+        )
+        .executable_stage(Box::new(super::reachability::ReachabilityStage::new(
+            max_turns,
+            temperature,
+        )))
+        .early_exit_if(
+            |s| s.findings.is_empty(),
+            "No findings remaining after reachability checks",
         )
         .stage(report_stage(max_turns, temperature))
         .build()
@@ -1249,6 +1301,7 @@ mod tests {
             deduplication_stage(1, 1.0).name(),
             conflict_resolution_stage(1, 1.0).name(),
             verification_stage(1, 1.0).name(),
+            super::super::reachability::ReachabilityStage::new(1, 1.0).name(),
             report_stage(1, 1.0).name(),
         ] {
             assert!(is_known_stage(name), "{name} is not in any stage table");
@@ -1392,7 +1445,7 @@ mod tests {
     fn test_build_workflow_graph_structure() {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
-        assert_eq!(workflow.steps.len(), 10);
+        assert_eq!(workflow.steps.len(), 12);
     }
 
     #[test]

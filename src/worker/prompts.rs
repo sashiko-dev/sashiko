@@ -352,6 +352,7 @@ impl Worker {
             patch_concerns: Vec::new(),
             concerns: Vec::new(),
             findings: Vec::new(),
+            reachability_checks: Vec::new(),
             summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
@@ -456,6 +457,7 @@ impl Worker {
         let final_output = json!({
             "summary": state.summary,
             "findings": state.findings,
+            "reachability_checks": state.reachability_checks,
             "dismissed_concerns": dismissed_concerns,
             "concerns": state.concerns,
             "review_inline": review_inline,
@@ -771,6 +773,7 @@ mod tests {
                 "deduplication",
                 "conflict-resolution",
                 "verification",
+                "reachability",
                 "report"
             ]
         );

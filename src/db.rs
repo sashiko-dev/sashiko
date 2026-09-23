@@ -370,6 +370,7 @@ pub struct Finding {
     pub severity_explanation: Option<String>,
     pub problem: String,
     pub preexisting: Option<bool>,
+    pub currently_unreachable: Option<bool>,
     pub locations: Option<serde_json::Value>,
 }
 
@@ -1574,7 +1575,16 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 11.");
+        if current_version < 12 {
+            info!("Applying database migration version 12 (finding reachability)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/012_finding_reachability.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 12", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 12.");
 
         Ok(())
     }
@@ -1893,21 +1903,23 @@ impl Database {
     }
 
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
-        let val = finding.preexisting.map(|b| if b { 1 } else { 0 });
+        let preexisting_val = finding.preexisting.map(|b| if b { 1 } else { 0 });
+        let currently_unreachable_val = finding.currently_unreachable.map(i32::from);
         let locations_val = finding
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
         self.conn
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, currently_unreachable, locations)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
                     finding.review_id,
                     finding.severity as i32,
                     finding.severity_explanation,
                     finding.problem,
-                    val,
+                    preexisting_val,
+                    currently_unreachable_val,
                     locations_val,
                 ],
             )
@@ -7466,7 +7478,7 @@ impl Database {
         for (review_id, patch_id, inline_review, summary, patch_message_id, index) in temp_reviews {
             // Fetch findings for this review
             let mut findings_rows = self.conn.query(
-                "SELECT severity, problem, severity_explanation, preexisting, locations FROM findings WHERE review_id = ?",
+                "SELECT severity, problem, severity_explanation, preexisting, locations, currently_unreachable FROM findings WHERE review_id = ?",
                 libsql::params![review_id],
             ).await?;
 
@@ -7487,12 +7499,14 @@ impl Database {
                 let locations_str: Option<String> = f_row.get(4).ok();
                 let locations =
                     locations_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                let currently_unreachable: Option<i64> = f_row.get(5).ok();
 
                 findings.push(json!({
                     "severity": severity,
                     "problem": problem,
                     "severity_explanation": severity_explanation,
                     "preexisting": preexisting,
+                    "currently_unreachable": currently_unreachable.map(|value| value != 0),
                     "locations": locations,
                 }));
             }
@@ -10359,6 +10373,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_currently_unreachable_migration_and_release_roundtrip() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("unreachable", "Latent defect", 70000)
+            .await
+            .unwrap();
+        db.create_message(
+            "unreachable-patch",
+            thread_id,
+            None,
+            "Author",
+            "Latent defect",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "unreachable-patch",
+                "Latent defect",
+                "Author",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(patchset_id, "unreachable-patch", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(patchset_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+
+        // An existing database has findings without the new classification.
+        db.conn
+            .execute("ALTER TABLE findings DROP COLUMN currently_unreachable", ())
+            .await
+            .unwrap();
+        db.conn.execute(
+            "INSERT INTO findings (review_id, severity, problem, preexisting) VALUES (?, 3, 'Legacy finding', 0)",
+            libsql::params![review_id],
+        ).await.unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 11", ())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        db.migrate().await.unwrap();
+        let problem = "Latent defect";
+        let report = "Currently unreachable in-tree, but a future caller could expose this defect.";
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::High,
+            severity_explanation: Some("Potential consequence under a future caller".into()),
+            problem: problem.into(),
+            preexisting: Some(false),
+            currently_unreachable: Some(true),
+            locations: None,
+        })
+        .await
+        .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Completed",
+            None,
+            None,
+            Some(report),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reviews = db
+            .get_completed_reviews_for_release(patchset_id)
+            .await
+            .unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].inline_review, report);
+        assert_eq!(reviews[0].findings.len(), 2);
+        let legacy = reviews[0]
+            .findings
+            .iter()
+            .find(|finding| finding["problem"] == "Legacy finding")
+            .unwrap();
+        assert!(legacy["currently_unreachable"].is_null());
+        let latent = reviews[0]
+            .findings
+            .iter()
+            .find(|finding| finding["problem"] == problem)
+            .unwrap();
+        assert_eq!(latent["currently_unreachable"], true);
+        assert_eq!(latent["preexisting"], false);
+        assert_eq!(latent["severity"], "High");
+    }
+
+    #[tokio::test]
     async fn test_clean_patchset_is_releasable_before_embargo_expiry() {
         let db = setup_db().await;
         let thread_id = db
@@ -10463,6 +10593,7 @@ mod tests {
             severity_explanation: None,
             problem: "Pre-existing issue".to_string(),
             preexisting: Some(true),
+            currently_unreachable: None,
             locations: None,
         })
         .await
@@ -15802,6 +15933,11 @@ mod tests {
                   WHERE id = ?2",
                 libsql::params![canonical, folded],
             )
+            .await
+            .unwrap();
+        // Recreate the older schema as well as its migration version.
+        db.conn
+            .execute("ALTER TABLE findings DROP COLUMN currently_unreachable", ())
             .await
             .unwrap();
         db.conn

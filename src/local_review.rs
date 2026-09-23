@@ -704,6 +704,7 @@ async fn review_single_patch(
 fn build_review_output(
     summary: String,
     findings: Vec<Value>,
+    reachability_checks: Vec<Value>,
     concerns: Vec<Value>,
     dismissed_concerns: Vec<Value>,
     concerns_count: u64,
@@ -712,6 +713,7 @@ fn build_review_output(
     json!({
         "summary": summary,
         "findings": findings,
+        "reachability_checks": reachability_checks,
         "concerns": concerns,
         "dismissed_concerns": dismissed_concerns,
         "concerns_count": concerns_count,
@@ -957,6 +959,7 @@ async fn run_worker_in_worktree(
     // Aggregate findings, inline reviews, history, input context, and concern counts
     let mut combined_summary = String::new();
     let mut combined_findings = Vec::new();
+    let mut combined_reachability_checks = Vec::new();
     let mut combined_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
     let mut combined_inline = String::new();
@@ -978,6 +981,14 @@ async fn run_worker_in_worktree(
             .unwrap_or_default();
 
         if let Some(review) = res.get("review") {
+            if let Some(checks) = review.get("reachability_checks").and_then(Value::as_array) {
+                for check in checks {
+                    let mut check = check.clone();
+                    check["patch_index"] = json!(p_idx);
+                    check["patch_subject"] = json!(patch_subject);
+                    combined_reachability_checks.push(check);
+                }
+            }
             if let Some(summary) = review.get("summary").and_then(|v| v.as_str())
                 && !summary.trim().is_empty()
             {
@@ -1056,6 +1067,7 @@ async fn run_worker_in_worktree(
     let review_output = build_review_output(
         combined_summary,
         combined_findings,
+        combined_reachability_checks,
         combined_concerns,
         combined_dismissed_concerns,
         total_concerns_count,
@@ -1923,6 +1935,7 @@ mod tests {
         let output = build_review_output(
             "Adds dev-queue routing heuristic.".to_string(),
             vec![json!({"problem": "new regression"})],
+            vec![json!({"finding_index": 0, "rejected": true})],
             vec![json!({"problem": "preexisting bug"})],
             vec![],
             3,
@@ -1935,6 +1948,7 @@ mod tests {
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(output["reachability_checks"][0]["rejected"], true);
     }
 
     #[test]

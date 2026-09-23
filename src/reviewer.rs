@@ -1630,6 +1630,8 @@ impl Reviewer {
                                             .as_str()
                                             .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
+                                        let currently_unreachable =
+                                            f["currently_unreachable"].as_bool();
                                         let locations = f.get("locations").cloned();
 
                                         ctx.db
@@ -1639,6 +1641,7 @@ impl Reviewer {
                                                 severity_explanation,
                                                 problem,
                                                 preexisting,
+                                                currently_unreachable,
                                                 locations,
                                             })
                                             .await?;

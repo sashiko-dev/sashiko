@@ -53,7 +53,8 @@ overrides that choice by name.
 - **deduplication** -- consolidates feedback from the analysis stages, merges duplicates, and groups overlapping issues.
 - **conflict-resolution** -- compares consolidated concerns against consolidated dismissed concerns and keeps only concerns that survive concrete code-based conflict checks.
 - **verification** -- validates the remaining concerns, filters false positives, and estimates severity.
-- **report** -- converts confirmed findings into a polite, standard, inline-commented LKML email reply.
+- **reachability** -- independently checks each verified finding's necessary conditions and actual execution paths. Checks run in separate conversations in parallel and return plain-text evidence with a keep/reject decision. Only non-preexisting findings receive a separate `currently_unreachable` attribute: latent defects that require future extensions or out-of-tree callers are marked true and reported only at High/Critical. Preexisting findings still receive the same technical audit. Retained findings keep their original wording and severity. The review output preserves every check, including policy-filtered findings, in `reachability_checks`.
+- **report** -- converts retained findings into a polite, standard, inline-commented LKML email reply, adding the `preexisting` prefix for existing issues or the `currently_unreachable` prefix for non-preexisting latent defects.
 
 
 Also Sashiko is using per-subsystem and generic prompts, initially developed by Chris Mason:

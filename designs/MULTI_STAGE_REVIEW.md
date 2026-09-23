@@ -3,8 +3,8 @@
 ## Overview
 The core idea is to split the patch review process into multiple steps.
 On each stage the LLM receives only required input, dependent on the specific stage.
-The LLM is expected to output a JSON with a predefined structure after each step.
-The exact output format varies depending on the stage, but follows a strict schema.
+Analysis and verification stages return JSON findings or concerns. The independent
+reachability check and final report use plain text.
 
 There should be a mechanism to pass important context (e.g. chunks of the code)
 between stages. Their outputs will be aggregated and passed to Stage 8 (Deduplication
@@ -35,7 +35,9 @@ These prompts are injected *only* alongside the `System Prompt` into the specifi
 - **Stage 10 (Verification and severity estimation):**
   - `false-positive-guide.md` (Checklist to filter out common LLM hallucinations and clarify false-positive cases)
   - `severity.md` (Criteria for assigning low/medium/high/critical severity scores)
-- **Stage 11 (LKML-friendly report generation):**
+- **Stage 11 (Independent reachability check):**
+  - A self-contained prompt; no automatic guide inclusions.
+- **Stage 12 (LKML-friendly report generation):**
   - `inline-template.md` (Strict formatting rules for the inline-commented LKML email reply format)
 
 ## Stage 1. Analyze commit main goal
@@ -253,13 +255,69 @@ You will be given a list of deduplicated concerns after conflict resolution.
 }
 ```
 
-## Stage 11. LKML-friendly report generation
+## Stage 11. Independent reachability check
+
+Run one independent conversation per Stage 10 finding, in parallel under the
+existing model-call concurrency limit. Stage 10 itself retains the community
+implementation, prompts, guides, and output format.
+
+Each check receives only the frozen target commit and one finding. Trace real
+entry points, object lifetimes, conditions, configuration and architecture gates,
+and error/cleanup paths. Reject only when concrete implementation evidence
+disproves a necessary condition across the relevant paths. Missing evidence and
+unresolved paths retain the finding. Do not mistake one safe caller or an
+incorrect proposed fix for proof that the core problem cannot occur.
+
+When the existing implementation has a concrete latent defect but no current
+in-tree caller can supply a necessary condition, identify the future extension
+or out-of-tree caller that could supply it. Retain it instead of rejecting it
+merely because current callers avoid the condition. Only non-preexisting findings
+receive the `currently_unreachable` attribute. Findings already marked
+`preexisting: true` keep that classification and receive the same technical audit
+and keep/reject decision, without a `currently_unreachable` attribute.
+Unsupported assumptions, arbitrary future code changes, and violations of an
+established API contract do not establish such a defect. Incomplete investigation
+retains a non-preexisting finding with `currently_unreachable: false`; false does
+not certify that the path is reachable.
+
+For non-preexisting findings, the response is concise prose followed by a separate
+attribute and decision:
+
+```text
+currently_unreachable: true
+Decision: keep
+```
+
+For preexisting findings, the response ends with only the decision line.
+The attribute accepts `true` or `false`; the decision accepts `keep` or `reject`.
+An explained, unambiguous decision is required for rejection. The attribute alone
+is not an explanation. Missing attributes remain unknown; malformed or ambiguous
+output retains the input unchanged. Model execution failures fail the review, as
+in other stages.
+
+The host copies the attribute only into non-preexisting findings and independently
+applies the High/Critical report threshold to currently unreachable findings,
+using the severity already assigned by Stage 10. For preexisting findings, the
+host ignores any reachability attribute returned by the model and removes a stale
+attribute from the retained finding. It preserves `preexisting`, the original
+problem text, severity and other finding content. Report generation adds the
+applicable prefix, with preexisting taking precedence. Machine-generated
+`reachability_checks` records preserve the original finding, decision and full
+response, including rejections. Low/Medium latent findings have
+`policy_filtered: true` and `rejected: false`, distinguishing reporting policy
+from technical refutation. No remaining findings means report generation is skipped.
+
+## Stage 12. LKML-friendly report generation
 This stage is dedicated to generation of the LKML-friendly report, described by inline-guide.md
 
 **System Prompt:**
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML).
 Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
 Follow the formatting rules strictly. Do not use markdown headers or ALL caps shouting.
+For `preexisting: true`, start with "This is a pre-existing issue, but...".
+Otherwise, for `currently_unreachable: true`, start with "Currently unreachable
+in-tree, but..." and use the supplied audit evidence to explain the future trigger.
+Prefixes are added here rather than stored in the original problem text.
 
-**Expected input:** The JSON output from Stage 10 (`findings`).
+**Expected input:** The remaining `findings` after the reachability checks.
 **Expected output:** Raw text suitable for an email body.
