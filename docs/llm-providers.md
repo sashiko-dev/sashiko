@@ -174,8 +174,8 @@ cp docs/examples/Settings.claude-bedrock.toml Settings.toml
 
 ## Google Cloud Vertex AI
 
-Uses Claude models (and potentially others) via Google Cloud
-infrastructure. Requires building with `--features vertex`.
+Uses Claude and Gemini models via Google Cloud infrastructure. Requires
+building with `--features vertex`.
 
 **Prerequisites:** Enable the Vertex AI API and model access in the
 [Vertex AI Model Garden](https://cloud.google.com/model-garden).
@@ -189,22 +189,35 @@ gcloud auth application-default login
 **Set project and region:**
 
 ```bash
-export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"
-export CLOUD_ML_REGION="us-east5"  # Or "global" for dynamic routing
+export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"  # Or GOOGLE_CLOUD_PROJECT
+export CLOUD_ML_REGION="us-east5"                    # Or GOOGLE_CLOUD_LOCATION
 ```
+
+`[ai.vertex]` in `Settings.toml` outranks all four.
 
 **Apply the example config:**
 
 ```bash
-cp docs/examples/Settings.claude-vertex.toml Settings.toml
+cp docs/examples/Settings.claude-vertex.toml Settings.toml   # Claude
+cp docs/examples/Settings.gemini-vertex.toml Settings.toml   # Gemini
 ```
 
 **What you get:**
 
 - No API key needed -- uses Google Cloud Application Default Credentials
 - Global, multi-region, and regional endpoint support
-- 1M context window for Claude Opus 4.7/4.6 and Sonnet 4.6 on Vertex
-- Full tool/function calling and prompt caching support
+- 1M context window for Claude Opus 4.7/4.6 and Sonnet 4.6 on Vertex, and
+  for Gemini
+- Full tool/function calling support
+
+**Model selection:**
+
+`model` selects the wire format: a `claude-` name goes to Anthropic's
+`rawPredict` endpoint, a `gemini-` name to Google's `generateContent`.
+Anything else is rejected at startup.
+
+`prompt_caching`, `max_tokens`, `thinking` and `effort` under `[ai.vertex]`
+apply to the Claude path only.
 
 ## Kiro CLI
 

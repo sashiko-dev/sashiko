@@ -19,13 +19,13 @@
 //! endpoint routing) and delegates wire-format translation to existing
 //! provider modules based on the detected model family.
 //!
-//! Currently supports Claude models via the `rawPredict` endpoint.
-//! Gemini support can be added by making gemini.rs translation functions
-//! public and adding the Gemini path — no structural changes required.
+//! Supports Claude models via the `rawPredict` endpoint and Gemini models
+//! via the `generateContent` endpoint.
 
 use crate::ai::claude::{
     self, ClaudeError, ClaudeMessage, ClaudeResponse, ClaudeTool, SystemBlock, ThinkingConfig,
 };
+use crate::ai::gemini::{self, GenerateContentRequest, GenerateContentResponse};
 use crate::ai::{AiProvider, AiRequest, AiResponse, ProviderCapabilities};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -40,16 +40,19 @@ use tracing::info;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelFamily {
     Claude,
-    // Future: Gemini, Llama, Mistral, etc.
+    Gemini,
+    // Future: Llama, Mistral, etc.
 }
 
 fn detect_model_family(model: &str) -> Result<ModelFamily> {
     if model.starts_with("claude") {
         Ok(ModelFamily::Claude)
+    } else if model.starts_with("gemini") {
+        Ok(ModelFamily::Gemini)
     } else {
         bail!(
             "Unsupported model family on Vertex AI: {}. \
-             Supported prefixes: claude-*",
+             Supported prefixes: claude-*, gemini-*",
             model
         )
     }
@@ -87,6 +90,10 @@ fn endpoint_info(family: ModelFamily) -> EndpointInfo {
         ModelFamily::Claude => EndpointInfo {
             publisher: "anthropic",
             method: "rawPredict",
+        },
+        ModelFamily::Gemini => EndpointInfo {
+            publisher: "google",
+            method: "generateContent",
         },
     }
 }
@@ -146,6 +153,7 @@ impl VertexClient {
                     200_000
                 }
             }
+            ModelFamily::Gemini => 1_000_000,
         };
 
         let credentials = Builder::default()
@@ -261,6 +269,32 @@ impl VertexClient {
         let response = self.post_claude_request(&vertex_req).await?;
         claude::translate_ai_response(&response)
     }
+
+    async fn post_gemini_request(
+        &self,
+        body: &GenerateContentRequest,
+    ) -> Result<GenerateContentResponse> {
+        let token = self.get_access_token().await?;
+        let url = self.endpoint_url();
+
+        let res = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .context("Failed to send request to Vertex AI")?;
+
+        gemini::read_generate_content_response(res).await
+    }
+
+    async fn generate_gemini(&self, request: AiRequest) -> Result<AiResponse> {
+        let gemini_req = gemini::translate_ai_request(request)?;
+        let response = self.post_gemini_request(&gemini_req).await?;
+        gemini::translate_ai_response(response)
+    }
 }
 
 #[async_trait]
@@ -268,6 +302,7 @@ impl AiProvider for VertexClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         match self.model_family {
             ModelFamily::Claude => self.generate_claude(request).await,
+            ModelFamily::Gemini => self.generate_gemini(request).await,
         }
     }
 
@@ -311,6 +346,18 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_model_family_gemini() {
+        assert_eq!(
+            detect_model_family("gemini-3.1-pro-preview").unwrap(),
+            ModelFamily::Gemini
+        );
+        assert_eq!(
+            detect_model_family("gemini-2.5-flash").unwrap(),
+            ModelFamily::Gemini
+        );
+    }
+
+    #[test]
     fn test_detect_model_family_unsupported() {
         assert!(detect_model_family("llama-3").is_err());
         assert!(detect_model_family("mistral-large").is_err());
@@ -335,6 +382,26 @@ mod tests {
         assert_eq!(
             url,
             "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-6:rawPredict"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_url_global_gemini() {
+        let info = endpoint_info(ModelFamily::Gemini);
+        let url = build_endpoint_url("global", "my-project", "gemini-3.1-pro-preview", &info);
+        assert_eq!(
+            url,
+            "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/publishers/google/models/gemini-3.1-pro-preview:generateContent"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_url_regional_gemini() {
+        let info = endpoint_info(ModelFamily::Gemini);
+        let url = build_endpoint_url("us-central1", "my-project", "gemini-2.5-flash", &info);
+        assert_eq!(
+            url,
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent"
         );
     }
 

@@ -320,7 +320,9 @@ fn classify_generate_content_failure(
     GeminiError::ApiError(status, error_text.to_string())
 }
 
-async fn read_generate_content_response(res: reqwest::Response) -> Result<GenerateContentResponse> {
+pub(crate) async fn read_generate_content_response(
+    res: reqwest::Response,
+) -> Result<GenerateContentResponse> {
     let status = res.status();
 
     if status.is_success() {
@@ -710,7 +712,7 @@ impl AiProvider for StdioGeminiClient {
 
 // --- Translation Helpers ---
 
-fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
+pub(crate) fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
     let mut contents: Vec<Content> = Vec::new();
     let mut system_instruction = None;
 
@@ -885,7 +887,7 @@ fn normalize_schema(mut schema: Value) -> Value {
     schema
 }
 
-fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
+pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
     if let Some(reason) = resp.prompt_feedback.and_then(|f| f.block_reason) {
         return Err(anyhow::anyhow!(
             "Gemini request blocked by prompt feedback (reason: {})",

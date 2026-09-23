@@ -670,13 +670,16 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             let project_id = vertex
                 .and_then(|v| v.project_id.clone())
                 .or_else(|| std::env::var("ANTHROPIC_VERTEX_PROJECT_ID").ok())
+                .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT").ok())
                 .context(
-                    "Vertex AI requires project_id in [ai.vertex] \
-                     or ANTHROPIC_VERTEX_PROJECT_ID env var",
+                    "Vertex AI requires project_id in [ai.vertex] or the \
+                     ANTHROPIC_VERTEX_PROJECT_ID or GOOGLE_CLOUD_PROJECT \
+                     env var",
                 )?;
             let region = vertex
                 .and_then(|v| v.region.clone())
                 .or_else(|| std::env::var("CLOUD_ML_REGION").ok())
+                .or_else(|| std::env::var("GOOGLE_CLOUD_LOCATION").ok())
                 .unwrap_or_else(|| "us-east5".to_string());
             let enable_caching = vertex.map(|v| v.prompt_caching).unwrap_or(true);
             let max_tokens = vertex.map(|v| v.max_tokens).unwrap_or(8192);
