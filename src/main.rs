@@ -416,6 +416,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(reason.into());
     }
 
+    if let Some(Err(reason)) = settings
+        .smtp
+        .as_ref()
+        .map(sashiko::worker::email::EmailWorker::check_sendmail_path)
+    {
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
+    }
+
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
