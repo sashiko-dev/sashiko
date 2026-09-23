@@ -253,7 +253,8 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 4. If there is no direct conflict for a concern, keep it unchanged.
 5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
 6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
-7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."#;
+7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern.
+8. SYMMETRICAL PROOF BAR: A dismissed_concern cannot override or discard a concern unless the dismissed_concern cites a concrete disproving `code_snippet` in its `locations` and you have verified that disproving code in the diff or by reading the repository with tools (`git_read_files` or `git_grep`). Never discard a concern based on a dismissed_concern that relies on unverified assumptions about external callers, helpers, hardware bounds, or build configurations."#;
 
 const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verification and severity estimation
 
@@ -288,9 +289,11 @@ Each object in the 'concerns' array MUST use exactly the following keys: "type",
 - "reasoning": A step-by-step explanation.
 - "preexisting": true if this bug already existed in the codebase before these patches were applied, false if the issue was newly introduced by the reviewed patchset.
 - "locations": An array of objects, each containing "file", "function_or_symbol", "line", "code_snippet" and "why_this_location_matters".
-Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations". They mean the same as above, except that "description" is the candidate concern that was investigated and disproved, and "reasoning" is the evidence proving it does not apply.
+Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations". They mean the same as above, except that "description" is the candidate concern that was investigated and disproved, "reasoning" is the evidence proving it does not apply, and "locations" MUST cite the concrete disproving code (the exact guard, lock, cleanup path, or caller/callee implementation that proves the issue cannot occur — not merely repeating the suspected line from the diff).
 
 Use the 'dismissed_concerns' array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
+
+NO DISMISSAL WITHOUT VERIFIED PROOF: To place a candidate issue in 'dismissed_concerns' (or to discard a suspected issue), you MUST find concrete proof in the code ('file', 'function_or_symbol', 'line', and verbatim 'code_snippet' in 'locations') that explicitly invalidates the concern's reasoning. If the disproving code lives outside the diff (for example, in a caller, callee, macro, sysctl, or build script), you MUST verify that code first using tools ('git_read_files' or 'git_grep') and quote the verified disproving snippet in 'locations'. If you cannot find definitive code proof that the candidate issue is impossible, you MUST report it in 'concerns' (NOT 'dismissed_concerns') and make the condition explicit: if X is possible, then problem Y can occur.
 
 SPECIFICITY REQUIREMENT: When reporting a concern or dismissed_concern, cite exact function name(s), file path(s), and line number(s) when known. Do not invent line numbers; use null when exact values are unknown.
 
@@ -339,10 +342,68 @@ Example Output:
 // Validation Logic
 // ---------------------------------------------------------------------------
 
+fn has_valid_proof_location(item: &Value) -> bool {
+    let Some(locations) = item.get("locations").and_then(Value::as_array) else {
+        return false;
+    };
+    locations.iter().any(|loc| {
+        let has_file = loc
+            .get("file")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_symbol = loc
+            .get("function_or_symbol")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_snippet = loc
+            .get("code_snippet")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        has_file && has_symbol && has_snippet
+    })
+}
+
 fn validate_concerns_output(
-    _output: &StageConcernsOutput,
+    output: &StageConcernsOutput,
     _state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
+    for (idx, concern) in output.concerns.iter().enumerate() {
+        let has_desc = concern
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_reasoning = concern
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_desc || !has_reasoning {
+            return Err(format!(
+                "concerns[{idx}] must have non-empty 'description' and 'reasoning' strings."
+            ));
+        }
+    }
+
+    for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
+        let has_desc = dismissed
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_reasoning = dismissed
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_desc || !has_reasoning {
+            return Err(format!(
+                "dismissed_concerns[{idx}] must have non-empty 'description' and 'reasoning' strings proving why the candidate concern does not apply."
+            ));
+        }
+        if !has_valid_proof_location(dismissed) {
+            return Err(format!(
+                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1380,12 +1441,77 @@ mod tests {
             "\"preexisting\": true if this bug already existed",
             "\"reasoning\": A step-by-step explanation.",
             "the candidate concern that was investigated and disproved",
+            "NO DISMISSAL WITHOUT VERIFIED PROOF",
+            "MUST cite the concrete disproving code",
         ] {
             assert!(
                 STAGE_JSON_SCHEMA_EXAMPLE.contains(required),
                 "analysis stage guidance lost: {required}"
             );
         }
+        assert!(
+            STAGE_CONFLICT_RESOLUTION_INSTRUCTION.contains("SYMMETRICAL PROOF BAR"),
+            "conflict-resolution stage must enforce symmetrical proof bar"
+        );
+    }
+
+    #[test]
+    fn test_validate_concerns_output_enforces_symmetrical_proof() {
+        let state = LinuxPatchReviewState::default();
+
+        // Empty output is valid.
+        assert!(validate_concerns_output(&StageConcernsOutput::default(), &state).is_ok());
+
+        // Valid concern and valid dismissed_concern with concrete disproving snippet.
+        let valid_output = StageConcernsOutput {
+            concerns: vec![json!({
+                "type": "Memory Leak",
+                "description": "Leaked buffer on error path",
+                "reasoning": "Buffer is not freed before return",
+                "preexisting": false,
+                "locations": [{
+                    "file": "drivers/foo/bar.c",
+                    "function_or_symbol": "bar_probe",
+                    "line": 42,
+                    "code_snippet": "return -ENOMEM;",
+                    "why_this_location_matters": "Early return leaks buf"
+                }]
+            })],
+            dismissed_concerns: vec![json!({
+                "type": "Locking",
+                "description": "Suspected unlocked access to state",
+                "reasoning": "Caller bar_ioctl holds bar_mutex across the call",
+                "locations": [{
+                    "file": "drivers/foo/bar.c",
+                    "function_or_symbol": "bar_ioctl",
+                    "line": 108,
+                    "code_snippet": "guard(mutex)(&bar->mutex);\nret = bar_update(bar);",
+                    "why_this_location_matters": "Proves mutex is held by caller"
+                }]
+            })],
+        };
+        assert!(validate_concerns_output(&valid_output, &state).is_ok());
+
+        // Dismissed concern without disproving code_snippet is rejected.
+        let missing_snippet = StageConcernsOutput {
+            concerns: vec![],
+            dismissed_concerns: vec![json!({
+                "type": "Locking",
+                "description": "Suspected unlocked access",
+                "reasoning": "Caller probably locks it",
+                "locations": [{
+                    "file": "drivers/foo/bar.c",
+                    "function_or_symbol": "bar_ioctl",
+                    "line": null,
+                    "code_snippet": "   ",
+                    "why_this_location_matters": "Unverified assumption"
+                }]
+            })],
+        };
+        let err = validate_concerns_output(&missing_snippet, &state)
+            .expect_err("dismissed_concern without disproving snippet must fail");
+        assert!(err.contains("dismissed_concerns[0]"));
+        assert!(err.contains("move the candidate issue to 'concerns'"));
     }
 
     #[test]
