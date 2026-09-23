@@ -33,23 +33,21 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::{error, info};
 
-/// What a worker is asked to do. Like `ReviewOptions`, it carries no settings
-/// path: the settings arrive as themselves, read once by whoever started the
-/// process.
+/// What a worker is asked to do: only what the settings have no notion of, such
+/// as which patch, which baseline, and where the prompts are.
+///
+/// Anything a settings file can also say — the provider, the stage list, whether
+/// to skip the AI, the repository, the worktree directory — is not here. `main`
+/// merges those onto the settings it read, so there is one answer to read.
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
     pub project: crate::project::ProjectId,
     pub baseline: Option<String>,
-    pub repo: Option<PathBuf>,
-    pub worktree_dir: Option<PathBuf>,
     pub prompts: PathBuf,
     pub review_patch_index: Option<i64>,
     pub review_commit: Option<String>,
-    pub no_ai: bool,
     pub reuse_worktree: Option<PathBuf>,
-    pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
-    pub stages: Option<Vec<String>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
     pub agent: bool,
@@ -61,16 +59,11 @@ impl Default for WorkerOptions {
         Self {
             project: crate::project::ProjectId::Linux,
             baseline: None,
-            repo: None,
-            worktree_dir: None,
             prompts: PathBuf::from("third_party/prompts/kernel"),
             review_patch_index: None,
             review_commit: None,
-            no_ai: false,
             reuse_worktree: None,
-            ai_provider: None,
             custom_prompt: None,
-            stages: None,
             scratch_clone: false,
             current_tree: false,
             agent: false,
@@ -86,10 +79,7 @@ pub struct ReviewOptions {
     pub project: crate::project::ProjectId,
     pub baseline: Option<String>,
     pub prompts: PathBuf,
-    pub no_ai: bool,
-    pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
-    pub stages: Option<Vec<String>>,
     pub agent: bool,
     pub report_preexisting: bool,
 }
@@ -100,10 +90,7 @@ impl Default for ReviewOptions {
             project: crate::project::ProjectId::Linux,
             baseline: None,
             prompts: PathBuf::from("third_party/prompts/kernel"),
-            no_ai: false,
-            ai_provider: None,
             custom_prompt: None,
-            stages: None,
             agent: false,
             report_preexisting: false,
         }
@@ -275,16 +262,12 @@ pub async fn run_git_review(
             project: options.project,
             baseline,
             prompts: options.prompts,
-            no_ai: options.no_ai,
-            ai_provider: options.ai_provider,
             custom_prompt: options.custom_prompt,
-            stages: options.stages,
             current_tree: true,
             agent: options.agent,
             report_preexisting: options.report_preexisting,
             ..WorkerOptions::default()
         },
-        Some(repo_path),
         settings,
         progress,
     )
@@ -294,26 +277,14 @@ pub async fn run_git_review(
 pub async fn run_worker(
     input: ReviewInput,
     options: WorkerOptions,
-    repo_override: Option<PathBuf>,
     settings: &Settings,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    // Handed in, because the process read them once already. Nothing here opens
-    // the settings file: a review and the command that started it are one
-    // process, and one process has one set of settings.
-    let mut ai = settings.ai.clone();
+    // Handed in, because the process read them once already: nothing here opens
+    // the settings file, and nothing here merges an override onto it.
     let concurrency = settings.review.concurrency;
     let timeout_seconds = settings.review.timeout_seconds;
-    // The tree named by the settings file, which is how a daemon's worker finds
-    // one. A caller that brought its own repository overrides this below, which
-    // is every local review: it reviews the tree it was run in.
-    let configured_repo_path = Some(settings.git.repository_path.as_str())
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from);
-
-    if let Some(provider) = &options.ai_provider {
-        ai.provider = provider.clone();
-    }
+    let worktree_dir = settings.review.worktree_dir.as_deref().map(Path::new);
 
     let patchset_id = input.id;
     let subject = input.subject;
@@ -326,8 +297,12 @@ pub async fn run_worker(
             .clone()
             .unwrap_or_else(|| "HEAD".to_string())
     };
-    let repo_path = repo_override
-        .or(configured_repo_path)
+    // The tree to review, which `main` resolved: a local review writes the
+    // checkout it was run in, a worker given --repo writes that, and a daemon's
+    // worker takes what the settings file says.
+    let repo_path = Some(settings.git.repository_path.as_str())
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
         .ok_or_else(|| anyhow!("Missing repository path"))?;
 
     let (worktree, baseline_sha) = if options.current_tree {
@@ -364,12 +339,8 @@ pub async fn run_worker(
                 sha: short_sha(&baseline_sha),
             },
         );
-        let worktree = GitWorktree::new_scratch_clone(
-            &repo_path,
-            &baseline_sha,
-            options.worktree_dir.as_deref(),
-        )
-        .await?;
+        let worktree =
+            GitWorktree::new_scratch_clone(&repo_path, &baseline_sha, worktree_dir).await?;
         emit(
             progress,
             ProgressEvent::WorktreeCreated {
@@ -386,8 +357,7 @@ pub async fn run_worker(
                 sha: short_sha(&baseline_sha),
             },
         );
-        let worktree =
-            GitWorktree::new(&repo_path, &baseline_sha, options.worktree_dir.as_deref()).await?;
+        let worktree = GitWorktree::new(&repo_path, &baseline_sha, worktree_dir).await?;
         emit(
             progress,
             ProgressEvent::WorktreeCreated {
@@ -399,7 +369,7 @@ pub async fn run_worker(
 
     let result = run_worker_in_worktree(
         &worktree,
-        &ai,
+        settings,
         concurrency,
         timeout_seconds,
         patchset_id,
@@ -514,7 +484,7 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
 #[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
-    ai: &AiSettings,
+    settings: &Settings,
     patchset_id: i64,
     subject: &str,
     p: &PatchInput,
@@ -528,6 +498,10 @@ async fn review_single_patch(
     timeout_seconds: u64,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
+    // The AI section and the stage list as this process resolved them, command
+    // line included.
+    let ai = &settings.ai;
+    let stages = settings.review.stages.clone();
     let retry_budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> =
         (timeout_seconds > 0).then(|| {
             let deadline = Arc::new(std::sync::Mutex::new(
@@ -614,7 +588,7 @@ async fn review_single_patch(
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),
-                stages: options.stages.clone(),
+                stages: stages.clone(),
                 skip_report: options.agent,
                 report_preexisting: options.report_preexisting,
             },
@@ -785,7 +759,7 @@ fn build_review_output(
 #[allow(clippy::too_many_arguments)]
 async fn run_worker_in_worktree(
     worktree: &GitWorktree,
-    ai: &AiSettings,
+    settings: &Settings,
     concurrency: usize,
     timeout_seconds: u64,
     patchset_id: i64,
@@ -907,7 +881,7 @@ async fn run_worker_in_worktree(
             patches.clone()
         };
 
-    if options.no_ai {
+    if settings.ai.no_ai {
         info!("Skipping AI review due to --no-ai flag.");
         patches_to_review.clear();
     }
@@ -993,7 +967,7 @@ async fn run_worker_in_worktree(
         async move {
             let result = review_single_patch(
                 worktree,
-                ai,
+                settings,
                 patchset_id,
                 &subject_clone,
                 p,
@@ -1171,15 +1145,7 @@ pub async fn run_worker_from_stdin(options: WorkerOptions, settings: &Settings) 
         return Err(anyhow!("No input provided on stdin"));
     }
     let input: ReviewInput = serde_json::from_str(&buffer)?;
-    let repo_override = options.repo.clone();
-    run_worker(
-        input,
-        options,
-        repo_override,
-        settings,
-        Some(&progress_to_stderr),
-    )
-    .await
+    run_worker(input, options, settings, Some(&progress_to_stderr)).await
 }
 
 /// The line prefix `progress_to_stderr` writes and `sashiko-cli local` keys

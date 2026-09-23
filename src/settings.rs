@@ -991,7 +991,59 @@ pub struct Settings {
     pub linux_bug: LinuxBugSettings,
 }
 
+/// What a command line can say that a settings file says too.
+///
+/// A flag not given is None, or false for the two that can only turn something
+/// off. Every command fills in the ones it has and leaves the rest alone.
+#[derive(Debug, Default)]
+pub struct Overrides {
+    pub repository_path: Option<String>,
+    pub worktree_dir: Option<String>,
+    pub no_ai: bool,
+    pub ai_provider: Option<String>,
+    pub stages: Option<Vec<String>>,
+    pub read_only: bool,
+    pub port: Option<u16>,
+}
+
 impl Settings {
+    /// Merges command-line overrides in, each winning over the file.
+    ///
+    /// One resolver for every command, so `sashiko review`, a worker, and the
+    /// daemon cannot come to differ on which source wins. Returns the lines
+    /// the daemon has always logged at startup for its own four flags, for the
+    /// daemon to log. No other override was ever reported, so none produces a
+    /// line.
+    pub fn apply_overrides(&mut self, overrides: Overrides) -> Vec<String> {
+        let mut changed = Vec::new();
+        if let Some(path) = overrides.repository_path {
+            self.git.repository_path = path;
+        }
+        if let Some(dir) = overrides.worktree_dir {
+            self.review.worktree_dir = Some(dir);
+        }
+        if overrides.no_ai {
+            changed.push("AI interactions disabled via --no-ai flag".to_string());
+            self.ai.no_ai = true;
+        }
+        if let Some(provider) = overrides.ai_provider {
+            self.ai.provider = provider;
+        }
+        if overrides.read_only {
+            changed.push("API enabled in READ-ONLY mode via --no-api flag".to_string());
+            self.server.read_only = true;
+        }
+        if let Some(port) = overrides.port {
+            changed.push(format!("Server port overridden via --port flag: {port}"));
+            self.server.port = port;
+        }
+        if let Some(stages) = overrides.stages {
+            changed.push(format!("Selected stages via --stages flag: {stages:?}"));
+            self.review.stages = Some(stages);
+        }
+        changed
+    }
+
     /// Refuses a configuration that names no database, no repository, or no
     /// worktree directory.
     ///
@@ -1300,6 +1352,60 @@ mod tests {
         .unwrap();
         let settings = Settings::load(Some(&path)).unwrap();
         assert!(settings.validate_for_daemon().is_ok());
+    }
+
+    /// A flag wins over the file, a flag not given leaves the file alone, and
+    /// only the daemon's own flags produce the lines it has always logged.
+    #[test]
+    fn test_overrides_win_over_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        std::fs::write(
+            &path,
+            "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\
+             \n[review]\nconcurrency = 8\nworktree_dir = \"from_file\"\n\
+             \n[git]\nrepository_path = \"from_file\"\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings::load(Some(&path)).unwrap();
+        assert!(settings.apply_overrides(Overrides::default()).is_empty());
+        assert_eq!(settings.ai.provider, "gemini");
+        assert_eq!(settings.git.repository_path, "from_file");
+        assert_eq!(settings.review.worktree_dir.as_deref(), Some("from_file"));
+        assert!(!settings.ai.no_ai);
+        assert!(settings.review.stages.is_none());
+
+        let changed = settings.apply_overrides(Overrides {
+            repository_path: Some("from_flag".to_string()),
+            worktree_dir: Some("from_flag".to_string()),
+            no_ai: true,
+            ai_provider: Some("stdio-claude".to_string()),
+            stages: Some(vec!["pre-screen".to_string()]),
+            read_only: true,
+            port: Some(9090),
+        });
+        // The daemon logs these at startup, so their wording and order are
+        // user-visible. The other three overrides were never reported.
+        assert_eq!(
+            changed,
+            [
+                "AI interactions disabled via --no-ai flag",
+                "API enabled in READ-ONLY mode via --no-api flag",
+                "Server port overridden via --port flag: 9090",
+                "Selected stages via --stages flag: [\"pre-screen\"]",
+            ]
+        );
+        assert_eq!(settings.git.repository_path, "from_flag");
+        assert_eq!(settings.review.worktree_dir.as_deref(), Some("from_flag"));
+        assert!(settings.ai.no_ai);
+        assert_eq!(settings.ai.provider, "stdio-claude");
+        assert_eq!(
+            settings.review.stages.as_deref(),
+            Some(&["pre-screen".to_string()][..])
+        );
+        assert!(settings.server.read_only);
+        assert_eq!(settings.server.port, 9090);
     }
 
     /// `sashiko init` writes this template, so it has to parse or the command

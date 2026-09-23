@@ -29,7 +29,7 @@ use sashiko::project::ProjectId;
 use sashiko::prompt_bundle;
 #[cfg(feature = "server")]
 use sashiko::reviewer::Reviewer;
-use sashiko::settings::Settings;
+use sashiko::settings::{Overrides, Settings};
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::io::Write;
@@ -242,6 +242,53 @@ enum ColorMode {
 #[cfg(feature = "server")]
 const PARSER_VERSION: i32 = 2;
 
+/// What this command line says about settings the file also carries.
+///
+/// The flags a command has are listed here once, and only where that command
+/// has them: the daemon's are top-level, a review's and a worker's belong to
+/// their subcommand.
+fn cli_overrides(cli: &Cli) -> Overrides {
+    let path_string = |path: &Path| path.to_string_lossy().into_owned();
+    match &cli.command {
+        Some(Commands::Review {
+            no_ai,
+            ai_provider,
+            stages,
+            ..
+        }) => Overrides {
+            no_ai: *no_ai,
+            ai_provider: ai_provider.clone(),
+            stages: stages.clone(),
+            ..Default::default()
+        },
+        Some(Commands::Worker {
+            repo,
+            worktree_dir,
+            no_ai,
+            ai_provider,
+            stages,
+            ..
+        }) => Overrides {
+            repository_path: repo.as_deref().map(path_string),
+            worktree_dir: worktree_dir.as_deref().map(path_string),
+            no_ai: *no_ai,
+            ai_provider: ai_provider.clone(),
+            stages: stages.clone(),
+            ..Default::default()
+        },
+        None => Overrides {
+            no_ai: cli.no_ai,
+            stages: cli.stages.clone(),
+            read_only: cli.no_api,
+            port: cli.port,
+            ..Default::default()
+        },
+        // Reads no settings, so the top-level flags typed before it mean
+        // nothing to it.
+        Some(Commands::Init { .. }) => Overrides::default(),
+    }
+}
+
 /// Ends a worker that failed, reporting why on stdout, where the daemon reads
 /// a worker's result whether it succeeded or not.
 fn exit_worker_with_error(error: String) -> ! {
@@ -267,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     let settings_path = Settings::resolve_path(named_settings.as_deref());
-    let settings_result = Settings::load(Some(&settings_path));
+    let mut settings_result = Settings::load(Some(&settings_path));
 
     // Determine log level
     // 1. CLI --debug takes precedence (implies "info")
@@ -317,6 +364,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Debug logging enabled");
     }
 
+    // The command line's say over the file, merged once, here, where both are
+    // known: the flags were parsed a few lines up and the file has just been
+    // read. Nothing dispatched below sees two sources. Only the daemon reports
+    // what changed, as it always has.
+    let overridden = match settings_result.as_mut() {
+        Ok(settings) => settings.apply_overrides(cli_overrides(&cli)),
+        Err(_) => Vec::new(),
+    };
+
     // Resolved once, before anything dispatches on it, so the flag, the
     // environment and the settings file cannot be read in a different order by
     // two different code paths.
@@ -337,19 +393,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             // What this arm passes down, and no more: --settings was read above,
-            // before dispatch, into settings_result.
+            // before dispatch, and the flags that shadow the settings were
+            // merged onto them there.
             Commands::Review {
                 input,
                 baseline,
-                no_ai,
                 report_preexisting,
                 custom_prompt,
-                ai_provider,
                 prompts,
                 format,
                 agent,
                 color,
-                stages,
                 ..
             } => {
                 // The settings themselves, not the path they came from: a review
@@ -357,20 +411,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let settings = anyhow::Context::with_context(settings_result, || {
                     format!("Failed to load settings from {}", settings_path.display())
                 })?;
+
                 return handle_review_command(
                     project,
                     input.clone(),
                     baseline.clone(),
                     settings,
-                    *no_ai,
                     *report_preexisting,
                     custom_prompt.clone(),
-                    ai_provider.clone(),
                     resolve_prompts_path(prompts.clone(), project)?,
                     *format,
                     *agent,
                     *color,
-                    stages.clone(),
                 )
                 .await;
             }
@@ -378,16 +430,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // worker's input is always JSON on stdin.
             Commands::Worker {
                 baseline,
-                repo,
-                worktree_dir,
                 prompts,
                 review_patch_index,
                 review_commit,
-                no_ai,
                 reuse_worktree,
-                ai_provider,
                 custom_prompt,
-                stages,
                 agent,
                 report_preexisting,
                 ..
@@ -396,8 +443,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
 
-                // Read above. A worker the daemon spawns keeps its SASHIKO_
-                // variables and working directory, so it finds the daemon's file.
                 let settings = match settings_result {
                     Ok(settings) => settings,
                     Err(e) => exit_worker_with_error(format!(
@@ -410,16 +455,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     WorkerOptions {
                         project,
                         baseline: baseline.clone(),
-                        repo: repo.clone(),
-                        worktree_dir: worktree_dir.clone(),
                         prompts: resolve_prompts_path(prompts.clone(), project)?,
                         review_patch_index: *review_patch_index,
                         review_commit: review_commit.clone(),
-                        no_ai: *no_ai,
                         reuse_worktree: reuse_worktree.clone(),
-                        ai_provider: ai_provider.clone(),
                         custom_prompt: custom_prompt.clone(),
-                        stages: stages.clone(),
                         scratch_clone: false,
                         current_tree: false,
                         agent: *agent,
@@ -442,11 +482,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "server")]
     {
-        run_daemon(cli, settings_result, project).await
+        run_daemon(cli, settings_result, overridden, project).await
     }
     #[cfg(not(feature = "server"))]
     {
-        let _ = (cli, settings_result, project);
+        let _ = (cli, settings_result, overridden, project);
         Err("this build has no daemon; rebuild with --features server".into())
     }
 }
@@ -455,6 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_daemon(
     cli: Cli,
     settings_result: Result<Settings, config::ConfigError>,
+    overridden: Vec<String>,
     project: ProjectId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Now handle settings result properly
@@ -476,24 +517,8 @@ async fn run_daemon(
     settings.project.kind = Some(project);
     info!("Reviewing project: {project}");
 
-    if cli.no_ai {
-        settings.ai.no_ai = true;
-        info!("AI interactions disabled via --no-ai flag");
-    }
-
-    if cli.no_api {
-        settings.server.read_only = true;
-        info!("API enabled in READ-ONLY mode via --no-api flag");
-    }
-
-    if let Some(port) = cli.port {
-        settings.server.port = port;
-        info!("Server port overridden via --port flag: {}", port);
-    }
-
-    if let Some(stages) = cli.stages {
-        settings.review.stages = Some(stages.clone());
-        info!("Selected stages via --stages flag: {:?}", stages);
+    for line in &overridden {
+        info!("{line}");
     }
 
     // The sections only a daemon reads parse as optional, because a local review
@@ -2235,16 +2260,13 @@ async fn handle_review_command(
     project: ProjectId,
     input: String,
     baseline: Option<String>,
-    settings: Settings,
-    no_ai: bool,
+    mut settings: Settings,
     report_preexisting: bool,
     custom_prompt: Option<String>,
-    ai_provider: Option<String>,
     prompts: PathBuf,
     format: OutputFormat,
     agent: bool,
     color: ColorMode,
-    stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The report goes to stdout and the progress display to stderr, and what one
     // of them can do says nothing about the other. TERM describes the terminal
@@ -2254,6 +2276,12 @@ async fn handle_review_command(
     let display = OutputStream::detect(color, &std::io::stderr(), terminal.as_ref());
 
     let repo_path = current_git_toplevel()?;
+
+    // The repository a local review works in: the checkout it was run in, which
+    // no settings file can name. The command-line overrides were merged onto
+    // these settings before dispatch.
+    settings.git.repository_path = repo_path.to_string_lossy().into_owned();
+
     if project.uses_maintainers()
         && sashiko::maintainers::get_global_maintainers().is_none()
         && let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
@@ -2460,10 +2488,7 @@ async fn handle_review_command(
             project,
             baseline,
             prompts,
-            no_ai,
-            ai_provider,
             custom_prompt,
-            stages,
             agent,
             report_preexisting,
         },
