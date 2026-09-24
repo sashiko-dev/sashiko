@@ -179,6 +179,7 @@ Settings for the goose provider (`provider = "goose"`).
 | `host` | string | `"::"` | Listen address. `"::"` binds to all interfaces (IPv4 and IPv6). |
 | `port` | integer | `8080` | Listen port for the web UI and API. |
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
+| `login_enabled` | bool | `true` | When false, disables authentication and login UI for local development or trusted internal environments. |
 | `public_base_url` | string | -- | The URL the service is reachable at from outside, with no trailing slash. Required whenever `[smtp]` is configured: sign-in links are mailed, and the bind address names no host a recipient can open. The server refuses to start without it. |
 | `jwt_secret` | string | -- | Signs sign-in links and session tokens. Without it, sign-in returns `501` and no identity can be established. Keep it stable: replacing it invalidates every session and every unopened link. Prefer `SASHIKO__SERVER__JWT_SECRET` over writing it to disk. |
 | `log_sign_in_links` | bool | `false` | Writes sign-in links to the log. For a developer machine with no real users; a link in a log is a credential anyone reading the log can spend. |

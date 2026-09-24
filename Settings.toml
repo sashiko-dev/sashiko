@@ -164,6 +164,11 @@ prompt_caching = true
 [server]
 host = "::"
 port = 8080
+
+# Whether authentication and login are enabled.
+# When true (default), requires maintainer/admin sign-in for bugs, comments, and actions.
+# When false, hides the login UI and grants open operator access to all routes.
+login_enabled = true
 # The URL this service is reachable at from outside, with no trailing slash.
 # Required whenever [smtp] is configured, because sign-in links are mailed and
 # the bind address above does not name a host a recipient can open. The server

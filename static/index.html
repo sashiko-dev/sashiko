@@ -1635,6 +1635,7 @@
         }
 
         function canPerformBugActions() {
+            if (config && config.login_enabled === false) return !config.read_only;
             if (config && config.read_only) return false;
             return !!getAuthToken();
         }
@@ -1642,6 +1643,9 @@
         function getCommentDisabledTitle() {
             if (config && config.read_only) {
                 return "Server is running in read-only mode.";
+            }
+            if (config && config.login_enabled === false) {
+                return "";
             }
             const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
             if (!isAuthed) {
@@ -1654,6 +1658,9 @@
             if (config && config.read_only) {
                 return "Server is running in read-only mode.";
             }
+            if (config && config.login_enabled === false) {
+                return "";
+            }
             const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
             if (!isAuthed) {
                 return "Please sign in with maintainer credentials to manage this bug.";
@@ -1664,6 +1671,9 @@
         function getActionDisabledTitle() {
             if (config && config.read_only) {
                 return "Server is running in read-only mode.";
+            }
+            if (config && config.login_enabled === false) {
+                return "";
             }
             const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
             if (!isAuthed) {
@@ -1775,6 +1785,11 @@
         }
 
         function updateAuthUI() {
+            if (config && config.login_enabled === false) {
+                const authHeader = document.getElementById('auth-header');
+                if (authHeader) authHeader.style.display = 'none';
+                return;
+            }
             const email = getAuthEmail();
             const emailSpan = document.getElementById('auth-email');
             const btn = document.getElementById('auth-btn');
@@ -1805,6 +1820,7 @@
         }
 
         function openAuthModal(noticeMessage) {
+            if (config && config.login_enabled === false) return;
             document.getElementById('authEmailInput').value = '';
             const msg = document.getElementById('authMessage');
             if (noticeMessage) {
@@ -2021,6 +2037,10 @@
                 const res = await fetch('/api/config');
                 if (res.ok) {
                     config = await res.json();
+                    if (config && config.login_enabled === false) {
+                        const authHeader = document.getElementById('auth-header');
+                        if (authHeader) authHeader.style.display = 'none';
+                    }
                     document.title = config.project_name;
                     if (config.project_description && config.project_description.trim() !== "") {
                         document.getElementById('about-text-content').innerHTML = `
