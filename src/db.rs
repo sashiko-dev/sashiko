@@ -14,11 +14,12 @@
 
 use crate::ReviewStatus;
 use crate::settings::DatabaseSettings;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
@@ -27,6 +28,137 @@ use tracing::{info, warn};
 const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
       OR (status IN ('Reviewed', 'Failed', 'Failed To Apply')
           AND received_parts >= total_parts))";
+
+fn get_required_text(row: &libsql::Row, index: i32) -> Result<String> {
+    get_optional_text(row, index)?
+        .ok_or_else(|| anyhow::anyhow!("database column {index} is unexpectedly NULL"))
+}
+
+fn get_optional_text(row: &libsql::Row, index: i32) -> Result<Option<String>> {
+    match row.get::<libsql::Value>(index)? {
+        libsql::Value::Null => Ok(None),
+        libsql::Value::Text(value) => Ok(Some(value)),
+        _ => bail!("database column {index} is not text or NULL"),
+    }
+}
+
+fn get_optional_integer(row: &libsql::Row, index: i32) -> Result<Option<i64>> {
+    match row.get::<libsql::Value>(index)? {
+        libsql::Value::Null => Ok(None),
+        libsql::Value::Integer(value) => Ok(Some(value)),
+        _ => bail!("database column {index} is not an integer or NULL"),
+    }
+}
+
+const PATCH_WRITE_MAX_ATTEMPTS: usize = 3;
+
+struct StoredPatchState {
+    diff: Arc<libsql::Value>,
+    git_patch_id: Option<String>,
+}
+
+enum PatchWriteOutcome {
+    Written(i64),
+    SnapshotChanged,
+}
+
+async fn get_stored_patch_state(
+    conn: &libsql::Connection,
+    patchset_id: i64,
+    message_id: &str,
+) -> Result<Option<StoredPatchState>> {
+    let mut rows = conn
+        .query(
+            "SELECT diff, git_patch_id FROM patches
+             WHERE patchset_id = ? AND message_id = ?",
+            libsql::params![patchset_id, message_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(StoredPatchState {
+        diff: Arc::new(row.get(0)?),
+        git_patch_id: get_optional_text(&row, 1)?,
+    }))
+}
+
+async fn select_git_patch_id(
+    old_patch: Option<&StoredPatchState>,
+    diff: Arc<str>,
+    git_patch_id: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(git_patch_id) = git_patch_id {
+        return Ok(Some(git_patch_id.to_owned()));
+    }
+    let Some(old_patch) = old_patch else {
+        return Ok(None);
+    };
+    let Some(old_patch_id) = old_patch.git_patch_id.clone() else {
+        return Ok(None);
+    };
+    let old_diff = Arc::clone(&old_patch.diff);
+    let unchanged = tokio::task::spawn_blocking(move || {
+        crate::compression::decompress_string_value(old_diff.as_ref())
+            .map(|old_diff| old_diff == diff.as_ref())
+    })
+    .await
+    .context("stored patch decompression task failed")??;
+
+    Ok(unchanged.then_some(old_patch_id))
+}
+
+async fn write_patch_if_unchanged(
+    conn: &libsql::Connection,
+    old_patch: Option<StoredPatchState>,
+    patchset_id: i64,
+    message_id: &str,
+    part_index: u32,
+    diff: libsql::Value,
+    git_patch_id: Option<String>,
+) -> Result<Option<(i64, bool)>> {
+    let existing_in_patchset = old_patch.is_some();
+    let mut rows = if let Some(old_patch) = old_patch {
+        let old_diff = match Arc::try_unwrap(old_patch.diff) {
+            Ok(diff) => diff,
+            Err(diff) => diff.as_ref().clone(),
+        };
+        conn.query(
+            "UPDATE patches SET part_index = ?, diff = ?, git_patch_id = ?
+             WHERE patchset_id = ? AND message_id = ?
+               AND diff IS ? AND git_patch_id IS ?
+             RETURNING id",
+            libsql::params![
+                part_index,
+                diff,
+                git_patch_id,
+                patchset_id,
+                message_id,
+                old_diff,
+                old_patch.git_patch_id
+            ],
+        )
+        .await?
+    } else {
+        conn.query(
+            "INSERT INTO patches
+                (patchset_id, message_id, part_index, diff, git_patch_id)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(patchset_id, message_id) DO NOTHING
+             RETURNING id",
+            libsql::params![patchset_id, message_id, part_index, diff, git_patch_id],
+        )
+        .await?
+    };
+
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row.get(0))
+        .transpose()?
+        .map(|patch_id| (patch_id, existing_in_patchset)))
+}
 
 pub struct Database {
     pub conn: libsql::Connection,
@@ -1574,7 +1706,38 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 11.");
+        // Builds predating the numbered migration may already have this
+        // column while still reporting an older schema version. Creating the
+        // index outside a transaction also avoids holding a write transaction
+        // while SQLite walks the potentially large patches table.
+        if current_version < 12 {
+            info!("Applying database migration version 12 (Git patch IDs)...");
+            let has_git_patch_id = {
+                let mut columns = self.conn.query("PRAGMA table_info(patches)", ()).await?;
+                let mut found = false;
+                while let Some(row) = columns.next().await? {
+                    let name: String = row.get(1)?;
+                    found |= name == "git_patch_id";
+                }
+                found
+            };
+            if has_git_patch_id {
+                self.conn
+                    .execute(
+                        "CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id
+                         ON patches(git_patch_id)",
+                        (),
+                    )
+                    .await?;
+            } else {
+                self.conn
+                    .execute_batch(include_str!("migrations/012_git_patch_id.sql"))
+                    .await?;
+            }
+            self.conn.execute("PRAGMA user_version = 12", ()).await?;
+        }
+
+        info!("Database schema is up to date at version 12.");
 
         Ok(())
     }
@@ -5887,6 +6050,11 @@ impl Database {
         }
     }
 
+    /// Inserts or updates a patch when no stable Git patch ID is available.
+    ///
+    /// Re-ingesting the same message with an unchanged diff preserves any
+    /// existing Git patch ID. If the diff changed, the old ID is cleared so
+    /// it cannot refer to different patch content.
     pub async fn create_patch(
         &self,
         patchset_id: i64,
@@ -5894,10 +6062,68 @@ impl Database {
         part_index: u32,
         diff: &str,
     ) -> Result<i64> {
-        // Check if index collision occurs for this patchset
-        let collision_exists: bool = {
-            let mut rows = self
+        self.create_patch_with_git_patch_id(patchset_id, message_id, part_index, diff, None)
+            .await
+    }
+
+    /// Inserts or updates a patch and associates its stable Git patch ID.
+    pub async fn create_patch_with_git_patch_id(
+        &self,
+        patchset_id: i64,
+        message_id: &str,
+        part_index: u32,
+        diff: &str,
+        git_patch_id: Option<&str>,
+    ) -> Result<i64> {
+        let diff: Arc<str> = Arc::from(diff);
+        let diff_to_compress = Arc::clone(&diff);
+        let compressed_diff = tokio::task::spawn_blocking(move || {
+            crate::compression::compress_string_if_needed(diff_to_compress.as_ref())
+        })
+        .await
+        .context("patch compression task failed")?;
+
+        for _ in 0..PATCH_WRITE_MAX_ATTEMPTS {
+            let old_patch = get_stored_patch_state(&self.conn, patchset_id, message_id).await?;
+            let selected_patch_id =
+                select_git_patch_id(old_patch.as_ref(), Arc::clone(&diff), git_patch_id).await?;
+            // Clone the prepared value before taking the write lock. A large
+            // compressed diff should not add memory-copy time to the lock.
+            let diff_to_write = compressed_diff.clone();
+            let tx = self
                 .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            match Self::write_patch_transaction(
+                tx,
+                old_patch,
+                patchset_id,
+                message_id,
+                part_index,
+                diff_to_write,
+                selected_patch_id,
+            )
+            .await?
+            {
+                PatchWriteOutcome::Written(patch_id) => return Ok(patch_id),
+                PatchWriteOutcome::SnapshotChanged => continue,
+            }
+        }
+
+        bail!("patch {message_id} changed during {PATCH_WRITE_MAX_ATTEMPTS} write attempts")
+    }
+
+    async fn write_patch_transaction(
+        tx: libsql::Transaction,
+        old_patch: Option<StoredPatchState>,
+        patchset_id: i64,
+        message_id: &str,
+        part_index: u32,
+        diff: libsql::Value,
+        git_patch_id: Option<String>,
+    ) -> Result<PatchWriteOutcome> {
+        let collision_exists = {
+            let mut rows = tx
                 .query(
                     "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
                     libsql::params![patchset_id, part_index, message_id],
@@ -5905,76 +6131,41 @@ impl Database {
                 .await?;
             rows.next().await?.is_some()
         };
-
         if collision_exists {
-            return Err(anyhow::anyhow!(
-                "Index collision: index {} already exists in patchset {}",
-                part_index,
-                patchset_id
-            ));
+            bail!("Index collision: index {part_index} already exists in patchset {patchset_id}");
         }
 
-        // Check if patch with same message_id already exists in this patchset
-        let existing_in_patchset: bool = {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT 1 FROM patches WHERE patchset_id = ? AND message_id = ?",
-                    libsql::params![patchset_id, message_id],
-                )
-                .await?;
-            rows.next().await?.is_some()
+        let Some((patch_id, existing_in_patchset)) = write_patch_if_unchanged(
+            &tx,
+            old_patch,
+            patchset_id,
+            message_id,
+            part_index,
+            diff,
+            git_patch_id,
+        )
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(PatchWriteOutcome::SnapshotChanged);
         };
 
-        // Insert or update within THIS patchset.
-        self.conn
-            .execute(
-                "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
-                 ON CONFLICT(patchset_id, message_id) DO UPDATE SET
-                    part_index=excluded.part_index,
-                    diff=excluded.diff",
-                libsql::params![
-                    patchset_id,
-                    message_id,
-                    part_index,
-                    crate::compression::compress_string_if_needed(diff)
-                ],
-            )
-            .await?;
-
-        // Update received_parts to match the physical patch count in this patchset
         if !existing_in_patchset {
-            self.conn
-                .execute(
-                    "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
-                    libsql::params![patchset_id, patchset_id],
-                )
-                .await?;
-        }
-
-        // Check if complete and update status
-        // We transition from 'Incomplete' OR 'Fetching' to 'Pending' (ready for review)
-        self.conn
-            .execute(
-                "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-                libsql::params![patchset_id],
+            tx.execute(
+                "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
+                libsql::params![patchset_id, patchset_id],
             )
             .await?;
-
-        // Get the patch ID for this patch in this patchset
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patches WHERE patchset_id = ? AND message_id = ?",
-                libsql::params![patchset_id, message_id],
-            )
-            .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to get patch ID"))
         }
+
+        tx.execute(
+            "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+            libsql::params![patchset_id],
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(PatchWriteOutcome::Written(patch_id))
     }
 
     fn build_search(
@@ -7200,6 +7391,36 @@ impl Database {
             diffs.push((id, index, diff, subject, author, date, message_id));
         }
         Ok(diffs)
+    }
+
+    pub async fn get_patch_by_git_patch_id(
+        &self,
+        git_patch_id: &str,
+    ) -> Result<Option<(String, String, String, String, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.message_id, p.diff, m.subject, m.author, m.date
+                 FROM patches p
+                 JOIN messages m ON p.message_id = m.message_id
+                 WHERE p.git_patch_id = ?
+                 ORDER BY m.date DESC
+                 LIMIT 1",
+                libsql::params![git_patch_id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(Some((
+                get_required_text(&row, 0)?,
+                crate::compression::get_compressed_string(&row, 1)?,
+                get_optional_text(&row, 2)?.unwrap_or_default(),
+                get_optional_text(&row, 3)?.unwrap_or_default(),
+                get_optional_integer(&row, 4)?.unwrap_or(0),
+            )))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {

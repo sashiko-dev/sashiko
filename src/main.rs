@@ -807,9 +807,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            for mut article in buffer.drain(..) {
+            let patch_ids = sashiko::prerequisites::calculate_git_patch_id_batch(
+                buffer
+                    .iter()
+                    .map(|article| article.patch.as_ref().map(|patch| patch.diff.as_str()))
+                    .collect(),
+            )
+            .await;
+            for (mut article, git_patch_id) in buffer.drain(..).zip(patch_ids) {
+                let git_patch_id = match git_patch_id {
+                    Ok(git_patch_id) => git_patch_id,
+                    Err(e) => {
+                        let message_id = article
+                            .patch
+                            .as_ref()
+                            .map_or(article.article_id.as_str(), |patch| {
+                                patch.message_id.as_str()
+                            });
+                        warn!(
+                            "Failed to calculate stable patch ID for {}: {}",
+                            message_id, e
+                        );
+                        None
+                    }
+                };
                 let mut receipt = article.receipt.take();
-                match process_parsed_article(&worker_db, article, &policy, &mapping).await {
+                match process_parsed_article(&worker_db, article, git_patch_id, &policy, &mapping)
+                    .await
+                {
                     ProcessStatus::Ingested => {
                         // The article is on disk, so the fetch loop may finally
                         // move its mark past it.
@@ -2443,6 +2468,7 @@ enum ProcessStatus {
 async fn process_parsed_article(
     worker_db: &Database,
     article: ParsedArticle,
+    git_patch_id: Option<String>,
     policy: &sashiko::email_policy::EmailPolicyConfig,
     subsystem_mapping: &[sashiko::settings::SubsystemMapping],
 ) -> ProcessStatus {
@@ -2905,11 +2931,12 @@ async fn process_parsed_article(
 
                 if let Some(patch) = patch_opt {
                     match worker_db
-                        .create_patch(
+                        .create_patch_with_git_patch_id(
                             patchset_id,
                             &patch.message_id,
                             patch.part_index,
                             &patch.diff,
+                            git_patch_id.as_deref(),
                         )
                         .await
                     {

@@ -21,21 +21,32 @@ pub fn get_compressed_string(row: &libsql::Row, index: i32) -> Result<String, li
     let val: Value = row.get(index)?;
     match val {
         Value::Text(s) => Ok(s),
-        Value::Blob(b) => {
-            if b.starts_with(&GZIP_MAGIC) {
-                let mut decoder = GzDecoder::new(Vec::new());
-                if decoder.write_all(&b).is_ok()
-                    && let Ok(decompressed) = decoder.finish()
-                    && let Ok(s) = String::from_utf8(decompressed)
-                {
-                    return Ok(s);
-                }
-            }
-            String::from_utf8(b).map_err(|_| libsql::Error::InvalidColumnType)
-        }
+        Value::Blob(b) => decompress_gzip(&b)
+            .map(Ok)
+            .unwrap_or_else(|| String::from_utf8(b).map_err(|_| libsql::Error::InvalidColumnType)),
         Value::Null => Ok(String::new()),
         _ => Err(libsql::Error::InvalidColumnType),
     }
+}
+
+pub fn decompress_string_value(value: &Value) -> Result<String, libsql::Error> {
+    match value {
+        Value::Text(s) => Ok(s.clone()),
+        Value::Blob(b) => decompress_gzip(b).map(Ok).unwrap_or_else(|| {
+            String::from_utf8(b.clone()).map_err(|_| libsql::Error::InvalidColumnType)
+        }),
+        Value::Null => Ok(String::new()),
+        _ => Err(libsql::Error::InvalidColumnType),
+    }
+}
+
+fn decompress_gzip(bytes: &[u8]) -> Option<String> {
+    if !bytes.starts_with(&GZIP_MAGIC) {
+        return None;
+    }
+    let mut decoder = GzDecoder::new(Vec::new());
+    decoder.write_all(bytes).ok()?;
+    String::from_utf8(decoder.finish().ok()?).ok()
 }
 
 pub fn get_compressed_string_opt(
