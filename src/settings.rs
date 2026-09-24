@@ -315,18 +315,24 @@ fn default_prompt_caching() -> bool {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct VertexSettings {
-    /// GCP project ID. Falls back to ANTHROPIC_VERTEX_PROJECT_ID env var.
+    /// GCP project ID. Falls back to the ANTHROPIC_VERTEX_PROJECT_ID or
+    /// GOOGLE_CLOUD_PROJECT env var, in that order.
     #[serde(default)]
     pub project_id: Option<String>,
-    /// GCP region (e.g., "us-east5", "global"). Falls back to CLOUD_ML_REGION env var.
+    /// GCP region (e.g., "us-east5", "global"). Falls back to the
+    /// CLOUD_ML_REGION or GOOGLE_CLOUD_LOCATION env var, in that order.
     #[serde(default)]
     pub region: Option<String>,
+    /// Claude only.
     #[serde(default = "default_prompt_caching")]
     pub prompt_caching: bool,
+    /// Claude only.
     #[serde(default = "default_vertex_max_tokens")]
     pub max_tokens: u32,
+    /// Claude only.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Claude only.
     #[serde(default)]
     pub effort: Option<String>,
 }

@@ -29,8 +29,11 @@ VertexClient
     |       |                  --> HTTP POST rawPredict
     |       |                  --> claude::translate_ai_response()
     |       |
-    |       +-- Gemini  --> (future: gemini translation functions)
+    |       +-- Gemini  --> gemini::translate_ai_request()
+    |       |                  --> GenerateContentRequest (unchanged)
     |       |                  --> HTTP POST generateContent
+    |       |                  --> gemini::read_generate_content_response()
+    |       |                  --> gemini::translate_ai_response()
     |       |
     |       +-- Others  --> (future: per-publisher translation)
     |
@@ -58,8 +61,8 @@ The `detect_model_family()` function maps model names to families:
 ```rust
 enum ModelFamily {
     Claude,   // claude-* --> publishers/anthropic, rawPredict
+    Gemini,   // gemini-* --> publishers/google, generateContent
     // Future:
-    // Gemini, // gemini-* --> publishers/google, generateContent
     // Llama,  // llama-*  --> publishers/meta, rawPredict
 }
 ```
@@ -97,16 +100,25 @@ Context window on Vertex:
 - 1M tokens: Claude Opus 4.7, Opus 4.6, Sonnet 4.6
 - 200K tokens: Sonnet 4.5, Sonnet 4, Haiku 4.5, older models
 
-### Gemini (future)
+### Gemini (implemented)
 
-The existing `gemini.rs` handles the Gemini wire format. Adding Gemini on
-Vertex requires:
-1. Making gemini.rs translation functions `pub`
-2. Adding `ModelFamily::Gemini` variant
-3. Adding the dispatch branch in `generate_content()`
-4. Using `publishers/google` and `generateContent` in endpoint URL
+| Property | Value |
+|----------|-------|
+| Publisher | `google` |
+| API method | `generateContent` |
+| Wire format | Gemini generateContent (same as the API-key endpoint) |
+| Request wrapper | None -- the body is what `gemini.rs` produces |
+| Translation | Reuses `gemini::translate_ai_request/response()` |
+| Response handling | Reuses `gemini::read_generate_content_response()` |
 
-No structural changes to the Vertex provider needed.
+Vertex API differences from the Gemini API-key endpoint:
+1. Host and path are Vertex's, and `model` is in the URL only
+2. Auth: ADC Bearer token (not an API key)
+
+Context window on Vertex: 1M tokens, matching the API-key path.
+
+`prompt_caching`, `max_tokens`, `thinking` and `effort` in `[ai.vertex]` are
+Claude-only and ignored here.
 
 ## Endpoint Types
 
@@ -114,7 +126,7 @@ Vertex AI offers three endpoint types, with pricing implications:
 
 | Type | Region value | URL pattern | Premium |
 |------|-------------|-------------|---------|
-| Global (recommended) | `"global"` | `https://global-aiplatform.googleapis.com/...` | None |
+| Global (recommended) | `"global"` | `https://aiplatform.googleapis.com/...` | None |
 | Multi-region | `"us"` or `"eu"` | `https://aiplatform.{region}.rep.googleapis.com/...` | 10% |
 | Regional | e.g. `"us-east5"` | `https://{region}-aiplatform.googleapis.com/...` | 10% |
 
@@ -145,15 +157,16 @@ that the `google-cloud-auth` crate discovers automatically.
 
 ```bash
 export ANTHROPIC_VERTEX_PROJECT_ID="my-gcp-project"
-export CLOUD_ML_REGION="us-east5"  # Regional endpoint (recommended)
+export CLOUD_ML_REGION="us-east5"  # Regional endpoint, or "global"
 ```
 
-These can alternatively be set in `[ai.vertex]` in Settings.toml.
+`GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` are consulted after those
+two. All four can alternatively be set in `[ai.vertex]` in Settings.toml,
+which outranks the environment.
 
-**Note on endpoint selection**: Regional endpoints (e.g., `us-east5`) are
-recommended over `global`. The global endpoint may not be available for all
-projects or models and can return 404 even when the model is enabled.
-Regional endpoints have a 10% pricing premium but provide reliable routing.
+**Note on endpoint selection**: `global` routes dynamically and carries no
+pricing premium. Regional endpoints (e.g., `us-east5`) pin traffic to one
+geography for data residency or provisioned throughput, at a 10% premium.
 
 ### Settings.toml Configuration
 
@@ -164,11 +177,23 @@ model = "claude-sonnet-4-6"
 max_input_tokens = 40000
 
 [ai.vertex]
-# project_id = "my-gcp-project"  # Falls back to ANTHROPIC_VERTEX_PROJECT_ID
-# region = "us-east5"            # Falls back to CLOUD_ML_REGION
+# project_id = "my-gcp-project"  # Falls back to the env vars above
+# region = "us-east5"            # Falls back to the env vars above
 prompt_caching = true
 # thinking = "enabled"
 # effort = "high"
+```
+
+For Gemini:
+
+```toml
+[ai]
+provider = "vertex"
+model = "gemini-3.1-pro-preview"
+max_input_tokens = 200000
+
+[ai.vertex]
+region = "global"
 ```
 
 ### Build
@@ -184,8 +209,8 @@ cargo build --features vertex --release
 | "Failed to initialize Google Cloud credentials" | No ADC found | Run `gcloud auth application-default login` |
 | 403 Forbidden | Model not enabled | Enable model in Vertex AI Model Garden console |
 | 403 Permission denied | Missing IAM role | Grant `roles/aiplatform.user` to your principal |
-| "Unsupported model family" | Model prefix not recognized | Check model name starts with `claude-` |
-| 404 Not Found on global endpoint | Global endpoint not available for project/model | Use a regional endpoint (e.g., `us-east5`) instead of `"global"`. Global endpoint availability depends on project configuration and model enablement. |
+| "Unsupported model family" | Model prefix not recognized | Check model name starts with `claude-` or `gemini-` |
+| 404 Not Found on global endpoint | Model not offered at the global location, or not enabled for the project | Enable the model in Model Garden, or use a regional endpoint (e.g., `us-east5`) |
 | 404 with `@version` suffix in model name | Versioned model IDs not supported for all endpoints | Use the base model name without version suffix (e.g., `claude-sonnet-4-6` not `claude-sonnet-4-6@20250514`) |
 | "quota_exceeded" or "API not enabled" after ADC warning | ADC account lacks `serviceusage.services.use` on project | Run `gcloud auth application-default set-quota-project PROJECT_ID` or grant the permission |
 
@@ -235,8 +260,9 @@ fn endpoint_info(family: ModelFamily) -> EndpointInfo {
 ### Step 4: Implement or reuse translation
 
 If the model uses a wire format already supported by an existing provider
-module, make that module's translation functions `pub` and reuse them.
-Otherwise, implement new translation functions.
+module, make that module's translation and response handling `pub(crate)`
+and reuse them, as the Claude and Gemini families do. Otherwise, implement
+new translation functions.
 
 ### Step 5: Add dispatch branch
 
@@ -244,6 +270,7 @@ Otherwise, implement new translation functions.
 async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
     match self.model_family {
         ModelFamily::Claude => self.generate_claude(request).await,
+        ModelFamily::Gemini => self.generate_gemini(request).await,
         ModelFamily::Llama => self.generate_llama(request).await,  // New
     }
 }
@@ -265,18 +292,22 @@ async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
 
 ### Unit Tests (`src/ai/vertex.rs`)
 
-- Model family detection (Claude, unsupported)
+- Model family detection (Claude, Gemini, unsupported)
 - Endpoint URL construction (global, regional, multi-region us/eu)
 - VertexClaudeRequest serialization (no model field, has anthropic_version)
 - Request conversion from translate_ai_request output
 - Context window detection (1M vs 200K models)
 
+Gemini translation and failure classification are covered by the `ai::gemini`
+tests; the Vertex path adds no logic of its own there.
+
 ### Integration Testing
 
 Requires GCP credentials. Manual testing steps:
 
-1. Set `provider = "vertex"` and `model = "claude-sonnet-4-6"` in Settings.toml
-2. Export `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
+1. Set `provider = "vertex"` and a `model` of each family in Settings.toml
+   (`claude-sonnet-4-6`, then `gemini-3.1-pro-preview`)
+2. Export the project and region variables
 3. Run `cargo run --features vertex` and submit a patch for review
 4. Verify response in logs (token counts, no errors)
 
@@ -284,13 +315,14 @@ Requires GCP credentials. Manual testing steps:
 
 End-to-end integration test performed on 2026-05-07:
 
-- **Region**: `us-east5` (regional endpoint; `global` returned 404 for this project)
+- **Region**: `us-east5` (regional endpoint; `global` returned 404 at the time)
 - **Model**: `claude-sonnet-4-6` (no version suffix)
 - **Auth**: `google-cloud-auth` ADC via `gcloud auth application-default login`
 - **Result**: Full multi-stage review completed successfully
 
 Key observations:
-- Global endpoint (`global-aiplatform.googleapis.com`) returned 404; regional
+- Global endpoint returned 404 because the request went to
+  `global-aiplatform.googleapis.com`, which serves no Vertex AI API; regional
   endpoint (`us-east5-aiplatform.googleapis.com`) worked immediately
 - Model name with `@version` suffix (e.g., `claude-sonnet-4-6@20250514`) also
   returned 404; bare model name worked

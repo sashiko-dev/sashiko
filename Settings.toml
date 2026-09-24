@@ -85,6 +85,12 @@ temperature = 1.0
 # max_input_tokens = 40000
 # max_interactions = 50
 
+# To use Gemini via Google Cloud Vertex AI (requires --features vertex):
+# provider = "vertex"
+# model = "gemini-3.1-pro-preview"
+# max_input_tokens = 200000
+# max_interactions = 100
+
 # To use Claude via AWS Bedrock (requires --features bedrock):
 # provider = "bedrock"
 # model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
@@ -141,9 +147,9 @@ prompt_caching = true
 # base_url = "https://api.orcarouter.ai/v1"  # Enable for OrcaRouter
 
 # [ai.vertex]
-# project_id = "my-gcp-project"  # Or set ANTHROPIC_VERTEX_PROJECT_ID env var
-# region = "us-east5"            # Or set CLOUD_ML_REGION env var (default: "us-east5")
-# prompt_caching = true
+# project_id = "my-gcp-project"  # Or ANTHROPIC_VERTEX_PROJECT_ID / GOOGLE_CLOUD_PROJECT
+# region = "us-east5"            # Or CLOUD_ML_REGION / GOOGLE_CLOUD_LOCATION (default: "us-east5")
+# prompt_caching = true          # Claude only, as are max_tokens/thinking/effort
 
 # [ai.bedrock]
 # region = "us-east-1"

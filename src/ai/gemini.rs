@@ -261,6 +261,111 @@ impl ClassifyAiError for GeminiError {
     }
 }
 
+fn retry_after_from_body(error_text: &str) -> Option<f64> {
+    let hint = Regex::new(r"Please retry in ([0-9.]+)s").ok()?;
+    hint.captures(error_text)?.get(1)?.as_str().parse().ok()
+}
+
+fn reason_suffix(error_text: &str) -> String {
+    extract_gemini_error_reason(error_text)
+        .map(|reason| format!(" (reason: {})", reason))
+        .unwrap_or_default()
+}
+
+fn classify_generate_content_failure(
+    status: reqwest::StatusCode,
+    retry_after_secs: Option<f64>,
+    error_text: &str,
+) -> GeminiError {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_seconds = retry_after_secs
+            .or_else(|| retry_after_from_body(error_text))
+            .unwrap_or(30.0);
+        tracing::warn!(
+            "Gemini 429 Quota Exceeded. Retry suggested in {}s. Body: {}",
+            retry_seconds,
+            error_text
+        );
+        return GeminiError::QuotaExceeded(Duration::from_secs_f64(retry_seconds + 1.0));
+    }
+
+    if status == reqwest::StatusCode::FORBIDDEN {
+        tracing::error!(
+            "Gemini Permission Denied (403){}: {}",
+            reason_suffix(error_text),
+            error_text
+        );
+        return GeminiError::PermissionDenied(error_text.to_string());
+    }
+
+    if status.is_server_error() || status.as_u16() == 499 {
+        let retry_after = retry_after_secs
+            .map(Duration::from_secs_f64)
+            .unwrap_or(Duration::from_secs(0));
+        tracing::debug!(
+            "Gemini API Transient Error: status={}, body={}",
+            status,
+            error_text
+        );
+        let summary = summarize_gemini_error(status, error_text);
+        return GeminiError::TransientError(retry_after, summary);
+    }
+
+    tracing::error!(
+        "Gemini API Error{}: status={}, body={}",
+        reason_suffix(error_text),
+        status,
+        error_text
+    );
+    GeminiError::ApiError(status, error_text.to_string())
+}
+
+pub(crate) async fn read_generate_content_response(
+    res: reqwest::Response,
+) -> Result<GenerateContentResponse> {
+    let status = res.status();
+
+    if status.is_success() {
+        let body_text = res.text().await?;
+        let response: GenerateContentResponse = match serde_json::from_str(&body_text) {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::error!("Failed to decode Gemini response: {}", e);
+                anyhow::bail!("Failed to decode response: {}. Body: {}", e, body_text);
+            }
+        };
+
+        match &response.usage_metadata {
+            Some(usage) => {
+                let cached = usage.cached_content_token_count.unwrap_or(0);
+                tracing::info!(
+                    "{}Gemini response received. Tokens: in={}, cached={}, out={}",
+                    crate::ai::get_log_prefix(),
+                    usage.prompt_token_count.saturating_sub(cached),
+                    cached,
+                    usage.candidates_token_count.unwrap_or(0)
+                );
+            }
+            None => tracing::info!(
+                "{}Gemini response received. No usage metadata.",
+                crate::ai::get_log_prefix()
+            ),
+        }
+
+        return Ok(response);
+    }
+
+    let retry_after_secs = res
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok());
+
+    let error_text = redact_secret(&res.text().await?);
+
+    Err(classify_generate_content_failure(status, retry_after_secs, &error_text).into())
+}
+
 struct ProxyGuard {
     child: std::sync::Mutex<Option<std::process::Child>>,
     port_file: std::path::PathBuf,
@@ -519,8 +624,6 @@ impl GeminiClient {
         url: &str,
         body: &T,
     ) -> Result<GenerateContentResponse> {
-        let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
-
         let client = self.client.read().await.clone();
         let mut req_builder = client.post(url).json(body);
         if let Some(token) = self.resolve_bearer_token()? {
@@ -541,100 +644,7 @@ impl GeminiClient {
             }
         };
 
-        if res.status().is_success() {
-            let body_text = res.text().await?;
-            match serde_json::from_str::<GenerateContentResponse>(&body_text) {
-                Ok(response) => {
-                    if let Some(usage) = &response.usage_metadata {
-                        let cached = usage.cached_content_token_count.unwrap_or(0);
-                        tracing::info!(
-                            "{}Gemini response received. Tokens: in={}, cached={}, out={}",
-                            crate::ai::get_log_prefix(),
-                            usage.prompt_token_count.saturating_sub(cached),
-                            cached,
-                            usage.candidates_token_count.unwrap_or(0)
-                        );
-                    } else {
-                        tracing::info!(
-                            "{}Gemini response received. No usage metadata.",
-                            crate::ai::get_log_prefix()
-                        );
-                    }
-                    return Ok(response);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to decode Gemini response: {}", e);
-                    anyhow::bail!("Failed to decode response: {}. Body: {}", e, body_text);
-                }
-            }
-        }
-
-        let status = res.status();
-        let retry_after_duration = res
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<f64>().ok());
-
-        let error_text = redact_secret(&res.text().await?);
-
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_seconds = if let Some(secs) = retry_after_duration {
-                secs
-            } else if let Some(caps) = re.captures(&error_text) {
-                caps[1].parse::<f64>().unwrap_or(30.0)
-            } else {
-                30.0
-            };
-            tracing::warn!(
-                "Gemini 429 Quota Exceeded. Retry suggested in {}s. Body: {}",
-                retry_seconds,
-                error_text
-            );
-            return Err(
-                GeminiError::QuotaExceeded(Duration::from_secs_f64(retry_seconds + 1.0)).into(),
-            );
-        }
-
-        if status == reqwest::StatusCode::FORBIDDEN {
-            let mut reason_str = String::new();
-            if let Some(reason) = extract_gemini_error_reason(&error_text) {
-                reason_str = format!(" (reason: {})", reason);
-            }
-            tracing::error!(
-                "Gemini Permission Denied (403){}: {}",
-                reason_str,
-                error_text
-            );
-            return Err(GeminiError::PermissionDenied(error_text).into());
-        }
-
-        let is_transient = status.is_server_error() || status.as_u16() == 499;
-        if is_transient {
-            let retry_duration = retry_after_duration
-                .map(Duration::from_secs_f64)
-                .unwrap_or(Duration::from_secs(0));
-            tracing::debug!(
-                "Gemini API Transient Error: status={}, body={}",
-                status,
-                error_text
-            );
-            let summary = summarize_gemini_error(status, &error_text);
-            return Err(GeminiError::TransientError(retry_duration, summary).into());
-        }
-
-        let mut reason_str = String::new();
-        if let Some(reason) = extract_gemini_error_reason(&error_text) {
-            reason_str = format!(" (reason: {})", reason);
-        }
-
-        tracing::error!(
-            "Gemini API Error{}: status={}, body={}",
-            reason_str,
-            status,
-            error_text
-        );
-        Err(GeminiError::ApiError(status, error_text).into())
+        read_generate_content_response(res).await
     }
 }
 
@@ -702,7 +712,7 @@ impl AiProvider for StdioGeminiClient {
 
 // --- Translation Helpers ---
 
-fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
+pub(crate) fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
     let mut contents: Vec<Content> = Vec::new();
     let mut system_instruction = None;
 
@@ -877,7 +887,7 @@ fn normalize_schema(mut schema: Value) -> Value {
     schema
 }
 
-fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
+pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
     if let Some(reason) = resp.prompt_feedback.and_then(|f| f.block_reason) {
         return Err(anyhow::anyhow!(
             "Gemini request blocked by prompt feedback (reason: {})",
@@ -1111,6 +1121,98 @@ mod tests {
         let text = resp.content.unwrap_or_default();
         println!("Live auto-proxy response: {}", text);
         assert!(text.to_uppercase().contains("PONG"));
+    }
+
+    #[test]
+    fn test_classify_failure_429_prefers_retry_after_header() {
+        let err = classify_generate_content_failure(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Some(12.0),
+            "Please retry in 99.0s",
+        );
+
+        assert!(matches!(
+            err,
+            GeminiError::QuotaExceeded(d) if d == Duration::from_secs_f64(13.0)
+        ));
+    }
+
+    #[test]
+    fn test_classify_failure_429_falls_back_to_body_hint() {
+        let err = classify_generate_content_failure(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            None,
+            "Quota exceeded. Please retry in 12.5s.",
+        );
+
+        assert!(matches!(
+            err,
+            GeminiError::QuotaExceeded(d) if d == Duration::from_secs_f64(13.5)
+        ));
+    }
+
+    #[test]
+    fn test_classify_failure_429_without_any_hint() {
+        let err = classify_generate_content_failure(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            None,
+            "Quota exceeded.",
+        );
+
+        assert!(matches!(
+            err,
+            GeminiError::QuotaExceeded(d) if d == Duration::from_secs_f64(31.0)
+        ));
+    }
+
+    #[test]
+    fn test_classify_failure_403_denies_permission() {
+        let err =
+            classify_generate_content_failure(reqwest::StatusCode::FORBIDDEN, None, "forbidden");
+
+        assert!(matches!(err, GeminiError::PermissionDenied(body) if body == "forbidden"));
+    }
+
+    #[test]
+    fn test_classify_failure_server_error_is_transient() {
+        let err = classify_generate_content_failure(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some(4.0),
+            "Overloaded prefill queue.",
+        );
+
+        assert!(matches!(
+            err,
+            GeminiError::TransientError(d, summary)
+                if d == Duration::from_secs(4)
+                    && summary == "503 Service Unavailable (request preempted in prefill queue)"
+        ));
+    }
+
+    #[test]
+    fn test_classify_failure_499_is_transient() {
+        let status = reqwest::StatusCode::from_u16(499).expect("499 is a valid status code");
+        let err = classify_generate_content_failure(status, None, "cancelled");
+
+        assert!(matches!(
+            err,
+            GeminiError::TransientError(d, _) if d == Duration::from_secs(0)
+        ));
+    }
+
+    #[test]
+    fn test_classify_failure_client_error_is_api_error() {
+        let err = classify_generate_content_failure(
+            reqwest::StatusCode::BAD_REQUEST,
+            None,
+            "bad request",
+        );
+
+        assert!(matches!(
+            err,
+            GeminiError::ApiError(status, body)
+                if status == reqwest::StatusCode::BAD_REQUEST && body == "bad request"
+        ));
     }
 
     #[test]
