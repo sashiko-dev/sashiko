@@ -184,21 +184,31 @@ impl VertexClient {
     async fn post_claude_request(&self, body: &VertexClaudeRequest) -> Result<ClaudeResponse> {
         let token = self.get_access_token().await?;
         let url = self.endpoint_url();
+        Self::send_claude_request(&self.client, &url, &token, body).await
+    }
 
-        let res = self
-            .client
-            .post(&url)
+    async fn send_claude_request(
+        client: &Client,
+        url: &str,
+        token: &str,
+        body: &VertexClaudeRequest,
+    ) -> Result<ClaudeResponse> {
+        let res = client
+            .post(url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .json(body)
             .send()
             .await
-            .context("Failed to send request to Vertex AI")?;
+            .map_err(|e| claude::transport_error("Vertex AI", e))?;
 
         let status = res.status();
 
         if status.is_success() {
-            let body_text = res.text().await?;
+            let body_text = res
+                .text()
+                .await
+                .map_err(|e| claude::transport_error("Vertex AI", e))?;
             let response: ClaudeResponse = serde_json::from_str(&body_text)
                 .context("Failed to parse Vertex AI Claude response")?;
 
@@ -212,12 +222,7 @@ impl VertexClient {
 
             Ok(response)
         } else {
-            let retry_after_duration = res
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_secs);
+            let retry_after_duration = claude::retry_after_header(res.headers());
 
             let error_body = res
                 .text()
@@ -296,6 +301,134 @@ impl AiProvider for VertexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_http;
+    use crate::ai::{AiErrorClass, AiMessage, AiRole};
+
+    fn hello_request() -> VertexClaudeRequest {
+        let claude_req = claude::translate_ai_request(
+            &AiRequest {
+                system: None,
+                messages: vec![AiMessage {
+                    role: AiRole::User,
+                    content: Some("hi".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                tools: None,
+                temperature: None,
+                response_format: None,
+                context_tag: None,
+            },
+            false,
+            1024,
+            None,
+            None,
+        )
+        .unwrap();
+        VertexClaudeRequest {
+            anthropic_version: "vertex-2023-10-16".to_string(),
+            messages: claude_req.messages,
+            max_tokens: claude_req.max_tokens,
+            system: claude_req.system,
+            tools: claude_req.tools,
+            thinking: claude_req.thinking,
+        }
+    }
+
+    async fn send_to(url: &str) -> Result<ClaudeResponse> {
+        tokio::time::timeout(
+            test_http::TEST_TIMEOUT,
+            VertexClient::send_claude_request(
+                &test_http::test_client(),
+                url,
+                "dummy-token",
+                &hello_request(),
+            ),
+        )
+        .await
+        .expect("request did not complete in time")
+    }
+
+    async fn error_for(response: Vec<u8>) -> anyhow::Error {
+        let server = test_http::serve(response).await;
+        let err = send_to(&server.url).await.expect_err("request should fail");
+        server.finish().await;
+        err
+    }
+
+    fn transient_message(err: &anyhow::Error) -> &str {
+        match err.downcast_ref::<ClaudeError>() {
+            Some(ClaudeError::TransientError(_, msg)) => msg,
+            _ => panic!("expected ClaudeError::TransientError, got: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_valid_response_succeeds() {
+        let server = test_http::serve(test_http::complete(
+            "200 OK",
+            "",
+            r#"{"id":"msg_1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ))
+        .await;
+        let response = send_to(&server.url).await.expect("request should succeed");
+        server.finish().await;
+        assert_eq!(response.id, "msg_1");
+    }
+
+    #[tokio::test]
+    async fn test_body_dropped_mid_response_is_transient() {
+        let err = error_for(test_http::truncated("200 OK", "", r#"{"id":"msg_"#)).await;
+        assert!(
+            matches!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient { .. }
+            ),
+            "{err:#}"
+        );
+        let msg = transient_message(&err);
+        assert!(msg.contains(test_http::BODY_READ_FAILURE), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_refused_is_transient() {
+        let port = test_http::RefusedPort::new();
+        let err = send_to(&port.url).await.expect_err("request should fail");
+        assert!(
+            matches!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient { .. }
+            ),
+            "{err:#}"
+        );
+        let msg = transient_message(&err);
+        assert!(msg.contains("error sending request"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_stays_fatal() {
+        let err = error_for(test_http::complete("200 OK", "", "not json")).await;
+        assert_eq!(crate::ai::classify_ai_error(&err), AiErrorClass::Fatal);
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_is_capped() {
+        let err = error_for(test_http::complete(
+            "429 Too Many Requests",
+            "Retry-After: 18446744073709551615\r\n",
+            "{}",
+        ))
+        .await;
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::RateLimit {
+                retry_after: crate::ai::quota::MAX_RETRY_AFTER
+            },
+            "{err:#}"
+        );
+    }
     // --- Model family detection ---
 
     #[test]

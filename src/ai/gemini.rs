@@ -206,6 +206,15 @@ fn summarize_gemini_error(status: reqwest::StatusCode, error_text: &str) -> Stri
     format!("{}: {}", status, first_line)
 }
 
+/// Rejects negative, NaN and infinite delays; caps others at the quota maximum.
+fn secs_to_duration(secs: f64) -> Option<Duration> {
+    let cap = crate::ai::quota::MAX_RETRY_AFTER;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some(Duration::try_from_secs_f64(secs).map_or(cap, |d| d.min(cap)))
+}
+
 #[derive(Debug)]
 pub enum GeminiError {
     QuotaExceeded(Duration),
@@ -531,7 +540,11 @@ impl GeminiClient {
         let res = match req_builder.send().await {
             Ok(res) => res,
             Err(e) => {
+                let is_permanent = crate::ai::is_permanent_transport_error(&e);
                 let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
+                if is_permanent {
+                    anyhow::bail!("Gemini request failed: {}", err_str);
+                }
                 tracing::error!("Gemini request failed (transport): {}", err_str);
 
                 // Trigger self-healing: Refresh the client for the next attempt
@@ -542,7 +555,17 @@ impl GeminiClient {
         };
 
         if res.status().is_success() {
-            let body_text = res.text().await?;
+            let body_text = match res.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
+                    tracing::error!("Gemini response body read failed (transport): {}", err_str);
+                    self.refresh_client().await;
+                    return Err(
+                        GeminiError::TransientError(Duration::from_secs(30), err_str).into(),
+                    );
+                }
+            };
             match serde_json::from_str::<GenerateContentResponse>(&body_text) {
                 Ok(response) => {
                     if let Some(usage) = &response.usage_metadata {
@@ -574,26 +597,33 @@ impl GeminiClient {
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<f64>().ok());
+            .and_then(|s| s.parse::<f64>().ok())
+            .and_then(secs_to_duration);
 
-        let error_text = redact_secret(&res.text().await?);
+        // A failed read of the error body must not hide the status.
+        let error_text = redact_secret(&res.text().await.unwrap_or_else(|e| {
+            format!("<failed to read error body: {:#}>", anyhow::Error::from(e))
+        }));
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_seconds = if let Some(secs) = retry_after_duration {
-                secs
-            } else if let Some(caps) = re.captures(&error_text) {
-                caps[1].parse::<f64>().unwrap_or(30.0)
-            } else {
-                30.0
-            };
+            let retry_after = retry_after_duration
+                .or_else(|| {
+                    re.captures(&error_text)
+                        .and_then(|caps| caps[1].parse::<f64>().ok())
+                        .and_then(secs_to_duration)
+                })
+                .unwrap_or(Duration::from_secs(30));
             tracing::warn!(
-                "Gemini 429 Quota Exceeded. Retry suggested in {}s. Body: {}",
-                retry_seconds,
+                "Gemini 429 Quota Exceeded. Retry suggested in {:?}. Body: {}",
+                retry_after,
                 error_text
             );
-            return Err(
-                GeminiError::QuotaExceeded(Duration::from_secs_f64(retry_seconds + 1.0)).into(),
-            );
+            return Err(GeminiError::QuotaExceeded(
+                retry_after
+                    .saturating_add(Duration::from_secs(1))
+                    .min(crate::ai::quota::MAX_RETRY_AFTER),
+            )
+            .into());
         }
 
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -611,9 +641,7 @@ impl GeminiClient {
 
         let is_transient = status.is_server_error() || status.as_u16() == 499;
         if is_transient {
-            let retry_duration = retry_after_duration
-                .map(Duration::from_secs_f64)
-                .unwrap_or(Duration::from_secs(0));
+            let retry_duration = retry_after_duration.unwrap_or(Duration::ZERO);
             tracing::debug!(
                 "Gemini API Transient Error: status={}, body={}",
                 status,
@@ -1010,6 +1038,7 @@ impl AiProvider for GeminiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_http;
     use crate::ai::{
         AiErrorClass, AiMessage, AiResponseFormat, AiRole, AiTool, ClassifyAiError,
         DEFAULT_RETRY_AFTER, ToolCall,
@@ -1163,6 +1192,273 @@ mod tests {
             GeminiError::ApiError(reqwest::StatusCode::BAD_REQUEST, "bad request".to_string());
 
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    fn local_client(base_url: &str) -> GeminiClient {
+        GeminiClient {
+            model: "gemini-test".to_string(),
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            proxy_command: None,
+            auth_token_command: None,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(test_http::test_client()),
+        }
+    }
+
+    async fn post_to(response: Vec<u8>) -> Result<GenerateContentResponse> {
+        let server = test_http::serve(response).await;
+        let request = GenerateContentRequest {
+            contents: vec![],
+            tools: None,
+            system_instruction: None,
+            generation_config: None,
+        };
+        let url = format!("{}/v1beta/models/gemini-test:generateContent", server.url);
+        let result = tokio::time::timeout(
+            test_http::TEST_TIMEOUT,
+            local_client(&server.url).post_request(&url, &request),
+        )
+        .await
+        .expect("request did not complete in time");
+        server.finish().await;
+        result
+    }
+
+    async fn error_for(response: Vec<u8>) -> anyhow::Error {
+        post_to(response).await.expect_err("request should fail")
+    }
+
+    fn transient_message(err: &anyhow::Error) -> &str {
+        match err.downcast_ref::<GeminiError>() {
+            Some(GeminiError::TransientError(_, msg)) => msg,
+            _ => panic!("expected GeminiError::TransientError, got: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_valid_response_succeeds() {
+        let response = post_to(test_http::complete("200 OK", "", r#"{"candidates":[]}"#))
+            .await
+            .expect("request should succeed");
+        assert!(response.candidates.is_some_and(|c| c.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_body_dropped_mid_response_is_transient() {
+        let err = error_for(test_http::truncated("200 OK", "", r#"{"candidates":"#)).await;
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(30)
+            },
+            "{err:#}"
+        );
+        let msg = transient_message(&err);
+        assert!(msg.contains(test_http::BODY_READ_FAILURE), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_error_body_dropped_on_server_error_is_transient() {
+        for status in ["503 Service Unavailable", "499 Client Closed Request"] {
+            let err = error_for(test_http::truncated(status, "", r#"{"error":"#)).await;
+            assert!(
+                matches!(
+                    crate::ai::classify_ai_error(&err),
+                    AiErrorClass::Transient { .. }
+                ),
+                "{status}: {err:#}"
+            );
+            let msg = transient_message(&err);
+            assert!(msg.contains("failed to read error body"), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_body_dropped_on_rate_limit_stays_rate_limit() {
+        let err = error_for(test_http::truncated(
+            "429 Too Many Requests",
+            "",
+            r#"{"error":"#,
+        ))
+        .await;
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::RateLimit {
+                retry_after: Duration::from_secs(31)
+            },
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_body_dropped_on_client_error_stays_fatal() {
+        let err = error_for(test_http::truncated("400 Bad Request", "", r#"{"error":"#)).await;
+        assert_eq!(crate::ai::classify_ai_error(&err), AiErrorClass::Fatal);
+        assert!(
+            matches!(
+                err.downcast_ref::<GeminiError>(),
+                Some(GeminiError::ApiError(reqwest::StatusCode::BAD_REQUEST, _))
+            ),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_retry_after_falls_back_to_default() {
+        for value in ["-1", "inf", "NaN"] {
+            let header = format!("Retry-After: {value}\r\n");
+            let err = error_for(test_http::complete("429 Too Many Requests", &header, "{}")).await;
+            assert_eq!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::RateLimit {
+                    retry_after: Duration::from_secs(31)
+                },
+                "429 with Retry-After {value}: {err:#}"
+            );
+            let err = error_for(test_http::complete(
+                "503 Service Unavailable",
+                &header,
+                "{}",
+            ))
+            .await;
+            assert_eq!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient {
+                    retry_after: Duration::ZERO
+                },
+                "503 with Retry-After {value}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_valid_retry_delays_are_honoured() {
+        let cap = crate::ai::quota::MAX_RETRY_AFTER;
+        let body_hint = r#"{"error":{"message":"Please retry in 7.5s"}}"#;
+        let huge_hint = r#"{"error":{"message":"Please retry in 100000s"}}"#;
+        let rate_limit = |d: Duration| AiErrorClass::RateLimit { retry_after: d };
+        let transient = |d: Duration| AiErrorClass::Transient { retry_after: d };
+        let cases = [
+            (
+                test_http::complete("429 Too Many Requests", "Retry-After: 2.5\r\n", "{}"),
+                rate_limit(Duration::from_millis(3500)),
+            ),
+            (
+                test_http::truncated("429 Too Many Requests", "Retry-After: 2.5\r\n", "{"),
+                rate_limit(Duration::from_millis(3500)),
+            ),
+            (
+                test_http::complete("503 Service Unavailable", "Retry-After: 2.5\r\n", "{}"),
+                transient(Duration::from_millis(2500)),
+            ),
+            (
+                test_http::truncated("503 Service Unavailable", "Retry-After: 2.5\r\n", "{"),
+                transient(Duration::from_millis(2500)),
+            ),
+            (
+                test_http::truncated("499 Client Closed Request", "Retry-After: 2.5\r\n", "{"),
+                transient(Duration::from_millis(2500)),
+            ),
+            (
+                test_http::complete("429 Too Many Requests", "", body_hint),
+                rate_limit(Duration::from_millis(8500)),
+            ),
+            (
+                test_http::complete("429 Too Many Requests", "Retry-After: -1\r\n", body_hint),
+                rate_limit(Duration::from_millis(8500)),
+            ),
+            (
+                test_http::complete("429 Too Many Requests", "Retry-After: 2\r\n", body_hint),
+                rate_limit(Duration::from_secs(3)),
+            ),
+            (
+                test_http::complete("429 Too Many Requests", "Retry-After: 100000\r\n", "{}"),
+                rate_limit(cap),
+            ),
+            (
+                test_http::complete("429 Too Many Requests", "", huge_hint),
+                rate_limit(cap),
+            ),
+            (
+                test_http::complete("503 Service Unavailable", "Retry-After: 100000\r\n", "{}"),
+                transient(cap),
+            ),
+            (
+                test_http::complete("429 Too Many Requests", "Retry-After: 1e30\r\n", "{}"),
+                rate_limit(cap),
+            ),
+            (
+                test_http::complete("503 Service Unavailable", "Retry-After: 1e30\r\n", "{}"),
+                transient(cap),
+            ),
+        ];
+        for (response, expected) in cases {
+            let head = String::from_utf8_lossy(&response)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let err = error_for(response).await;
+            assert_eq!(
+                crate::ai::classify_ai_error(&err),
+                expected,
+                "{head}: {err:#}"
+            );
+        }
+    }
+
+    async fn send_error(base_url: &str, url: &str) -> anyhow::Error {
+        let request = GenerateContentRequest {
+            contents: vec![],
+            tools: None,
+            system_instruction: None,
+            generation_config: None,
+        };
+        tokio::time::timeout(
+            test_http::TEST_TIMEOUT,
+            local_client(base_url).post_request(url, &request),
+        )
+        .await
+        .expect("request did not complete in time")
+        .expect_err("request should fail")
+    }
+
+    #[tokio::test]
+    async fn test_redirect_loop_stays_fatal() {
+        let server = test_http::RedirectLoop::start().await;
+        let err = send_error(server.url(), server.url()).await;
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Fatal,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("redirect"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_url_stays_fatal() {
+        let err = send_error("not a url", "not a url").await;
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Fatal,
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_refused_is_transient() {
+        let port = test_http::RefusedPort::new();
+        let err = send_error(&port.url, &port.url).await;
+        let msg = transient_message(&err);
+        assert!(msg.contains("error sending request"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_stays_fatal() {
+        let err = error_for(test_http::complete("200 OK", "", "not json")).await;
+        assert_eq!(crate::ai::classify_ai_error(&err), AiErrorClass::Fatal);
     }
 
     #[test]

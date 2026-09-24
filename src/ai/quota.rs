@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 pub struct QuotaManager {
     // Stores the time when we can resume making requests.

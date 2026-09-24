@@ -23,10 +23,13 @@
 //!
 //! - `RateLimit` (429 / quota): account-wide, so it is reported to a shared
 //!   [`QuotaManager`] and every concurrent request waits out the window.
-//! - `Transient` (503 overloaded, 500/502/504, 529): a momentary server-side
-//!   failure, so only this call backs off, exponentially and with jitter so
-//!   concurrent stages do not resynchronise onto the same retry instant.
-//! - `Fatal`: propagated immediately.
+//! - `Transient` (503 overloaded, 500/502/504, 529, and transport failures
+//!   such as a refused or reset connection, a timeout or a response body cut
+//!   off): a momentary failure, so only this call backs off, exponentially
+//!   and with jitter so concurrent stages do not resynchronise onto the same
+//!   retry instant.
+//! - `Fatal` (including requests that cannot be built or that hit a redirect
+//!   loop): propagated immediately.
 
 use std::sync::Arc;
 use std::time::Duration;

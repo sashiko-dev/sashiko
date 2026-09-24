@@ -153,6 +153,8 @@ pub enum ClaudeError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+    #[error("Transient error: {1}, retry after {0:?}")]
+    TransientError(Duration, String),
 }
 
 impl ClassifyAiError for ClaudeError {
@@ -161,7 +163,8 @@ impl ClassifyAiError for ClaudeError {
             ClaudeError::RateLimitExceeded(retry_after) => AiErrorClass::RateLimit {
                 retry_after: *retry_after,
             },
-            ClaudeError::OverloadedError(retry_after) => AiErrorClass::Transient {
+            ClaudeError::OverloadedError(retry_after)
+            | ClaudeError::TransientError(retry_after, _) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
             ClaudeError::InvalidRequest(_) => AiErrorClass::Fatal,
@@ -171,6 +174,28 @@ impl ClassifyAiError for ClaudeError {
             }
         }
     }
+}
+
+pub(crate) const TRANSPORT_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Types a transport failure as transient unless retrying cannot fix it.
+pub(crate) fn transport_error(provider: &str, e: reqwest::Error) -> anyhow::Error {
+    let is_permanent = crate::ai::is_permanent_transport_error(&e);
+    let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
+    if is_permanent {
+        return anyhow::anyhow!("{provider} request failed: {err_str}");
+    }
+    tracing::error!("{} request failed (transport): {}", provider, err_str);
+    ClaudeError::TransientError(TRANSPORT_RETRY_AFTER, err_str).into()
+}
+
+/// Parses a Retry-After in seconds, capped at the quota manager's maximum.
+pub(crate) fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs).min(crate::ai::quota::MAX_RETRY_AFTER))
 }
 
 // --- ClaudeClient ---
@@ -275,16 +300,13 @@ impl ClaudeClient {
             .await
         {
             Ok(res) => res,
-            Err(e) => {
-                let err_str = redact_secret(&e.to_string());
-                anyhow::bail!("Failed to send request to Claude API: {}", err_str);
-            }
+            Err(e) => return Err(transport_error("Claude", e)),
         };
 
         let status = res.status();
 
         if status.is_success() {
-            let body_text = res.text().await?;
+            let body_text = res.text().await.map_err(|e| transport_error("Claude", e))?;
             let response: ClaudeResponse =
                 serde_json::from_str(&body_text).context("Failed to parse Claude API response")?;
 
@@ -298,13 +320,7 @@ impl ClaudeClient {
 
             Ok(response)
         } else {
-            // Parse retry-after header
-            let retry_after_duration = res
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_secs);
+            let retry_after_duration = retry_after_header(res.headers());
 
             let error_body = res
                 .text()
@@ -723,6 +739,7 @@ impl AiProvider for StdioClaudeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_http;
     use crate::ai::{
         AiErrorClass, AiMessage, AiRequest, AiRole, AiTool, ClassifyAiError, DEFAULT_RETRY_AFTER,
         ToolCall,
@@ -822,6 +839,213 @@ mod tests {
             ClaudeError::ApiError(reqwest::StatusCode::BAD_REQUEST, "bad request".to_string());
 
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_transient_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(30);
+        let err = ClaudeError::TransientError(retry_after, "connection reset".to_string());
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+        assert_eq!(
+            crate::ai::classify_ai_error(&anyhow::Error::from(err)),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    fn local_client(base_url: &str) -> ClaudeClient {
+        ClaudeClient {
+            api_key: "test-key".to_string(),
+            model: "claude-test".to_string(),
+            client: test_http::test_client(),
+            enable_caching: false,
+            max_tokens: 1024,
+            base_url: base_url.to_string(),
+            thinking: None,
+            effort: None,
+            extra_headers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn hello_request() -> ClaudeRequest {
+        translate_ai_request(
+            &make_request(vec![AiMessage {
+                role: AiRole::User,
+                content: Some("hi".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }]),
+            false,
+            1024,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    async fn post_to(url: &str) -> Result<ClaudeResponse> {
+        tokio::time::timeout(
+            test_http::TEST_TIMEOUT,
+            local_client(url).post_request(&hello_request()),
+        )
+        .await
+        .expect("request did not complete in time")
+    }
+
+    async fn error_for(response: Vec<u8>) -> anyhow::Error {
+        let server = test_http::serve(response).await;
+        let err = post_to(&server.url).await.expect_err("request should fail");
+        server.finish().await;
+        err
+    }
+
+    fn transient_message(err: &anyhow::Error) -> &str {
+        match err.downcast_ref::<ClaudeError>() {
+            Some(ClaudeError::TransientError(retry_after, msg)) => {
+                assert_eq!(*retry_after, TRANSPORT_RETRY_AFTER);
+                msg
+            }
+            _ => panic!("expected ClaudeError::TransientError, got: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_valid_response_succeeds() {
+        let server = test_http::serve(test_http::complete(
+            "200 OK",
+            "",
+            r#"{"id":"msg_1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ))
+        .await;
+        let response = post_to(&server.url).await.expect("request should succeed");
+        server.finish().await;
+        assert_eq!(response.id, "msg_1");
+    }
+
+    #[tokio::test]
+    async fn test_body_dropped_mid_response_is_transient() {
+        let err = error_for(test_http::truncated("200 OK", "", r#"{"id":"msg_"#)).await;
+        assert!(
+            matches!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient { .. }
+            ),
+            "{err:#}"
+        );
+        let msg = transient_message(&err);
+        assert!(msg.contains(test_http::BODY_READ_FAILURE), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_refused_is_transient() {
+        let port = test_http::RefusedPort::new();
+        let err = post_to(&port.url).await.expect_err("request should fail");
+        assert!(
+            matches!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient { .. }
+            ),
+            "{err:#}"
+        );
+        let msg = transient_message(&err);
+        assert!(msg.contains("error sending request"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_transport_error_is_transient_and_redacted() {
+        let port = test_http::RefusedPort::new();
+        let e = test_http::test_client()
+            .get(format!("{}/?key=hunter2", port.url))
+            .send()
+            .await
+            .expect_err("connect should fail");
+        let raw = e.to_string();
+        assert!(raw.contains("hunter2"), "{raw}");
+        let err = transport_error("Claude", e);
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Transient {
+                retry_after: TRANSPORT_RETRY_AFTER
+            }
+        );
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("hunter2"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_redirect_loop_stays_fatal() {
+        let server = test_http::RedirectLoop::start().await;
+        let err = post_to(server.url())
+            .await
+            .expect_err("request should fail");
+        assert_eq!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Fatal,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("redirect"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_url_stays_fatal() {
+        let err = post_to("not a url").await.expect_err("request should fail");
+        assert_eq!(crate::ai::classify_ai_error(&err), AiErrorClass::Fatal);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_stays_fatal() {
+        let err = error_for(test_http::complete("200 OK", "", "not json")).await;
+        assert_eq!(crate::ai::classify_ai_error(&err), AiErrorClass::Fatal);
+    }
+
+    #[tokio::test]
+    async fn test_truncated_400_stays_fatal() {
+        let err = error_for(test_http::truncated("400 Bad Request", "", r#"{"error":"#)).await;
+        assert_eq!(crate::ai::classify_ai_error(&err), AiErrorClass::Fatal);
+        assert!(
+            matches!(
+                err.downcast_ref::<ClaudeError>(),
+                Some(ClaudeError::InvalidRequest(_))
+            ),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_is_capped() {
+        let cap = crate::ai::quota::MAX_RETRY_AFTER;
+        let cases = [
+            (
+                "429 Too Many Requests",
+                "Retry-After: 18446744073709551615\r\n",
+                AiErrorClass::RateLimit { retry_after: cap },
+            ),
+            (
+                "503 Service Unavailable",
+                "Retry-After: 18446744073709551615\r\n",
+                AiErrorClass::Transient { retry_after: cap },
+            ),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 7\r\n",
+                AiErrorClass::RateLimit {
+                    retry_after: Duration::from_secs(7),
+                },
+            ),
+        ];
+        for (status, header, expected) in cases {
+            let err = error_for(test_http::complete(status, header, "{}")).await;
+            assert_eq!(
+                crate::ai::classify_ai_error(&err),
+                expected,
+                "{status} {header}: {err:#}"
+            );
+        }
     }
 
     // --- ThinkingConfig tests (Bug 1 regression) ---
