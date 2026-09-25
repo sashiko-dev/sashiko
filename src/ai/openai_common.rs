@@ -20,7 +20,7 @@
 
 use crate::ai::{AiErrorClass, ClassifyAiError, classify_status_code};
 use crate::utils::redact_secret;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
 use reqwest::Client;
 use reqwest::header::HeaderMap;
@@ -78,8 +78,11 @@ where
 
 /// Builds the HTTP client both transports use.  The key comes from the
 /// environment rather than from settings, so an instance that has none
-/// still builds a client and fails at the endpoint with a 401.
-pub fn build_http_client(api_timeout_secs: u64) -> Client {
+/// still builds a client and fails at the endpoint with a 401.  A builder
+/// failure is returned rather than papered over with a bare client: that
+/// one would carry neither the key nor the timeout, and its 401 would
+/// point at the key.
+pub fn build_http_client(api_timeout_secs: u64) -> Result<Client> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("LLM_API_KEY"))
         .unwrap_or_default();
@@ -95,7 +98,7 @@ pub fn build_http_client(api_timeout_secs: u64) -> Client {
         .default_headers(headers)
         .timeout(Duration::from_secs(api_timeout_secs))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .context("Failed to build the OpenAI HTTP client")
 }
 
 /// Normalize a base URL so it always ends with `endpoint_path`.

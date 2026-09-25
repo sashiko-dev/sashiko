@@ -266,7 +266,7 @@ impl OpenAiResponsesClient {
         api_timeout_secs: u64,
         effort: Option<String>,
     ) -> Result<Self> {
-        let client = build_http_client(api_timeout_secs);
+        let client = build_http_client(api_timeout_secs)?;
         let base_url = normalize_base_url(&base_url, ENDPOINT_PATH)?;
 
         Ok(Self {
