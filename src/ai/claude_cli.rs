@@ -335,7 +335,8 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
 
     if !merged_tool_calls.is_empty() {
         debug!(
-            "claude-cli: merged {} tool calls from JSONL response",
+            target: "sashiko::ai::cli_provider",
+            "cli provider: merged {} tool calls from JSONL response",
             merged_tool_calls.len()
         );
         return Ok(AiResponse {
@@ -362,7 +363,10 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
     }
 
     // Not parseable as JSON — return raw text
-    warn!("claude-cli response not valid JSON, returning as raw content");
+    warn!(
+        target: "sashiko::ai::cli_provider",
+        "cli provider response not valid JSON, returning as raw content"
+    );
     Ok(AiResponse {
         content: Some(text.to_string()),
         thought: None,
