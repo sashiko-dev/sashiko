@@ -704,13 +704,25 @@ impl AiProvider for StdioGeminiClient {
 
 fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
     let mut contents: Vec<Content> = Vec::new();
-    let mut system_instruction = None;
 
-    if let Some(sys_content) = request.system {
-        system_instruction = Some(Content {
+    let mut system_text = request.system;
+    if system_text.is_none() {
+        for msg in &request.messages {
+            if msg.role == AiRole::System && msg.content.is_some() {
+                system_text = msg.content.clone();
+                break;
+            }
+        }
+    }
+
+    if let Some(sys_content) = system_text {
+        contents.push(Content {
             role: "user".to_string(),
             parts: vec![Part::Text {
-                text: sys_content,
+                text: format!(
+                    "<system_instructions>\n{}\n</system_instructions>",
+                    sys_content
+                ),
                 thought_signature: None,
                 thought: false,
             }],
@@ -720,19 +732,7 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
     for msg in request.messages {
         match msg.role {
             AiRole::System => {
-                if let Some(content) = msg.content {
-                    // Only set if not already set by request.system
-                    if system_instruction.is_none() {
-                        system_instruction = Some(Content {
-                            role: "user".to_string(), // role is ignored for system_instruction but required by struct
-                            parts: vec![Part::Text {
-                                text: content,
-                                thought_signature: None,
-                                thought: false,
-                            }],
-                        });
-                    }
-                }
+                // Handled above as leading user content.
             }
             AiRole::User => {
                 let part = Part::Text {
@@ -843,7 +843,7 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
     Ok(GenerateContentRequest {
         contents,
         tools,
-        system_instruction,
+        system_instruction: None,
         generation_config: Some(GenerationConfig {
             response_mime_type,
             response_schema,
@@ -1202,18 +1202,19 @@ mod tests {
 
         let gemini_req = translate_ai_request(request)?;
 
-        assert!(gemini_req.system_instruction.is_some());
-        let sys_part = &gemini_req.system_instruction.unwrap().parts[0];
-        if let Part::Text { text, .. } = sys_part {
-            assert_eq!(text, "You are a helpful assistant.");
+        assert!(gemini_req.system_instruction.is_none());
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "user");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        if let Part::Text { text, .. } = &gemini_req.contents[0].parts[0] {
+            assert_eq!(
+                text,
+                "<system_instructions>\nYou are a helpful assistant.\n</system_instructions>"
+            );
         } else {
             panic!("Expected Text part in system instruction");
         }
-
-        assert_eq!(gemini_req.contents.len(), 1);
-        assert_eq!(gemini_req.contents[0].role, "user");
-        let user_part = &gemini_req.contents[0].parts[0];
-        if let Part::Text { text, .. } = user_part {
+        if let Part::Text { text, .. } = &gemini_req.contents[0].parts[1] {
             assert_eq!(text, "Hello!");
         } else {
             panic!("Expected Text part in user content");
@@ -1221,6 +1222,72 @@ mod tests {
 
         assert_eq!(gemini_req.generation_config.unwrap().temperature, Some(0.7));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_request_request_system_field() -> Result<()> {
+        let request = AiRequest {
+            system: Some("System prompt from request.system".to_string()),
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("User message".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert!(gemini_req.system_instruction.is_none());
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "user");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        if let Part::Text { text, .. } = &gemini_req.contents[0].parts[0] {
+            assert_eq!(
+                text,
+                "<system_instructions>\nSystem prompt from request.system\n</system_instructions>"
+            );
+        } else {
+            panic!("Expected Text part for system instructions");
+        }
+        if let Part::Text { text, .. } = &gemini_req.contents[0].parts[1] {
+            assert_eq!(text, "User message");
+        } else {
+            panic!("Expected Text part for user message");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_request_system_without_user_message() -> Result<()> {
+        let request = AiRequest {
+            system: Some("Standalone system prompt".to_string()),
+            messages: vec![],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert!(gemini_req.system_instruction.is_none());
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "user");
+        assert_eq!(gemini_req.contents[0].parts.len(), 1);
+        if let Part::Text { text, .. } = &gemini_req.contents[0].parts[0] {
+            assert_eq!(
+                text,
+                "<system_instructions>\nStandalone system prompt\n</system_instructions>"
+            );
+        } else {
+            panic!("Expected Text part for system instructions");
+        }
         Ok(())
     }
 
