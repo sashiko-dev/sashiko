@@ -27,6 +27,7 @@ use reqwest::header::HeaderMap;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -216,14 +217,22 @@ pub async fn post_json<T: DeserializeOwned>(
     }
 }
 
+/// The pattern a 429 body states its retry hint in, compiled once for the
+/// process rather than on every request.  The literal is fixed, so the
+/// compile cannot fail.
+fn retry_in_regex() -> &'static Regex {
+    static RETRY_IN: OnceLock<Regex> = OnceLock::new();
+    RETRY_IN.get_or_init(|| {
+        Regex::new(r"Please retry in ([0-9.]+)s").expect("the retry hint pattern is a valid regex")
+    })
+}
+
 async fn post_json_once<T: DeserializeOwned>(
     client: &Client,
     url: &str,
     headers: &HeaderMap,
     body: &Value,
 ) -> Result<T, OpenAiCompatError> {
-    let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
-
     // Request headers replace default headers of the same name, so an extra
     // authorization header overrides the bearer token.
     let request = client.post(url).headers(headers.clone()).json(body);
@@ -273,7 +282,7 @@ async fn post_json_once<T: DeserializeOwned>(
     match status_code {
         429 => {
             let default_retry = retry_after_duration.unwrap_or(Duration::from_secs(60));
-            let retry_duration = re
+            let retry_duration = retry_in_regex()
                 .captures(&error_text)
                 .and_then(|caps| caps[1].parse::<f64>().ok())
                 .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
