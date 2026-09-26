@@ -152,7 +152,7 @@ pub enum OpenAiCompatError {
 | `AiRole::Tool` message | `{ role: "tool", tool_call_id, content }` |
 | `tools` | `[{ type: "function", function: { name, description, parameters } }]` |
 | `temperature` | Passed through directly when present |
-| `response_format: Json` | `{ type: "json_object" }`. **JSON word injection:** OpenAI requires the word "json" to appear in at least one message when using `json_object` mode. If no message already contains "json" (case-insensitive), the provider appends `"\nRespond in JSON format."` to the first system message, or prepends a new system message `"Respond in JSON format."` if none exists. |
+| `response_format: Json` | `{ type: "json_object" }`. **JSON word injection:** Some Responses-backed gateways require "json" in a user message. If the first user message lacks it (case-insensitive), append `"\nRespond in JSON format."` there so the prompt prefix stays stable across turns. If there is no user message, append a new one with the hint. |
 | `response_format: Text` | `{ type: "text" }` |
 | `OpenAiProviderType::OpenAi` | `{ max_completion_tokens: N }` (OpenAI) |
 | `OpenAiProviderType::OpenAiCompatible` | `{ max_tokens: N }` (OpenAI-compatible) |
@@ -208,8 +208,10 @@ fn get_capabilities(&self) -> ProviderCapabilities {
 | 5 | `test_translate_request_tools_definition` | `AiTool` → `{"type": "function", "function": {"name", "description", "parameters"}}`. |
 | 5.1 | `test_translate_request_empty_tools` | `Some(vec![])` tools → `None` (for `skip_serializing_if` compatibility). |
 | 6 | `test_translate_request_conversation_chain` | Full user → assistant (tool_calls) → tool response chain. Correct roles and ordering. |
-| 7 | `test_translate_request_json_format` | `AiResponseFormat::Json` → `{"type": "json_object"}`. When no message contains "json", a system message `"Respond in JSON format."` is prepended. |
-| 7.1 | `test_translate_request_json_format_no_injection_when_present` | When messages already contain "json" (case-insensitive), no additional system message is injected. |
+| 7 | `test_translate_request_json_format` | `AiResponseFormat::Json` → `{"type": "json_object"}`. The first user message receives the JSON hint when it lacks one. |
+| 7.1 | `test_translate_request_json_format_no_injection_when_present` | A first user message already mentioning JSON keeps its original content. |
+| 7.2 | `test_json_hint_stays_on_first_user_across_turns` | Later user messages do not move the hint or change the first user message. |
+| 7.3 | `test_json_hint_adds_user_when_request_has_none` | A request without a user message receives one containing the JSON hint. |
 | 8 | `test_translate_request_temperature` | Temperature from `AiRequest` included in `OpenAiRequest.temperature`. |
 
 ##### Response Translation Tests

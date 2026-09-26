@@ -470,3 +470,7 @@ For OpenAI's own API with an API key (rather than a self-hosted
 compatible endpoint), use `docs/examples/Settings.openai-api.toml`:
 set `provider = "openai"`, `model = "gpt-5.6-sol"`, and export
 `OPENAI_API_KEY`.
+
+Some compatible gateways reject the `temperature` field for reasoning
+models. Sashiko retries an explicit unsupported-temperature error without
+the field and omits it on later requests to the same endpoint.
