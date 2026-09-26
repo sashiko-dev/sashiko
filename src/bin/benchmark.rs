@@ -218,17 +218,20 @@ async fn main() -> Result<()> {
             let mut completed_reviews = 0;
 
             for entry in &benchmark_entries {
-                // Find patch ID
+                // Find patch ID and patch status
                 let mut rows = db
                     .conn
                     .query(
-                        "SELECT id FROM patches WHERE message_id = ?",
+                        "SELECT id, status FROM patches WHERE message_id = ?",
                         libsql::params![entry.commit.clone()],
                     )
                     .await?;
 
-                let patch_id = if let Ok(Some(row)) = rows.next().await {
-                    row.get::<i64>(0).unwrap_or_default()
+                let (patch_id, patch_status) = if let Ok(Some(row)) = rows.next().await {
+                    (
+                        row.get::<i64>(0).unwrap_or_default(),
+                        row.get::<String>(1).unwrap_or_default(),
+                    )
                 } else {
                     // Patch not found yet (maybe still downloading/parsing)
                     all_completed = false;
@@ -253,6 +256,10 @@ async fn main() -> Result<()> {
                     } else {
                         completed_reviews += 1;
                     }
+                } else if patch_status == "Skipped" || patch_status == "Failed" {
+                    // Patch was skipped (e.g., max_lines_changed / max_files_touched) or failed
+                    // before creating a review row; it will not produce a review.
+                    completed_reviews += 1;
                 } else {
                     // No review created yet
                     all_completed = false;
