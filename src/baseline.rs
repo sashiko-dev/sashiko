@@ -203,7 +203,13 @@ impl BaselineRegistry {
         let mainline_ref = format!("{}/master^{{commit}}", self.mainline_remote_name());
         let tip = match run_offline_git(
             &self.repo_path,
-            &["rev-parse", "--verify", "--quiet", "--end-of-options", &mainline_ref],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &mainline_ref,
+            ],
         )
         .await
         {
