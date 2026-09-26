@@ -490,32 +490,25 @@ fn translate_ai_request(
         AiResponseFormat::Text => serde_json::json!({"type": "text"}),
     });
 
-    // OpenAI requires the word "json" to appear in at least one message when
-    // using response_format: json_object. Inject it if missing.
+    // Responses-backed gateways check user input for "json" and may not count
+    // system instructions. Keep the hint on the first user message so later
+    // turns preserve the same prompt prefix.
     if response_format
         .as_ref()
         .is_some_and(|rf| rf["type"] == "json_object")
     {
-        let has_json = messages.iter().any(|m| {
-            m.content
-                .as_ref()
-                .is_some_and(|c| c.to_lowercase().contains("json"))
-        });
-        if !has_json {
-            if let Some(system_msg) = messages.iter_mut().find(|m| m.role == "system") {
-                let content = system_msg.content.get_or_insert_default();
+        if let Some(user_msg) = messages.iter_mut().find(|m| m.role == "user") {
+            let content = user_msg.content.get_or_insert_default();
+            if !content.to_lowercase().contains("json") {
                 content.push_str("\nRespond in JSON format.");
-            } else {
-                messages.insert(
-                    0,
-                    OpenAiMessage {
-                        role: "system".to_string(),
-                        content: Some("Respond in JSON format.".to_string()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                );
             }
+        } else {
+            messages.push(OpenAiMessage {
+                role: "user".to_string(),
+                content: Some("Respond in JSON format.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
         }
     }
 
@@ -1000,13 +993,12 @@ mod tests {
             openai_req.response_format,
             Some(json!({"type": "json_object"}))
         );
-        // "json" not in any message, so a system message should be prepended
-        assert_eq!(openai_req.messages[0].role, "system");
+        assert_eq!(openai_req.messages[0].role, "user");
         assert_eq!(
             openai_req.messages[0].content,
-            Some("Respond in JSON format.".to_string())
+            Some("Score this.\nRespond in JSON format.".to_string())
         );
-        assert_eq!(openai_req.messages.len(), 2);
+        assert_eq!(openai_req.messages.len(), 1);
 
         Ok(())
     }
@@ -1042,6 +1034,65 @@ mod tests {
             Some("You are helpful.".to_string())
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_json_hint_stays_on_first_user_across_turns() -> Result<()> {
+        let user = |content: &str| AiMessage {
+            role: AiRole::User,
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let translate = |messages| {
+            translate_ai_request(
+                AiRequest {
+                    system: None,
+                    messages,
+                    tools: None,
+                    temperature: None,
+                    response_format: Some(AiResponseFormat::Json { schema: None }),
+                    context_tag: None,
+                },
+                4096,
+                OpenAiProviderType::OpenAiCompatible,
+            )
+        };
+
+        let first_turn = translate(vec![user("Inspect this.")])?;
+        let next_turn = translate(vec![user("Inspect this."), user("Retry as JSON.")])?;
+        assert_eq!(
+            first_turn.messages[0].content,
+            next_turn.messages[0].content
+        );
+        assert_eq!(
+            next_turn.messages[1].content.as_deref(),
+            Some("Retry as JSON.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_json_hint_adds_user_when_request_has_none() -> Result<()> {
+        let request = AiRequest {
+            system: Some("You are helpful.".to_string()),
+            messages: vec![],
+            tools: None,
+            temperature: None,
+            response_format: Some(AiResponseFormat::Json { schema: None }),
+            context_tag: None,
+        };
+
+        let translated = translate_ai_request(request, 4096, OpenAiProviderType::OpenAiCompatible)?;
+        assert_eq!(translated.messages[0].role, "system");
+        assert_eq!(translated.messages[1].role, "user");
+        assert_eq!(
+            translated.messages[1].content.as_deref(),
+            Some("Respond in JSON format.")
+        );
         Ok(())
     }
 
