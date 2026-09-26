@@ -336,7 +336,9 @@ impl<'a> SessionRunner<'a> {
             log_history.push(assistant_msg);
 
             // Handle Tool Calls
-            if let Some(tool_calls) = &resp.tool_calls {
+            if let Some(tool_calls) = &resp.tool_calls
+                && !tool_calls.is_empty()
+            {
                 if is_final_turn {
                     tracing::warn!(
                         "Model emitted tool calls on final turn; ignoring tools to force validation."
