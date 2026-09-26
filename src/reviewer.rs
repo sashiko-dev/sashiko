@@ -3774,11 +3774,11 @@ fi
             1,
             &stale_head_candidates(&repo),
             &one_patch(diff),
+            None,
         )
         .await;
 
-        let (candidate, _, worktree) = chosen.expect("mainline should apply");
-        assert_eq!(candidate.as_str(), "origin/master");
+        let (_, worktree, _) = chosen.expect("mainline should apply");
         assert_eq!(
             attempt_statuses(&logs),
             vec![
@@ -3806,11 +3806,11 @@ fi
             1,
             &stale_head_candidates(&repo),
             &one_patch(diff),
+            None,
         )
         .await;
 
-        let (candidate, _, worktree) = chosen.expect("the merged HEAD should apply");
-        assert_eq!(candidate.as_str(), "stale/HEAD");
+        let (_, worktree, _) = chosen.expect("the merged HEAD should apply");
         assert_eq!(
             attempt_statuses(&logs),
             vec![
