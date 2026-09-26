@@ -23,6 +23,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +163,36 @@ impl ClassifyAiError for OpenAiCompatError {
     }
 }
 
+fn rejects_temperature_parameter(error: &OpenAiCompatError) -> bool {
+    let OpenAiCompatError::ApiError(status, body) = error else {
+        return false;
+    };
+    if !matches!(
+        *status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let detail = parsed.as_ref().map(|value| &value["error"]);
+    let param = detail.and_then(|value| value["param"].as_str());
+    let code = detail.and_then(|value| value["code"].as_str());
+    if param == Some("temperature") && code == Some("unsupported_parameter") {
+        return true;
+    }
+
+    let message = detail
+        .and_then(|value| value["message"].as_str())
+        .unwrap_or(body)
+        .to_ascii_lowercase();
+    message.contains("unsupported parameter: 'temperature'")
+        || message.contains("unsupported parameter: \"temperature\"")
+        || message.contains("unsupported parameter: temperature")
+        || message.contains("temperature is not supported")
+        || message.contains("'temperature' is not supported")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiProviderType {
     /// Official OpenAI API — uses `max_completion_tokens`.
@@ -177,6 +208,7 @@ pub struct OpenAiCompatClient {
     max_tokens: u32,
     provider_type: OpenAiProviderType,
     client: Client,
+    temperature_unsupported: AtomicBool,
 }
 
 impl OpenAiCompatClient {
@@ -215,7 +247,17 @@ impl OpenAiCompatClient {
             max_tokens,
             provider_type,
             client,
+            temperature_unsupported: AtomicBool::new(false),
         })
+    }
+
+    fn prepare_request(&self, request: AiRequest) -> Result<OpenAiRequest> {
+        let mut openai_req = translate_ai_request(request, self.max_tokens, self.provider_type)?;
+        openai_req.model = self.model.clone();
+        if self.temperature_unsupported.load(Ordering::Relaxed) {
+            openai_req.temperature = None;
+        }
+        Ok(openai_req)
     }
 
     /// Normalize a base URL so it always ends with `/chat/completions`.
@@ -564,11 +606,24 @@ impl AiProvider for OpenAiCompatClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         tracing::info!("Sending OpenAI request...");
 
-        let mut openai_req = translate_ai_request(request, self.max_tokens, self.provider_type)?;
-        openai_req.model = self.model.clone();
-
+        let mut openai_req = self.prepare_request(request)?;
         let resp_body = serde_json::to_value(&openai_req)?;
-        let resp = self.post_request(&resp_body).await?;
+        let resp = match self.post_request(&resp_body).await {
+            Ok(resp) => resp,
+            Err(error)
+                if openai_req.temperature.is_some() && rejects_temperature_parameter(&error) =>
+            {
+                self.temperature_unsupported.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "{}OpenAI endpoint rejected temperature; retrying without it",
+                    crate::ai::get_log_prefix()
+                );
+                openai_req.temperature = None;
+                let retry_body = serde_json::to_value(&openai_req)?;
+                self.post_request(&retry_body).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
         translate_ai_response(resp)
     }
 
@@ -1462,5 +1517,155 @@ mod tests {
 
         let elsewhere = test_client("http://localhost:1234/v1", 4096);
         assert_ne!(capped.cache_identity(), elsewhere.cache_identity());
+    }
+
+    #[test]
+    fn cache_identity_preserves_existing_format() {
+        let client = test_client("https://api.openai.com/v1", 4096);
+        assert_eq!(
+            client.cache_identity(),
+            "gpt-5.1|max_tokens=4096|base_url=https://api.openai.com/v1/chat/completions|provider_type=openai"
+        );
+    }
+
+    #[test]
+    fn temperature_fallback_matches_only_explicit_unsupported_errors() {
+        let error = |status, message: &str| {
+            OpenAiCompatError::ApiError(status, json!({"error": {"message": message}}).to_string())
+        };
+        assert!(rejects_temperature_parameter(&error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "Unsupported parameter: 'temperature' is not supported with this model."
+        )));
+        assert!(rejects_temperature_parameter(&OpenAiCompatError::ApiError(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": {"param": "temperature", "code": "unsupported_parameter"}}).to_string(),
+        )));
+        assert!(!rejects_temperature_parameter(&error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "Temperature must be between 0 and 1"
+        )));
+        assert!(!rejects_temperature_parameter(&error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "Unsupported parameter: 'max_tokens'"
+        )));
+        assert!(!rejects_temperature_parameter(&error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Unsupported parameter: 'temperature'"
+        )));
+    }
+
+    #[tokio::test]
+    async fn temperature_fallback_retries_once_and_remembers_rejection() -> Result<()> {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let requests = Arc::clone(&requests);
+                async move {
+                    let has_temperature = body.get("temperature").is_some();
+                    requests.lock().await.push(body);
+                    if has_temperature {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": {"message": "Unsupported parameter: 'temperature' is not supported with this model."}})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}/v1", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = OpenAiCompatClient::new(
+            base_url,
+            OpenAiProviderType::OpenAiCompatible,
+            "test-model".to_string(),
+            8192,
+            128,
+            5,
+        )?;
+        let request = AiRequest {
+            system: None,
+            messages: vec![],
+            tools: None,
+            temperature: Some(0.0),
+            response_format: None,
+            context_tag: None,
+        };
+
+        client.generate_content(request.clone()).await?;
+        client.generate_content(request).await?;
+        let bodies = captured.lock().await;
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0]["temperature"], 0.0);
+        assert!(bodies[1].get("temperature").is_none());
+        assert!(bodies[2].get("temperature").is_none());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn temperature_fallback_does_not_retry_other_requests() -> Result<()> {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::{Arc, atomic::AtomicUsize};
+
+        async fn check(message: &str, temperature: Option<f32>) -> Result<()> {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&calls);
+            let error_message = message.to_string();
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let seen = Arc::clone(&seen);
+                    let error_message = error_message.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": {"message": error_message}})),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let base_url = format!("http://{}/v1", listener.local_addr()?);
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let client = OpenAiCompatClient::new(
+                base_url,
+                OpenAiProviderType::OpenAiCompatible,
+                "test-model".to_string(),
+                8192,
+                128,
+                5,
+            )?;
+            let request = AiRequest {
+                system: None,
+                messages: vec![],
+                tools: None,
+                temperature,
+                response_format: None,
+                context_tag: None,
+            };
+
+            assert!(client.generate_content(request).await.is_err());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            server.abort();
+            Ok(())
+        }
+
+        check("Unsupported parameter: 'max_tokens'", Some(0.0)).await?;
+        check("Unsupported parameter: 'temperature'", None).await?;
+        Ok(())
     }
 }
