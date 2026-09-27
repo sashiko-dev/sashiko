@@ -139,8 +139,11 @@ Within a required section, a field with no `#[serde(default)]` is itself
 required: `database.url`, `database.token`, `nntp.server`, `nntp.port`,
 `ai.provider`, `ai.model`, `server.host`, `server.port`,
 `git.repository_path`, `review.concurrency`, `review.worktree_dir`,
-`mailing_lists.track`, and, inside `[smtp]` when present, `server`, `port`,
-`sender_address`.
+`mailing_lists.track`, and, inside `[smtp]` when present, `sender_address`.
+`smtp.server` and `smtp.port` are `Option` because the `sendmail` transport
+has no use for them; `SmtpSettings::validate()` requires both when
+`transport` is `smtp` (the default) and rejects credentials when it is
+`sendmail`.
 
 **Adding a field to a required section without `#[serde(default = ...)]` or
 `Option` breaks every existing configuration file.** That is a decision, not

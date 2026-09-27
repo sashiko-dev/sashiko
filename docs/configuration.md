@@ -81,13 +81,30 @@ Optional. If omitted, no review emails are sent. Even when present,
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `server` | string | -- | SMTP server hostname. |
-| `port` | integer | -- | SMTP server port. |
+| `transport` | string | `smtp` | Delivery method: `smtp` or `sendmail`. |
+| `server` | string | -- | SMTP server hostname. Required for `smtp`. |
+| `port` | integer | -- | SMTP server port. Required for `smtp`. |
 | `username` | string | -- | SMTP username (optional). |
 | `password` | string | -- | SMTP password (optional). |
+| `sendmail_path` | string | `/usr/sbin/sendmail` | Sendmail binary to invoke. |
 | `sender_address` | string | -- | From address for review emails. |
 | `reply_to` | string | -- | Reply-To address (optional). |
 | `dry_run` | bool | `true` | When true, emails are logged but not sent. |
+
+The `smtp` transport connects over implicit TLS, so it cannot reach a
+submission service that offers only cleartext. The `sendmail`
+transport pipes the message to the local MTA instead, which leaves
+transport security and queueing to the host's mail configuration. It
+ignores `server` and `port`. Supplying credentials alongside it is
+rejected when the configuration loads. A `sendmail_path` that is not
+an executable file is rejected at startup, unless `dry_run` is on,
+since a dry run never invokes it.
+
+A message the local MTA accepts is queued, not delivered. Sashiko
+records it as sent once sendmail exits zero, so a later rejection
+arrives as a bounce that only the host mail configuration sees. A
+sendmail that has not exited after 60 seconds is killed and the
+message marked failed.
 
 ### `[ai]`
 
