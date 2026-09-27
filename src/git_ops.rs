@@ -1346,9 +1346,11 @@ pub async fn get_remote_branches(repo_path: &Path, remote_name: &str) -> Result<
     Ok(branches)
 }
 
+/// Resolve a revision to an existing commit, peeling annotated tags.
 pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
     let output = crate::git_cmd::in_dir_async(path)
-        .args(["rev-parse", ref_name])
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{ref_name}^{{commit}}"))
         .output()
         .await?;
 
@@ -1612,6 +1614,94 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+
+    async fn run_test_git(repo: &Path, args: &[&str]) -> Result<String> {
+        let output = crate::git_cmd::in_dir_async(repo)
+            .args(args)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    async fn commit_resolution_repo() -> Result<TempDir> {
+        let repo = tempfile::tempdir()?;
+        run_test_git(repo.path(), &["init", "-q", "-b", "main"]).await?;
+        run_test_git(repo.path(), &["config", "user.name", "Test User"]).await?;
+        run_test_git(repo.path(), &["config", "user.email", "test@example.com"]).await?;
+        std::fs::write(repo.path().join("value.txt"), "base\n")?;
+        run_test_git(repo.path(), &["add", "value.txt"]).await?;
+        run_test_git(repo.path(), &["commit", "-q", "-s", "-m", "base"]).await?;
+        Ok(repo)
+    }
+
+    #[tokio::test]
+    async fn test_get_commit_hash_resolves_commits_and_tags() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let head = run_test_git(repo.path(), &["rev-parse", "HEAD"]).await?;
+        run_test_git(repo.path(), &["tag", "lightweight"]).await?;
+        run_test_git(repo.path(), &["tag", "-a", "annotated", "-m", "release"]).await?;
+        let tag = run_test_git(repo.path(), &["rev-parse", "annotated"]).await?;
+        assert_ne!(tag, head);
+
+        for ref_name in [
+            "HEAD",
+            "refs/heads/main",
+            head.as_str(),
+            &head[..12],
+            "lightweight",
+            "annotated",
+            tag.as_str(),
+        ] {
+            assert_eq!(
+                get_commit_hash(repo.path(), ref_name).await?,
+                head,
+                "failed to resolve {ref_name} to its commit"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_commit_hash_rejects_missing_objects() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        for ref_name in ["1111111111111111111111111111111111111111", "missing-branch"] {
+            assert!(
+                get_commit_hash(repo.path(), ref_name).await.is_err(),
+                "accepted missing revision {ref_name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_commit_hash_rejects_non_commit_objects() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        for ref_name in ["HEAD^{tree}", "HEAD:value.txt"] {
+            let hash = run_test_git(repo.path(), &["rev-parse", ref_name]).await?;
+            assert!(
+                get_commit_hash(repo.path(), &hash).await.is_err(),
+                "accepted non-commit object {ref_name} ({hash})"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_commit_hash_rejects_options_and_ranges() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        for ref_name in ["--all", "--default=HEAD", "HEAD..HEAD", ""] {
+            assert!(
+                get_commit_hash(repo.path(), ref_name).await.is_err(),
+                "accepted invalid revision {ref_name:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_is_stale_commit_graph_matches_both_wordings() {
