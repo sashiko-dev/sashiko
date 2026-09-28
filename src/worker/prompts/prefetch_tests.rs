@@ -89,6 +89,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
                 series_range: None,
                 baseline_sha: None,
                 custom_prompt: None,
+                cover_letter: None,
                 stages: Some(vec!["goal".to_string()]),
             },
         );

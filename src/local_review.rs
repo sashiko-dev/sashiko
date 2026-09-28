@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::{
-    git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
+    git_ops::{
+        GitWorktree, RangeSeries, extract_patch_metadata, get_commit_hash, resolve_git_range,
+        split_range_cover_letter,
+    },
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
     worker::{
@@ -179,6 +182,10 @@ pub struct CommitSummary {
 
 pub type ProgressCallback<'a> = dyn Fn(ProgressEvent) + Send + Sync + 'a;
 
+/// Build the review input for a commit or commit range, together with every
+/// commit the input resolved to. The review's baseline is the parent of the
+/// first of those, which for a range that starts with a b4 cover commit is the
+/// commit the series was prepared on.
 pub async fn build_review_input_from_git(
     repo_path: &Path,
     input: &str,
@@ -191,16 +198,26 @@ pub async fn build_review_input_from_git(
         },
     );
 
-    let shas = if input.contains("..") {
-        resolve_git_range(repo_path, input).await?
+    // A range can carry its series' cover letter, in a merge commit at its tip
+    // or in a b4 cover commit; that commit is then not reviewed as a patch. A
+    // single commit is reviewed as it is.
+    let (shas, series) = if input.contains("..") {
+        let shas = resolve_git_range(repo_path, input).await?;
+        let series = split_range_cover_letter(repo_path, &shas).await?;
+        (shas, series)
     } else {
-        vec![get_commit_hash(repo_path, input).await?]
+        let shas = vec![get_commit_hash(repo_path, input).await?];
+        let series = RangeSeries {
+            shas: shas.clone(),
+            cover_letter: None,
+        };
+        (shas, series)
     };
 
     let mut patches = Vec::new();
     let mut summaries = Vec::new();
 
-    for (i, sha) in shas.iter().enumerate() {
+    for (i, sha) in series.shas.iter().enumerate() {
         let meta = extract_patch_metadata(repo_path, sha)
             .await
             .with_context(|| format!("Failed to extract metadata for commit {}", sha))?;
@@ -237,6 +254,7 @@ pub async fn build_review_input_from_git(
             id: 0,
             subject,
             patches,
+            cover_letter: series.cover_letter,
         },
         shas,
     ))
@@ -320,6 +338,7 @@ pub async fn run_worker(
     let patchset_id = input.id;
     let subject = input.subject;
     let patches = input.patches;
+    let cover_letter = input.cover_letter;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
     } else {
@@ -410,6 +429,7 @@ pub async fn run_worker(
         &baseline_arg,
         &baseline_sha,
         &options,
+        cover_letter.as_deref(),
         progress,
     )
     .await;
@@ -479,6 +499,7 @@ async fn review_single_patch(
     rich_patches: &[Value],
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
+    cover_letter: Option<&str>,
     baseline_sha: &str,
     llm_semaphore: &Arc<Semaphore>,
     quota: &Arc<crate::ai::quota::QuotaManager>,
@@ -568,6 +589,7 @@ async fn review_single_patch(
                 max_interactions: ai.max_interactions,
                 temperature: ai.temperature,
                 custom_prompt: options.custom_prompt.clone(),
+                cover_letter: cover_letter.map(str::to_string),
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
@@ -731,6 +753,7 @@ async fn run_worker_in_worktree(
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
+    cover_letter: Option<&str>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     info!("Worktree at {:?}", worktree.path);
@@ -938,6 +961,7 @@ async fn run_worker_in_worktree(
                 &rich_patches,
                 patch_shas,
                 options,
+                cover_letter,
                 baseline_sha,
                 llm_semaphore,
                 quota,
@@ -1590,6 +1614,314 @@ mod tests {
         );
         assert_eq!(input.patches[0].subject.as_deref(), Some("Feature"));
 
+        Ok(())
+    }
+
+    /// Commit a change to `name` in `repo_path` and return the commit.
+    async fn commit_file(repo_path: &Path, name: &str, message: &str) -> Result<String> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(repo_path.join(name))?;
+        writeln!(file, "{message}")?;
+        git(repo_path, &["add", name])?;
+        git(repo_path, &["commit", "--message", message])?;
+        get_commit_hash(repo_path, "HEAD").await
+    }
+
+    const B4_COVER: &str = "f: add x and y\n\nThe second patch uses the helper the first adds.\n\n--- b4-submit-tracking ---\n# This section is used internally by b4 prep for tracking purposes.\n{\n  \"series\": {\"revision\": 1}\n}";
+
+    fn review_shas(input: &ReviewInput) -> Vec<String> {
+        input
+            .patches
+            .iter()
+            .map(|p| p.commit_id.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_range_without_a_cover_letter_has_none() -> Result<()> {
+        let (_temp, repo_path, initial_sha, feature_sha) = test_repo().await?;
+        let second = commit_file(&repo_path, "file.txt", "Second").await?;
+        let (input, shas) =
+            build_review_input_from_git(&repo_path, &format!("{initial_sha}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter, None);
+        assert_eq!(
+            review_shas(&input),
+            vec![feature_sha.clone(), second.clone()]
+        );
+        assert_eq!(shas, vec![feature_sha, second]);
+        Ok(())
+    }
+
+    /// Whether the installed git can check that a merge is clean: `git
+    /// merge-tree --write-tree` arrived in Git 2.38. Without it a merge is
+    /// always kept as a patch, so a test expecting one to be taken out says
+    /// why it skips instead of failing.
+    fn merge_tree_write_tree_supported(repo_path: &Path, test: &str) -> bool {
+        let supported = git(repo_path, &["merge-tree", "--write-tree", "HEAD", "HEAD"]).is_ok();
+        if !supported {
+            eprintln!("skipping {test}: git merge-tree --write-tree needs Git 2.38 or newer");
+        }
+        supported
+    }
+
+    #[tokio::test]
+    async fn test_range_ending_in_a_merge_uses_its_message() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        if !merge_tree_write_tree_supported(
+            &repo_path,
+            "test_range_ending_in_a_merge_uses_its_message",
+        ) {
+            return Ok(());
+        }
+        git(&repo_path, &["checkout", "--quiet", "-b", "series"])?;
+        let p1 = commit_file(&repo_path, "a.txt", "f: add x").await?;
+        let p2 = commit_file(&repo_path, "b.txt", "f: use x").await?;
+        git(&repo_path, &["checkout", "--quiet", &feature_sha])?;
+        let message = "Merge branch 'series'\n\nThe second patch uses the helper the first adds.";
+        git(
+            &repo_path,
+            &["merge", "--no-ff", "--message", message, "series"],
+        )?;
+        let merge = get_commit_hash(&repo_path, "HEAD").await?;
+
+        let (input, shas) =
+            build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter.as_deref(), Some(message));
+        assert_eq!(review_shas(&input), vec![p1.clone(), p2.clone()]);
+        assert_eq!(input.patches[0].index, 1);
+        assert_eq!(input.patches[1].index, 2);
+        assert!(shas.contains(&merge), "the range still reports the merge");
+
+        // A single commit is reviewed as it is, merge or not.
+        let (input, _) = build_review_input_from_git(&repo_path, &merge, None).await?;
+        assert_eq!(input.cover_letter, None);
+        assert_eq!(review_shas(&input), vec![merge.clone()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_range_reaching_past_the_merge_base_is_not_a_series_merge() -> Result<()> {
+        let (_temp, repo_path, initial_sha, feature_sha) = test_repo().await?;
+        git(&repo_path, &["checkout", "--quiet", "-b", "series"])?;
+        let p1 = commit_file(&repo_path, "a.txt", "f: add x").await?;
+        git(&repo_path, &["checkout", "--quiet", &feature_sha])?;
+        let other = commit_file(&repo_path, "c.txt", "g: unrelated").await?;
+        git(
+            &repo_path,
+            &["merge", "--no-ff", "--message", "Merge x", "series"],
+        )?;
+        let merge = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // The range also holds commits of the first-parent side, so the merge
+        // is not a series merge, and the range is reviewed as before.
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{initial_sha}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter, None);
+        let reviewed = review_shas(&input);
+        for sha in [&feature_sha, &p1, &other, &merge] {
+            assert!(reviewed.contains(sha), "{sha} was not reviewed");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_that_resolved_a_conflict_is_reviewed() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        git(&repo_path, &["checkout", "--quiet", "-b", "series"])?;
+        let p1 = commit_file(&repo_path, "file.txt", "Series side").await?;
+        git(&repo_path, &["checkout", "--quiet", &feature_sha])?;
+        let other = commit_file(&repo_path, "file.txt", "Mainline side").await?;
+        // Conflicts, then is resolved by hand and committed.
+        assert!(
+            git(
+                &repo_path,
+                &["merge", "--no-ff", "--message", "Merge", "series"]
+            )
+            .is_err()
+        );
+        std::fs::write(repo_path.join("file.txt"), "Initial\nChange\nResolved\n")?;
+        git(&repo_path, &["add", "file.txt"])?;
+        git(&repo_path, &["commit", "--no-edit"])?;
+        let merge = get_commit_hash(&repo_path, "HEAD").await?;
+
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{other}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter, None);
+        assert_eq!(review_shas(&input), vec![p1, merge]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_with_changes_of_its_own_is_reviewed() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        git(&repo_path, &["checkout", "--quiet", "-b", "series"])?;
+        let p1 = commit_file(&repo_path, "a.txt", "f: add x").await?;
+        git(&repo_path, &["checkout", "--quiet", &feature_sha])?;
+        // A clean merge, with a change added before it is committed.
+        git(&repo_path, &["merge", "--no-ff", "--no-commit", "series"])?;
+        std::fs::write(repo_path.join("extra.txt"), "Only in the merge\n")?;
+        git(&repo_path, &["add", "extra.txt"])?;
+        git(&repo_path, &["commit", "--message", "Merge x"])?;
+        let merge = get_commit_hash(&repo_path, "HEAD").await?;
+
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter, None);
+        assert_eq!(review_shas(&input), vec![p1, merge]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mainline_merged_into_a_topic_branch() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        git(&repo_path, &["checkout", "--quiet", "-b", "mainline"])?;
+        let m1 = commit_file(&repo_path, "m.txt", "mainline change").await?;
+        git(
+            &repo_path,
+            &["checkout", "--quiet", "-b", "topic", &feature_sha],
+        )?;
+        let t1 = commit_file(&repo_path, "t.txt", "topic change").await?;
+        git(
+            &repo_path,
+            &[
+                "merge",
+                "--no-ff",
+                "--message",
+                "Merge mainline",
+                "mainline",
+            ],
+        )?;
+        let merge = get_commit_hash(&repo_path, "HEAD").await?;
+
+        // Reviewing the topic branch reaches its own commits on the first
+        // parent's side, so the merge is not taken for a series merge.
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter, None);
+        let reviewed = review_shas(&input);
+        for sha in [&m1, &t1, &merge] {
+            assert!(reviewed.contains(sha), "{sha} was not reviewed");
+        }
+
+        if !merge_tree_write_tree_supported(&repo_path, "test_mainline_merged_into_a_topic_branch")
+        {
+            return Ok(());
+        }
+        // Only a range that starts at the topic's own tip has the shape of a
+        // series merge. From the range alone that cannot be told apart from a
+        // series merged into mainline, so the merge message is taken as the
+        // cover letter; the merge is git's own, so no change goes unreviewed.
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{t1}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter.as_deref(), Some("Merge mainline"));
+        assert_eq!(review_shas(&input), vec![m1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_b4_cover_commit_needs_a_letter_and_tracking_data() -> Result<()> {
+        for message in [
+            // A marker with nothing above it.
+            "--- b4-submit-tracking ---\n# comment\n{\"series\": {\"revision\": 1}}",
+            // A letter with no tracking data after the marker.
+            "f: add x\n\nWhy.\n\n--- b4-submit-tracking ---\n",
+            // Tracking data that is not JSON.
+            "f: add x\n\nWhy.\n\n--- b4-submit-tracking ---\n{ not json",
+            // JSON that is not b4's.
+            "f: add x\n\nWhy.\n\n--- b4-submit-tracking ---\n{\"other\": 1}",
+        ] {
+            let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+            git(
+                &repo_path,
+                &["commit", "--allow-empty", "--message", message],
+            )?;
+            let empty = get_commit_hash(&repo_path, "HEAD").await?;
+            let p1 = commit_file(&repo_path, "a.txt", "f: add x").await?;
+
+            let (input, _) =
+                build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None)
+                    .await?;
+            assert_eq!(input.cover_letter, None, "{message}");
+            assert_eq!(review_shas(&input), vec![empty, p1], "{message}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_range_starting_with_a_b4_cover_commit_uses_it() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        git(
+            &repo_path,
+            &["commit", "--allow-empty", "--message", B4_COVER],
+        )?;
+        let cover = get_commit_hash(&repo_path, "HEAD").await?;
+        let p1 = commit_file(&repo_path, "a.txt", "f: add x").await?;
+        let p2 = commit_file(&repo_path, "b.txt", "f: use x").await?;
+
+        let (input, shas) =
+            build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None).await?;
+        assert_eq!(
+            input.cover_letter.as_deref(),
+            Some("f: add x and y\n\nThe second patch uses the helper the first adds.")
+        );
+        assert_eq!(review_shas(&input), vec![p1, p2]);
+        // The baseline is the parent of the cover commit, where the series
+        // was prepared.
+        assert_eq!(shas.first(), Some(&cover));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_range_ending_with_a_b4_cover_commit_uses_it() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        let p1 = commit_file(&repo_path, "a.txt", "f: add x").await?;
+        let p2 = commit_file(&repo_path, "b.txt", "f: use x").await?;
+        git(
+            &repo_path,
+            &["commit", "--allow-empty", "--message", B4_COVER],
+        )?;
+
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None).await?;
+        assert!(input.cover_letter.is_some());
+        assert_eq!(review_shas(&input), vec![p1, p2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_b4_marker_only_counts_in_an_empty_commit() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        // An empty commit without the marker is an ordinary commit.
+        git(
+            &repo_path,
+            &["commit", "--allow-empty", "--message", "Empty"],
+        )?;
+        let empty = get_commit_hash(&repo_path, "HEAD").await?;
+        let p1 = commit_file(&repo_path, "a.txt", "f: add x").await?;
+        // A commit that changes something is a patch, whatever its message.
+        let marked = commit_file(&repo_path, "b.txt", B4_COVER).await?;
+
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter, None);
+        assert_eq!(review_shas(&input), vec![empty, p1, marked]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_lone_cover_commit_is_still_reviewed() -> Result<()> {
+        let (_temp, repo_path, _initial_sha, feature_sha) = test_repo().await?;
+        git(
+            &repo_path,
+            &["commit", "--allow-empty", "--message", B4_COVER],
+        )?;
+        let cover = get_commit_hash(&repo_path, "HEAD").await?;
+        let (input, _) =
+            build_review_input_from_git(&repo_path, &format!("{feature_sha}..HEAD"), None).await?;
+        assert_eq!(input.cover_letter, None);
+        assert_eq!(review_shas(&input), vec![cover]);
         Ok(())
     }
 

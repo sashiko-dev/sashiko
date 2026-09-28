@@ -226,18 +226,7 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     // Detection logic
     let subject_lower = subject.to_lowercase();
     let subject_clean = subject_lower.trim();
-    let is_reply = subject_clean.starts_with("re:")
-        || subject_clean.starts_with("fwd:")
-        || subject_clean.starts_with("forwarded:")
-        || subject_clean.starts_with("aw:") // German 'Antwort'
-        || subject_clean.starts_with("wg:") // German 'Weitergeleitet'
-        || subject_clean.starts_with("回复:") // Chinese 'Re'
-        || subject_clean.starts_with("回复：") // Chinese 'Re' with full-width colon
-        || subject_clean.starts_with("答复:") // Chinese 'Reply'
-        || subject_clean.starts_with("答复：") // Chinese 'Reply'
-        || subject_clean.starts_with("[reproducer]") // Reproducers
-        || subject_lower.contains("(was ")
-        || subject_lower.contains("(was:");
+    let is_reply = is_reply_subject(&subject);
     let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
     let has_diff = !diff.is_empty();
 
@@ -278,6 +267,32 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     };
 
     Ok((metadata, patch))
+}
+
+/// Whether `subject` is a reply to or a forward of another message rather than
+/// a patch or cover letter of its own, such as "Re: [PATCH 0/3] ...".
+///
+/// A "(was ...)" note anywhere in the subject also counts, which also catches
+/// a series renamed in a new version; [`has_reply_prefix`] does not.
+pub fn is_reply_subject(subject: &str) -> bool {
+    let subject_lower = subject.to_lowercase();
+    has_reply_prefix(subject) || subject_lower.contains("(was ") || subject_lower.contains("(was:")
+}
+
+/// Whether `subject` starts with a reply or forward prefix such as "Re:".
+pub fn has_reply_prefix(subject: &str) -> bool {
+    let subject_lower = subject.to_lowercase();
+    let subject_clean = subject_lower.trim();
+    subject_clean.starts_with("re:")
+        || subject_clean.starts_with("fwd:")
+        || subject_clean.starts_with("forwarded:")
+        || subject_clean.starts_with("aw:") // German 'Antwort'
+        || subject_clean.starts_with("wg:") // German 'Weitergeleitet'
+        || subject_clean.starts_with("回复:") // Chinese 'Re'
+        || subject_clean.starts_with("回复：") // Chinese 'Re' with full-width colon
+        || subject_clean.starts_with("答复:") // Chinese 'Reply'
+        || subject_clean.starts_with("答复：") // Chinese 'Reply'
+        || subject_clean.starts_with("[reproducer]") // Reproducers
 }
 
 /// Read the `M/N` part counter out of a patch subject, as `(index, total)`.

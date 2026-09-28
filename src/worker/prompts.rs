@@ -86,6 +86,10 @@ pub struct ReviewInput {
     pub id: i64,
     pub subject: String,
     pub patches: Vec<PatchInput>,
+    /// Text of the series' cover letter, when the input carries one. Absent
+    /// from payloads written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_letter: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +99,9 @@ pub struct WorkerConfig {
     pub max_interactions: usize,
     pub temperature: f32,
     pub custom_prompt: Option<String>,
+    /// Text of the series' cover letter, shown only to the stages whose table
+    /// entry asks for it.
+    pub cover_letter: Option<String>,
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
     pub stages: Option<Vec<String>>,
@@ -178,6 +185,7 @@ pub struct Worker {
     context_tag: Option<String>,
     stages: Option<Vec<String>>,
     custom_prompt: Option<String>,
+    cover_letter: Option<String>,
 }
 
 impl Worker {
@@ -200,6 +208,7 @@ impl Worker {
             context_tag: None,
             stages: config.stages,
             custom_prompt: config.custom_prompt,
+            cover_letter: config.cover_letter,
         }
     }
 
@@ -344,6 +353,7 @@ impl Worker {
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
+            cover_letter: self.cover_letter.clone(),
             planned_stages: Vec::new(),
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
@@ -1135,6 +1145,7 @@ mod tests {
             series_range: None,
             baseline_sha: None,
             custom_prompt: None,
+            cover_letter: None,
             stages: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
@@ -1282,6 +1293,7 @@ mod tests {
             series_range: None,
             baseline_sha: None,
             custom_prompt: None,
+            cover_letter: None,
             stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
@@ -1317,6 +1329,7 @@ mod tests {
             series_range: None,
             baseline_sha: Some("explicit_baseline_sha".to_string()),
             custom_prompt: None,
+            cover_letter: None,
             stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
@@ -1356,6 +1369,7 @@ mod tests {
             series_range: Some("base_sha..sha2".to_string()),
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
+            cover_letter: None,
             stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
@@ -1454,6 +1468,7 @@ mod tests {
             series_range: Some("base_sha..sha2".to_string()),
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
+            cover_letter: None,
             stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
@@ -1499,6 +1514,189 @@ mod tests {
         assert!(content.contains("Series End Commit (Final State): sha2"));
         assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
         assert!(content.contains("SERIES VERIFICATION DIRECTIVE:"));
+    }
+
+    /// Wraps [`MockMultiStageSeriesProvider`] and keeps every request it is
+    /// sent, so tests can inspect the prompts exactly as a model would see them.
+    struct RecordingProvider {
+        requests: std::sync::Mutex<Vec<crate::ai::AiRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for RecordingProvider {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            // The pre-screen and planning stages run too when no stages are
+            // named; answer them here, asking for every optional stage.
+            let asks = |text: &str| {
+                request.messages.iter().any(|m| {
+                    m.role == crate::ai::AiRole::User
+                        && m.content.as_deref().unwrap_or_default().contains(text)
+                })
+            };
+            let content = if asks("<subsystem_guide_index>") {
+                r#"{"selected_prompts": []}"#
+            } else if asks("determine which of the following review stages are relevant") {
+                r#"{"relevant_stages": ["resources", "locking", "security", "hardware"]}"#
+            } else {
+                return MockMultiStageSeriesProvider.generate_content(request).await;
+            };
+            Ok(crate::ai::AiResponse {
+                content: Some(content.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            MockMultiStageSeriesProvider.get_capabilities()
+        }
+    }
+
+    /// Run a two-patch series through every stage and keep the requests.
+    async fn record_series_review(cover_letter: Option<String>) -> Vec<crate::ai::AiRequest> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = std::sync::Arc::new(RecordingProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let config = WorkerConfig {
+            project: ProjectId::Linux,
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: Some("base_sha..sha2".to_string()),
+            baseline_sha: Some("base_sha".to_string()),
+            custom_prompt: None,
+            cover_letter,
+            stages: None,
+        };
+        let mut worker = Worker::new(
+            provider.clone(),
+            std::sync::Arc::new(tools),
+            prompts,
+            config,
+        );
+
+        let patchset = serde_json::json!({
+            "id": 201,
+            "patch_index": 1,
+            "patches": [
+                {
+                    "index": 1,
+                    "subject": "Patch 1 Subject",
+                    "diff": "diff --git a/file1.c b/file1.c\n+int patch1;",
+                    "commit_id": "sha1"
+                },
+                {
+                    "index": 2,
+                    "subject": "Patch 2 Subject",
+                    "diff": "diff --git a/file2.c b/file2.c\n+int patch2;",
+                    "commit_id": "sha2"
+                }
+            ]
+        });
+        worker.run(patchset, None).await.unwrap();
+        provider.requests.lock().unwrap().clone()
+    }
+
+    /// Everything a request shows the model: its system prompt and every
+    /// message, whatever the provider does with the system prompt.
+    fn request_text(request: &crate::ai::AiRequest) -> String {
+        let mut text = request.system.clone().unwrap_or_default();
+        for m in &request.messages {
+            text.push('\n');
+            text.push_str(m.content.as_deref().unwrap_or_default());
+        }
+        text
+    }
+
+    fn is_verification_request(request: &crate::ai::AiRequest) -> bool {
+        request.messages.iter().any(|m| {
+            m.role == crate::ai::AiRole::User
+                && m.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("# Verification and severity estimation")
+        })
+    }
+
+    #[tokio::test]
+    async fn test_cover_letter_reaches_only_the_verification_stage() {
+        let letter = "Patch 2 depends on patch 1 because it calls the new helper.";
+        let requests = record_series_review(Some(format!("{letter}\n"))).await;
+        let block = crate::workflows::linux_patch_review::cover_letter_block(Some(letter));
+
+        let (verification, others): (Vec<_>, Vec<_>) =
+            requests.iter().partition(|r| is_verification_request(r));
+        assert!(
+            !verification.is_empty(),
+            "the verification stage did not run"
+        );
+        // Every other stage ran as well, so the absence below is not vacuous.
+        for heading in [
+            "<subsystem_guide_index>",
+            "determine which of the following review stages are relevant",
+            "# Analyze commit main goal",
+            "# High-level implementation verification",
+            "# Execution flow verification",
+            "# Resource management",
+            "# Locking and synchronization",
+            "# Security audit",
+            "# Hardware engineer's review",
+            "# Deduplication and Consolidation",
+            "# Concern/dismissed-concern conflict resolution",
+        ] {
+            assert!(
+                others.iter().any(|r| request_text(r).contains(heading)),
+                "no request for {heading}"
+            );
+        }
+
+        for request in &verification {
+            let user = request
+                .messages
+                .iter()
+                .find(|m| m.role == crate::ai::AiRole::User)
+                .and_then(|m| m.content.clone())
+                .unwrap_or_default();
+            assert!(
+                user.contains(&block),
+                "verification did not see the cover letter"
+            );
+            let system = request.system.clone().unwrap_or_default();
+            assert!(
+                !system.contains(letter),
+                "the cover letter is in a system prompt"
+            );
+        }
+        for request in &others {
+            let text = request_text(request);
+            assert!(
+                !text.contains(letter) && !text.contains("series_cover_letter"),
+                "a stage other than verification saw the cover letter: {}",
+                text.chars().take(200).collect::<String>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_cover_letter_renders_nothing() {
+        let requests = record_series_review(None).await;
+        assert!(requests.iter().any(is_verification_request));
+        for request in &requests {
+            assert!(!request_text(request).contains("series_cover_letter"));
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
     PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput,
+    VerificationOutput, cover_letter_placeholder, with_cover_letter,
 };
 
 /// State container for a Sashiko patch review run.
@@ -225,7 +225,7 @@ const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verify remaining concerns and 
 
 For each remaining concern, use the available Git and file tools to inspect the actual code in the worktree and verify whether the defect is real.
 1. Drop any concern that alleges a build, compilation, syntax, type-checking, borrow-checker, lifetime, missing-import, unresolved-symbol, missing-trait-bound, or linter error. Build correctness is verified deterministically by the compiler; LLMs must never vibe-guess build failures.
-2. SERIES VALIDATION RULE: If other patches in this series are provided in the context, check whether each identified concern is resolved, wired up, or refactored in the final state of the series (`Series End Commit`). If a concern is simply work-in-progress completed in a subsequent patch of the series (e.g., types or helpers introduced in Patch 1 and wired to HTTP endpoints or CLI commands in Patch 2 or 3) or fixed by the end of the series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools (`git_read_files` or `git_diff` with `revision` / `target_revision` set to the `Series End Commit`); do not trust promises in commit messages alone.
+2. SERIES VALIDATION RULE: If other patches in this series are provided in the context, check whether each identified concern is resolved, wired up, or refactored in the final state of the series (`Series End Commit`). If a concern is simply work-in-progress completed in a subsequent patch of the series (e.g., types or helpers introduced in Patch 1 and wired to HTTP endpoints or CLI commands in Patch 2 or 3) or fixed by the end of the series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools (`git_read_files` or `git_diff` with `revision` / `target_revision` set to the `Series End Commit`); do not trust promises in commit messages or the cover letter alone.
 3. DESIGN & DOCUMENTATION RULE: If a concern targets illustrative pseudo-code or abbreviated struct snippets in documentation (`designs/*.md`, `README.md`, `prompts/*.md`), inspect the actual Rust implementation in `src/` at the series head (`Series End Commit` / `HEAD`). If the actual Rust code properly enforces the invariant (e.g., `#[serde(default)]`, validation, or auth checks), discard the documentation concern as a false positive.
 4. When referring to other patches within this series in your explanation, DO NOT use ephemeral git hashes. Instead, refer to them by their patch subject (e.g., 'commit "auth: add max_bug_access claim"').
 5. If concrete code proves the concern is a false positive, drop it.
@@ -391,30 +391,35 @@ pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
     name: "deduplication",
     short: "Deduplication",
     wants_series_context: false,
+    wants_cover_letter: false,
 };
 
 pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
     name: "conflict-resolution",
     short: "Conflict Resolution",
     wants_series_context: false,
+    wants_cover_letter: false,
 };
 
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Severity Estimation",
     wants_series_context: true,
+    wants_cover_letter: true,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
     wants_series_context: false,
+    wants_cover_letter: false,
 };
 
 pub static SUMMARY: ConsolidationStage = ConsolidationStage {
     name: "summary",
     short: "Change Summary",
     wants_series_context: false,
+    wants_cover_letter: false,
 };
 
 pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[
@@ -941,13 +946,14 @@ pub fn verification_stage(
     temperature: f32,
 ) -> Stage<SashikoPatchReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
+    let cover_letter = cover_letter_placeholder(VERIFICATION.wants_cover_letter);
     Stage::builder(VERIFICATION.name)
         .system_prompt(sashiko_system_prompt(true))
-        .user_prompt(with_series_context(
+        .user_prompt(with_cover_letter(with_series_context(
             PromptTemplate::<SashikoPatchReviewState>::new(format!(
                 r#"{STAGE_VERIFICATION_INSTRUCTION}
 
-CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid. If you cannot find concrete proof of safety, you must retain the concern.{series_context}
+CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid. If you cannot find concrete proof of safety, you must retain the concern.{series_context}{cover_letter}
 
 Consolidated Concerns:
 {{{{patch_concerns}}}}
@@ -960,7 +966,7 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
                 serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
             }),
             VERIFICATION.wants_series_context,
-        ))
+        ), VERIFICATION.wants_cover_letter))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {
             tools: ToolScope::All,
@@ -1199,6 +1205,25 @@ mod tests {
         assert!(validate_summary_format("   ", &state).is_err());
         assert!(validate_summary_format("Uses `backticks` in summary.", &state).is_err());
         assert!(validate_summary_format("Summary: prefixed summary.", &state).is_err());
+    }
+
+    #[test]
+    fn test_sashiko_cover_letter_reaches_verification_only() {
+        let wanting: Vec<&str> = CONSOLIDATION_STAGES
+            .iter()
+            .filter(|s| s.wants_cover_letter)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(wanting, vec![VERIFICATION.name]);
+
+        for use_log in [true, false] {
+            let system = sashiko_system_prompt(use_log).render_for_log(&SashikoPatchReviewState {
+                cover_letter: Some("Patch 2 relies on the claim added in patch 1.".to_string()),
+                ..Default::default()
+            });
+            assert!(!system.contains("series_cover_letter"));
+            assert!(!system.contains("Patch 2 relies on the claim"));
+        }
     }
 
     #[test]

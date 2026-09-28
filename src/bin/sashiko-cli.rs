@@ -1905,46 +1905,20 @@ async fn handle_local(
     loop {
         eprint_phase(1, 4, &format!("Extracting patches from {}...", input));
 
-        // Resolve commits
-        let shas = if input.contains("..") {
-            sashiko::git_ops::resolve_git_range(&repo_path, &input).await?
-        } else {
-            // Single ref — resolve to SHA
-            let sha = sashiko::git_ops::get_commit_hash(&repo_path, &input).await?;
-            vec![sha]
-        };
+        // Resolve commits the way a local review does, so that a range carrying
+        // its cover letter is reviewed with it here too.
+        let (review_input, shas) =
+            sashiko::local_review::build_review_input_from_git(&repo_path, &input, None).await?;
 
         eprintln!(
             " ({} commit{})",
-            shas.len(),
-            if shas.len() == 1 { "" } else { "s" }
+            review_input.patches.len(),
+            if review_input.patches.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         );
-
-        // Extract patch metadata and build ReviewInput
-        let mut patches = Vec::new();
-        for (i, sha) in shas.iter().enumerate() {
-            let meta = sashiko::git_ops::extract_patch_metadata(&repo_path, sha)
-                .await
-                .with_context(|| format!("Failed to extract metadata for commit {}", sha))?;
-            patches.push(sashiko::worker::PatchInput {
-                index: (i + 1) as i64,
-                diff: meta.diff,
-                subject: Some(meta.subject),
-                author: Some(meta.author),
-                date: Some(meta.timestamp),
-                message_id: None,
-                commit_id: Some(sha.clone()),
-            });
-        }
-
-        let review_input = sashiko::worker::ReviewInput {
-            id: 0, // Local review, no DB ID
-            subject: patches
-                .first()
-                .and_then(|p| p.subject.clone())
-                .unwrap_or_else(|| input.clone()),
-            patches,
-        };
 
         let review_json =
             serde_json::to_string(&review_input).context("Failed to serialize review input")?;
