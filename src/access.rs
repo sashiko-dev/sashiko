@@ -335,7 +335,7 @@ impl FromRequestParts<Arc<crate::api::AppState>> for Principal {
         parts: &mut Parts,
         state: &Arc<crate::api::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        if state.settings.server.testing_mode {
+        if !state.settings.server.login_enabled || state.settings.server.testing_mode {
             return Ok(Principal::testing_operator());
         }
         let user = crate::auth::AuthUser::from_request_parts(parts, state).await?;
