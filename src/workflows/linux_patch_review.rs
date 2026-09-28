@@ -27,6 +27,7 @@ use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
 use crate::workflow::stage::{ExecutableStage, Stage};
+use crate::workflows::recovery::RecoverableStage;
 
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
@@ -71,6 +72,12 @@ pub struct LinuxPatchReviewState {
 
     /// Verified findings from the verification stage.
     pub findings: Vec<Value>,
+    /// Candidates carried past a failed consolidation stage for verification.
+    pub unverified_concerns: Vec<Value>,
+    /// Recoverable stage failures retained in the final review status.
+    pub stage_errors: Vec<ReviewStageError>,
+    /// True when the verification stage returned a valid result.
+    pub verification_complete: bool,
 
     /// Concise plain-text summary of the change generated at the end of review.
     pub summary: String,
@@ -78,6 +85,37 @@ pub struct LinuxPatchReviewState {
     pub review_inline: String,
     /// Fix suggestions.
     pub fixes: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewStageKind {
+    Deduplication,
+    ConflictResolution,
+    Verification,
+    Report,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewStageError {
+    pub stage: ReviewStageKind,
+    pub message: String,
+}
+
+pub(crate) fn concerns_for_verification(state: &LinuxPatchReviewState) -> Vec<Value> {
+    state
+        .patch_concerns
+        .iter()
+        .chain(&state.unverified_concerns)
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn verification_concerns_heading(state: &LinuxPatchReviewState) -> &'static str {
+    if state.unverified_concerns.is_empty() {
+        "Consolidated Concerns:"
+    } else {
+        "Candidate Concerns (some may be unconsolidated after a stage error):"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1074,12 @@ Example Output:
             temperature,
             ..Default::default()
         })
+        .skip_if(|state| {
+            state
+                .stage_errors
+                .iter()
+                .any(|error| error.stage == ReviewStageKind::Deduplication)
+        })
         .reduce(|state, out: ConflictResolutionOutput| {
             let mut new_concerns = Vec::new();
             let mut preexisting = Vec::new();
@@ -1069,7 +1113,7 @@ pub fn verification_stage(
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{series_context}
 
-Consolidated Concerns:
+{{{{concerns_heading}}}}
 {{{{patch_concerns}}}}
 
 Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
@@ -1099,8 +1143,11 @@ Example Output:
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
+            .with_var("concerns_heading", |s: &LinuxPatchReviewState| {
+                verification_concerns_heading(s).to_string()
+            })
             .with_var("patch_concerns", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
+                serde_json::to_string_pretty(&concerns_for_verification(s)).unwrap_or_default()
             }),
             VERIFICATION.wants_series_context,
         ))
@@ -1131,6 +1178,8 @@ Example Output:
                 new_findings.push(finding);
             }
             state.findings = new_findings;
+            state.unverified_concerns.clear();
+            state.verification_complete = true;
         })
         .build()
 }
@@ -1196,28 +1245,66 @@ pub fn build_linux_patch_review_workflow_with_options(
             |s| s.all_concerns.is_empty(),
             "No concerns raised in initial analysis stages",
         )
-        .stage(deduplication_stage(max_turns, temperature))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(deduplication_stage(max_turns, temperature)),
+            ReviewStageKind::Deduplication,
+        ))
         .early_exit_if(
-            |s| s.deduplicated_concerns.is_empty(),
+            |s| s.deduplicated_concerns.is_empty() && s.unverified_concerns.is_empty(),
             "No concerns remaining after deduplication",
         )
-        .stage(conflict_resolution_stage(max_turns, temperature))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(conflict_resolution_stage(max_turns, temperature)),
+            ReviewStageKind::ConflictResolution,
+        ))
         .early_exit_if(
-            |s| s.patch_concerns.is_empty(),
+            |s| s.patch_concerns.is_empty() && s.unverified_concerns.is_empty(),
             "No concerns remaining after conflict resolution",
         )
-        .stage(verification_stage(max_turns, temperature))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(verification_stage(max_turns, temperature)),
+            ReviewStageKind::Verification,
+        ))
         .early_exit_if(
             |s| s.findings.is_empty(),
             "No findings validated in verification stage",
         )
-        .stage(report_stage(max_turns, temperature))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(report_stage(max_turns, temperature)),
+            ReviewStageKind::Report,
+        ))
         .build()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_prompt_includes_candidates_from_failed_consolidation() {
+        let state = LinuxPatchReviewState {
+            unverified_concerns: vec![json!({"description": "raw candidate"})],
+            ..Default::default()
+        };
+        let prompt = verification_stage(1, 0.0)
+            .user_prompt
+            .render_for_log(&state);
+        assert!(prompt.contains("raw candidate"));
+        assert!(prompt.contains("Candidate Concerns (some may be unconsolidated"));
+    }
+
+    #[test]
+    fn verification_prompt_keeps_normal_concerns_heading() {
+        let state = LinuxPatchReviewState {
+            patch_concerns: vec![json!({"description": "consolidated candidate"})],
+            ..Default::default()
+        };
+        let prompt = verification_stage(1, 0.0)
+            .user_prompt
+            .render_for_log(&state);
+        assert!(prompt.contains("Consolidated Concerns:\n"));
+        assert!(!prompt.contains("Candidate Concerns (some may be unconsolidated"));
+    }
 
     #[test]
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {

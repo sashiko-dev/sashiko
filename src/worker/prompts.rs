@@ -352,6 +352,9 @@ impl Worker {
             patch_concerns: Vec::new(),
             concerns: Vec::new(),
             findings: Vec::new(),
+            unverified_concerns: Vec::new(),
+            stage_errors: Vec::new(),
+            verification_complete: false,
             summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
@@ -436,8 +439,19 @@ impl Worker {
             }
         };
 
-        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await?;
-        self.global_history.extend(outcome.history.clone());
+        let execution = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await;
+        let mut errors: Vec<String> = state
+            .stage_errors
+            .iter()
+            .map(|stage_error| stage_error.message.clone())
+            .collect();
+        if let Err(error) = &execution {
+            errors.push(error.to_string());
+        }
+        let error = (!errors.is_empty()).then(|| errors.join("; "));
+        if let Ok(outcome) = &execution {
+            self.global_history.extend(outcome.history.clone());
+        }
 
         let concerns_count = state.all_concerns.len();
         let dismissed_concerns = if !state.deduplicated_dismissed_concerns.is_empty() {
@@ -447,7 +461,17 @@ impl Worker {
         };
         let dismissed_concerns_count = dismissed_concerns.len();
 
-        let review_inline = if state.review_inline.is_empty() {
+        // A failed consolidation stage still leaves completed analysis in
+        // state. Keep it separate from findings, which require verification.
+        let unverified_concerns = if !state.unverified_concerns.is_empty() {
+            state.unverified_concerns.clone()
+        } else if execution.is_err() && !state.verification_complete {
+            partial_concerns(&state)
+        } else {
+            Vec::new()
+        };
+
+        let review_inline = if state.review_inline.is_empty() && error.is_none() {
             "No issues found.".to_string()
         } else {
             state.review_inline
@@ -458,6 +482,8 @@ impl Worker {
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
             "concerns": state.concerns,
+            "unverified_concerns": unverified_concerns,
+            "verification_complete": state.verification_complete,
             "review_inline": review_inline,
             "fixes": state.fixes,
             "concerns_count": concerns_count,
@@ -466,15 +492,33 @@ impl Worker {
 
         Ok(WorkerResult {
             output: Some(final_output),
-            error: None,
-            input_context: "Multi-stage execution completed".to_string(),
+            error,
+            input_context: "Multi-stage execution".to_string(),
             history: self.global_history.clone(),
             history_before_pruning: self.global_history.clone(),
             history_after_pruning: self.global_history.clone(),
-            tokens_in: outcome.tokens_in,
-            tokens_out: outcome.tokens_out,
-            tokens_cached: outcome.tokens_cached,
+            tokens_in: execution.as_ref().map_or(0, |outcome| outcome.tokens_in),
+            tokens_out: execution.as_ref().map_or(0, |outcome| outcome.tokens_out),
+            tokens_cached: execution
+                .as_ref()
+                .map_or(0, |outcome| outcome.tokens_cached),
         })
+    }
+}
+
+fn partial_concerns(state: &LinuxPatchReviewState) -> Vec<Value> {
+    if !state.patch_concerns.is_empty() || !state.concerns.is_empty() {
+        let mut candidates = state.concerns.clone();
+        if state.findings.is_empty() {
+            candidates.extend_from_slice(&state.patch_concerns);
+        }
+        candidates
+    } else if !state.findings.is_empty() {
+        Vec::new()
+    } else if !state.deduplicated_concerns.is_empty() {
+        state.deduplicated_concerns.clone()
+    } else {
+        state.all_concerns.clone()
     }
 }
 
@@ -756,6 +800,23 @@ mod prefetch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_concerns_keep_completed_analysis_without_relabeling_findings() {
+        let mut state = LinuxPatchReviewState {
+            all_concerns: vec![serde_json::json!({"description": "raw"})],
+            ..Default::default()
+        };
+        assert_eq!(partial_concerns(&state)[0]["description"], "raw");
+        state.deduplicated_concerns = vec![serde_json::json!({"description": "merged"})];
+        assert_eq!(partial_concerns(&state)[0]["description"], "merged");
+        state.patch_concerns = vec![serde_json::json!({"description": "filtered"})];
+        assert_eq!(partial_concerns(&state)[0]["description"], "filtered");
+        state.concerns = vec![serde_json::json!({"description": "preexisting"})];
+        assert_eq!(partial_concerns(&state).len(), 2);
+        state.findings = vec![serde_json::json!({"problem": "verified"})];
+        assert_eq!(partial_concerns(&state)[0]["description"], "preexisting");
+    }
 
     #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
@@ -1119,7 +1180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_failure_aborts_review() {
+    async fn test_stage_failure_returns_partial_review() {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
@@ -1145,13 +1206,12 @@ mod tests {
             "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
         });
 
-        match worker.run(patchset, None).await {
-            Ok(_) => panic!("Expected stage failure error, got Ok"),
-            Err(e) => assert!(
-                e.to_string().contains("simulated AI failure"),
-                "unexpected error: {e}"
-            ),
-        }
+        let result = worker.run(patchset, None).await.unwrap();
+        assert!(result.error.unwrap().contains("simulated AI failure"));
+        let output = result.output.unwrap();
+        assert_eq!(output["findings"], serde_json::json!([]));
+        assert_eq!(output["unverified_concerns"], serde_json::json!([]));
+        assert_eq!(output["review_inline"], "");
     }
 
     // ReviewError tests

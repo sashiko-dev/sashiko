@@ -28,9 +28,11 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
-    PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput,
+    PlanningOutput, PrescreenOutput, ReviewStageKind, SERIES_CONTEXT_PLACEHOLDER,
+    StageConcernsOutput, VerificationOutput, concerns_for_verification,
+    verification_concerns_heading,
 };
+use crate::workflows::recovery::RecoverableStage;
 
 /// State container for a Sashiko patch review run.
 pub type SashikoPatchReviewState = LinuxPatchReviewState;
@@ -915,7 +917,12 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
             temperature,
             ..Default::default()
         })
-        .skip_if(|s| s.deduplicated_concerns.is_empty())
+        .skip_if(|s| {
+            s.deduplicated_concerns.is_empty()
+                || s.stage_errors
+                    .iter()
+                    .any(|error| error.stage == ReviewStageKind::Deduplication)
+        })
         .reduce(|state, out: ConflictResolutionOutput| {
             let mut new_concerns = Vec::new();
             let mut preexisting = Vec::new();
@@ -949,15 +956,18 @@ pub fn verification_stage(
 
 CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid. If you cannot find concrete proof of safety, you must retain the concern.{series_context}
 
-Consolidated Concerns:
+{{{{concerns_heading}}}}
 {{{{patch_concerns}}}}
 
 Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters)."#
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
+            .with_var("concerns_heading", |s: &SashikoPatchReviewState| {
+                verification_concerns_heading(s).to_string()
+            })
             .with_var("patch_concerns", |s: &SashikoPatchReviewState| {
-                serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
+                serde_json::to_string_pretty(&concerns_for_verification(s)).unwrap_or_default()
             }),
             VERIFICATION.wants_series_context,
         ))
@@ -968,7 +978,7 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             temperature,
             ..Default::default()
         })
-        .skip_if(|s| s.patch_concerns.is_empty())
+        .skip_if(|s| s.patch_concerns.is_empty() && s.unverified_concerns.is_empty())
         .reduce(|state, out: VerificationOutput| {
             let mut new_findings = Vec::new();
             for finding in out.findings {
@@ -990,6 +1000,8 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
                 }
             }
             state.findings = new_findings;
+            state.unverified_concerns.clear();
+            state.verification_complete = true;
         })
         .build()
 }
@@ -1081,10 +1093,22 @@ pub fn build_sashiko_patch_review_workflow_with_options(
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
             ParallelPolicy::BestEffort,
         )
-        .stage(deduplication_stage(max_turns, temperature))
-        .stage(conflict_resolution_stage(max_turns, temperature))
-        .stage(verification_stage(max_turns, temperature))
-        .stage(report_stage(max_turns, temperature))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(deduplication_stage(max_turns, temperature)),
+            ReviewStageKind::Deduplication,
+        ))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(conflict_resolution_stage(max_turns, temperature)),
+            ReviewStageKind::ConflictResolution,
+        ))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(verification_stage(max_turns, temperature)),
+            ReviewStageKind::Verification,
+        ))
+        .executable_stage(RecoverableStage::boxed(
+            Box::new(report_stage(max_turns, temperature)),
+            ReviewStageKind::Report,
+        ))
         .stage(summary_stage(max_turns, temperature))
         .build()
 }
@@ -1092,6 +1116,32 @@ pub fn build_sashiko_patch_review_workflow_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_prompt_includes_candidates_from_failed_consolidation() {
+        let state = SashikoPatchReviewState {
+            unverified_concerns: vec![json!({"description": "raw candidate"})],
+            ..Default::default()
+        };
+        let prompt = verification_stage(1, 0.0)
+            .user_prompt
+            .render_for_log(&state);
+        assert!(prompt.contains("raw candidate"));
+        assert!(prompt.contains("Candidate Concerns (some may be unconsolidated"));
+    }
+
+    #[test]
+    fn verification_prompt_keeps_normal_concerns_heading() {
+        let state = SashikoPatchReviewState {
+            patch_concerns: vec![json!({"description": "consolidated candidate"})],
+            ..Default::default()
+        };
+        let prompt = verification_stage(1, 0.0)
+            .user_prompt
+            .render_for_log(&state);
+        assert!(prompt.contains("Consolidated Concerns:\n"));
+        assert!(!prompt.contains("Candidate Concerns (some may be unconsolidated"));
+    }
 
     #[test]
     fn test_sashiko_analysis_stages_table() {

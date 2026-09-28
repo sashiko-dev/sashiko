@@ -17,6 +17,7 @@ use crate::project::ProjectId;
 pub mod guard;
 pub mod linux_bug;
 pub mod linux_patch_review;
+pub mod recovery;
 pub mod sashiko_patch_review;
 
 /// Returns the short UI label for a review stage belonging to `project`.

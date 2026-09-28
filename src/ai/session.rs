@@ -136,6 +136,8 @@ pub trait LlmSession: Send {
     }
 }
 
+type UsageCallback<'a> = Box<dyn Fn(&AiUsage) + Send + Sync + 'a>;
+
 /// Orchestrates the execution of an [`LlmSession`].
 pub struct SessionRunner<'a> {
     provider: &'a dyn AiProvider,
@@ -144,6 +146,7 @@ pub struct SessionRunner<'a> {
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+    on_usage: Option<UsageCallback<'a>>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -156,6 +159,7 @@ impl<'a> SessionRunner<'a> {
             max_transient_retries: 5,
             max_provider_error_retries: 3,
             on_turn: None,
+            on_usage: None,
         }
     }
 
@@ -189,6 +193,15 @@ impl<'a> SessionRunner<'a> {
         F: Fn(usize, usize) + Send + Sync + 'a,
     {
         self.on_turn = Some(Box::new(cb));
+        self
+    }
+
+    /// Reports each provider response's usage, including truncated responses.
+    pub fn with_usage_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&AiUsage) + Send + Sync + 'a,
+    {
+        self.on_usage = Some(Box::new(cb));
         self
     }
 
@@ -313,6 +326,12 @@ impl<'a> SessionRunner<'a> {
                     }
                 },
             };
+
+            if let Some(usage) = &resp.usage
+                && let Some(cb) = &self.on_usage
+            {
+                cb(usage);
+            }
 
             if resp.truncated {
                 anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");

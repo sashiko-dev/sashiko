@@ -19,9 +19,10 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ai::{
-    AiMessage, AiProvider, AiResponse, AiResponseFormat, AiTool, ErrorAction, LlmSession,
+    AiMessage, AiProvider, AiResponse, AiResponseFormat, AiTool, AiUsage, ErrorAction, LlmSession,
     SessionRunner, ToolCall, ValidationError,
 };
 use crate::toolbox::ToolBox;
@@ -38,6 +39,41 @@ pub struct StageOutcome {
     pub tokens_out: u32,
     pub tokens_cached: u32,
     pub history: Vec<AiMessage>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub(crate) struct StageFailure {
+    #[source]
+    source: anyhow::Error,
+    pub(crate) usage: StageOutcome,
+}
+
+#[derive(Default)]
+struct StageUsage {
+    tokens_in: AtomicUsize,
+    tokens_out: AtomicUsize,
+    tokens_cached: AtomicUsize,
+}
+
+impl StageUsage {
+    fn record(&self, usage: &AiUsage) {
+        self.tokens_in
+            .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
+        self.tokens_out
+            .fetch_add(usage.completion_tokens, Ordering::Relaxed);
+        self.tokens_cached
+            .fetch_add(usage.cached_tokens.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    fn outcome(&self) -> StageOutcome {
+        StageOutcome {
+            tokens_in: self.tokens_in.load(Ordering::Relaxed) as u32,
+            tokens_out: self.tokens_out.load(Ordering::Relaxed) as u32,
+            tokens_cached: self.tokens_cached.load(Ordering::Relaxed) as u32,
+            history: Vec::new(),
+        }
+    }
 }
 
 /// Execution environment provided to stages during workflow runs.
@@ -425,6 +461,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         let log_user_prompt = self.user_prompt.render_for_log(state);
 
         let stage_name = self.name;
+        let usage = StageUsage::default();
         let result = {
             let mut session = StageSession {
                 stage: self,
@@ -449,9 +486,16 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                             max_turns,
                         });
                     }
-                });
+                })
+                .with_usage_callback(|response_usage| usage.record(response_usage));
 
-            runner.run(&mut session).await?
+            runner
+                .run(&mut session)
+                .await
+                .map_err(|source| StageFailure {
+                    source,
+                    usage: usage.outcome(),
+                })?
         };
 
         let tokens_in = result.usage.prompt_tokens as u32;

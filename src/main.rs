@@ -1252,6 +1252,7 @@ enum PatchStatus {
     Planning,
     Reviewing,
     Finished,
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -1655,6 +1656,7 @@ fn status_label(project: ProjectId, p: &PatchState, with_turns: bool) -> String 
             }
         }
         PatchStatus::Finished => "Finished".to_string(),
+        PatchStatus::Failed => "Incomplete".to_string(),
     }
 }
 
@@ -1891,6 +1893,7 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
             PatchStatus::PreScreening | PatchStatus::Planning => (Some(Color::Cyan), false),
             PatchStatus::Reviewing => (Some(Color::Cyan), true),
             PatchStatus::Finished => (Some(Color::Green), true),
+            PatchStatus::Failed => (Some(Color::Red), true),
         };
         let _ = tw.write_segment(out, &status_str, status_color, status_bold);
 
@@ -1959,7 +1962,7 @@ fn patch_stage_total(project: ProjectId, p: &PatchState) -> usize {
     // list, and the consolidation stages after that point never run, though
     // planned_stages counted them. Whatever else went unrun, a failed stage
     // under BestEffort say, is settled here too.
-    if matches!(p.status, PatchStatus::Finished) {
+    if matches!(p.status, PatchStatus::Finished | PatchStatus::Failed) {
         return p.completed_stages;
     }
 
@@ -2177,13 +2180,21 @@ async fn handle_review_command(
                     render_progress(&mut s);
                 }
             }
-            ProgressEvent::ReviewComplete => {
+            ProgressEvent::AiReviewFailed { patch_index } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.status = PatchStatus::Failed;
+                    p.active_stages.clear();
+                    p.active_stage_turns.clear();
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::ReviewComplete { partial } => {
                 // The region goes back before this prints, and the frame it was
                 // holding stays: it is the review's final state, a hundred per
                 // cent of the stages it ran. So this line, and the report after
                 // it, start below the frame instead of inside it or over it.
                 finish_progress(&mut s);
-                eprintln!("Review complete");
+                eprintln!("Review {}", if partial { "incomplete" } else { "complete" });
             }
         }
     };
@@ -2280,7 +2291,6 @@ fn print_review_result(
         println!();
         print_colored(color_choice, Color::Red, "Error: ")?;
         println!("{}", error);
-        return Ok(());
     }
 
     let Some(review) = result.get("review") else {
@@ -2293,9 +2303,9 @@ fn print_review_result(
 
     let counts = count_findings(findings);
     let total = counts.critical + counts.high + counts.medium + counts.low;
-    if total == 0 {
+    if total == 0 && !result_has_error(result) {
         print_colored(color_choice, Color::Green, "\nNo issues found.\n")?;
-    } else {
+    } else if total > 0 {
         println!("\nFindings:");
         print!("  Critical: ");
         print_colored(color_choice, Color::Red, &counts.critical.to_string())?;
@@ -2341,6 +2351,24 @@ fn print_review_result(
             for finding in ungrouped_findings {
                 print_finding(finding, color_choice)?;
             }
+        }
+    }
+
+    if let Some(candidates) = review.get("unverified_concerns").and_then(Value::as_array)
+        && !candidates.is_empty()
+    {
+        println!("\nUnverified candidates (review incomplete):");
+        for candidate in candidates {
+            let patch = candidate
+                .get("patch_index")
+                .and_then(Value::as_i64)
+                .map(|index| format!("Patch {index}: "))
+                .unwrap_or_default();
+            let description = candidate
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed concern");
+            println!("  {patch}{description}");
         }
     }
 
@@ -3965,6 +3993,10 @@ mod tests {
         done.status = PatchStatus::Finished;
         done.completed_stages = 4;
         assert_eq!(total(&done), 4);
+
+        done.status = PatchStatus::Failed;
+        assert_eq!(total(&done), 4);
+        assert_eq!(status_label(ProjectId::Linux, &done, false), "Incomplete");
     }
 
     #[test]

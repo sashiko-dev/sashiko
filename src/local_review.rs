@@ -166,7 +166,12 @@ pub enum ProgressEvent {
     AiReviewFinished {
         patch_index: i64,
     },
-    ReviewComplete,
+    AiReviewFailed {
+        patch_index: i64,
+    },
+    ReviewComplete {
+        partial: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -419,7 +424,12 @@ pub async fn run_worker(
     {
         error!("Failed to remove worktree: {}", e);
     }
-    emit(progress, ProgressEvent::ReviewComplete);
+    emit(
+        progress,
+        ProgressEvent::ReviewComplete {
+            partial: result.as_ref().map_or(true, result_has_error),
+        },
+    );
 
     result
 }
@@ -494,6 +504,7 @@ async fn review_single_patch(
                 as Arc<dyn crate::ai::backoff_provider::RetryBudget>
         });
     let mut last_error = None;
+    let mut partial_result: Option<Value> = None;
     for attempt in 1..=3 {
         emit(
             progress,
@@ -638,6 +649,42 @@ async fn review_single_patch(
             .await
         {
             Ok(result) => {
+                if let Some(err) = &result.error {
+                    error!("AI review for patch {} failed: {}", p.index, err);
+                    let inline_review = result
+                        .output
+                        .as_ref()
+                        .and_then(|output| output.get("review_inline"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let candidate = json!({
+                        "patch_index": p.index,
+                        "review": result.output,
+                        "error": err,
+                        "partial": true,
+                        "inline_review": inline_review,
+                        "history": result.history,
+                        "input_context": result.input_context,
+                        "tokens_in": result.tokens_in,
+                        "tokens_out": result.tokens_out,
+                        "tokens_cached": result.tokens_cached,
+                    });
+                    if candidate["review"]["verification_complete"].as_bool() == Some(true) {
+                        emit(
+                            progress,
+                            ProgressEvent::AiReviewFailed {
+                                patch_index: p.index,
+                            },
+                        );
+                        return Ok(candidate);
+                    }
+                    if partial_result.as_ref().is_none_or(|previous| {
+                        partial_review_score(&candidate) > partial_review_score(previous)
+                    }) {
+                        partial_result = Some(candidate);
+                    }
+                    continue;
+                }
                 info!("AI review completed for patch {}.", p.index);
                 emit(
                     progress,
@@ -693,7 +740,45 @@ async fn review_single_patch(
         }
     }
 
+    if let Some(result) = partial_result {
+        emit(
+            progress,
+            ProgressEvent::AiReviewFailed {
+                patch_index: p.index,
+            },
+        );
+        return Ok(result);
+    }
+    emit(
+        progress,
+        ProgressEvent::AiReviewFailed {
+            patch_index: p.index,
+        },
+    );
     Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
+}
+
+fn partial_review_score(result: &Value) -> (usize, usize) {
+    let review = &result["review"];
+    let findings = review["findings"].as_array().map_or(0, Vec::len);
+    let candidates = review["unverified_concerns"].as_array().map_or(0, Vec::len);
+    (findings, candidates)
+}
+
+fn mark_patch_review_status(patches: &mut [Value], patch_index: i64, error: Option<&str>) {
+    if let Some(patch) = patches
+        .iter_mut()
+        .find(|patch| patch["index"].as_i64() == Some(patch_index))
+    {
+        patch["review_status"] = json!(if error.is_some() {
+            "incomplete"
+        } else {
+            "complete"
+        });
+        if let Some(error) = error {
+            patch["review_error"] = json!(error);
+        }
+    }
 }
 
 /// Assembles the combined review payload for a review.
@@ -705,6 +790,7 @@ fn build_review_output(
     summary: String,
     findings: Vec<Value>,
     concerns: Vec<Value>,
+    unverified_concerns: Vec<Value>,
     dismissed_concerns: Vec<Value>,
     concerns_count: u64,
     dismissed_concerns_count: u64,
@@ -713,6 +799,7 @@ fn build_review_output(
         "summary": summary,
         "findings": findings,
         "concerns": concerns,
+        "unverified_concerns": unverified_concerns,
         "dismissed_concerns": dismissed_concerns,
         "concerns_count": concerns_count,
         "dismissed_concerns_count": dismissed_concerns_count
@@ -928,7 +1015,7 @@ async fn run_worker_in_worktree(
         let llm_semaphore = &llm_semaphore;
         let quota = &quota;
         async move {
-            review_single_patch(
+            let result = review_single_patch(
                 worktree,
                 ai,
                 patchset_id,
@@ -944,20 +1031,23 @@ async fn run_worker_in_worktree(
                 timeout_seconds,
                 progress,
             )
-            .await
+            .await;
+            (p.index, result)
         }
     }));
 
     let mut buffered = futures_stream.buffer_unordered(concurrency);
     let mut results = Vec::new();
     while let Some(res) = buffered.next().await {
-        results.push(res?);
+        results.push(res);
     }
+    results.sort_by_key(|(patch_index, _)| *patch_index);
 
     // Aggregate findings, inline reviews, history, input context, and concern counts
     let mut combined_summary = String::new();
     let mut combined_findings = Vec::new();
     let mut combined_concerns = Vec::new();
+    let mut combined_unverified_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
@@ -967,9 +1057,24 @@ async fn run_worker_in_worktree(
     let mut total_tokens_cached = 0;
     let mut total_concerns_count = 0;
     let mut total_dismissed_concerns_count = 0;
+    let mut review_errors = Vec::new();
 
-    for res in results {
+    for (patch_index, result) in results {
+        let res = match result {
+            Ok(res) => res,
+            Err(err) => json!({
+                "patch_index": patch_index,
+                "error": err.to_string(),
+                "partial": true,
+            }),
+        };
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+        if let Some(err) = res.get("error").and_then(Value::as_str) {
+            review_errors.push(format!("patch {p_idx}: {err}"));
+            mark_patch_review_status(&mut patch_results, p_idx, Some(err));
+        } else {
+            mark_patch_review_status(&mut patch_results, p_idx, None);
+        }
         let patch_subject = patches_to_review
             .iter()
             .find(|p| p.index == p_idx)
@@ -1004,6 +1109,14 @@ async fn run_worker_in_worktree(
                     concern_val["patch_index"] = json!(p_idx);
                     concern_val["patch_subject"] = json!(patch_subject);
                     combined_concerns.push(concern_val);
+                }
+            }
+            if let Some(concerns) = review.get("unverified_concerns").and_then(Value::as_array) {
+                for concern in concerns {
+                    let mut candidate = concern.clone();
+                    candidate["patch_index"] = json!(p_idx);
+                    candidate["patch_subject"] = json!(patch_subject);
+                    combined_unverified_concerns.push(candidate);
                 }
             }
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
@@ -1057,23 +1170,29 @@ async fn run_worker_in_worktree(
         combined_summary,
         combined_findings,
         combined_concerns,
+        combined_unverified_concerns,
         combined_dismissed_concerns,
         total_concerns_count,
         total_dismissed_concerns_count,
     );
 
-    let combined_result = json!({
+    let mut combined_result = json!({
         "patchset_id": patchset_id,
         "baseline": baseline_arg,
         "patches": patch_results,
         "review": review_output,
-        "inline_review": if combined_inline.is_empty() { "No issues found.".to_string() } else { combined_inline },
+        "inline_review": if combined_inline.is_empty() && review_errors.is_empty() { "No issues found.".to_string() } else { combined_inline },
         "history": combined_history,
         "input_context": combined_input_context,
         "tokens_in": total_tokens_in,
         "tokens_out": total_tokens_out,
         "tokens_cached": total_tokens_cached
     });
+
+    if !review_errors.is_empty() {
+        combined_result["partial"] = json!(true);
+        combined_result["error"] = json!(review_errors.join("; "));
+    }
 
     Ok(combined_result)
 }
@@ -1139,6 +1258,7 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
             max_attempts,
         } if attempt > 1 => format!("patch {patch_index}: retry {attempt}/{max_attempts}"),
         ProgressEvent::AiReviewFinished { patch_index } => format!("patch {patch_index}: done"),
+        ProgressEvent::AiReviewFailed { patch_index } => format!("patch {patch_index}: incomplete"),
         _ => return None,
     };
     Some(line)
@@ -1925,6 +2045,7 @@ mod tests {
             vec![json!({"problem": "new regression"})],
             vec![json!({"problem": "preexisting bug"})],
             vec![],
+            vec![],
             3,
             0,
         );
@@ -1935,6 +2056,29 @@ mod tests {
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn partial_retry_prefers_verified_findings_over_candidates() {
+        let candidates = json!({"review": {
+            "findings": [],
+            "unverified_concerns": [{"description": "a"}, {"description": "b"}]
+        }});
+        let verified = json!({"review": {
+            "findings": [{"problem": "verified"}],
+            "unverified_concerns": []
+        }});
+        assert!(partial_review_score(&verified) > partial_review_score(&candidates));
+    }
+
+    #[test]
+    fn patch_status_records_success_and_partial_failure_separately() {
+        let mut patches = vec![json!({"index": 1}), json!({"index": 2})];
+        mark_patch_review_status(&mut patches, 1, None);
+        mark_patch_review_status(&mut patches, 2, Some("output truncated"));
+        assert_eq!(patches[0]["review_status"], "complete");
+        assert_eq!(patches[1]["review_status"], "incomplete");
+        assert_eq!(patches[1]["review_error"], "output truncated");
     }
 
     #[test]
