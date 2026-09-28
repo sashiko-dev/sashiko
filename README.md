@@ -163,6 +163,9 @@ sashiko review
 
 # Review a range of commits
 sashiko review HEAD~3..HEAD
+
+# Also show candidate bugs that existed before the reviewed change
+sashiko review --report-preexisting
 ```
 
 This mode:

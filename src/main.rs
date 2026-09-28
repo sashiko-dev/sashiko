@@ -122,6 +122,10 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
 
+        /// Show candidate pre-existing concerns in text output
+        #[arg(long)]
+        report_preexisting: bool,
+
         /// Custom prompt to append to the review task
         #[arg(long)]
         custom_prompt: Option<String>,
@@ -303,6 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 baseline,
                 settings,
                 no_ai,
+                report_preexisting,
                 custom_prompt,
                 ai_provider,
                 prompts,
@@ -317,6 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     baseline.clone(),
                     settings.clone(),
                     *no_ai,
+                    *report_preexisting,
                     custom_prompt.clone(),
                     ai_provider.clone(),
                     resolve_prompts_path(prompts.clone(), project)?,
@@ -2010,6 +2016,7 @@ async fn handle_review_command(
     baseline: Option<String>,
     settings_path: Option<PathBuf>,
     no_ai: bool,
+    report_preexisting: bool,
     custom_prompt: Option<String>,
     ai_provider: Option<String>,
     prompts: PathBuf,
@@ -2269,7 +2276,7 @@ async fn handle_review_command(
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
             OutputFormat::Text => {
-                print_review_result(&result, &input, report.color)?;
+                print_review_result(&result, &input, report.color, report_preexisting)?;
             }
         }
     }
@@ -2305,6 +2312,7 @@ fn print_review_result(
     result: &Value,
     _input: &str,
     color_choice: ColorChoice,
+    report_preexisting: bool,
 ) -> std::io::Result<()> {
     if let Some(error) = result.get("error").and_then(|v| v.as_str())
         && !error.is_empty()
@@ -2321,11 +2329,20 @@ fn print_review_result(
         print_colored(color_choice, Color::Green, "\nNo AI review was run.\n")?;
         return Ok(());
     };
+    let concerns = review
+        .get("concerns")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
 
     let counts = count_findings(findings);
     let total = counts.critical + counts.high + counts.medium + counts.low;
     if total == 0 && !result_has_error(result) {
-        print_colored(color_choice, Color::Green, "\nNo issues found.\n")?;
+        print_colored(
+            color_choice,
+            Color::Green,
+            no_patch_findings_message(report_preexisting && !concerns.is_empty()),
+        )?;
     } else if total > 0 {
         println!("\nFindings:");
         print!("  Critical: ");
@@ -2371,6 +2388,25 @@ fn print_review_result(
             println!("  --- General Findings ---");
             for finding in ungrouped_findings {
                 print_finding(finding, color_choice)?;
+            }
+        }
+    }
+
+    if report_preexisting && !concerns.is_empty() {
+        println!("\nCandidate pre-existing concerns (pending separate verification):");
+        for concern in concerns {
+            let concern_type = concern.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let description = concern
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match (concern_type.is_empty(), description.is_empty()) {
+                (false, false) if concern_type != description => {
+                    println!("  - {}: {}", concern_type, description);
+                }
+                (false, _) => println!("  - {}", concern_type),
+                (_, false) => println!("  - {}", description),
+                _ => println!("  - Unnamed pre-existing concern"),
             }
         }
     }
@@ -2448,6 +2484,14 @@ struct FindingCounts {
     high: usize,
     medium: usize,
     low: usize,
+}
+
+fn no_patch_findings_message(report_preexisting: bool) -> &'static str {
+    if report_preexisting {
+        "\nNo patch-introduced issues found.\n"
+    } else {
+        "\nNo issues found.\n"
+    }
 }
 
 fn count_findings(findings: &[Value]) -> FindingCounts {
@@ -3270,6 +3314,15 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preexisting_concerns_change_the_message_only_when_reported() {
+        assert_eq!(no_patch_findings_message(false), "\nNo issues found.\n");
+        assert_eq!(
+            no_patch_findings_message(true),
+            "\nNo patch-introduced issues found.\n"
+        );
+    }
     use termcolor::Buffer;
 
     /// The terminfo entry for `term`, where this machine has one.
@@ -4154,8 +4207,14 @@ mod tests {
         let args = vec!["sashiko", "review"];
         let cli = Cli::parse_from(args);
         match cli.command {
-            Some(Commands::Review { input, agent, .. }) => {
+            Some(Commands::Review {
+                input,
+                report_preexisting,
+                agent,
+                ..
+            }) => {
                 assert_eq!(input, "HEAD");
+                assert!(!report_preexisting);
                 assert!(!agent);
             }
             _ => panic!("expected review command"),
@@ -4168,6 +4227,7 @@ mod tests {
             "--baseline",
             "main",
             "--no-ai",
+            "--report-preexisting",
             "--format",
             "json",
             "--agent",
@@ -4181,6 +4241,7 @@ mod tests {
                 baseline,
                 settings,
                 no_ai,
+                report_preexisting,
                 format,
                 agent,
                 color,
@@ -4190,6 +4251,7 @@ mod tests {
                 assert_eq!(baseline.as_deref(), Some("main"));
                 assert!(settings.is_none());
                 assert!(no_ai);
+                assert!(report_preexisting);
                 assert!(matches!(format, OutputFormat::Json));
                 assert!(agent);
                 assert!(matches!(color, ColorMode::Never));
