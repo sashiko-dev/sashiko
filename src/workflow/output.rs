@@ -151,6 +151,18 @@ where
 
     /// Validates raw model output text and parses it into `T`.
     pub fn validate(&self, raw_text: &str, state: &S) -> Result<T, String> {
+        self.validate_with_recitation_fallback(raw_text, state, false)
+    }
+
+    /// Validates raw model output text and parses it into `T`, bypassing custom
+    /// text formatting validators (such as verbatim diff-quoting checks) when
+    /// free-form recitation fallback is active.
+    pub fn validate_with_recitation_fallback(
+        &self,
+        raw_text: &str,
+        state: &S,
+        recitation_fallback_active: bool,
+    ) -> Result<T, String> {
         match self {
             Self::Json { validator, .. } => {
                 let parsed = parse_json_from_text::<T>(raw_text)?;
@@ -160,7 +172,13 @@ where
                 Ok(parsed)
             }
             Self::Text { validator, .. } => {
-                validator(raw_text, state)?;
+                if recitation_fallback_active {
+                    if raw_text.trim().is_empty() {
+                        return Err("The output must not be empty.".to_string());
+                    }
+                } else {
+                    validator(raw_text, state)?;
+                }
                 // Safe cast since Self::Text is only constructed when T = String
                 let boxed_any: Box<dyn std::any::Any> = Box::new(raw_text.to_string());
                 match boxed_any.downcast::<T>() {

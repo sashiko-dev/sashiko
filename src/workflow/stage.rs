@@ -353,7 +353,11 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
         let text = response.content.as_deref().unwrap_or("");
-        match self.stage.output_format.validate(text, self.state) {
+        match self.stage.output_format.validate_with_recitation_fallback(
+            text,
+            self.state,
+            self.recitation_fallback_active,
+        ) {
             Ok(parsed) => Ok(parsed),
             Err(violation) => Err(ValidationError::FormatViolation(violation)),
         }
@@ -846,5 +850,75 @@ mod tests {
             "the model should see the tool's error: {:?}",
             tool_reply.content
         );
+    }
+
+    struct RecitationThenFreeFormProvider {
+        turn: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl AiProvider for RecitationThenFreeFormProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let mut turn = self.turn.lock().unwrap();
+            *turn += 1;
+            if *turn == 1 {
+                anyhow::bail!("Gemini API blocked response (finish reason: RECITATION)");
+            }
+            Ok(AiResponse {
+                content: Some("Summary without verbatim diff quotes.".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recitation_fallback_skips_text_validator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecitationThenFreeFormProvider {
+            turn: Mutex::new(0),
+        });
+        let env = WorkflowEnv {
+            provider,
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("report")
+            .user_prompt(PromptTemplate::new("generate report"))
+            .output_format(OutputFormat::text_with_validator(
+                |text, _| {
+                    if !text.lines().any(|l| l.starts_with('>')) {
+                        Err("missing '>' quote".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |v| v.to_string(),
+            ))
+            .policy(StagePolicy {
+                recitation_policy: RecitationPolicy::FallbackToFreeForm {
+                    reminder: "Do not quote code verbatim.".to_string(),
+                },
+                ..Default::default()
+            })
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("recitation fallback should accept non-quoted text response");
     }
 }

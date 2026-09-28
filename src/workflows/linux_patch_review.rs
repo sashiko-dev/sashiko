@@ -1161,7 +1161,7 @@ Return raw text output, not JSON."#
             max_turns,
             temperature,
             recitation_policy: RecitationPolicy::FallbackToFreeForm {
-                reminder: "Do not quote code verbatim. Summarize your review directly.".to_string(),
+                reminder: "CRITICAL OVERRIDE: Your previous response was blocked by the API recitation filter for quoting the patch diff verbatim. Ignore the diff-quoting instructions in inline-template.md. Do NOT quote any code or diff lines with '>'. Instead, start with the Commit/Author/Subject headers, write the summary, and describe each finding directly by referencing file names, function names, and line numbers in plain prose.".to_string(),
             },
             ..Default::default()
         })
