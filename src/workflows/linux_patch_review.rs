@@ -96,7 +96,6 @@ pub struct PlanningOutput {
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct StageConcernsOutput {
-    #[serde(default)]
     pub concerns: Vec<Value>,
     #[serde(default)]
     pub dismissed_concerns: Vec<Value>,
@@ -104,13 +103,11 @@ pub struct StageConcernsOutput {
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct ConflictResolutionOutput {
-    #[serde(default)]
     pub concerns: Vec<Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct VerificationOutput {
-    #[serde(default)]
     pub findings: Vec<Value>,
 }
 
@@ -1512,6 +1509,51 @@ mod tests {
             .expect_err("dismissed_concern without disproving snippet must fail");
         assert!(err.contains("dismissed_concerns[0]"));
         assert!(err.contains("move the candidate issue to 'concerns'"));
+    }
+
+    #[test]
+    fn test_stage_outputs_do_not_match_inner_location_on_malformed_outer_json() {
+        let malformed_with_inner_location = r#"{
+  "concerns": [
+    {
+      "type": "Configuration Bug",
+      "description": "Missing core dependency",
+      "reasoning": "It omits "core" and "std" from deps.",
+      "preexisting": false,
+      "locations": [
+        {
+          "file": "scripts/generate_rust_analyzer.py",
+          "function_or_symbol": "generate_crates",
+          "line": 149,
+          "code_snippet": "append_crate(\"quote\", ...)",
+          "why_this_location_matters": "Missing core dependency"
+        }
+      ]
+    }
+  ],
+  "dismissed_concerns": []
+}"#;
+
+        let err = crate::workflow::output::parse_json_from_text::<StageConcernsOutput>(
+            malformed_with_inner_location,
+        )
+        .expect_err("malformed outer JSON must not match inner location as StageConcernsOutput");
+        assert!(err.contains("line 6"));
+
+        assert!(
+            crate::workflow::output::parse_json_from_text::<ConflictResolutionOutput>(
+                malformed_with_inner_location
+            )
+            .is_err(),
+            "malformed outer JSON must not match inner location as ConflictResolutionOutput"
+        );
+        assert!(
+            crate::workflow::output::parse_json_from_text::<VerificationOutput>(
+                malformed_with_inner_location
+            )
+            .is_err(),
+            "malformed outer JSON must not match inner location as VerificationOutput"
+        );
     }
 
     #[test]

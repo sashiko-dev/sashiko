@@ -175,9 +175,10 @@ where
 /// Parses JSON from text with fallback extraction of embedded JSON objects.
 pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, String> {
     let cleaned = crate::utils::clean_json_string(raw_text);
-    if let Ok(val) = serde_json::from_str::<T>(&cleaned) {
-        return Ok(val);
-    }
+    let primary_err = match serde_json::from_str::<T>(&cleaned) {
+        Ok(val) => return Ok(val),
+        Err(e) => e,
+    };
     if let Ok(val) = serde_json::from_str::<T>(raw_text) {
         return Ok(val);
     }
@@ -191,7 +192,7 @@ pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, St
     }
 
     Err(format!(
-        "Failed to parse JSON from output: {}",
+        "Failed to parse JSON from output ({primary_err}): {}",
         crate::utils::utf8_prefix(raw_text, 200)
     ))
 }
