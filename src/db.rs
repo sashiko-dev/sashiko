@@ -5808,6 +5808,67 @@ impl Database {
                     )
                     .await?;
 
+                    tx.execute(
+                        "UPDATE email_outbox
+                            SET patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = email_outbox.patch_id
+                                )
+                          WHERE id IN (
+                                    SELECT MIN(eo.id)
+                                      FROM email_outbox eo
+                                      JOIN patches mp ON mp.id = eo.patch_id
+                                      JOIN patches tp ON tp.message_id = mp.message_id
+                                     WHERE mp.patchset_id = ?
+                                       AND tp.patchset_id = ?
+                                       AND NOT EXISTS (
+                                               SELECT 1
+                                                 FROM email_outbox teo
+                                                WHERE teo.patch_id = tp.id
+                                           )
+                                     GROUP BY mp.id
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    tx.execute(
+                        "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id)
+                         SELECT tp.id, ps.subsystem_id
+                           FROM patches_subsystems ps
+                           JOIN patches mp ON mp.id = ps.patch_id
+                           JOIN patches tp ON tp.message_id = mp.message_id
+                          WHERE mp.patchset_id = ?
+                            AND tp.patchset_id = ?",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM patches_subsystems
+                          WHERE patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
                     // Reassign patches: first remove duplicates that already exist on target_id
                     // to prevent unique constraint conflicts and lingering foreign key references.
                     tx.execute(
@@ -5846,6 +5907,41 @@ impl Database {
                     .await?;
                     tx.execute(
                         "DELETE FROM patchsets_subsystems WHERE patchset_id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+
+                    // Merge maintainer sections, upgrading provenance when target lacks maintainers_section
+                    tx.execute(
+                        "INSERT INTO patchset_maintainer_sections (patchset_id, subsystem, source)
+                         SELECT ?, subsystem, source FROM patchset_maintainer_sections WHERE patchset_id = ?
+                         ON CONFLICT(patchset_id, subsystem) DO UPDATE SET
+                             source = CASE
+                                 WHEN patchset_maintainer_sections.source = 'maintainers_section'
+                                   OR excluded.source = 'maintainers_section'
+                                 THEN 'maintainers_section'
+                                 WHEN patchset_maintainer_sections.source = 'path_prefix'
+                                   OR excluded.source = 'path_prefix'
+                                 THEN 'path_prefix'
+                                 ELSE patchset_maintainer_sections.source
+                             END",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM patchset_maintainer_sections WHERE patchset_id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+
+                    // Reassign or clean up forge_outbox entries referencing merge_from_id
+                    tx.execute(
+                        "UPDATE OR IGNORE forge_outbox SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM forge_outbox WHERE patchset_id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
@@ -18884,5 +18980,224 @@ mod tests {
             db.get_patchset_status(ps_id).await.unwrap().as_deref(),
             Some("Cancelled")
         );
+    }
+
+    #[tokio::test]
+    async fn test_multirow_merge_cleans_up_patch_and_patchset_foreign_keys() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let cover = "20260920000000.100-0-author@example.com";
+        let p1 = "20260920000000.100-1-author@example.com";
+        let p2 = "20260920000000.100-2-author@example.com";
+
+        let thread_id = db
+            .create_thread(cover, "[PATCH 0/3] Series", 1000)
+            .await
+            .unwrap();
+        for (mid, idx, subj) in [
+            (cover, 0u32, "[PATCH 0/3] Series"),
+            (p1, 1, "[PATCH 1/3] Part 1"),
+            (p2, 2, "[PATCH 2/3] Part 2"),
+        ] {
+            db.create_message(
+                mid,
+                thread_id,
+                (idx > 0).then_some(cover),
+                author,
+                subj,
+                1000 + i64::from(idx),
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Insert two incomplete candidate patchset rows in the same thread so
+        // the arrival of the 0/3 cover letter merges ps_b into ps_a.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject, subject_index, author, date, status, total_parts, received_parts)
+                 VALUES (10, ?, ?, '[PATCH 1/3] Part 1', 1, ?, 1001, 'Incomplete', 3, 2),
+                        (20, ?, NULL, '[PATCH 1/3] Part 1', 1, ?, 1001, 'Incomplete', 3, 2)",
+                libsql::params![thread_id, p1, author, thread_id, author],
+            )
+            .await
+            .unwrap();
+
+        let p1_a = db.create_patch(10, p1, 1, "diff1").await.unwrap();
+        let p1_b = db.create_patch(20, p1, 1, "diff1").await.unwrap();
+        let p2_a = db.create_patch(10, p2, 2, "diff2").await.unwrap();
+        let p2_b = db.create_patch(20, p2, 2, "diff2").await.unwrap();
+
+        // Attach foreign-key child rows to p1_b, p2_b, and patchset 20:
+        // - patches_subsystems on p1_b
+        // - email_outbox on p1_b only (should re-point to p1_a)
+        // - email_outbox on BOTH p2_a and p2_b (should keep p2_a's row and drop p2_b's duplicate)
+        // - patchset_maintainer_sections on patchsets 10 and 20
+        // - forge_outbox on patchset 20
+        let sub_id = db
+            .ensure_subsystem("NFS", "linux-nfs@vger.kernel.org")
+            .await
+            .unwrap();
+        db.add_subsystem_to_patch(p1_b, sub_id).await.unwrap();
+
+        db.insert_email_outbox(
+            p1_b,
+            "Pending",
+            r#"["author@example.com"]"#,
+            "[]",
+            "Re: [PATCH 1/3] Part 1",
+            p1,
+            p1,
+            "review body",
+        )
+        .await
+        .unwrap();
+
+        db.insert_email_outbox(
+            p2_a,
+            "Sent",
+            r#"["author@example.com"]"#,
+            "[]",
+            "Re: [PATCH 2/3] Part 2",
+            p2,
+            p2,
+            "already sent body",
+        )
+        .await
+        .unwrap();
+        db.insert_email_outbox(
+            p2_b,
+            "Pending",
+            r#"["author@example.com"]"#,
+            "[]",
+            "Re: [PATCH 2/3] Part 2",
+            p2,
+            p2,
+            "duplicate pending body",
+        )
+        .await
+        .unwrap();
+
+        db.add_patchset_maintainer_sections(10, &[AttributedSubsystem::from_path_prefix("fs/nfs")])
+            .await
+            .unwrap();
+        db.add_patchset_maintainer_sections(
+            20,
+            &[
+                AttributedSubsystem::from_maintainers("fs/nfs"),
+                AttributedSubsystem::from_maintainers("NFS, SUNRPC, AND LOCKD CLIENTS"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        db.insert_forge_outbox(
+            20,
+            "github",
+            "sashiko-dev/sashiko",
+            42,
+            Some("deadbeef"),
+            "forge review",
+            "https://example.com/patchset/20",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        // Ingesting 0/3 matches both patchset 10 and patchset 20 and merges 20 into 10.
+        let merged_id = db
+            .create_patchset(
+                thread_id,
+                Some(cover),
+                cover,
+                "[PATCH 0/3] Series",
+                author,
+                1000,
+                3,
+                1,
+                "to",
+                "cc",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("multi-row merge must not fail with foreign key constraint error")
+            .unwrap();
+
+        assert_eq!(merged_id, 10);
+
+        // Verify email_outbox for p1 was re-pointed to p1_a
+        let mut eo_rows = db
+            .conn
+            .query(
+                "SELECT patch_id FROM email_outbox WHERE in_reply_to = ?",
+                libsql::params![p1],
+            )
+            .await
+            .unwrap();
+        let eo_patch_id: i64 = eo_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(eo_patch_id, p1_a);
+        assert!(eo_rows.next().await.unwrap().is_none());
+
+        // Verify email_outbox for p2 kept p2_a's row and dropped p2_b's duplicate
+        let mut eo2_rows = db
+            .conn
+            .query(
+                "SELECT patch_id, status, body FROM email_outbox WHERE in_reply_to = ?",
+                libsql::params![p2],
+            )
+            .await
+            .unwrap();
+        let eo2_row = eo2_rows.next().await.unwrap().unwrap();
+        assert_eq!(eo2_row.get::<i64>(0).unwrap(), p2_a);
+        assert_eq!(eo2_row.get::<String>(1).unwrap(), "Sent");
+        assert_eq!(eo2_row.get::<String>(2).unwrap(), "already sent body");
+        assert!(
+            eo2_rows.next().await.unwrap().is_none(),
+            "merging duplicate patches must not create duplicate email_outbox rows"
+        );
+
+        // Verify patches_subsystems was transferred to p1_a
+        let mut ps_rows = db
+            .conn
+            .query(
+                "SELECT subsystem_id FROM patches_subsystems WHERE patch_id = ?",
+                libsql::params![p1_a],
+            )
+            .await
+            .unwrap();
+        let transferred_sub: i64 = ps_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(transferred_sub, sub_id);
+
+        // Verify maintainer sections were merged and provenance upgraded
+        let sections = db.authorizing_sections_for_patchset(10).await.unwrap();
+        assert_eq!(
+            sections,
+            vec![
+                "NFS, SUNRPC, AND LOCKD CLIENTS".to_string(),
+                "fs/nfs".to_string()
+            ]
+        );
+
+        // Verify forge_outbox was re-pointed to patchset 10
+        let mut fo_rows = db
+            .conn
+            .query(
+                "SELECT patchset_id FROM forge_outbox WHERE pr_number = 42",
+                (),
+            )
+            .await
+            .unwrap();
+        let fo_ps_id: i64 = fo_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(fo_ps_id, 10);
     }
 }
