@@ -5449,7 +5449,7 @@ impl Database {
                     p_rows.next().await?.is_some()
                 };
 
-                if index_collision || (!is_placeholder && !versions_compatible) {
+                if (!is_duplicate && index_collision) || (!is_placeholder && !versions_compatible) {
                     continue;
                 }
 
@@ -5548,6 +5548,7 @@ impl Database {
             id: i64,
             subject: String,
             subject_index: u32,
+            total_parts: u32,
             cover_id: Option<String>,
             baseline_id: Option<i64>,
             baseline_part: Option<u32>,
@@ -5732,20 +5733,23 @@ impl Database {
             // we strictly require multi-part series patches to belong to the same thread,
             // unless they share a git send-email Message-ID prefix indicating they were sent together unthreaded.
             let thread_compatible = same_thread || is_singleton || msgid_prefix_match;
+            let is_same_series_redelivery =
+                is_duplicate && same_thread && total_parts == existing_total;
 
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
                 && versions_compatible
                 && (total_parts == existing_total || existing_total == 1 || total_parts == 1)
-                && subject_match
+                && (subject_match || is_same_series_redelivery)
                 && prefix_match
                 && thread_compatible
-                && !index_collision
+                && (!index_collision || is_same_series_redelivery)
             {
                 matches.push(CandidateMatch {
                     id,
                     subject: existing_subject,
                     subject_index: existing_subject_index,
+                    total_parts: existing_total,
                     cover_id: existing_cover_id,
                     baseline_id: existing_baseline_id,
                     baseline_part: existing_baseline_part,
@@ -6015,6 +6019,12 @@ impl Database {
                     .get(..3)
                     .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
 
+            let final_total = if total_parts == 1 && matches[0].total_parts > 1 {
+                matches[0].total_parts
+            } else {
+                total_parts
+            };
+
             // Update the target patchset
             if is_reply_msg {
                 self.conn
@@ -6027,7 +6037,7 @@ impl Database {
                 self.conn
                     .execute(
                         "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                        libsql::params![author, total_parts, parser_version, to, cc, target_id],
+                        libsql::params![author, final_total, parser_version, to, cc, target_id],
                     )
                     .await?;
             }
@@ -6218,17 +6228,21 @@ impl Database {
         diff: libsql::Value,
         git_patch_id: Option<String>,
     ) -> Result<PatchWriteOutcome> {
-        let collision_exists = {
-            let mut rows = tx
-                .query(
-                    "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
-                    libsql::params![patchset_id, part_index, message_id],
-                )
-                .await?;
-            rows.next().await?.is_some()
-        };
-        if collision_exists {
-            bail!("Index collision: index {part_index} already exists in patchset {patchset_id}");
+        if old_patch.is_none() {
+            let collision_exists = {
+                let mut rows = tx
+                    .query(
+                        "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
+                        libsql::params![patchset_id, part_index, message_id],
+                    )
+                    .await?;
+                rows.next().await?.is_some()
+            };
+            if collision_exists {
+                bail!(
+                    "Index collision: index {part_index} already exists in patchset {patchset_id}"
+                );
+            }
         }
 
         let Some((patch_id, existing_in_patchset)) = write_patch_if_unchanged(
@@ -19199,5 +19213,183 @@ mod tests {
             .unwrap();
         let fo_ps_id: i64 = fo_rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(fo_ps_id, 10);
+    }
+
+    #[tokio::test]
+    async fn test_redelivered_patch_reuses_open_patchset_despite_misnumbered_cover_or_duplicate_index()
+     {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let cover = "20260921000000.200-0-author@example.com";
+        let p1 = "20260921000000.200-1-author@example.com";
+        let p2 = "20260921000000.200-2-author@example.com";
+
+        // Case 1: Cover letter lacks [0/2] so it is parsed as 1/1 (subject_index = 1),
+        // followed by patch [1/2]. When patch [1/2] is redelivered while the series is
+        // still Incomplete, it must match the existing patchset rather than spawning a
+        // duplicate patchset row.
+        let thread_id = db
+            .create_thread(cover, "[PATCH] Series cover without 0/N", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            cover,
+            thread_id,
+            None,
+            author,
+            "[PATCH] Series cover without 0/N",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            p1,
+            thread_id,
+            Some(cover),
+            author,
+            "[PATCH 1/2] First real patch",
+            2001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_cover = db
+            .create_patchset(
+                thread_id,
+                Some(cover),
+                cover,
+                "[PATCH] Series cover without 0/N",
+                author,
+                2000,
+                1,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let ps_first = db
+            .create_patchset(
+                thread_id,
+                Some(cover),
+                p1,
+                "[PATCH 1/2] First real patch",
+                author,
+                2001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_first, ps_cover);
+        db.create_patch(ps_first, p1, 1, "diff1").await.unwrap();
+
+        // Cross-list redelivery of p1 while patchset is still Incomplete (1/2 received)
+        let ps_redelivered = db
+            .create_patchset(
+                thread_id,
+                Some(p1),
+                p1,
+                "[PATCH 1/2] First real patch",
+                author,
+                2001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ps_redelivered, ps_first,
+            "redelivered patch 1/2 must reuse the open patchset rather than spawning a duplicate"
+        );
+
+        // Case 2: Open patchset holds two messages with the same part_index (e.g. from an
+        // earlier merge or misnumbered series). Redelivering one of those existing messages
+        // must reuse the patchset and update the patch in place without bailing on index collision.
+        db.create_message(
+            p2,
+            thread_id,
+            Some(cover),
+            author,
+            "[PATCH 1/2] Misnumbered second patch",
+            2002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, 1, 'diff2')",
+                libsql::params![ps_first, p2],
+            )
+            .await
+            .unwrap();
+
+        let ps_collision_redelivery = db
+            .create_patchset(
+                thread_id,
+                Some(p1),
+                p1,
+                "[PATCH 1/2] First real patch",
+                author,
+                2001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_collision_redelivery, ps_first);
+        db.create_patch(ps_first, p1, 1, "diff1 updated")
+            .await
+            .expect("updating an already-present patch must not bail on index collision");
     }
 }
