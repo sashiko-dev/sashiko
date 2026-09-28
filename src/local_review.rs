@@ -468,6 +468,46 @@ fn decorate_provider(
     ))
 }
 
+/// Daemon-spawned workers (`stdio-*`) already have their retry lifecycle managed
+/// by the parent `Reviewer` via `review.max_retries`, so retrying the full
+/// workflow inside the child process as well would multiply attempts.
+fn worker_max_attempts(ai: &AiSettings) -> usize {
+    if ai.provider.starts_with("stdio-") {
+        1
+    } else {
+        3
+    }
+}
+
+/// Validates and extracts the inline review body from a worker result.
+///
+/// When findings are present without a non-empty `review_inline` string, this
+/// returns an error so `review_single_patch` records `last_error` and fails the
+/// attempt (allowing either the next in-process attempt or the parent daemon's
+/// retry loop to run) instead of falling through and returning a successful
+/// payload with a missing inline review.
+fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Option<String>> {
+    let inline_content = output
+        .and_then(|out| out.get("review_inline"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+
+    let has_findings = output
+        .and_then(|out| out.get("findings"))
+        .and_then(|f| f.as_array())
+        .is_some_and(|findings| !findings.is_empty());
+
+    if has_findings && inline_content.is_none() {
+        return Err(anyhow!(
+            "Review failure on patch {}: Findings detected but review_inline field was missing or empty.",
+            patch_index
+        ));
+    }
+
+    Ok(inline_content)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
@@ -493,21 +533,22 @@ async fn review_single_patch(
             Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(deadline))
                 as Arc<dyn crate::ai::backoff_provider::RetryBudget>
         });
+    let max_attempts = worker_max_attempts(ai);
     let mut last_error = None;
-    for attempt in 1..=3 {
+    for attempt in 1..=max_attempts {
         emit(
             progress,
             ProgressEvent::AiReviewAttempt {
                 patch_index: p.index,
                 attempt,
-                max_attempts: 3,
+                max_attempts,
             },
         );
 
         if attempt > 1 {
             info!(
-                "Restarting AI review for patch {} (attempt {}/3)...",
-                p.index, attempt
+                "Restarting AI review for patch {} (attempt {}/{})...",
+                p.index, attempt, max_attempts
             );
         }
 
@@ -638,6 +679,15 @@ async fn review_single_patch(
             .await
         {
             Ok(result) => {
+                let inline_content = match extract_inline_review(p.index, result.output.as_ref()) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        error!("{}", e);
+                        last_error = Some(e);
+                        continue;
+                    }
+                };
+
                 info!("AI review completed for patch {}.", p.index);
                 emit(
                     progress,
@@ -645,31 +695,6 @@ async fn review_single_patch(
                         patch_index: p.index,
                     },
                 );
-
-                let mut inline_content = None;
-                if let Some(output) = &result.output
-                    && let Some(content) = output.get("review_inline").and_then(|v| v.as_str())
-                {
-                    inline_content = Some(content.to_string());
-                }
-
-                let mut has_findings = false;
-                if let Some(output) = &result.output
-                    && let Some(findings) = output.get("findings").and_then(|f| f.as_array())
-                    && !findings.is_empty()
-                {
-                    has_findings = true;
-                }
-
-                if has_findings && inline_content.is_none() {
-                    error!(
-                        "Review failure on patch {}: Findings detected but review_inline field was missing or empty.",
-                        p.index
-                    );
-                    if attempt < 3 {
-                        continue;
-                    }
-                }
 
                 return Ok(json!({
                     "patch_index": p.index,
@@ -1538,6 +1563,48 @@ mod tests {
             &decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &None)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn test_worker_max_attempts_skips_inner_retries_for_stdio_workers() -> Result<()> {
+        let mut settings = Settings::new()?;
+
+        settings.ai.provider = "stdio-gemini".to_string();
+        assert_eq!(worker_max_attempts(&settings.ai), 1);
+
+        settings.ai.provider = "gemini".to_string();
+        assert_eq!(worker_max_attempts(&settings.ai), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_inline_review_errors_when_findings_lack_inline_text() {
+        let missing_inline = json!({
+            "findings": [{"problem": "bug"}]
+        });
+        assert!(extract_inline_review(1, Some(&missing_inline)).is_err());
+
+        let empty_inline = json!({
+            "findings": [{"problem": "bug"}],
+            "review_inline": "   "
+        });
+        assert!(extract_inline_review(1, Some(&empty_inline)).is_err());
+
+        let valid_inline = json!({
+            "findings": [{"problem": "bug"}],
+            "review_inline": "> +foo();\n\nBug here."
+        });
+        assert_eq!(
+            extract_inline_review(1, Some(&valid_inline))
+                .unwrap()
+                .as_deref(),
+            Some("> +foo();\n\nBug here.")
+        );
+
+        let no_findings = json!({
+            "findings": []
+        });
+        assert_eq!(extract_inline_review(1, Some(&no_findings)).unwrap(), None);
     }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
