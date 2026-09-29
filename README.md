@@ -235,10 +235,23 @@ git commit -s
 
 ## Development
 
-Development agents working on this repository should follow the guidance in `GEMINI.md`.
-Please make sure your code builds cleanly without warnings, all tests pass, and `cargo fmt` and `cargo clippy` succeed before sending a pull request.
-If you are changing AI-related parts, please run at least several code reviews.
-Development got much faster these days, but testing is as important as ever.
+Development agents and contributors working on this repository should follow the guidance in `GEMINI.md`.
+Before opening or updating a pull request, make sure your code builds cleanly without warnings, all tests pass, and `make check-pr` (`make sob`, `cargo fmt`, `cargo clippy`, `cargo test`, and `yamllint`) succeeds.
+If you are changing Linux kernel review prompts or workflows, please also validate with the benchmark suite.
+
+### Sashiko-for-Sashiko Review Workflow
+
+Sashiko reviews its own codebase (`--project sashiko`) using first-party prompts under `prompts/sashiko/` and the pipeline in `src/workflows/sashiko_patch_review.rs`. Development follows a two-stage review model:
+
+1. **Local Agentic Loop**: After `make check-pr` passes, run Sashiko self-review locally on every commit before pushing:
+   ```bash
+   sashiko review --project sashiko HEAD
+   ```
+   Iterate on any findings locally and re-run `make check-pr` and `sashiko review --project sashiko` until the change is clean.
+
+2. **Upstream GitHub PR Review**: When a pull request is opened or updated, the upstream Sashiko service (`sashiko.sashiko.dev`) automatically reviews the commits and posts its report as a GitHub PR comment (`sashiko-bot`). PR authors are **required to act on every finding**:
+   - **Valid issue**: Fix the defect, re-run `make check-pr` and local self-review, push the updated branch, and reply on the PR confirming the fix.
+   - **False positive**: Reply on the PR with concrete code evidence explaining why the finding does not apply, and ideally propose an accompanying or follow-up update to the Sashiko-for-Sashiko prompts or workflow (`prompts/sashiko/`, `src/workflows/sashiko_patch_review.rs`) to prevent similar false positives in the future.
 
 ### Agent Skills
 
