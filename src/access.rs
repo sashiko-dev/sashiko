@@ -231,6 +231,13 @@ impl Principal {
         self.operator
     }
 
+    /// Whether this principal may exercise Sashiko administrator authority
+    /// (a configured Sashiko operator whose token is not attenuated below
+    /// [`BugAccess::Manage`]).
+    pub fn can_administer(&self) -> bool {
+        self.operator && self.access_to(&[]).can_manage()
+    }
+
     /// The address this principal was resolved from.
     pub fn email(&self) -> &str {
         &self.email

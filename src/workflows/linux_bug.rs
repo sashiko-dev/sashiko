@@ -245,6 +245,8 @@ pub struct TracingJson {
 pub struct SeverityJson {
     pub severity: String,
     pub severity_explanation: String,
+    #[serde(default)]
+    pub dismiss_as_non_bug: bool,
 }
 
 struct VerifySession<'a> {
@@ -257,6 +259,7 @@ struct VerifySession<'a> {
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
     prefetched_context: String,
+    threat_model_doc: &'a str,
 }
 
 #[async_trait]
@@ -267,9 +270,9 @@ impl LlmSession for VerifySession<'_> {
         let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
         format!(
             "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
-            You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
+            You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree and the official Linux Kernel threat model (`Documentation/process/threat-model.rst`).\n\
             Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
-            CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+            CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled, OR that the candidate issue is framed solely as a security vulnerability excluded by the Linux Kernel threat model (`Documentation/process/threat-model.rst`) where no functional defect exists under conforming operation. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
         )
     }
 
@@ -285,6 +288,15 @@ impl LlmSession for VerifySession<'_> {
             format!(
                 "\n<pre_fetched_context>\nThe following context was automatically pre-fetched from mainline at commit `{}`. It contains the source code around the reported locations.\nIf this context is sufficient to verify the defect, render your verdict directly without redundant tool calls.\n\n{}\n</pre_fetched_context>\n",
                 self.master_sha, self.prefetched_context
+            )
+        };
+
+        let threat_model_block = if self.threat_model_doc.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n<linux_kernel_threat_model path=\"Documentation/process/threat-model.rst\">\n{}\n</linux_kernel_threat_model>\n",
+                self.threat_model_doc.trim()
             )
         };
 
@@ -304,11 +316,15 @@ Subsystem: {subsystem}
 {description}
 Locations:
 {locations}
-{prefetch_block}
+{prefetch_block}{threat_model_block}
 Task:
 1. Verify the problem against the mainline code shown above and top-of-trunk of Linus's main tree (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `master` to check the actual top-of-trunk.
 2. Scope your verification to the relevant functions and code blocks. Do not wander across unrelated drivers or files.
-3. Determine if the issue is a genuine, reachable defect in the codebase.
+3. Determine if the issue is a genuine, reachable defect in the codebase and evaluate its reachability under the official Linux Kernel threat model (`Documentation/process/threat-model.rst`):
+   - Under the Linux Kernel threat model, the kernel assumes conforming hardware and trusted administrators (`root` / `CAP_SYS_ADMIN`). Issues that are NOT exploitable across a kernel trust boundary—such as requiring trusted hardware to violate its specification (when the driver is not documented as hardened against hostile hardware), requiring `root` or initial capabilities (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_RAWIO`, `CAP_SYS_MODULE`) to abuse privileged configuration interfaces (`debugfs`, privileged `sysfs`/`configfs` knobs, module parameters, or mounting corrupted block filesystem images), theoretical lab-only timing attacks, or kernel address/pointer and small structure padding leaks with no cross-boundary exploit path—are NOT kernel security vulnerabilities.
+   - If the candidate is framed solely as a security vulnerability when no functional defect exists under conforming operation, set \"is_false_positive\": true and cite the Linux Kernel threat model in \"refutation_evidence\".
+   - If a genuine functional or hardening defect exists without untrusted exploitability across a threat-model boundary, keep \"is_false_positive\": false, explicitly note the non-security threat-model reachability in \"verification_reasoning\", and cap \"impact_severity\" at \"Medium\" or \"Low\".
+   - If the defect is exploitable across an actual Linux Kernel threat model trust boundary (e.g., unprivileged local user, unprivileged user namespace/container under `CONFIG_USER_NS` escaping into the initial namespace, untrusted remote network peer, unprivileged syscall/ioctl/netlink input, or untrusted external USB/PCIe peripheral when IOMMU/driver hardening applies) and causes memory corruption, privilege escalation, cross-user data/IPC exposure, or kernel panic/DoS, set \"impact_severity\" to \"Critical\" or \"High\".
 4. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
 5. If it is a confirmed bug, set \"is_false_positive\": false, \"refutation_evidence\": null, provide your step-by-step proof in \"verification_reasoning\", carry forward and refine the verified code locations in \"relevant_code_locations\", and optionally suggest an \"impact_severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\").
 
@@ -329,6 +345,7 @@ Return ONLY a valid JSON object matching this schema:
             description = self.description,
             locations = loc_str,
             prefetch_block = prefetch_block,
+            threat_model_block = threat_model_block,
         )
     }
 
@@ -836,6 +853,9 @@ struct SeveritySession<'a> {
     canonical_title: &'a str,
     canonical_description: &'a str,
     locations: &'a str,
+    threat_model_doc: &'a str,
+    prefetched_context: &'a str,
+    tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
 }
 
@@ -844,14 +864,31 @@ impl LlmSession for SeveritySession<'_> {
     type Output = SeverityJson;
 
     fn system_prompt(&self) -> String {
+        let threat_model_section = if self.threat_model_doc.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n<linux_kernel_threat_model path=\"Documentation/process/threat-model.rst\">\n{}\n</linux_kernel_threat_model>",
+                self.threat_model_doc.trim()
+            )
+        };
         format!(
-            "{}\n\nAssess the severity and impact of a verified defect in the Linux kernel following the severity definitions and calibration guidance above.\n\
+            "{}{}\n\nAssess the severity and impact of a defect in the Linux kernel following the severity definitions in `severity.md` and the official Linux Kernel threat model (`Documentation/process/threat-model.rst`) above.\n\
             Output raw JSON only matching the schema.",
-            crate::prompt_bundle::kernel_severity_guide()
+            crate::prompt_bundle::kernel_severity_guide(),
+            threat_model_section
         )
     }
 
     fn initial_user_prompt(&self) -> String {
+        let code_section = if self.prefetched_context.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n<pre_fetched_context>\n{}\n</pre_fetched_context>\n",
+                self.prefetched_context.trim()
+            )
+        };
         format!(
             "{stage_heading}
 
@@ -861,21 +898,39 @@ Description:
 {description}
 Code Locations:
 {locations}
-
+{code_section}
 Task:
-Assess the severity of this defect and provide an explanation following the severity levels and calibration guidance above.
-State your reasoning (consequence, triggering path, reachability) at the start of severity_explanation so the label is auditable.
+Assess the severity of this defect and provide an explanation following the severity levels in `severity.md` and the official Linux Kernel threat model (`Documentation/process/threat-model.rst`).
+State your reasoning (consequence, triggering path, and Linux Kernel threat-model reachability) at the start of severity_explanation so the label is auditable:
+1. RAISE SEVERITY (`\"Critical\"` or `\"High\"`) for defects exploitable across an actual Linux Kernel threat model trust boundary (e.g., unprivileged local user, unprivileged user namespace/container under `CONFIG_USER_NS` escaping into the initial namespace, untrusted remote network peer, unprivileged syscall/ioctl/netlink input, or untrusted external USB/PCIe peripheral when IOMMU/driver hardening applies) that cause memory corruption, privilege escalation, cross-user data/IPC exposure, or kernel panic/DoS.
+2. DISMISS OR LOWER SEVERITY (`\"Medium\"` or `\"Low\"`) for issues that are NOT exploitable under the Linux Kernel threat model (e.g., requiring trusted hardware to violate specifications without a threat-model exception, requiring `root` or initial capabilities such as `CAP_SYS_ADMIN` to abuse privileged configuration interfaces like `sysfs`, `debugfs`, `procfs`, module parameters, or mounting corrupted block filesystem images, or kernel address/pointer and small padding leaks with no cross-boundary exploit path):
+   - Set `\"dismiss_as_non_bug\": true` and `\"severity\": \"Low\"` if the issue is framed solely as a hypothetical security attack excluded by the Linux Kernel threat model and no functional bug exists under conforming operation.
+   - Otherwise set `\"dismiss_as_non_bug\": false` and lower `\"severity\"` to `\"Medium\"` or `\"Low\"` if a genuine functional or hardening defect exists without untrusted exploitability.
 
 Return ONLY a valid JSON object matching:
 {{
   \"severity\": \"Low\" | \"Medium\" | \"High\" | \"Critical\" | \"Unknown\",
-  \"severity_explanation\": \"Explain consequence, triggering path, reachability, attack prerequisites, required privileges, and blast radius...\"
+  \"severity_explanation\": \"Explain consequence, triggering path, Linux Kernel threat-model reachability, attack prerequisites, required privileges, and blast radius...\",
+  \"dismiss_as_non_bug\": false
 }}",
             stage_heading = BugStage::SeverityAssessment.heading(),
             title = self.canonical_title,
             description = self.canonical_description,
             locations = self.locations,
+            code_section = code_section,
         )
+    }
+
+    fn tools(&self) -> Option<Vec<AiTool>> {
+        self.tools.as_ref().map(|t| t.get_declarations_generic())
+    }
+
+    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+        if let Some(ref tools) = self.tools {
+            tools.call(name, args).await
+        } else {
+            bail!("Tool execution requested but no toolbox available");
+        }
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
@@ -1891,6 +1946,10 @@ pub async fn process_issue_worker(
 
     // Verification and ground-truth confirmation.
     info!("--- {} ---", BugStage::Verification.title());
+    let threat_model_doc = tools
+        .as_ref()
+        .and_then(|tb| crate::git_ops::load_linux_threat_model(tb.get_worktree_path()))
+        .unwrap_or_default();
     let prefetched_context =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &effective_locations).await;
     let mut verify_session = VerifySession {
@@ -1903,6 +1962,7 @@ pub async fn process_issue_worker(
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
         prefetched_context: prefetched_context.clone(),
+        threat_model_doc: &threat_model_doc,
     };
 
     let verify_result = runner.run(&mut verify_session).await?;
@@ -1965,7 +2025,7 @@ pub async fn process_issue_worker(
         let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
 
         let mut known_bugs = db.list_all_bugs_for_vector_search().await?;
-        known_bugs.retain(|b| b.id != bug_row.id);
+        known_bugs.retain(|b| b.id != bug_row.id && b.duplicate_of_id != Some(bug_row.id));
         let candidate_matches = find_top_candidates(
             &query_vector,
             &known_bugs,
@@ -2072,12 +2132,23 @@ pub async fn process_issue_worker(
     };
     let introduced_in_commit = format_commit(tools.as_ref(), introducing_commit_sha).await;
 
+    let verified_prefetched =
+        prefetch_bug_locations(tools.as_ref(), &master_sha, &verified_locations).await;
+    let effective_prefetched = if !verified_prefetched.is_empty() {
+        verified_prefetched
+    } else {
+        prefetched_context
+    };
+
     // Severity and impact estimation, recorded as an enrichment.
     info!("--- {} ---", BugStage::SeverityAssessment.title());
     let mut severity_session = SeveritySession {
         canonical_title: &norm.canonical_title,
         canonical_description: &norm.canonical_description,
         locations: &verified_locations_str,
+        threat_model_doc: &threat_model_doc,
+        prefetched_context: &effective_prefetched,
+        tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
     };
     let severity_result = runner.run(&mut severity_session).await?;
@@ -2091,17 +2162,40 @@ pub async fn process_issue_worker(
     full_history.extend(severity_result.history);
 
     let severity_output = severity_result.output;
+    if severity_output.dismiss_as_non_bug {
+        let reason = severity_output.severity_explanation.clone();
+        info!(
+            "Linux kernel candidate dismissed by threat model severity calibration: {}",
+            reason
+        );
+        let logs = serde_json::to_string(&full_history).unwrap_or_default();
+        db.update_bug_outcome(
+            bug_row.id,
+            crate::db::UpdateBugOutcomeParams {
+                lifecycle_status: crate::db::BugLifecycleStatus::Dismissed,
+                problem: Some(&norm.canonical_title),
+                subsystems: Some(&official_subsystems),
+                source_files: Some(&verified_files),
+                severity_explanation: Some(&reason),
+                logs: None,
+                verified_on_sha: Some(&master_sha),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(BugOutcome::Discarded {
+            reason,
+            logs: Some(logs),
+        });
+    }
+
     let severity = Severity::from_str(&severity_output.severity);
 
     // Standalone plaintext review generation, recorded as an enrichment.
     info!("--- {} ---", BugStage::ReportGeneration.title());
-    let verified_prefetched =
-        prefetch_bug_locations(tools.as_ref(), &master_sha, &verified_locations).await;
-    let effective_prefetched = if !verified_prefetched.is_empty() {
-        verified_prefetched
-    } else {
-        prefetched_context
-    };
 
     let mut report_session = ReportSession {
         problem: &norm.canonical_title,
@@ -2156,6 +2250,176 @@ pub async fn process_issue_worker(
         bug_row.id, bug_row.bugid
     );
     Ok(BugOutcome::NewlyDiscovered { bug: saved_bug })
+}
+
+/// Reconstructs [`BugInput`] from a stored [`Bug`] row so that the full bug
+/// workflow (`process_issue_worker`) can be re-executed on an existing bug.
+pub fn reconstruct_bug_input(bug: &Bug) -> BugInput {
+    if let Some(raw) = bug.raw_input()
+        && let Ok(input) = serde_json::from_str::<BugInput>(&raw)
+    {
+        return input;
+    }
+
+    BugInput {
+        problem: bug.problem().to_string(),
+        reasoning: bug
+            .description()
+            .or_else(|| bug.severity_explanation())
+            .unwrap_or_else(|| "No reasoning provided.".to_string()),
+        locations: bug.locations(),
+        subsystems: bug
+            .subsystems
+            .iter()
+            .map(|name| AttributedSubsystem::new(name, crate::db::SubsystemSource::CallerSupplied))
+            .collect(),
+        source_files: bug.source_files().unwrap_or_default(),
+        commit_sha: bug.discovered_in_commit.clone(),
+        patchset_id: bug.discovered_in_patchset_id,
+        patch_id: bug.discovered_in_patch_id,
+        baseline_sha: bug.discovered_in_commit.clone(),
+        review_id: None,
+    }
+}
+
+/// Re-runs the entire Linux kernel bug workflow (`Normalization` -> `Verification` ->
+/// `Deduplication` -> `OriginTracing` -> `SeverityAssessment` -> `ReportGeneration`)
+/// against an existing bug record.
+pub async fn reanalyze_bug_workflow(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    db: &Database,
+    bug_row: &Bug,
+    reason: Option<&str>,
+) -> Result<BugOutcome> {
+    db.requeue_bug_for_analysis(bug_row.id, reason).await?;
+    let refreshed = db
+        .get_bug(bug_row.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Bug {} disappeared before re-analysis", bug_row.id))?;
+    let input = reconstruct_bug_input(&refreshed);
+    let mut configured_tools = tools;
+    if let Some(ref sha) = refreshed.discovered_in_commit
+        && let Some(ref tb) = configured_tools
+    {
+        let mut cloned_tb = ToolBox::new(tb.get_worktree_path().to_path_buf(), None);
+        cloned_tb.set_virtual_head(sha.clone());
+        configured_tools = Some(Arc::new(cloned_tb));
+    }
+    match process_issue_worker(
+        provider,
+        configured_tools,
+        db,
+        &refreshed,
+        input,
+        Some("bug_reanalyze"),
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(e) => {
+            let error_msg = format!("Error during bug re-analysis: {}", e);
+            let _ = db.fail_bug_analysis(refreshed.id, &error_msg).await;
+            Err(e)
+        }
+    }
+}
+
+/// Re-evaluates and updates an existing bug's severity (or dismisses it if excluded as a non-bug)
+/// using the Linux Kernel threat model (`Documentation/process/threat-model.rst`) loaded directly
+/// from the kernel git repository.
+pub async fn reassess_bug_severity(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    db: &Database,
+    bug: &Bug,
+    reason_hint: Option<&str>,
+) -> Result<SeverityJson> {
+    let threat_model_doc = tools
+        .as_ref()
+        .and_then(|tb| crate::git_ops::load_linux_threat_model(tb.get_worktree_path()))
+        .or_else(|| {
+            let default_repo = std::path::Path::new("third_party/linux");
+            default_repo
+                .exists()
+                .then(|| crate::git_ops::load_linux_threat_model(default_repo))
+                .flatten()
+        })
+        .unwrap_or_default();
+
+    let locations_val = bug.locations();
+    let locations_str = locations_val
+        .as_ref()
+        .and_then(|v| serde_json::to_string_pretty(v).ok())
+        .unwrap_or_else(|| "[]".to_string());
+
+    let master_sha = bug
+        .verified_on_sha()
+        .or_else(|| bug.discovered_in_commit.clone())
+        .unwrap_or_else(|| "origin/master".to_string());
+    let prefetched_context =
+        prefetch_bug_locations(tools.as_ref(), &master_sha, &locations_val).await;
+
+    let mut desc = bug
+        .description()
+        .or_else(|| bug.severity_explanation())
+        .unwrap_or_else(|| bug.problem().to_string());
+    if let Some(hint) = reason_hint.map(str::trim).filter(|s| !s.is_empty()) {
+        desc.push_str("\n\nRe-rating Context / Hint: ");
+        desc.push_str(hint);
+    }
+
+    let mut severity_session = SeveritySession {
+        canonical_title: bug.problem(),
+        canonical_description: &desc,
+        locations: &locations_str,
+        context_tag: Some("bug_rerate".to_string()),
+        threat_model_doc: &threat_model_doc,
+        tools,
+        prefetched_context: &prefetched_context,
+    };
+
+    let runner = SessionRunner::new(provider);
+    let result = runner.run(&mut severity_session).await?;
+    let out = result.output;
+    let sev = Severity::from_str(&out.severity);
+
+    db.add_bug_enrichment(
+        bug.id,
+        &crate::db::NewBugEnrichment {
+            kind: "severity_calibration".to_string(),
+            content: Some(out.severity_explanation.clone()),
+            data_json: Some(serde_json::json!({
+                "severity": sev.as_str(),
+                "severity_int": sev as i32,
+                "explanation": out.severity_explanation,
+                "dismiss_as_non_bug": out.dismiss_as_non_bug,
+                "rerated_with_threat_model": true,
+            })),
+            logs: serde_json::to_string(&result.history).ok(),
+            tokens_in: Some(result.usage.prompt_tokens),
+            tokens_out: Some(result.usage.completion_tokens),
+            tokens_cached: result.usage.cached_tokens,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    if out.dismiss_as_non_bug
+        && matches!(
+            bug.lifecycle_status,
+            crate::db::BugLifecycleStatus::New | crate::db::BugLifecycleStatus::Open
+        )
+    {
+        db.change_bug_status_with_reason(
+            bug.id,
+            crate::db::BugLifecycleStatus::Dismissed,
+            Some(&out.severity_explanation),
+        )
+        .await?;
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2226,6 +2490,7 @@ mod tests {
             tools: None,
             context_tag: None,
             prefetched_context: String::new(),
+            threat_model_doc: "",
         };
 
         let runner = SessionRunner::new(&mock_provider);
@@ -2794,6 +3059,7 @@ mod tests {
                     tools: None,
                     context_tag: None,
                     prefetched_context: String::new(),
+                    threat_model_doc: "",
                 }
                 .initial_user_prompt(),
             ),
@@ -2827,6 +3093,9 @@ mod tests {
                     canonical_description: &input.reasoning,
                     locations: "[]",
                     context_tag: None,
+                    threat_model_doc: "",
+                    tools: None,
+                    prefetched_context: "",
                 }
                 .initial_user_prompt(),
             ),
@@ -2924,6 +3193,9 @@ mod tests {
             canonical_description: "Buffer allocated but not freed",
             locations: "[]",
             context_tag: None,
+            threat_model_doc: "",
+            tools: None,
+            prefetched_context: "",
         };
 
         let sys_prompt = session.system_prompt();
@@ -3597,6 +3869,215 @@ F:	drivers/net/ethernet/intel/e1000/
                 "BTRFS FILE SYSTEM".to_string(),
                 "INTEL E1000 NETWORK DRIVER".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_verify_and_severity_sessions_include_linux_threat_model_directly() {
+        let kernel_repo =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third_party/linux");
+        let threat_model_doc = crate::git_ops::load_linux_threat_model(&kernel_repo)
+            .expect("must load Documentation/process/threat-model.rst directly from kernel repo");
+
+        let verify_session = VerifySession {
+            title: "sysfs: root write triggers warning",
+            description: "Writing malformed value as root",
+            subsystem: "sysfs",
+            affected_files: &[],
+            locations: None,
+            master_sha: "master".to_string(),
+            tools: None,
+            context_tag: None,
+            prefetched_context: String::new(),
+            threat_model_doc: &threat_model_doc,
+        };
+        let verify_prompt = verify_session.initial_user_prompt();
+        assert!(
+            verify_prompt.contains(
+                "<linux_kernel_threat_model path=\"Documentation/process/threat-model.rst\">"
+            ),
+            "VerifySession must inject <linux_kernel_threat_model> directly from git"
+        );
+        assert!(
+            verify_prompt.contains("The Linux Kernel threat model"),
+            "VerifySession prompt must contain threat-model.rst content"
+        );
+
+        let severity_session = SeveritySession {
+            canonical_title: "sysfs: root write triggers warning",
+            canonical_description: "Writing malformed value as root",
+            locations: "[]",
+            threat_model_doc: &threat_model_doc,
+            prefetched_context: "",
+            tools: None,
+            context_tag: None,
+        };
+        let sev_sys = severity_session.system_prompt();
+        let sev_user = severity_session.initial_user_prompt();
+        assert!(
+            sev_sys.contains(
+                "<linux_kernel_threat_model path=\"Documentation/process/threat-model.rst\">"
+            ),
+            "SeveritySession system prompt must inject <linux_kernel_threat_model> directly"
+        );
+        assert!(
+            sev_user.contains("RAISE SEVERITY") && sev_user.contains("DISMISS OR LOWER SEVERITY"),
+            "SeveritySession user prompt must include threat model calibration instructions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reassess_bug_severity_updates_and_dismisses_existing_bug() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = db
+            .create_bug(&NewBug {
+                bugid: "linux-test-rerate-1".to_string(),
+                title: "drivers/foo: root debugfs knob crash".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![AttributedSubsystem::from_path_prefix("drivers/foo")],
+            })
+            .await
+            .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &crate::db::NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                content: Some("Previously rated High".to_string()),
+                data_json: Some(json!({
+                    "severity": "High",
+                    "severity_int": Severity::High as i32,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let bug_before = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(bug_before.severity(), Severity::High);
+
+        let provider_lower = MockAiProvider {
+            response_text: json!({
+                "severity": "Low",
+                "severity_explanation": "Requires CAP_SYS_ADMIN access to debugfs knob; under Documentation/process/threat-model.rst this is not a security boundary violation.",
+                "dismiss_as_non_bug": false
+            })
+            .to_string(),
+        };
+        let out = reassess_bug_severity(&provider_lower, None, &db, &bug_before, None)
+            .await
+            .unwrap();
+        assert_eq!(out.severity, "Low");
+
+        let bug_after_lower = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(bug_after_lower.severity(), Severity::Low);
+        assert_eq!(
+            bug_after_lower.lifecycle_status,
+            crate::db::BugLifecycleStatus::Open
+        );
+
+        let provider_dismiss = MockAiProvider {
+            response_text: json!({
+                "severity": "Low",
+                "severity_explanation": "Hypothetical hostile hardware attack excluded by Documentation/process/threat-model.rst with no functional defect.",
+                "dismiss_as_non_bug": true
+            })
+            .to_string(),
+        };
+        let out_dismiss =
+            reassess_bug_severity(&provider_dismiss, None, &db, &bug_after_lower, None)
+                .await
+                .unwrap();
+        assert!(out_dismiss.dismiss_as_non_bug);
+
+        let bug_after_dismiss = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(
+            bug_after_dismiss.lifecycle_status,
+            crate::db::BugLifecycleStatus::Dismissed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reanalyze_bug_workflow_reruns_entire_pipeline() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = db
+            .create_bug(&NewBug {
+                bugid: "linux-test-reanalyze-workflow".to_string(),
+                title: "drivers/foo: speculative hardware register corruption".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![AttributedSubsystem::from_path_prefix("drivers/foo")],
+            })
+            .await
+            .unwrap();
+
+        let bug_before = db.get_bug(bug_id).await.unwrap().unwrap();
+        // Combined JSON satisfies Normalization and Verification in MockAiProvider.
+        let provider = MockAiProvider {
+            response_text: json!({
+                "canonical_title": "drivers/foo: speculative hardware register corruption",
+                "canonical_description": "Assumes internal PCIe device compromises MMIO registers without IOMMU hardening.",
+                "affected_source_files": ["drivers/foo/bar.c"],
+                "verification_reasoning": "Excluded by Linux kernel threat model because trusted internal hardware is assumed conforming.",
+                "is_false_positive": true,
+                "refutation_evidence": "Excluded under Documentation/process/threat-model.rst because trusted internal hardware is outside the kernel threat model."
+            })
+            .to_string(),
+        };
+
+        let outcome = reanalyze_bug_workflow(
+            &provider,
+            None,
+            &db,
+            &bug_before,
+            Some("Re-run full workflow with Linux Kernel threat model"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, BugOutcome::Discarded { .. }));
+
+        let bug_after = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(
+            bug_after.lifecycle_status,
+            crate::db::BugLifecycleStatus::Dismissed
+        );
+        assert_eq!(
+            bug_after.pipeline_state,
+            crate::db::BugPipelineState::Succeeded
         );
     }
 }

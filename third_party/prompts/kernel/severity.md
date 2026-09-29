@@ -18,25 +18,48 @@ auditable.
   preconditions a caller or input must satisfy. If you cannot, because it rests
   on an unproven assumption or on an ABI, register, or convention you might be
   misreading, still report the finding and mark it speculative.
-- Reachability: if the bug is reachable by untrusted, remote, or unprivileged
-  input, raise the level. Do not lower a finding because you believe it is
-  unreachable: reachability is hard to establish from a diff, and a wrong call
-  buries a real bug. If you cannot establish reachability, leave the level on
-  consequence alone.
+- Reachability & Linux Kernel Threat Model (`Documentation/process/threat-model.rst`): evaluate whether
+  the triggering path crosses an actual trust boundary defined by the Linux
+  Kernel threat model:
+  - **Exploitable across a threat-model boundary (Raise Severity to `Critical` or `High`)**:
+    If the bug is reachable by an unprivileged local user, an unprivileged user
+    namespace/container (`CONFIG_USER_NS`) escaping into the initial namespace,
+    an untrusted remote network peer, unprivileged syscall/ioctl/netlink input,
+    or an untrusted external USB/PCIe peripheral where IOMMU or driver hardening
+    applies—and triggers memory corruption, privilege escalation, unauthorized
+    cross-user data/IPC access, or kernel panic/DoS—**raise** the severity to
+    `Critical` or `High`.
+  - **Not exploitable under the threat model (Dismiss or Lower Severity to `Medium` / `Low`)**:
+    If a candidate issue is excluded from being a vulnerability by the Linux
+    Kernel threat model—for example, it requires trusted hardware to violate its
+    specification (when the driver is not hardened against hostile hardware),
+    requires `root` or initial capabilities (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`,
+    `CAP_SYS_RAWIO`, `CAP_SYS_MODULE`) to abuse privileged interfaces (`sysfs`,
+    `debugfs`, `procfs`, module parameters, or mounting corrupted block
+    filesystem images), or is a hardening weakness / kernel pointer or small
+    structure padding leak with no cross-boundary exploit path—do **not** classify
+    it as a `Critical` security vulnerability. **Dismiss** it if it is framed
+    solely as a hypothetical security attack where no bug exists under
+    conforming operation, or **lower** its severity (`Medium` or `Low`) if a real
+    functional or hardening defect exists without untrusted exploitability.
+  - Do not lower a genuine functional bug merely because you are uncertain
+    whether an unprivileged caller can reach it from the diff alone: if
+    reachability is unknown, leave the level calibrated on functional
+    consequence.
 
-A speculative finding is the one case where the level is capped, at Medium,
-because the open question is whether the bug is real at all. The finding is
-always reported, never dropped. This is the only reason to lower a level.
-Reachability never does.
+A speculative finding is capped at Medium because the open question is whether
+the bug is real at all. Issues that are provably outside the Linux Kernel threat
+model must be dismissed (when no functional bug exists) or lowered in severity
+(when only a non-security defect or hardening weakness exists).
 
 ## Critical
-- **Definition**: Issues that cause data loss, memory corruptions or security vulnerabilities.
-- **Question to ask**: Is it actually better for system to crash rather then keep working? If yes, it's a critical issue.
+- **Definition**: Issues that cause data loss, memory corruptions, or security vulnerabilities exploitable across a Linux Kernel threat model trust boundary.
+- **Question to ask**: Is it actually better for system to crash rather then keep working, or can an unprivileged user / untrusted remote peer cross a kernel security boundary? If yes, it's a critical issue.
 - **Examples**:
-    - Security vulnerability.
+    - Security vulnerability exploitable across a Linux Kernel threat model boundary (e.g., unprivileged local privilege escalation, cross-user isolation breach, or remote exploit).
     - Data corruption.
-    - Memory corruption (e.g., buffer overflow, use-after-free).
-    - Kernel panic or oops on hot path or which can be triggered by a userspace program or remotely.
+    - Memory corruption (e.g., buffer overflow, use-after-free) reachable in normal operation or via untrusted input.
+    - Kernel panic or oops on hot path or which can be triggered by an unprivileged userspace program or remotely.
     - ABI breakage without proper deprecation.
 
 ## High

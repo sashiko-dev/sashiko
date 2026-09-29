@@ -1,7 +1,6 @@
 use crate::ai::AiProvider;
-use crate::db::{AttributedSubsystem, Database, SubsystemSource};
+use crate::db::Database;
 use crate::toolbox::ToolBox;
-use crate::workflows::linux_bug::BugInput;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -129,36 +128,7 @@ impl BugWorker {
                         );
                         info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
 
-                        let input = if let Some(raw) = bug.raw_input() {
-                            serde_json::from_str::<BugInput>(&raw).ok()
-                        } else {
-                            None
-                        }
-                        .unwrap_or_else(|| BugInput {
-                            problem: bug.problem().to_string(),
-                            reasoning: bug
-                                .severity_explanation()
-                                .unwrap_or_else(|| "No reasoning provided.".to_string()),
-                            locations: bug.locations(),
-                            // The stored bug keeps the subsystem names but the
-                            // read model drops their provenance, so they are
-                            // rebuilt as caller supplied. Nothing is lost: the
-                            // analysis re-resolves subsystems from MAINTAINERS
-                            // before the outcome is written back.
-                            subsystems: bug
-                                .subsystems
-                                .iter()
-                                .map(|name| {
-                                    AttributedSubsystem::new(name, SubsystemSource::CallerSupplied)
-                                })
-                                .collect(),
-                            source_files: bug.source_files().unwrap_or_default(),
-                            commit_sha: bug.discovered_in_commit.clone(),
-                            patchset_id: bug.discovered_in_patchset_id,
-                            patch_id: bug.discovered_in_patch_id,
-                            baseline_sha: bug.discovered_in_commit.clone(),
-                            review_id: None,
-                        });
+                        let input = crate::workflows::linux_bug::reconstruct_bug_input(&bug);
 
                         let mut tb = ToolBox::new(std::path::PathBuf::from(&repo_path), None);
                         if let Some(ref sha) = bug.discovered_in_commit {
