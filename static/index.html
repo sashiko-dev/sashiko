@@ -2877,7 +2877,7 @@
                     <div style="display: flex; gap: 8px; margin-left: auto;">
                         <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
                         <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
-                        <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}" data-hint="Pre-existing bugs discovered during review (available to maintainers)" aria-label="Bugs — Pre-existing bugs discovered during review (available to maintainers)">Bugs</button>
+                        <button id="btn-bugs" style="${config && config.bugs_enabled === false ? 'display: none;' : ''}" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}" data-hint="Pre-existing bugs discovered during review (available to maintainers)" aria-label="Bugs — Pre-existing bugs discovered during review (available to maintainers)">Bugs</button>
                     </div>
                 </div>
                 <table id="dataTable">

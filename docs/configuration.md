@@ -272,13 +272,17 @@ pass.
 
 ### `[linux_bug]`
 
-Tuning for the worker that analyses Linux kernel bugs. Both keys are
-optional; omitting the whole section uses the defaults below.
+Controls pre-existing Linux kernel bug tracking and background analysis.
+By default (`enabled = false`), pre-existing issues discovered during patch
+reviews are ignored and the background bug worker is not started.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `lease_ttl_seconds` | integer | `1800` | How long a worker's claim on a bug stays valid. If the worker dies, the bug becomes claimable again once this elapses. Must exceed the longest expected analysis, or a slow run will be reclaimed and analysed twice in parallel. |
+| `enabled` | bool | `false` | Enable pre-existing bug tracking, the `/api/bug/analyze` endpoint, and the background `BugWorker`. |
+| `lease_ttl_seconds` | integer | `300` | How long a worker's claim on a bug stays valid without renewal. If the worker dies, the bug becomes claimable again once this elapses. |
 | `max_attempts` | integer | `3` | How many analysis attempts a bug gets before it is abandoned. Abandoned bugs are never retried automatically. |
+| `fix_check_interval_seconds` | integer | `21600` | Interval in seconds between periodic upstream fix checks against Linus's mainline tree (`master`). Set to `0` to disable periodic checks. |
+| `fix_check_batch_size` | integer | `50` | Maximum number of open bugs evaluated per upstream fix check cycle. |
 
 ### `[subsystems]`
 

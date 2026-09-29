@@ -1851,6 +1851,11 @@ impl Reviewer {
                                             .as_str()
                                             .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
+                                        if preexisting == Some(true)
+                                            && !ctx.settings.linux_bug.enabled
+                                        {
+                                            continue;
+                                        }
                                         let locations = f.get("locations").cloned();
 
                                         ctx.db
@@ -1866,8 +1871,9 @@ impl Reviewer {
                                     }
                                 }
 
-                                if let Some(arr) =
-                                    review_content.get("concerns").and_then(|f| f.as_array())
+                                if ctx.settings.linux_bug.enabled
+                                    && let Some(arr) =
+                                        review_content.get("concerns").and_then(|f| f.as_array())
                                 {
                                     for concern in arr {
                                         let problem = concern

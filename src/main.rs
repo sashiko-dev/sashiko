@@ -1005,7 +1005,7 @@ async fn run_daemon(
         None
     };
 
-    let bug_worker_handle = {
+    let bug_worker_handle = if settings.linux_bug.enabled {
         let provider =
             sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
         let bug_worker = sashiko::worker::bug_worker::BugWorker::new(
@@ -1013,9 +1013,12 @@ async fn run_daemon(
             provider,
             settings.git.repository_path.clone(),
         );
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             bug_worker.run().await;
-        })
+        }))
+    } else {
+        info!("Linux bug worker disabled via settings (linux_bug.enabled = false).");
+        None
     };
     // Initialize custom remotes
     // Start Background Compressor Worker
@@ -1153,7 +1156,9 @@ async fn run_daemon(
     if let Some(h) = forge_handle {
         h.abort();
     }
-    bug_worker_handle.abort();
+    if let Some(h) = bug_worker_handle {
+        h.abort();
+    }
     compressor_handle.abort();
     commit_graph_handle.abort();
     sync_handle.abort();

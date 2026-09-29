@@ -1290,6 +1290,13 @@ async fn analyze_bug(
         ));
     }
 
+    if !state.settings.linux_bug.enabled {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Linux bug tracking is disabled on this server.".to_string(),
+        ));
+    }
+
     // Uncached, as this asked for before the cached constructor grew to take the
     // AI settings and a database path: filing a bug is a one-off analysis.
     let provider = match crate::ai::create_provider(&state.settings) {
@@ -1682,6 +1689,7 @@ async fn get_config(
         "project_domain": state.settings.project.domain,
         "attribution": state.settings.project.attribution(),
         "forge_enabled": state.settings.forge.enabled,
+        "bugs_enabled": state.settings.linux_bug.enabled,
         "read_only": state.read_only,
         "permissions": {
             "review": can_review,
@@ -4188,6 +4196,23 @@ mod tests {
         assert_eq!(
             denied_analyze.text().await.unwrap(),
             "You don't have permissions to file bugs."
+        );
+
+        // When linux_bug.enabled is false (the default), /api/config reports
+        // bugs_enabled: false and /api/bug/analyze refuses even an admin.
+        let cfg: serde_json::Value = get("/api/config".into(), None)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cfg["bugs_enabled"], false);
+
+        let disabled_analyze = analyze(Some(token("operator@example.org"))).await.unwrap();
+        assert_eq!(disabled_analyze.status(), 404);
+        assert_eq!(
+            disabled_analyze.text().await.unwrap(),
+            "Linux bug tracking is disabled on this server."
         );
     }
 

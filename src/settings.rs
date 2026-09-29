@@ -833,6 +833,55 @@ fn default_log_level() -> String {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
+pub struct LinuxBugSettings {
+    /// Whether pre-existing bug tracking and the background bug worker are enabled.
+    /// Disabled by default so pre-existing issues are ignored unless opted in.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_bug_lease_ttl_seconds")]
+    pub lease_ttl_seconds: i64,
+    #[serde(default = "default_bug_max_attempts")]
+    pub max_attempts: i64,
+    /// Interval in seconds between periodic upstream fix checks against Linus's tree.
+    /// Set to 0 to disable periodic upstream fix checks.
+    #[serde(default = "default_fix_check_interval_seconds")]
+    pub fix_check_interval_seconds: u64,
+    /// Maximum number of open bugs to evaluate per upstream fix check cycle.
+    #[serde(default = "default_fix_check_batch_size")]
+    pub fix_check_batch_size: usize,
+}
+
+fn default_bug_lease_ttl_seconds() -> i64 {
+    300
+}
+
+fn default_bug_max_attempts() -> i64 {
+    3
+}
+
+fn default_fix_check_interval_seconds() -> u64 {
+    21_600
+}
+
+fn default_fix_check_batch_size() -> usize {
+    50
+}
+
+impl Default for LinuxBugSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lease_ttl_seconds: default_bug_lease_ttl_seconds(),
+            max_attempts: default_bug_max_attempts(),
+            fix_check_interval_seconds: default_fix_check_interval_seconds(),
+            fix_check_batch_size: default_fix_check_batch_size(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
 pub struct Settings {
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -852,6 +901,8 @@ pub struct Settings {
     pub server: ServerSettings,
     pub git: GitSettings,
     pub review: ReviewSettings,
+    #[serde(default, alias = "bugs")]
+    pub linux_bug: LinuxBugSettings,
 }
 
 impl Settings {
@@ -1424,5 +1475,26 @@ mod tests {
         let omitted: AclSettings = serde_json::from_str("{}").unwrap();
         assert!(omitted.admins.is_empty());
         assert!(!omitted.is_admin(""));
+    }
+
+    #[test]
+    fn test_linux_bug_settings_defaults_to_disabled() {
+        let default_bug = LinuxBugSettings::default();
+        assert!(!default_bug.enabled);
+        assert_eq!(default_bug.lease_ttl_seconds, 300);
+        assert_eq!(default_bug.max_attempts, 3);
+        assert_eq!(default_bug.fix_check_interval_seconds, 21_600);
+        assert_eq!(default_bug.fix_check_batch_size, 50);
+
+        let settings = Settings::new().unwrap();
+        assert!(!settings.linux_bug.enabled);
+
+        let custom: LinuxBugSettings = toml::from_str(
+            "enabled = true\nfix_check_interval_seconds = 3600\nfix_check_batch_size = 20\n",
+        )
+        .unwrap();
+        assert!(custom.enabled);
+        assert_eq!(custom.fix_check_interval_seconds, 3600);
+        assert_eq!(custom.fix_check_batch_size, 20);
     }
 }
