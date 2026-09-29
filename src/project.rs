@@ -51,6 +51,14 @@ impl ProjectId {
         }
     }
 
+    /// Human-readable display name for UI headers and titles.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ProjectId::Linux => "Linux",
+            ProjectId::Sashiko => "Sashiko",
+        }
+    }
+
     /// The subdirectory of the installed prompt bundle holding this project's
     /// prompts.
     ///
@@ -149,6 +157,12 @@ mod tests {
             assert_eq!(ProjectId::from_str(project.as_str()), Ok(*project));
             assert_eq!(project.to_string(), project.as_str());
         }
+    }
+
+    #[test]
+    fn test_display_name() {
+        assert_eq!(ProjectId::Linux.display_name(), "Linux");
+        assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
     }
 
     #[test]

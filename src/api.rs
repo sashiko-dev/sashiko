@@ -1810,8 +1810,11 @@ async fn get_config(
     let can_cancel = !state.read_only && is_auth(crate::settings::Permission::Cancel);
     let can_ingest = !state.read_only && is_auth(crate::settings::Permission::Ingest);
 
+    let project = state.settings.project.kind.unwrap_or_default();
+
     Ok(Json(serde_json::json!({
         "project_name": state.settings.project.name,
+        "project": project.display_name(),
         "project_description": state.settings.project.description,
         "project_domain": state.settings.project.domain,
         "attribution": state.settings.project.attribution(),
@@ -2902,6 +2905,7 @@ mod tests {
         // capability assertions further down honest.
         const SECRET: &str = "bug-test-secret-12345678901234567890";
         let mut settings = crate::settings::Settings::new().unwrap();
+        settings.project.kind = Some(crate::project::ProjectId::Linux);
         settings.server.jwt_secret = Some(SECRET.to_string());
         settings.server.acl.security = vec!["security@example.org".to_string()];
         settings.server.acl.admins = vec!["operator@example.org".to_string()];
@@ -3304,6 +3308,7 @@ mod tests {
             .json()
             .await
             .unwrap();
+        assert_eq!(cfg_identity["project"], "Linux");
         assert_eq!(cfg_identity["permissions"]["review"], false);
         assert!(cfg_identity["permissions"]["action"].is_null());
 

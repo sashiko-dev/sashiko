@@ -2016,12 +2016,21 @@
 
         
         let config = {};
+        function getHeaderTitle() {
+            const base = (config.project_name || 'Sashiko').trim() || 'Sashiko';
+            const proj = (config.project || '').trim();
+            if (!proj || base.includes(':')) {
+                return base;
+            }
+            return `${base}: ${proj}`;
+        }
+
         async function fetchConfig() {
             try {
                 const res = await fetch('/api/config');
                 if (res.ok) {
                     config = await res.json();
-                    document.title = config.project_name;
+                    document.title = getHeaderTitle();
                     if (config.project_description && config.project_description.trim() !== "") {
                         document.getElementById('about-text-content').innerHTML = `
                             <p>${escapeHtml(config.project_description)}</p>
@@ -2029,7 +2038,7 @@
                     }
                     const aboutNameEl = document.getElementById('about-modal-project-name');
                     if (aboutNameEl) {
-                        aboutNameEl.textContent = config.project_name;
+                        aboutNameEl.textContent = config.project_name || 'Sashiko';
                     }
                 }
             } catch(e) { console.error("Failed to load config", e); }
@@ -2668,11 +2677,13 @@
                 `<option value="${escapeHtml(l.group)}" ${state.selectedList === l.group ? 'selected' : ''}>${escapeHtml(l.name)}</option>`
             ).join('');
 
+            document.title = getHeaderTitle();
+
             app.innerHTML = `
                 <h1>
                     <span style="display:flex; align-items:center; cursor:pointer;" onclick="openAbout()">
                         <img src="static/logo.png" style="height: 1.2em; margin-right: 12px;">
-                        ${escapeHtml(config.project_name || 'Sashiko')}
+                        ${escapeHtml(getHeaderTitle())}
                     </span>
                 </h1>
                 <div class="controls">
@@ -4020,7 +4031,7 @@
             if (!res.ok) throw new Error('Message not found');
             const data = await res.json();
 
-            document.title = `${config.project_name || 'Sashiko'} - ${data.subject}`;
+            document.title = `${getHeaderTitle()} - ${data.subject}`;
             const date = formatDate(data.date, true);
             
             // Heuristic: message_id is SHA or synthetic local ID means it's a direct git submission
@@ -4200,7 +4211,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             // Any record with an interaction log makes the raw log page useful,
             // so the link is offered whenever at least one exists.
             const hasInteractionLogs = activity.some(e => e.has_logs);
-            document.title = `${config.project_name || 'Sashiko'} - ${data.problem || bugid}`;
+            document.title = `${getHeaderTitle()} - ${data.problem || bugid}`;
             const commit = (value, includeTag = false) => value ? `<code>${escapeHtml(formatCommitRef(value, includeTag))}</code>` : '';
 
             const discoveryRows = (evidence.discoveries || []).map(d => {
@@ -4645,7 +4656,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const payload = await res.json();
             const records = payload.records || [];
             const bugid = payload.bugid;
-            document.title = `${config.project_name || 'Sashiko'} - Interaction log for ${bugid}`;
+            document.title = `${getHeaderTitle()} - Interaction log for ${bugid}`;
             const selected = new URLSearchParams(location.hash.split('?')[1] || '').get('event');
 
             const stages = [];
@@ -4770,7 +4781,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const payload = await res.json();
             const bugid = payload.bugid;
             const inputs = payload.inputs || [];
-            document.title = `${config.project_name || 'Sashiko'} - Raw input for ${bugid}`;
+            document.title = `${getHeaderTitle()} - Raw input for ${bugid}`;
 
             const inputsHtml = inputs.map(record => {
                 const body = record.input !== null && record.input !== undefined
