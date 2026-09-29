@@ -92,16 +92,21 @@ authentication is a security boundary.
 **5. Benchmark Backing for Linux Review-Quality Changes (HIGH Severity).**
 Do not demand benchmark data, measurements, or manual test procedures for ordinary
 code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
-Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`).
-However, any change that can meaningfully affect overall Linux AI review quality
-across the board — such as global Linux stage instructions (`linux_patch_review.rs`,
-`linux_bug.rs`), generic workflow graph structure, model parameters, shared
-verification/deduplication logic, or broad Linux prompt changes (`third_party/prompts/`)
-— must include validation evidence in the commit message (either benchmark suite
-evaluation results or, for targeted false-positive prompt refinements, local
-re-review results on the affected Linux patches/series). Note that the JSON files
-in `benchmarks/` are static ground-truth corpora of known positive bugs (`BenchmarkEntry`
-in `src/bin/benchmark.rs`) and do not store negative/false-positive test cases;
+Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`),
+nor for post-triage maintenance tasks (such as periodic upstream fix checks on
+already-triaged open bugs) or filtering pre-existing issues out of patch review
+reports that are not exercised by the patch-review or initial bug-discovery
+benchmark suites (`benchmarks/`). However, any change that can meaningfully
+affect overall Linux AI patch-review or initial bug-discovery quality across the
+board — such as global Linux patch-review or initial bug-discovery stage
+instructions (`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph
+structure, model parameters, shared verification/deduplication logic, or broad
+Linux prompt changes (`third_party/prompts/`) — must include validation evidence
+in the commit message (either benchmark suite evaluation results or, for targeted
+false-positive prompt refinements, local re-review results on the affected Linux
+patches/series). Note that the JSON files in `benchmarks/` are static
+ground-truth corpora of known positive bugs (`BenchmarkEntry` in
+`src/bin/benchmark.rs`) and do not store negative/false-positive test cases;
 **never** demand that a prompt or workflow commit modify or add files in the
 `benchmarks/` directory. Flag Linux review-quality changes that provide no
 validation evidence in the commit message or risk silent regressions in detection
