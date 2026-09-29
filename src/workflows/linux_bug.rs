@@ -22,18 +22,18 @@
 //! 5. Database persistence and review linking.
 
 use crate::api::{BugInput, BugOutcome};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ai::session::{LlmSession, SessionRunner, ValidationError};
 use crate::ai::vector_search::{
     DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_TOP_CANDIDATES, extract_bug_vector, find_top_candidates,
 };
-use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool};
+use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool, ToolCall};
 use crate::db::{AttributedSubsystem, Bug, Database, NewBug, Severity};
 use crate::toolbox::ToolBox;
 
@@ -2055,6 +2055,805 @@ pub async fn process_issue_worker(
     Ok(BugOutcome::NewlyDiscovered { bug: saved_bug })
 }
 
+// ---------------------------------------------------------------------------
+// 7. Periodic Upstream Fix Check (Linus Tree)
+// ---------------------------------------------------------------------------
+
+const UPSTREAM_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const MAX_FIX_CANDIDATE_COMMITS: usize = 10;
+pub const MAX_FIX_CHECK_PREFETCH_BYTES: usize = 24_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpstreamFixVerdict {
+    /// One of `"fixed"`, `"still_present"`, or `"uncertain"`.
+    pub status: String,
+    #[serde(default)]
+    pub fixing_commit_sha: Option<String>,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamFixCheckOutcome {
+    SkippedAlreadyAtSha,
+    SkippedNotAncestor,
+    AdvancedWithoutLlm {
+        verified_on_sha: String,
+    },
+    StillPresentAfterLlm {
+        verified_on_sha: String,
+        explanation: String,
+    },
+    FixedUpstream {
+        fixing_commit_sha: String,
+        verified_on_sha: String,
+        explanation: String,
+    },
+    Uncertain {
+        explanation: String,
+    },
+}
+
+async fn run_git_query(repo_path: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut cmd = crate::git_cmd::in_dir_async(repo_path);
+    cmd.env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["-c", "safe.bareRepository=all"])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(UPSTREAM_GIT_TIMEOUT, cmd.output())
+        .await
+        .with_context(|| {
+            format!(
+                "git command {:?} timed out after {:?} in {}",
+                args,
+                UPSTREAM_GIT_TIMEOUT,
+                repo_path.display()
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "failed to execute git command {:?} in {}",
+                args,
+                repo_path.display()
+            )
+        })
+}
+
+/// Resolves the current HEAD commit SHA of Linus's mainline tree in `repo_path`.
+///
+/// Prefers a remote whose URL matches `torvalds/linux` (such as `linus/master`
+/// or `origin/master`), falling back to `origin/master`, `master`, and `HEAD`.
+pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
+    let mut candidate_refs = Vec::new();
+    match run_git_query(repo_path, &["remote", "-v"]).await {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let mut parts = line.split_whitespace();
+                if let (Some(name), Some(url)) = (parts.next(), parts.next())
+                    && url.contains("torvalds/linux")
+                {
+                    let r = format!("{}/master", name);
+                    if !candidate_refs.contains(&r) {
+                        candidate_refs.push(r);
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("Failed to query git remotes for Linus tree: {}", e);
+        }
+    }
+    for fallback in ["origin/master", "master", "HEAD"] {
+        let s = fallback.to_string();
+        if !candidate_refs.contains(&s) {
+            candidate_refs.push(s);
+        }
+    }
+
+    for ref_name in candidate_refs {
+        let rev = format!("{}^{{commit}}", ref_name);
+        match run_git_query(
+            repo_path,
+            &["rev-parse", "--verify", "--quiet", "--end-of-options", &rev],
+        )
+        .await
+        {
+            Ok(out) if out.status.success() => {
+                let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(sha);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Failed to resolve ref '{}' in git repo: {}", ref_name, e);
+            }
+        }
+    }
+    None
+}
+
+fn sanitize_bug_file_path(raw: &str) -> Option<String> {
+    let path = raw.trim();
+    if path.is_empty()
+        || path.starts_with('-')
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains("..")
+    {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Extracts deduplicated, sanitized file paths associated with `bug` from both
+/// `source_files` and `locations`.
+pub fn extract_bug_files(bug: &Bug) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Some(src_files) = bug.source_files() {
+        for f in src_files {
+            if let Some(clean) = sanitize_bug_file_path(&f)
+                && !files.contains(&clean)
+            {
+                files.push(clean);
+            }
+        }
+    }
+    if let Some(locs) = bug.locations()
+        && let Some(arr) = locs.as_array()
+    {
+        for loc in arr {
+            if let Some(f) = loc.get("file").and_then(|v| v.as_str())
+                && let Some(clean) = sanitize_bug_file_path(f)
+                && !files.contains(&clean)
+            {
+                files.push(clean);
+            }
+        }
+    }
+    files
+}
+
+async fn resolve_verified_commit_sha(
+    repo_path: &std::path::Path,
+    raw_sha: &str,
+) -> Result<Option<String>> {
+    let trimmed = raw_sha.trim();
+    if trimmed.len() < 7 || trimmed.len() > 40 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let rev = format!("{}^{{commit}}", trimmed);
+    let out = run_git_query(
+        repo_path,
+        &["rev-parse", "--verify", "--quiet", "--end-of-options", &rev],
+    )
+    .await?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let full_sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if full_sha.len() < 7 || !full_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    Ok(Some(full_sha))
+}
+
+/// Verifies that `commit_sha` resolves to a valid commit in `repo_path` and is
+/// an ancestor of `target_sha`, returning the full 40-character SHA when valid.
+pub async fn verify_commit_is_ancestor(
+    repo_path: &std::path::Path,
+    commit_sha: &str,
+    target_sha: &str,
+) -> Option<String> {
+    let full_sha = match resolve_verified_commit_sha(repo_path, commit_sha).await {
+        Ok(Some(sha)) => sha,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                "Git error resolving commit_sha '{}' during ancestry check: {}",
+                commit_sha, e
+            );
+            return None;
+        }
+    };
+    let full_target_sha = match resolve_verified_commit_sha(repo_path, target_sha).await {
+        Ok(Some(sha)) => sha,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                "Git error resolving target_sha '{}' during ancestry check: {}",
+                target_sha, e
+            );
+            return None;
+        }
+    };
+    match run_git_query(
+        repo_path,
+        &["merge-base", "--is-ancestor", &full_sha, &full_target_sha],
+    )
+    .await
+    {
+        Ok(anc) if anc.status.success() => Some(full_sha),
+        Ok(_) => None,
+        Err(e) => {
+            warn!(
+                "Git error checking merge-base --is-ancestor {} {}: {}",
+                full_sha, full_target_sha, e
+            );
+            None
+        }
+    }
+}
+
+/// Deterministic Tier-2 git pre-filter for upstream fix checking.
+///
+/// Returns:
+/// - `Ok(None)` if `from_sha` is not an ancestor of `to_sha` or `files` is empty.
+/// - `Ok(Some(vec![]))` if `from_sha` is an ancestor of `to_sha` and zero commits
+///   in `from_sha..to_sha` modified `files` or referenced `introducing_sha`.
+/// - `Ok(Some(shas))` with deduplicated candidate commit SHAs when commits
+///   touched `files` or mentioned `introducing_sha`.
+pub async fn find_candidate_fix_commits(
+    repo_path: &std::path::Path,
+    from_sha: &str,
+    to_sha: &str,
+    files: &[String],
+    introducing_sha: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let Some(full_from_sha) = resolve_verified_commit_sha(repo_path, from_sha).await? else {
+        return Ok(None);
+    };
+    let Some(full_to_sha) = resolve_verified_commit_sha(repo_path, to_sha).await? else {
+        return Ok(None);
+    };
+    let anc = run_git_query(
+        repo_path,
+        &["merge-base", "--is-ancestor", &full_from_sha, &full_to_sha],
+    )
+    .await?;
+    if !anc.status.success() {
+        return Ok(None);
+    }
+
+    let range = format!("{}..{}", full_from_sha, full_to_sha);
+    let mut log_args: Vec<&str> = vec![
+        "log",
+        "--no-merges",
+        "-n",
+        "100",
+        "--format=%H",
+        &range,
+        "--",
+    ];
+    for f in files {
+        log_args.push(f.as_str());
+    }
+    let out = run_git_query(repo_path, &log_args).await?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+
+    let mut candidates = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let sha = line.trim();
+        if sha.len() >= 7
+            && sha.chars().all(|c| c.is_ascii_hexdigit())
+            && !candidates.iter().any(|c| c == sha)
+        {
+            candidates.push(sha.to_string());
+        }
+    }
+
+    if let Some(intro) = introducing_sha {
+        let short_intro: String = intro
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .take(12)
+            .collect();
+        if short_intro.len() >= 7 {
+            let grep_arg = format!("--grep={}", short_intro);
+            let grep_out = run_git_query(
+                repo_path,
+                &[
+                    "log",
+                    "--no-merges",
+                    "-n",
+                    "100",
+                    "--fixed-strings",
+                    &grep_arg,
+                    "--format=%H",
+                    &range,
+                ],
+            )
+            .await?;
+            if !grep_out.status.success() {
+                return Ok(None);
+            }
+            for line in String::from_utf8_lossy(&grep_out.stdout).lines() {
+                let sha = line.trim();
+                if sha.len() >= 7
+                    && sha.chars().all(|c| c.is_ascii_hexdigit())
+                    && !candidates.iter().any(|c| c == sha)
+                {
+                    candidates.push(sha.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(Some(candidates))
+}
+
+async fn prefetch_candidate_fix_commits(
+    repo_path: &std::path::Path,
+    candidate_shas: &[String],
+    files: &[String],
+) -> String {
+    let mut output = String::new();
+    for sha in candidate_shas.iter().take(MAX_FIX_CANDIDATE_COMMITS) {
+        let mut args: Vec<&str> = vec!["show", "--stat", "--patch", "--unified=5", sha.as_str()];
+        if !files.is_empty() {
+            args.push("--");
+            for f in files {
+                args.push(f.as_str());
+            }
+        }
+        let mut commit_text = run_git_query(repo_path, &args)
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+
+        if commit_text.trim().is_empty() {
+            commit_text = run_git_query(
+                repo_path,
+                &["show", "--stat", "--patch", "--unified=5", sha.as_str()],
+            )
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        }
+        if commit_text.trim().is_empty() {
+            continue;
+        }
+
+        let entry = format!("=== Candidate Commit {} ===\n{}\n", sha, commit_text);
+        let current_bytes = output.len();
+        let entry_bytes = entry.len();
+        if current_bytes + entry_bytes > MAX_FIX_CHECK_PREFETCH_BYTES {
+            let remaining = MAX_FIX_CHECK_PREFETCH_BYTES.saturating_sub(current_bytes);
+            if remaining > 120 {
+                let mut end = remaining.min(entry_bytes);
+                while end > 0 && !entry.is_char_boundary(end) {
+                    end -= 1;
+                }
+                output.push_str(&entry[..end]);
+            }
+            output.push_str("\n... (Candidate commit prefetch limit reached)\n");
+            break;
+        }
+        output.push_str(&entry);
+    }
+    output
+}
+
+struct VerifyUpstreamFixSession<'a> {
+    bug: &'a Bug,
+    affected_files: &'a [String],
+    previous_sha: &'a str,
+    linus_sha: &'a str,
+    candidate_shas: &'a [String],
+    prefetched_commits: String,
+    prefetched_code: String,
+    tools: Option<Arc<ToolBox>>,
+    context_tag: Option<String>,
+    last_turn_tool_calls: Vec<(String, Value)>,
+}
+
+#[async_trait]
+impl LlmSession for VerifyUpstreamFixSession<'_> {
+    type Output = UpstreamFixVerdict;
+
+    fn system_prompt(&self) -> String {
+        "You are an expert Linux kernel maintainer auditing whether a previously verified kernel bug has been fixed in Linus's upstream mainline tree.\n\
+        Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
+        If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
+        Output raw JSON only."
+            .to_string()
+    }
+
+    fn initial_user_prompt(&self) -> String {
+        let locations_str = self
+            .bug
+            .locations()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| "[]".to_string());
+        let files_str = self.affected_files.join(", ");
+        let intro_str = self
+            .bug
+            .introduced_in_commit()
+            .unwrap_or_else(|| "unknown".to_string());
+        let displayed_candidates = self
+            .candidate_shas
+            .iter()
+            .take(MAX_FIX_CANDIDATE_COMMITS)
+            .map(|s| format!("- {}", s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let candidate_list = if self.candidate_shas.len() > MAX_FIX_CANDIDATE_COMMITS {
+            format!(
+                "{}\n- ... ({} additional candidate commits omitted; use git_log to inspect)",
+                displayed_candidates,
+                self.candidate_shas.len() - MAX_FIX_CANDIDATE_COMMITS
+            )
+        } else {
+            displayed_candidates
+        };
+        let report_body = {
+            let rev = self.bug.inline_review();
+            if !rev.trim().is_empty() {
+                rev
+            } else {
+                self.bug
+                    .severity_explanation()
+                    .unwrap_or_else(|| "No additional description recorded.".to_string())
+            }
+        };
+
+        format!(
+            "# Upstream Mainline Fix Verification\n\n\
+            Previously Verified On SHA: {prev_sha}\n\
+            Current Linus Mainline SHA: {linus_sha}\n\n\
+            ## Open Linux Kernel Bug (#{bug_id} / {bugid})\n\
+            Title: {title}\n\
+            Introduced In Commit: {intro}\n\
+            Affected Files: {files}\n\
+            Locations:\n{locations}\n\n\
+            Bug Report / Mechanism:\n{report}\n\n\
+            ## Candidate Commits in {prev_sha}..{linus_sha} ({total_candidates} total)\n\
+            {candidate_list}\n\n\
+            <prefetched_candidate_commits>\n\
+            {prefetched_commits}\n\
+            </prefetched_candidate_commits>\n\n\
+            <current_code_at_linus_sha>\n\
+            {prefetched_code}\n\
+            </current_code_at_linus_sha>\n\n\
+            ## Task\n\
+            Determine whether the bug described above has been fixed in Linus's tree at `{linus_sha}`.\n\
+            1. Inspect the candidate commits and the current code at `{linus_sha}`. If the prefetched context is insufficient (for example, more than {max_commits} candidate commits exist or a fix moved across files), use `git_show`, `git_diff`, `git_log`, or `git_read_files` at `{linus_sha}`.\n\
+            2. If a commit in `{prev_sha}..{linus_sha}` fixes the defect (or deletes the buggy code path so the defect no longer exists), set `\"status\": \"fixed\"` and set `\"fixing_commit_sha\"` to that commit's SHA.\n\
+            3. If the defect is still present at `{linus_sha}`, set `\"status\": \"still_present\"` and `\"fixing_commit_sha\": null`.\n\
+            4. If you cannot conclusively determine whether the bug is fixed or still present, set `\"status\": \"uncertain\"` and `\"fixing_commit_sha\": null`.\n\n\
+            Return ONLY a valid JSON object matching:\n\
+            {{\n\
+              \"status\": \"fixed\" | \"still_present\" | \"uncertain\",\n\
+              \"fixing_commit_sha\": \"<40-char or >=7-char commit SHA, or null>\",\n\
+              \"explanation\": \"Cite the exact commit and code changes that resolved the bug, or explain why the defect remains present at {linus_sha}.\"\n\
+            }}",
+            prev_sha = self.previous_sha,
+            linus_sha = self.linus_sha,
+            bug_id = self.bug.id,
+            bugid = self.bug.bugid,
+            title = self.bug.problem(),
+            intro = intro_str,
+            files = files_str,
+            locations = locations_str,
+            report = report_body,
+            total_candidates = self.candidate_shas.len(),
+            candidate_list = candidate_list,
+            prefetched_commits = self.prefetched_commits,
+            prefetched_code = self.prefetched_code,
+            max_commits = MAX_FIX_CANDIDATE_COMMITS,
+        )
+    }
+
+    fn tools(&self) -> Option<Vec<AiTool>> {
+        self.tools.as_ref().map(|t| t.get_declarations_generic())
+    }
+
+    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+        let Some(ref tools) = self.tools else {
+            bail!("Tool execution requested but no toolbox available");
+        };
+        let repeated = self
+            .last_turn_tool_calls
+            .iter()
+            .any(|prev| prev.0 == name && prev.1 == args);
+        if repeated {
+            warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
+            return Ok(json!({
+                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+            }));
+        }
+        self.last_turn_tool_calls = vec![(name.to_string(), args.clone())];
+        match tools.call(name, args).await {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(json!({ "error": e.to_string() })),
+        }
+    }
+
+    async fn call_tools(&mut self, calls: Vec<ToolCall>) -> Result<Vec<(String, Value)>> {
+        let Some(ref tools) = self.tools else {
+            bail!("Tool execution requested but no toolbox available");
+        };
+        let mut results: Vec<Option<(String, Value)>> = vec![None; calls.len()];
+        let mut to_run = Vec::new();
+        let mut current_turn_calls: Vec<(String, Value)> = Vec::new();
+
+        for (idx, call) in calls.into_iter().enumerate() {
+            let repeated = self
+                .last_turn_tool_calls
+                .iter()
+                .any(|prev| prev.0 == call.function_name && prev.1 == call.arguments)
+                || current_turn_calls
+                    .iter()
+                    .any(|prev| prev.0 == call.function_name && prev.1 == call.arguments);
+            if repeated {
+                warn!(
+                    "Blocked duplicate tool call: {} with args {:?}",
+                    call.function_name, call.arguments
+                );
+                results[idx] = Some((
+                    call.id,
+                    json!({
+                        "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+                    }),
+                ));
+            } else {
+                current_turn_calls.push((call.function_name.clone(), call.arguments.clone()));
+                to_run.push((idx, call));
+            }
+        }
+        if !current_turn_calls.is_empty() {
+            self.last_turn_tool_calls = current_turn_calls;
+        }
+
+        let futures = to_run.into_iter().map(|(idx, call)| {
+            let tools = tools.clone();
+            async move {
+                let res = match tools.call(&call.function_name, call.arguments).await {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e.to_string() }),
+                };
+                (idx, (call.id, res))
+            }
+        });
+        for (idx, res) in futures::future::join_all(futures).await {
+            results[idx] = Some(res);
+        }
+
+        Ok(results.into_iter().flatten().collect())
+    }
+
+    fn response_format(&self) -> Option<AiResponseFormat> {
+        Some(AiResponseFormat::Json { schema: None })
+    }
+
+    fn context_tag(&self) -> Option<String> {
+        self.context_tag.clone()
+    }
+
+    fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+        let text = response.content.as_deref().unwrap_or("");
+        let mut parsed: UpstreamFixVerdict = crate::workflow::output::parse_json_from_text(text)
+            .map_err(ValidationError::FormatViolation)?;
+
+        parsed.status = parsed.status.trim().to_lowercase();
+        if !matches!(
+            parsed.status.as_str(),
+            "fixed" | "still_present" | "uncertain"
+        ) {
+            return Err(ValidationError::FormatViolation(format!(
+                "status must be one of 'fixed', 'still_present', or 'uncertain', got '{}'",
+                parsed.status
+            )));
+        }
+
+        if parsed.explanation.trim().is_empty() {
+            return Err(ValidationError::FormatViolation(
+                "explanation must not be empty".to_string(),
+            ));
+        }
+
+        if parsed.status == "fixed" {
+            let sha = parsed
+                .fixing_commit_sha
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("");
+            if sha.len() < 7 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ValidationError::FormatViolation(
+                    "fixing_commit_sha must be a valid hexadecimal commit SHA (>= 7 chars) when status is 'fixed'"
+                        .to_string(),
+                ));
+            }
+            parsed.fixing_commit_sha = Some(sha.to_string());
+        } else {
+            parsed.fixing_commit_sha = None;
+        }
+
+        Ok(parsed)
+    }
+}
+
+/// Checks whether a single open bug has been fixed in Linus's tree at `linus_sha`.
+///
+/// Uses a three-tier pipeline:
+/// 1. Fast skip if `bug.verified_on_sha() == Some(linus_sha)`.
+/// 2. Deterministic zero-token git check (`find_candidate_fix_commits`): if no
+///    commits in `verified_on_sha..linus_sha` touched the bug's files or
+///    referenced its introducing commit, advances `verified_on_sha` to
+///    `linus_sha` without invoking the LLM.
+/// 3. Single-stage LLM verification (`VerifyUpstreamFixSession`) when candidate
+///    commits exist, guarded by deterministic git commit + ancestry verification.
+pub async fn check_bug_fixed_upstream(
+    provider: &dyn AiProvider,
+    repo_path: &std::path::Path,
+    db: &Database,
+    bug: &Bug,
+    linus_sha: &str,
+) -> Result<UpstreamFixCheckOutcome> {
+    let linus_sha = linus_sha.trim();
+    let Some(prev_sha) = bug.verified_on_sha() else {
+        db.touch_bug_fix_check_timestamp(bug.id).await?;
+        return Ok(UpstreamFixCheckOutcome::SkippedNotAncestor);
+    };
+    if prev_sha.trim() == linus_sha {
+        db.release_bug_lease(bug.id).await?;
+        return Ok(UpstreamFixCheckOutcome::SkippedAlreadyAtSha);
+    }
+
+    let files = extract_bug_files(bug);
+    let intro_sha = bug.introducing_commit_sha();
+    let locations = bug.locations();
+    let source_files = bug.source_files();
+
+    let Some(candidates) = find_candidate_fix_commits(
+        repo_path,
+        &prev_sha,
+        linus_sha,
+        &files,
+        intro_sha.as_deref(),
+    )
+    .await?
+    else {
+        db.touch_bug_fix_check_timestamp(bug.id).await?;
+        return Ok(UpstreamFixCheckOutcome::SkippedNotAncestor);
+    };
+
+    if candidates.is_empty() {
+        db.record_upstream_fix_check(
+            bug.id,
+            crate::db::UpstreamFixCheckParams {
+                verified_on_sha: linus_sha,
+                fixing_commit_sha: None,
+                explanation: None,
+                locations: locations.as_ref(),
+                source_files: source_files.as_deref(),
+                llm_checked: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(UpstreamFixCheckOutcome::AdvancedWithoutLlm {
+            verified_on_sha: linus_sha.to_string(),
+        });
+    }
+
+    let mut tb = ToolBox::new(repo_path.to_path_buf(), None);
+    tb.set_virtual_head(linus_sha.to_string());
+    let tools = Arc::new(tb);
+
+    let prefetched_commits = prefetch_candidate_fix_commits(repo_path, &candidates, &files).await;
+    let prefetched_code = prefetch_bug_locations(Some(&tools), linus_sha, &locations).await;
+
+    let mut session = VerifyUpstreamFixSession {
+        bug,
+        affected_files: &files,
+        previous_sha: &prev_sha,
+        linus_sha,
+        candidate_shas: &candidates,
+        prefetched_commits,
+        prefetched_code,
+        tools: Some(tools),
+        context_tag: Some("upstream_fix_check".to_string()),
+        last_turn_tool_calls: Vec::new(),
+    };
+
+    let runner = SessionRunner::new(provider).with_max_turns(8);
+    let session_result = runner.run(&mut session).await?;
+    let verdict = session_result.output;
+    let logs = serde_json::to_string(&session_result.history).ok();
+
+    let attributed_db = db.with_bug_actor(
+        "sashiko",
+        "sashiko:linux_bug:fix_check",
+        Some(provider.get_capabilities().model_name),
+    );
+
+    match verdict.status.as_str() {
+        "fixed" => {
+            let raw_fix_sha = verdict.fixing_commit_sha.as_deref().unwrap_or("");
+            let Some(verified_fix_sha) =
+                verify_commit_is_ancestor(repo_path, raw_fix_sha, linus_sha).await
+            else {
+                warn!(
+                    "Upstream fix check for bug #{} ({}) returned non-ancestor or invalid commit '{}'; keeping bug open",
+                    bug.id, bug.bugid, raw_fix_sha
+                );
+                attributed_db.touch_bug_fix_check_timestamp(bug.id).await?;
+                return Ok(UpstreamFixCheckOutcome::Uncertain {
+                    explanation: verdict.explanation,
+                });
+            };
+
+            attributed_db
+                .record_upstream_fix_check(
+                    bug.id,
+                    crate::db::UpstreamFixCheckParams {
+                        verified_on_sha: linus_sha,
+                        fixing_commit_sha: Some(&verified_fix_sha),
+                        explanation: Some(&verdict.explanation),
+                        locations: locations.as_ref(),
+                        source_files: source_files.as_deref(),
+                        llm_checked: true,
+                        logs: logs.as_deref(),
+                        tokens_in: Some(session_result.usage.prompt_tokens),
+                        tokens_out: Some(session_result.usage.completion_tokens),
+                        tokens_cached: session_result.usage.cached_tokens,
+                    },
+                )
+                .await?;
+
+            Ok(UpstreamFixCheckOutcome::FixedUpstream {
+                fixing_commit_sha: verified_fix_sha,
+                verified_on_sha: linus_sha.to_string(),
+                explanation: verdict.explanation,
+            })
+        }
+        "still_present" => {
+            attributed_db
+                .record_upstream_fix_check(
+                    bug.id,
+                    crate::db::UpstreamFixCheckParams {
+                        verified_on_sha: linus_sha,
+                        fixing_commit_sha: None,
+                        explanation: Some(&verdict.explanation),
+                        locations: locations.as_ref(),
+                        source_files: source_files.as_deref(),
+                        llm_checked: true,
+                        logs: logs.as_deref(),
+                        tokens_in: Some(session_result.usage.prompt_tokens),
+                        tokens_out: Some(session_result.usage.completion_tokens),
+                        tokens_cached: session_result.usage.cached_tokens,
+                    },
+                )
+                .await?;
+
+            Ok(UpstreamFixCheckOutcome::StillPresentAfterLlm {
+                verified_on_sha: linus_sha.to_string(),
+                explanation: verdict.explanation,
+            })
+        }
+        _ => {
+            attributed_db.touch_bug_fix_check_timestamp(bug.id).await?;
+            Ok(UpstreamFixCheckOutcome::Uncertain {
+                explanation: verdict.explanation,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3495,5 +4294,402 @@ F:	drivers/net/ethernet/intel/e1000/
                 "INTEL E1000 NETWORK DRIVER".to_string()
             ]
         );
+    }
+
+    struct NeverCalledAiProvider;
+
+    #[async_trait]
+    impl AiProvider for NeverCalledAiProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            panic!("LLM should not be called when zero commits touched the bug's files");
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "never-called".to_string(),
+                context_window_size: 8192,
+            }
+        }
+    }
+
+    fn init_test_git_repo(dir: &std::path::Path) -> String {
+        let run = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(dir).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-b", "master"]);
+        run(&["config", "user.name", "Test User"]);
+        run(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(dir.join("net/core")).unwrap();
+        std::fs::create_dir_all(dir.join("fs/ext4")).unwrap();
+        std::fs::write(
+            dir.join("net/core/dev.c"),
+            "int dev_open(void) {\n    char *buf = alloc();\n    return -EINVAL;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("fs/ext4/inode.c"),
+            "int ext4_iget(void) { return 0; }\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "Initial commit"]);
+        run(&["rev-parse", "HEAD"])
+    }
+
+    async fn create_open_bug_at_sha(db: &Database, sha: &str) -> i64 {
+        let id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "bug-upstream-check-1".to_string(),
+                title: "net: dev: memory leak in dev_open()".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Running,
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
+                assignee: None,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: Some(sha.to_string()),
+                source_ref: Some(sha.to_string()),
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![AttributedSubsystem::from_maintainers("NETWORKING")],
+            })
+            .await
+            .unwrap();
+
+        let locs = json!([{"file": "net/core/dev.c", "line": 3, "function_or_symbol": "dev_open"}]);
+        let files = vec!["net/core/dev.c".to_string()];
+        db.update_bug_outcome(
+            id,
+            crate::db::UpdateBugOutcomeParams {
+                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                problem: Some("net: dev: memory leak in dev_open()"),
+                source_files: Some(&files),
+                locations: Some(&locs),
+                severity: Severity::High,
+                severity_explanation: Some("Leaks buf on error return"),
+                inline_review: "dev_open() leaks buf when returning -EINVAL.",
+                verified_on_sha: Some(sha),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn test_upstream_fix_check_zero_token_advance_when_files_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let sha1 = init_test_git_repo(repo);
+
+        // Second commit only touches fs/ext4/inode.c, leaving net/core/dev.c untouched.
+        std::fs::write(
+            repo.join("fs/ext4/inode.c"),
+            "int ext4_iget(void) { return 1; }\n",
+        )
+        .unwrap();
+        crate::git_cmd::in_dir(repo)
+            .args(["commit", "-am", "ext4: update return value"])
+            .output()
+            .unwrap();
+        let sha2 = String::from_utf8_lossy(
+            &crate::git_cmd::in_dir(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_open_bug_at_sha(&db, &sha1).await;
+        let claimed = db
+            .claim_open_bug_for_fix_check(&sha2, "worker-1", 300)
+            .await
+            .unwrap()
+            .expect("open bug should be claimed for fix check");
+        // While worker-1 holds the lease, a second worker cannot claim the same bug.
+        assert!(
+            db.claim_open_bug_for_fix_check(&sha2, "worker-2", 300)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let outcome = check_bug_fixed_upstream(&NeverCalledAiProvider, repo, &db, &claimed, &sha2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpstreamFixCheckOutcome::AdvancedWithoutLlm {
+                verified_on_sha: sha2.clone()
+            }
+        );
+
+        let updated = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.lifecycle_status,
+            crate::db::BugLifecycleStatus::Open
+        );
+        assert_eq!(updated.verified_on_sha().as_deref(), Some(sha2.as_str()));
+        assert_eq!(
+            updated.source_files(),
+            Some(vec!["net/core/dev.c".to_string()])
+        );
+        // Updating the verification SHA in place avoids adding activity feed rows on 0-token sweeps.
+        let verification_count = updated
+            .enrichments
+            .iter()
+            .filter(|e| e.kind == "verification")
+            .count();
+        assert_eq!(verification_count, 1);
+        assert!(
+            db.claim_open_bug_for_fix_check(&sha2, "worker-1", 300)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_fix_check_marks_bug_fixed_when_llm_confirms_ancestor_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let sha1 = init_test_git_repo(repo);
+
+        // Second commit touches net/core/dev.c and fixes the leak.
+        std::fs::write(
+            repo.join("net/core/dev.c"),
+            "int dev_open(void) {\n    char *buf = alloc();\n    kfree(buf);\n    return -EINVAL;\n}\n",
+        )
+        .unwrap();
+        crate::git_cmd::in_dir(repo)
+            .args(["commit", "-am", "net: dev: free buf on error path"])
+            .output()
+            .unwrap();
+        let sha2 = String::from_utf8_lossy(
+            &crate::git_cmd::in_dir(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_open_bug_at_sha(&db, &sha1).await;
+        let bug = db.get_bug(bug_id).await.unwrap().unwrap();
+
+        let provider = MockAiProvider {
+            response_text: json!({
+                "status": "fixed",
+                "fixing_commit_sha": &sha2[..12],
+                "explanation": "Commit adds kfree(buf) before returning -EINVAL."
+            })
+            .to_string(),
+        };
+
+        let outcome = check_bug_fixed_upstream(&provider, repo, &db, &bug, &sha2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpstreamFixCheckOutcome::FixedUpstream {
+                fixing_commit_sha: sha2.clone(),
+                verified_on_sha: sha2.clone(),
+                explanation: "Commit adds kfree(buf) before returning -EINVAL.".to_string(),
+            }
+        );
+
+        let updated = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.lifecycle_status,
+            crate::db::BugLifecycleStatus::Fixed
+        );
+        assert!(updated.is_fixed());
+        assert_eq!(updated.fixed_in_commit().as_deref(), Some(sha2.as_str()));
+        assert_eq!(updated.verified_on_sha().as_deref(), Some(sha2.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_upstream_fix_check_rejects_non_ancestor_hallucinated_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let sha1 = init_test_git_repo(repo);
+
+        // Create a commit on an unmerged side branch, then return to master and make an unrelated change to dev.c.
+        crate::git_cmd::in_dir(repo)
+            .args(["checkout", "-b", "side-branch"])
+            .output()
+            .unwrap();
+        std::fs::write(
+            repo.join("net/core/dev.c"),
+            "int dev_open(void) { return 0; }\n",
+        )
+        .unwrap();
+        crate::git_cmd::in_dir(repo)
+            .args(["commit", "-am", "side branch fix"])
+            .output()
+            .unwrap();
+        let side_sha = String::from_utf8_lossy(
+            &crate::git_cmd::in_dir(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        crate::git_cmd::in_dir(repo)
+            .args(["checkout", "master"])
+            .output()
+            .unwrap();
+        std::fs::write(
+            repo.join("net/core/dev.c"),
+            "int dev_open(void) {\n    /* comment */\n    char *buf = alloc();\n    return -EINVAL;\n}\n",
+        )
+        .unwrap();
+        crate::git_cmd::in_dir(repo)
+            .args(["commit", "-am", "net: dev: add comment"])
+            .output()
+            .unwrap();
+        let master_sha2 = String::from_utf8_lossy(
+            &crate::git_cmd::in_dir(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_open_bug_at_sha(&db, &sha1).await;
+        let bug = db.get_bug(bug_id).await.unwrap().unwrap();
+
+        // LLM claims side_sha fixed the bug, which is NOT an ancestor of master_sha2.
+        let provider = MockAiProvider {
+            response_text: json!({
+                "status": "fixed",
+                "fixing_commit_sha": side_sha,
+                "explanation": "Fixed on side branch."
+            })
+            .to_string(),
+        };
+
+        let outcome = check_bug_fixed_upstream(&provider, repo, &db, &bug, &master_sha2)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, UpstreamFixCheckOutcome::Uncertain { .. }));
+
+        let updated = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.lifecycle_status,
+            crate::db::BugLifecycleStatus::Open
+        );
+        assert!(!updated.is_fixed());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_fix_check_still_present_when_commit_does_not_fix_bug() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let sha1 = init_test_git_repo(repo);
+
+        // Second commit modifies net/core/dev.c with an unrelated comment, leaving the leak intact.
+        std::fs::write(
+            repo.join("net/core/dev.c"),
+            "int dev_open(void) {\n    /* unrelated comment */\n    char *buf = alloc();\n    return -EINVAL;\n}\n",
+        )
+        .unwrap();
+        crate::git_cmd::in_dir(repo)
+            .args(["commit", "-am", "net: dev: document dev_open"])
+            .output()
+            .unwrap();
+        let sha2 = String::from_utf8_lossy(
+            &crate::git_cmd::in_dir(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_open_bug_at_sha(&db, &sha1).await;
+        let bug = db.get_bug(bug_id).await.unwrap().unwrap();
+
+        let provider = MockAiProvider {
+            response_text: json!({
+                "status": "still_present",
+                "fixing_commit_sha": null,
+                "explanation": "Commit only adds a comment; buf is still leaked on -EINVAL return."
+            })
+            .to_string(),
+        };
+
+        let outcome = check_bug_fixed_upstream(&provider, repo, &db, &bug, &sha2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpstreamFixCheckOutcome::StillPresentAfterLlm {
+                verified_on_sha: sha2.clone(),
+                explanation: "Commit only adds a comment; buf is still leaked on -EINVAL return."
+                    .to_string(),
+            }
+        );
+
+        let updated = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.lifecycle_status,
+            crate::db::BugLifecycleStatus::Open
+        );
+        assert!(!updated.is_fixed());
+        assert_eq!(updated.verified_on_sha().as_deref(), Some(sha2.as_str()));
     }
 }

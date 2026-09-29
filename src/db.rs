@@ -721,6 +721,30 @@ impl Bug {
         None
     }
 
+    pub fn introducing_commit_sha(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "origin_discovery" {
+                let candidate = e
+                    .data_json
+                    .as_ref()
+                    .and_then(|d| d.get("introducing_commit_sha"))
+                    .and_then(|v| v.as_str())
+                    .or(e.content.as_deref());
+                if let Some(raw) = candidate {
+                    let hex: String = raw
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .collect();
+                    if hex.len() >= 7 {
+                        return Some(hex);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn is_fixed(&self) -> bool {
         if self.lifecycle_status == BugLifecycleStatus::Fixed {
             return true;
@@ -1038,6 +1062,20 @@ pub struct MarkDuplicateBugParams<'a> {
     pub ephemeral_id: i64,
     pub canonical_id: i64,
     pub reasoning: &'a str,
+    pub logs: Option<&'a str>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct UpstreamFixCheckParams<'a> {
+    pub verified_on_sha: &'a str,
+    pub fixing_commit_sha: Option<&'a str>,
+    pub explanation: Option<&'a str>,
+    pub locations: Option<&'a serde_json::Value>,
+    pub source_files: Option<&'a [String]>,
+    pub llm_checked: bool,
     pub logs: Option<&'a str>,
     pub tokens_in: Option<usize>,
     pub tokens_out: Option<usize>,
@@ -1764,7 +1802,16 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 12", ()).await?;
         }
 
-        info!("Database schema is up to date at version 12.");
+        if current_version < 13 {
+            info!("Applying database migration version 13 (index bugs fix check)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/013_index_bugs_fix_check.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 13", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 13.");
 
         Ok(())
     }
@@ -3617,6 +3664,263 @@ impl Database {
         // Success and every outcome record become visible together at commit.
         self.set_bug_pipeline_state(id, BugPipelineState::Succeeded)
             .await?;
+        Ok(())
+    }
+
+    /// Atomically claims the oldest-updated open, canonical, triaged bug whose
+    /// `verified_on_sha` differs from `current_linus_sha` for an upstream fix
+    /// check, acquiring a temporary lease (`locked_by`, `lease_expires_at`) so
+    /// concurrent workers cannot run duplicate fix checks on the same bug.
+    pub async fn claim_open_bug_for_fix_check(
+        &self,
+        current_linus_sha: &str,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<Option<Bug>> {
+        if current_linus_sha.trim().is_empty() {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let ttl = lease_ttl_seconds.clamp(1, 86_400);
+        let id_opt: Option<i64> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "UPDATE bugs
+                        SET locked_by = ?1,
+                            lease_expires_at = ?2,
+                            updated_at = ?3
+                      WHERE id = (
+                          SELECT id FROM bugs
+                           WHERE lifecycle_status = 'open'
+                             AND pipeline_state = 'succeeded'
+                             AND duplicate_of_id IS NULL
+                             AND verified_on_sha IS NOT NULL
+                             AND verified_on_sha != ''
+                             AND verified_on_sha != ?4
+                             AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
+                           ORDER BY updated_at ASC, id ASC
+                           LIMIT 1
+                      )
+                      RETURNING id",
+                    libsql::params![
+                        worker_id,
+                        now.saturating_add(ttl),
+                        now,
+                        current_linus_sha.trim()
+                    ],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| row.get::<i64>(0))
+                .transpose()?
+        };
+        match id_opt {
+            Some(id) => self.get_bug(id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Bumps `updated_at` and sets a short cooldown lease on an open bug when
+    /// an upstream fix check could not advance `verified_on_sha` (for example,
+    /// when `verified_on_sha` is on an unmerged subsystem branch or the LLM
+    /// verdict is uncertain), preventing the bug from being re-claimed in the
+    /// same sweep or starving the rest of the periodic check queue.
+    pub async fn touch_bug_fix_check_timestamp(&self, id: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let owner = self.bug_claim.as_ref().map(|c| c.owner.as_str());
+        self.conn
+            .execute(
+                "UPDATE bugs
+                    SET updated_at = ?1,
+                        locked_by = NULL,
+                        lease_expires_at = ?2
+                  WHERE id = ?3
+                    AND lifecycle_status = 'open'
+                    AND (?4 IS NULL OR locked_by = ?4)",
+                libsql::params![now, now + 60, id, owner],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Persists the outcome of an upstream fix check for an open bug.
+    ///
+    /// Returns `Ok(false)` without writing enrichments if the bug is no longer
+    /// in the `open` lifecycle state, preserving concurrent human triage.
+    pub async fn record_upstream_fix_check(
+        &self,
+        id: i64,
+        params: UpstreamFixCheckParams<'_>,
+    ) -> Result<bool> {
+        let tx = self.conn.transaction().await?;
+        // In libsql, Transaction derefs to Connection and Connection::clone()
+        // clones an Arc to the same underlying sqlite3 connection handle where
+        // tx is active, so all queries in write_upstream_fix_check execute
+        // atomically inside tx.
+        let applied = self
+            .with_connection((*tx).clone())
+            .write_upstream_fix_check(id, params)
+            .await?;
+        if applied {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(applied)
+    }
+
+    async fn write_upstream_fix_check(
+        &self,
+        id: i64,
+        params: UpstreamFixCheckParams<'_>,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let owner = self.bug_claim.as_ref().map(|c| c.owner.as_str());
+        if let Some(fix_sha) = params.fixing_commit_sha {
+            let updated = self
+                .conn
+                .execute(
+                    "UPDATE bugs
+                        SET lifecycle_status = 'fixed',
+                            verified_on_sha = ?1,
+                            updated_at = ?2,
+                            locked_by = NULL,
+                            lease_expires_at = NULL,
+                            audit_author = ?3,
+                            audit_tool = ?4,
+                            audit_model = ?5
+                      WHERE id = ?6
+                        AND lifecycle_status = 'open'
+                        AND (?7 IS NULL OR locked_by = ?7)",
+                    libsql::params![
+                        params.verified_on_sha,
+                        now,
+                        self.bug_actor.as_str(),
+                        self.bug_tool.as_str(),
+                        self.bug_model.clone(),
+                        id,
+                        owner,
+                    ],
+                )
+                .await?;
+            if updated == 0 {
+                return Ok(false);
+            }
+            self.advance_latest_verification_sha(id, now, &params)
+                .await?;
+            self.insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "fix_candidate".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: params.explanation.map(str::to_string),
+                    data_json: Some(serde_json::json!({
+                        "status": "merged",
+                        "commit_sha": fix_sha,
+                        "verified_on_sha": params.verified_on_sha,
+                        "explanation": params.explanation,
+                    })),
+                    tokens_in: params.tokens_in,
+                    tokens_out: params.tokens_out,
+                    tokens_cached: params.tokens_cached,
+                    logs: params.logs.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE bugs
+                    SET verified_on_sha = ?1,
+                        updated_at = ?2,
+                        locked_by = NULL,
+                        lease_expires_at = NULL
+                  WHERE id = ?3
+                    AND lifecycle_status = 'open'
+                    AND (?4 IS NULL OR locked_by = ?4)",
+                libsql::params![params.verified_on_sha, now, id, owner],
+            )
+            .await?;
+        if updated == 0 {
+            return Ok(false);
+        }
+
+        if params.llm_checked {
+            self.insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "verification".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: params.explanation.map(str::to_string),
+                    data_json: Some(serde_json::json!({
+                        "verified_on_sha": params.verified_on_sha,
+                        "is_valid": true,
+                        "locations": params.locations,
+                        "source_files": params.source_files,
+                        "check_type": "upstream_fix_check",
+                    })),
+                    tokens_in: params.tokens_in,
+                    tokens_out: params.tokens_out,
+                    tokens_cached: params.tokens_cached,
+                    logs: params.logs.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        } else {
+            self.advance_latest_verification_sha(id, now, &params)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn advance_latest_verification_sha(
+        &self,
+        id: i64,
+        now: i64,
+        params: &UpstreamFixCheckParams<'_>,
+    ) -> Result<()> {
+        let updated_enrichment = self
+            .conn
+            .execute(
+                "UPDATE bug_enrichments
+                    SET data_json = json_set(COALESCE(data_json, '{}'), '$.verified_on_sha', ?1)
+                  WHERE id = (
+                        SELECT id FROM bug_enrichments
+                         WHERE bug_id = ?2 AND kind = 'verification'
+                         ORDER BY created_at DESC, id DESC
+                         LIMIT 1
+                  )",
+                libsql::params![params.verified_on_sha, id],
+            )
+            .await?;
+        if updated_enrichment == 0 {
+            self.insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "verification".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: Some("Verified against upstream mainline".to_string()),
+                    data_json: Some(serde_json::json!({
+                        "verified_on_sha": params.verified_on_sha,
+                        "is_valid": true,
+                        "locations": params.locations,
+                        "source_files": params.source_files,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
         Ok(())
     }
 

@@ -1012,7 +1012,8 @@ async fn run_daemon(
             db.clone(),
             provider,
             settings.git.repository_path.clone(),
-        );
+        )
+        .with_settings(settings.linux_bug.clone());
         Some(tokio::spawn(async move {
             bug_worker.run().await;
         }))
