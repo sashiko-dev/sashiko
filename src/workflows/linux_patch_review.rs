@@ -52,6 +52,8 @@ pub struct LinuxPatchReviewState {
     pub custom_prompt: Option<String>,
     /// Stages selected by dynamic planning (or overridden by manual_stages).
     pub planned_stages: Vec<String>,
+    /// Skip plain-text report and summary generation stages (e.g. in `--agent` mode).
+    pub skip_report: bool,
 
     /// Aggregated raw concerns collected from the analysis stages.
     pub all_concerns: Vec<Value>,
@@ -1162,6 +1164,7 @@ Return raw text output, not JSON."#
             },
             ..Default::default()
         })
+        .skip_if(|s| s.skip_report)
         .reduce(|state, out: String| {
             state.review_inline = out;
         })

@@ -50,6 +50,7 @@ pub struct WorkerOptions {
     pub stages: Option<Vec<String>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
+    pub agent: bool,
 }
 
 impl Default for WorkerOptions {
@@ -70,6 +71,7 @@ impl Default for WorkerOptions {
             stages: None,
             scratch_clone: false,
             current_tree: false,
+            agent: false,
         }
     }
 }
@@ -84,6 +86,7 @@ pub struct ReviewOptions {
     pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
     pub stages: Option<Vec<String>>,
+    pub agent: bool,
 }
 
 impl Default for ReviewOptions {
@@ -97,6 +100,7 @@ impl Default for ReviewOptions {
             ai_provider: None,
             custom_prompt: None,
             stages: None,
+            agent: false,
         }
     }
 }
@@ -273,6 +277,7 @@ pub async fn run_git_review(
             custom_prompt: options.custom_prompt,
             stages: options.stages,
             current_tree: true,
+            agent: options.agent,
             ..WorkerOptions::default()
         },
         Some(repo_path),
@@ -622,6 +627,7 @@ async fn review_single_patch(
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
+                skip_report: options.agent,
             },
         );
 
@@ -689,12 +695,16 @@ async fn review_single_patch(
             .await
         {
             Ok(result) => {
-                let inline_content = match extract_inline_review(p.index, result.output.as_ref()) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        error!("{}", e);
-                        last_error = Some(e);
-                        continue;
+                let inline_content = if options.agent {
+                    None
+                } else {
+                    match extract_inline_review(p.index, result.output.as_ref()) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            error!("{}", e);
+                            last_error = Some(e);
+                            continue;
+                        }
                     }
                 };
 
@@ -1142,7 +1152,13 @@ async fn run_worker_in_worktree(
         "baseline": baseline_arg,
         "patches": patch_results,
         "review": review_output,
-        "inline_review": if combined_inline.is_empty() && review_errors.is_empty() { "No issues found.".to_string() } else { combined_inline },
+        "inline_review": if options.agent {
+            String::new()
+        } else if combined_inline.is_empty() && review_errors.is_empty() {
+            "No issues found.".to_string()
+        } else {
+            combined_inline
+        },
         "history": combined_history,
         "input_context": combined_input_context,
         "tokens_in": total_tokens_in,
@@ -1256,6 +1272,56 @@ pub fn result_has_high_or_critical_findings(result: &Value) -> bool {
             .to_ascii_lowercase();
         is_new && matches!(severity.as_str(), "critical" | "high")
     })
+}
+
+/// Formats a local review result as a concise, machine-friendly JSON payload for
+/// `--agent` mode, omitting internal LLM conversation history, raw prompt context,
+/// dismissed concerns, and human-formatted inline reports.
+pub fn format_agent_review_output(result: &Value) -> Value {
+    let findings = result
+        .get("review")
+        .and_then(|r| r.get("findings"))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let concerns = result
+        .get("review")
+        .and_then(|r| r.get("concerns"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let status = if result_has_error(result) {
+        "error"
+    } else if !findings.is_empty() {
+        "issues_found"
+    } else {
+        "clean"
+    };
+
+    let mut out = json!({
+        "status": status,
+        "baseline": result.get("baseline").cloned().unwrap_or(Value::Null),
+        "patches": result.get("patches").cloned().unwrap_or_else(|| json!([])),
+        "findings": findings,
+        "concerns": concerns,
+        "tokens_in": result.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
+        "tokens_out": result.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
+        "tokens_cached": result.get("tokens_cached").and_then(|v| v.as_u64()).unwrap_or(0),
+    });
+
+    if let Some(obj) = out.as_object_mut() {
+        if let Some(partial) = result.get("partial") {
+            obj.insert("partial".into(), partial.clone());
+        }
+        if let Some(err) = result.get("error")
+            && !err.is_null()
+        {
+            obj.insert("error".into(), err.clone());
+        }
+    }
+
+    out
 }
 
 async fn apply_single_patch(
@@ -2142,5 +2208,80 @@ mod tests {
         );
         assert!(progress_line(ProgressEvent::PatchApplied { index: 1 }).is_none());
         assert!(PROGRESS_LINE_PREFIX.ends_with(' '));
+    }
+
+    #[test]
+    fn test_format_agent_review_output_clean_and_issues_and_error() {
+        let clean = json!({
+            "patchset_id": 0,
+            "baseline": "abc1234",
+            "patches": [{"index": 1, "status": "applied", "sha": "def5678", "subject": "feat: x"}],
+            "review": {
+                "summary": "",
+                "findings": [],
+                "concerns": [{"type": "Note", "description": "pre-existing", "preexisting": true}],
+                "dismissed_concerns": [{"type": "Noise"}],
+            },
+            "inline_review": "",
+            "history": [{"role": "user", "content": "huge prompt"}],
+            "input_context": "Multi-stage execution completed",
+            "tokens_in": 1200,
+            "tokens_out": 300,
+            "tokens_cached": 800
+        });
+        let formatted_clean = format_agent_review_output(&clean);
+        assert_eq!(formatted_clean["status"], "clean");
+        assert_eq!(formatted_clean["baseline"], "abc1234");
+        assert_eq!(formatted_clean["findings"], json!([]));
+        assert_eq!(formatted_clean["concerns"].as_array().unwrap().len(), 1);
+        assert_eq!(formatted_clean["tokens_in"], 1200);
+        assert_eq!(formatted_clean["tokens_out"], 300);
+        assert_eq!(formatted_clean["tokens_cached"], 800);
+        assert!(formatted_clean.get("history").is_none());
+        assert!(formatted_clean.get("input_context").is_none());
+        assert!(formatted_clean.get("inline_review").is_none());
+        assert!(formatted_clean.get("dismissed_concerns").is_none());
+        assert!(formatted_clean.get("error").is_none());
+
+        let issues = json!({
+            "baseline": "abc1234",
+            "patches": [{"index": 1, "status": "applied", "sha": "def5678"}],
+            "review": {
+                "findings": [{
+                    "severity": "High",
+                    "problem": "missing bounds check",
+                    "severity_explanation": "panics on empty slice",
+                    "locations": [{"file": "src/lib.rs", "line": 42}],
+                    "patch_index": 1,
+                    "patch_subject": "feat: x"
+                }],
+                "concerns": []
+            },
+            "tokens_in": 100,
+            "tokens_out": 50,
+            "tokens_cached": 0
+        });
+        let formatted_issues = format_agent_review_output(&issues);
+        assert_eq!(formatted_issues["status"], "issues_found");
+        assert_eq!(formatted_issues["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            formatted_issues["findings"][0]["problem"],
+            "missing bounds check"
+        );
+
+        let errored = json!({
+            "baseline": "abc1234",
+            "patches": [{"index": 1, "status": "applied", "review_status": "incomplete"}],
+            "review": {"findings": [], "concerns": []},
+            "partial": true,
+            "error": "patch 1: timed out",
+            "tokens_in": 50,
+            "tokens_out": 10,
+            "tokens_cached": 0
+        });
+        let formatted_err = format_agent_review_output(&errored);
+        assert_eq!(formatted_err["status"], "error");
+        assert_eq!(formatted_err["partial"], true);
+        assert_eq!(formatted_err["error"], "patch 1: timed out");
     }
 }

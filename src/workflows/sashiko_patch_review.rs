@@ -1025,7 +1025,7 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             },
             ..Default::default()
         })
-        .skip_if(|s| s.findings.is_empty())
+        .skip_if(|s| s.skip_report || s.findings.is_empty())
         .reduce(|state, out: String| {
             state.review_inline = format_sashiko_inline_findings(&out);
         })
@@ -1056,6 +1056,7 @@ pub fn summary_stage(
             },
             ..Default::default()
         })
+        .skip_if(|s| s.skip_report)
         .reduce(|state, out: String| {
             state.summary = out.trim().to_string();
         })

@@ -98,6 +98,7 @@ pub struct WorkerConfig {
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
     pub stages: Option<Vec<String>>,
+    pub skip_report: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +179,7 @@ pub struct Worker {
     context_tag: Option<String>,
     stages: Option<Vec<String>>,
     custom_prompt: Option<String>,
+    skip_report: bool,
 }
 
 impl Worker {
@@ -200,6 +202,7 @@ impl Worker {
             context_tag: None,
             stages: config.stages,
             custom_prompt: config.custom_prompt,
+            skip_report: config.skip_report,
         }
     }
 
@@ -345,6 +348,7 @@ impl Worker {
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
             planned_stages: Vec::new(),
+            skip_report: self.skip_report,
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
             deduplicated_concerns: Vec::new(),
@@ -391,6 +395,7 @@ impl Worker {
         };
 
         let project = self.project;
+        let skip_report = self.skip_report;
         let event_cb = move |event: WorkflowEvent| {
             if let Some(progress_cb) = progress {
                 match event {
@@ -406,12 +411,12 @@ impl Worker {
                         }
                     }
                     WorkflowEvent::ParallelResolved { stage_names } => {
-                        progress_cb(WorkerProgressEvent::ReviewStarted {
-                            planned_stages: crate::workflows::planned_stages_from(
-                                project,
-                                &stage_names,
-                            ),
-                        });
+                        let mut planned_stages =
+                            crate::workflows::planned_stages_from(project, &stage_names);
+                        if skip_report {
+                            planned_stages.retain(|s| s != "report" && s != "summary");
+                        }
+                        progress_cb(WorkerProgressEvent::ReviewStarted { planned_stages });
                     }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
                         if crate::workflows::is_counted_stage(project, stage_name) {
@@ -447,7 +452,7 @@ impl Worker {
         };
         let dismissed_concerns_count = dismissed_concerns.len();
 
-        let review_inline = if state.review_inline.is_empty() {
+        let review_inline = if state.review_inline.is_empty() && !self.skip_report {
             "No issues found.".to_string()
         } else {
             state.review_inline
@@ -1136,6 +1141,7 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: None,
+            skip_report: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1283,6 +1289,7 @@ mod tests {
             baseline_sha: None,
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            skip_report: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1318,6 +1325,7 @@ mod tests {
             baseline_sha: Some("explicit_baseline_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            skip_report: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1357,6 +1365,7 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            skip_report: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1455,6 +1464,7 @@ mod tests {
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
+            skip_report: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1548,5 +1558,103 @@ mod tests {
         assert!(ctx_last.contains("- [Patch 1 of 3] (commit sha1): auth: add max_bug_access"));
         assert!(ctx_last.contains("- [Patch 2 of 3] (commit sha2): api: enforce max_bug_access"));
         assert!(!ctx_last.contains("Subsequent patches in this series:"));
+    }
+
+    #[tokio::test]
+    async fn test_skip_report_skips_report_and_summary_stages() {
+        struct MockFindingWithoutReportProvider;
+
+        #[async_trait::async_trait]
+        impl crate::ai::AiProvider for MockFindingWithoutReportProvider {
+            async fn generate_content(
+                &self,
+                request: crate::ai::AiRequest,
+            ) -> anyhow::Result<crate::ai::AiResponse> {
+                let last_user = request
+                    .messages
+                    .iter()
+                    .rfind(|m| m.role == crate::ai::AiRole::User)
+                    .and_then(|m| m.content.as_deref())
+                    .unwrap_or_default();
+
+                if last_user.contains("Return raw text output, not JSON.")
+                    || last_user.contains("# Generate plain-text inline review report")
+                    || last_user.contains("# Summarize the proposed change")
+                {
+                    anyhow::bail!("report or summary stage should have been skipped");
+                }
+
+                let content = if last_user.contains("# Analyze commit main goal")
+                    || last_user.contains("# Deduplication and Consolidation")
+                    || last_user.contains("# Deduplicate concerns and dismissed concerns")
+                {
+                    r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
+                } else if last_user.contains("# Concern/dismissed-concern conflict resolution")
+                    || last_user
+                        .contains("# Resolve conflicts between concerns and dismissed concerns")
+                {
+                    r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
+                } else if last_user.contains("# Verification and severity estimation")
+                    || last_user.contains("# Verify remaining concerns and calibrate severity")
+                {
+                    r#"{"findings": [{"problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}]}"#
+                } else {
+                    r#"{"concerns": [], "dismissed_concerns": []}"#
+                };
+
+                Ok(crate::ai::AiResponse {
+                    content: Some(content.to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        for project in [ProjectId::Linux, ProjectId::Sashiko] {
+            let provider = std::sync::Arc::new(MockFindingWithoutReportProvider);
+            let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+            let prompts = PromptRegistry::new(prompts_dir.clone());
+            let config = WorkerConfig {
+                project,
+                max_input_tokens: 10000,
+                max_interactions: 3,
+                temperature: 0.0,
+                series_range: None,
+                baseline_sha: Some("base_sha".to_string()),
+                custom_prompt: None,
+                stages: Some(vec!["goal".to_string()]),
+                skip_report: true,
+            };
+            let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+
+            let patchset = serde_json::json!({
+                "id": 1,
+                "patch_index": 1,
+                "patches": [{"index": 1, "diff": "diff --git a/foo.c b/foo.c\n+int x;", "commit_id": "sha1"}]
+            });
+
+            let res = worker
+                .run(patchset, None)
+                .await
+                .expect("worker should succeed");
+            let output = res.output.expect("worker output");
+            assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+            assert_eq!(output["review_inline"], "");
+            assert_eq!(output["summary"], "");
+        }
     }
 }

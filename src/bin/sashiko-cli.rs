@@ -215,6 +215,10 @@ enum Commands {
         /// Pause on failure, wait for agent/user to fix code, and re-run automatically
         #[arg(long)]
         interactive: bool,
+
+        /// Output concise machine-friendly JSON for AI agents and skip plain-text report generation
+        #[arg(long)]
+        agent: bool,
     },
     /// Query and triage bugs in the Sashiko bug repository
     Bugs {
@@ -499,6 +503,7 @@ async fn run_command(
             custom_prompt,
             force_local,
             interactive,
+            agent,
         } => {
             handle_local(
                 client,
@@ -510,6 +515,7 @@ async fn run_command(
                 custom_prompt,
                 force_local,
                 interactive,
+                agent,
                 format,
             )
             .await
@@ -1835,6 +1841,7 @@ async fn handle_local(
     custom_prompt: Option<String>,
     force_local: bool,
     interactive: bool,
+    agent: bool,
     format: OutputFormat,
 ) -> Result<()> {
     // Determine repository path
@@ -1851,8 +1858,11 @@ async fn handle_local(
         cwd
     };
 
-    // Check if server is running (unless --force-local)
-    if !force_local && let Ok(settings) = Settings::new() {
+    // Check if server is running (unless --force-local or --agent)
+    if !force_local
+        && !agent
+        && let Ok(settings) = Settings::new()
+    {
         let addr = format!("{}:{}", settings.server.host, settings.server.port);
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
             // Server is running — submit via API
@@ -1974,6 +1984,9 @@ async fn handle_local(
 
         if no_ai {
             args.push("--no-ai".to_string());
+        }
+        if agent {
+            args.push("--agent".to_string());
         }
         if let Some(prompt) = &dynamic_prompt {
             args.push("--custom-prompt".to_string());
@@ -2112,12 +2125,21 @@ async fn handle_local(
             }
         };
 
-        match format {
-            OutputFormat::Json => {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            }
-            OutputFormat::Text => {
-                print_local_review_results(&result, &input);
+        if agent {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sashiko::local_review::format_agent_review_output(
+                    &result
+                ))?
+            );
+        } else {
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                OutputFormat::Text => {
+                    print_local_review_results(&result, &input);
+                }
             }
         }
 
@@ -2142,7 +2164,7 @@ async fn handle_local(
             }
         }
 
-        if interactive && (has_error || has_issues) {
+        if interactive && !agent && (has_error || has_issues) {
             println!(
                 "\nIssues found. Please modify the code, or type a rebuttal here, then press Enter to re-run the review... (or Ctrl+C to exit)"
             );
@@ -2596,6 +2618,17 @@ mod tests {
             Commands::Token {
                 action: TokenCommands::Create { days: 14, .. }
             }
+        ));
+
+        let local_cmd = Cli::try_parse_from(["sashiko-cli", "local", "HEAD~1..HEAD", "--agent"])
+            .expect("local --agent should parse");
+        assert!(matches!(
+            local_cmd.command,
+            Commands::Local {
+                ref input,
+                agent: true,
+                ..
+            } if input == "HEAD~1..HEAD"
         ));
     }
 }

@@ -17,8 +17,8 @@ use sashiko::db::Database;
 use sashiko::events::{Event, MessageSource, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
-    ProgressEvent, ReviewOptions, WorkerOptions, print_worker_json, result_has_error,
-    result_has_high_or_critical_findings, run_git_review, run_worker_from_stdin,
+    ProgressEvent, ReviewOptions, WorkerOptions, format_agent_review_output, print_worker_json,
+    result_has_error, result_has_high_or_critical_findings, run_git_review, run_worker_from_stdin,
 };
 use sashiko::project::ProjectId;
 use sashiko::prompt_bundle;
@@ -138,6 +138,10 @@ enum Commands {
         #[arg(long, default_value = "text")]
         format: OutputFormat,
 
+        /// Output concise machine-friendly JSON for AI agents and skip plain-text report generation
+        #[arg(long)]
+        agent: bool,
+
         /// When to use color
         #[arg(long, default_value = "auto")]
         color: ColorMode,
@@ -197,6 +201,10 @@ enum Commands {
         /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<String>>,
+
+        /// Agent mode: skip plain-text report generation
+        #[arg(long, hide = true)]
+        agent: bool,
     },
 }
 
@@ -299,6 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ai_provider,
                 prompts,
                 format,
+                agent,
                 color,
                 stages,
             } => {
@@ -312,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ai_provider.clone(),
                     resolve_prompts_path(prompts.clone(), project)?,
                     *format,
+                    *agent,
                     *color,
                     stages.clone(),
                 )
@@ -330,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ai_provider,
                 custom_prompt,
                 stages,
+                agent,
             } => {
                 std::panic::set_hook(Box::new(|info| {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
@@ -351,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages: stages.clone(),
                     scratch_clone: false,
                     current_tree: false,
+                    agent: *agent,
                 })
                 .await;
 
@@ -2002,6 +2014,7 @@ async fn handle_review_command(
     ai_provider: Option<String>,
     prompts: PathBuf,
     format: OutputFormat,
+    agent: bool,
     color: ColorMode,
     stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2030,7 +2043,7 @@ async fn handle_review_command(
         eprintln!(
             " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
         );
-        if std::io::stdin().is_terminal() {
+        if !agent && std::io::stdin().is_terminal() {
             eprint!("Do you want to proceed? [y/N]: ");
             std::io::stderr().flush()?;
             let mut input = String::new();
@@ -2224,6 +2237,7 @@ async fn handle_review_command(
             ai_provider,
             custom_prompt,
             stages,
+            agent,
         },
         Some(&progress),
     )
@@ -2244,12 +2258,19 @@ async fn handle_review_command(
     finish_progress(&mut progress_state.lock().unwrap());
     let result = result?;
 
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        OutputFormat::Text => {
-            print_review_result(&result, &input, report.color)?;
+    if agent {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&format_agent_review_output(&result))?
+        );
+    } else {
+        match format {
+            OutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            OutputFormat::Text => {
+                print_review_result(&result, &input, report.color)?;
+            }
         }
     }
 
@@ -4133,8 +4154,9 @@ mod tests {
         let args = vec!["sashiko", "review"];
         let cli = Cli::parse_from(args);
         match cli.command {
-            Some(Commands::Review { input, .. }) => {
+            Some(Commands::Review { input, agent, .. }) => {
                 assert_eq!(input, "HEAD");
+                assert!(!agent);
             }
             _ => panic!("expected review command"),
         }
@@ -4148,6 +4170,7 @@ mod tests {
             "--no-ai",
             "--format",
             "json",
+            "--agent",
             "--color",
             "never",
         ];
@@ -4159,6 +4182,7 @@ mod tests {
                 settings,
                 no_ai,
                 format,
+                agent,
                 color,
                 ..
             }) => {
@@ -4167,6 +4191,7 @@ mod tests {
                 assert!(settings.is_none());
                 assert!(no_ai);
                 assert!(matches!(format, OutputFormat::Json));
+                assert!(agent);
                 assert!(matches!(color, ColorMode::Never));
             }
             _ => panic!("expected review command"),
@@ -4183,6 +4208,7 @@ mod tests {
             "--review-patch-index",
             "2",
             "--no-ai",
+            "--agent",
         ];
         let cli = Cli::parse_from(args);
         match cli.command {
@@ -4190,11 +4216,13 @@ mod tests {
                 baseline,
                 review_patch_index,
                 no_ai,
+                agent,
                 ..
             }) => {
                 assert_eq!(baseline.as_deref(), Some("HEAD~1"));
                 assert_eq!(review_patch_index, Some(2));
                 assert!(no_ai);
+                assert!(agent);
             }
             _ => panic!("expected worker command"),
         }
