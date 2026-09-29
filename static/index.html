@@ -64,6 +64,11 @@
             --sev-medium: #FF9800;
             --sev-low: #FBC02D;
             --sev-unknown: #6e7681;
+
+            --bugs-btn-border: #8c6dd0;
+            --bugs-btn-border-hover: #6f42c1;
+            --bugs-btn-glow: rgba(111, 66, 193, 0.1);
+            --bugs-btn-glow-hover: rgba(111, 66, 193, 0.22);
         }
 
         @media (prefers-color-scheme: dark) {
@@ -116,6 +121,11 @@
                 --sev-medium: #ffc260;
                 --sev-low: #ffea7f;
                 --sev-unknown: #8b949e;
+
+                --bugs-btn-border: #6e5494;
+                --bugs-btn-border-hover: #bc8cff;
+                --bugs-btn-glow: rgba(188, 140, 255, 0.12);
+                --bugs-btn-glow-hover: rgba(188, 140, 255, 0.25);
             }
         }
 
@@ -133,6 +143,11 @@
             --sev-medium: #787221;       /* Dark Yellow/Olive */
             --sev-low: #336C8B;          /* Dark Sky Blue */
             --sev-unknown: #6e7681;
+
+            --bugs-btn-border: #336C8B;
+            --bugs-btn-border-hover: #004D73;
+            --bugs-btn-glow: rgba(51, 108, 139, 0.12);
+            --bugs-btn-glow-hover: rgba(51, 108, 139, 0.24);
         }
 
         /* Dark Theme (System Preference): Uses standard Okabe-Ito colors */
@@ -149,6 +164,11 @@
                 --sev-medium: #F0E442;       /* Yellow */
                 --sev-low: #56B4E9;          /* Sky Blue */
                 --sev-unknown: #8b949e;
+
+                --bugs-btn-border: #56B4E9;
+                --bugs-btn-border-hover: #79c0ff;
+                --bugs-btn-glow: rgba(86, 180, 233, 0.12);
+                --bugs-btn-glow-hover: rgba(86, 180, 233, 0.25);
             }
         }
 
@@ -165,6 +185,11 @@
             --sev-medium: #787221;
             --sev-low: #336C8B;
             --sev-unknown: #6e7681;
+
+            --bugs-btn-border: #336C8B;
+            --bugs-btn-border-hover: #004D73;
+            --bugs-btn-glow: rgba(51, 108, 139, 0.12);
+            --bugs-btn-glow-hover: rgba(51, 108, 139, 0.24);
         }
 
         /* Explicit Dark Theme: Overrides system light preference */
@@ -180,6 +205,11 @@
             --sev-medium: #F0E442;
             --sev-low: #56B4E9;
             --sev-unknown: #8b949e;
+
+            --bugs-btn-border: #56B4E9;
+            --bugs-btn-border-hover: #79c0ff;
+            --bugs-btn-glow: rgba(86, 180, 233, 0.12);
+            --bugs-btn-glow-hover: rgba(86, 180, 233, 0.25);
         }
 
         /* Explicit Theme Overrides */
@@ -230,6 +260,10 @@
             --sev-medium: #FF9800;
             --sev-low: #FBC02D;
             --sev-unknown: #6e7681;
+            --bugs-btn-border: #8c6dd0;
+            --bugs-btn-border-hover: #6f42c1;
+            --bugs-btn-glow: rgba(111, 66, 193, 0.1);
+            --bugs-btn-glow-hover: rgba(111, 66, 193, 0.22);
         }
 
         body.theme-dark {
@@ -279,6 +313,10 @@
             --sev-medium: #ffc260;
             --sev-low: #ffea7f;
             --sev-unknown: #8b949e;
+            --bugs-btn-border: #6e5494;
+            --bugs-btn-border-hover: #bc8cff;
+            --bugs-btn-glow: rgba(188, 140, 255, 0.12);
+            --bugs-btn-glow-hover: rgba(188, 140, 255, 0.25);
         }
 
 
@@ -396,6 +434,78 @@
         .controls button.active {
             background: var(--selected);
             font-weight: bold;
+        }
+
+        /* Bugs Button Highlight & Popup Hint */
+        #btn-bugs {
+            position: relative;
+            border-color: var(--bugs-btn-border);
+            box-shadow: 0 0 0 1px var(--bugs-btn-glow);
+            transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+        }
+
+        #btn-bugs:hover,
+        #btn-bugs:focus-visible,
+        #btn-bugs.active {
+            border-color: var(--bugs-btn-border-hover);
+            box-shadow: 0 0 0 2px var(--bugs-btn-glow-hover);
+        }
+
+        #btn-bugs[data-hint]::after {
+            content: attr(data-hint);
+            position: absolute;
+            top: calc(100% + 8px);
+            right: 0;
+            width: max-content;
+            max-width: 260px;
+            padding: 6px 10px;
+            background: var(--card-bg);
+            color: var(--text);
+            border: 1px solid var(--bugs-btn-border);
+            border-radius: 4px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+            font-size: 11.5px;
+            font-weight: normal;
+            line-height: 1.35;
+            white-space: normal;
+            text-align: left;
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-3px);
+            transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s ease;
+            pointer-events: none;
+        }
+
+        #btn-bugs[data-hint]::before {
+            content: "";
+            position: absolute;
+            top: calc(100% + 3px);
+            right: 16px;
+            width: 8px;
+            height: 8px;
+            background: var(--card-bg);
+            border-top: 1px solid var(--bugs-btn-border);
+            border-left: 1px solid var(--bugs-btn-border);
+            transform: rotate(45deg);
+            z-index: 1001;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.15s ease, visibility 0.15s ease;
+            pointer-events: none;
+        }
+
+        #btn-bugs[data-hint]:hover::after,
+        #btn-bugs[data-hint]:focus-visible::after {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+
+        #btn-bugs[data-hint]:hover::before,
+        #btn-bugs[data-hint]:focus-visible::before {
+            opacity: 1;
+            visibility: visible;
         }
 
         /* Subsystem Multi-select Dropdown */
@@ -2724,7 +2834,7 @@
                     <div style="display: flex; gap: 8px; margin-left: auto;">
                         <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
                         <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
-                        <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}">Bugs</button>
+                        <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}" data-hint="Pre-existing bugs discovered during review (available to maintainers)" aria-label="Bugs — Pre-existing bugs discovered during review (available to maintainers)">Bugs</button>
                     </div>
                 </div>
                 <table id="dataTable">
