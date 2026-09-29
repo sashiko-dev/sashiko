@@ -81,3 +81,10 @@ a durable queue polled by background workers (`lock_pending_email`,
    letter ordering, and singleton root protection?
 4. **Positional Row Indexing**: When changing `SELECT` column lists, are all
    `row.get::<T>(idx)` positional indices updated to match?
+5. **`libsql` Transaction Handle Sharing (`with_connection((*tx).clone())`)**:
+   In `libsql`, `Transaction` implements `Deref<Target = Connection>`, and
+   `Connection::clone()` is an `Arc<dyn Conn>` clone of the *exact same*
+   underlying SQLite connection handle where `BEGIN` is active. Therefore,
+   `self.with_connection((*tx).clone())` executes all queries inside `tx` and
+   participates in `tx.commit()` / `tx.rollback()`; do NOT flag it as spawning a
+   separate connection outside the transaction.
