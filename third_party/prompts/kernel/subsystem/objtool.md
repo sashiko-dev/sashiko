@@ -48,6 +48,24 @@ both `-mno-check-zero-division` and `-fno-isolate-erroneous-paths-dereference`
 to prevent GCC from generating `break` instructions that would be
 misinterpreted by objtool.
 
+## Process Lifecycle, Memory Management, and Threading
+
+`objtool` is a short-lived single-invocation CLI build tool that runs on an
+object file and exits, relying on the OS to reclaim memory on process exit.
+
+**Do NOT report (false positives):**
+- Memory leaks on OOM or error-exit paths (such as `decode_ranges =
+  realloc(decode_ranges, size)` overwriting the old pointer when `realloc`
+  returns `NULL`, early error returns in `decode_file()` / `check()` skipping
+  `free()`, or un-freed `insn_chunk` / hash allocations at exit).
+- Cleanup-path bugs (such as `free_insns()` dereferencing a NULL hash table)
+  that are only reachable if a startup heap allocation (`calloc`/`malloc`)
+  fails under OOM.
+- Concurrent writes to a plain `bool` status flag (such as `elf->changed` or
+  `sec->_changed`) during parallel worker passes when all threads only ever
+  store the same constant (`true` / `1`), the field is not a bitfield, and the
+  value is read only after `pthread_join()`.
+
 ## Quick Checks
 
 - Instruction decoder changes in `tools/objtool/arch/*/decode.c` may require
@@ -55,3 +73,5 @@ misinterpreted by objtool.
 - The instruction classification must match how the architecture's trap
   handler processes the instruction at runtime (e.g., `break 0x1` on
   LoongArch triggers `BUG()` handling, matching its `INSN_BUG` classification)
+- Do not flag memory leaks, OOM-only error-cleanup issues, or idempotent
+  `bool = true` writes across worker threads in `tools/objtool/`
