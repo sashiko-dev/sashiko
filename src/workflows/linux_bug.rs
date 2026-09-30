@@ -1514,7 +1514,7 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
             _ => "".to_string(),
         };
 
-        let short_sha = if sha.len() >= 12 { &sha[..12] } else { &sha };
+        let short_sha: String = sha.chars().take(12).collect();
         format!("{} (\"{}\"){}", short_sha, subject, tag_part)
     })
     .await
@@ -2618,6 +2618,15 @@ pub async fn verify_commit_is_ancestor(
     }
 }
 
+async fn commit_subject(repo_path: &std::path::Path, sha: &str) -> Option<String> {
+    let out = run_git_query(repo_path, &["log", "-1", "--format=%s", sha])
+        .await
+        .ok()
+        .filter(|o| o.status.success())?;
+    let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!subject.is_empty()).then_some(subject)
+}
+
 /// Deterministic Tier-2 git pre-filter for upstream fix checking.
 ///
 /// Returns:
@@ -3172,12 +3181,15 @@ pub async fn check_bug_fixed_upstream_for_project(
                 });
             };
 
+            let fixing_commit_title = commit_subject(repo_path, &verified_fix_sha).await;
+
             attributed_db
                 .record_upstream_fix_check(
                     bug.id,
                     crate::db::UpstreamFixCheckParams {
                         verified_on_sha: linus_sha,
                         fixing_commit_sha: Some(&verified_fix_sha),
+                        fixing_commit_title: fixing_commit_title.as_deref(),
                         explanation: Some(&verdict.explanation),
                         locations: locations.as_ref(),
                         source_files: source_files.as_deref(),
@@ -3203,6 +3215,7 @@ pub async fn check_bug_fixed_upstream_for_project(
                     crate::db::UpstreamFixCheckParams {
                         verified_on_sha: linus_sha,
                         fixing_commit_sha: None,
+                        fixing_commit_title: None,
                         explanation: Some(&verdict.explanation),
                         locations: locations.as_ref(),
                         source_files: source_files.as_deref(),
@@ -4927,7 +4940,10 @@ F:	drivers/net/ethernet/intel/e1000/
             crate::db::BugLifecycleStatus::Fixed
         );
         assert!(updated.is_fixed());
-        assert_eq!(updated.fixed_in_commit().as_deref(), Some(sha2.as_str()));
+        assert_eq!(
+            updated.fixed_in_commit().as_deref(),
+            Some(format!("{} (net: dev: free buf on error path)", &sha2[..12]).as_str())
+        );
         assert_eq!(updated.verified_on_sha().as_deref(), Some(sha2.as_str()));
     }
 
@@ -5263,6 +5279,9 @@ F:	drivers/net/ethernet/intel/e1000/
             final_bug.lifecycle_status,
             crate::db::BugLifecycleStatus::Fixed
         );
-        assert_eq!(final_bug.fixed_in_commit().as_deref(), Some(sha2.as_str()));
+        assert_eq!(
+            final_bug.fixed_in_commit().as_deref(),
+            Some(format!("{} (api: bounds-check handle_query index)", &sha2[..12]).as_str())
+        );
     }
 }

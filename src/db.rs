@@ -709,7 +709,8 @@ impl Bug {
                         .get("introducing_commit_title")
                         .and_then(|v| v.as_str())
                     {
-                        return Some(format!("{} ({})", &sha[..12.min(sha.len())], title));
+                        let short_sha: String = sha.chars().take(12).collect();
+                        return Some(format!("{} ({})", short_sha, title));
                     }
                     return Some(sha.to_string());
                 }
@@ -766,6 +767,14 @@ impl Bug {
                 && let Some(ref data) = e.data_json
                 && let Some(sha) = data.get("commit_sha").and_then(|v| v.as_str())
             {
+                if let Some(title) = data
+                    .get("commit_title")
+                    .and_then(|v| v.as_str())
+                    .filter(|t| !t.trim().is_empty())
+                {
+                    let short_sha: String = sha.chars().take(12).collect();
+                    return Some(format!("{} ({})", short_sha, title));
+                }
                 return Some(sha.to_string());
             }
         }
@@ -1021,6 +1030,8 @@ fn bug_reference_json(bug: &Bug, is_newly_discovered: bool) -> serde_json::Value
         "lifecycle_status": bug.lifecycle_status.as_str(),
         "pipeline_state": bug.pipeline_state.as_str(),
         "is_fixed": bug.is_fixed(),
+        "introduced_in_commit": bug.introduced_in_commit(),
+        "fixed_in_commit": bug.fixed_in_commit(),
         "assignee": bug.assignee,
     })
 }
@@ -1072,6 +1083,7 @@ pub struct MarkDuplicateBugParams<'a> {
 pub struct UpstreamFixCheckParams<'a> {
     pub verified_on_sha: &'a str,
     pub fixing_commit_sha: Option<&'a str>,
+    pub fixing_commit_title: Option<&'a str>,
     pub explanation: Option<&'a str>,
     pub locations: Option<&'a serde_json::Value>,
     pub source_files: Option<&'a [String]>,
@@ -2934,6 +2946,24 @@ impl Database {
                 ] {
                     obj.remove(key);
                 }
+                if enrichment.kind == "fix_candidate"
+                    && let Some(data) = &enrichment.data_json
+                    && let Some(sha) = data.get("commit_sha").and_then(|v| v.as_str())
+                {
+                    event["commit_sha"] = json!(sha);
+                    let fixed_ref = match data
+                        .get("commit_title")
+                        .and_then(|v| v.as_str())
+                        .filter(|t| !t.trim().is_empty())
+                    {
+                        Some(title) => {
+                            let short_sha: String = sha.chars().take(12).collect();
+                            format!("{} ({})", short_sha, title)
+                        }
+                        None => sha.to_string(),
+                    };
+                    event["fixed_in_commit"] = json!(fixed_ref);
+                }
                 if enrichment.kind == "audit"
                     && let Some(data) = &enrichment.data_json
                 {
@@ -3820,6 +3850,7 @@ impl Database {
                     data_json: Some(serde_json::json!({
                         "status": "merged",
                         "commit_sha": fix_sha,
+                        "commit_title": params.fixing_commit_title,
                         "verified_on_sha": params.verified_on_sha,
                         "explanation": params.explanation,
                     })),

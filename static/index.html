@@ -3111,6 +3111,10 @@
                         if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
                             tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
                         }
+                        let fixedByHtml = '';
+                        if (p.fixed_in_commit) {
+                            fixedByHtml = `<div class="text-muted-sm" style="margin-top:2px;">Fixed by: <code>${escapeHtml(formatCommitRef(p.fixed_in_commit))}</code></div>`;
+                        }
                         
                         const sevStr = p.severity || 'Unknown';
                         const sevColor = getSeverityColor(sevStr);
@@ -3127,7 +3131,7 @@
                         const discoveriesTitle = `${discoveriesCount} ${discoveriesCount === 1 ? 'discovery' : 'discoveries'} (${toolsText}, ${modelsText})`;
 
                         row.innerHTML = `
-                            <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
+                            <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}${fixedByHtml}</td>
                             <td style="line-height:1.2;">${sevHtml}</td>
                             <td title="${escapeHtml(discoveriesTitle)}">${discoveriesCount}</td>
                             <td style="line-height:1.2;"><div>${dateStr}</div>${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}</td>
@@ -3816,6 +3820,7 @@
                                                 <span class="tag">${escapeHtml((b.bugid || b.slug || b.id))}</span>
                                                 <span class="tag" style="border:1px solid ${statusInfo.color}; color:${statusInfo.color}; font-weight:bold; background:transparent;">${statusInfo.label}</span>
                                                 ${b.introduced_in_commit ? `<span class="tag" title="${escapeHtml(b.introduced_in_commit)}">Intro: ${escapeHtml(b.introduced_in_commit.length > 20 ? b.introduced_in_commit.substring(0, 20) + '...' : b.introduced_in_commit)}</span>` : ''}
+                                                ${b.fixed_in_commit ? `<span class="tag" title="${escapeHtml(b.fixed_in_commit)}">Fixed by: ${escapeHtml(b.fixed_in_commit.length > 20 ? b.fixed_in_commit.substring(0, 20) + '...' : b.fixed_in_commit)}</span>` : ''}
                                                 ${b.is_newly_discovered ? `<span class="tag" style="background:var(--diff-add-bg); color:var(--status-reviewed);">Newly Discovered</span>` : ''}
                                             </div>
                                         </div>
@@ -4546,6 +4551,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             <div class="review-meta" style="margin-top: 4px;">
                                 <div class="review-meta-label">Actor:</div>
                                 <div>${bugAttribution(f)}</div>
+                                ${(f.fixed_in_commit || f.commit_sha) ? `
+                                <div class="review-meta-label">Fixed by:</div>
+                                <div>${commit(f.fixed_in_commit || f.commit_sha)} <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling)">Copy</button></div>
+                                ` : ''}
                             </div>
                             ${f.content ? `
                                 <div style="position: relative; margin-top: 8px;">
@@ -4694,7 +4703,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Updated:</div><div>${formatDate(data.updated_at, true)}</div></div>
                     <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
                     ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced by:</div><div>${commit(data.introduced_in_commit)} <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling)">Copy</button></div></div>` : ''}
-                    ${data.fixed_in_commit ? `<div class="kv"><div class="label">Fixed in:</div><div>${commit(data.fixed_in_commit)}</div></div>` : ''}
+                    ${data.fixed_in_commit ? `<div class="kv"><div class="label">Fixed by:</div><div>${commit(data.fixed_in_commit)} <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling)">Copy</button></div></div>` : ''}
                     ${data.verified_on_sha ? `<div class="kv"><div class="label">Verified on:</div><div>${commit(data.verified_on_sha)}</div></div>` : ''}
                     ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
                     ${hasInteractionLogs ? `<div class="kv"><div class="label">Interaction log:</div><div>${bugLogLinkHtml(bugid)}</div></div>` : ''}
