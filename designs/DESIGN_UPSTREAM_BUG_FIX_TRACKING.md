@@ -25,8 +25,10 @@ Add `LinuxBugSettings` to `Settings` (`src/settings.rs`), deserialized from `[li
 [linux_bug]
 # Enable tracking and background analysis of pre-existing bugs (default: false)
 enabled = false
+# Enable periodic verification of whether open bugs have been fixed upstream (default: false)
+fix_check_enabled = false
 # Lease TTL in seconds for in-progress bug claims
-lease_ttl_seconds = 1800
+lease_ttl_seconds = 300
 # Maximum pipeline attempts before marking a bug failed
 max_attempts = 3
 # Interval in seconds between periodic upstream fix checks against Linus's tree (0 = disabled)
@@ -45,14 +47,17 @@ During `linux_patch_review` (`src/workflows/linux_patch_review.rs`), `conflict_r
 
 ### 2.3 Worker, API, UI, and Deployment Gating
 
-- **Background Worker (`src/main.rs`):** `BugWorker` is spawned only when `settings.linux_bug.enabled` is `true`, configured with `.with_project(settings.project.kind)`.
+- **Background Worker (`src/main.rs`):** `BugWorker` is spawned only when `settings.linux_bug.enabled` is `true`, configured with `.with_project(settings.project.kind)` and `.with_settings(settings.linux_bug.clone())`. Periodic upstream fix verification runs only when `settings.linux_bug.fix_check_enabled` is `true`.
 - **REST API (`src/api.rs`):**
-  - `GET /api/config` includes `"bugs_enabled": state.settings.linux_bug.enabled`.
+  - `GET /api/config` includes `"bugs_enabled": state.settings.linux_bug.enabled` and `"bug_fix_check_enabled": state.settings.linux_bug.fix_check_enabled`.
   - `POST /api/bug/analyze` returns `404 Not Found` when `state.settings.linux_bug.enabled` is `false`.
-- **Frontend (`static/index.html`):** The `#btn-bugs` navigation button is hidden when `config.bugs_enabled === false`.
+- **Frontend (`static/index.html`):**
+  - The `#btn-bugs` navigation button is hidden when `config.bugs_enabled === false`.
+  - When a bug is fixed (`fixed_in_commit`), the UI displays `Fixed by: <12-char-sha> ("<subject>")` on the bug detail page (with Copy button), in the Fixes & Patches tab, in the Bugs table list view, and on patchset bug cards.
 - **Deployment Manifests:**
-  - `Settings.toml` leaves `linux_bug.enabled = false` by default.
-  - `deployment/sashiko.dev/base/app/sashiko-k8s.yaml` and `deployment/sashiko.sashiko.dev/base/app/sashiko-self-k8s.yaml` set `SASHIKO__LINUX_BUG__ENABLED: "true"` so both production instances track pre-existing bugs and periodic upstream fixes.
+  - `Settings.toml` leaves `linux_bug.enabled = false` and `linux_bug.fix_check_enabled = false` by default.
+  - `deployment/sashiko.sashiko.dev/base/app/sashiko-self-k8s.yaml` sets `SASHIKO__LINUX_BUG__ENABLED: "true"` and `SASHIKO__LINUX_BUG__FIX_CHECK_ENABLED: "true"`.
+  - `deployment/sashiko.dev/base/app/sashiko-k8s.yaml` sets `SASHIKO__LINUX_BUG__ENABLED: "true"` and `SASHIKO__LINUX_BUG__FIX_CHECK_ENABLED: "false"`.
 
 ---
 

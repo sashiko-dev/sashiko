@@ -1700,6 +1700,7 @@ async fn get_config(
         "attribution": state.settings.project.attribution(),
         "forge_enabled": state.settings.forge.enabled,
         "bugs_enabled": state.settings.linux_bug.enabled,
+        "bug_fix_check_enabled": state.settings.linux_bug.fix_check_enabled,
         "read_only": state.read_only,
         "permissions": {
             "review": can_review,

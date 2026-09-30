@@ -229,8 +229,11 @@ ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 # Enable pre-existing bug tracking and the background bug worker (default: false).
 # When disabled, pre-existing issues found during patch review are ignored.
 enabled = false
+# Enable periodic verification of whether open bugs have been fixed upstream (default: false).
+fix_check_enabled = false
 # Interval in seconds between periodic upstream fix checks against Linus's tree (0 = disabled).
 # fix_check_interval_seconds = 21600
 # Maximum number of open bugs to evaluate per upstream fix check cycle.
 # fix_check_batch_size = 50
+
 

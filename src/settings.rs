@@ -838,6 +838,10 @@ pub struct LinuxBugSettings {
     /// Disabled by default so pre-existing issues are ignored unless opted in.
     #[serde(default)]
     pub enabled: bool,
+    /// Whether periodic upstream bug fix verification is enabled.
+    /// Disabled by default (`false`).
+    #[serde(default, alias = "verify_fixes")]
+    pub fix_check_enabled: bool,
     #[serde(default = "default_bug_lease_ttl_seconds")]
     pub lease_ttl_seconds: i64,
     #[serde(default = "default_bug_max_attempts")]
@@ -871,6 +875,7 @@ impl Default for LinuxBugSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            fix_check_enabled: false,
             lease_ttl_seconds: default_bug_lease_ttl_seconds(),
             max_attempts: default_bug_max_attempts(),
             fix_check_interval_seconds: default_fix_check_interval_seconds(),
@@ -1481,6 +1486,7 @@ mod tests {
     fn test_linux_bug_settings_defaults_to_disabled() {
         let default_bug = LinuxBugSettings::default();
         assert!(!default_bug.enabled);
+        assert!(!default_bug.fix_check_enabled);
         assert_eq!(default_bug.lease_ttl_seconds, 300);
         assert_eq!(default_bug.max_attempts, 3);
         assert_eq!(default_bug.fix_check_interval_seconds, 21_600);
@@ -1488,12 +1494,14 @@ mod tests {
 
         let settings = Settings::new().unwrap();
         assert!(!settings.linux_bug.enabled);
+        assert!(!settings.linux_bug.fix_check_enabled);
 
         let custom: LinuxBugSettings = toml::from_str(
-            "enabled = true\nfix_check_interval_seconds = 3600\nfix_check_batch_size = 20\n",
+            "enabled = true\nfix_check_enabled = true\nfix_check_interval_seconds = 3600\nfix_check_batch_size = 20\n",
         )
         .unwrap();
         assert!(custom.enabled);
+        assert!(custom.fix_check_enabled);
         assert_eq!(custom.fix_check_interval_seconds, 3600);
         assert_eq!(custom.fix_check_batch_size, 20);
     }

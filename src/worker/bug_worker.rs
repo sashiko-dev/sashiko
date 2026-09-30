@@ -121,6 +121,9 @@ impl BugWorker {
     /// Runs a single bounded sweep checking whether open bugs have been fixed
     /// in the upstream mainline tree.
     pub async fn check_open_bugs_upstream(&self) -> usize {
+        if !self.settings.fix_check_enabled {
+            return 0;
+        }
         let batch_size = self.settings.fix_check_batch_size;
         if batch_size == 0 {
             return 0;
@@ -247,15 +250,17 @@ impl BugWorker {
     pub async fn run(&self) {
         let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
         let max_attempts = self.settings.max_attempts.max(1);
+        let fix_check_enabled = self.settings.fix_check_enabled;
         let fix_check_interval = self.settings.fix_check_interval_seconds;
 
         info!(
-            "Starting Bug Worker as {} (project {}, lease {}s renewed every {}s, {} attempts max, fix check interval {}s)...",
+            "Starting Bug Worker as {} (project {}, lease {}s renewed every {}s, {} attempts max, fix check enabled: {}, interval {}s)...",
             self.worker_id,
             self.project.as_str(),
             lease_ttl_seconds,
             ((lease_ttl_seconds as u64) / 3).clamp(1, BUG_LEASE_RENEW_INTERVAL_SECONDS),
             max_attempts,
+            fix_check_enabled,
             fix_check_interval
         );
         if let Err(e) = self.db.recover_stale_running_bugs().await {
@@ -267,7 +272,8 @@ impl BugWorker {
         let mut last_fix_check: Option<tokio::time::Instant> = None;
 
         loop {
-            if fix_check_interval > 0
+            if fix_check_enabled
+                && fix_check_interval > 0
                 && last_fix_check
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(fix_check_interval))
             {
@@ -593,6 +599,21 @@ mod tests {
         .await
         .unwrap();
 
+        let disabled_worker = BugWorker::new(
+            db.clone(),
+            Arc::new(DummyProvider),
+            repo.to_string_lossy().to_string(),
+        )
+        .with_settings(crate::settings::LinuxBugSettings {
+            enabled: true,
+            fix_check_enabled: false,
+            lease_ttl_seconds: 60,
+            max_attempts: 3,
+            fix_check_interval_seconds: 60,
+            fix_check_batch_size: 10,
+        });
+        assert_eq!(disabled_worker.check_open_bugs_upstream().await, 0);
+
         let worker = BugWorker::new(
             db.clone(),
             Arc::new(DummyProvider),
@@ -600,6 +621,7 @@ mod tests {
         )
         .with_settings(crate::settings::LinuxBugSettings {
             enabled: true,
+            fix_check_enabled: true,
             lease_ttl_seconds: 60,
             max_attempts: 3,
             fix_check_interval_seconds: 60,
