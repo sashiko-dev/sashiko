@@ -297,6 +297,30 @@ impl VertexClient {
     }
 }
 
+fn build_cache_identity(
+    model: &str,
+    thinking: Option<&str>,
+    effort: Option<&str>,
+    max_tokens: u32,
+    region: &str,
+    project_id: &str,
+) -> String {
+    // max_tokens is what truncates a response, so a raised limit has to
+    // miss the entry recorded under the lower one rather than replay it.
+    // region and project_id select the Vertex endpoint in build_endpoint_url.
+    let max_tokens = max_tokens.to_string();
+    crate::ai::cache_identity_with(
+        model,
+        &[
+            ("thinking", thinking),
+            ("effort", effort),
+            ("max_tokens", Some(max_tokens.as_str())),
+            ("region", Some(region)),
+            ("project_id", Some(project_id)),
+        ],
+    )
+}
+
 #[async_trait]
 impl AiProvider for VertexClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -314,16 +338,13 @@ impl AiProvider for VertexClient {
     }
 
     fn cache_identity(&self) -> String {
-        // max_tokens is what truncates a response, so a raised limit has to
-        // miss the entry recorded under the lower one rather than replay it.
-        let max_tokens = self.max_tokens.to_string();
-        crate::ai::cache_identity_with(
+        build_cache_identity(
             &self.model,
-            &[
-                ("thinking", self.thinking.as_deref()),
-                ("effort", self.effort.as_deref()),
-                ("max_tokens", Some(max_tokens.as_str())),
-            ],
+            self.thinking.as_deref(),
+            self.effort.as_deref(),
+            self.max_tokens,
+            &self.region,
+            &self.project_id,
         )
     }
 }
@@ -331,6 +352,91 @@ impl AiProvider for VertexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_identity_tracks_the_knobs_outside_the_request() {
+        let base = build_cache_identity(
+            "claude-opus-4-7",
+            Some("enabled"),
+            Some("high"),
+            4096,
+            "us-east5",
+            "project-a",
+        );
+        assert_ne!(
+            base,
+            build_cache_identity(
+                "claude-sonnet-4-6",
+                Some("enabled"),
+                Some("high"),
+                4096,
+                "us-east5",
+                "project-a",
+            ),
+            "a changed model must not replay another model's response"
+        );
+        assert_ne!(
+            base,
+            build_cache_identity(
+                "claude-opus-4-7",
+                None,
+                Some("high"),
+                4096,
+                "us-east5",
+                "project-a",
+            ),
+            "a changed thinking mode must not replay the old response"
+        );
+        assert_ne!(
+            base,
+            build_cache_identity(
+                "claude-opus-4-7",
+                Some("enabled"),
+                Some("low"),
+                4096,
+                "us-east5",
+                "project-a",
+            ),
+            "a changed effort level must not replay the old response"
+        );
+        assert_ne!(
+            base,
+            build_cache_identity(
+                "claude-opus-4-7",
+                Some("enabled"),
+                Some("high"),
+                65536,
+                "us-east5",
+                "project-a",
+            ),
+            "a raised max_tokens must not replay the truncated response"
+        );
+        assert_ne!(
+            base,
+            build_cache_identity(
+                "claude-opus-4-7",
+                Some("enabled"),
+                Some("high"),
+                4096,
+                "global",
+                "project-a",
+            ),
+            "a changed region must not replay the old endpoint's response"
+        );
+        assert_ne!(
+            base,
+            build_cache_identity(
+                "claude-opus-4-7",
+                Some("enabled"),
+                Some("high"),
+                4096,
+                "us-east5",
+                "project-b",
+            ),
+            "a changed project_id must not replay another project's response"
+        );
+    }
+
     // --- Model family detection ---
 
     #[test]
