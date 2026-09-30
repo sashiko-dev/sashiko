@@ -261,13 +261,48 @@ impl Reviewer {
                 provider: self.provider.clone(),
             };
 
-            tokio::spawn(async move {
-                let _permit = permit;
-                Self::review_patchset_task(context, patchset).await;
-            });
+            let patchset_id = patchset.id;
+            Self::spawn_supervised_patchset_review(
+                self.db.clone(),
+                permit,
+                patchset_id,
+                Self::review_patchset_task(context, patchset),
+            );
         }
 
         Ok(())
+    }
+
+    fn spawn_supervised_patchset_review<F>(
+        db: Arc<Database>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        patchset_id: i64,
+        review_fut: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let _permit = permit;
+            let inner = tokio::spawn(review_fut);
+            if let Err(join_err) = inner.await {
+                error!(
+                    "Review task for patchset {} terminated abnormally ({}); marking as Failed",
+                    patchset_id, join_err
+                );
+                let current_status = db.get_patchset_status(patchset_id).await.ok().flatten();
+                if current_status.as_deref() != Some(ReviewStatus::Cancelled.as_str())
+                    && let Err(db_err) = db
+                        .update_patchset_status(patchset_id, ReviewStatus::Failed.as_str())
+                        .await
+                {
+                    error!(
+                        "Failed to mark patchset {} as Failed after task termination: {}",
+                        patchset_id, db_err
+                    );
+                }
+            }
+        })
     }
 
     async fn release_embargoed_results(&self) -> Result<()> {
@@ -4877,6 +4912,78 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(args.contains(&"worker".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_supervised_patchset_review_marks_failed_on_panic() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db.create_thread("msg_id_panic", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_panic_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_id_panic",
+                "Subject",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, "msg_id_panic_p1", 1, "diff --git a/a b/a\n")
+            .await?;
+
+        assert!(db.claim_patchset_for_review(ps_id).await?);
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some(ReviewStatus::InReview.as_str())
+        );
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await?;
+        assert_eq!(semaphore.available_permits(), 0);
+
+        let handle =
+            Reviewer::spawn_supervised_patchset_review(db.clone(), permit, ps_id, async move {
+                panic!("simulated worker panic");
+            });
+        handle.await?;
+
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some(ReviewStatus::Failed.as_str())
+        );
+        assert_eq!(semaphore.available_permits(), 1);
+
         Ok(())
     }
 }
