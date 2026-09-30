@@ -2805,9 +2805,14 @@ impl Reviewer {
         let patch_author = msg_details.author.unwrap_or_default();
         let patch_subject = msg_details.subject.unwrap_or_default();
 
+        let domain = if ctx.settings.project.domain.is_empty() {
+            "sashiko.dev"
+        } else {
+            ctx.settings.project.domain.as_str()
+        };
         let target_url = format!(
-            "https://sashiko.dev/#/patchset/{}?part={}",
-            patchset_msg_id_clean, index
+            "https://{}/#/patchset/{}?part={}",
+            domain, patchset_msg_id_clean, index
         );
 
         let patchwork_policies =
