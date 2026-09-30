@@ -129,9 +129,9 @@ fn is_token_shaped(value: &str) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
-    pub exp: usize,
+    pub exp: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub iat: Option<usize>,
+    pub iat: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,7 +144,7 @@ pub struct Claims {
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub email: String,
-    pub iat: Option<usize>,
+    pub iat: Option<u64>,
     pub sid: Option<String>,
     pub typ: Option<String>,
     pub max_bug_access: Option<String>,
@@ -187,8 +187,8 @@ pub fn create_api_token(
 
     let claims = Claims {
         sub: email.to_owned(),
-        exp: (now + expiration_secs) as usize,
-        iat: Some(now as usize),
+        exp: now.saturating_add(expiration_secs),
+        iat: Some(now),
         sid: Some(format!("{:032x}", fastrand::u128(..))),
         typ: Some("api_token".to_string()),
         max_bug_access,
@@ -207,7 +207,7 @@ pub fn create_token_with_session(
     secret: &str,
     typ: Option<String>,
     expiration_secs: u64,
-    iat: Option<usize>,
+    iat: Option<u64>,
     sid: Option<String>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = std::time::SystemTime::now()
@@ -215,7 +215,7 @@ pub fn create_token_with_session(
         .expect("Time went backwards")
         .as_secs();
 
-    let issued_at = iat.unwrap_or(now as usize);
+    let issued_at = iat.unwrap_or(now);
     let session_id = sid.or_else(|| {
         if typ.as_deref() == Some("session") {
             Some(format!("{:032x}", fastrand::u128(..)))
@@ -226,7 +226,7 @@ pub fn create_token_with_session(
 
     let claims = Claims {
         sub: email.to_owned(),
-        exp: (now + expiration_secs) as usize,
+        exp: now.saturating_add(expiration_secs),
         iat: Some(issued_at),
         sid: session_id,
         typ,
@@ -358,10 +358,32 @@ mod tests {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
-            .as_secs() as usize;
+            .as_secs();
 
         assert!(claims.exp > now);
         assert!(claims.exp <= now + 24 * 3600);
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_token_preserves_u64_timestamps_and_saturates_exp() {
+        let email = "test@example.com";
+        let secret = "super_secret_key";
+        let post_2038_iat = u64::from(u32::MAX) + 100_000;
+
+        let token = create_token_with_session(
+            email,
+            secret,
+            Some("session".to_string()),
+            u64::MAX,
+            Some(post_2038_iat),
+            None,
+        )
+        .expect("Failed to create token with post-2038 iat and max expiration");
+
+        let claims = verify_token(&token, secret).expect("Failed to verify token");
+        assert_eq!(claims.iat, Some(post_2038_iat));
+        assert_eq!(claims.exp, u64::MAX);
     }
 
     #[cfg(feature = "server")]

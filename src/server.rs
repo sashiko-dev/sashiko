@@ -3344,7 +3344,9 @@ mod tests {
         assert_eq!(res_bearer_sign_in.status(), 401);
 
         // Session token whose initial issue date is older than 30 days cannot be refreshed
-        let old_iat = (chrono::Utc::now().timestamp() as usize).saturating_sub(31 * 86400);
+        let old_iat = u64::try_from(chrono::Utc::now().timestamp())
+            .unwrap_or(0)
+            .saturating_sub(31 * 86400);
         let expired_session_token = crate::auth::create_token_with_session(
             "reviewer@example.com",
             secret,
@@ -4563,7 +4565,7 @@ async fn refresh_token(
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("Time went backwards")
-                .as_secs() as usize;
+                .as_secs();
 
             let max_session_lifetime = 30 * 24 * 3600; // 30 days
             if let Some(iat) = user.iat
