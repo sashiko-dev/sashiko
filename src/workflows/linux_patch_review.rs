@@ -339,7 +339,7 @@ Example Output:
 // Validation Logic
 // ---------------------------------------------------------------------------
 
-fn has_valid_proof_location(item: &Value) -> bool {
+pub(crate) fn has_valid_proof_location(item: &Value) -> bool {
     let Some(locations) = item.get("locations").and_then(Value::as_array) else {
         return false;
     };
@@ -407,6 +407,110 @@ fn validate_concerns_output(
 fn format_concerns_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
+        violation
+    )
+}
+
+pub(crate) fn validate_conflict_resolution_output(
+    output: &ConflictResolutionOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    for (idx, concern) in output.concerns.iter().enumerate() {
+        let Some(obj) = concern.as_object() else {
+            return Err(format!("concerns[{idx}] must be a JSON object."));
+        };
+        let has_desc = obj
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_desc {
+            return Err(format!(
+                "concerns[{idx}] must have a non-empty 'description' string."
+            ));
+        }
+        let has_reasoning = obj
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_reasoning {
+            return Err(format!(
+                "concerns[{idx}] must have a non-empty 'reasoning' string."
+            ));
+        }
+        if !obj.get("preexisting").is_some_and(Value::is_boolean) {
+            return Err(format!(
+                "concerns[{idx}] must have a boolean 'preexisting' field (true or false)."
+            ));
+        }
+        if !obj.get("locations").is_some_and(Value::is_array) {
+            return Err(format!("concerns[{idx}] must have a 'locations' array."));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_conflict_resolution_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing a 'concerns' array where each item is an object with 'type', non-empty 'description' and 'reasoning' strings, a boolean 'preexisting', and a 'locations' array. If no concerns remain after conflict resolution, return `{{\"concerns\": []}}`.",
+        violation
+    )
+}
+
+pub(crate) fn validate_verification_output(
+    output: &VerificationOutput,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    for (idx, finding) in output.findings.iter().enumerate() {
+        let Some(obj) = finding.as_object() else {
+            return Err(format!("findings[{idx}] must be a JSON object."));
+        };
+        let has_problem = obj
+            .get("problem")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_problem {
+            return Err(format!(
+                "findings[{idx}] must have a non-empty 'problem' string."
+            ));
+        }
+        let valid_severity = obj
+            .get("severity")
+            .and_then(Value::as_str)
+            .is_some_and(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "low" | "medium" | "high" | "critical" | "unknown"
+                )
+            });
+        if !valid_severity {
+            return Err(format!(
+                "findings[{idx}] must have a valid 'severity' string ('Low', 'Medium', 'High', 'Critical', or 'Unknown')."
+            ));
+        }
+        let has_explanation = obj
+            .get("severity_explanation")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_explanation {
+            return Err(format!(
+                "findings[{idx}] must have a non-empty 'severity_explanation' string."
+            ));
+        }
+        if !obj.get("preexisting").is_some_and(Value::is_boolean) {
+            return Err(format!(
+                "findings[{idx}] must have a boolean 'preexisting' field (true or false)."
+            ));
+        }
+        if !obj.get("locations").is_some_and(Value::is_array) {
+            return Err(format!("findings[{idx}] must have a 'locations' array."));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_verification_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing a 'findings' array where each item has a non-empty 'problem', a valid 'severity' ('Low', 'Medium', 'High', 'Critical', or 'Unknown'), a non-empty 'severity_explanation', a boolean 'preexisting', and a 'locations' array. If there are no findings, return `{{\"findings\": []}}`.",
         violation
     )
 }
@@ -1026,7 +1130,11 @@ Example Output:
                 serde_json::to_string_pretty(&s.deduplicated_dismissed_concerns).unwrap_or_default()
             }),
         )
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_conflict_resolution_output)
+                .with_feedback_formatter(format_conflict_resolution_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1101,7 +1209,11 @@ Example Output:
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_verification_output)
+                .with_feedback_formatter(format_verification_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1631,5 +1743,130 @@ mod tests {
         assert_eq!(state.concerns[1]["reasoning"], "Old leak");
         assert_eq!(state.findings.len(), 1);
         assert_eq!(state.findings[0]["problem"], "new regression");
+    }
+
+    #[test]
+    fn test_conflict_resolution_and_verification_stage_validators() {
+        let state = LinuxPatchReviewState::default();
+        let cr_stage = conflict_resolution_stage(20, 0.0);
+        let ver_stage = verification_stage(20, 0.0);
+
+        // Missing top-level arrays or stray inner objects must fail.
+        assert!(cr_stage.output_format.validate("{}", &state).is_err());
+        assert!(
+            cr_stage
+                .output_format
+                .validate(r#"{"file": "a.c"}"#, &state)
+                .is_err()
+        );
+        assert!(ver_stage.output_format.validate("{}", &state).is_err());
+        assert!(
+            ver_stage
+                .output_format
+                .validate(r#"{"file": "a.c"}"#, &state)
+                .is_err()
+        );
+
+        // Malformed concern elements in conflict-resolution must fail with index-qualified error.
+        let err = cr_stage
+            .output_format
+            .validate(r#"{"concerns": [{"file": "a.c"}]}"#, &state)
+            .expect_err("concern missing description must fail");
+        assert!(err.contains("concerns[0]"));
+        let cr_feedback = cr_stage.output_format.format_feedback(&err);
+        assert!(cr_feedback.contains("'concerns' array"));
+        assert!(cr_feedback.contains("'reasoning'"));
+        assert!(cr_feedback.contains("'preexisting'"));
+        assert!(cr_feedback.contains("'locations'"));
+
+        let err = cr_stage
+            .output_format
+            .validate(
+                r#"{"concerns": [{"description": "Null deref in foo()", "reasoning": "Unchecked ptr"}]}"#,
+                &state,
+            )
+            .expect_err("concern missing preexisting must fail");
+        assert!(err.contains("preexisting"));
+
+        assert!(
+            cr_stage
+                .output_format
+                .validate(r#"{"concerns": []}"#, &state)
+                .is_ok()
+        );
+        assert!(
+            cr_stage
+                .output_format
+                .validate(
+                    r#"{"concerns": [{"description": "Null deref in foo()", "reasoning": "Unchecked ptr", "preexisting": false, "locations": []}]}"#,
+                    &state
+                )
+                .is_ok()
+        );
+
+        // Malformed finding elements in verification must fail with index-qualified error.
+        let err = ver_stage
+            .output_format
+            .validate(r#"{"findings": [{"file": "a.c"}]}"#, &state)
+            .expect_err("finding missing problem must fail");
+        assert!(err.contains("findings[0]"));
+        let ver_feedback = ver_stage.output_format.format_feedback(&err);
+        assert!(ver_feedback.contains("'findings' array"));
+        assert!(ver_feedback.contains("'preexisting'"));
+        assert!(ver_feedback.contains("'locations'"));
+
+        let err = ver_stage
+            .output_format
+            .validate(
+                r#"{"findings": [{"problem": "mm: leak", "severity": "Severe", "severity_explanation": "Leaks page", "preexisting": false, "locations": []}]}"#,
+                &state,
+            )
+            .expect_err("invalid severity must fail");
+        assert!(err.contains("findings[0]"));
+        assert!(err.contains("severity"));
+
+        let err = ver_stage
+            .output_format
+            .validate(
+                r#"{"findings": [{"problem": "mm: leak", "severity": "High", "severity_explanation": "  ", "preexisting": false, "locations": []}]}"#,
+                &state,
+            )
+            .expect_err("empty severity_explanation must fail");
+        assert!(err.contains("findings[0]"));
+        assert!(err.contains("severity_explanation"));
+
+        let err = ver_stage
+            .output_format
+            .validate(
+                r#"{"findings": [{"problem": "mm: leak", "severity": "High", "severity_explanation": "Leaks page"}]}"#,
+                &state,
+            )
+            .expect_err("finding missing preexisting must fail");
+        assert!(err.contains("preexisting"));
+
+        assert!(
+            ver_stage
+                .output_format
+                .validate(r#"{"findings": []}"#, &state)
+                .is_ok()
+        );
+        assert!(
+            ver_stage
+                .output_format
+                .validate(
+                    r#"{"findings": [{"problem": "mm: leak in foo()", "severity": "High", "severity_explanation": "Leaks page on error path", "preexisting": false, "locations": []}]}"#,
+                    &state
+                )
+                .is_ok()
+        );
+        assert!(
+            ver_stage
+                .output_format
+                .validate(
+                    r#"{"findings": [{"problem": "mm: ambiguous edge case in foo()", "severity": "Unknown", "severity_explanation": "Depends on hardware config", "preexisting": false, "locations": []}]}"#,
+                    &state
+                )
+                .is_ok()
+        );
     }
 }

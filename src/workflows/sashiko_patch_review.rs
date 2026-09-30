@@ -29,7 +29,8 @@ use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
     PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput,
+    VerificationOutput, format_conflict_resolution_feedback, format_verification_feedback,
+    has_valid_proof_location, validate_conflict_resolution_output, validate_verification_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -498,15 +499,76 @@ pub fn is_known_stage(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn validate_concerns_output(
-    _output: &StageConcernsOutput,
+    output: &StageConcernsOutput,
     _state: &SashikoPatchReviewState,
 ) -> Result<(), String> {
+    for (idx, concern) in output.concerns.iter().enumerate() {
+        let Some(obj) = concern.as_object() else {
+            return Err(format!("concerns[{idx}] must be a JSON object."));
+        };
+        let has_desc = obj
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_desc {
+            return Err(format!(
+                "concerns[{idx}] must have a non-empty 'description' string."
+            ));
+        }
+        let has_reasoning = obj
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_reasoning {
+            return Err(format!(
+                "concerns[{idx}] must have a non-empty 'reasoning' string."
+            ));
+        }
+        if !obj.get("preexisting").is_some_and(Value::is_boolean) {
+            return Err(format!(
+                "concerns[{idx}] must have a boolean 'preexisting' field (true or false)."
+            ));
+        }
+        if !obj.get("locations").is_some_and(Value::is_array) {
+            return Err(format!("concerns[{idx}] must have a 'locations' array."));
+        }
+    }
+
+    for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
+        let Some(obj) = dismissed.as_object() else {
+            return Err(format!("dismissed_concerns[{idx}] must be a JSON object."));
+        };
+        let has_desc = obj
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_desc {
+            return Err(format!(
+                "dismissed_concerns[{idx}] must have a non-empty 'description' string."
+            ));
+        }
+        let has_reasoning = obj
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_reasoning {
+            return Err(format!(
+                "dismissed_concerns[{idx}] must have a non-empty 'reasoning' string."
+            ));
+        }
+        if !has_valid_proof_location(dismissed) {
+            return Err(format!(
+                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
+            ));
+        }
+    }
+
     Ok(())
 }
 
 fn format_concerns_feedback(violation: &str) -> String {
     format!(
-        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' (each with 'type', non-empty 'description' and 'reasoning' strings, a boolean 'preexisting', and a 'locations' array) and 'dismissed_concerns' (each with 'type', non-empty 'description' and 'reasoning' strings, and a 'locations' array) arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
         violation
     )
 }
@@ -922,7 +984,11 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
                 },
             ),
         )
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_conflict_resolution_output)
+                .with_feedback_formatter(format_conflict_resolution_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -975,7 +1041,11 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_verification_output)
+                .with_feedback_formatter(format_verification_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1344,5 +1414,113 @@ mod tests {
             "db: pre-existing missing index on patches table"
         );
         assert_eq!(state.concerns[0]["preexisting"], true);
+    }
+
+    #[test]
+    fn test_sashiko_stage_output_validators() {
+        let state = SashikoPatchReviewState::default();
+        let dedup_stage = deduplication_stage(20, 0.0);
+        let cr_stage = conflict_resolution_stage(20, 0.0);
+        let ver_stage = verification_stage(20, 0.0);
+
+        // Missing top-level arrays or stray inner objects must fail.
+        assert!(dedup_stage.output_format.validate("{}", &state).is_err());
+        assert!(
+            dedup_stage
+                .output_format
+                .validate(r#"{"file": "a.rs"}"#, &state)
+                .is_err()
+        );
+        assert!(cr_stage.output_format.validate("{}", &state).is_err());
+        assert!(
+            cr_stage
+                .output_format
+                .validate(r#"{"file": "a.rs"}"#, &state)
+                .is_err()
+        );
+        assert!(ver_stage.output_format.validate("{}", &state).is_err());
+        assert!(
+            ver_stage
+                .output_format
+                .validate(r#"{"file": "a.rs"}"#, &state)
+                .is_err()
+        );
+
+        // Malformed concerns in deduplication and conflict-resolution must fail.
+        let err = dedup_stage
+            .output_format
+            .validate(r#"{"concerns": [{"file": "a.rs"}]}"#, &state)
+            .expect_err("concern missing description must fail");
+        assert!(err.contains("concerns[0]"));
+
+        let err = dedup_stage
+            .output_format
+            .validate(
+                r#"{"concerns": [{"description": "Missing check", "reasoning": "Unchecked"}], "dismissed_concerns": []}"#,
+                &state,
+            )
+            .expect_err("concern missing preexisting must fail");
+        assert!(err.contains("preexisting"));
+
+        let err = dedup_stage
+            .output_format
+            .validate(
+                r#"{"concerns": [], "dismissed_concerns": [{"description": "Safe", "reasoning": "Checked", "locations": []}]}"#,
+                &state,
+            )
+            .expect_err("dismissed concern without proof location must fail");
+        assert!(err.contains("dismissed_concerns[0]"));
+        assert!(err.contains("move the candidate issue to 'concerns'"));
+
+        let err = cr_stage
+            .output_format
+            .validate(r#"{"concerns": [{"file": "a.rs"}]}"#, &state)
+            .expect_err("concern missing description must fail");
+        assert!(err.contains("concerns[0]"));
+
+        // Malformed findings in verification must fail.
+        let err = ver_stage
+            .output_format
+            .validate(r#"{"findings": [{"file": "a.rs"}]}"#, &state)
+            .expect_err("finding missing problem must fail");
+        assert!(err.contains("findings[0]"));
+
+        let err = ver_stage
+            .output_format
+            .validate(
+                r#"{"findings": [{"problem": "workflow: bug", "severity": "High", "severity_explanation": "explain", "preexisting": false}]}"#,
+                &state,
+            )
+            .expect_err("finding missing locations must fail");
+        assert!(err.contains("locations"));
+
+        // Valid outputs succeed.
+        assert!(
+            dedup_stage
+                .output_format
+                .validate(
+                    r#"{"concerns": [{"description": "Missing check", "reasoning": "Unchecked", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#,
+                    &state
+                )
+                .is_ok()
+        );
+        assert!(
+            cr_stage
+                .output_format
+                .validate(
+                    r#"{"concerns": [{"description": "Missing check", "reasoning": "Unchecked", "preexisting": false, "locations": []}]}"#,
+                    &state
+                )
+                .is_ok()
+        );
+        assert!(
+            ver_stage
+                .output_format
+                .validate(
+                    r#"{"findings": [{"problem": "workflow: missing check", "severity": "High", "severity_explanation": "Unchecked return value", "preexisting": false, "locations": []}]}"#,
+                    &state
+                )
+                .is_ok()
+        );
     }
 }
