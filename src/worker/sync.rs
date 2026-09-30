@@ -18,7 +18,10 @@ impl GitSyncWorker {
         info!("GitSyncWorker started. Will sync remotes periodically.");
         loop {
             if let Err(e) = self.sync_all_remotes().await {
-                error!("GitSyncWorker failed during sync cycle: {}", e);
+                error!(
+                    "GitSyncWorker failed during sync cycle: {}",
+                    crate::utils::redact_secret(&e.to_string())
+                );
             }
             // Sleep for 1 hour before checking again.
             // refresh_remote applies the per-remote fetch interval, the
@@ -38,7 +41,7 @@ impl GitSyncWorker {
             .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = crate::utils::redact_secret(&String::from_utf8_lossy(&output.stderr));
             error!("GitSyncWorker: Failed to list git remotes: {}", stderr);
             return Err(anyhow::anyhow!("Failed to list remotes"));
         }
@@ -107,9 +110,13 @@ impl GitSyncWorker {
                     backed_off += 1;
                 }
                 Err(e) => {
-                    error!("GitSyncWorker: Failed to sync remote {}: {}", remote, e);
+                    let message = crate::utils::redact_secret(&e.to_string());
+                    error!(
+                        "GitSyncWorker: Failed to sync remote {}: {}",
+                        remote, message
+                    );
                     failed += 1;
-                    record_failure(&e.to_string());
+                    record_failure(&message);
                 }
             }
         }
@@ -141,6 +148,131 @@ impl GitSyncWorker {
                 fetched, skipped, backed_off, stale, failed
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = BufferWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferWriter(Arc::clone(&self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_all_remotes_redacts_secrets_in_logs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+
+        let init = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+        assert!(init.status.success(), "git init failed");
+
+        let secret_url =
+            "https://myuser:secret_token_123@127.0.0.1:0/repo.git?token=api_secret_456";
+        let add = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["remote", "add", "secret-remote", secret_url])
+            .output()
+            .await?;
+        assert!(add.status.success(), "git remote add failed");
+
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+
+        let worker = GitSyncWorker::new(repo_path);
+        worker
+            .sync_all_remotes()
+            .with_subscriber(subscriber)
+            .await?;
+
+        let logs = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+        assert!(
+            logs.contains("GitSyncWorker: Failed to sync remote secret-remote:"),
+            "expected failure log in: {logs}"
+        );
+        assert!(
+            logs.contains("[REDACTED]"),
+            "expected redacted marker in: {logs}"
+        );
+        assert!(
+            !logs.contains("secret_token_123"),
+            "secret password leaked in logs: {logs}"
+        );
+        assert!(
+            !logs.contains("myuser"),
+            "secret username leaked in logs: {logs}"
+        );
+        assert!(
+            !logs.contains("api_secret_456"),
+            "secret token parameter leaked in logs: {logs}"
+        );
+
+        // Also verify redaction when `git remote` itself fails with a secret in stderr.
+        // Include the secret token in both the working directory path and the `gitdir:`
+        // target path so Git's error message contains it whether Git prints the `.git`
+        // file path or the resolved `gitdir` target path.
+        let bad_dir = tempfile::tempdir()?;
+        let sub_dir = bad_dir.path().join("token=api_secret_456");
+        std::fs::create_dir(&sub_dir)?;
+        std::fs::write(
+            sub_dir.join(".git"),
+            "gitdir: /nonexistent/token=api_secret_456\n",
+        )?;
+        let bad_buffer = LogBuffer::default();
+        let bad_subscriber = tracing_subscriber::fmt()
+            .with_writer(bad_buffer.clone())
+            .with_ansi(false)
+            .finish();
+        let bad_worker = GitSyncWorker::new(sub_dir);
+        let res = bad_worker
+            .sync_all_remotes()
+            .with_subscriber(bad_subscriber)
+            .await;
+        assert!(res.is_err());
+
+        let bad_logs = String::from_utf8_lossy(&bad_buffer.0.lock().unwrap()).into_owned();
+        assert!(
+            bad_logs.contains("GitSyncWorker: Failed to list git remotes:"),
+            "expected list remotes failure log in: {bad_logs}"
+        );
+        assert!(
+            bad_logs.contains("[REDACTED]"),
+            "expected redacted marker in: {bad_logs}"
+        );
+        assert!(
+            !bad_logs.contains("api_secret_456"),
+            "secret token parameter leaked in list remotes logs: {bad_logs}"
+        );
+
         Ok(())
     }
 }
