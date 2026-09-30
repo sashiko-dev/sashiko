@@ -108,7 +108,9 @@ auditable.
       error-handling omissions (`let _ = ...` where failure should be logged or
       propagated).
     - Commit hygiene and test gaps: missing `Signed-off-by`, missing commit
-      rationale, or missing unit test coverage for new behavior.
+      rationale on non-trivial code changes (note: self-explanatory config,
+      deployment, mailing-list, or email-policy additions do not need extra
+      rationale), or missing unit test coverage for new behavior.
 
 ## Low
 
@@ -137,5 +139,6 @@ auditable.
 > clippy` reports on source files are not findings at all. They are verified
 > deterministically before a human ever sees them — never vibe-guess build bugs.
 > However, commit message issues (missing real-name `Signed-off-by`, missing
-> description of what/why, unwrapped prose lines > 85 chars, backticks in commit
-> message) are NOT checked by `cargo fmt` and MUST be reported.
+> description of what/why on non-trivial changes, unwrapped prose lines > 85
+> chars, backticks in commit message) are NOT checked by `cargo fmt` and MUST
+> be reported.

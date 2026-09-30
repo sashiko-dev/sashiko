@@ -28,16 +28,21 @@ else clippy emits on Rust source files.
 
 Note: `make lint` does NOT check commit messages. Commit message defects —
 such as missing or cryptic/nickname `Signed-off-by` trailers, missing
-explanation of *what* and *why*, genuinely unwrapped prose lines exceeding ~85
-characters, backticks quoting code/symbols in the commit message, or internal
-metadata tags (`TAG=`, `CONV=`) — are valid findings and must NOT be dismissed
-as linter issues. However, do NOT nitpick commit message lines that are 73-80
-characters long or lines that exceed the margin for reasonable reasons (quoting
-code, compiler/log output, URLs, or file paths).
+explanation of *what* and *why* on non-trivial code changes, genuinely
+unwrapped prose lines exceeding ~85 characters, backticks quoting code/symbols
+in the commit message, or internal metadata tags (`TAG=`, `CONV=`) — are valid
+findings and must NOT be dismissed as linter issues. However, do NOT nitpick
+commit message lines that are 73-80 characters long or lines that exceed the
+margin for reasonable reasons (quoting code, compiler/log output, URLs, or file
+paths), and do NOT demand additional rationale for trivial or self-explanatory
+commits (such as adding a mailing list to track, adding an email policy entry
+or subsystem git remote, simple configuration/deployment updates, or typo fixes)
+where a brief one-sentence description is already self-sufficient.
 
 - Bad: "Consider using `iter()` instead of `into_iter()` here."
 - Bad: "This `clone()` looks unnecessary."
 - Bad: "The commit message body has lines that are 74 characters long."
+- Bad: "The commit message adds a mailing list to track without explaining why."
 - Good: "This `clone()` copies the full patch body on every stage, and
   `max_input_tokens` is already the binding constraint" — a consequence, not a
   style preference.

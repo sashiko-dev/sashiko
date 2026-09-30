@@ -118,9 +118,14 @@ Every commit message must meet Sashiko's repository standards:
 - **Real-Name Signed-off-by (DCO):** Every commit must include a
   `Signed-off-by: Full Name <email>` trailer with the author's real human name
   (not a cryptic nickname, single-word handle, username, or AI/bot placeholder).
-- **Clear Description (What & Why):** The commit body must explain both *what*
-  the change does and *why* it is necessary (motivation/rationale), rather than
-  having an empty body or merely repeating the diff.
+- **Clear Description (When Non-Trivial):** Non-trivial code, architectural, or
+  behavior changes must explain both *what* the change does and *why* it is
+  necessary (motivation/rationale), rather than having an empty body or merely
+  repeating a complex diff. However, trivial or self-explanatory commits — such
+  as adding a mailing list to track, configuring an email policy or subsystem
+  git remote, simple configuration/deployment updates, or typo fixes — are
+  completely self-sufficient with a brief one-sentence description and must NOT
+  be flagged for lacking additional rationale.
 - **Formatting & Wrapping:** Commit messages must never use backticks (`) to
   quote code, function names, or variables, and must not contain internal metadata
   tags (such as `TAG=` or `CONV=`). Do NOT nitpick minor line-length overruns
@@ -161,8 +166,8 @@ Evaluate every change for fundamental engineering soundness:
   closed enums, Cargo dependency/feature issues, or compiler/clippy lints. If
   you think a patch fails to compile, you have misread the code or missed a
   definition, re-export, macro, or trait impl — do NOT report it. However,
-  *commit message* defects (missing/nickname SOB, missing rationale, unwrapped
-  prose lines > 85 chars, backticks in commit message) are NOT caught by
-  `cargo fmt` and MUST be reported.
+  *commit message* defects (missing/nickname SOB, missing rationale on
+  non-trivial code changes, unwrapped prose lines > 85 chars, backticks in
+  commit message) are NOT caught by `cargo fmt` and MUST be reported.
 - **Prefer one proven finding to three speculative ones.** Every false positive
   spends the author's trust.
