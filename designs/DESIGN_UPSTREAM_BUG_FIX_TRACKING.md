@@ -1,15 +1,16 @@
-# Design: Optional Linux Bug Database and Economical Upstream Fix Tracking
+# Design: Optional Bug Database and Economical Upstream Fix Tracking
 
 ## 1. Context & Motivation
 
-Sashiko discovers pre-existing bugs in surrounding code while reviewing patches and tracks them in a dedicated bugs database (`bugs`, `bug_occurrences`, `bug_enrichments`), processed asynchronously by `BugWorker` (`src/worker/bug_worker.rs`) and `workflows::linux_bug` (`src/workflows/linux_bug.rs`).
+Sashiko discovers pre-existing bugs in surrounding code while reviewing patches and tracks them in a dedicated bugs database (`bugs`, `bug_occurrences`, `bug_enrichments`), processed asynchronously by `BugWorker` (`src/worker/bug_worker.rs`) and `workflows::linux_bug` (`src/workflows/linux_bug.rs`) across both supported projects (`ProjectId::Linux` and `ProjectId::Sashiko`).
 
 Two operational requirements have emerged:
-1. **Optional Bug Database (Disabled by Default):** Not all Sashiko deployments track pre-existing upstream bugs (for example, `sashiko.sashiko.dev` or lightweight self-hosted instances). By default, pre-existing issues discovered during patch review should be ignored rather than reported as patch findings or queued for standalone bug analysis.
-2. **Economical Periodic Upstream Fix Tracking:** For deployments that enable the bug database (such as `sashiko.dev`), open bugs verified at an earlier mainline commit (`verified_on_sha`) may subsequently be fixed in Linus Torvalds's mainline tree (`master`). Re-running the full multi-stage bug verification LLM pipeline across all open bugs after every mainline pull would consume prohibitive token budgets because the vast majority of open bugs reside in files that have not been modified since `verified_on_sha`.
+1. **Optional Bug Database (Disabled by Default):** Not all Sashiko deployments track pre-existing upstream bugs (for example, lightweight local or self-hosted instances). By default, pre-existing issues discovered during patch review should be ignored rather than reported as patch findings or queued for standalone bug analysis.
+2. **Economical Periodic Upstream Fix Tracking:** For deployments that enable the bug database (`sashiko.dev` for the Linux kernel and `sashiko.sashiko.dev` for Sashiko itself), open bugs verified at an earlier mainline commit (`verified_on_sha`) may subsequently be fixed upstream (`master` in Linus Torvalds's tree or `main` in `sashiko-dev/sashiko`). Re-running the full multi-stage bug verification LLM pipeline across all open bugs after every mainline pull would consume prohibitive token budgets because the vast majority of open bugs reside in files that have not been modified since `verified_on_sha`.
 
 This design specifies:
-- Making the Linux bug database opt-in (`[linux_bug] enabled = false` by default), ensuring pre-existing issues are excluded from patch review findings and ignored when the bug database is disabled, and updating deployment manifests accordingly.
+- Making the bug database opt-in (`[linux_bug] enabled = false` by default), ensuring pre-existing issues are excluded from patch review findings and ignored when the bug database is disabled, and enabling it in the production deployment manifests (`deployment/sashiko.dev` and `deployment/sashiko.sashiko.dev`).
+- Supporting both `ProjectId::Linux` (C kernel code, `MAINTAINERS`, `prompts/severity.md`, `torvalds/linux` `master`) and `ProjectId::Sashiko` (Rust/SQL/HTML/YAML code, module-based subsystems, `prompts/sashiko/severity.md`, `sashiko-dev/sashiko` `main`) in the bug triage and upstream fix verification workflows.
 - A three-tier periodic upstream fix checker in `BugWorker` that uses deterministic git history filtering to handle $>95\%$ of open bugs with **zero LLM tokens**, invoking a lightweight single-stage LLM fix verifier only when commits in `<verified_on_sha>..<linus_sha>` actually touch a bug's source files or reference its introducing commit.
 
 ---
@@ -36,22 +37,22 @@ fix_check_batch_size = 50
 
 ### 2.2 Exclusion of Pre-existing Issues from Patch Findings
 
-During `linux_patch_review` (`src/workflows/linux_patch_review.rs`), `conflict_resolution_stage` already routes `preexisting: true` items exclusively to `state.concerns` while excluding them from `state.findings`. However, `verification_stage` previously appended `preexisting: true` items to `state.concerns` *and* left them in `state.findings`, causing pre-existing bugs to appear in inline patch review emails.
+During `linux_patch_review` (`src/workflows/linux_patch_review.rs`), `conflict_resolution_stage` already routes `preexisting: true` items exclusively to `state.concerns` while excluding them from `state.findings` (matching `sashiko_patch_review.rs`). However, `verification_stage` in `linux_patch_review.rs` previously appended `preexisting: true` items to `state.concerns` *and* left them in `state.findings`, causing pre-existing bugs to appear in inline patch review emails.
 
-`verification_stage` is updated to match `conflict_resolution_stage`:
+`verification_stage` is updated to match `conflict_resolution_stage` and `sashiko_patch_review.rs`:
 - Any finding marked `preexisting: true` is converted into a concern in `state.concerns` and excluded from `state.findings`.
-- In `Reviewer::process_issue` (`src/reviewer.rs`), when `!self.settings.linux_bug.enabled`, `concerns` extracted from reviews are ignored instead of creating `bugs` and `bug_occurrences` rows.
+- In `src/reviewer.rs`, when `!ctx.settings.linux_bug.enabled`, `concerns` extracted from reviews are ignored instead of creating `bugs` and `bug_occurrences` rows.
 
 ### 2.3 Worker, API, UI, and Deployment Gating
 
-- **Background Worker (`src/main.rs`):** `BugWorker` is spawned only when `settings.linux_bug.enabled` is `true`.
+- **Background Worker (`src/main.rs`):** `BugWorker` is spawned only when `settings.linux_bug.enabled` is `true`, configured with `.with_project(settings.project.kind)`.
 - **REST API (`src/api.rs`):**
   - `GET /api/config` includes `"bugs_enabled": state.settings.linux_bug.enabled`.
-  - `POST /api/bug/analyze` returns `404 Not Found` (or `403 Forbidden`) when `state.settings.linux_bug.enabled` is `false`.
+  - `POST /api/bug/analyze` returns `404 Not Found` when `state.settings.linux_bug.enabled` is `false`.
 - **Frontend (`static/index.html`):** The `#btn-bugs` navigation button is hidden when `config.bugs_enabled === false`.
 - **Deployment Manifests:**
-  - `Settings.toml`, `docs/examples/Settings.example.toml`, and `deployment/sashiko.sashiko.dev` leave `linux_bug.enabled = false`.
-  - `deployment/sashiko.dev/base/app/sashiko-k8s.yaml` sets `SASHIKO__LINUX_BUG__ENABLED: "true"` in `sashiko-config` so the primary Linux kernel instance continues tracking pre-existing bugs and periodic upstream fixes.
+  - `Settings.toml` leaves `linux_bug.enabled = false` by default.
+  - `deployment/sashiko.dev/base/app/sashiko-k8s.yaml` and `deployment/sashiko.sashiko.dev/base/app/sashiko-self-k8s.yaml` set `SASHIKO__LINUX_BUG__ENABLED: "true"` so both production instances track pre-existing bugs and periodic upstream fixes.
 
 ---
 

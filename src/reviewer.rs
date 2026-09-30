@@ -1903,23 +1903,40 @@ impl Reviewer {
                                                 }
                                             }
                                         }
-                                        let matched_subsystems = if let Some(mindex) =
-                                            crate::maintainers::get_global_maintainers()
+                                        let project = ctx.settings.project.kind.unwrap_or_default();
+                                        let matched_subsystems: Vec<_> = if project
+                                            .uses_maintainers()
                                         {
-                                            mindex.match_files(&source_files)
-                                        } else if let Ok(mindex) =
-                                            crate::maintainers::MaintainersIndex::from_top_of_trunk(
-                                                &ctx.settings.git.repository_path,
-                                            )
-                                        {
-                                            mindex.match_files(&source_files)
+                                            let names = if let Some(mindex) =
+                                                crate::maintainers::get_global_maintainers()
+                                            {
+                                                mindex.match_files(&source_files)
+                                            } else if let Ok(mindex) =
+                                                crate::maintainers::MaintainersIndex::from_top_of_trunk(
+                                                    &ctx.settings.git.repository_path,
+                                                )
+                                            {
+                                                mindex.match_files(&source_files)
+                                            } else {
+                                                Vec::new()
+                                            };
+                                            names
+                                                .into_iter()
+                                                .map(
+                                                    crate::db::AttributedSubsystem::from_maintainers,
+                                                )
+                                                .collect()
                                         } else {
-                                            Vec::new()
-                                        };
-                                        let matched_subsystems: Vec<_> = matched_subsystems
+                                            crate::workflows::linux_bug::extract_directory_subsystems_for_project(
+                                                &source_files,
+                                                project,
+                                            )
                                             .into_iter()
-                                            .map(crate::db::AttributedSubsystem::from_maintainers)
-                                            .collect();
+                                            .map(
+                                                crate::db::AttributedSubsystem::from_path_prefix,
+                                            )
+                                            .collect()
+                                        };
 
                                         let input = crate::api::BugInput {
                                             problem,
@@ -1938,23 +1955,24 @@ impl Reviewer {
                                         );
                                         let mainline_remote =
                                             ctx.baseline_registry.mainline_remote_name();
-                                        let mainline_ref = format!("{}/master", mainline_remote);
-                                        let mainline_sha = match get_commit_hash(
-                                            &repo_path,
-                                            &mainline_ref,
-                                        )
-                                        .await
-                                        {
-                                            Ok(sha) => Some(sha),
-                                            Err(_) => {
-                                                match get_commit_hash(&repo_path, "master").await {
-                                                    Ok(sha) => Some(sha),
-                                                    Err(_) => get_commit_hash(&repo_path, "HEAD")
-                                                        .await
-                                                        .ok(),
-                                                }
+                                        let candidate_refs = [
+                                            format!("{}/master", mainline_remote),
+                                            format!("{}/main", mainline_remote),
+                                            "origin/master".to_string(),
+                                            "origin/main".to_string(),
+                                            "master".to_string(),
+                                            "main".to_string(),
+                                            "HEAD".to_string(),
+                                        ];
+                                        let mut mainline_sha = None;
+                                        for candidate_ref in &candidate_refs {
+                                            if let Ok(sha) =
+                                                get_commit_hash(&repo_path, candidate_ref).await
+                                            {
+                                                mainline_sha = Some(sha);
+                                                break;
                                             }
-                                        };
+                                        }
 
                                         let mut toolbox = None;
                                         let base_path = if repo_path.exists() {
@@ -1970,19 +1988,29 @@ impl Reviewer {
                                             }
                                             toolbox = Some(Arc::new(tb));
                                         }
+                                        let review_tool = match project {
+                                            crate::project::ProjectId::Linux => {
+                                                "sashiko:linux_patch_review"
+                                            }
+                                            crate::project::ProjectId::Sashiko => {
+                                                "sashiko:sashiko_patch_review"
+                                            }
+                                        };
                                         let discovery_db = ctx.db.with_bug_actor(
                                             ctx.settings.project.attribution(),
-                                            "sashiko:linux_patch_review",
+                                            review_tool,
                                             Some(ctx.provider.get_capabilities().model_name),
                                         );
-                                        if let Err(e) = crate::workflows::linux_bug::process_issue(
-                                            ctx.provider.as_ref(),
-                                            toolbox,
-                                            &discovery_db,
-                                            input,
-                                            Some("bug"),
-                                        )
-                                        .await
+                                        if let Err(e) =
+                                            crate::workflows::linux_bug::process_issue_for_project(
+                                                ctx.provider.as_ref(),
+                                                toolbox,
+                                                &discovery_db,
+                                                input,
+                                                Some("bug"),
+                                                project,
+                                            )
+                                            .await
                                         {
                                             warn!(
                                                 "Failed to queue candidate pre-existing bug: {}",

@@ -35,6 +35,7 @@ use crate::ai::vector_search::{
 };
 use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool, ToolCall};
 use crate::db::{AttributedSubsystem, Bug, Database, NewBug, Severity};
+use crate::project::ProjectId;
 use crate::toolbox::ToolBox;
 
 /// Named stages of the Linux kernel bug pipeline, in execution order.
@@ -145,6 +146,7 @@ pub struct SeverityJson {
 }
 
 struct VerifySession<'a> {
+    project: ProjectId,
     title: &'a str,
     description: &'a str,
     subsystem: &'a str,
@@ -162,12 +164,20 @@ impl LlmSession for VerifySession<'_> {
 
     fn system_prompt(&self) -> String {
         let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
-        format!(
-            "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
-            You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
-            Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
-            CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
-        )
+        match self.project {
+            ProjectId::Linux => format!(
+                "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
+                You are an expert Linux kernel maintainer. Your task is to rigorously verify a candidate Linux kernel defect or vulnerability against the top-of-trunk of Linus Torvalds' main Linux kernel tree.\n\
+                Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
+                CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+            ),
+            ProjectId::Sashiko => format!(
+                "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
+                You are an expert Sashiko maintainer and Rust systems engineer. Your task is to rigorously verify a candidate Sashiko defect or vulnerability against the top-of-trunk of the Sashiko repository (`origin/main`).\n\
+                Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
+                CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+            ),
+        }
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -191,8 +201,9 @@ impl LlmSession for VerifySession<'_> {
             format!("Affected Files: {}\n", self.affected_files.join(", "))
         };
 
-        format!(
-            "{stage_heading}
+        match self.project {
+            ProjectId::Linux => format!(
+                "{stage_heading}
 
 Candidate Defect to Verify:
 Title: {title}
@@ -219,14 +230,51 @@ Return ONLY a valid JSON object matching this schema:
   \"impact_severity\": \"High\",
   \"relevant_code_locations\": [ {{\"file\": \"path/to/file.c\", \"function_or_symbol\": \"function_name\", \"line\": 123}} ]
 }}",
-            stage_heading = BugStage::Verification.heading(),
-            master_sha = self.master_sha,
-            title = self.title,
-            subsystem = self.subsystem,
-            description = self.description,
-            locations = loc_str,
-            prefetch_block = prefetch_block,
-        )
+                stage_heading = BugStage::Verification.heading(),
+                master_sha = self.master_sha,
+                title = self.title,
+                subsystem = self.subsystem,
+                description = self.description,
+                locations = loc_str,
+                prefetch_block = prefetch_block,
+            ),
+            ProjectId::Sashiko => format!(
+                "{stage_heading}
+
+Candidate Defect to Verify:
+Title: {title}
+Subsystem: {subsystem}
+{files_str}Description:
+{description}
+Locations:
+{locations}
+{prefetch_block}
+Task:
+1. Verify the problem against the mainline code shown above and top-of-trunk of the Sashiko `main` branch (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `main` to check the actual top-of-trunk.
+2. Scope your verification to the relevant functions and modules. Do not wander across unrelated files.
+3. Determine if the issue is a genuine, reachable defect in the codebase.
+4. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
+5. If it is a confirmed bug, set \"is_false_positive\": false, \"refutation_evidence\": null, provide your step-by-step proof in \"verification_reasoning\", carry forward and refine the verified code locations in \"relevant_code_locations\", and optionally suggest an \"impact_severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\").
+
+EFFICIENCY LIMIT REQUIREMENT: Limit your investigation to the core defect. Do not trace unrelated history. You have a strict limit on tool calls; be extremely efficient instead of wandering the history.
+
+Return ONLY a valid JSON object matching this schema:
+{{
+  \"verification_reasoning\": \"1. Call chain... 2. Condition...\",
+  \"is_false_positive\": false,
+  \"refutation_evidence\": null,
+  \"impact_severity\": \"High\",
+  \"relevant_code_locations\": [ {{\"file\": \"src/reviewer.rs\", \"function_or_symbol\": \"function_name\", \"line\": 123}} ]
+}}",
+                stage_heading = BugStage::Verification.heading(),
+                master_sha = self.master_sha,
+                title = self.title,
+                subsystem = self.subsystem,
+                description = self.description,
+                locations = loc_str,
+                prefetch_block = prefetch_block,
+            ),
+        }
     }
 
     fn tools(&self) -> Option<Vec<AiTool>> {
@@ -262,6 +310,7 @@ Return ONLY a valid JSON object matching this schema:
 // ---------------------------------------------------------------------------
 
 struct NormalizeSession<'a> {
+    project: ProjectId,
     problem: &'a str,
     reasoning: &'a str,
     locations: &'a str,
@@ -276,15 +325,26 @@ impl LlmSession for NormalizeSession<'_> {
     type Output = NormalizationJson;
 
     fn system_prompt(&self) -> String {
-        format!(
-            "You are an expert Linux kernel maintainer and technical editor. Your role is to normalize a candidate Linux kernel defect into canonical form.\n\
-            You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
-            The target codebase is Linus Torvalds' mainline Linux kernel tree at top-of-trunk commit `{master_sha}`.\n\
-            Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
-            - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
-            - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional subsystem commit prefix used by maintainers (e.g. 'btrfs:', 'net:', 'mm:', 'drm/i915:').",
-            master_sha = self.master_sha
-        )
+        match self.project {
+            ProjectId::Linux => format!(
+                "You are an expert Linux kernel maintainer and technical editor. Your role is to normalize a candidate Linux kernel defect into canonical form.\n\
+                You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
+                The target codebase is Linus Torvalds' mainline Linux kernel tree at top-of-trunk commit `{master_sha}`.\n\
+                Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
+                - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
+                - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional subsystem commit prefix used by maintainers (e.g. 'btrfs:', 'net:', 'mm:', 'drm/i915:').",
+                master_sha = self.master_sha
+            ),
+            ProjectId::Sashiko => format!(
+                "You are an expert Sashiko maintainer and technical editor. Your role is to normalize a candidate Sashiko defect into canonical form.\n\
+                You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
+                The target codebase is the Sashiko repository at top-of-trunk commit `{master_sha}`.\n\
+                Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
+                - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
+                - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional module commit prefix used in Sashiko (e.g. 'workflows:', 'db:', 'reviewer:', 'api:', 'toolbox:', 'worker:').",
+                master_sha = self.master_sha
+            ),
+        }
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -294,8 +354,9 @@ impl LlmSession for NormalizeSession<'_> {
             .map(|h| format!("\n{}\n", h))
             .unwrap_or_default();
 
-        format!(
-            "{stage_heading}
+        match self.project {
+            ProjectId::Linux => format!(
+                "{stage_heading}
 
 Candidate Bug Details:
 Original Problem: {problem}
@@ -323,13 +384,50 @@ Return ONLY a valid JSON object matching this schema:
   \"affected_source_files\": [\"fs/btrfs/ordered-data.c\"],
   \"affected_symbols\": [\"btrfs_cleanup_ordered_extents\"]
 }}",
-            stage_heading = BugStage::Normalization.heading(),
-            problem = self.problem,
-            reasoning = self.reasoning,
-            locations = self.locations,
-            hint = hint_section,
-            master_sha = self.master_sha
-        )
+                stage_heading = BugStage::Normalization.heading(),
+                problem = self.problem,
+                reasoning = self.reasoning,
+                locations = self.locations,
+                hint = hint_section,
+                master_sha = self.master_sha
+            ),
+            ProjectId::Sashiko => format!(
+                "{stage_heading}
+
+Candidate Bug Details:
+Original Problem: {problem}
+Reasoning: {reasoning}
+Reported Locations:
+{locations}
+{hint}
+Target Mainline Commit: {master_sha}
+
+Task:
+1. Determine the conventional module commit prefix for this defect (e.g. 'workflows', 'db', 'reviewer', 'api', 'toolbox', 'worker', 'cli', 'prompts', 'settings', 'forge'). Use git_log on the affected file(s) at revision '{master_sha}' to observe the standard commit prefix used in Sashiko.
+2. Formulate a canonical title matching Sashiko commit conventions: '<subsystem_prefix>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+   - CRITICAL: This is a bug report title describing an existing defect, NOT a patch or commit title. Do NOT use patch/fix action verbs like 'fix', 'resolve', 'prevent', 'avoid', or 'handle'. State the defect directly (e.g. 'reviewer: leaked worktree on early return in run_review()', NEVER 'reviewer: fix leaked worktree in run_review()').
+3. Provide a detailed, structured canonical description:
+   - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect.
+   - Call Chain / Execution Path: Detail the complete chain of events/calls leading up to the problem.
+   - Failure Mechanism: Detail the exact root cause and how the fault, state inconsistency, or resource leak occurs.
+   - Impact: Consequence of the failure (e.g. stuck review, panic, database lock contention, leaked worktree, silent data drop).
+4. Verify and list the affected source files and symbols in the mainline tree at commit '{master_sha}'.
+
+Return ONLY a valid JSON object matching this schema:
+{{
+  \"canonical_title\": \"reviewer: leaked worktree on early return in run_review()\",
+  \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
+  \"affected_source_files\": [\"src/reviewer.rs\"],
+  \"affected_symbols\": [\"run_review\"]
+}}",
+                stage_heading = BugStage::Normalization.heading(),
+                problem = self.problem,
+                reasoning = self.reasoning,
+                locations = self.locations,
+                hint = hint_section,
+                master_sha = self.master_sha
+            ),
+        }
     }
 
     fn tools(&self) -> Option<Vec<AiTool>> {
@@ -422,22 +520,48 @@ pub fn extract_title_prefix(title: &str) -> &str {
 
 /// Extracts coarse directory-based subsystem prefixes (e.g. "fs/btrfs" or "net/core") from file paths.
 pub fn extract_directory_subsystems(files: &[String]) -> Vec<String> {
+    extract_directory_subsystems_for_project(files, ProjectId::Linux)
+}
+
+/// Extracts coarse directory-based subsystem prefixes for `project` from file paths.
+pub fn extract_directory_subsystems_for_project(
+    files: &[String],
+    project: ProjectId,
+) -> Vec<String> {
     let mut subs = Vec::new();
     for file in files {
-        let parts: Vec<&str> = file.split('/').collect();
-        let sub = if parts.len() >= 2 {
-            format!("{}/{}", parts[0], parts[1])
-        } else if !parts.is_empty() && !parts[0].is_empty() {
-            parts[0].to_string()
-        } else {
-            continue;
+        let parts: Vec<&str> = file.split('/').filter(|p| !p.is_empty()).collect();
+        let sub = match project {
+            ProjectId::Linux => {
+                if parts.len() >= 2 {
+                    format!("{}/{}", parts[0], parts[1])
+                } else if !parts.is_empty() {
+                    parts[0].to_string()
+                } else {
+                    continue;
+                }
+            }
+            ProjectId::Sashiko => {
+                if parts.first() == Some(&"src") && parts.len() >= 2 {
+                    parts[1].strip_suffix(".rs").unwrap_or(parts[1]).to_string()
+                } else if parts.len() >= 2 {
+                    parts[0].to_string()
+                } else if !parts.is_empty() {
+                    parts[0].strip_suffix(".rs").unwrap_or(parts[0]).to_string()
+                } else {
+                    continue;
+                }
+            }
         };
         if !subs.contains(&sub) {
             subs.push(sub);
         }
     }
     if subs.is_empty() {
-        vec!["kernel".to_string()]
+        match project {
+            ProjectId::Linux => vec!["kernel".to_string()],
+            ProjectId::Sashiko => vec!["sashiko".to_string()],
+        }
     } else {
         subs
     }
@@ -451,10 +575,25 @@ pub fn extract_directory_subsystems(files: &[String]) -> Vec<String> {
 /// lookup order is unchanged: an available index wins, a directory prefix is
 /// the fallback, and a name the caller supplied is only used when no index can
 /// be consulted at all.
+#[cfg(test)]
 fn resolve_official_subsystems(
     tools: Option<&ToolBox>,
     input_subsystems: &[AttributedSubsystem],
     verified_files: &[String],
+) -> Vec<AttributedSubsystem> {
+    resolve_official_subsystems_for_project(
+        tools,
+        input_subsystems,
+        verified_files,
+        ProjectId::Linux,
+    )
+}
+
+fn resolve_official_subsystems_for_project(
+    tools: Option<&ToolBox>,
+    input_subsystems: &[AttributedSubsystem],
+    verified_files: &[String],
+    project: ProjectId,
 ) -> Vec<AttributedSubsystem> {
     let from_index = |index: &crate::maintainers::MaintainersIndex| {
         let matched = index.match_files(verified_files);
@@ -466,30 +605,39 @@ fn resolve_official_subsystems(
         })
     };
     let from_paths = || {
-        extract_directory_subsystems(verified_files)
+        extract_directory_subsystems_for_project(verified_files, project)
             .into_iter()
             .map(AttributedSubsystem::from_path_prefix)
             .collect::<Vec<_>>()
     };
 
-    if let Some(tb) = tools {
+    if project.uses_maintainers() {
+        if let Some(tb) = tools {
+            return match crate::maintainers::get_global_maintainers() {
+                Some(index) => from_index(&index).unwrap_or_else(from_paths),
+                None => {
+                    match crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()) {
+                        Ok(index) => from_index(&index).unwrap_or_else(from_paths),
+                        Err(_) => from_paths(),
+                    }
+                }
+            };
+        }
+
+        if !input_subsystems.is_empty() {
+            return input_subsystems.to_vec();
+        }
+
         return match crate::maintainers::get_global_maintainers() {
             Some(index) => from_index(&index).unwrap_or_else(from_paths),
-            None => match crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()) {
-                Ok(index) => from_index(&index).unwrap_or_else(from_paths),
-                Err(_) => from_paths(),
-            },
+            None => from_paths(),
         };
     }
 
     if !input_subsystems.is_empty() {
         return input_subsystems.to_vec();
     }
-
-    match crate::maintainers::get_global_maintainers() {
-        Some(index) => from_index(&index).unwrap_or_else(from_paths),
-        None => from_paths(),
-    }
+    from_paths()
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +645,7 @@ fn resolve_official_subsystems(
 // ---------------------------------------------------------------------------
 
 struct DedupSession<'a> {
+    project: ProjectId,
     candidate_problem: &'a str,
     candidate_locations: Option<&'a Value>,
     candidate_subsystems: &'a [String],
@@ -509,12 +658,20 @@ impl LlmSession for DedupSession<'_> {
     type Output = DedupJson;
 
     fn system_prompt(&self) -> String {
-        "You are an expert Linux kernel maintainer responsible for defect tracking and deduplication.\n\
+        match self.project {
+            ProjectId::Linux => "You are an expert Linux kernel maintainer responsible for defect tracking and deduplication.\n\
         You will compare a newly verified Linux kernel bug against a list of known Linux kernel bugs in the codebase.\n\
         Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
         IMPORTANT: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
         Output raw JSON only."
-            .to_string()
+                .to_string(),
+            ProjectId::Sashiko => "You are an expert Sashiko maintainer responsible for defect tracking and deduplication.\n\
+        You will compare a newly verified Sashiko bug against a list of known Sashiko bugs in the codebase.\n\
+        Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
+        IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
+        Output raw JSON only."
+                .to_string(),
+        }
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -561,9 +718,14 @@ impl LlmSession for DedupSession<'_> {
             self.candidate_subsystems.join(", ")
         };
 
+        let bug_header = match self.project {
+            ProjectId::Linux => "Newly Verified Linux Kernel Bug:",
+            ProjectId::Sashiko => "Newly Verified Sashiko Bug:",
+        };
+
         format!(
             "{stage_heading}\n\n\
-            Newly Verified Linux Kernel Bug:\n\
+            {bug_header}\n\
             Problem: {problem}\n\
             Subsystems: {subsystems}\n\
             Locations:\n{locations}\n\n\
@@ -582,6 +744,7 @@ impl LlmSession for DedupSession<'_> {
               \"reasoning\": \"Both describe the same missing unlock in foo_cleanup()\"\n\
             }}",
             stage_heading = BugStage::Deduplication.heading(),
+            bug_header = bug_header,
             problem = self.candidate_problem,
             subsystems = cand_subs,
             locations = loc_str,
@@ -630,6 +793,7 @@ impl LlmSession for DedupSession<'_> {
 // ---------------------------------------------------------------------------
 
 struct TracingSession<'a> {
+    project: ProjectId,
     input: &'a BugInput,
     master_sha: String,
     verification_reasoning: String,
@@ -643,9 +807,14 @@ impl LlmSession for TracingSession<'_> {
     type Output = TracingJson;
 
     fn system_prompt(&self) -> String {
-        "You are an expert Linux kernel maintainer. Your task is to determine the exact commit that introduced a verified kernel defect.\n\
+        match self.project {
+            ProjectId::Linux => "You are an expert Linux kernel maintainer. Your task is to determine the exact commit that introduced a verified kernel defect.\n\
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
-        EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string()
+        EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
+            ProjectId::Sashiko => "You are an expert Sashiko maintainer. Your task is to determine the exact commit that introduced a verified Sashiko defect.\n\
+        Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
+        EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
+        }
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -730,6 +899,7 @@ Return ONLY a valid JSON object matching this schema:
 // ---------------------------------------------------------------------------
 
 struct SeveritySession<'a> {
+    project: ProjectId,
     canonical_title: &'a str,
     canonical_description: &'a str,
     locations: &'a str,
@@ -741,18 +911,27 @@ impl LlmSession for SeveritySession<'_> {
     type Output = SeverityJson;
 
     fn system_prompt(&self) -> String {
+        let target_name = match self.project {
+            ProjectId::Linux => "the Linux kernel",
+            ProjectId::Sashiko => "Sashiko",
+        };
         format!(
-            "{}\n\nAssess the severity and impact of a verified defect in the Linux kernel following the severity definitions and calibration guidance above.\n\
+            "{}\n\nAssess the severity and impact of a verified defect in {} following the severity definitions and calibration guidance above.\n\
             Output raw JSON only matching the schema.",
-            crate::prompt_bundle::kernel_severity_guide()
+            crate::prompt_bundle::severity_guide(self.project),
+            target_name
         )
     }
 
     fn initial_user_prompt(&self) -> String {
+        let defect_header = match self.project {
+            ProjectId::Linux => "Verified Linux Kernel Defect:",
+            ProjectId::Sashiko => "Verified Sashiko Defect:",
+        };
         format!(
             "{stage_heading}
 
-Verified Linux Kernel Defect:
+{defect_header}
 Title: {title}
 Description:
 {description}
@@ -769,6 +948,7 @@ Return ONLY a valid JSON object matching:
   \"severity_explanation\": \"Explain consequence, triggering path, reachability, attack prerequisites, required privileges, and blast radius...\"
 }}",
             stage_heading = BugStage::SeverityAssessment.heading(),
+            defect_header = defect_header,
             title = self.canonical_title,
             description = self.canonical_description,
             locations = self.locations,
@@ -797,6 +977,7 @@ Return ONLY a valid JSON object matching:
 // ---------------------------------------------------------------------------
 
 struct ReportSession<'a> {
+    project: ProjectId,
     problem: &'a str,
     severity: &'a str,
     canonical_description: &'a str,
@@ -813,7 +994,8 @@ impl LlmSession for ReportSession<'_> {
     type Output = String;
 
     fn system_prompt(&self) -> String {
-        r#"You are an expert Linux kernel maintainer drafting a comprehensive, standalone technical defect description suitable for submission to the Linux Kernel Mailing List (LKML).
+        match self.project {
+            ProjectId::Linux => r#"You are an expert Linux kernel maintainer drafting a comprehensive, standalone technical defect description suitable for submission to the Linux Kernel Mailing List (LKML).
 Maintainers demand technical rigor, exactness, and zero wasted prose.
 
 # SECTION 1: ROLE & AUDIENCE PRINCIPLES
@@ -990,7 +1172,24 @@ sync(&kvm->srcu);
 CPU 0 holds slots_lock while waiting for vcpu mutex via sync_srcu, while
 CPU 1 holds vcpu mutex and attempts to acquire slots_lock, creating an
 unresolvable AB-BA deadlock.
-"#.to_string()
+"#
+            .to_string(),
+            ProjectId::Sashiko => r#"You are an expert Sashiko maintainer drafting a concise, standalone technical defect description for a verified bug in the Sashiko Rust codebase.
+
+# PRINCIPLES & STRUCTURE
+- Maintainer Voice: Write for an experienced Rust and systems engineer. Do NOT explain generic Rust or Tokio concepts. Focus strictly on the broken contract or invariant in this code.
+- Zero Boilerplate: Do NOT include greetings, conversational preamble, or section headers ("Defect Report:", "Description:", or the bug title). Start immediately with the technical description.
+- Scope Boundary: Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue or write a patch.
+- Narrative Flow (1 to 2 cohesive paragraphs):
+  1. Opening Sentence: State what goes wrong, in which function and module/file, and under what condition.
+  2. Failure Mechanics: Trace the precise cause-and-effect chain (precondition -> triggering event -> faulty state transition / missing cleanup / race -> failure).
+  3. Concrete Consequence: State the direct impact (e.g. leaked worktree, wedged review queue, SQLITE_BUSY stall, panic, dropped finding).
+- Code Presentation:
+  Include a concise code snippet (`// <filepath>:<start_line>-<end_line>`) starting at column 0 with `< ... >` omission markers when localized code proves the defect.
+- Output Format:
+  100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
+                .to_string(),
+        }
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -1013,10 +1212,15 @@ unresolvable AB-BA deadlock.
             String::new()
         };
 
+        let details_header = match self.project {
+            ProjectId::Linux => "Linux Kernel Defect Details:",
+            ProjectId::Sashiko => "Sashiko Defect Details:",
+        };
+
         format!(
             "{stage_heading}
 
-Linux Kernel Defect Details:
+{details_header}
 Title: {problem}
 Severity: {severity}
 Description:
@@ -1058,6 +1262,7 @@ Draft the standalone technical defect description for upstream submission follow
    - For function names, ALWAYS use func() format.
    - Hard-wrap all prose and comment lines at 75 characters per line (LKML standard: 72-75 columns).",
             stage_heading = BugStage::ReportGeneration.heading(),
+            details_header = details_header,
             problem = self.problem,
             severity = self.severity,
             description = self.canonical_description,
@@ -1100,7 +1305,30 @@ Draft the standalone technical defect description for upstream submission follow
 
 /// Generates a unique bugid for a newly discovered Linux kernel bug (format: linux-<uuid>).
 pub fn generate_bugid() -> String {
-    format!("linux-{}", uuid::Uuid::new_v4())
+    generate_bugid_for_project(ProjectId::Linux)
+}
+
+/// Generates a unique bugid for a newly discovered bug in `project` (format: <project>-<uuid>).
+pub fn generate_bugid_for_project(project: ProjectId) -> String {
+    format!("{}-{}", project.as_str(), uuid::Uuid::new_v4())
+}
+
+pub fn infer_project_from_bug_or_tool(
+    bugid: Option<&str>,
+    tool: Option<&str>,
+    default_project: ProjectId,
+) -> ProjectId {
+    if bugid.is_some_and(|id| id.starts_with("sashiko-"))
+        || tool.is_some_and(|t| t.starts_with("sashiko:sashiko"))
+    {
+        ProjectId::Sashiko
+    } else if bugid.is_some_and(|id| id.starts_with("linux-"))
+        || tool.is_some_and(|t| t.starts_with("sashiko:linux"))
+    {
+        ProjectId::Linux
+    } else {
+        default_project
+    }
 }
 
 #[deprecated(note = "use generate_bugid instead")]
@@ -1108,18 +1336,45 @@ pub fn generate_slug() -> String {
     generate_bugid()
 }
 
-/// Executes the standalone Linux kernel bug pipeline for a single candidate concern.
+/// Executes the standalone bug pipeline for a single candidate concern.
 pub async fn process_issue(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    db: &Database,
+    input: BugInput,
+    context_tag: Option<&str>,
+) -> Result<BugOutcome> {
+    let project = infer_project_from_bug_or_tool(
+        None,
+        if db.has_bug_actor() {
+            Some(db.bug_tool())
+        } else {
+            None
+        },
+        ProjectId::Linux,
+    );
+    process_issue_for_project(provider, tools, db, input, context_tag, project).await
+}
+
+/// Executes the standalone bug pipeline for a single candidate concern in `project`.
+pub async fn process_issue_for_project(
     provider: &dyn AiProvider,
     _tools: Option<Arc<ToolBox>>,
     db: &Database,
     input: BugInput,
     _context_tag: Option<&str>,
+    project: ProjectId,
 ) -> Result<BugOutcome> {
     info!(
-        "Queueing candidate Linux kernel issue: '{}' in subsystems '{:?}'",
-        input.problem, input.subsystems
+        "Queueing candidate {} issue: '{}' in subsystems '{:?}'",
+        project.display_name(),
+        input.problem,
+        input.subsystems
     );
+    let default_tool = match project {
+        ProjectId::Linux => "sashiko:linux_patch_review",
+        ProjectId::Sashiko => "sashiko:sashiko_patch_review",
+    };
     let reviewer_db;
     let db = if db.has_bug_actor() && db.bug_model().is_some() {
         db
@@ -1127,17 +1382,25 @@ pub async fn process_issue(
         let (actor, tool) = if db.has_bug_actor() {
             (db.bug_actor().to_string(), db.bug_tool().to_string())
         } else {
-            (
-                "sashiko".to_string(),
-                "sashiko:linux_patch_review".to_string(),
-            )
+            ("sashiko".to_string(), default_tool.to_string())
         };
         reviewer_db =
             db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name));
         &reviewer_db
     };
-    let bugid = generate_bugid();
+    let bugid = generate_bugid_for_project(project);
     let now = chrono::Utc::now().timestamp();
+    let initial_subsystems = if input.subsystems.is_empty()
+        && !input.source_files.is_empty()
+        && !project.uses_maintainers()
+    {
+        extract_directory_subsystems_for_project(&input.source_files, project)
+            .into_iter()
+            .map(AttributedSubsystem::from_path_prefix)
+            .collect()
+    } else {
+        input.subsystems.clone()
+    };
     let new_bug = NewBug {
         bugid: bugid.clone(),
         title: input.problem.clone(),
@@ -1152,7 +1415,7 @@ pub async fn process_issue(
         source_ref: input.commit_sha.clone(),
         vector_json: None,
         duplicate_of_id: None,
-        subsystems: input.subsystems.clone(),
+        subsystems: initial_subsystems,
     };
     let id = db
         .create_bug_with_enrichment(
@@ -1183,7 +1446,7 @@ async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
     };
     tokio::task::spawn_blocking(move || {
         let worktree = tb.get_worktree_path();
-        for ref_name in ["origin/master", "master", "HEAD"] {
+        for ref_name in ["origin/master", "origin/main", "master", "main", "HEAD"] {
             if let Ok(output) = crate::git_cmd::in_dir(worktree)
                 .args(["rev-parse", ref_name])
                 .output()
@@ -1340,7 +1603,7 @@ pub const MAX_BUG_SNIPPET_LINES: usize = 100;
 ///
 /// Strictly bounded by guardrails to prevent context window bloat from malformed or
 /// adversarial candidate reports:
-/// 1. At most 3 distinct .c/.h files.
+/// 1. At most 3 distinct .c/.h/.rs files.
 /// 2. At most 2 snippets per file, 5 snippets total.
 /// 3. At most 100 lines per snippet (enclosing function via Tree-sitter or clamped window).
 /// 4. Total character budget <= 20,000 characters (~5,000 tokens).
@@ -1359,7 +1622,7 @@ pub async fn prefetch_bug_locations(
         return String::new();
     }
 
-    // Step 1: Collect and sanitize candidate file paths (max 3 distinct valid C files)
+    // Step 1: Collect and sanitize candidate file paths (max 3 distinct valid C/Rust files)
     let mut files: Vec<String> = Vec::new();
     for loc in loc_arr {
         let Some(file) = loc.get("file").and_then(|v| v.as_str()) else {
@@ -1369,7 +1632,7 @@ pub async fn prefetch_bug_locations(
         if file.contains("..")
             || file.starts_with('/')
             || file.starts_with('\\')
-            || (!file.ends_with(".c") && !file.ends_with(".h"))
+            || (!file.ends_with(".c") && !file.ends_with(".h") && !file.ends_with(".rs"))
         {
             continue;
         }
@@ -1479,6 +1742,7 @@ pub async fn prefetch_bug_locations(
             if lines.is_empty() {
                 continue;
             }
+            let is_c_file = actual_file.ends_with(".c") || actual_file.ends_with(".h");
 
             let file_locs: Vec<&Value> = loc_arr_owned
                 .iter()
@@ -1513,13 +1777,21 @@ pub async fn prefetch_bug_locations(
                                     && (trimmed.contains('(')
                                         || trimmed.starts_with("static")
                                         || trimmed.starts_with("int")
-                                        || trimmed.starts_with("void"))
+                                        || trimmed.starts_with("void")
+                                        || trimmed.starts_with("fn ")
+                                        || trimmed.starts_with("pub fn ")
+                                        || trimmed.starts_with("pub(crate) fn ")
+                                        || trimmed.starts_with("async fn ")
+                                        || trimmed.starts_with("pub async fn "))
                             })
                             .or_else(|| lines.iter().position(|l| l.contains(sym)));
                         if let Some(idx) = found_idx {
                             let line = idx + 1;
-                            if let Some((block_text, name)) =
-                                crate::worker::prefetch::extract_enclosing_block(&content, idx, idx)
+                            if is_c_file
+                                && let Some((block_text, name)) =
+                                    crate::worker::prefetch::extract_enclosing_block(
+                                        &content, idx, idx,
+                                    )
                             {
                                 let b_lines: Vec<&str> = block_text.lines().collect();
                                 let clamped_text = if b_lines.len() > MAX_BUG_SNIPPET_LINES {
@@ -1555,10 +1827,11 @@ pub async fn prefetch_bug_locations(
                         && line <= lines.len()
                     {
                         let line_0 = line.saturating_sub(1);
-                        if let Some((block_text, name)) =
-                            crate::worker::prefetch::extract_enclosing_block(
-                                &content, line_0, line_0,
-                            )
+                        if is_c_file
+                            && let Some((block_text, name)) =
+                                crate::worker::prefetch::extract_enclosing_block(
+                                    &content, line_0, line_0,
+                                )
                         {
                             let b_lines: Vec<&str> = block_text.lines().collect();
                             let clamped_text = if b_lines.len() > MAX_BUG_SNIPPET_LINES {
@@ -1650,9 +1923,43 @@ pub async fn process_issue_worker(
     input: BugInput,
     context_tag: Option<&str>,
 ) -> Result<BugOutcome> {
+    let default_project = infer_project_from_bug_or_tool(
+        Some(&bug_row.bugid),
+        if db.has_bug_actor() {
+            Some(db.bug_tool())
+        } else {
+            None
+        },
+        ProjectId::Linux,
+    );
+    process_issue_worker_for_project(
+        provider,
+        tools,
+        db,
+        bug_row,
+        input,
+        context_tag,
+        default_project,
+    )
+    .await
+}
+
+pub async fn process_issue_worker_for_project(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    db: &Database,
+    bug_row: &crate::db::Bug,
+    input: BugInput,
+    context_tag: Option<&str>,
+    project: ProjectId,
+) -> Result<BugOutcome> {
+    let project_label = match project {
+        ProjectId::Linux => "Linux kernel",
+        ProjectId::Sashiko => "Sashiko",
+    };
     info!(
-        "Processing candidate Linux kernel issue: '{}' in subsystems '{:?}'",
-        input.problem, input.subsystems
+        "Processing candidate {} issue: '{}' in subsystems '{:?}'",
+        project_label, input.problem, input.subsystems
     );
 
     let actor = if db.has_bug_actor() {
@@ -1665,7 +1972,10 @@ pub async fn process_issue_worker(
     let tool = if db.has_bug_actor() {
         db.bug_tool().to_string()
     } else {
-        "sashiko:linux_bug".to_string()
+        match project {
+            ProjectId::Linux => "sashiko:linux_bug".to_string(),
+            ProjectId::Sashiko => "sashiko:sashiko_bug".to_string(),
+        }
     };
     let attributed_db =
         db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name));
@@ -1716,25 +2026,29 @@ pub async fn process_issue_worker(
 
     // Normalization and canonical naming.
     info!("--- {} ---", BugStage::Normalization.title());
-    let maintainers_hint = crate::maintainers::get_global_maintainers()
-        .or_else(|| {
-            tools.as_ref().and_then(|tb| {
-                crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
-                    .ok()
-                    .map(std::sync::Arc::new)
+    let maintainers_hint = if project.uses_maintainers() {
+        crate::maintainers::get_global_maintainers()
+            .or_else(|| {
+                tools.as_ref().and_then(|tb| {
+                    crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
+                        .ok()
+                        .map(std::sync::Arc::new)
+                })
             })
-        })
-        .map(|mindex| {
-            let matched = mindex.match_files(&effective_source_files);
-            if matched.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "Detected Subsystems from MAINTAINERS: {}",
-                    matched.join(", ")
-                )
-            }
-        });
+            .map(|mindex| {
+                let matched = mindex.match_files(&effective_source_files);
+                if matched.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "Detected Subsystems from MAINTAINERS: {}",
+                        matched.join(", ")
+                    )
+                }
+            })
+    } else {
+        None
+    };
 
     let raw_locations_str = effective_locations
         .as_ref()
@@ -1749,6 +2063,7 @@ pub async fn process_issue_worker(
         maintainers_hint,
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
+        project,
     };
 
     let norm_result = runner.run(&mut norm_session).await?;
@@ -1774,8 +2089,12 @@ pub async fn process_issue_worker(
         verified_files = effective_source_files.clone();
     }
 
-    let official_subsystems =
-        resolve_official_subsystems(tools.as_deref(), &input.subsystems, &verified_files);
+    let official_subsystems = resolve_official_subsystems_for_project(
+        tools.as_deref(),
+        &input.subsystems,
+        &verified_files,
+        project,
+    );
     let official_subsystem_names: Vec<String> =
         official_subsystems.iter().map(|s| s.name.clone()).collect();
 
@@ -1800,6 +2119,7 @@ pub async fn process_issue_worker(
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
         prefetched_context: prefetched_context.clone(),
+        project,
     };
 
     let verify_result = runner.run(&mut verify_session).await?;
@@ -1816,7 +2136,7 @@ pub async fn process_issue_worker(
         let reason = verification.refutation_evidence.unwrap_or_else(|| {
             "Discarded as a hallucinated or disproved false positive".to_string()
         });
-        info!("Linux kernel candidate discarded: {}", reason);
+        info!("{} candidate discarded: {}", project_label, reason);
         let logs = serde_json::to_string(&full_history).unwrap_or_default();
         db.update_bug_outcome(
             bug_row.id,
@@ -1884,6 +2204,7 @@ pub async fn process_issue_worker(
                 candidate_subsystems: &official_subsystem_names,
                 known_candidates: &candidate_bugs,
                 context_tag: context_tag.map(|s| s.to_string()),
+                project,
             };
 
             let dedup_result = runner.run(&mut dedup_session).await?;
@@ -1902,8 +2223,8 @@ pub async fn process_issue_worker(
 
             if let Some(existing) = duplicate_match {
                 info!(
-                    "Matched duplicate Linux kernel bug #{} ({})",
-                    existing.id, existing.bugid
+                    "Matched duplicate {} bug #{} ({})",
+                    project_label, existing.id, existing.bugid
                 );
                 let logs = serde_json::to_string(&full_history).unwrap_or_default();
                 let folded = db
@@ -1956,6 +2277,7 @@ pub async fn process_issue_worker(
         relevant_locations: verified_locations_str.clone(),
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
+        project,
     };
     let tracing_result = tracing_runner.run(&mut tracing_session).await?;
     record_bug_stage(db, bug_row.id, BugStage::OriginTracing, &tracing_result).await?;
@@ -1976,6 +2298,7 @@ pub async fn process_issue_worker(
         canonical_description: &norm.canonical_description,
         locations: &verified_locations_str,
         context_tag: context_tag.map(|s| s.to_string()),
+        project,
     };
     let severity_result = runner.run(&mut severity_session).await?;
     record_bug_stage(
@@ -2010,6 +2333,7 @@ pub async fn process_issue_worker(
         tools: tools.clone(),
         context_tag: context_tag.map(|s| s.to_string()),
         prefetched_context: effective_prefetched,
+        project,
     };
     let report_result = runner.run(&mut report_session).await?;
     record_bug_stage(db, bug_row.id, BugStage::ReportGeneration, &report_result).await?;
@@ -2049,14 +2373,14 @@ pub async fn process_issue_worker(
         db.link_review_to_bug(r_id, saved_bug.id, true).await?;
     }
     info!(
-        "Successfully registered newly verified Linux kernel bug #{} ({})",
-        bug_row.id, bug_row.bugid
+        "Successfully registered newly verified {} bug #{} ({})",
+        project_label, bug_row.id, bug_row.bugid
     );
     Ok(BugOutcome::NewlyDiscovered { bug: saved_bug })
 }
 
 // ---------------------------------------------------------------------------
-// 7. Periodic Upstream Fix Check (Linus Tree)
+// 7. Periodic Upstream Fix Check (Mainline Tree)
 // ---------------------------------------------------------------------------
 
 const UPSTREAM_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2120,10 +2444,11 @@ async fn run_git_query(repo_path: &std::path::Path, args: &[&str]) -> Result<std
         })
 }
 
-/// Resolves the current HEAD commit SHA of Linus's mainline tree in `repo_path`.
+/// Resolves the current HEAD commit SHA of the upstream mainline tree in `repo_path`.
 ///
-/// Prefers a remote whose URL matches `torvalds/linux` (such as `linus/master`
-/// or `origin/master`), falling back to `origin/master`, `master`, and `HEAD`.
+/// Prefers a remote whose URL matches `torvalds/linux` (`{name}/master`) or
+/// `sashiko-dev/sashiko` (`{name}/main`), falling back to `origin/master`,
+/// `origin/main`, `master`, `main`, and `HEAD`.
 pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
     let mut candidate_refs = Vec::new();
     match run_git_query(repo_path, &["remote", "-v"]).await {
@@ -2131,22 +2456,27 @@ pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 let mut parts = line.split_whitespace();
-                if let (Some(name), Some(url)) = (parts.next(), parts.next())
-                    && url.contains("torvalds/linux")
-                {
-                    let r = format!("{}/master", name);
-                    if !candidate_refs.contains(&r) {
-                        candidate_refs.push(r);
+                if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
+                    if url.contains("torvalds/linux") {
+                        let r = format!("{}/master", name);
+                        if !candidate_refs.contains(&r) {
+                            candidate_refs.push(r);
+                        }
+                    } else if url.contains("sashiko-dev/sashiko") {
+                        let r = format!("{}/main", name);
+                        if !candidate_refs.contains(&r) {
+                            candidate_refs.push(r);
+                        }
                     }
                 }
             }
         }
         Ok(_) => {}
         Err(e) => {
-            warn!("Failed to query git remotes for Linus tree: {}", e);
+            warn!("Failed to query git remotes for mainline tree: {}", e);
         }
     }
-    for fallback in ["origin/master", "master", "HEAD"] {
+    for fallback in ["origin/master", "origin/main", "master", "main", "HEAD"] {
         let s = fallback.to_string();
         if !candidate_refs.contains(&s) {
             candidate_refs.push(s);
@@ -2458,6 +2788,7 @@ struct VerifyUpstreamFixSession<'a> {
     tools: Option<Arc<ToolBox>>,
     context_tag: Option<String>,
     last_turn_tool_calls: Vec<(String, Value)>,
+    project: ProjectId,
 }
 
 #[async_trait]
@@ -2465,11 +2796,22 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
     type Output = UpstreamFixVerdict;
 
     fn system_prompt(&self) -> String {
-        "You are an expert Linux kernel maintainer auditing whether a previously verified kernel bug has been fixed in Linus's upstream mainline tree.\n\
-        Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
-        If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
-        Output raw JSON only."
-            .to_string()
+        match self.project {
+            ProjectId::Linux => {
+                "You are an expert Linux kernel maintainer auditing whether a previously verified kernel bug has been fixed in Linus's upstream mainline tree.\n\
+                Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
+                If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
+                Output raw JSON only."
+                    .to_string()
+            }
+            ProjectId::Sashiko => {
+                "You are an expert Rust and distributed systems maintainer auditing whether a previously verified Sashiko bug has been fixed on the upstream main branch.\n\
+                Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
+                If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
+                Output raw JSON only."
+                    .to_string()
+            }
+        }
     }
 
     fn initial_user_prompt(&self) -> String {
@@ -2510,11 +2852,24 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
             }
         };
 
+        let (sha_label, bug_heading, tree_label) = match self.project {
+            ProjectId::Linux => (
+                "Current Linus Mainline SHA",
+                "Open Linux Kernel Bug",
+                "Linus's tree",
+            ),
+            ProjectId::Sashiko => (
+                "Current Upstream Main SHA",
+                "Open Sashiko Bug",
+                "the upstream main branch",
+            ),
+        };
+
         format!(
             "# Upstream Mainline Fix Verification\n\n\
             Previously Verified On SHA: {prev_sha}\n\
-            Current Linus Mainline SHA: {linus_sha}\n\n\
-            ## Open Linux Kernel Bug (#{bug_id} / {bugid})\n\
+            {sha_label}: {linus_sha}\n\n\
+            ## {bug_heading} (#{bug_id} / {bugid})\n\
             Title: {title}\n\
             Introduced In Commit: {intro}\n\
             Affected Files: {files}\n\
@@ -2529,7 +2884,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
             {prefetched_code}\n\
             </current_code_at_linus_sha>\n\n\
             ## Task\n\
-            Determine whether the bug described above has been fixed in Linus's tree at `{linus_sha}`.\n\
+            Determine whether the bug described above has been fixed in {tree_label} at `{linus_sha}`.\n\
             1. Inspect the candidate commits and the current code at `{linus_sha}`. If the prefetched context is insufficient (for example, more than {max_commits} candidate commits exist or a fix moved across files), use `git_show`, `git_diff`, `git_log`, or `git_read_files` at `{linus_sha}`.\n\
             2. If a commit in `{prev_sha}..{linus_sha}` fixes the defect (or deletes the buggy code path so the defect no longer exists), set `\"status\": \"fixed\"` and set `\"fixing_commit_sha\"` to that commit's SHA.\n\
             3. If the defect is still present at `{linus_sha}`, set `\"status\": \"still_present\"` and `\"fixing_commit_sha\": null`.\n\
@@ -2541,7 +2896,9 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
               \"explanation\": \"Cite the exact commit and code changes that resolved the bug, or explain why the defect remains present at {linus_sha}.\"\n\
             }}",
             prev_sha = self.previous_sha,
+            sha_label = sha_label,
             linus_sha = self.linus_sha,
+            bug_heading = bug_heading,
             bug_id = self.bug.id,
             bugid = self.bug.bugid,
             title = self.bug.problem(),
@@ -2553,6 +2910,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
             candidate_list = candidate_list,
             prefetched_commits = self.prefetched_commits,
             prefetched_code = self.prefetched_code,
+            tree_label = tree_label,
             max_commits = MAX_FIX_CANDIDATE_COMMITS,
         )
     }
@@ -2686,7 +3044,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
     }
 }
 
-/// Checks whether a single open bug has been fixed in Linus's tree at `linus_sha`.
+/// Checks whether a single open bug has been fixed in the upstream mainline tree at `linus_sha`.
 ///
 /// Uses a three-tier pipeline:
 /// 1. Fast skip if `bug.verified_on_sha() == Some(linus_sha)`.
@@ -2702,6 +3060,18 @@ pub async fn check_bug_fixed_upstream(
     db: &Database,
     bug: &Bug,
     linus_sha: &str,
+) -> Result<UpstreamFixCheckOutcome> {
+    let project = infer_project_from_bug_or_tool(Some(&bug.bugid), None, ProjectId::Linux);
+    check_bug_fixed_upstream_for_project(provider, repo_path, db, bug, linus_sha, project).await
+}
+
+pub async fn check_bug_fixed_upstream_for_project(
+    provider: &dyn AiProvider,
+    repo_path: &std::path::Path,
+    db: &Database,
+    bug: &Bug,
+    linus_sha: &str,
+    project: ProjectId,
 ) -> Result<UpstreamFixCheckOutcome> {
     let linus_sha = linus_sha.trim();
     let Some(prev_sha) = bug.verified_on_sha() else {
@@ -2768,6 +3138,7 @@ pub async fn check_bug_fixed_upstream(
         tools: Some(tools),
         context_tag: Some("upstream_fix_check".to_string()),
         last_turn_tool_calls: Vec::new(),
+        project,
     };
 
     let runner = SessionRunner::new(provider).with_max_turns(8);
@@ -2775,9 +3146,13 @@ pub async fn check_bug_fixed_upstream(
     let verdict = session_result.output;
     let logs = serde_json::to_string(&session_result.history).ok();
 
+    let fix_tool = match project {
+        ProjectId::Linux => "sashiko:linux_bug:fix_check",
+        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
+    };
     let attributed_db = db.with_bug_actor(
         "sashiko",
-        "sashiko:linux_bug:fix_check",
+        fix_tool,
         Some(provider.get_capabilities().model_name),
     );
 
@@ -2922,6 +3297,7 @@ mod tests {
             tools: None,
             context_tag: None,
             prefetched_context: String::new(),
+            project: ProjectId::Linux,
         };
 
         let runner = SessionRunner::new(&mock_provider);
@@ -3045,6 +3421,7 @@ mod tests {
             ),
             tools: None,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let runner = SessionRunner::new(&mock_provider);
@@ -3071,6 +3448,7 @@ mod tests {
             maintainers_hint: None,
             tools: None,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let prompt = session.initial_user_prompt();
@@ -3100,6 +3478,7 @@ mod tests {
             maintainers_hint: None,
             tools: None,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let bad_titles = &[
@@ -3151,6 +3530,7 @@ mod tests {
             maintainers_hint: None,
             tools: None,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let good_titles = &[
@@ -3234,6 +3614,7 @@ mod tests {
             candidate_subsystems: &["net".to_string()],
             known_candidates: &known_bugs,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let runner = SessionRunner::new(&mock_provider);
@@ -3286,6 +3667,7 @@ mod tests {
             candidate_subsystems: &["net".to_string()],
             known_candidates: &known_bugs,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let sys = session.system_prompt();
@@ -3421,6 +3803,7 @@ mod tests {
             tools: None,
             context_tag: None,
             prefetched_context: String::new(),
+            project: ProjectId::Linux,
         };
 
         let runner = SessionRunner::new(&mock_provider);
@@ -3475,6 +3858,7 @@ mod tests {
                     maintainers_hint: None,
                     tools: None,
                     context_tag: None,
+                    project: ProjectId::Linux,
                 }
                 .initial_user_prompt(),
             ),
@@ -3490,6 +3874,7 @@ mod tests {
                     tools: None,
                     context_tag: None,
                     prefetched_context: String::new(),
+                    project: ProjectId::Linux,
                 }
                 .initial_user_prompt(),
             ),
@@ -3501,6 +3886,7 @@ mod tests {
                     candidate_subsystems: &subsystem_names,
                     known_candidates: &[],
                     context_tag: None,
+                    project: ProjectId::Linux,
                 }
                 .initial_user_prompt(),
             ),
@@ -3513,6 +3899,7 @@ mod tests {
                     relevant_locations: "[]".to_string(),
                     tools: None,
                     context_tag: None,
+                    project: ProjectId::Linux,
                 }
                 .initial_user_prompt(),
             ),
@@ -3523,6 +3910,7 @@ mod tests {
                     canonical_description: &input.reasoning,
                     locations: "[]",
                     context_tag: None,
+                    project: ProjectId::Linux,
                 }
                 .initial_user_prompt(),
             ),
@@ -3538,6 +3926,7 @@ mod tests {
                     tools: None,
                     context_tag: None,
                     prefetched_context: String::new(),
+                    project: ProjectId::Linux,
                 }
                 .initial_user_prompt(),
             ),
@@ -3566,6 +3955,7 @@ mod tests {
             tools: None,
             context_tag: None,
             prefetched_context: String::new(),
+            project: ProjectId::Linux,
         };
 
         let sys_prompt = session.system_prompt();
@@ -3620,6 +4010,7 @@ mod tests {
             canonical_description: "Buffer allocated but not freed",
             locations: "[]",
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let sys_prompt = session.system_prompt();
@@ -4194,6 +4585,7 @@ Call Trace:
             maintainers_hint: None,
             tools: None,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let response = AiResponse {
@@ -4234,6 +4626,7 @@ Call Trace:
             maintainers_hint: None,
             tools: None,
             context_tag: None,
+            project: ProjectId::Linux,
         };
 
         let response = AiResponse {
@@ -4691,5 +5084,185 @@ F:	drivers/net/ethernet/intel/e1000/
         );
         assert!(!updated.is_fixed());
         assert_eq!(updated.verified_on_sha().as_deref(), Some(sha2.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_sashiko_bug_triage_and_fix_check_flow() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let run = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "Test User"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/sashiko-dev/sashiko.git",
+        ]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/api.rs"),
+            "pub async fn handle_query(limit: usize) -> usize {\n    let items = vec![1, 2, 3];\n    items[limit]\n}\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "api: initial query handler"]);
+        let sha1 = run(&["rev-parse", "HEAD"]);
+        run(&["update-ref", "refs/remotes/origin/main", &sha1]);
+
+        let resolved_main = resolve_linus_sha(repo).await;
+        assert_eq!(resolved_main.as_deref(), Some(sha1.as_str()));
+
+        let tb = Arc::new(ToolBox::new(repo.to_path_buf(), None));
+        let locs = json!([{"file": "src/api.rs", "line": 3, "function_or_symbol": "handle_query"}]);
+        let prefetched = prefetch_bug_locations(Some(&tb), &sha1, &Some(locs.clone())).await;
+        assert!(
+            prefetched.contains("pub async fn handle_query"),
+            "Rust function should be prefetched: {}",
+            prefetched
+        );
+
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let normalize_json = json!({
+            "canonical_title": "api: out-of-bounds panic in handle_query()",
+            "canonical_description": "Trigger: limit >= 3.\nFailure Mechanism: Unchecked slice index.\nImpact: Worker task panic.",
+            "affected_source_files": ["src/api.rs"],
+            "affected_symbols": ["handle_query"]
+        })
+        .to_string();
+        let verify_json = json!({
+            "verification_reasoning": "items[limit] panics when limit >= 3.",
+            "is_false_positive": false,
+            "refutation_evidence": null,
+            "impact_severity": "High",
+            "relevant_code_locations": [{"file": "src/api.rs", "line": 3, "function_or_symbol": "handle_query"}]
+        })
+        .to_string();
+        let tracing_json = json!({
+            "introducing_commit_sha": &sha1
+        })
+        .to_string();
+        let severity_json = json!({
+            "severity": "High",
+            "severity_explanation": "Unbounded limit parameter triggers panic in API handler."
+        })
+        .to_string();
+        let report_text = "api: out-of-bounds panic in handle_query()\n\n// src/api.rs:1-4\npub async fn handle_query(limit: usize) -> usize {\n    let items = vec![1, 2, 3];\n    items[limit]\n    ^^^^^^^^^^^^\n}\n\nIndexing items[limit] without bounds checking panics when limit >= 3.\n".to_string();
+
+        let provider = QueuedMockAiProvider::new(vec![
+            normalize_json,
+            verify_json,
+            tracing_json,
+            severity_json,
+            report_text,
+        ]);
+
+        let input = BugInput {
+            problem: "Out-of-bounds index in handle_query".to_string(),
+            reasoning: "items[limit] can panic".to_string(),
+            locations: Some(locs),
+            subsystems: Vec::new(),
+            source_files: vec!["src/api.rs".to_string()],
+            commit_sha: Some(sha1.clone()),
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: Some(sha1.clone()),
+            review_id: None,
+        };
+
+        let BugOutcome::NewlyDiscovered { bug: pending_bug } = process_issue_for_project(
+            &provider,
+            Some(tb.clone()),
+            &db,
+            input.clone(),
+            None,
+            ProjectId::Sashiko,
+        )
+        .await
+        .unwrap() else {
+            panic!("Expected NewlyDiscovered pending bug");
+        };
+        assert!(pending_bug.bugid.starts_with("sashiko-"));
+        assert_eq!(pending_bug.subsystems, vec!["api".to_string()]);
+
+        let BugOutcome::NewlyDiscovered { bug: verified_bug } = process_issue_worker_for_project(
+            &provider,
+            Some(tb),
+            &db,
+            &pending_bug,
+            input,
+            None,
+            ProjectId::Sashiko,
+        )
+        .await
+        .unwrap() else {
+            panic!("Expected NewlyDiscovered verified bug");
+        };
+        assert_eq!(
+            verified_bug.problem(),
+            "api: out-of-bounds panic in handle_query()"
+        );
+        assert_eq!(
+            verified_bug.verified_on_sha().as_deref(),
+            Some(sha1.as_str())
+        );
+
+        // Advance main branch with a fix commit and verify check_bug_fixed_upstream_for_project marks it Fixed.
+        std::fs::write(
+            repo.join("src/api.rs"),
+            "pub async fn handle_query(limit: usize) -> usize {\n    let items = vec![1, 2, 3];\n    items.get(limit).copied().unwrap_or(0)\n}\n",
+        )
+        .unwrap();
+        run(&["commit", "-am", "api: bounds-check handle_query index"]);
+        let sha2 = run(&["rev-parse", "HEAD"]);
+        run(&["update-ref", "refs/remotes/origin/main", &sha2]);
+
+        let fix_provider = MockAiProvider {
+            response_text: json!({
+                "status": "fixed",
+                "fixing_commit_sha": &sha2,
+                "explanation": "Commit replaces items[limit] with items.get(limit).copied().unwrap_or(0)."
+            })
+            .to_string(),
+        };
+
+        let fix_outcome = check_bug_fixed_upstream_for_project(
+            &fix_provider,
+            repo,
+            &db,
+            &verified_bug,
+            &sha2,
+            ProjectId::Sashiko,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            fix_outcome,
+            UpstreamFixCheckOutcome::FixedUpstream { .. }
+        ));
+
+        let final_bug = db.get_bug(verified_bug.id).await.unwrap().unwrap();
+        assert_eq!(
+            final_bug.lifecycle_status,
+            crate::db::BugLifecycleStatus::Fixed
+        );
+        assert_eq!(final_bug.fixed_in_commit().as_deref(), Some(sha2.as_str()));
     }
 }

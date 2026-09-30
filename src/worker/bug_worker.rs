@@ -81,6 +81,7 @@ pub struct BugWorker {
     db: Arc<Database>,
     provider: Arc<dyn AiProvider>,
     repo_path: String,
+    project: crate::project::ProjectId,
     settings: crate::settings::LinuxBugSettings,
     /// Identifies this worker in the lease it takes, so that a lease which
     /// never gets released can be traced back to a process.
@@ -93,6 +94,7 @@ impl BugWorker {
             db,
             provider,
             repo_path,
+            project: crate::project::ProjectId::Linux,
             settings: crate::settings::LinuxBugSettings {
                 lease_ttl_seconds: BUG_LEASE_TTL_SECONDS,
                 max_attempts: BUG_MAX_ATTEMPTS,
@@ -106,13 +108,18 @@ impl BugWorker {
         }
     }
 
+    pub fn with_project(mut self, project: crate::project::ProjectId) -> Self {
+        self.project = project;
+        self
+    }
+
     pub fn with_settings(mut self, settings: crate::settings::LinuxBugSettings) -> Self {
         self.settings = settings;
         self
     }
 
     /// Runs a single bounded sweep checking whether open bugs have been fixed
-    /// in Linus's mainline tree.
+    /// in the upstream mainline tree.
     pub async fn check_open_bugs_upstream(&self) -> usize {
         let batch_size = self.settings.fix_check_batch_size;
         if batch_size == 0 {
@@ -122,7 +129,7 @@ impl BugWorker {
         let Some(linus_sha) = crate::workflows::linux_bug::resolve_linus_sha(repo_path).await
         else {
             warn!(
-                "Skipping upstream bug fix check: could not resolve Linus tree SHA in {}",
+                "Skipping upstream bug fix check: could not resolve mainline tree SHA in {}",
                 self.repo_path
             );
             return 0;
@@ -151,19 +158,25 @@ impl BugWorker {
 
             if checked == 0 {
                 info!(
-                    "Checking open bug(s) (batch limit {}) against Linus tree SHA {}...",
+                    "Checking open bug(s) (batch limit {}) against mainline SHA {}...",
                     batch_size, linus_sha
                 );
             }
 
+            let effective_project = crate::workflows::linux_bug::infer_project_from_bug_or_tool(
+                Some(&bug.bugid),
+                None,
+                self.project,
+            );
             let scoped_db = self.db.with_bug_claim(bug.id, &claim_id);
             let Some(res) = run_while_leased(
-                crate::workflows::linux_bug::check_bug_fixed_upstream(
+                crate::workflows::linux_bug::check_bug_fixed_upstream_for_project(
                     self.provider.as_ref(),
                     repo_path,
                     &scoped_db,
                     &bug,
                     &linus_sha,
+                    effective_project,
                 ),
                 maintain_lease(
                     &scoped_db,
@@ -237,8 +250,9 @@ impl BugWorker {
         let fix_check_interval = self.settings.fix_check_interval_seconds;
 
         info!(
-            "Starting Bug Worker as {} (lease {}s renewed every {}s, {} attempts max, fix check interval {}s)...",
+            "Starting Bug Worker as {} (project {}, lease {}s renewed every {}s, {} attempts max, fix check interval {}s)...",
             self.worker_id,
+            self.project.as_str(),
             lease_ttl_seconds,
             ((lease_ttl_seconds as u64) / 3).clamp(1, BUG_LEASE_RENEW_INTERVAL_SECONDS),
             max_attempts,
@@ -272,8 +286,19 @@ impl BugWorker {
                     let provider = self.provider.clone();
                     let db = self.db.clone();
                     let repo_path = self.repo_path.clone();
+                    let worker_project = self.project;
 
                     tokio::spawn(async move {
+                        let effective_project =
+                            crate::workflows::linux_bug::infer_project_from_bug_or_tool(
+                                Some(&bug.bugid),
+                                None,
+                                worker_project,
+                            );
+                        let bug_tool = match effective_project {
+                            crate::project::ProjectId::Linux => "sashiko:linux_bug",
+                            crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
+                        };
                         let actor = if !bug.reporter.is_empty() {
                             bug.reporter.as_str()
                         } else {
@@ -281,7 +306,7 @@ impl BugWorker {
                         };
                         let db = db.with_bug_claim(bug.id, &claim_id).with_bug_actor(
                             actor,
-                            "sashiko:linux_bug",
+                            bug_tool,
                             Some(provider.get_capabilities().model_name),
                         );
                         info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
@@ -324,13 +349,14 @@ impl BugWorker {
                         let tools = Some(Arc::new(tb));
 
                         let analysis = run_while_leased(
-                            crate::workflows::linux_bug::process_issue_worker(
+                            crate::workflows::linux_bug::process_issue_worker_for_project(
                                 provider.as_ref(),
                                 tools,
                                 &db,
                                 &bug,
                                 input,
                                 Some("bug_worker"),
+                                effective_project,
                             ),
                             maintain_lease(
                                 &db,

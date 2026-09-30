@@ -1013,12 +1013,13 @@ async fn run_daemon(
             provider,
             settings.git.repository_path.clone(),
         )
+        .with_project(project)
         .with_settings(settings.linux_bug.clone());
         Some(tokio::spawn(async move {
             bug_worker.run().await;
         }))
     } else {
-        info!("Linux bug worker disabled via settings (linux_bug.enabled = false).");
+        info!("Bug worker disabled via settings (linux_bug.enabled = false).");
         None
     };
     // Initialize custom remotes

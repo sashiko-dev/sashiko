@@ -1312,18 +1312,16 @@ async fn analyze_bug(
         }
     };
 
+    let project = state.settings.project.kind.unwrap_or_default();
     let repo_path = std::path::PathBuf::from(&state.settings.git.repository_path);
     let tools = if repo_path.exists() {
-        let mainline_sha = match crate::git_ops::get_commit_hash(&repo_path, "origin/master").await
-        {
-            Ok(sha) => Some(sha),
-            Err(_) => match crate::git_ops::get_commit_hash(&repo_path, "master").await {
-                Ok(sha) => Some(sha),
-                Err(_) => crate::git_ops::get_commit_hash(&repo_path, "HEAD")
-                    .await
-                    .ok(),
-            },
-        };
+        let mut mainline_sha = None;
+        for ref_name in ["origin/master", "origin/main", "master", "main", "HEAD"] {
+            if let Ok(sha) = crate::git_ops::get_commit_hash(&repo_path, ref_name).await {
+                mainline_sha = Some(sha);
+                break;
+            }
+        }
         let mut tb = crate::toolbox::ToolBox::new(repo_path, None);
         if let Some(m_sha) = mainline_sha {
             tb.set_virtual_head(m_sha);
@@ -1343,19 +1341,30 @@ async fn analyze_bug(
         .or_else(|| Some(provider.get_capabilities().model_name));
     let mut payload = payload.input;
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
-        let matched = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-            mindex.match_files(&payload.source_files)
-        } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
-            &state.settings.git.repository_path,
-        ) {
-            mindex.match_files(&payload.source_files)
+        if project.uses_maintainers() {
+            let matched = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
+                mindex.match_files(&payload.source_files)
+            } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
+                &state.settings.git.repository_path,
+            ) {
+                mindex.match_files(&payload.source_files)
+            } else {
+                Vec::new()
+            };
+            payload.subsystems = matched
+                .into_iter()
+                .map(crate::db::AttributedSubsystem::from_maintainers)
+                .collect();
         } else {
-            Vec::new()
-        };
-        payload.subsystems = matched
-            .into_iter()
-            .map(crate::db::AttributedSubsystem::from_maintainers)
-            .collect();
+            payload.subsystems =
+                crate::workflows::linux_bug::extract_directory_subsystems_for_project(
+                    &payload.source_files,
+                    project,
+                )
+                .into_iter()
+                .map(crate::db::AttributedSubsystem::from_path_prefix)
+                .collect();
+        }
     }
 
     let actor = if principal.email().is_empty() {
@@ -1364,12 +1373,13 @@ async fn analyze_bug(
         principal.email().to_string()
     };
     let attributed_db = state.db.with_bug_actor(&actor, &source_tool, source_model);
-    match crate::workflows::linux_bug::process_issue(
+    match crate::workflows::linux_bug::process_issue_for_project(
         provider.as_ref(),
         tools,
         &attributed_db,
         payload,
         Some("api_analyze"),
+        project,
     )
     .await
     {

@@ -12,9 +12,10 @@ deliberate differences:
   work from **GitHub pull request webhooks** rather than from NNTP.
 - It has **no SMTP configuration at all**, so it can never mail anyone. The
   sign-in link is written to the pod log instead (see *Signing in* below).
-- It leaves **pre-existing bug tracking disabled** (`linux_bug.enabled = false`
-  by default, whereas `sashiko.dev` sets `SASHIKO__LINUX_BUG__ENABLED=true`), so
-  pre-existing issues are ignored and the Linux bug worker does not run.
+- Like `sashiko.dev`, it explicitly enables **pre-existing bug tracking**
+  (`SASHIKO__LINUX_BUG__ENABLED=true`, which defaults to `false` in standalone
+  configurations), tracking pre-existing Sashiko issues and periodic upstream
+  fixes on `origin/main`.
 
 ## Layout
 
