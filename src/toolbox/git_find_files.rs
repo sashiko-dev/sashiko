@@ -14,7 +14,7 @@
 
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::framework::LlmTool;
-use crate::toolbox::utils::glob_to_regex;
+use crate::toolbox::utils::{glob_to_regex, validate_path};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -80,6 +80,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
             if p.starts_with('-') {
                 return Err(anyhow!("Invalid path parameter"));
             }
+            validate_path(p, &context.worktree_path)?;
             cmd.arg("--").arg(p);
         }
 

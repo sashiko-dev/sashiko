@@ -14,6 +14,7 @@
 
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::framework::LlmTool;
+use crate::toolbox::utils::validate_path;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -58,6 +59,7 @@ impl LlmTool<SashikoToolContext> for GitLsTool {
         let tree_spec = if path_str.is_empty() || path_str == "." {
             revision.to_string()
         } else {
+            validate_path(path_str, &context.worktree_path)?;
             format!("{}:{}", revision, path_str)
         };
 

@@ -606,4 +606,149 @@ mod tests {
         assert_eq!(results[0]["start_line"].as_u64().unwrap(), 3);
         assert_eq!(results[0]["end_line"].as_u64().unwrap(), 6);
     }
+
+    #[test]
+    fn test_git_tools_reject_invalid_paths() {
+        let (linux_path, _prompts_path) = get_test_paths();
+        let toolbox = ToolBox::new(linux_path, None);
+        let rt = Runtime::new().unwrap();
+
+        for bad_path in ["../outside", "/etc/passwd"] {
+            // 1. git_blame
+            let res = rt.block_on(
+                toolbox.call("git_blame", json!({ "revision": "HEAD", "path": bad_path })),
+            );
+            assert!(res.is_err(), "git_blame should reject {bad_path}");
+
+            // 2. git_diff
+            let res = rt.block_on(toolbox.call(
+                "git_diff",
+                json!({
+                    "base_revision": "HEAD~1",
+                    "target_revision": "HEAD",
+                    "paths": [bad_path]
+                }),
+            ));
+            assert!(res.is_err(), "git_diff should reject {bad_path}");
+
+            // 3. git_find_files
+            let res = rt.block_on(toolbox.call(
+                "git_find_files",
+                json!({
+                    "revision": "HEAD",
+                    "pattern": "*",
+                    "path": bad_path
+                }),
+            ));
+            assert!(res.is_err(), "git_find_files should reject {bad_path}");
+
+            // 4. git_grep
+            let res = rt.block_on(toolbox.call(
+                "git_grep",
+                json!({
+                    "revision": "HEAD",
+                    "pattern": "Sashiko",
+                    "path": bad_path
+                }),
+            ));
+            assert!(res.is_err(), "git_grep should reject {bad_path}");
+
+            // 5. git_ls
+            let res = rt
+                .block_on(toolbox.call("git_ls", json!({ "revision": "HEAD", "path": bad_path })));
+            assert!(res.is_err(), "git_ls should reject {bad_path}");
+
+            // 6. git_read_files
+            let res = rt
+                .block_on(toolbox.call(
+                    "git_read_files",
+                    json!({
+                        "revision": "HEAD",
+                        "files": [{ "path": bad_path }]
+                    }),
+                ))
+                .unwrap();
+            let file_res = &res["results"][0];
+            assert!(
+                file_res["error"].is_string() && file_res.get("content").is_none(),
+                "git_read_files should report error for {bad_path}: {file_res:?}"
+            );
+
+            // 7a. git_show with object rev:path
+            let res = rt.block_on(
+                toolbox.call("git_show", json!({ "object": format!("HEAD:{bad_path}") })),
+            );
+            assert!(res.is_err(), "git_show object should reject {bad_path}");
+
+            // 7b. git_show with paths filter
+            let res = rt.block_on(
+                toolbox.call("git_show", json!({ "object": "HEAD", "paths": [bad_path] })),
+            );
+            assert!(res.is_err(), "git_show paths should reject {bad_path}");
+        }
+    }
+
+    #[test]
+    fn test_git_tools_historical_deleted_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::git_cmd::in_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+
+        let nested_dir = repo_path.join("deleted_dir/sub");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(
+            nested_dir.join("file.c"),
+            "int old_func(void) { return 42; }\n",
+        )
+        .unwrap();
+        run_git(&["add", "deleted_dir/sub/file.c"]);
+        run_git(&["commit", "-m", "Add nested file"]);
+
+        run_git(&["rm", "-r", "deleted_dir"]);
+        std::fs::write(repo_path.join("keep.c"), "int keep(void) { return 0; }\n").unwrap();
+        run_git(&["add", "keep.c"]);
+        run_git(&["commit", "-m", "Remove nested dir"]);
+
+        assert!(!repo_path.join("deleted_dir").exists());
+
+        let toolbox = ToolBox::new(repo_path, None);
+        let rt = Runtime::new().unwrap();
+
+        // git_read_files on historical deleted path in HEAD~1
+        let read_res = rt
+            .block_on(toolbox.call(
+                "git_read_files",
+                json!({
+                    "revision": "HEAD~1",
+                    "files": [{ "path": "deleted_dir/sub/file.c" }]
+                }),
+            ))
+            .unwrap();
+        assert!(
+            read_res["results"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("old_func")
+        );
+
+        // git_show on historical deleted path in HEAD~1
+        let show_res = rt
+            .block_on(toolbox.call(
+                "git_show",
+                json!({ "object": "HEAD~1:deleted_dir/sub/file.c" }),
+            ))
+            .unwrap();
+        assert!(show_res["content"].as_str().unwrap().contains("old_func"));
+    }
 }

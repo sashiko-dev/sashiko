@@ -12,40 +12,82 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Result, anyhow};
-use std::path::{Path, PathBuf};
+use anyhow::{Context, Result, anyhow};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+
+fn clean_relative_path(relative: &str) -> Result<PathBuf> {
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err(anyhow!("Invalid path: {}", relative));
+    }
+
+    let mut clean_rel = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Normal(c) => clean_rel.push(c),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("Invalid path: {}", relative));
+            }
+        }
+    }
+    Ok(clean_rel)
+}
 
 /// Validates a relative path against a base path to prevent path traversal attacks.
 ///
-/// Returns the canonicalized absolute path if it is safe and exists (or its parent exists),
-/// otherwise returns an error.
+/// Returns the canonicalized absolute path if it is safe and confined within `base`,
+/// allowing non-existent trailing path components (such as files that only exist in
+/// git history) while rejecting symlinks or dangling symlinks that escape `base`.
 pub fn validate_path(relative: &str, base: &Path) -> Result<PathBuf> {
-    if relative.contains("..") || relative.starts_with('/') {
-        return Err(anyhow!("Invalid path: {}", relative));
-    }
-    let full_path = base.join(relative);
+    let clean_rel = clean_relative_path(relative)?;
 
     let canonical_base = base
         .canonicalize()
-        .map_err(|e| anyhow!("Failed to canonicalize base path: {}", e))?;
+        .context("Failed to canonicalize base directory")?;
+    if !canonical_base.is_dir() {
+        return Err(anyhow!(
+            "Base path is not a directory: {:?}",
+            canonical_base
+        ));
+    }
 
-    let canonical_full = match full_path.canonicalize() {
-        Ok(p) => p,
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = full_path.parent() {
-                let canonical_parent = parent
-                    .canonicalize()
-                    .map_err(|e| anyhow!("Failed to canonicalize parent path: {}", e))?;
-                if !canonical_parent.starts_with(&canonical_base) {
-                    return Err(anyhow!("Path traversal detected in parent: {:?}", parent));
+    let full_path = canonical_base.join(&clean_rel);
+    let mut current = full_path.as_path();
+    let mut missing_components = Vec::new();
+
+    let canonical_full = loop {
+        match current.canonicalize() {
+            Ok(canon) => {
+                if !canon.starts_with(&canonical_base) {
+                    return Err(anyhow!(
+                        "Access denied: Path escapes root directory: {:?}",
+                        canon
+                    ));
                 }
-                full_path
-            } else {
-                return Err(anyhow!("No parent directory for path: {:?}", full_path));
+                let mut resolved = canon;
+                for comp in missing_components.into_iter().rev() {
+                    resolved.push(comp);
+                }
+                break resolved;
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if current.symlink_metadata().is_ok() {
+                    return Err(anyhow!(
+                        "Dangling symlink not allowed in path: {:?}",
+                        current
+                    ));
+                }
+                if let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
+                    missing_components.push(name.to_os_string());
+                    current = parent;
+                } else {
+                    return Err(anyhow!("No parent directory for path: {:?}", full_path));
+                }
+            }
+            Err(e) => return Err(anyhow!("Failed to canonicalize path: {}", e)),
         }
-        Err(e) => return Err(anyhow!("Failed to canonicalize path: {}", e)),
     };
 
     if !canonical_full.starts_with(&canonical_base) {
@@ -410,5 +452,54 @@ mod tests {
             !re.is_match("a"),
             "empty pattern does not match non-empty string"
         );
+    }
+
+    #[test]
+    fn test_validate_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("worktree");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let existing_file = base.join("existing.c");
+        std::fs::write(&existing_file, "int main() {}\n").unwrap();
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, "secret\n").unwrap();
+
+        let canon_base = base.canonicalize().unwrap();
+
+        // 1. Existing file inside base succeeds
+        let resolved = validate_path("existing.c", &base).unwrap();
+        assert_eq!(resolved, canon_base.join("existing.c"));
+
+        // 2. Non-existent nested path (e.g. deleted in git history) succeeds
+        let resolved_missing = validate_path("deleted_dir/sub/file.c", &base).unwrap();
+        assert_eq!(resolved_missing, canon_base.join("deleted_dir/sub/file.c"));
+        let resolved_dots = validate_path("v1..v2.txt", &base).unwrap();
+        assert_eq!(resolved_dots, canon_base.join("v1..v2.txt"));
+
+        // 3. Parent directory traversal and absolute paths are rejected
+        assert!(validate_path("..", &base).is_err());
+        assert!(validate_path("../outside/secret.txt", &base).is_err());
+        assert!(validate_path("sub/../../outside", &base).is_err());
+        assert!(validate_path("/etc/passwd", &base).is_err());
+
+        // 4. Symlinks pointing outside base (and nested paths under them) are rejected
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let escape_dir_link = base.join("escape_dir");
+            symlink(&outside, &escape_dir_link).unwrap();
+            assert!(validate_path("escape_dir", &base).is_err());
+            assert!(validate_path("escape_dir/secret.txt", &base).is_err());
+            assert!(validate_path("escape_dir/nonexistent/file.c", &base).is_err());
+
+            let dangling_link = base.join("dangling_link");
+            symlink(outside.join("does_not_exist"), &dangling_link).unwrap();
+            assert!(validate_path("dangling_link", &base).is_err());
+            assert!(validate_path("dangling_link/sub/file.c", &base).is_err());
+        }
     }
 }

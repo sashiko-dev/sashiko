@@ -16,6 +16,7 @@ use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
+use crate::toolbox::utils::validate_path;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -84,6 +85,7 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
                     if p_str.starts_with('-') {
                         return Err(anyhow!("Invalid path parameter: {}", p_str));
                     }
+                    validate_path(p_str, &context.worktree_path)?;
                     cmd.arg(p_str);
                 }
             }

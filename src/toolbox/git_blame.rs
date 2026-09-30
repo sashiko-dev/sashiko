@@ -16,6 +16,7 @@ use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
+use crate::toolbox::utils::validate_path;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -73,6 +74,10 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
+        if path_str.starts_with('-') {
+            return Err(anyhow!("Invalid path name: {}", path_str));
+        }
+        validate_path(path_str, &context.worktree_path)?;
 
         let start_line = args["start_line"].as_u64();
         let end_line = args["end_line"].as_u64();

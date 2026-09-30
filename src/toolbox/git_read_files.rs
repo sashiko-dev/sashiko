@@ -16,6 +16,7 @@ use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
+use crate::toolbox::utils::validate_path;
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -145,6 +146,7 @@ impl GitReadFilesTool {
         if path_str.starts_with('-') {
             return Err(anyhow!("Invalid path name: {}", path_str));
         }
+        validate_path(path_str, &context.worktree_path)?;
 
         let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
         cmd.args(["show", &format!("{}:{}", revision, path_str)]);

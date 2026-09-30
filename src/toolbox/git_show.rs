@@ -16,6 +16,7 @@ use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
+use crate::toolbox::utils::validate_path;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -86,6 +87,30 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
             return Err(anyhow!("Invalid object name: {}", object));
         }
 
+        if let Some((rev_part, path_part)) = object.split_once(':')
+            && !rev_part.is_empty()
+            && !rev_part.ends_with('{')
+            && !path_part.is_empty()
+        {
+            if path_part.starts_with('-') {
+                return Err(anyhow!("Invalid path parameter: {}", path_part));
+            }
+            validate_path(path_part, &context.worktree_path)?;
+        }
+
+        let mut path_args = Vec::new();
+        if let Some(paths_val) = args["paths"].as_array() {
+            for p in paths_val {
+                if let Some(p_str) = p.as_str() {
+                    if p_str.starts_with('-') {
+                        return Err(anyhow!("Invalid path parameter: {}", p_str));
+                    }
+                    validate_path(p_str, &context.worktree_path)?;
+                    path_args.push(p_str);
+                }
+            }
+        }
+
         let raw_key = format!(
             "git_show_raw:{}:{}:{:?}",
             object,
@@ -111,16 +136,9 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
 
                 cmd.arg(object);
 
-                if let Some(paths_val) = args["paths"].as_array() {
+                if !path_args.is_empty() {
                     cmd.arg("--");
-                    for p in paths_val {
-                        if let Some(p_str) = p.as_str() {
-                            if p_str.starts_with('-') {
-                                return Err(anyhow!("Invalid path parameter: {}", p_str));
-                            }
-                            cmd.arg(p_str);
-                        }
-                    }
+                    cmd.args(&path_args);
                 }
 
                 let output = capped_output(&mut cmd).await?;

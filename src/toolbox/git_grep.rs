@@ -16,7 +16,7 @@ use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
 use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
-use crate::toolbox::utils::format_git_grep_output;
+use crate::toolbox::utils::{format_git_grep_output, validate_path};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -108,6 +108,12 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         {
             cmd.arg("--");
             for pathspec in p.split_whitespace() {
+                if pathspec.starts_with('-') {
+                    return Err(anyhow!("Invalid path parameter: {}", pathspec));
+                }
+                if pathspec != "." {
+                    validate_path(pathspec, &context.worktree_path)?;
+                }
                 cmd.arg(pathspec);
             }
         }
