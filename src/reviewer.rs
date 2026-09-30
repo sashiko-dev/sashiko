@@ -39,6 +39,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -71,7 +72,8 @@ struct BaselineAttempt {
 
 static INTERACTION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Budget for a single fetch of a missing base-commit.
+/// Budget for one fetch of a missing base-commit, and for the search of
+/// the trees that may hold it.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn generate_interaction_id() -> String {
@@ -1086,6 +1088,7 @@ impl Reviewer {
         repo_path: &Path,
         mainline_remote: &str,
         sha: &CommitId,
+        candidates: &[BaselineResolution],
     ) -> Result<String> {
         // A base-commit that is already merged upstream comes straight from
         // the mainline remote.
@@ -1098,14 +1101,95 @@ impl Reviewer {
         // object for v7.2-rc2). Those aren't fetchable by SHA, so pull tags
         // from the mainline remote and retry.
         Self::try_fetch(repo_path, &["fetch", mainline_remote, "--tags"]).await;
-        get_commit_hash(repo_path, sha.as_str()).await
+        if let Ok(resolved) = get_commit_hash(repo_path, sha.as_str()).await {
+            return Ok(resolved);
+        }
+
+        // What is left is a base-commit that only exists in the tree the
+        // series was built on.  Those trees are candidates for this series
+        // already, so ask each of them for that one commit.  Asking by SHA
+        // keeps the cost proportional to what is missing, needs no remote to
+        // be configured, takes no per-remote lock, and leaves the fetch
+        // schedule and the failure backoff of ensure_remote untouched for the
+        // candidate loop that follows.
+        //
+        // One budget covers the whole search, so a base-commit no tree has
+        // costs a bounded wait however many trees the series touches.
+        let deadline = Instant::now() + FETCH_TIMEOUT;
+        // The mainline remote answered above, and a candidate tree can carry
+        // its local name, so recognise it by URL.
+        let mainline_url = crate::git_cmd::in_dir_async(repo_path)
+            .args(["remote", "get-url", "--end-of-options", mainline_remote])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+        let mut asked: Vec<(&str, &str)> = Vec::new();
+        for candidate in candidates {
+            let BaselineResolution::RemoteTarget { url, name, .. } = candidate else {
+                continue;
+            };
+            // One tree reaches the candidate list once per branch it offers.
+            if Some(url.as_str()) == mainline_url.as_deref()
+                || asked.iter().any(|(_, seen)| *seen == url.as_str())
+            {
+                continue;
+            }
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() {
+                break;
+            }
+            asked.push((name, url));
+
+            // upload-pack serves an object nothing advertises only over
+            // protocol v2, and the fetch writes no FETCH_HEAD so that
+            // concurrent reviews of the same repository do not serialise on
+            // its lock.
+            Self::try_fetch_within(
+                repo_path,
+                &[
+                    "-c",
+                    "protocol.version=2",
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--end-of-options",
+                    url,
+                    sha.as_str(),
+                ],
+                budget,
+            )
+            .await;
+            if let Ok(resolved) = get_commit_hash(repo_path, sha.as_str()).await {
+                info!("Fetched base-commit {} from {}", sha, name);
+                return Ok(resolved);
+            }
+        }
+
+        // Name what was asked, and claim no more than that: a fetch that
+        // times out or is refused says nothing about the tree holding the
+        // commit.  The baseline log is what a maintainer reads to find out
+        // why their base-commit was ignored.
+        get_commit_hash(repo_path, sha.as_str()).await.map_err(|e| {
+            let mut sources = vec![mainline_remote];
+            sources.extend(asked.iter().map(|(name, _)| *name));
+            anyhow!("{} (not obtained from {})", e, sources.join(", "))
+        })
+    }
+
+    /// Run a fetch bounded by the default budget.
+    async fn try_fetch(repo_path: &Path, args: &[&str]) {
+        Self::try_fetch_within(repo_path, args, FETCH_TIMEOUT).await
     }
 
     /// Run a bounded fetch, ignoring its outcome: callers judge the result by
     /// resolving the revision they are after.
-    async fn try_fetch(repo_path: &Path, args: &[&str]) {
+    async fn try_fetch_within(repo_path: &Path, args: &[&str], timeout: Duration) {
         let _ = tokio::time::timeout(
-            FETCH_TIMEOUT,
+            timeout,
             crate::git_cmd::in_dir_async(repo_path)
                 .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
                 .args(args)
@@ -1202,7 +1286,8 @@ impl Reviewer {
                 Ok(sha) => Ok(sha),
                 Err(e) => match candidate {
                     BaselineResolution::Commit(sha_str) => {
-                        Self::fetch_missing_commit(&repo_path, mainline_remote, sha_str).await
+                        Self::fetch_missing_commit(&repo_path, mainline_remote, sha_str, candidates)
+                            .await
                     }
                     _ => Err(e),
                 },
@@ -3310,6 +3395,118 @@ mod tests {
             "one\ntwo changed\n"
         );
         assert!(logs.contains("Applied prerequisite"));
+        worktree.remove().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prepare_baseline_fetches_base_commit_from_maintainer_tree() -> Result<()> {
+        let temp_dir = tempdir()?;
+
+        // A maintainer tree holding the base-commit the series was built on.
+        let maintainer = temp_dir.path().join("maintainer");
+        std::fs::create_dir_all(&maintainer)?;
+        run_git(&maintainer, &["init", "-q"])?;
+        run_git(&maintainer, &["config", "user.name", "Test Author"])?;
+        run_git(&maintainer, &["config", "user.email", "author@example.com"])?;
+        let file = maintainer.join("value.txt");
+        std::fs::write(&file, "one\n")?;
+        run_git(&maintainer, &["add", "value.txt"])?;
+        run_git(&maintainer, &["commit", "-q", "-m", "maintainer base"])?;
+        let base_sha = run_git(&maintainer, &["rev-parse", "HEAD"])?;
+        std::fs::write(&file, "one\ntwo\n")?;
+        run_git(&maintainer, &["commit", "-q", "-am", "target"])?;
+        let target_diff = run_git(&maintainer, &["show", "--format=", "--patch", "HEAD"])?;
+        run_git(&maintainer, &["reset", "--hard", "-q", &base_sha])?;
+
+        // The tree has moved on since, so its tip is not the base-commit:
+        // reviewing the series there would not be what the maintainer built.
+        std::fs::write(maintainer.join("later.txt"), "later work\n")?;
+        run_git(&maintainer, &["add", "later.txt"])?;
+        run_git(&maintainer, &["commit", "-q", "-m", "later work"])?;
+
+        // The review repository knows nothing of that tree yet.
+        let repo = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo)?;
+        run_git(&repo, &["init", "-q"])?;
+        run_git(&repo, &["config", "user.name", "Test Author"])?;
+        run_git(&repo, &["config", "user.email", "author@example.com"])?;
+        std::fs::write(repo.join("unrelated.txt"), "mainline\n")?;
+        run_git(&repo, &["add", "unrelated.txt"])?;
+        run_git(&repo, &["commit", "-q", "-m", "mainline"])?;
+        assert!(get_commit_hash(&repo, &base_sha).await.is_err());
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.git.repository_path = repo.to_string_lossy().into_owned();
+        settings.review.worktree_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .to_string_lossy()
+            .into_owned();
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings: settings.clone(),
+            baseline_registry: Arc::new(BaselineRegistry::new(&repo, None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+
+        // A decoy tree that is unreachable, and one that shares the local
+        // remote name of the real tree: neither may hide the base-commit.
+        let decoy = temp_dir.path().join("decoy");
+        std::fs::create_dir_all(&decoy)?;
+        run_git(&decoy, &["init", "-q"])?;
+
+        // The subsystem heuristic offers the maintainer trees alongside the
+        // explicit base-commit taken from the series.
+        let candidates = vec![
+            BaselineResolution::Commit(CommitId::parse(&base_sha).unwrap()),
+            BaselineResolution::RemoteTarget {
+                url: temp_dir.path().join("gone").to_string_lossy().into_owned(),
+                name: "gone".to_string(),
+                branch: None,
+            },
+            BaselineResolution::RemoteTarget {
+                url: decoy.to_string_lossy().into_owned(),
+                name: "linux".to_string(),
+                branch: None,
+            },
+            BaselineResolution::RemoteTarget {
+                url: maintainer.to_string_lossy().into_owned(),
+                name: "linux".to_string(),
+                branch: Some("main".to_string()),
+            },
+        ];
+        let diffs = vec![(
+            99,
+            1,
+            target_diff,
+            "[PATCH] target".to_string(),
+            "Test Author <author@example.com>".to_string(),
+            1_700_000_001,
+            "target@example.com".to_string(),
+        )];
+
+        let (found, _patch_commits, logs) =
+            Reviewer::prepare_baseline_worktree(&ctx, 99, &candidates, &diffs, None).await;
+        let (_, worktree, review_baseline) =
+            found.ok_or_else(|| anyhow::anyhow!("baseline preparation failed: {logs}"))?;
+
+        // The series is reviewed on the exact base the maintainer used,
+        // not on the tip of the tree it came from.
+        assert_eq!(review_baseline, base_sha);
+        assert!(!worktree.path.join("later.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("value.txt"))?,
+            "one\ntwo\n"
+        );
         worktree.remove().await?;
         Ok(())
     }
