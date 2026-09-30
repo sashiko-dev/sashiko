@@ -36,18 +36,19 @@ crashes, unaligned page offsets, or wrong code paths being taken.
 **How VMA classification works** (see `include/linux/mm.h`):
 - `vma_is_anonymous(vma)` returns `!vma->vm_ops` -- this is the canonical
   test for anonymous VMAs
-- `vma_set_anonymous(vma)` sets `vma->vm_ops = NULL` but does NOT clear
-  `vma->vm_file`
+- `vma_set_anonymous(vma)` / `vma_desc_set_anonymous(desc)` sets
+  `vm_ops = NULL` but does NOT clear `vm_file`
 - A VMA can have `vma->vm_file != NULL` AND be anonymous (`vm_ops == NULL`)
 
 **VMAs where `vm_file` is set but the VMA is anonymous:**
-- Private mappings of `/dev/zero`: `mmap_zero_private_success()` in
-  `drivers/char/mem.c` calls `vma_set_anonymous(vma)` for private mappings,
-  leaving `vm_file` pointing to the `/dev/zero` file. Shared mappings take
-  a different path via `shmem_zero_setup()` which sets
+- Private mappings of `/dev/zero`: `mmap_zero_prepare()` in
+  `drivers/char/mem.c` calls `vma_desc_set_anonymous(desc)` for private
+  mappings, leaving `vm_file` pointing to the `/dev/zero` file. Shared
+  mappings take a different path via `shmem_zero_setup_desc()` which sets
   `vm_ops = &shmem_anon_vm_ops`
-- Any driver `mmap` handler that calls `vma_set_anonymous()` after the VMA
-  is created with a file reference
+- Any driver `mmap` / `mmap_prepare` handler that calls
+  `vma_set_anonymous()` / `vma_desc_set_anonymous()` after the mapping is
+  created with a file reference
 
 **Correct usage:**
 - To test "is this VMA file-backed?": use `!vma_is_anonymous(vma)`, NOT
@@ -57,9 +58,19 @@ crashes, unaligned page offsets, or wrong code paths being taken.
 - To access the backing file of a file-backed VMA: check
   `!vma_is_anonymous(vma)` first, then use `vma->vm_file`
 
-**REPORT as bugs**: Code that uses `vma->vm_file` (or `!vma->vm_file`) as
-a proxy for file-backed (or anonymous) VMA classification in dispatch logic,
-conditionals, or assertions. The correct test is `vma_is_anonymous()`.
+**REPORT as bugs**: Newly introduced or modified code that uses `vma->vm_file`
+(or `!vma->vm_file`) as a proxy for file-backed (or anonymous) VMA
+classification in page-fault, rmap, or memory-management dispatch logic where
+private `/dev/zero` mappings should behave like anonymous memory.
+
+**Do NOT report (false positives)**:
+- Intentional checks for `vma->vm_file` where the operation specifically
+  requires the absence of a backing `struct file` (for example,
+  `MADV_WIPEONFORK` requiring `MAP_ANONYMOUS`, or `__MADV_SET_ANON_VMA_NAME`
+  rejecting `vma->vm_file && !vma_is_anon_shmem(vma)` because `/proc/$pid/maps`
+  prints the file path whenever `vm_file` is set).
+- Pre-existing `vma->vm_file` checks in unrelated `switch` cases or functions
+  not modified by the patch.
 
 ## VMA Split/Merge Critical Section
 
@@ -144,6 +155,42 @@ When a callback replaces the file (`f_op->mmap_prepare()` replacing
 `desc->vm_file`, or legacy `f_op->mmap()` replacing `vma->vm_file`), the
 replacement already carries its own reference.
 
+**Error teardown and `.mmap_prepare` lifecycle (`mm/vma.c`):**
+- **Replaced `vm_file` cleanup via `put_map(&map)`**: When a callback swaps
+  `vma->vm_file` (`vma->vm_file != map->file`), `__mmap_new_file_vma()` saves
+  `map->vm_file = vma->vm_file`. If a subsequent step fails,
+  `__mmap_new_file_vma()` checks `if (map_same_file(map)) fput(map->vm_file);`
+  and deliberately skips `fput` when the file was swapped because
+  `__mmap_region()`'s `abort_munmap:` path invokes `put_map(&map)` after
+  `unmap_region(&map)` to release the swapped `map->vm_file`. Do NOT flag this
+  as a file reference leak or double-`fput`.
+- **No VMA exists during `call_mmap_prepare()`**: `.mmap_prepare`
+  (`vfs_mmap_prepare()`) operates on `struct vm_area_desc` *before* any
+  `struct vm_area_struct` is allocated. If `vfs_mmap_prepare()` or
+  `mmap_prepare_validate()` fails, `desc->vm_ops->close(vma)` cannot and must
+  not be called (drivers using `.mmap_prepare` defer resource allocation or use
+  `mmap_action` callbacks). Do NOT flag missing `vm_ops->close()` calls on
+  `call_mmap_prepare()` / `mmap_prepare_validate()` failure.
+- **`__compat_vma_mmap()` file pointer**: `__compat_vma_mmap()` is only invoked
+  from a file's `f_op->mmap` callback, so `vma->vm_file` is guaranteed
+  non-NULL on entry, and `.mmap_prepare` callbacks cannot clear `desc->vm_file`
+  to `NULL` (`vma_desc_set_anonymous()` only clears `desc->vm_ops`). Do NOT
+  flag missing NULL checks before `fput(vma->vm_file)` or `fput(desc->vm_file)`
+  in `__compat_vma_mmap()` / `compat_set_vma_from_desc()`.
+- **Restoring VMA bounds before `unmap_region()` on validation failure**: In
+  `mmap_file()`, restoring `vma->vm_start`, `vma->vm_end`, and `vma->vm_pgoff`
+  before returning an error from `mmap_validate()` / `mmap_hook_validate()` is
+  deliberate so that `unmap_region(&map)` only unmaps the address range
+  originally reserved for this VMA rather than adjacent VMAs.
+- **Driver contract assertions (`WARN_ON_ONCE` / `VM_WARN_ON_ONCE`)**:
+  `WARN_ON_ONCE()` / `VM_WARN_ON_ONCE()` checks in `mmap_validate_vma_flags()`,
+  `mmap_action`, or `discontig_kernel_map_page*()` assert internal kernel
+  driver API contracts (e.g., setting `VMA_IO_BIT` without a kernel mapping
+  flag, or passing a tail page to `discontig_kernel_map_page()`). Do NOT report
+  these as user-triggerable `panic_on_warn` DoS vulnerabilities or speculative
+  driver API footguns unless a driver in the patch series actually violates the
+  contract.
+
 **REPORT as bugs**: unconditional `get_file()` on a file that may have been
 swapped by a callback -- the replacement gets a leaked extra reference. See
 `map->file_doesnt_need_get` in `call_mmap_prepare()` in `mm/vma.c` and
@@ -193,11 +240,29 @@ swapped by a callback -- the replacement gets a leaked extra reference. See
   on a surviving VMA (e.g., `MREMAP_DONTUNMAP`, partial unmap) leaks
   committed memory permanently — `do_vmi_munmap()` only uncharges VMAs
   with `VM_ACCOUNT`. Review `vm_flags_clear()` calls including `VM_ACCOUNT`
-- **VMA iteration on external mm_struct**: call
-  `check_stable_address_space(mm)` after mmap lock, before traversal.
-  On `dup_mmap()` failure, maple tree slots contain `XA_ZERO_ENTRY`
-  markers and the mm is flagged `MMF_UNSTABLE`. OOM reaper also sets
-  `MMF_UNSTABLE`. See `unuse_mm()` in `mm/swapfile.c`
+- **VMA iteration on external mm_struct**: `check_stable_address_space(mm)` is
+  needed when walking an external `mm`'s maple tree directly while iterating
+  the global `mmlist` (such as `unuse_mm()` in `mm/swapfile.c`), where a
+  half-constructed child `mm` from a failed `dup_mmap()` may contain
+  `XA_ZERO_ENTRY` markers and have `MMF_UNSTABLE` set before `exit_mmap()`
+  tears it down. Do NOT flag missing `check_stable_address_space(mm)` when a
+  subsystem iterates its own list of active mappings (e.g.,
+  `kernel/bpf/arena.c:zap_pages()` walking `arena->vma_list` under
+  `mmap_read_lock(mm)` and calling `find_vma()` / `zap_page_range_single()`):
+  a failed `dup_mmap()` never adds un-copied VMAs to subsystem lists, and
+  `MMF_UNSTABLE` set by the OOM reaper does not corrupt the VMA maple tree
+- **`find_vm_area()` and `remap_vmalloc_range_partial()`**: `find_vm_area(addr)`
+  (via `find_vmap_area()`) performs a range containment lookup
+  (`addr >= va->va_start && addr < va->va_end`), NOT an exact base-address
+  match (`addr == area->addr`). Passing a page-aligned interior pointer `kaddr`
+  within a `VM_USERMAP` `vmalloc` allocation to
+  `remap_vmalloc_range_partial(vma, uaddr, kaddr, pgoff, size)` is valid and
+  maps `size` bytes starting at `kaddr + (pgoff << PAGE_SHIFT)`
+- **Casting `bool` to `void *` in page-walk callbacks**: in C (`_Bool`),
+  casting a `bool` directly to `void *` (e.g.,
+  `walk_page_range_vma(..., (void *)lock)`) does NOT trigger
+  `-Wint-to-pointer-cast` in either GCC or Clang. Do NOT report `(void *)bool`
+  as a compiler warning or `-Werror` build failure
 - **VMA operation results assigned to struct members**: `vma_merge_extend()`,
   `vma_merge_new_range()`, `copy_vma()` return NULL on failure. Assigning
   directly to a struct member (e.g., `vrm->vma = vma_merge_extend(...)`)
