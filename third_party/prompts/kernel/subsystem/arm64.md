@@ -118,6 +118,11 @@ the encodings, with no recall.
 - A claim that an ISS sub-field sits at a different bit, or has opposite
   polarity, than stated here when that claim rests only on recall. That is the
   unverifiable-spec confabulation the grounding note rules out.
+- Lower-EL trap helpers in `arch/arm64/include/asm/esr.h` (such as
+  `esr_trap_is_iabt()` or `esr_abt_is_exec_fault()`) checking
+  `ESR_ELx_EC_IABT_LOW` without `ESR_ELx_EC_IABT_CUR` when all callers handle
+  lower-EL traps (such as KVM stage-2 faults). Do not report speculative API
+  footguns for hypothetical future current-EL callers.
 
 ## Memory Tagging Extension (MTE) and Tagged Addresses
 
