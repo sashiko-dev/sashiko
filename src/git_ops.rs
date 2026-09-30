@@ -1053,7 +1053,7 @@ pub async fn refresh_remote(
                 if !update.status.success() {
                     return Err(anyhow!(
                         "Failed to update remote URL: {}",
-                        String::from_utf8_lossy(&update.stderr)
+                        redact_secret(String::from_utf8_lossy(&update.stderr).trim())
                     ));
                 }
             }
@@ -1066,7 +1066,10 @@ pub async fn refresh_remote(
             if !add.status.success() {
                 let stderr = String::from_utf8_lossy(&add.stderr);
                 if !stderr.contains("already exists") {
-                    return Err(anyhow!("Failed to add remote: {}", stderr));
+                    return Err(anyhow!(
+                        "Failed to add remote: {}",
+                        redact_secret(stderr.trim())
+                    ));
                 }
             }
             just_added = true;
@@ -1281,7 +1284,7 @@ pub async fn refresh_remote(
                 tracing::debug!(
                     "Could not set default HEAD for remote {}: {}",
                     name,
-                    String::from_utf8_lossy(&set_head.stderr).trim()
+                    redact_secret(String::from_utf8_lossy(&set_head.stderr).trim())
                 );
             }
         }
@@ -2360,6 +2363,65 @@ mod tests {
             err.downcast_ref::<BackoffError>().is_some(),
             "expected BackoffError, got {:?}",
             err
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_redacts_stderr_on_failure() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["remote", "add", "existing", "https://example.com/old.git"])
+            .output()
+            .await?;
+
+        // Lock .git/config so git remote add and git remote set-url fail and echo the target URL
+        File::create(repo_path.join(".git/config.lock"))?;
+
+        let cred_url = "https://user:secret_token_123@example.com/repo.git";
+
+        // 1. git remote add failure when .git/config.lock exists
+        let add_err = ensure_remote(&repo_path, "new_remote", cred_url, false)
+            .await
+            .expect_err("expected remote add to fail when config.lock exists")
+            .to_string();
+        assert!(
+            add_err.contains("Failed to add remote:"),
+            "unexpected error: {add_err}"
+        );
+        assert!(
+            add_err.contains("[REDACTED]"),
+            "expected redacted credentials in error: {add_err}"
+        );
+        assert!(
+            !add_err.contains("secret_token_123"),
+            "leaked secret token in error: {add_err}"
+        );
+
+        // 2. git remote set-url failure when .git/config.lock exists
+        let set_url_err = ensure_remote(&repo_path, "existing", cred_url, false)
+            .await
+            .expect_err("expected remote set-url to fail when config.lock exists")
+            .to_string();
+        assert!(
+            set_url_err.contains("Failed to update remote URL:"),
+            "unexpected error: {set_url_err}"
+        );
+        assert!(
+            set_url_err.contains("[REDACTED]"),
+            "expected redacted credentials in error: {set_url_err}"
+        );
+        assert!(
+            !set_url_err.contains("secret_token_123"),
+            "leaked secret token in error: {set_url_err}"
         );
 
         Ok(())
