@@ -92,15 +92,20 @@ authentication is a security boundary.
 **5. Benchmark Backing for Linux Review-Quality Changes (HIGH Severity).**
 Do not demand benchmark data, measurements, or manual test procedures for ordinary
 code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
-Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`)
-since `benchmarks/` only covers Linux kernel reviews. However, any change that
-can meaningfully affect overall Linux AI review quality across the board — such as
-Linux prompts (`third_party/prompts/`), Linux stage instructions
-(`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph structure,
-model parameters, or shared verification/deduplication logic — must be backed up
-by benchmark data (`benchmarks/`). Flag such Linux review-quality changes that
-lack benchmark validation or risk silent regressions in detection rate or
-precision as **High** severity.
+Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`).
+However, any change that can meaningfully affect overall Linux AI review quality
+across the board — such as global Linux stage instructions (`linux_patch_review.rs`,
+`linux_bug.rs`), generic workflow graph structure, model parameters, shared
+verification/deduplication logic, or broad Linux prompt changes (`third_party/prompts/`)
+— must include validation evidence in the commit message (either benchmark suite
+evaluation results or, for targeted false-positive prompt refinements, local
+re-review results on the affected Linux patches/series). Note that the JSON files
+in `benchmarks/` are static ground-truth corpora of known positive bugs (`BenchmarkEntry`
+in `src/bin/benchmark.rs`) and do not store negative/false-positive test cases;
+**never** demand that a prompt or workflow commit modify or add files in the
+`benchmarks/` directory. Flag Linux review-quality changes that provide no
+validation evidence in the commit message or risk silent regressions in detection
+rate or precision as **High** severity.
 
 **6. Zero Regressions and No Silent Failures.**
 Avoid regressions in CLI flags, `Settings.toml` parsing, or API contracts.

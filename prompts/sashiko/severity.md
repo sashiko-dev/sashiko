@@ -81,10 +81,14 @@ auditable.
       unbounded child processes, or retry storms).
     - Breaking a public configuration (`Settings`), CLI flag, or API contract
       without a compatibility path.
-    - Missing benchmark validation data for a change that can meaningfully
-      affect overall AI review quality, detection rate, or false-positive rate
-      across the board (e.g. global prompts, stage instructions, workflow graph,
-      planner logic, or verification/deduplication rules).
+    - Missing validation evidence in the commit message (neither benchmark suite
+      results nor targeted patch re-review results for false-positive prompt
+      refinements) for a change that can meaningfully affect overall Linux AI
+      review quality, detection rate, or false-positive rate across the board
+      (e.g. Linux prompts in `third_party/prompts/`, stage instructions,
+      workflow graph, planner logic, or verification/deduplication rules). Note:
+      `benchmarks/*.json` are static positive-bug suites and are never modified
+      by prompt or workflow commits; do not flag a missing diff in `benchmarks/`.
 
 ## Medium
 
