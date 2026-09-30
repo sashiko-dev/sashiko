@@ -288,6 +288,50 @@ async fn test_submit_rejects_empty_mbox() {
     assert_eq!(resp.status(), 400);
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_submit_rejects_a_baseline_that_is_not_a_commit_id() {
+    let server = spawn_test_server(false).await;
+    let client = reqwest::Client::new();
+
+    for baseline in [
+        "v6.7-rc2",
+        "origin/master",
+        "1234567",
+        "--upload-pack=sh",
+        "1234567890ABCDEF1234567890ABCDEF12345678",
+        "1234567890abcdef1234567890abcdef12345678\nbase-commit: x",
+    ] {
+        let resp = client
+            .post(format!("{}/api/submit", server.base_url))
+            .json(&serde_json::json!({
+                "type": "inject",
+                "raw": SAMPLE_MBOX,
+                "base_commit": baseline,
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        // A baseline that names no commit would be resolved as a ref, or
+        // reach git and the review log verbatim.
+        assert_eq!(resp.status(), 400, "baseline {baseline:?} was accepted");
+    }
+
+    let resp = client
+        .post(format!("{}/api/submit", server.base_url))
+        .json(&serde_json::json!({
+            "type": "inject",
+            "raw": SAMPLE_MBOX,
+            "base_commit": "1234567890abcdef1234567890abcdef12345678",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+}
+
 // ── Database-Backed Query Tests ─────────────────────────────────────────
 
 #[tokio::test]

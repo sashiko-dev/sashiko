@@ -18,7 +18,7 @@ use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
     create_provider_cached,
 };
-use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
+use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
@@ -554,18 +554,28 @@ impl Reviewer {
             None
         };
         let subject = patchset.subject.clone().unwrap_or("Unknown".to_string());
-        let candidates = if let Some(bid) = patchset.baseline_id {
-            if let Ok(Some(commit)) = ctx.db.get_baseline_commit(bid).await {
-                info!(
-                    "Using forced baseline commit {} from ingestion for patchset {}",
-                    commit, patchset_id
-                );
-                vec![BaselineResolution::Commit(commit)]
-            } else {
-                ctx.baseline_registry
-                    .resolve_candidates(&all_files, &subject, body.as_deref())
-                    .await
-            }
+        // A baseline recorded before ingestion required an object ID may be
+        // anything, and anything else resolves nothing, so the series is
+        // reviewed on the candidates it would have had without it.
+        let forced_baseline = match patchset.baseline_id {
+            Some(bid) => match ctx.db.get_baseline_commit(bid).await.ok().flatten() {
+                Some(commit) => CommitId::parse(&commit).or_else(|| {
+                    warn!(
+                        "Ignoring forced baseline of patchset {}: not a commit ID",
+                        patchset_id
+                    );
+                    None
+                }),
+                None => None,
+            },
+            None => None,
+        };
+        let candidates = if let Some(commit) = forced_baseline {
+            info!(
+                "Using forced baseline commit {} from ingestion for patchset {}",
+                commit, patchset_id
+            );
+            vec![BaselineResolution::Commit(commit)]
         } else {
             ctx.baseline_registry
                 .resolve_candidates(&all_files, &subject, body.as_deref())
@@ -1153,29 +1163,13 @@ impl Reviewer {
                 Ok(sha) => sha,
                 Err(e) => {
                     if let BaselineResolution::Commit(sha_str) = candidate {
-                        // Guard against flag and refspec injection from untrusted headers.
-                        let is_hex_sha = (4..=64).contains(&sha_str.len())
-                            && sha_str.bytes().all(|b| b.is_ascii_hexdigit());
-                        if !is_hex_sha {
-                            let msg = format!(
-                                "Failed to resolve baseline ref {} (invalid hex SHA): {}\n",
-                                baseline_ref, e
-                            );
-                            current_log.push_str(&msg);
-                            attempts.push(BaselineAttempt {
-                                baseline: baseline_ref.clone(),
-                                status: current_status,
-                                log: current_log,
-                            });
-                            continue;
-                        }
                         // Attempt to fetch the missing commit from the
                         // mainline remote.
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(120),
                             crate::git_cmd::in_dir_async(&repo_path)
                                 .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-                                .args(["fetch", mainline_remote, sha_str])
+                                .args(["fetch", mainline_remote, sha_str.as_str()])
                                 .kill_on_drop(true)
                                 .output(),
                         )
@@ -3283,7 +3277,7 @@ mod tests {
             target_review_count: 1,
             provider: Arc::new(MockProvider),
         };
-        let candidate = BaselineResolution::Commit(base_sha.clone());
+        let candidate = BaselineResolution::Commit(CommitId::parse(&base_sha).unwrap());
         let diffs = vec![(
             99,
             1,

@@ -60,9 +60,43 @@ pub struct MaintainersEntry {
     pub patterns: Vec<String>,
 }
 
+/// A git object ID naming a commit, in the form the trees Sashiko reviews
+/// write one: 40 lowercase hexadecimal digits. A SHA-256 repository would
+/// need the 64-digit form too; no such tree is reviewed today.
+///
+/// Every producer of a baseline commit emits that form, so parsing keeps a
+/// value that came over the wire from reaching git as an option, a refspec or
+/// a log line full of control characters.
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct CommitId(String);
+
+impl CommitId {
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.len() != 40
+            || !value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return None;
+        }
+
+        Some(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CommitId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum BaselineResolution {
-    Commit(String),   // Explicit base-commit hash
+    Commit(CommitId), // Explicit base-commit
     LocalRef(String), // e.g. "net-next/master" or "HEAD"
     RemoteTarget {
         url: String,
@@ -74,7 +108,7 @@ pub enum BaselineResolution {
 impl BaselineResolution {
     pub fn as_str(&self) -> String {
         match self {
-            BaselineResolution::Commit(h) => h.clone(),
+            BaselineResolution::Commit(h) => h.to_string(),
             BaselineResolution::LocalRef(r) => r.clone(),
             BaselineResolution::RemoteTarget { name, branch, .. } => match branch {
                 Some(b) => format!("{}/{}", name, b),
@@ -711,12 +745,13 @@ pub fn extract_files_from_diff(diff: &str) -> Vec<String> {
     files
 }
 
-pub fn extract_base_commit(body: &str) -> Option<String> {
+pub fn extract_base_commit(body: &str) -> Option<CommitId> {
     static BASE_COMMIT_RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        BASE_COMMIT_RE.get_or_init(|| Regex::new(r"(?m)^base-commit: ([0-9a-f]{40})").unwrap());
-    re.captures(body)
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+    let re = BASE_COMMIT_RE.get_or_init(|| Regex::new(r"(?m)^base-commit:[ \t]*(\S+)").unwrap());
+    // The trailer only says where to look; what an object ID is stays with
+    // CommitId, and a trailer that holds anything else is no trailer at all.
+    re.captures_iter(body)
+        .find_map(|caps| CommitId::parse(caps.get(1)?.as_str()))
 }
 
 pub fn extract_version_tag(subject: &str) -> Option<String> {
@@ -730,6 +765,43 @@ pub fn extract_version_tag(subject: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_id_takes_the_form_git_writes_and_nothing_else() {
+        let sha1 = "1234567890abcdef1234567890abcdef12345678";
+        assert_eq!(CommitId::parse(sha1).unwrap().as_str(), sha1);
+
+        // Abbreviated, over-long, upper case, and anything git would read as
+        // an option, a refspec or a log line of its own.
+        assert!(CommitId::parse("").is_none());
+        assert!(CommitId::parse("1234567").is_none());
+        assert!(CommitId::parse(&sha1[..39]).is_none());
+        assert!(CommitId::parse(&format!("{sha1}0")).is_none());
+        assert!(CommitId::parse(&sha1.to_uppercase()).is_none());
+        assert!(CommitId::parse("v6.7-rc2").is_none());
+        assert!(CommitId::parse("--upload-pack=sh").is_none());
+        assert!(CommitId::parse("refs/heads/main:refs/heads/main").is_none());
+        assert!(CommitId::parse("dead\u{1b}[2K\nApplied: beef").is_none());
+    }
+
+    #[test]
+    fn extract_base_commit_keeps_the_first_trailer_naming_an_object_id() {
+        let sha1 = "1234567890abcdef1234567890abcdef12345678";
+        assert_eq!(
+            extract_base_commit(&format!("text\nbase-commit: {sha1}\n")).as_ref(),
+            CommitId::parse(sha1).as_ref()
+        );
+
+        // A trailer that names something else is not a base-commit, and does
+        // not hide the one that follows it.
+        assert!(extract_base_commit("base-commit: v6.7-rc2\n").is_none());
+        assert!(extract_base_commit(&format!("base-commit: {sha1}-dirty\n")).is_none());
+        assert_eq!(
+            extract_base_commit(&format!("base-commit: HEAD\nbase-commit: {sha1}\n")).as_ref(),
+            CommitId::parse(sha1).as_ref()
+        );
+        assert!(extract_base_commit(&format!("prefix base-commit: {sha1}\n")).is_none());
+    }
 
     fn create_registry() -> BaselineRegistry {
         let entries = vec![MaintainersEntry {
@@ -762,7 +834,9 @@ mod tests {
 
         assert_eq!(
             candidates[0],
-            BaselineResolution::Commit("1234567890123456789012345678901234567890".to_string())
+            BaselineResolution::Commit(
+                CommitId::parse("1234567890123456789012345678901234567890").unwrap()
+            )
         );
 
         match &candidates[1] {
@@ -1315,7 +1389,7 @@ F: patterns/
             name: "ext4".to_string(),
             branch: Some("dev".to_string()),
         };
-        let base_commit = BaselineResolution::Commit(old.clone());
+        let base_commit = BaselineResolution::Commit(CommitId::parse(&old).unwrap());
         let version_tag = BaselineResolution::LocalRef("v5.10".to_string());
         for candidate in [explicit_branch, base_commit, version_tag] {
             assert!(

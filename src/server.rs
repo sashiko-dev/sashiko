@@ -14,6 +14,7 @@
 
 use crate::access::{BugAccess, OptionalPrincipal, Principal, SectionTitle};
 use crate::api::*;
+use crate::baseline::CommitId;
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
 use crate::fetcher::FetchRequest;
@@ -426,14 +427,12 @@ async fn submit_patch(
             skip_subjects,
             only_subjects,
         } => {
+            // A baseline that names no commit would be resolved as a ref,
+            // or reach git and the review log verbatim.
             if raw.trim().is_empty()
-                || base_commit.as_deref().is_some_and(|b| {
-                    b.is_empty()
-                        || b.chars().any(char::is_whitespace)
-                        || b.starts_with('-')
-                        || b.starts_with('+')
-                        || b.contains(':')
-                })
+                || base_commit
+                    .as_deref()
+                    .is_some_and(|b| CommitId::parse(b).is_none())
             {
                 return Err(StatusCode::BAD_REQUEST);
             }

@@ -14,6 +14,8 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "server")]
+use sashiko::baseline::CommitId;
+#[cfg(feature = "server")]
 use sashiko::db::Database;
 #[cfg(feature = "server")]
 use sashiko::events::{Event, MessageSource, ParsedArticle};
@@ -2586,17 +2588,28 @@ async fn process_parsed_article(
         patch_opt = None;
     }
 
-    // Resolve baseline ID if provided
-    let baseline_id = if let Some(b) = baseline {
-        match worker_db.create_baseline(None, None, Some(&b)).await {
+    // Resolve baseline ID if provided.  A baseline that does not name an
+    // object is dropped here rather than stored, so review never has to
+    // decide what an unresolvable one means.
+    let baseline_id = match baseline.as_deref().map(CommitId::parse) {
+        Some(Some(commit)) => match worker_db
+            .create_baseline(None, None, Some(commit.as_str()))
+            .await
+        {
             Ok(id) => Some(id),
             Err(e) => {
-                error!("Failed to create baseline for {}: {}", b, e);
+                error!("Failed to create baseline for {}: {}", commit, e);
                 None
             }
+        },
+        Some(None) => {
+            warn!(
+                "Ignoring submitted baseline of {}: not a commit ID",
+                article_id
+            );
+            None
         }
-    } else {
-        None
+        None => None,
     };
 
     // 1. Thread Resolution

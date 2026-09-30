@@ -23,7 +23,7 @@ Refactor `resolve_baseline` to `resolve_candidates` which returns a `Vec<Baselin
 - Output: Ordered list of unique candidates.
 
 **Candidate Generation:**
-1.  **Check `body`** for `base-commit: [0-9a-f]+`. If found -> `BaselineResolution::Commit(hash)`.
+1.  **Check `body`** for `base-commit: [0-9a-f]{40}`. If found -> `BaselineResolution::Commit(hash)`.
 2.  **Run Heuristic** (existing logic) -> `BaselineResolution::RemoteTarget` (Subsystem).
 3.  **Add Linux Next**: Hardcoded URL `https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git`.
 4.  **Add Mainline Tag**: Detect local `origin/master` (or equivalent) and find latest tag via `git describe`.
