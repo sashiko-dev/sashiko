@@ -30,6 +30,7 @@
 
 **Notes**:
 - If code checks for a condition via WARN_ON() or BUG_ON() assume that condition will never happen, unless you can provide concrete evidence of that condition existing via code snippets and call traces
+- `WARN_ON_ONCE()` / `VM_WARN_ON_ONCE()` assertions that validate internal kernel/driver API contracts are not user-triggerable `panic_on_warn` DoS bugs unless an in-tree caller can actually violate the contract from untrusted user input
 
 ### Bounds & Validation
 
@@ -40,6 +41,8 @@
 - **Migration disabled**: Stay on current CPU but may be preempted
 - **typeof() safety**: Can be used with container_of() before init
 - **Self-tests**: Memory leaks/FD leaks acceptable unless they can crash the system
+- **Host CLI build tools (`scripts/`, `tools/objtool/`)**: Single-invocation userspace build tools run on a POSIX host and exit immediately. Do not flag memory/FD leaks on error/exit paths, OOM-only cleanup issues, or non-POSIX (`fopen` `"wb"`, macOS `st_mtimespec`) portability issues
+- **Boolean-to-pointer casts (`(void *)bool_val`)**: Casting `bool` (`_Bool`) directly to `void *` does not trigger `-Wint-to-pointer-cast` in GCC or Clang; do not report it as a compiler warning
 - **likely()/unlikely()**: don't report on changes to compiler hinting unless
   they introduce larger logic bugs
 - READ_ONCE() is not required when the data structure being read is protected by a lock we're currently holding

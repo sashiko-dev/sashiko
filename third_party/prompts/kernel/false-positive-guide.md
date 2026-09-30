@@ -59,9 +59,11 @@ Do not confuse **mandatory kernel API error-handling** with "defensive programmi
 
 ### 2. API Misuse Assumptions
 **Never report** issues based on theoretical API misuse unless you can prove:
-  - An actual calling path exists that triggers the issue
+  - An actual calling path exists in the patch series or kernel tree that triggers the issue
   - The function naming/documentation doesn't clearly indicate usage constraints
   - Similar kernel APIs validate the same preconditions
+- **No speculative driver/caller footguns**: Do not report that a new or refactored internal helper could fail if a hypothetical or out-of-tree caller passes an invalid argument (e.g., a stack-allocated array where a persistent array is required, a tail page where an order-0 page or head page is required, `nr_pages = 0` or an overflowing `nr_pages`, or a current-EL syndrome to a lower-EL trap helper) unless a caller in the patch series actually violates the contract.
+- **Internal API contract `WARN_ON_ONCE` / `VM_WARN_ON_ONCE`**: Do not report `WARN_ON_ONCE()` or `VM_WARN_ON_ONCE()` checks that enforce kernel driver API contracts as user-triggerable `panic_on_warn` Denial-of-Service bugs unless you can prove an actual in-tree driver violates the contract on a user-reachable path.
 
 ### 3. Unverifiable Assumptions
 **Assume the author is wrong** and require proof they are correct
@@ -157,6 +159,7 @@ the code behaves a certain way, you MUST verify against the actual implementatio
 - Object was added to a list/queue for later processing
 - Cleanup happens in a callback or delayed work
 - It's in test code and doesn't affect the system
+- It's in a short-lived userspace CLI build utility (`scripts/`, `tools/objtool/`) on a fatal error path or at process exit (e.g., `ptr = realloc(ptr, size)` losing the old pointer on OOM right before exiting, early error returns skipping `free()`, or `ferror(f) || fclose(f)` skipping `fclose(f)` before process termination), where the OS immediately reclaims all memory and file descriptors
 
 **Verify by**:
 - Trace object ownership changes
@@ -451,9 +454,16 @@ Before reporting ANY regression, verify:
 - File descriptor leaks in tests → Usually OK
 - Unless it crashes/hangs the system → Report it
 
+### Host Build Utilities (`scripts/`, `tools/objtool/`)
+- Memory leaks (`realloc` losing old pointer on OOM, missing `free()` on error/exit paths) → Do NOT report (process exits immediately and OS reclaims memory)
+- File descriptor / `FILE *` leaks on fatal error paths (`ferror(f) || fclose(f)` before exit) → Do NOT report
+- Non-POSIX portability assumptions (`fopen(..., "w")` vs `"wb"`, `struct stat` `.st_mtim` vs `st_mtimespec`, standard coreutils like `seq`) → Do NOT report
+- Concurrent worker threads writing the same constant (`true`) to a plain `bool` status flag → Do NOT report
+
 ### Assertions and Warnings
 - Removing WARN_ON/BUG_ON → Not a regression
 - Removing BUILD_BUG_ON → Not a regression
+- Adding `WARN_ON_ONCE` / `VM_WARN_ON_ONCE` for internal kernel/driver API contract checks → Not a user-triggerable `panic_on_warn` DoS unless an actual in-tree caller allows user input to violate the contract
 - Unless removing critical runtime checks → Then report
 
 ### Reverts
