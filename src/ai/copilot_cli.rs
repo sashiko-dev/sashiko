@@ -31,7 +31,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, parse_inner_response};
+use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
 use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities};
 
 pub struct CopilotCliProvider {
@@ -90,24 +90,12 @@ impl AiProvider for CopilotCliProvider {
             .map_err(|_| anyhow::anyhow!("copilot CLI timed out after 10 minutes"))?
             .map_err(|e| anyhow::anyhow!("copilot CLI wait error: {}", e))?;
 
-        if !output.stderr.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.lines() {
-                if !line.trim().is_empty() {
-                    debug!("[copilot-cli stderr] {}", line);
-                }
-            }
-        }
+        let stderr = log_and_redact_stderr("copilot-cli", &output.stderr);
 
         let raw = String::from_utf8_lossy(&output.stdout);
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "copilot CLI exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
+            anyhow::bail!("copilot CLI exited with {}: {}", output.status, stderr);
         }
 
         parse_jsonl_events(&raw)

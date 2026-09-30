@@ -25,10 +25,11 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, parse_inner_response};
+use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, cache_identity_with,
 };
+use crate::utils::redact_secret;
 
 pub struct CodexCliProvider {
     pub model: String,
@@ -82,17 +83,9 @@ impl AiProvider for CodexCliProvider {
             .map_err(|_| anyhow::anyhow!("codex CLI timed out after 10 minutes"))?
             .map_err(|e| anyhow::anyhow!("codex CLI wait error: {}", e))?;
 
-        if !output.stderr.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.lines() {
-                if !line.trim().is_empty() {
-                    debug!("[codex-cli stderr] {}", line);
-                }
-            }
-        }
+        let stderr = log_and_redact_stderr("codex-cli", &output.stderr);
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             // codex reports why it rejected an invocation -- an unsupported
             // model_reasoning_effort value, say -- as a JSON error event on
@@ -101,9 +94,8 @@ impl AiProvider for CodexCliProvider {
             // on stdout does not explain a login failure printed on stderr, so
             // report both.
             let mut detail = collect_error_messages(&stdout);
-            let stderr = stderr.trim();
             if !stderr.is_empty() {
-                detail.push(stderr.to_string());
+                detail.push(stderr);
             }
             anyhow::bail!(
                 "codex CLI exited with {}: {}",
@@ -182,9 +174,10 @@ impl CodexCliProvider {
     /// that substitutes its own value for a setting reports the substitution
     /// this way and lets the run proceed.
     fn check_error_message(&self, message: &str) -> Result<()> {
-        if is_approval_policy_substitution(message) {
+        let message = redact_secret(message);
+        if is_approval_policy_substitution(&message) {
             debug!("codex-cli: {}", message);
-        } else if self.effort.is_some() && is_effort_substitution(message) {
+        } else if self.effort.is_some() && is_effort_substitution(&message) {
             // The response cache files the reply under the configured effort,
             // so a reply produced at the substituted one must not be returned.
             anyhow::bail!("codex CLI did not run at the configured effort: {message}");
@@ -212,10 +205,11 @@ fn collect_error_messages(raw: &str) -> Vec<String> {
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if let Some(message) = error_message(&event)
-            && !messages.iter().any(|m| m == message)
-        {
-            messages.push(message.to_string());
+        if let Some(message) = error_message(&event) {
+            let redacted = redact_secret(message);
+            if !messages.iter().any(|m| m == &redacted) {
+                messages.push(redacted);
+            }
         }
     }
     messages
@@ -301,6 +295,41 @@ mod tests {
                 "disallowed by requirements".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn error_messages_redact_secrets_in_json_and_check_error() {
+        let raw = concat!(
+            r#"{"type":"error","message":"auth failed for https://user:pass@host?key=sk-secret token=tok-123"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"error","message":"auth failed for https://user:pass@host?key=sk-secret token=tok-999"}}"#,
+            "\n",
+        );
+        let messages = collect_error_messages(raw);
+        assert_eq!(
+            messages,
+            vec![
+                "auth failed for https://[REDACTED]:[REDACTED]@host?key=[REDACTED] token=[REDACTED]"
+                    .to_string(),
+            ]
+        );
+
+        let raised = CodexCliProvider {
+            model: "gpt-5-codex".to_string(),
+            effort: Some("xhigh".to_string()),
+        };
+        let err = raised
+            .check_error_message(
+                "Configured value for `model_reasoning_effort` rejected at https://user:pass@host key=sk-secret token=tok-123",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https://[REDACTED]:[REDACTED]@host"));
+        assert!(err.contains("key=[REDACTED]"));
+        assert!(err.contains("token=[REDACTED]"));
+        assert!(!err.contains("sk-secret"));
+        assert!(!err.contains("tok-123"));
+        assert!(!err.contains("user:pass"));
     }
 
     #[test]

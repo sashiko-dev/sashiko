@@ -37,7 +37,7 @@ use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall, cache_identity_with,
 };
-use crate::utils::utf8_prefix;
+use crate::utils::{redact_secret, utf8_prefix};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClaudeCliError {
@@ -67,6 +67,44 @@ impl ClassifyAiError for ClaudeCliError {
             ClaudeCliError::Parse(_) => AiErrorClass::Fatal,
         }
     }
+}
+
+pub(crate) fn log_and_redact_stderr(label: &str, stderr: &[u8]) -> String {
+    if stderr.is_empty() {
+        return String::new();
+    }
+    let redacted = redact_secret(&String::from_utf8_lossy(stderr));
+    for line in redacted.lines() {
+        if !line.trim().is_empty() {
+            debug!("[{label} stderr] {line}");
+        }
+    }
+    redacted.trim().to_string()
+}
+
+fn format_cli_exit_error(
+    status: impl std::fmt::Display,
+    raw: &str,
+    stderr: &str,
+) -> ClaudeCliError {
+    // Try to extract the actual error message from the JSON output.
+    // The CLI emits a JSON object with is_error=true and the reason
+    // in the "result" field even when it exits non-zero.
+    if let Ok(outer) = serde_json::from_str::<Value>(raw)
+        && let Some(msg) = outer["result"].as_str()
+    {
+        return ClaudeCliError::Cli(redact_secret(msg));
+    }
+    ClaudeCliError::Cli(format!("exited with {status}: {stderr}"))
+}
+
+fn extract_cli_result(outer: &Value) -> Result<String, ClaudeCliError> {
+    if outer["is_error"].as_bool().unwrap_or(false) {
+        return Err(ClaudeCliError::Cli(redact_secret(
+            outer["result"].as_str().unwrap_or("unknown error"),
+        )));
+    }
+    Ok(outer["result"].as_str().unwrap_or("").trim().to_string())
 }
 
 pub struct ClaudeCliProvider {
@@ -117,47 +155,14 @@ impl AiProvider for ClaudeCliProvider {
             .map_err(|_| ClaudeCliError::Timeout)?
             .map_err(|e| ClaudeCliError::Wait(e.to_string()))?;
 
-        if !output.stderr.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.lines() {
-                if !line.trim().is_empty() {
-                    debug!("[claude-cli stderr] {}", line);
-                }
-            }
-        }
-
+        let stderr = log_and_redact_stderr("claude-cli", &output.stderr);
         let raw = String::from_utf8_lossy(&output.stdout);
 
         if !output.status.success() {
-            // Try to extract the actual error message from the JSON output.
-            // The CLI emits a JSON object with is_error=true and the reason
-            // in the "result" field even when it exits non-zero.
-            if let Ok(outer) = serde_json::from_str::<Value>(&raw)
-                && let Some(msg) = outer["result"].as_str()
-            {
-                return Err(ClaudeCliError::Cli(msg.to_string()).into());
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ClaudeCliError::Cli(format!(
-                "exited with {}: {}",
-                output.status,
-                stderr.trim()
-            ))
-            .into());
+            return Err(format_cli_exit_error(output.status, &raw, &stderr).into());
         }
         let outer = parse_cli_output(&raw)?;
-
-        if outer["is_error"].as_bool().unwrap_or(false) {
-            return Err(ClaudeCliError::Cli(
-                outer["result"]
-                    .as_str()
-                    .unwrap_or("unknown error")
-                    .to_string(),
-            )
-            .into());
-        }
-
-        let result_text = outer["result"].as_str().unwrap_or("").trim().to_string();
+        let result_text = extract_cli_result(&outer)?;
 
         // Parse usage from the outer JSON
         let usage = parse_usage(&outer);
@@ -179,8 +184,10 @@ impl AiProvider for ClaudeCliProvider {
 }
 
 fn parse_cli_output(raw: &str) -> Result<Value, ClaudeCliError> {
-    serde_json::from_str(raw)
-        .map_err(|e| ClaudeCliError::Parse(format!("{}\nRaw: {}", e, utf8_prefix(raw, 200))))
+    serde_json::from_str(raw).map_err(|e| {
+        let redacted = redact_secret(raw);
+        ClaudeCliError::Parse(format!("{}\nRaw: {}", e, utf8_prefix(&redacted, 200)))
+    })
 }
 
 /// Pick the context window to advertise for a given model name. The value is
@@ -573,5 +580,54 @@ mod tests {
 
         assert_eq!(usage.prompt_tokens, 500);
         assert_eq!(usage.cached_tokens, None);
+    }
+
+    #[test]
+    fn test_log_and_redact_stderr_strips_secrets() {
+        let raw_stderr =
+            b"Error connecting to https://user:pass@host/v1?key=sk-secret token=tok-123\n";
+        let redacted = log_and_redact_stderr("claude-cli", raw_stderr);
+        assert_eq!(
+            redacted,
+            "Error connecting to https://[REDACTED]:[REDACTED]@host/v1?key=[REDACTED] token=[REDACTED]"
+        );
+        assert!(!redacted.contains("sk-secret"));
+        assert!(!redacted.contains("tok-123"));
+        assert!(!redacted.contains("user:pass"));
+    }
+
+    #[test]
+    fn test_cli_error_redacts_secrets_in_json_and_raw_output() {
+        let err_parse =
+            parse_cli_output("not-json https://user:pass@host?key=sk-secret token=tok-123")
+                .unwrap_err()
+                .to_string();
+        assert!(err_parse.contains("https://[REDACTED]:[REDACTED]@host?key=[REDACTED]"));
+        assert!(err_parse.contains("token=[REDACTED]"));
+        assert!(!err_parse.contains("sk-secret"));
+        assert!(!err_parse.contains("tok-123"));
+        assert!(!err_parse.contains("user:pass"));
+
+        let outer_err = json!({
+            "is_error": true,
+            "result": "upstream failed at https://user:pass@host with key=sk-secret and token=tok-123"
+        });
+        let err_result = extract_cli_result(&outer_err).unwrap_err().to_string();
+        assert!(err_result.contains("https://[REDACTED]:[REDACTED]@host"));
+        assert!(err_result.contains("key=[REDACTED]"));
+        assert!(err_result.contains("token=[REDACTED]"));
+        assert!(!err_result.contains("sk-secret"));
+        assert!(!err_result.contains("tok-123"));
+        assert!(!err_result.contains("user:pass"));
+
+        let err_exit_json =
+            format_cli_exit_error("exit status: 1", &outer_err.to_string(), "ignored stderr")
+                .to_string();
+        assert!(err_exit_json.contains("https://[REDACTED]:[REDACTED]@host"));
+        assert!(err_exit_json.contains("key=[REDACTED]"));
+        assert!(err_exit_json.contains("token=[REDACTED]"));
+        assert!(!err_exit_json.contains("sk-secret"));
+        assert!(!err_exit_json.contains("tok-123"));
+        assert!(!err_exit_json.contains("user:pass"));
     }
 }

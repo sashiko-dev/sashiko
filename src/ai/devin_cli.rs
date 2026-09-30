@@ -33,7 +33,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, parse_inner_response};
+use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
 use crate::ai::{AiProvider, AiRequest, AiResponse, ProviderCapabilities};
 
 pub struct DevinCliProvider {
@@ -123,18 +123,10 @@ impl AiProvider for DevinCliProvider {
         // Drop the temp file now that the child has exited.
         drop(prompt_file);
 
-        if !output.stderr.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.lines() {
-                if !line.trim().is_empty() {
-                    debug!("[devin-cli stderr] {}", line);
-                }
-            }
-        }
+        let stderr = log_and_redact_stderr("devin-cli", &output.stderr);
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("devin CLI exited with {}: {}", output.status, stderr.trim());
+            anyhow::bail!("devin CLI exited with {}: {}", output.status, stderr);
         }
 
         let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
