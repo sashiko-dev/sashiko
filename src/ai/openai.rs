@@ -378,16 +378,17 @@ impl OpenAiCompatClient {
 
         match status_code {
             429 => {
-                let mut retry_seconds = retry_after_duration
-                    .unwrap_or(Duration::from_secs(60))
-                    .as_secs_f64();
-                if let Some(caps) = re.captures(&error_text) {
-                    retry_seconds = caps[1].parse::<f64>().unwrap_or(retry_seconds);
-                }
-                tracing::warn!("OpenAI 429 Rate Limit. Retry in {}s", retry_seconds);
-                Err(OpenAiCompatError::RateLimitExceeded(
-                    Duration::from_secs_f64(retry_seconds),
-                ))?
+                let default_retry = retry_after_duration.unwrap_or(Duration::from_secs(60));
+                let retry_duration = re
+                    .captures(&error_text)
+                    .and_then(|caps| caps[1].parse::<f64>().ok())
+                    .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+                    .unwrap_or(default_retry);
+                tracing::warn!(
+                    "OpenAI 429 Rate Limit. Retry in {}s",
+                    retry_duration.as_secs_f64()
+                );
+                Err(OpenAiCompatError::RateLimitExceeded(retry_duration))?
             }
             401 | 403 => Err(OpenAiCompatError::AuthenticationError(error_text))?,
             500..=599 => {

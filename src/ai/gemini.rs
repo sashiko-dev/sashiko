@@ -261,9 +261,19 @@ impl ClassifyAiError for GeminiError {
     }
 }
 
+fn valid_retry_after_secs(secs: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64(secs).ok()
+}
+
 fn retry_after_from_body(error_text: &str) -> Option<f64> {
     let hint = Regex::new(r"Please retry in ([0-9.]+)s").ok()?;
-    hint.captures(error_text)?.get(1)?.as_str().parse().ok()
+    let secs = hint
+        .captures(error_text)?
+        .get(1)?
+        .as_str()
+        .parse::<f64>()
+        .ok()?;
+    valid_retry_after_secs(secs).map(|_| secs)
 }
 
 fn reason_suffix(error_text: &str) -> String {
@@ -278,15 +288,19 @@ fn classify_generate_content_failure(
     error_text: &str,
 ) -> GeminiError {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_seconds = retry_after_secs
-            .or_else(|| retry_after_from_body(error_text))
-            .unwrap_or(30.0);
+        let retry_after = retry_after_secs
+            .and_then(valid_retry_after_secs)
+            .or_else(|| retry_after_from_body(error_text).and_then(valid_retry_after_secs))
+            .unwrap_or(Duration::from_secs(30));
         tracing::warn!(
             "Gemini 429 Quota Exceeded. Retry suggested in {}s. Body: {}",
-            retry_seconds,
+            retry_after.as_secs_f64(),
             error_text
         );
-        return GeminiError::QuotaExceeded(Duration::from_secs_f64(retry_seconds + 1.0));
+        let quota_delay = retry_after
+            .checked_add(Duration::from_secs(1))
+            .unwrap_or(Duration::from_secs(31));
+        return GeminiError::QuotaExceeded(quota_delay);
     }
 
     if status == reqwest::StatusCode::FORBIDDEN {
@@ -300,7 +314,7 @@ fn classify_generate_content_failure(
 
     if status.is_server_error() || status.as_u16() == 499 {
         let retry_after = retry_after_secs
-            .map(Duration::from_secs_f64)
+            .and_then(valid_retry_after_secs)
             .unwrap_or(Duration::from_secs(0));
         tracing::debug!(
             "Gemini API Transient Error: status={}, body={}",
@@ -359,7 +373,8 @@ pub(crate) async fn read_generate_content_response(
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok());
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&secs| valid_retry_after_secs(secs).is_some());
 
     let error_text = redact_secret(&res.text().await?);
 
@@ -1163,6 +1178,50 @@ mod tests {
             err,
             GeminiError::QuotaExceeded(d) if d == Duration::from_secs_f64(31.0)
         ));
+    }
+
+    #[test]
+    fn test_classify_failure_invalid_retry_after_falls_back_cleanly() {
+        let invalid_headers = [
+            Some(-5.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::MAX),
+        ];
+        let invalid_bodies = [
+            "Quota exceeded.",
+            "Please retry in 1e100s",
+            "Please retry in 999999999999999999999999999999s",
+        ];
+
+        for body in invalid_bodies {
+            assert_eq!(retry_after_from_body(body), None);
+        }
+
+        for retry_after_secs in invalid_headers {
+            for body in invalid_bodies {
+                let err_429 = classify_generate_content_failure(
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    retry_after_secs,
+                    body,
+                );
+                assert!(matches!(
+                    err_429,
+                    GeminiError::QuotaExceeded(d) if d == Duration::from_secs(31)
+                ));
+
+                let err_503 = classify_generate_content_failure(
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    retry_after_secs,
+                    body,
+                );
+                assert!(matches!(
+                    err_503,
+                    GeminiError::TransientError(d, _) if d == Duration::from_secs(0)
+                ));
+            }
+        }
     }
 
     #[test]
