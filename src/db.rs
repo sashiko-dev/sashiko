@@ -5505,14 +5505,18 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
+                "SELECT cover_letter_message_id, total_parts, subject_index, subject, status FROM patchsets WHERE id = ?",
                 libsql::params![patchset_id],
             )
             .await?;
-        let current: Option<String> = match rows.next().await {
-            Ok(Some(row)) => row.get::<Option<String>>(0).ok().flatten(),
-            _ => None,
+        let Some(row) = rows.next().await? else {
+            return Ok(());
         };
+        let current = row.get::<Option<String>>(0)?;
+        let existing_total = row.get::<Option<u32>>(1)?.unwrap_or(1);
+        let existing_subject_index = row.get::<Option<u32>>(2)?.unwrap_or(9999);
+        let existing_subject = row.get::<Option<String>>(3)?.unwrap_or_default();
+        let existing_status = row.get::<Option<String>>(4)?.unwrap_or_default();
 
         if current.as_deref() == Some(identity) {
             return Ok(());
@@ -5545,9 +5549,33 @@ impl Database {
                     }
                     Some(curr_idx) => {
                         if !is_own_part_id || part_index == 0 {
-                            // The incoming identity is a cover letter (either part_index == 0
-                            // or an unclaimed parent cover letter from In-Reply-To).
-                            true
+                            let is_placeholder = existing_subject == "(placeholder)"
+                                || existing_status == "Fetching";
+                            if !is_placeholder && existing_total == 1 && existing_subject_index == 1
+                            {
+                                let mut m_rows = self
+                                    .conn
+                                    .query(
+                                        "SELECT subject FROM messages WHERE message_id = ? LIMIT 1",
+                                        libsql::params![identity],
+                                    )
+                                    .await?;
+                                if let Some(m_row) = m_rows.next().await? {
+                                    let msg_subj =
+                                        m_row.get::<Option<String>>(0)?.unwrap_or_default();
+                                    !Self::is_reply_subject(&msg_subj)
+                                        && (Self::has_explicit_zero_index(&msg_subj)
+                                            || self
+                                                .patches_reply_to_message(patchset_id, identity)
+                                                .await?)
+                                } else {
+                                    true
+                                }
+                            } else {
+                                // The incoming identity is a cover letter (either part_index == 0
+                                // or an unclaimed parent cover letter from In-Reply-To).
+                                true
+                            }
                         } else {
                             // Both current and incoming are patch message IDs; the lower
                             // part index wins.
@@ -5572,6 +5600,64 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+
+    /// Returns true if `subject` represents a reply, forward, reproducer, or
+    /// renamed thread rather than a canonical series/patch subject.
+    fn is_reply_subject(subject: &str) -> bool {
+        let lower = subject.to_ascii_lowercase();
+        if lower.contains("(was ") || lower.contains("(was:") {
+            return true;
+        }
+        let mut s = subject.trim_start();
+        let mut stripped_bracket = false;
+        while !s.is_empty() {
+            let s_lower = s.to_ascii_lowercase();
+            for p in [
+                "re:",
+                "fwd:",
+                "forwarded:",
+                "回复:",
+                "回复：",
+                "答复:",
+                "答复：",
+                "[reproducer]",
+            ] {
+                if s_lower.starts_with(p) {
+                    return true;
+                }
+            }
+            if !stripped_bracket && (s_lower.starts_with("aw:") || s_lower.starts_with("wg:")) {
+                return true;
+            }
+            if s.starts_with('[')
+                && let Some(end) = s.find(']')
+            {
+                s = s[end + 1..].trim_start();
+                stripped_bracket = true;
+                continue;
+            }
+            break;
+        }
+        false
+    }
+
+    /// Returns true if `subject` is not a reply and contains an explicit `0/N`
+    /// cover letter counter.
+    fn has_explicit_zero_index(subject: &str) -> bool {
+        !Self::is_reply_subject(subject) && crate::patch::parse_subject_index(subject).0 == 0
+    }
+
+    /// Report whether any patch in `patchset_id` has `in_reply_to = message_id`.
+    async fn patches_reply_to_message(&self, patchset_id: i64, message_id: &str) -> Result<bool> {
+        let mut p_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND m.in_reply_to = ? LIMIT 1",
+                libsql::params![patchset_id, message_id],
+            )
+            .await?;
+        Ok(p_rows.next().await?.is_some())
     }
 
     /// The part number a message holds in a patchset, or None when the message
@@ -5823,11 +5909,19 @@ impl Database {
                     total_parts
                 };
 
-                let trimmed = subject.trim_start();
-                let is_reply_msg = part_index == 0
-                    && trimmed
-                        .get(..3)
-                        .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
+                let patches_reply_to_new_cover = if part_index == 0 && subject_index > 0 {
+                    self.patches_reply_to_message(id, message_id).await?
+                } else {
+                    false
+                };
+                let is_singleton_non_cover = part_index == 0
+                    && !is_placeholder
+                    && existing_total == 1
+                    && subject_index == 1
+                    && !patches_reply_to_new_cover
+                    && !Self::has_explicit_zero_index(subject);
+                let is_reply_msg =
+                    (part_index == 0 && Self::is_reply_subject(subject)) || is_singleton_non_cover;
 
                 let final_author = if is_placeholder
                     || part_index <= subject_index
@@ -5914,6 +6008,8 @@ impl Database {
             cover_id: Option<String>,
             baseline_id: Option<i64>,
             baseline_part: Option<u32>,
+            patches_reply_to_new_cover: bool,
+            is_placeholder: bool,
         }
 
         let mut matches: Vec<CandidateMatch> = Vec::new();
@@ -5984,14 +6080,7 @@ impl Database {
                 && new_msgid_prefix.len() > 10;
 
             let patches_reply_to_new_cover = if part_index == 0 && existing_subject_index > 0 {
-                let mut p_rows = self
-                    .conn
-                    .query(
-                        "SELECT 1 FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND m.in_reply_to = ? LIMIT 1",
-                        libsql::params![id, message_id],
-                    )
-                    .await?;
-                p_rows.next().await?.is_some()
+                self.patches_reply_to_message(id, message_id).await?
             } else {
                 false
             };
@@ -6024,7 +6113,11 @@ impl Database {
                     return Ok(Some(id));
                 }
                 let is_late_own_cover = part_index == 0
+                    && !Self::is_reply_subject(subject)
                     && existing_subject_index > 0
+                    && (existing_total > 1
+                        || patches_reply_to_new_cover
+                        || Self::has_explicit_zero_index(subject))
                     && (patches_reply_to_new_cover || msgid_prefix_match)
                     && versions_compatible
                     && author_or_series_match
@@ -6107,6 +6200,8 @@ impl Database {
                 && thread_compatible
                 && (!index_collision || is_same_series_redelivery)
             {
+                let is_placeholder =
+                    existing_subject == "(placeholder)" || existing_status == "Fetching";
                 matches.push(CandidateMatch {
                     id,
                     subject: existing_subject,
@@ -6115,6 +6210,8 @@ impl Database {
                     cover_id: existing_cover_id,
                     baseline_id: existing_baseline_id,
                     baseline_part: existing_baseline_part,
+                    patches_reply_to_new_cover,
+                    is_placeholder,
                 });
             }
         }
@@ -6375,11 +6472,14 @@ impl Database {
                 }
             }
 
-            let trimmed = subject.trim_start();
-            let is_reply_msg = part_index == 0
-                && trimmed
-                    .get(..3)
-                    .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
+            let is_singleton_non_cover = part_index == 0
+                && !matches[0].is_placeholder
+                && matches[0].total_parts == 1
+                && current_subject_index == 1
+                && !matches[0].patches_reply_to_new_cover
+                && !Self::has_explicit_zero_index(subject);
+            let is_reply_msg =
+                (part_index == 0 && Self::is_reply_subject(subject)) || is_singleton_non_cover;
 
             let final_total = if total_parts == 1 && matches[0].total_parts > 1 {
                 matches[0].total_parts
@@ -6504,7 +6604,7 @@ impl Database {
             .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
                  VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && subject.trim_start().get(..3).is_some_and(|p| p.eq_ignore_ascii_case("re:")) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && Self::is_reply_subject(subject) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
             )
             .await?;
 
@@ -19754,5 +19854,266 @@ mod tests {
         db.create_patch(ps_first, p1, 1, "diff1 updated")
             .await
             .expect("updating an already-present patch must not bail on index collision");
+    }
+
+    #[tokio::test]
+    async fn test_singleton_patchset_metadata_not_overwritten_by_replies_or_non_cover() {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: "".to_string(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let thread_id = db
+            .create_thread(
+                "patch-1@example.com",
+                "[PATCH] net: fix race condition",
+                1000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "patch-1@example.com",
+            thread_id,
+            None,
+            "Alice <alice@example.com>",
+            "[PATCH] net: fix race condition",
+            1000,
+            "patch body",
+            "netdev@vger.kernel.org",
+            "lkml@vger.kernel.org",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("patch-1@example.com"),
+                "patch-1@example.com",
+                "[PATCH] net: fix race condition",
+                "Alice <alice@example.com>",
+                1000,
+                1,
+                1,
+                "netdev@vger.kernel.org",
+                "lkml@vger.kernel.org",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_id, "patch-1@example.com", 1, "diff --git a/f b/f")
+            .await
+            .unwrap();
+
+        // 1. Reply with bracketed prefix before Re: and its own cover_letter_message_id (Branch 2)
+        db.create_message(
+            "reply-bracket@example.com",
+            thread_id,
+            Some("patch-1@example.com"),
+            "Bob <bob@example.com>",
+            "[PATCH] Re: net: fix race condition",
+            1010,
+            "reply body",
+            "other@example.com",
+            "other-cc@example.com",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let res1 = db
+            .create_patchset(
+                thread_id,
+                Some("reply-bracket@example.com"),
+                "reply-bracket@example.com",
+                "[PATCH] Re: net: fix race condition",
+                "Bob <bob@example.com>",
+                1010,
+                1,
+                1,
+                "other@example.com",
+                "other-cc@example.com",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res1, ps_id);
+
+        // 2. Reply with Aw: prefix matching via cover_letter_message_id (Branch 1)
+        db.create_message(
+            "reply-aw@example.com",
+            thread_id,
+            Some("patch-1@example.com"),
+            "Charlie <charlie@example.com>",
+            "Aw: [PATCH] net: fix race condition",
+            1020,
+            "aw reply",
+            "wrong-to@example.com",
+            "wrong-cc@example.com",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let res2 = db
+            .create_patchset(
+                thread_id,
+                Some("patch-1@example.com"),
+                "reply-aw@example.com",
+                "Aw: [PATCH] net: fix race condition",
+                "Charlie <charlie@example.com>",
+                1020,
+                1,
+                1,
+                "wrong-to@example.com",
+                "wrong-cc@example.com",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res2, ps_id);
+
+        // 3. Unindexed part_index == 0 message in the same thread (no 0/1 counter, patch does not reply to it)
+        db.create_message(
+            "unindexed-followup@example.com",
+            thread_id,
+            Some("patch-1@example.com"),
+            "Dave <dave@example.com>",
+            "[PATCH] net: fix race condition",
+            1030,
+            "followup body",
+            "dave-to@example.com",
+            "dave-cc@example.com",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let res3 = db
+            .create_patchset(
+                thread_id,
+                Some("unindexed-followup@example.com"),
+                "unindexed-followup@example.com",
+                "[PATCH] net: fix race condition",
+                "Dave <dave@example.com>",
+                1030,
+                1,
+                1,
+                "dave-to@example.com",
+                "dave-cc@example.com",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res3, ps_id);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT subject, subject_index, cover_letter_message_id, author, to_recipients, cc_recipients FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let subj: String = row.get(0).unwrap();
+        let subj_idx: u32 = row.get(1).unwrap();
+        let cover_id: Option<String> = row.get(2).unwrap();
+        let author: String = row.get(3).unwrap();
+        let to_rec: String = row.get(4).unwrap();
+        let cc_rec: String = row.get(5).unwrap();
+
+        assert_eq!(subj, "[PATCH] net: fix race condition");
+        assert_eq!(subj_idx, 1);
+        assert_eq!(cover_id.as_deref(), Some("patch-1@example.com"));
+        assert_eq!(author, "Alice <alice@example.com>");
+        assert_eq!(to_rec, "netdev@vger.kernel.org");
+        assert_eq!(cc_rec, "lkml@vger.kernel.org");
+
+        // 4. Genuine [PATCH 0/1] cover letter (including wg: subsystem prefix) arriving later DOES update singleton subject and identity
+        db.create_message(
+            "cover-0-1@example.com",
+            thread_id,
+            None,
+            "Alice <alice@example.com>",
+            "[PATCH 0/1] wg: cover letter for singleton",
+            999,
+            "cover body",
+            "netdev@vger.kernel.org",
+            "lkml@vger.kernel.org",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let res4 = db
+            .create_patchset(
+                thread_id,
+                Some("cover-0-1@example.com"),
+                "cover-0-1@example.com",
+                "[PATCH 0/1] wg: cover letter for singleton",
+                "Alice <alice@example.com>",
+                999,
+                1,
+                1,
+                "netdev@vger.kernel.org",
+                "lkml@vger.kernel.org",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res4, ps_id);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT subject, subject_index, cover_letter_message_id FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let subj: String = row.get(0).unwrap();
+        let subj_idx: u32 = row.get(1).unwrap();
+        let cover_id: Option<String> = row.get(2).unwrap();
+
+        assert_eq!(subj, "[PATCH 0/1] wg: cover letter for singleton");
+        assert_eq!(subj_idx, 0);
+        assert_eq!(cover_id.as_deref(), Some("cover-0-1@example.com"));
     }
 }
