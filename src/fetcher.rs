@@ -95,7 +95,10 @@ impl FetchAgent {
             }
 
             let commit_list: Vec<String> = commits.into_iter().collect();
-            let url_display = url_opt.as_deref().unwrap_or("local");
+            let url_display = url_opt
+                .as_deref()
+                .map(redact_secret)
+                .unwrap_or_else(|| "local".to_string());
 
             info!(
                 "Processing {} commits for remote {}",
@@ -160,13 +163,17 @@ impl FetchAgent {
                     // Do not continue here; let it fall through to Step 3 where it will fail individually
                 } else {
                     if let Err(e) = self.ensure_remote(&remote_name, &url).await {
-                        error!("Failed to ensure remote {}: {}", url, e);
+                        let err_msg = redact_secret(&e.to_string());
+                        error!("Failed to ensure remote {}: {}", url_display, err_msg);
                         for commit in &missing_commits {
                             let _ = self
                                 .main_tx
                                 .send(Event::IngestionFailed {
                                     article_id: commit.clone(),
-                                    error: format!("Failed to set up remote {}: {}", url, e),
+                                    error: format!(
+                                        "Failed to set up remote {}: {}",
+                                        url_display, err_msg
+                                    ),
                                     source: MessageSource::GitFetch,
                                 })
                                 .await;
@@ -178,17 +185,22 @@ impl FetchAgent {
                     if let Err(e) = self.fetch_commits(&remote_name, &missing_commits).await {
                         warn!(
                             "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
-                            url, e
+                            url_display,
+                            redact_secret(&e.to_string())
                         );
                         // 2. Fallback: Fetch everything (heads)
                         if let Err(e) = self.fetch_all(&remote_name).await {
-                            error!("Full fetch failed for {}: {}", url, e);
+                            let err_msg = redact_secret(&e.to_string());
+                            error!("Full fetch failed for {}: {}", url_display, err_msg);
                             for commit in &missing_commits {
                                 let _ = self
                                     .main_tx
                                     .send(Event::IngestionFailed {
                                         article_id: commit.clone(),
-                                        error: format!("Failed to fetch from {}: {}", url, e),
+                                        error: format!(
+                                            "Failed to fetch from {}: {}",
+                                            url_display, err_msg
+                                        ),
                                         source: MessageSource::GitFetch,
                                     })
                                     .await;
@@ -219,7 +231,10 @@ impl FetchAgent {
                                 .main_tx
                                 .send(Event::IngestionFailed {
                                     article_id: range.clone(),
-                                    error: format!("Failed to resolve git range: {}", e),
+                                    error: format!(
+                                        "Failed to resolve git range: {}",
+                                        redact_secret(&e.to_string())
+                                    ),
                                     source: MessageSource::GitFetch,
                                 })
                                 .await;
@@ -268,7 +283,9 @@ impl FetchAgent {
                             Err(e) => {
                                 error!(
                                     "Failed to extract patch {} from range {}: {}",
-                                    sha, range, e
+                                    sha,
+                                    range,
+                                    redact_secret(&e.to_string())
                                 );
                             }
                         }
@@ -283,7 +300,10 @@ impl FetchAgent {
                                 .main_tx
                                 .send(Event::IngestionFailed {
                                     article_id: commit_or_range.clone(),
-                                    error: format!("Failed to resolve SHA: {}", e),
+                                    error: format!(
+                                        "Failed to resolve SHA: {}",
+                                        redact_secret(&e.to_string())
+                                    ),
                                     source: MessageSource::GitFetch,
                                 })
                                 .await;
@@ -329,12 +349,13 @@ impl FetchAgent {
                             }
                         }
                         Err(e) => {
-                            error!("Failed to extract patch {}: {}", commit_or_range, e);
+                            let err_msg = redact_secret(&e.to_string());
+                            error!("Failed to extract patch {}: {}", commit_or_range, err_msg);
                             let _ = self
                                 .main_tx
                                 .send(Event::IngestionFailed {
                                     article_id: commit_or_range,
-                                    error: format!("Failed to extract patch: {}", e),
+                                    error: format!("Failed to extract patch: {}", err_msg),
                                     source: MessageSource::GitFetch,
                                 })
                                 .await;
@@ -398,11 +419,18 @@ impl FetchAgent {
                     redact_secret(&current_url),
                     redact_secret(&authenticated_url)
                 );
-                crate::git_cmd::in_dir_async(&self.repo_path)
+                let output = crate::git_cmd::in_dir_async(&self.repo_path)
                     .args(["-c", "safe.bareRepository=all"])
                     .args(["remote", "set-url", name, &authenticated_url])
                     .output()
                     .await?;
+
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "Failed to update remote: {}",
+                        redact_secret(String::from_utf8_lossy(&output.stderr).trim())
+                    ));
+                }
             }
         } else {
             info!(
@@ -726,6 +754,63 @@ mod tests {
             agent.is_present(&commit_sha).await,
             "Commit SHA should be considered present"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_process_queue_redacts_credentials_on_failure() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (agent, _) = FetchAgent::new(repo_path, tx, None);
+
+        let req = FetchRequest {
+            repo_url: Some("https://oauth2:glpat_secret123@127.0.0.1:0/group/repo.git".to_string()),
+            commit_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+        };
+
+        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+        queue
+            .entry(req.repo_url)
+            .or_default()
+            .insert(req.commit_hash.clone());
+
+        agent.process_queue(&mut queue).await;
+
+        let event = rx
+            .try_recv()
+            .expect("Expected IngestionFailed event to be emitted");
+        match event {
+            Event::IngestionFailed {
+                article_id,
+                error,
+                source,
+            } => {
+                assert_eq!(article_id, req.commit_hash);
+                assert_eq!(source, MessageSource::GitFetch);
+                assert!(
+                    error.contains("[REDACTED]"),
+                    "Expected error to contain [REDACTED], got: {}",
+                    error
+                );
+                assert!(
+                    !error.contains("glpat_secret123"),
+                    "Error leaked credential: {}",
+                    error
+                );
+            }
+            other => panic!("Expected IngestionFailed, got {:?}", other),
+        }
 
         Ok(())
     }
