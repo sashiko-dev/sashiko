@@ -242,9 +242,19 @@ Generate the plain-text inline review report following the exact formatting rule
 
 const STAGE_SUMMARY_INSTRUCTION: &str = r#"# Summarize the proposed change
 
-Provide a concise 1-2 sentence plain-text summary explaining what this commit/change does and why.
-- Use strictly plain text: no markdown, no backticks (`), no markdown headings (`#`), and no bullet points.
-- Wrap lines at 78 characters or fewer.
+Provide a concise plain-text summary explaining what this commit/change does and why.
+- Start with 1-2 sentences describing the core change and its rationale.
+- User-Visible Effect Rule: If this commit has any user-visible effect (for example: adding or changing a cmdline option/subcommand/output, adding or changing a configuration setting, changing the format of generated emails or GitHub PR comments, changing REST API responses, or altering Web UI display), you MUST explicitly describe that user-visible effect and provide a concrete 'Before:' and 'After:' example showing how it looked or worked before vs. how it will look or work for a user after this change:
+
+Before:
+  <how it was or looked for a user before>
+
+After:
+  <how it will look or work for a user after>
+
+- If the change is strictly internal with no user-visible effect (e.g. internal refactoring, unit test additions, or internal prompt tuning without output format changes), omit the 'Before:' / 'After:' section and keep the summary to 1-2 sentences.
+- Use strictly plain text: no markdown, no backticks, no markdown headings ('#'), and no bullet points.
+- Wrap prose lines at 78 characters or fewer (keep indented 'Before:' and 'After:' example lines concise as well, though long CLI commands, URLs, or output lines may exceed 78 characters when necessary).
 - Summarize the change itself (do not list review findings or issues here)."#;
 
 const CONCERN_JSON_SCHEMA_EXAMPLE: &str = r#"Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
@@ -610,18 +620,21 @@ fn validate_summary_format(content: &str, _state: &SashikoPatchReviewState) -> R
     }
     for line in trimmed.lines() {
         let l = line.trim_start();
-        if l.starts_with('#') || l.starts_with("Summary:") {
-            return Err(
-                "Do not use markdown headings ('#') or 'Summary:' prefixes in the summary."
-                    .to_string(),
-            );
-        }
-        if line.chars().count() > 84 {
-            return Err(format!(
-                "Line exceeds 78-character terminal width ({} chars): \"{}...\". Wrap lines at 78 characters.",
-                line.chars().count(),
-                line.chars().take(40).collect::<String>()
-            ));
+        let is_indented = line.starts_with("  ") || line.starts_with('\t');
+        if !is_indented {
+            if l.starts_with('#') || l.starts_with("Summary:") {
+                return Err(
+                    "Do not use markdown headings ('#') or 'Summary:' prefixes in the summary."
+                        .to_string(),
+                );
+            }
+            if line.chars().count() > 84 {
+                return Err(format!(
+                    "Line exceeds 78-character terminal width ({} chars): \"{}...\". Wrap prose lines at 78 characters.",
+                    line.chars().count(),
+                    line.chars().take(40).collect::<String>()
+                ));
+            }
         }
     }
     Ok(())
@@ -629,7 +642,7 @@ fn validate_summary_format(content: &str, _state: &SashikoPatchReviewState) -> R
 
 fn format_summary_feedback(violation: &str) -> String {
     format!(
-        "\n\nPrevious attempt was rejected: {}. Provide a concise 1-2 sentence plain-text summary without backticks, markdown headings, or 'Summary:' prefixes, wrapped at 78 characters.",
+        "\n\nPrevious attempt was rejected: {}. Provide a plain-text summary (including Before: and After: examples if the change has a user-visible effect) without backticks, markdown headings, or 'Summary:' prefixes, wrapped at 78 characters.",
         violation
     )
 }
@@ -1052,7 +1065,7 @@ pub fn summary_stage(
             temperature,
             recitation_policy: RecitationPolicy::FallbackToFreeForm {
                 reminder:
-                    "Summarize the change concisely in 1-2 sentences without quoting verbatim."
+                    "Summarize the change concisely in plain text (including Before: and After: examples if user-visible) without quoting large blocks verbatim."
                         .to_string(),
             },
             ..Default::default()
@@ -1198,9 +1211,21 @@ mod tests {
             )
             .is_ok()
         );
+        assert!(
+            validate_summary_format(
+                "Adds fix_check_enabled setting under [linux_bug] to toggle periodic fix\nchecks independently of the bugs database.\n\nBefore:\n  Summary: old format\n  [linux_bug]\n  enabled = true\n\nAfter:\n  [linux_bug]\n  enabled = true\n  # Periodic fix checks are now configured separately:\n  fix_check_enabled = false\n  sashiko review --project sashiko --agent --settings /etc/sashiko/Settings.toml HEAD~1..HEAD",
+                &state
+            )
+            .is_ok()
+        );
+        assert!(STAGE_SUMMARY_INSTRUCTION.contains("Before:"));
+        assert!(STAGE_SUMMARY_INSTRUCTION.contains("After:"));
+        assert!(!STAGE_SUMMARY_INSTRUCTION.contains('`'));
         assert!(validate_summary_format("   ", &state).is_err());
         assert!(validate_summary_format("Uses `backticks` in summary.", &state).is_err());
         assert!(validate_summary_format("Summary: prefixed summary.", &state).is_err());
+        assert!(validate_summary_format("# Top-level heading in summary", &state).is_err());
+        assert!(validate_summary_format(&long_line, &state).is_err());
     }
 
     #[test]
