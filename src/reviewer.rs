@@ -71,6 +71,9 @@ struct BaselineAttempt {
 
 static INTERACTION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Budget for a single fetch of a missing base-commit.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn generate_interaction_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let epoch_millis = SystemTime::now()
@@ -1076,6 +1079,42 @@ impl Reviewer {
         Ok(review_baseline_sha)
     }
 
+    /// Fetch an explicit base-commit that the object store is missing.
+    ///
+    /// Returns the resolved SHA, or the error of the last resolution attempt.
+    async fn fetch_missing_commit(
+        repo_path: &Path,
+        mainline_remote: &str,
+        sha: &CommitId,
+    ) -> Result<String> {
+        // A base-commit that is already merged upstream comes straight from
+        // the mainline remote.
+        Self::try_fetch(repo_path, &["fetch", mainline_remote, sha.as_str()]).await;
+        if let Ok(resolved) = get_commit_hash(repo_path, sha.as_str()).await {
+            return Ok(resolved);
+        }
+
+        // b4 can emit annotated tag object SHAs as base-commit (e.g. the tag
+        // object for v7.2-rc2). Those aren't fetchable by SHA, so pull tags
+        // from the mainline remote and retry.
+        Self::try_fetch(repo_path, &["fetch", mainline_remote, "--tags"]).await;
+        get_commit_hash(repo_path, sha.as_str()).await
+    }
+
+    /// Run a bounded fetch, ignoring its outcome: callers judge the result by
+    /// resolving the revision they are after.
+    async fn try_fetch(repo_path: &Path, args: &[&str]) {
+        let _ = tokio::time::timeout(
+            FETCH_TIMEOUT,
+            crate::git_cmd::in_dir_async(repo_path)
+                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+                .args(args)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+    }
+
     async fn prepare_baseline_worktree(
         ctx: &ReviewContext,
         patchset_id: i64,
@@ -1159,68 +1198,26 @@ impl Reviewer {
             }
 
             // Resolve SHA
-            let baseline_sha = match get_commit_hash(&repo_path, &baseline_ref).await {
+            let resolved = match get_commit_hash(&repo_path, &baseline_ref).await {
+                Ok(sha) => Ok(sha),
+                Err(e) => match candidate {
+                    BaselineResolution::Commit(sha_str) => {
+                        Self::fetch_missing_commit(&repo_path, mainline_remote, sha_str).await
+                    }
+                    _ => Err(e),
+                },
+            };
+            let baseline_sha = match resolved {
                 Ok(sha) => sha,
                 Err(e) => {
-                    if let BaselineResolution::Commit(sha_str) = candidate {
-                        // Attempt to fetch the missing commit from the
-                        // mainline remote.
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(120),
-                            crate::git_cmd::in_dir_async(&repo_path)
-                                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-                                .args(["fetch", mainline_remote, sha_str.as_str()])
-                                .kill_on_drop(true)
-                                .output(),
-                        )
-                        .await;
-                        // Retry resolving
-                        match get_commit_hash(&repo_path, &baseline_ref).await {
-                            Ok(sha) => sha,
-                            Err(_) => {
-                                // b4 can emit annotated tag object SHAs as
-                                // base-commit (e.g. the tag object for
-                                // v7.2-rc2). Those aren't fetchable by SHA,
-                                // so pull tags from the mainline remote and
-                                // retry.
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(120),
-                                    crate::git_cmd::in_dir_async(&repo_path)
-                                        .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-                                        .args(["fetch", mainline_remote, "--tags"])
-                                        .kill_on_drop(true)
-                                        .output(),
-                                )
-                                .await;
-                                match get_commit_hash(&repo_path, &baseline_ref).await {
-                                    Ok(sha) => sha,
-                                    Err(e2) => {
-                                        let msg = format!(
-                                            "Failed to resolve baseline ref {}: {}\n",
-                                            baseline_ref, e2
-                                        );
-                                        current_log.push_str(&msg);
-                                        attempts.push(BaselineAttempt {
-                                            baseline: baseline_ref.clone(),
-                                            status: current_status,
-                                            log: current_log,
-                                        });
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let msg =
-                            format!("Failed to resolve baseline ref {}: {}\n", baseline_ref, e);
-                        current_log.push_str(&msg);
-                        attempts.push(BaselineAttempt {
-                            baseline: baseline_ref.clone(),
-                            status: current_status,
-                            log: current_log,
-                        });
-                        continue;
-                    }
+                    let msg = format!("Failed to resolve baseline ref {}: {}\n", baseline_ref, e);
+                    current_log.push_str(&msg);
+                    attempts.push(BaselineAttempt {
+                        baseline: baseline_ref.clone(),
+                        status: current_status,
+                        log: current_log,
+                    });
+                    continue;
                 }
             };
 
