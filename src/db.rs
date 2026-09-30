@@ -5460,7 +5460,7 @@ impl Database {
                 libsql::params![msg_id],
             )
             .await?;
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows.next().await? {
             let subj: String = row.get(0).unwrap_or_default();
             let (idx, _total) = crate::patch::parse_subject_index(&subj);
             if idx == 0 {
@@ -5476,7 +5476,7 @@ impl Database {
                 libsql::params![patchset_id],
             )
             .await?;
-        if let Ok(Some(row)) = ps_rows.next().await {
+        if let Some(row) = ps_rows.next().await? {
             let subj_idx: u32 = row.get(0).unwrap_or(9999);
             if subj_idx == 0 {
                 return Ok(None);
@@ -5670,9 +5670,9 @@ impl Database {
                 libsql::params![patchset_id, message_id],
             )
             .await?;
-        match rows.next().await {
-            Ok(Some(row)) => Ok(row.get::<Option<u32>>(0).ok().flatten()),
-            _ => Ok(None),
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<Option<u32>>(0).ok().flatten()),
+            None => Ok(None),
         }
     }
 
@@ -5838,7 +5838,7 @@ impl Database {
                     .query(query, libsql::params![clid.clone()])
                     .await?
             };
-            while let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows.next().await? {
                 let id: i64 = row.get(0)?;
                 let existing_author: String = row.get(2).unwrap_or_default();
                 let existing_subject: String = row.get(3)?;
@@ -6014,7 +6014,7 @@ impl Database {
 
         let mut matches: Vec<CandidateMatch> = Vec::new();
 
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
             let existing_date: i64 = row.get(1)?;
             let existing_author: String = row.get(2)?;
@@ -6069,7 +6069,7 @@ impl Database {
                         libsql::params![id],
                     )
                     .await?;
-                if let Ok(Some(p_row)) = p_rows.next().await {
+                if let Some(p_row) = p_rows.next().await? {
                     let pid: String = p_row.get(0)?;
                     existing_msgid_prefix = Some(pid.split('-').next().unwrap_or(&pid).to_string());
                 }
@@ -6608,7 +6608,7 @@ impl Database {
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
             Ok(Some(id))
         } else {
@@ -20115,5 +20115,239 @@ mod tests {
         assert_eq!(subj, "[PATCH 0/1] wg: cover letter for singleton");
         assert_eq!(subj_idx, 0);
         assert_eq!(cover_id.as_deref(), Some("cover-0-1@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_create_patchset_propagates_cursor_and_query_errors() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let p1 = "20260930000000.300-1-author@example.com";
+        let p2 = "20260930000000.300-2-author@example.com";
+
+        let thread_id = db
+            .create_thread(p1, "[PATCH 1/2] First patch", 3000)
+            .await
+            .unwrap();
+        db.create_message(
+            p1,
+            thread_id,
+            None,
+            author,
+            "[PATCH 1/2] First patch",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                p1,
+                "[PATCH 1/2] First patch",
+                author,
+                3000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_id, p1, 1, "diff1").await.unwrap();
+
+        // 1. Verify that a cursor step failure on INSERT ... RETURNING id propagates
+        // the underlying SQLite error rather than swallowing it.
+        db.conn
+            .execute(
+                "CREATE TRIGGER fail_patchset_insert BEFORE INSERT ON patchsets
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated patchset insert failure');
+                 END",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let insert_err = db
+            .create_patchset(
+                thread_id + 999,
+                Some("unrelated-cover@example.com"),
+                "unrelated-msg@example.com",
+                "[PATCH 1/1] Unrelated patch",
+                "Other <other@example.com>",
+                9000,
+                1,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect_err("insert trigger error must propagate");
+        assert!(
+            insert_err
+                .to_string()
+                .contains("simulated patchset insert failure"),
+            "expected underlying SQLite error, got: {insert_err}"
+        );
+
+        db.conn
+            .execute("DROP TRIGGER fail_patchset_insert", ())
+            .await
+            .unwrap();
+
+        // 2. Replace `patches` with a view that fails at cursor step time (`rows.next().await`)
+        // to verify `patch_part_index` and `create_patchset_inner` patches queries propagate errors.
+        db.conn
+            .execute("ALTER TABLE patches RENAME TO patches_backing", ())
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "CREATE VIEW patches AS
+                 SELECT * FROM patches_backing WHERE abs(-9223372036854775808) > 0",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let part_idx_err = db
+            .patch_part_index(ps_id, p1)
+            .await
+            .expect_err("patch_part_index cursor step error must propagate");
+        assert!(
+            part_idx_err.to_string().contains("integer overflow"),
+            "expected integer overflow error from patch_part_index, got: {part_idx_err}"
+        );
+
+        let patches_step_err = db
+            .create_patchset(
+                thread_id,
+                None,
+                p2,
+                "[PATCH 2/2] Second patch",
+                author,
+                3001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect_err("patches cursor step error in create_patchset must propagate");
+        assert!(
+            patches_step_err.to_string().contains("integer overflow"),
+            "expected integer overflow error from patches cursor step, got: {patches_step_err}"
+        );
+
+        db.conn.execute("DROP VIEW patches", ()).await.unwrap();
+        db.conn
+            .execute("ALTER TABLE patches_backing RENAME TO patches", ())
+            .await
+            .unwrap();
+
+        // 3. Replace `patchsets` with a view that succeeds at prepare time (`conn.query`)
+        // but fails at cursor step time (`rows.next().await`) via integer overflow.
+        db.conn
+            .execute("ALTER TABLE patchsets RENAME TO patchsets_backing", ())
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "CREATE VIEW patchsets AS
+                 SELECT * FROM patchsets_backing WHERE abs(-9223372036854775808) > 0",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // Cover-letter lookup loop (when cover_letter_message_id is Some) must propagate step error.
+        let clid_step_err = db
+            .create_patchset(
+                thread_id,
+                Some(p1),
+                p2,
+                "[PATCH 2/2] Second patch",
+                author,
+                3001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect_err("cover_letter_message_id cursor step error must propagate");
+        assert!(
+            clid_step_err.to_string().contains("integer overflow"),
+            "expected integer overflow error from cursor step, got: {clid_step_err}"
+        );
+
+        // Candidate matching loop (when cover_letter_message_id is None and total_parts > 1)
+        // must also propagate step error.
+        let candidate_step_err = db
+            .create_patchset(
+                thread_id,
+                None,
+                p2,
+                "[PATCH 2/2] Second patch",
+                author,
+                3001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect_err("candidate loop cursor step error must propagate");
+        assert!(
+            candidate_step_err.to_string().contains("integer overflow"),
+            "expected integer overflow error from cursor step, got: {candidate_step_err}"
+        );
+
+        // `adopt_series_identity` and `identity_part_index` must also propagate step errors.
+        let adopt_err = db
+            .adopt_series_identity(ps_id, p1, 1, true)
+            .await
+            .expect_err("adopt_series_identity cursor step error must propagate");
+        assert!(
+            adopt_err.to_string().contains("integer overflow"),
+            "expected integer overflow error from adopt_series_identity, got: {adopt_err}"
+        );
     }
 }
