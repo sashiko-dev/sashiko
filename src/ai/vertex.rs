@@ -281,16 +281,23 @@ impl VertexClient {
     ) -> Result<GenerateContentResponse> {
         let token = self.get_access_token().await?;
         let url = self.endpoint_url();
+        Self::send_gemini_request(&self.client, &url, &token, body).await
+    }
 
-        let res = self
-            .client
-            .post(&url)
+    async fn send_gemini_request(
+        client: &Client,
+        url: &str,
+        token: &str,
+        body: &GenerateContentRequest,
+    ) -> Result<GenerateContentResponse> {
+        let res = client
+            .post(url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .json(body)
             .send()
             .await
-            .context("Failed to send request to Vertex AI")?;
+            .map_err(|e| gemini::transport_error("Vertex AI", e))?;
 
         gemini::read_generate_content_response(res).await
     }
@@ -568,6 +575,62 @@ mod tests {
             },
             "{err:#}"
         );
+    }
+
+    async fn send_gemini_to(url: &str) -> Result<GenerateContentResponse> {
+        let request = GenerateContentRequest {
+            contents: vec![],
+            tools: None,
+            system_instruction: None,
+            generation_config: None,
+        };
+        tokio::time::timeout(
+            test_http::TEST_TIMEOUT,
+            VertexClient::send_gemini_request(
+                &test_http::test_client(),
+                url,
+                "dummy-token",
+                &request,
+            ),
+        )
+        .await
+        .expect("request did not complete in time")
+    }
+
+    fn gemini_transient_message(err: &anyhow::Error) -> &str {
+        match err.downcast_ref::<gemini::GeminiError>() {
+            Some(gemini::GeminiError::TransientError(_, msg)) => msg,
+            _ => panic!("expected GeminiError::TransientError, got: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gemini_body_dropped_mid_response_is_transient() {
+        let server =
+            test_http::serve(test_http::truncated("200 OK", "", r#"{"candidates":"#)).await;
+        let err = send_gemini_to(&server.url)
+            .await
+            .expect_err("request should fail");
+        server.finish().await;
+        assert!(
+            matches!(
+                crate::ai::classify_ai_error(&err),
+                AiErrorClass::Transient { .. }
+            ),
+            "{err:#}"
+        );
+        let msg = gemini_transient_message(&err);
+        assert!(msg.contains(test_http::BODY_READ_FAILURE), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_gemini_connection_refused_is_transient() {
+        let port = test_http::RefusedPort::new();
+        let err = send_gemini_to(&port.url)
+            .await
+            .expect_err("request should fail");
+        let msg = gemini_transient_message(&err);
+        assert!(msg.contains("error sending request"), "{msg}");
     }
 
     // --- Model family detection ---

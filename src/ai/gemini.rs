@@ -269,6 +269,24 @@ fn valid_retry_after_secs(secs: f64) -> Option<Duration> {
         .map(|d| d.min(crate::ai::quota::MAX_RETRY_AFTER))
 }
 
+const TRANSPORT_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Types a transport failure as transient unless retrying cannot fix it.
+pub(crate) fn transport_error(provider: &str, e: reqwest::Error) -> anyhow::Error {
+    let is_permanent = crate::ai::is_permanent_transport_error(&e);
+    let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
+    if is_permanent {
+        return anyhow::anyhow!("{provider} request failed: {err_str}");
+    }
+    tracing::error!(
+        "{}{} request failed (transport): {}",
+        crate::ai::get_log_prefix(),
+        provider,
+        err_str
+    );
+    GeminiError::TransientError(TRANSPORT_RETRY_AFTER, err_str).into()
+}
+
 fn retry_after_from_body(error_text: &str) -> Option<f64> {
     let hint = Regex::new(r"Please retry in ([0-9.]+)s").ok()?;
     let secs = hint
@@ -345,7 +363,7 @@ pub(crate) async fn read_generate_content_response(
     let status = res.status();
 
     if status.is_success() {
-        let body_text = res.text().await?;
+        let body_text = res.text().await.map_err(|e| transport_error("Gemini", e))?;
         let response: GenerateContentResponse = match serde_json::from_str(&body_text) {
             Ok(response) => response,
             Err(e) => {
@@ -658,39 +676,28 @@ impl GeminiClient {
         let res = match req_builder.send().await {
             Ok(res) => res,
             Err(e) => {
-                let is_permanent = crate::ai::is_permanent_transport_error(&e);
-                let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
-                if is_permanent {
-                    anyhow::bail!("Gemini request failed: {}", err_str);
+                let err = transport_error("Gemini", e);
+                if err.downcast_ref::<GeminiError>().is_some() {
+                    // Trigger self-healing: Refresh the client for the next attempt
+                    self.refresh_client().await;
                 }
-                tracing::error!(
-                    "{}Gemini request failed (transport): {}",
-                    crate::ai::get_log_prefix(),
-                    err_str
-                );
-
-                // Trigger self-healing: Refresh the client for the next attempt
-                self.refresh_client().await;
-
-                return Err(GeminiError::TransientError(Duration::from_secs(30), err_str).into());
+                return Err(err);
             }
         };
 
         let status = res.status();
-        match read_generate_content_response(res).await {
-            // A success body cut off mid-read is a transport failure too.
-            Err(e) if status.is_success() && e.is::<reqwest::Error>() => {
-                let err_str = redact_secret(&format!("{e:#}"));
-                tracing::error!(
-                    "{}Gemini response body read failed (transport): {}",
-                    crate::ai::get_log_prefix(),
-                    err_str
-                );
-                self.refresh_client().await;
-                Err(GeminiError::TransientError(Duration::from_secs(30), err_str).into())
-            }
-            result => result,
+        let result = read_generate_content_response(res).await;
+        // A success body cut off mid-read is a transport failure too.
+        if status.is_success()
+            && let Err(e) = &result
+            && matches!(
+                e.downcast_ref::<GeminiError>(),
+                Some(GeminiError::TransientError(..))
+            )
+        {
+            self.refresh_client().await;
         }
+        result
     }
 }
 
