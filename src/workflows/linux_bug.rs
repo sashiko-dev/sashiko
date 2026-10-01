@@ -1587,6 +1587,8 @@ pub async fn process_issue_for_project(
     Ok(BugOutcome::NewlyDiscovered { bug })
 }
 
+/// Serializes deduplication checks and canonical bug commits across concurrent
+/// `BugWorker` Tokio tasks running inside the single `sashiko` server daemon.
 static BUG_DEDUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
@@ -2094,6 +2096,112 @@ pub async fn process_issue_worker(
     .await
 }
 
+struct DedupAttemptContext<'a> {
+    runner: &'a SessionRunner<'a>,
+    db: &'a Database,
+    bug_row_id: i64,
+    review_id: Option<i64>,
+    project: ProjectId,
+    project_label: &'a str,
+    context_tag: Option<&'a str>,
+    canonical_title: &'a str,
+    canonical_description: &'a str,
+    verified_locations: Option<&'a Value>,
+    official_subsystem_names: &'a [String],
+    query_vector: &'a crate::ai::vector_search::BugVector,
+}
+
+impl DedupAttemptContext<'_> {
+    async fn check_and_fold(
+        &self,
+        known_bugs: &[Bug],
+        full_history: &mut Vec<crate::ai::AiMessage>,
+    ) -> Result<Option<BugOutcome>> {
+        let candidate_matches = find_top_candidates(
+            self.query_vector,
+            known_bugs,
+            DEFAULT_TOP_CANDIDATES,
+            DEFAULT_SIMILARITY_THRESHOLD,
+        );
+        info!(
+            "Deduplication: found {} potential candidates.",
+            candidate_matches.len()
+        );
+
+        let duplicate_match = if !candidate_matches.is_empty() {
+            let candidate_bugs: Vec<Bug> = candidate_matches.into_iter().map(|m| m.bug).collect();
+
+            let mut dedup_session = DedupSession {
+                candidate_problem: self.canonical_title,
+                candidate_description: self.canonical_description,
+                candidate_locations: self.verified_locations,
+                candidate_subsystems: self.official_subsystem_names,
+                known_candidates: &candidate_bugs,
+                context_tag: self.context_tag.map(str::to_string),
+                project: self.project,
+            };
+
+            let dedup_result = self.runner.run(&mut dedup_session).await?;
+            record_bug_stage(
+                self.db,
+                self.bug_row_id,
+                BugStage::Deduplication,
+                &dedup_result,
+            )
+            .await?;
+            full_history.extend(dedup_result.history);
+
+            let dedup = dedup_result.output;
+            if dedup.is_duplicate {
+                dedup.duplicate_of_id.and_then(|dup_id| {
+                    candidate_bugs
+                        .into_iter()
+                        .find(|b| b.id == dup_id)
+                        .map(|b| (b, dedup.reasoning))
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((existing, reasoning)) = duplicate_match {
+            info!(
+                "Matched duplicate {} bug {} ({})",
+                self.project_label, existing.id, existing.bugid
+            );
+            let logs = serde_json::to_string(full_history).unwrap_or_default();
+            let folded = self
+                .db
+                .mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+                    preserve_triage: true,
+                    ephemeral_id: self.bug_row_id,
+                    canonical_id: existing.id,
+                    reasoning: &reasoning,
+                    logs: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                })
+                .await?;
+            if !folded {
+                return Ok(None);
+            }
+            if let Some(r_id) = self.review_id {
+                self.db.link_review_to_bug(r_id, existing.id, false).await?;
+            }
+            return Ok(Some(BugOutcome::Duplicate {
+                existing_bug: existing,
+                reasoning,
+                logs: Some(logs),
+            }));
+        }
+
+        Ok(None)
+    }
+}
+
 pub async fn process_issue_worker_for_project(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
@@ -2328,93 +2436,35 @@ pub async fn process_issue_worker_for_project(
         verified_locations.as_ref(),
     );
 
-    let (is_dup, dup_outcome) = {
+    let dedup_ctx = DedupAttemptContext {
+        runner: &runner,
+        db,
+        bug_row_id: bug_row.id,
+        review_id: input.review_id,
+        project,
+        project_label,
+        context_tag,
+        canonical_title: &norm.canonical_title,
+        canonical_description: &norm.canonical_description,
+        verified_locations: verified_locations.as_ref(),
+        official_subsystem_names: &official_subsystem_names,
+        query_vector: &query_vector,
+    };
+
+    let (seen_bug_ids, early_dup_outcome) = {
         let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
 
         let mut known_bugs = db.list_all_bugs_for_vector_search().await?;
         known_bugs.retain(|b| b.id != bug_row.id);
-        let candidate_matches = find_top_candidates(
-            &query_vector,
-            &known_bugs,
-            DEFAULT_TOP_CANDIDATES,
-            DEFAULT_SIMILARITY_THRESHOLD,
-        );
-
-        info!(
-            "Deduplication: found {} potential candidates.",
-            candidate_matches.len()
-        );
-
-        if !candidate_matches.is_empty() {
-            let candidate_bugs: Vec<Bug> =
-                candidate_matches.iter().map(|m| m.bug.clone()).collect();
-            let mut dedup_session = DedupSession {
-                candidate_problem: &norm.canonical_title,
-                candidate_description: &norm.canonical_description,
-                candidate_locations: verified_locations.as_ref(),
-                candidate_subsystems: &official_subsystem_names,
-                known_candidates: &candidate_bugs,
-                context_tag: context_tag.map(|s| s.to_string()),
-                project,
-            };
-
-            let dedup_result = runner.run(&mut dedup_session).await?;
-            record_bug_stage(db, bug_row.id, BugStage::Deduplication, &dedup_result).await?;
-            full_history.extend(dedup_result.history);
-
-            let dedup = dedup_result.output;
-
-            let duplicate_match = if dedup.is_duplicate {
-                dedup
-                    .duplicate_of_id
-                    .and_then(|dup_id| candidate_bugs.iter().find(|b| b.id == dup_id))
-            } else {
-                None
-            };
-
-            if let Some(existing) = duplicate_match {
-                info!(
-                    "Matched duplicate {} bug #{} ({})",
-                    project_label, existing.id, existing.bugid
-                );
-                let logs = serde_json::to_string(&full_history).unwrap_or_default();
-                let folded = db
-                    .mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
-                        preserve_triage: true,
-                        ephemeral_id: bug_row.id,
-                        canonical_id: existing.id,
-                        reasoning: &dedup.reasoning,
-                        logs: None,
-                        tokens_in: None,
-                        tokens_out: None,
-                        tokens_cached: None,
-                    })
-                    .await?;
-                if folded {
-                    if let Some(r_id) = input.review_id {
-                        db.link_review_to_bug(r_id, existing.id, false).await?;
-                    }
-                    (
-                        true,
-                        Some(BugOutcome::Duplicate {
-                            existing_bug: existing.clone(),
-                            reasoning: dedup.reasoning,
-                            logs: Some(logs),
-                        }),
-                    )
-                } else {
-                    (false, None)
-                }
-            } else {
-                (false, None)
-            }
-        } else {
-            (false, None)
-        }
+        let seen_ids: std::collections::HashSet<i64> = known_bugs.iter().map(|b| b.id).collect();
+        let outcome = dedup_ctx
+            .check_and_fold(&known_bugs, &mut full_history)
+            .await?;
+        (seen_ids, outcome)
     };
 
-    if is_dup {
-        return Ok(dup_outcome.unwrap());
+    if let Some(dup_outcome) = early_dup_outcome {
+        return Ok(dup_outcome);
     }
     info!("Deduplication complete: novel bug confirmed.");
 
@@ -2492,39 +2542,64 @@ pub async fn process_issue_worker_for_project(
 
     let inline_review = report_result.output;
 
-    // Final database write.
+    // Final database write, serialized under BUG_DEDUP_LOCK so any canonical
+    // bug committed while Stages 4-6 were in flight is checked before this bug
+    // transitions to 'open' and publishes its vector.
     info!("--- Final database write ---");
 
-    db.update_bug_outcome(
-        bug_row.id,
-        crate::db::UpdateBugOutcomeParams {
-            lifecycle_status: crate::db::BugLifecycleStatus::Open,
-            problem: Some(&norm.canonical_title),
-            subsystems: Some(&official_subsystems),
-            source_files: Some(&verified_files),
-            locations: verified_locations.as_ref(),
-            severity,
-            severity_explanation: Some(&severity_output.severity_explanation),
-            inline_review: &inline_review,
-            logs: None,
-            vector_json: Some(&query_vector.to_json()),
-            introduced_in_commit: introduced_in_commit.as_deref(),
-            verified_on_sha: Some(&master_sha),
-            is_fixed: false,
-            fixed_in_commit: None,
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
-        },
-    )
-    .await?;
+    let late_dup_outcome = {
+        let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
+
+        let mut newly_arrived_bugs = db.list_all_bugs_for_vector_search().await?;
+        newly_arrived_bugs.retain(|b| b.id != bug_row.id && !seen_bug_ids.contains(&b.id));
+        let late_dup = if !newly_arrived_bugs.is_empty() {
+            dedup_ctx
+                .check_and_fold(&newly_arrived_bugs, &mut full_history)
+                .await?
+        } else {
+            None
+        };
+
+        if let Some(dup_outcome) = late_dup {
+            Some(dup_outcome)
+        } else {
+            db.update_bug_outcome(
+                bug_row.id,
+                crate::db::UpdateBugOutcomeParams {
+                    lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                    problem: Some(&norm.canonical_title),
+                    subsystems: Some(&official_subsystems),
+                    source_files: Some(&verified_files),
+                    locations: verified_locations.as_ref(),
+                    severity,
+                    severity_explanation: Some(&severity_output.severity_explanation),
+                    inline_review: &inline_review,
+                    logs: None,
+                    vector_json: Some(&query_vector.to_json()),
+                    introduced_in_commit: introduced_in_commit.as_deref(),
+                    verified_on_sha: Some(&master_sha),
+                    is_fixed: false,
+                    fixed_in_commit: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                },
+            )
+            .await?;
+            None
+        }
+    };
+
+    if let Some(dup_outcome) = late_dup_outcome {
+        return Ok(dup_outcome);
+    }
 
     let saved_bug = db.get_bug(bug_row.id).await?.expect("Saved bug must exist");
     if let Some(r_id) = input.review_id {
         db.link_review_to_bug(r_id, saved_bug.id, true).await?;
     }
     info!(
-        "Successfully registered newly verified {} bug #{} ({})",
+        "Successfully registered newly verified {} bug {} ({})",
         project_label, bug_row.id, bug_row.bugid
     );
     Ok(BugOutcome::NewlyDiscovered { bug: saved_bug })
@@ -5881,5 +5956,349 @@ F:	drivers/net/ethernet/intel/e1000/
             prefetched.contains("impl Drop for Worktree"),
             "Expected cross-file hunk from src/git_ops.rs in prefetched diff, got:\n{prefetched}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_in_flight_bugs_deduplicate_at_final_commit() {
+        let db = Arc::new(
+            Database::new(&crate::settings::DatabaseSettings {
+                url: ":memory:".to_string(),
+                token: String::new(),
+            })
+            .await
+            .unwrap(),
+        );
+        db.migrate().await.unwrap();
+
+        let locs = json!([{
+            "file": "net/core/dev.c",
+            "line": 120,
+            "function": "dev_alloc"
+        }]);
+        let input = BugInput {
+            problem: "net: memory leak in dev_alloc".to_string(),
+            reasoning: "Allocated buffer is leaked on error return.".to_string(),
+            locations: Some(locs.clone()),
+            subsystems: vec![AttributedSubsystem::from_maintainers(
+                "NETWORKING [GENERAL]",
+            )],
+            source_files: vec!["net/core/dev.c".to_string()],
+            commit_sha: None,
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: None,
+            review_id: None,
+        };
+
+        // Both Bug A and Bug B are queued as 'new' / 'pending' before either
+        // worker finishes Stages 4-6.
+        let dummy = MockAiProvider {
+            response_text: "{}".to_string(),
+        };
+        let BugOutcome::NewlyDiscovered { bug: bug_a } =
+            process_issue(&dummy, None, &db, input.clone(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("Expected candidate A");
+        };
+        let BugOutcome::NewlyDiscovered { bug: bug_b } =
+            process_issue(&dummy, None, &db, input.clone(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("Expected candidate B");
+        };
+
+        // Provider for Worker B: when Stage 3 runs, Bug A is still 'new', so
+        // Stage 3 sees 0 canonical candidates and makes no LLM call. While
+        // Worker B is in Stage 6 (ReportGeneration), Worker A commits its
+        // canonical 'open' outcome. Worker B's final-write check under
+        // BUG_DEDUP_LOCK then detects Bug A and folds Bug B into Bug A.
+        struct ConcurrentCommitProvider {
+            db: Arc<Database>,
+            bug_a_id: i64,
+            locs: Value,
+            responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl AiProvider for ConcurrentCommitProvider {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                let step = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Step 0: Normalization, Step 1: Verification, Step 2: OriginTracing,
+                // Step 3: SeverityAssessment, Step 4: ReportGeneration (commit Bug A here),
+                // Step 5: Late Deduplication at final write.
+                if step == 4 {
+                    let sub_names = vec!["NETWORKING [GENERAL]".to_string()];
+                    let files = vec!["net/core/dev.c".to_string()];
+                    let vec_a = extract_bug_vector(
+                        "net: memory leak in dev_alloc()",
+                        &sub_names,
+                        &files,
+                        Some(&self.locs),
+                    );
+                    self.db
+                        .update_bug_outcome(
+                            self.bug_a_id,
+                            crate::db::UpdateBugOutcomeParams {
+                                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                                problem: Some("net: memory leak in dev_alloc()"),
+                                subsystems: Some(&[AttributedSubsystem::from_maintainers(
+                                    "NETWORKING [GENERAL]",
+                                )]),
+                                source_files: Some(&files),
+                                locations: Some(&self.locs),
+                                severity: Severity::High,
+                                severity_explanation: Some("Leaks buffer on error path"),
+                                inline_review: "In dev_alloc(), kfree is missing on error.",
+                                vector_json: Some(&vec_a.to_json()),
+                                verified_on_sha: Some("HEAD"),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                let next_resp = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| "{}".to_string());
+                Ok(AiResponse {
+                    content: Some(next_resp),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 8192,
+                }
+            }
+        }
+
+        let provider = ConcurrentCommitProvider {
+            db: db.clone(),
+            bug_a_id: bug_a.id,
+            locs: locs.clone(),
+            responses: std::sync::Mutex::new(
+                vec![
+                    json!({
+                        "canonical_title": "net: memory leak in dev_alloc()",
+                        "canonical_description": "Trigger: Error path in dev_alloc.\nFailure Mechanism: Missing kfree.\nImpact: Memory leak.",
+                        "affected_source_files": ["net/core/dev.c"]
+                    })
+                    .to_string(),
+                    json!({
+                        "verification_reasoning": "Confirmed leak in dev_alloc.",
+                        "is_false_positive": false,
+                        "refutation_evidence": null,
+                        "impact_severity": "High",
+                        "relevant_code_locations": locs
+                    })
+                    .to_string(),
+                    json!({
+                        "introducing_commit_sha": "112233445566"
+                    })
+                    .to_string(),
+                    json!({
+                        "severity": "High",
+                        "severity_explanation": "Memory leak in dev_alloc."
+                    })
+                    .to_string(),
+                    "net: memory leak in dev_alloc()\n\nMissing kfree on error return.\n"
+                        .to_string(),
+                    json!({
+                        "is_duplicate": true,
+                        "duplicate_of_id": bug_a.id,
+                        "reasoning": "Both describe the same missing kfree in dev_alloc()."
+                    })
+                    .to_string(),
+                ]
+                .into(),
+            ),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let outcome = process_issue_worker(&provider, None, &db, &bug_b, input, None)
+            .await
+            .unwrap();
+        let BugOutcome::Duplicate { existing_bug, .. } = outcome else {
+            panic!("Expected Bug B to fold into Bug A at final write, got {outcome:?}");
+        };
+        assert_eq!(existing_bug.id, bug_a.id);
+
+        let final_b = db.get_bug(bug_b.id).await.unwrap().unwrap();
+        assert_eq!(
+            final_b.lifecycle_status,
+            crate::db::BugLifecycleStatus::Duplicate
+        );
+        assert_eq!(final_b.duplicate_of_id, Some(bug_a.id));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_of_human_dismissed_bug_preserves_dismissed_status() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let locs = json!([{
+            "file": "net/core/dev.c",
+            "line": 120,
+            "function": "dev_alloc"
+        }]);
+        let sub_names = vec!["NETWORKING [GENERAL]".to_string()];
+        let files = vec!["net/core/dev.c".to_string()];
+        let vec_canon = extract_bug_vector(
+            "net: false positive leak in dev_alloc()",
+            &sub_names,
+            &files,
+            Some(&locs),
+        );
+
+        let dummy = MockAiProvider {
+            response_text: "{}".to_string(),
+        };
+        let input = BugInput {
+            problem: "net: false positive leak in dev_alloc".to_string(),
+            reasoning: "Appear to leak buffer.".to_string(),
+            locations: Some(locs.clone()),
+            subsystems: vec![AttributedSubsystem::from_maintainers(
+                "NETWORKING [GENERAL]",
+            )],
+            source_files: files.clone(),
+            commit_sha: None,
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: None,
+            review_id: None,
+        };
+        let BugOutcome::NewlyDiscovered { bug: canon_bug } =
+            process_issue(&dummy, None, &db, input.clone(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("Expected canonical candidate");
+        };
+        db.update_bug_outcome(
+            canon_bug.id,
+            crate::db::UpdateBugOutcomeParams {
+                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                problem: Some("net: false positive leak in dev_alloc()"),
+                subsystems: Some(&[AttributedSubsystem::from_maintainers(
+                    "NETWORKING [GENERAL]",
+                )]),
+                source_files: Some(&files),
+                locations: Some(&locs),
+                severity: Severity::Medium,
+                severity_explanation: Some("Potential leak"),
+                inline_review: "Report body",
+                vector_json: Some(&vec_canon.to_json()),
+                verified_on_sha: Some("HEAD"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // A maintainer dismisses the canonical bug as a false positive.
+        db.with_bug_actor("maintainer@kernel.org", "cli", None)
+            .set_bug_lifecycle_status(canon_bug.id, crate::db::BugLifecycleStatus::Dismissed)
+            .await
+            .unwrap();
+
+        let thread_id = db
+            .create_thread("<ps-dismissed-dup@example.com>", "net: test series", 1000)
+            .await
+            .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "<ps-dismissed-dup@example.com>",
+                "net: test series",
+                "dev@kernel.org",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, None, "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        let mut dup_input = input;
+        dup_input.review_id = Some(review_id);
+        let BugOutcome::NewlyDiscovered { bug: dup_cand } =
+            process_issue(&dummy, None, &db, dup_input.clone(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("Expected duplicate candidate");
+        };
+
+        let provider = QueuedMockAiProvider::new(vec![
+            json!({
+                "canonical_title": "net: false positive leak in dev_alloc()",
+                "canonical_description": "Same false positive in dev_alloc.",
+                "affected_source_files": ["net/core/dev.c"]
+            })
+            .to_string(),
+            json!({
+                "verification_reasoning": "Verified on tree.",
+                "is_false_positive": false,
+                "refutation_evidence": null,
+                "impact_severity": "Medium",
+                "relevant_code_locations": locs
+            })
+            .to_string(),
+            json!({
+                "is_duplicate": true,
+                "duplicate_of_id": canon_bug.id,
+                "reasoning": "Identical to human-dismissed dev_alloc issue."
+            })
+            .to_string(),
+        ]);
+
+        let outcome = process_issue_worker(&provider, None, &db, &dup_cand, dup_input, None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BugOutcome::Duplicate { .. }));
+
+        // Canonical bug stays Dismissed (not re-opened) and rediscovery is recorded.
+        let refreshed_canon = db.get_bug(canon_bug.id).await.unwrap().unwrap();
+        assert_eq!(
+            refreshed_canon.lifecycle_status,
+            crate::db::BugLifecycleStatus::Dismissed
+        );
+        let linked = db.list_bugs_for_patchset(ps_id).await.unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].0.id, canon_bug.id);
+        assert!(!linked[0].1);
     }
 }
