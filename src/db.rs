@@ -4387,8 +4387,18 @@ impl Database {
             bugs.push(Self::parse_bug_row_core(&row)?);
         }
 
-        if !bugs.is_empty() {
-            let bug_ids: Vec<i64> = bugs.iter().map(|b| b.id).collect();
+        self.hydrate_bugs_batch(&mut bugs).await?;
+
+        Ok((bugs, total))
+    }
+
+    async fn hydrate_bugs_batch(&self, bugs: &mut [Bug]) -> Result<()> {
+        if bugs.is_empty() {
+            return Ok(());
+        }
+        const HYDRATE_CHUNK_SIZE: usize = 200;
+        for chunk in bugs.chunks_mut(HYDRATE_CHUNK_SIZE) {
+            let bug_ids: Vec<i64> = chunk.iter().map(|b| b.id).collect();
             let placeholders = vec!["?"; bug_ids.len()].join(", ");
 
             // Batch fetch subsystems
@@ -4415,7 +4425,7 @@ impl Database {
                         tokens_in, tokens_out, tokens_cached, NULL as logs
                  FROM bug_enrichments
                  WHERE bug_id IN ({})
-                 ORDER BY created_at ASC, id ASC",
+                 ORDER BY bug_id ASC, created_at ASC, id ASC",
                 placeholders
             );
             let enr_params: Vec<libsql::Value> = bug_ids
@@ -4433,7 +4443,7 @@ impl Database {
                     .push(enrichment);
             }
 
-            for bug in &mut bugs {
+            for bug in chunk {
                 if let Some(subs) = subs_map.remove(&bug.id) {
                     bug.subsystems = subs;
                 }
@@ -4442,8 +4452,7 @@ impl Database {
                 }
             }
         }
-
-        Ok((bugs, total))
+        Ok(())
     }
 
     /// Counts open bugs per subsystem, over only the bugs the principal may
@@ -4760,8 +4769,14 @@ impl Database {
         Ok(list)
     }
 
-    /// Loads the deduplication corpus: every bug that is still a candidate for
-    /// being matched against, together with its embedding.
+    /// Loads the deduplication corpus: every canonical bug that has completed
+    /// triage or verification, together with its embedding.
+    ///
+    /// Unverified `'new'` candidates and Stage-2 AI-refuted `'dismissed'` rows
+    /// are excluded so that a verified bug cannot be folded into an unverified
+    /// candidate or swallowed by a transient verification refutation, while
+    /// `'closed'` and human-`'dismissed'` bugs are retained so maintainer
+    /// triage decisions are not re-opened by later reviews.
     ///
     /// This is the only read path that pulls vectors, which is why they live in
     /// a side table rather than on the core row.
@@ -4769,29 +4784,45 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT b.id, v.vector_json
+                "SELECT b.id, b.bugid, b.title, b.lifecycle_status, b.pipeline_state,
+                        b.reporter, b.reported_at, b.assignee, b.assigned_at,
+                        b.discovered_in_patchset_id, b.discovered_in_patch_id, b.discovered_in_commit,
+                        b.source_ref, b.duplicate_of_id, b.created_at, b.updated_at,
+                        v.vector_json
                  FROM bugs b
                  LEFT JOIN bug_vectors v ON v.bug_id = b.id
-                 WHERE b.lifecycle_status IN ('new', 'open', 'fixed')
-                 ORDER BY b.id ASC",
+                 WHERE b.duplicate_of_id IS NULL
+                   AND (
+                       b.lifecycle_status IN ('open', 'fixed', 'closed')
+                       OR (
+                           b.lifecycle_status = 'dismissed'
+                           AND (
+                               v.vector_json IS NOT NULL
+                               OR NOT EXISTS (
+                                   SELECT 1 FROM bug_enrichments e
+                                   WHERE e.bug_id = b.id
+                                     AND e.kind = 'verification'
+                                     AND json_extract(e.data_json, '$.is_valid') = 0
+                               )
+                           )
+                       )
+                   )
+                 ORDER BY b.id ASC, v.created_at DESC, v.model DESC",
                 (),
             )
             .await?;
 
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let id: i64 = row.get(0)?;
-            let vector_json: Option<String> = row.get(1).ok().flatten();
-            ids.push((id, vector_json));
-        }
-
         let mut list = Vec::new();
-        for (id, vector_json) in ids {
-            if let Some(mut bug) = self.get_bug(id).await? {
-                bug.vector_json = vector_json;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            let mut bug = Self::parse_bug_row_core(&row)?;
+            if seen.insert(bug.id) {
+                bug.vector_json = row.get(16).ok().flatten();
                 list.push(bug);
             }
         }
+
+        self.hydrate_bugs_batch(&mut list).await?;
 
         Ok(list)
     }
@@ -16999,6 +17030,142 @@ mod tests {
         let all_bugs = db.list_all_bugs_for_vector_search().await.unwrap();
         assert_eq!(all_bugs.len(), 1);
         assert_eq!(all_bugs[0].id, bug_id);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_bugs_for_vector_search_filters_by_triage_state() {
+        let db = setup_db().await;
+        let worker_db = db.with_bug_actor(
+            "sashiko.dev",
+            "sashiko:linux_bug",
+            Some("gemini-2.5-pro".to_string()),
+        );
+        let human_db = db.with_bug_actor("maintainer@kernel.org", "web", None);
+
+        // 1. Pending 'new' candidate: must be excluded so unverified bugs cannot be deduplicated against.
+        let _new_id = create_pending_bug(&worker_db, "linux-vec-new").await;
+
+        // 2. Stage-2 AI-refuted 'dismissed' bug: must be excluded so a transient AI refutation
+        // does not suppress a later verified finding.
+        let ai_dismissed_id = create_pending_bug(&worker_db, "linux-vec-ai-dismissed").await;
+        worker_db
+            .update_bug_outcome(
+                ai_dismissed_id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Dismissed,
+                    problem: Some("net: false positive leak"),
+                    severity_explanation: Some("Freed by caller"),
+                    verified_on_sha: Some("deadbeef"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 3. Verified 'open' canonical bug: must be included.
+        let open_id = create_pending_bug(&worker_db, "linux-vec-open").await;
+        worker_db
+            .update_bug_outcome(
+                open_id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Open,
+                    problem: Some("net: real leak in foo()"),
+                    vector_json: Some("{\"tok:leak\":1.0}"),
+                    verified_on_sha: Some("deadbeef"),
+                    inline_review: "In foo(), buffer is leaked.",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 4. Non-canonical 'duplicate' bug: must be excluded.
+        let dup_id = create_pending_bug(&worker_db, "linux-vec-dup").await;
+        worker_db
+            .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                preserve_triage: true,
+                ephemeral_id: dup_id,
+                canonical_id: open_id,
+                reasoning: "Same leak",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 5. Verified bug later 'dismissed' by a human maintainer: must be included
+        // so the false positive is not re-opened on future patchset reviews.
+        let human_dismissed_id = create_pending_bug(&worker_db, "linux-vec-human-dismissed").await;
+        worker_db
+            .update_bug_outcome(
+                human_dismissed_id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Open,
+                    problem: Some("hwmon: aqc: false positive in aqc_raw_event()"),
+                    vector_json: Some("{\"tok:aqc\":1.0}"),
+                    verified_on_sha: Some("deadbeef"),
+                    inline_review: "In aqc_raw_event(), out-of-bounds read.",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        human_db
+            .change_bug_status_with_reason(
+                human_dismissed_id,
+                BugLifecycleStatus::Dismissed,
+                Some("Not a bug"),
+            )
+            .await
+            .unwrap();
+
+        // 6. Verified bug later 'closed' by a maintainer: must be included.
+        let closed_id = create_pending_bug(&worker_db, "linux-vec-closed").await;
+        worker_db
+            .update_bug_outcome(
+                closed_id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Open,
+                    problem: Some("hwmon: lm90: leak on probe failure"),
+                    vector_json: Some("{\"tok:lm90\":1.0}"),
+                    verified_on_sha: Some("deadbeef"),
+                    inline_review: "In lm90_probe(), leak on error.",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        human_db
+            .change_bug_status_with_reason(
+                closed_id,
+                BugLifecycleStatus::Closed,
+                Some("Fix queued."),
+            )
+            .await
+            .unwrap();
+
+        // 7. Verified 'fixed' bug: must be included.
+        let fixed_id = create_pending_bug(&worker_db, "linux-vec-fixed").await;
+        worker_db
+            .update_bug_outcome(
+                fixed_id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Fixed,
+                    problem: Some("net: fixed leak in bar()"),
+                    vector_json: Some("{\"tok:bar\":1.0}"),
+                    verified_on_sha: Some("deadbeef"),
+                    inline_review: "In bar(), buffer is leaked.",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let corpus = db.list_all_bugs_for_vector_search().await.unwrap();
+        let corpus_ids: Vec<i64> = corpus.iter().map(|b| b.id).collect();
+        assert_eq!(
+            corpus_ids,
+            vec![open_id, human_dismissed_id, closed_id, fixed_id]
+        );
     }
 
     /// Builds a bug that is ready to be claimed for analysis.
