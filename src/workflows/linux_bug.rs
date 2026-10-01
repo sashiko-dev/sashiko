@@ -644,9 +644,156 @@ fn resolve_official_subsystems_for_project(
 // 3. Deduplication Confirmation Session
 // ---------------------------------------------------------------------------
 
+const MAX_DEDUP_DESCRIPTION_BYTES: usize = 800;
+
+fn format_known_bug_locations(bug: &Bug) -> String {
+    if let Some(locs) = bug.locations()
+        && let Some(arr) = locs.as_array()
+    {
+        let mut items = Vec::new();
+        for obj in arr {
+            let file = obj
+                .get("file")
+                .or_else(|| obj.get("path"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let line = obj
+                .get("line")
+                .or_else(|| obj.get("start_line"))
+                .and_then(|v| v.as_i64());
+            let func = obj
+                .get("function")
+                .or_else(|| obj.get("symbol"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            match (file, line, func) {
+                (Some(f), Some(l), Some(fn_name)) => {
+                    items.push(format!("{f}:{l} ({fn_name})"));
+                }
+                (Some(f), Some(l), None) => {
+                    items.push(format!("{f}:{l}"));
+                }
+                (Some(f), None, Some(fn_name)) => {
+                    items.push(format!("{f} ({fn_name})"));
+                }
+                (Some(f), None, None) => {
+                    items.push(f.to_string());
+                }
+                (None, _, Some(fn_name)) => {
+                    items.push(fn_name.to_string());
+                }
+                _ => {}
+            }
+        }
+        if !items.is_empty() {
+            return items.join(", ");
+        }
+    }
+    bug.source_files()
+        .map(|f| f.join(", "))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn find_known_bug_description_slice(bug: &Bug) -> Option<&str> {
+    let report = bug.enrichments.iter().rev().find_map(|e| {
+        if e.kind == "report" {
+            e.content
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    });
+    if report.is_some() {
+        return report;
+    }
+
+    let sev = bug.enrichments.iter().rev().find_map(|e| {
+        if e.kind == "severity_calibration" {
+            e.content
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    e.data_json
+                        .as_ref()
+                        .and_then(|d| d.get("explanation"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+        } else if e.kind == "verification" {
+            e.data_json
+                .as_ref()
+                .and_then(|d| d.get("refutation_evidence"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    });
+    if sev.is_some() {
+        return sev;
+    }
+
+    bug.enrichments.iter().rev().find_map(|e| {
+        let s = match e.kind.as_str() {
+            "verification" | "candidate" | "raw_candidate" => e.content.as_deref(),
+            "normalization_run" => e
+                .data_json
+                .as_ref()
+                .and_then(|d| d.get("canonical_description"))
+                .and_then(|v| v.as_str()),
+            _ => None,
+        };
+        s.map(str::trim).filter(|s| !s.is_empty())
+    })
+}
+
+fn format_known_bug_description(bug: &Bug) -> String {
+    let Some(raw) = find_known_bug_description_slice(bug) else {
+        return "none".to_string();
+    };
+
+    let mut compact = String::with_capacity(MAX_DEDUP_DESCRIPTION_BYTES.min(raw.len()));
+    let mut was_truncated = false;
+    for word in raw.split_whitespace() {
+        let sep_len = usize::from(!compact.is_empty());
+        if compact.len() + sep_len + word.len() > MAX_DEDUP_DESCRIPTION_BYTES {
+            let remaining = MAX_DEDUP_DESCRIPTION_BYTES.saturating_sub(compact.len() + sep_len);
+            let prefix = crate::utils::utf8_prefix(word, remaining);
+            if !prefix.is_empty() {
+                if sep_len > 0 {
+                    compact.push(' ');
+                }
+                compact.push_str(prefix);
+            }
+            was_truncated = true;
+            break;
+        }
+        if sep_len > 0 {
+            compact.push(' ');
+        }
+        compact.push_str(word);
+    }
+
+    if was_truncated {
+        format!("{compact}...[truncated]...")
+    } else {
+        compact
+    }
+}
+
 struct DedupSession<'a> {
     project: ProjectId,
     candidate_problem: &'a str,
+    candidate_description: &'a str,
     candidate_locations: Option<&'a Value>,
     candidate_subsystems: &'a [String],
     known_candidates: &'a [Bug],
@@ -677,17 +824,7 @@ impl LlmSession for DedupSession<'_> {
     fn initial_user_prompt(&self) -> String {
         let loc_str = self
             .candidate_locations
-            .map(|v| {
-                let mut stripped = v.clone();
-                if let Some(arr) = stripped.as_array_mut() {
-                    for obj in arr {
-                        if let Some(map) = obj.as_object_mut() {
-                            map.remove("line");
-                        }
-                    }
-                }
-                serde_json::to_string_pretty(&stripped).unwrap_or_else(|_| "[]".to_string())
-            })
+            .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| "[]".to_string()))
             .unwrap_or_else(|| "[]".to_string());
 
         let mut known_list = String::new();
@@ -701,14 +838,19 @@ impl LlmSession for DedupSession<'_> {
             } else {
                 bug.subsystems.join(", ")
             };
+            let locs_str = format_known_bug_locations(bug);
+            let desc_str = format_known_bug_description(bug);
             known_list.push_str(&format!(
-                "- Bug ID {}: [BugID: {}] [Severity: {}] [Subsystems: {}]\n  Problem: {}\n  Affected Files: {}\n\n",
+                "- Bug ID {}: [BugID: {}] [Status: {}] [Severity: {}] [Subsystems: {}]\n  Problem: {}\n  Affected Files: {}\n  Locations: {}\n  Description: {}\n\n",
                 bug.id,
                 bug.bugid,
+                bug.lifecycle_status.as_str(),
                 bug.severity().as_str(),
                 subs_str,
                 bug.problem(),
-                files_str
+                files_str,
+                locs_str,
+                desc_str,
             ));
         }
 
@@ -716,6 +858,11 @@ impl LlmSession for DedupSession<'_> {
             "unknown".to_string()
         } else {
             self.candidate_subsystems.join(", ")
+        };
+        let cand_desc = if self.candidate_description.trim().is_empty() {
+            "none"
+        } else {
+            self.candidate_description.trim()
         };
 
         let bug_header = match self.project {
@@ -727,6 +874,7 @@ impl LlmSession for DedupSession<'_> {
             "{stage_heading}\n\n\
             {bug_header}\n\
             Problem: {problem}\n\
+            Description:\n{description}\n\
             Subsystems: {subsystems}\n\
             Locations:\n{locations}\n\n\
             Candidate Known Bugs in Database:\n\
@@ -746,6 +894,7 @@ impl LlmSession for DedupSession<'_> {
             stage_heading = BugStage::Deduplication.heading(),
             bug_header = bug_header,
             problem = self.candidate_problem,
+            description = cand_desc,
             subsystems = cand_subs,
             locations = loc_str,
             known_bugs = known_list,
@@ -2201,6 +2350,7 @@ pub async fn process_issue_worker_for_project(
                 candidate_matches.iter().map(|m| m.bug.clone()).collect();
             let mut dedup_session = DedupSession {
                 candidate_problem: &norm.canonical_title,
+                candidate_description: &norm.canonical_description,
                 candidate_locations: verified_locations.as_ref(),
                 candidate_subsystems: &official_subsystem_names,
                 known_candidates: &candidate_bugs,
@@ -3859,6 +4009,7 @@ mod tests {
 
         let mut session = DedupSession {
             candidate_problem: "Memory leak in net/core/dev.c",
+            candidate_description: "Buffer allocated in dev_alloc is leaked on error path.",
             candidate_locations: None,
             candidate_subsystems: &["net".to_string()],
             known_candidates: &known_bugs,
@@ -3912,6 +4063,7 @@ mod tests {
 
         let session = DedupSession {
             candidate_problem: "Use-after-free crash in dev.c due to race",
+            candidate_description: "Concurrent teardown frees netdev while rx handler is running.",
             candidate_locations: None,
             candidate_subsystems: &["net".to_string()],
             known_candidates: &known_bugs,
@@ -3930,6 +4082,108 @@ mod tests {
         assert!(
             user.contains("If fixing one issue will resolve the other issue, it's the same bug")
         );
+    }
+
+    #[test]
+    fn test_dedup_session_prompt_includes_locations_and_descriptions() {
+        let known_bugs = vec![Bug {
+            id: 42,
+            bugid: "linux-42".to_string(),
+            title: "amdgpu: missing ring_muxer cleanup on pci remove".to_string(),
+            lifecycle_status: crate::db::BugLifecycleStatus::Fixed,
+            pipeline_state: crate::db::BugPipelineState::Succeeded,
+            assignee: None,
+            assigned_at: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 100,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            created_at: 100,
+            updated_at: 100,
+            subsystems: vec!["DRM DRIVERS FOR AMD GPU".to_string()],
+            enrichments: vec![
+                BugEnrichment {
+                    id: 1,
+                    bug_id: 42,
+                    kind: "verification".to_string(),
+                    tool: "sashiko".to_string(),
+                    model: None,
+                    author: None,
+                    created_at: 100,
+                    content: Some("Verified missing ring_muxer_fini call.".to_string()),
+                    data_json: Some(json!({
+                        "verified_on_sha": "deadbeef",
+                        "is_valid": true,
+                        "source_files": ["drivers/gpu/drm/amd/amdgpu/amdgpu_ring_mux.c"],
+                        "locations": [{
+                            "file": "drivers/gpu/drm/amd/amdgpu/amdgpu_ring_mux.c",
+                            "line": 218,
+                            "function": "amdgpu_ring_mux_fini"
+                        }]
+                    })),
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                    logs: None,
+                },
+                BugEnrichment {
+                    id: 2,
+                    bug_id: 42,
+                    kind: "report".to_string(),
+                    tool: "sashiko".to_string(),
+                    model: None,
+                    author: None,
+                    created_at: 101,
+                    content: Some(
+                        "In amdgpu_ring_mux_fini(), the timer is not cancelled before freeing."
+                            .to_string(),
+                    ),
+                    data_json: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                    logs: None,
+                },
+            ],
+        }];
+
+        let cand_locs = json!([{
+            "file": "drivers/gpu/drm/amd/amdgpu/amdgpu_ring_mux.c",
+            "line": 224,
+            "function": "amdgpu_ring_mux_fini"
+        }]);
+
+        let session = DedupSession {
+            candidate_problem: "amdgpu: use-after-free of mux timer after ring_mux_fini",
+            candidate_description: "Trigger: GPU reset or unload.\nFailure Mechanism: Timer fires after ring_mux_fini frees the struct.\nImpact: Use-after-free.",
+            candidate_locations: Some(&cand_locs),
+            candidate_subsystems: &["DRM DRIVERS FOR AMD GPU".to_string()],
+            known_candidates: &known_bugs,
+            context_tag: None,
+            project: ProjectId::Linux,
+        };
+
+        let prompt = session.initial_user_prompt();
+        // Candidate description and line number must be preserved.
+        assert!(prompt.contains("Timer fires after ring_mux_fini frees the struct."));
+        assert!(prompt.contains("\"line\": 224"));
+        // Known bug status, function/line locations, and description must be present.
+        assert!(prompt.contains("[Status: fixed]"));
+        assert!(prompt.contains(
+            "Locations: drivers/gpu/drm/amd/amdgpu/amdgpu_ring_mux.c:218 (amdgpu_ring_mux_fini)"
+        ));
+        assert!(prompt.contains(
+            "Description: In amdgpu_ring_mux_fini(), the timer is not cancelled before freeing."
+        ));
+
+        let mut long_bug = known_bugs[0].clone();
+        long_bug.enrichments[1].content = Some("a".repeat(MAX_DEDUP_DESCRIPTION_BYTES + 50));
+        let truncated_desc = format_known_bug_description(&long_bug);
+        assert!(truncated_desc.ends_with("...[truncated]..."));
     }
 
     struct QueuedMockAiProvider {
@@ -4131,6 +4385,7 @@ mod tests {
                 BugStage::Deduplication,
                 DedupSession {
                     candidate_problem: &input.problem,
+                    candidate_description: &input.reasoning,
                     candidate_locations: None,
                     candidate_subsystems: &subsystem_names,
                     known_candidates: &[],
