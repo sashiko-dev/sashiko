@@ -510,6 +510,7 @@ impl AiProvider for BedrockClient {
         crate::ai::cache_identity_with(
             &self.model_id,
             &[
+                ("region", self.region.as_deref()),
                 ("thinking", self.thinking.as_deref()),
                 ("effort", self.effort.as_deref()),
                 ("max_tokens", Some(max_tokens.as_str())),
@@ -935,5 +936,54 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert!(matches!(&tools[0], Tool::ToolSpec(_)));
         Ok(())
+    }
+
+    #[test]
+    fn cache_identity_tracks_region_and_knobs() {
+        let base = BedrockClient::new(
+            "anthropic.claude-sonnet-4".to_string(),
+            None,
+            false,
+            4096,
+            None,
+            None,
+        );
+        let us_east = BedrockClient::new(
+            "anthropic.claude-sonnet-4".to_string(),
+            Some("us-east-1".to_string()),
+            false,
+            4096,
+            None,
+            None,
+        );
+        let us_west = BedrockClient::new(
+            "anthropic.claude-sonnet-4".to_string(),
+            Some("us-west-2".to_string()),
+            false,
+            4096,
+            None,
+            None,
+        );
+        let thinking = BedrockClient::new(
+            "anthropic.claude-sonnet-4".to_string(),
+            Some("us-east-1".to_string()),
+            false,
+            4096,
+            Some("adaptive".to_string()),
+            Some("high".to_string()),
+        );
+        let more_tokens = BedrockClient::new(
+            "anthropic.claude-sonnet-4".to_string(),
+            Some("us-east-1".to_string()),
+            false,
+            8192,
+            None,
+            None,
+        );
+
+        assert_ne!(base.cache_identity(), us_east.cache_identity());
+        assert_ne!(us_east.cache_identity(), us_west.cache_identity());
+        assert_ne!(us_east.cache_identity(), thinking.cache_identity());
+        assert_ne!(us_east.cache_identity(), more_tokens.cache_identity());
     }
 }
