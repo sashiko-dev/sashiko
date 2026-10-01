@@ -5128,8 +5128,8 @@ impl Database {
                 libsql::params![message_id],
             )
             .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(Some(row.get(0)?))
+        if let Some(row) = rows.next().await? {
+            Ok(row.get::<Option<i64>>(0)?)
         } else {
             Ok(None)
         }
@@ -5212,49 +5212,64 @@ impl Database {
         mailing_list: Option<&str>,
         references_hdr: Option<&str>,
     ) -> Result<()> {
+        let compressed_body = crate::compression::compress_string_if_needed(body);
+        let tx = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+
         // Check for thread merge (Thread split resolution)
-        if let Ok(Some(old_thread_id)) = self.get_thread_id_for_message(message_id).await
+        let old_thread_id = {
+            let mut rows = tx
+                .query(
+                    "SELECT thread_id FROM messages WHERE message_id = ?",
+                    libsql::params![message_id],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                row.get::<Option<i64>>(0)?
+            } else {
+                None
+            }
+        };
+
+        if let Some(old_thread_id) = old_thread_id
             && old_thread_id != thread_id
         {
             info!("Merging thread {} into {}", old_thread_id, thread_id);
             // 1. Move messages
-            self.conn
-                .execute(
-                    "UPDATE messages SET thread_id = ? WHERE thread_id = ?",
-                    libsql::params![thread_id, old_thread_id],
-                )
-                .await?;
+            tx.execute(
+                "UPDATE messages SET thread_id = ? WHERE thread_id = ?",
+                libsql::params![thread_id, old_thread_id],
+            )
+            .await?;
 
             // 2. Move patchsets
-            self.conn
-                .execute(
-                    "UPDATE patchsets SET thread_id = ? WHERE thread_id = ?",
-                    libsql::params![thread_id, old_thread_id],
-                )
-                .await?;
+            tx.execute(
+                "UPDATE patchsets SET thread_id = ? WHERE thread_id = ?",
+                libsql::params![thread_id, old_thread_id],
+            )
+            .await?;
 
             // 3. Merge subsystems
-            self.conn
-                .execute(
-                    "UPDATE OR IGNORE threads_subsystems SET thread_id = ? WHERE thread_id = ?",
-                    libsql::params![thread_id, old_thread_id],
-                )
-                .await?;
+            tx.execute(
+                "UPDATE OR IGNORE threads_subsystems SET thread_id = ? WHERE thread_id = ?",
+                libsql::params![thread_id, old_thread_id],
+            )
+            .await?;
             // Delete any remaining (conflicting) subsystem mappings for the old thread
-            self.conn
-                .execute(
-                    "DELETE FROM threads_subsystems WHERE thread_id = ?",
-                    libsql::params![old_thread_id],
-                )
-                .await?;
+            tx.execute(
+                "DELETE FROM threads_subsystems WHERE thread_id = ?",
+                libsql::params![old_thread_id],
+            )
+            .await?;
 
             // 5. Delete old thread
-            self.conn
-                .execute(
-                    "DELETE FROM threads WHERE id = ?",
-                    libsql::params![old_thread_id],
-                )
-                .await?;
+            tx.execute(
+                "DELETE FROM threads WHERE id = ?",
+                libsql::params![old_thread_id],
+            )
+            .await?;
         }
 
         // Use INSERT OR REPLACE to handle updating placeholders.
@@ -5268,7 +5283,7 @@ impl Database {
         // Blindly replacing might change the thread_id if a different one is passed.
         // But main.rs logic should ensure consistency.
         // Use INSERT OR REPLACE.
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO messages (message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id) DO UPDATE SET
@@ -5283,8 +5298,9 @@ impl Database {
                 git_blob_hash=excluded.git_blob_hash,
                 mailing_list=excluded.mailing_list,
                 references_hdr=excluded.references_hdr",
-            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, crate::compression::compress_string_if_needed(body), to, cc, git_blob_hash, mailing_list, references_hdr],
+            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, compressed_body, to, cc, git_blob_hash, mailing_list, references_hdr],
         ).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -20548,6 +20564,157 @@ mod tests {
         assert!(
             adopt_err.to_string().contains("integer overflow"),
             "expected integer overflow error from adopt_series_identity, got: {adopt_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_message_with_references_thread_merge_is_transactional() {
+        let db = setup_db().await;
+        let main_thread = db
+            .create_thread("root@example.com", "Main Thread", 1000)
+            .await
+            .unwrap();
+        let split_thread = db
+            .ensure_thread_for_message("split@example.com", 1001)
+            .await
+            .unwrap();
+        assert_ne!(main_thread, split_thread);
+
+        let sub_id = db
+            .ensure_subsystem("netdev", "netdev@vger.kernel.org")
+            .await
+            .unwrap();
+        db.add_subsystem_to_thread(split_thread, sub_id)
+            .await
+            .unwrap();
+
+        // Simulate a failure on the final DELETE FROM threads step during thread merge.
+        db.conn
+            .execute(
+                "CREATE TRIGGER fail_thread_delete BEFORE DELETE ON threads
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated thread delete failure');
+                 END;",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let err = db
+            .create_message_with_references(
+                "split@example.com",
+                main_thread,
+                Some("root@example.com"),
+                "Author <a@example.com>",
+                "Real Subject",
+                1002,
+                "Body",
+                "to",
+                "cc",
+                None,
+                None,
+                Some("root@example.com"),
+            )
+            .await
+            .expect_err("thread merge must fail when DELETE FROM threads aborts");
+        assert!(err.to_string().contains("simulated thread delete failure"));
+
+        // Because the merge runs inside a transaction, messages and subsystems
+        // must remain on split_thread rather than being left in a torn state.
+        assert_eq!(
+            db.get_thread_id_for_message("split@example.com")
+                .await
+                .unwrap(),
+            Some(split_thread)
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT thread_id FROM threads_subsystems WHERE subsystem_id = ?",
+                libsql::params![sub_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), split_thread);
+
+        // Remove the failure trigger and verify the retry merges cleanly.
+        db.conn
+            .execute("DROP TRIGGER fail_thread_delete", ())
+            .await
+            .unwrap();
+
+        db.create_message_with_references(
+            "split@example.com",
+            main_thread,
+            Some("root@example.com"),
+            "Author <a@example.com>",
+            "Real Subject",
+            1002,
+            "Body",
+            "to",
+            "cc",
+            None,
+            None,
+            Some("root@example.com"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_thread_id_for_message("split@example.com")
+                .await
+                .unwrap(),
+            Some(main_thread)
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM threads WHERE id = ?",
+                libsql::params![split_thread],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 0);
+
+        // Verify that a message row with a NULL thread_id is handled as None
+        // rather than failing FromSql conversion.
+        db.conn
+            .execute(
+                "INSERT INTO messages (message_id, thread_id, author, subject, date)
+                 VALUES ('null-thread@example.com', NULL, 'unknown', '(placeholder)', 1003)",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_thread_id_for_message("null-thread@example.com")
+                .await
+                .unwrap(),
+            None
+        );
+        db.create_message_with_references(
+            "null-thread@example.com",
+            main_thread,
+            Some("root@example.com"),
+            "Author <a@example.com>",
+            "Resolved Subject",
+            1004,
+            "Body",
+            "to",
+            "cc",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_thread_id_for_message("null-thread@example.com")
+                .await
+                .unwrap(),
+            Some(main_thread)
         );
     }
 }
