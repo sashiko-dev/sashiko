@@ -1746,10 +1746,11 @@ impl Database {
 
         if current_version < 8 {
             info!("Applying database migration version 8 (meta table)...");
-            self.conn
-                .execute_batch(include_str!("migrations/008_meta_table.sql"))
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/008_meta_table.sql"))
                 .await?;
-            self.conn.execute("PRAGMA user_version = 8", ()).await?;
+            tx.execute("PRAGMA user_version = 8", ()).await?;
+            tx.commit().await?;
         }
 
         if current_version < 9 {
@@ -1765,15 +1766,11 @@ impl Database {
 
         if current_version < 10 {
             info!("Applying database migration version 10 (forge outbox)...");
-            self.conn
-                .execute_batch(include_str!(
-                    "migrations/009_patchset_maintainer_sections.sql"
-                ))
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/010_forge_outbox.sql"))
                 .await?;
-            self.conn
-                .execute_batch(include_str!("migrations/010_forge_outbox.sql"))
-                .await?;
-            self.conn.execute("PRAGMA user_version = 10", ()).await?;
+            tx.execute("PRAGMA user_version = 10", ()).await?;
+            tx.commit().await?;
         }
 
         if current_version < 11 {
@@ -21210,5 +21207,77 @@ mod tests {
                 "{table} cancellation should have rolled back on claim failure"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v8_and_v10_apply_cleanly_without_reapplying_v9() {
+        let db = setup_db().await;
+
+        // Rewind to version 7 without meta, patchset_maintainer_sections, or forge_outbox,
+        // and verify migrations 8, 9, and 10 apply cleanly.
+        db.conn
+            .execute_batch(
+                "DROP TABLE IF EXISTS meta;
+                 DROP TABLE IF EXISTS patchset_maintainer_sections;
+                 DROP TABLE IF EXISTS forge_outbox;
+                 PRAGMA user_version = 7;",
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        for table in ["meta", "patchset_maintainer_sections", "forge_outbox"] {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<i64>(0).unwrap(), 1, "expected table {table}");
+        }
+
+        // Now rewind to version 9 and drop both patchset_maintainer_sections and forge_outbox.
+        // Migration 10 must create forge_outbox without re-executing migration 9.
+        db.conn
+            .execute_batch(
+                "DROP TABLE patchset_maintainer_sections;
+                 DROP TABLE forge_outbox;
+                 PRAGMA user_version = 9;",
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'forge_outbox'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'patchset_maintainer_sections'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            0,
+            "migration 10 must not re-execute 009_patchset_maintainer_sections.sql"
+        );
     }
 }
