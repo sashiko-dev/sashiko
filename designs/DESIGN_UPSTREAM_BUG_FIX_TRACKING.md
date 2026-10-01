@@ -98,31 +98,33 @@ flowchart TD
 
 `BugWorker::resolve_master_sha` resolves `<mainline_remote>/master` (configured via `git.mainline_remote`, defaulting to `origin/master`, falling back to `master`, then `HEAD`). This guarantees that upstream fix checks exclusively inspect Linus's mainline branch rather than subsystem `-next` branches.
 
-### 3.3 Tier 1 & Tier 2: Deterministic Zero-Token Git Pre-Filter
+### 3.3 Tier 1 & Tier 2: Range-Indexed Zero-Token Git Pre-Filter ($\mathcal{O}(N_{\text{commits}})$ Scaling)
 
-For each open canonical bug (`lifecycle_status = 'open'`, `pipeline_state = 'succeeded'`, `duplicate_of_id IS NULL`) up to `fix_check_batch_size`:
+To scale to $\mathcal{O}(10\text{k})$ open bugs in the Linux kernel without spawning $\mathcal{O}(N_{\text{bugs}})$ separate `git` subprocesses or burning `fix_check_batch_size` slots on zero-token watermark advancements, `BugWorker::check_open_bugs_upstream` executes a two-phase sweep backed by an in-memory per-range index (`CommitRangeIndex`):
 
-1. **Determine Baseline (`verified_on_sha`):**
-   - Read `bug.verified_on_sha()`.
-   - If `verified_on_sha == Some(linus_sha)`, skip immediately.
-   - Verify that `verified_on_sha` exists and is an ancestor of `linus_sha` via `git merge-base --is-ancestor <verified_on_sha> <linus_sha>`.
-2. **Extract Tracked Files & Introducing Commit:**
-   - Extract affected file paths from `bug.source_files()` and `bug.locations()`.
-   - Extract `introducing_commit_sha` from the bug's `origin_discovery` enrichment (if present).
-3. **Query Git Range (`<verified_on_sha>..<linus_sha>`):**
-   - Run `git log --oneline --no-merges <verified_on_sha>..<linus_sha> -- <files...>` using `git_cmd::in_dir_async`.
-   - If `introducing_commit_sha` is available (at least 7 hex chars), also run `git log --oneline --no-merges --fixed-strings --grep=<short_sha> <verified_on_sha>..<linus_sha>` to catch fixes that refactored or moved code across files while citing `Fixes: <short_sha>`.
-4. **Short-Circuit When Untouched:**
-   - If both queries return zero commits, the bug's files and `Fixes:` references were untouched in `<verified_on_sha>..<linus_sha>`.
-   - Insert a `verification` enrichment advancing `verified_on_sha` to `linus_sha` while preserving `locations` and `source_files` in `data_json` so projections and UI views remain intact.
-   - Cost: **0 LLM tokens**.
+1. **Per-Range Git Index (`CommitRangeIndex`):**
+   - In steady state, almost all open bugs share one (or a handful of) `verified_on_sha` values from the previous mainline sweep.
+   - For each distinct `verified_on_sha` encountered (up to `MAX_CACHED_RANGES_PER_SWEEP = 64`), Sashiko verifies ancestry (`git merge-base --is-ancestor <verified_on_sha> <linus_sha>`) once and queries the commit range `<verified_on_sha>..<linus_sha>` once via `git log --no-merges -n 2001 -z --name-only --format=%x1e%H%x1f%B%x1d`.
+   - If the range contains $\le 2{,}000$ non-merge commits (`MAX_INDEXED_RANGE_COMMITS`), `CommitRangeIndex` indexes:
+     - `files_to_commits: HashMap<String, Vec<String>>` mapping each modified file path to the ordered commit SHAs touching it.
+     - `commit_messages: Vec<(String, String)>` storing `(commit_sha, raw_body)` for fast in-memory `Fixes:` / `introducing_commit_sha` substring matching.
+   - Candidate lookup for each bug at `verified_on_sha` is then an $\mathcal{O}(1)$ in-memory lookup requiring **zero per-bug `git` subprocesses**. If a historical range exceeds `MAX_INDEXED_RANGE_COMMITS`, lookup transparently falls back to per-bug `find_candidate_fix_commits`.
+2. **Phase 1 — Keyset-Paginated Zero-Token Batch Advancement:**
+   - Open canonical bugs (`lifecycle_status = 'open'`, `pipeline_state = 'succeeded'`, `duplicate_of_id IS NULL`, `verified_on_sha != linus_sha`) are scanned in chunks of `250` (`FIX_CHECK_SCAN_CHUNK_SIZE`, up to `MAX_FIX_CHECK_SCAN_CHUNKS = 80`, or `20,000` bugs per sweep) using keyset pagination on `(updated_at ASC, id ASC)` (`idx_bugs_fix_check`).
+   - Bugs with **zero candidate commits** in `<verified_on_sha>..<linus_sha>` are batch-advanced to `linus_sha` in short SQLite transactions (`advance_open_bugs_without_llm_batch`, capped at 100 rows per transaction) without consuming `fix_check_batch_size`.
+   - Bugs with $\ge 1$ candidate commits are queued for Phase 2 up to `fix_check_batch_size` (which exclusively bounds LLM verification sessions per sweep).
+3. **Phase 2 — Bounded LLM Verification (`VerifyUpstreamFixSession`):**
+   - For each queued bug (at most `fix_check_batch_size`), the worker atomically claims the specific bug lease (`claim_specific_open_bug_for_fix_check`) and runs `VerifyUpstreamFixSession` under `run_while_leased(..., maintain_lease(...))`.
+4. **Non-Blocking Background Execution in `BugWorker::run`:**
+   - Periodic upstream fix sweeps are spawned on a dedicated background task (guarded by an atomic/handle check so at most one sweep runs at a time) rather than blocking `claim_pending_bug` on the main worker loop.
 
 ### 3.4 Tier 3: Single-Stage LLM Fix Verification (`verify_upstream_fix`)
 
 When one or more commits in `<verified_on_sha>..<linus_sha>` touch the bug's files or cite its introducing commit:
 
-1. **Bounded Prefetching:**
-   - Prefetch the commit log and per-file diffs for the candidate commits (capped at `MAX_FIX_CHECK_PREFETCH_CHARS = 24,000` characters, restricting diffs to the bug's affected files) plus the current code snippet around the bug's locations at `linus_sha`.
+1. **Bounded Prefetching (Full Commit Diff with Per-File Fallback):**
+   - For each candidate commit (up to `MAX_FIX_CANDIDATE_COMMITS = 10`), `prefetch_candidate_fix_commits` first fetches the full commit diff (`git show --stat --patch --unified=5 <sha>`). If the full commit diff fits within `MAX_FULL_COMMIT_PREFETCH_BYTES` (`12,000` bytes), it is included in full so cross-file fixes (such as adding a `Drop` guard in another module) are never stripped. Only when a candidate commit diff exceeds `MAX_FULL_COMMIT_PREFETCH_BYTES` does prefetching fall back to filtering by `-- <bug_files...>`, capped at `MAX_FIX_CHECK_PREFETCH_BYTES = 24,000` total bytes.
+   - Prefetches the current code snippet around the bug's locations at `linus_sha`.
 2. **Single-Stage Session (`VerifyUpstreamFixSession`):**
    - Equipped with `ToolScope::GitOnly` (`git_show`, `git_read_files`, `git_log`, `git_blame`, `git_grep`) and a tight turn budget (`max_turns = 8`).
    - Output schema (`UpstreamFixVerdict`):
@@ -133,8 +135,8 @@ When one or more commits in `<verified_on_sha>..<linus_sha>` touch the bug's fil
    - If the LLM reports `status == "fixed"`, validate `fixing_commit_sha` using `git rev-parse --verify <sha>^{commit}` and `git merge-base --is-ancestor <sha> <linus_sha>`.
    - If the SHA does not resolve to a valid ancestor of `linus_sha`, reject the `"fixed"` verdict and treat it as `"uncertain"` (preventing hallucinated commit SHAs from closing open bugs).
 4. **Database State Transitions (`src/db.rs`):**
-   - **Fixed:** `db.mark_bug_fixed_upstream(bug.id, &full_fixing_sha, &linus_sha, &explanation, ...)` atomically inserts a `fix_candidate` enrichment (`status: "merged"`, `commit_sha: full_fixing_sha`, `verified_on_sha: linus_sha`, `explanation`), inserts a `verification` enrichment updating `verified_on_sha`, and updates `lifecycle_status = 'fixed'` (`WHERE id = ? AND lifecycle_status = 'open'`).
-   - **Still Present:** `db.advance_bug_verified_sha(bug.id, &linus_sha, ...)` inserts a `verification` enrichment advancing `verified_on_sha` to `linus_sha` (preserving existing `locations` and `source_files`) so the same commits are not re-evaluated on the next cycle.
+   - **Fixed:** `db.record_upstream_fix_check` atomically inserts a `fix_candidate` enrichment (`status: "merged"`, `commit_sha: full_fixing_sha`, `verified_on_sha: linus_sha`, `explanation`), advances `verified_on_sha`, and updates `lifecycle_status = 'fixed'` (`WHERE id = ? AND lifecycle_status = 'open'`).
+   - **Still Present:** `db.record_upstream_fix_check` inserts a `verification` enrichment advancing `verified_on_sha` to `linus_sha` (preserving existing `locations` and `source_files`) so the same commits are not re-evaluated on the next cycle.
 
 ---
 
@@ -146,10 +148,10 @@ When one or more commits in `<verified_on_sha>..<linus_sha>` touch the bug's fil
    - Verify `Settings::new()` defaults `linux_bug.enabled` to `false`.
    - Verify `Reviewer::process_issue` skips creating bugs when `linux_bug.enabled == false`.
    - Verify `/api/config` exposes `bugs_enabled` and `/api/bug/analyze` rejects requests when disabled.
-3. **Upstream Fix Tracking Tests:**
-   - **Zero-token path:** Create a temporary git repository with an open bug verified at commit A, add commit B touching an unrelated file, run the upstream fix check, and assert `verified_on_sha` advances to B with 0 AI calls.
-   - **Fixed path:** Add commit C modifying the buggy file to fix the defect, run the upstream fix check with a mock AI provider returning `status = "fixed"` and commit C's SHA, and assert `lifecycle_status` transitions to `Fixed`, `fixed_in_commit()` equals C, and `verified_on_sha` advances to C.
-   - **Hallucinated SHA guardrail:** Verify that if the AI returns `status = "fixed"` with a non-existent or non-ancestor SHA, the bug remains `Open`.
-   - **Still-present path:** Verify that if commit C touches the file without fixing the bug (`status = "still_present"`), the bug remains `Open` and `verified_on_sha` advances to C while preserving `locations` and `source_files`.
+3. **Upstream Fix Tracking & Scalability Tests:**
+   - **Zero-token path & `CommitRangeIndex`:** Create a temporary git repository with open bugs verified at commit A, add commits touching specific files and citing `Fixes:` tags, and verify `CommitRangeIndex` matches both file-touching and `Fixes:`-citing commits while advancing untouched bugs with 0 AI calls.
+   - **Batch scalability beyond `fix_check_batch_size`:** Verify that when `fix_check_batch_size` is small (e.g. `2`), `BugWorker::check_open_bugs_upstream` still advances all untouched open bugs in a single sweep while limiting LLM evaluations to `fix_check_batch_size`.
+   - **Cross-file fix prefetching:** Verify `prefetch_candidate_fix_commits` includes cross-file hunks when a candidate commit fits within `MAX_FULL_COMMIT_PREFETCH_BYTES`.
+   - **Fixed / Hallucinated / Still-present paths:** Verify `Fixed`, `Uncertain`, and `StillPresentAfterLlm` state transitions.
 4. **CI & Self-Review:**
    - Run `make check-pr` and `sashiko review --project sashiko --agent` across all commits.
