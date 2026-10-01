@@ -4,7 +4,7 @@
 daemon or for running standalone local reviews. It can submit patches for
 review, query review status, and display findings -- all from the terminal.
 
-See also: [main README](../README.md) for project overview and daemon setup.
+See also: [main README](../README.md) for project overview and [Daemon Guide](daemon.md) for daemon setup.
 
 ## Installation
 
