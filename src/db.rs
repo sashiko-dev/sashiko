@@ -1547,7 +1547,7 @@ impl Database {
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows.next().await? {
             let body: Option<String> =
                 crate::compression::get_compressed_string_opt(&row, 0).unwrap_or(None);
             if let Some(b) = body
@@ -5573,8 +5573,8 @@ impl Database {
                 libsql::params![id],
             )
             .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0).ok())
+        if let Some(row) = rows.next().await? {
+            get_optional_text(&row, 0)
         } else {
             Ok(None)
         }

@@ -273,6 +273,20 @@ impl Reviewer {
         Ok(())
     }
 
+    async fn mark_patchset_failed_unless_cancelled(db: &Database, patchset_id: i64) {
+        let current_status = db.get_patchset_status(patchset_id).await.ok().flatten();
+        if current_status.as_deref() != Some(ReviewStatus::Cancelled.as_str())
+            && let Err(db_err) = db
+                .update_patchset_status(patchset_id, ReviewStatus::Failed.as_str())
+                .await
+        {
+            error!(
+                "Failed to mark patchset {} as Failed: {}",
+                patchset_id, db_err
+            );
+        }
+    }
+
     fn spawn_supervised_patchset_review<F>(
         db: Arc<Database>,
         permit: tokio::sync::OwnedSemaphorePermit,
@@ -290,17 +304,7 @@ impl Reviewer {
                     "Review task for patchset {} terminated abnormally ({}); marking as Failed",
                     patchset_id, join_err
                 );
-                let current_status = db.get_patchset_status(patchset_id).await.ok().flatten();
-                if current_status.as_deref() != Some(ReviewStatus::Cancelled.as_str())
-                    && let Err(db_err) = db
-                        .update_patchset_status(patchset_id, ReviewStatus::Failed.as_str())
-                        .await
-                {
-                    error!(
-                        "Failed to mark patchset {} as Failed after task termination: {}",
-                        patchset_id, db_err
-                    );
-                }
+                Self::mark_patchset_failed_unless_cancelled(&db, patchset_id).await;
             }
         })
     }
@@ -546,7 +550,7 @@ impl Reviewer {
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to fetch diffs for {}: {}", patchset_id, e);
-                let _ = ctx.db.update_patchset_status(patchset_id, "Failed").await;
+                Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
                 return;
             }
         };
@@ -581,32 +585,46 @@ impl Reviewer {
         all_files.sort();
         all_files.dedup();
 
-        let body = if let Some(mid) = &patchset.message_id {
-            ctx.db.get_message_body(mid).await.unwrap_or(None)
-        } else if let Some(first_patch_msg_id) =
-            patches_json.first().and_then(|p| p["message_id"].as_str())
-        {
-            ctx.db
-                .get_message_body(first_patch_msg_id)
-                .await
-                .unwrap_or(None)
-        } else {
-            None
+        let body_msg_id = patchset
+            .message_id
+            .as_deref()
+            .or_else(|| patches_json.first().and_then(|p| p["message_id"].as_str()));
+        let body = match body_msg_id {
+            Some(mid) => match ctx.db.get_message_body(mid).await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(
+                        "Failed to fetch message body {} for patchset {}: {}",
+                        mid, patchset_id, e
+                    );
+                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    return;
+                }
+            },
+            None => None,
         };
         let subject = patchset.subject.clone().unwrap_or("Unknown".to_string());
         // A baseline recorded before ingestion required an object ID may be
         // anything, and anything else resolves nothing, so the series is
         // reviewed on the candidates it would have had without it.
         let forced_baseline = match patchset.baseline_id {
-            Some(bid) => match ctx.db.get_baseline_commit(bid).await.ok().flatten() {
-                Some(commit) => CommitId::parse(&commit).or_else(|| {
+            Some(bid) => match ctx.db.get_baseline_commit(bid).await {
+                Ok(Some(commit)) => CommitId::parse(&commit).or_else(|| {
                     warn!(
                         "Ignoring forced baseline of patchset {}: not a commit ID",
                         patchset_id
                     );
                     None
                 }),
-                None => None,
+                Ok(None) => None,
+                Err(e) => {
+                    error!(
+                        "Failed to fetch baseline {} for patchset {}: {}",
+                        bid, patchset_id, e
+                    );
+                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    return;
+                }
             },
             None => None,
         };
@@ -4988,6 +5006,100 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             Some(ReviewStatus::Failed.as_str())
         );
         assert_eq!(semaphore.available_permits(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_review_patchset_task_marks_failed_on_baseline_db_error() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db.create_thread("msg_id_base_err", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_base_err_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let baseline_id = db
+            .create_baseline(
+                None,
+                Some("main"),
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            )
+            .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_id_base_err",
+                "Subject",
+                "Author",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                Some(baseline_id),
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, "msg_id_base_err_p1", 1, "diff --git a/a b/a\n")
+            .await?;
+
+        let mut patchsets = db.get_pending_patchsets(10).await?;
+        assert_eq!(patchsets.len(), 1);
+        let patchset = patchsets.pop().unwrap();
+        assert_eq!(patchset.baseline_id, Some(baseline_id));
+
+        // Corrupt the baseline row's column type so get_baseline_commit fails with a DB error
+        // instead of returning Ok(Some(...)) or Ok(None).
+        db.conn
+            .execute(
+                "UPDATE baselines SET last_known_commit = X'deadbeef' WHERE id = ?",
+                libsql::params![baseline_id],
+            )
+            .await?;
+        assert!(db.get_baseline_commit(baseline_id).await.is_err());
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(crate::baseline::BaselineRegistry::new(
+                Path::new("."),
+                None,
+            )?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+
+        Reviewer::review_patchset_task(ctx, patchset).await;
+
+        // Must be marked Failed (not FailedToApply from falling back to heuristic candidates).
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some(ReviewStatus::Failed.as_str())
+        );
 
         Ok(())
     }
