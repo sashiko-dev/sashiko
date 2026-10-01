@@ -77,6 +77,18 @@ fn new_claim_id(worker_id: &str) -> String {
     format!("{}:{:032x}", worker_id, fastrand::u128(..))
 }
 
+const FIX_CHECK_SCAN_CHUNK_SIZE: usize = 250;
+const MAX_FIX_CHECK_SCAN_CHUNKS: usize = 80;
+const MAX_CACHED_RANGES_PER_SWEEP: usize = 64;
+
+enum FixCheckClassification {
+    Untouched,
+    NeedsLlm(Vec<String>),
+    SkipAndTouch,
+    DeferredForNextSweep,
+}
+
+#[derive(Clone)]
 pub struct BugWorker {
     db: Arc<Database>,
     provider: Arc<dyn AiProvider>,
@@ -118,8 +130,13 @@ impl BugWorker {
         self
     }
 
-    /// Runs a single bounded sweep checking whether open bugs have been fixed
-    /// in the upstream mainline tree.
+    /// Runs a bounded two-phase sweep checking whether open bugs have been
+    /// fixed in the upstream mainline tree:
+    /// 1. Phase 1 scans open bugs in chunks using keyset pagination and an
+    ///    in-memory `CommitRangeIndex`, batch-advancing all bugs with zero
+    ///    candidate commits without consuming `fix_check_batch_size`.
+    /// 2. Phase 2 claims and runs LLM verification for up to
+    ///    `fix_check_batch_size` bugs that have candidate commits.
     pub async fn check_open_bugs_upstream(&self) -> usize {
         if !self.settings.fix_check_enabled {
             return 0;
@@ -138,113 +155,384 @@ impl BugWorker {
             return 0;
         };
 
+        let (advanced_without_llm, llm_queue) = self
+            .sweep_zero_token_fix_checks(repo_path, &linus_sha, batch_size)
+            .await;
+        if advanced_without_llm > 0 {
+            info!(
+                "Advanced {} open bug(s) verified_on_sha to {} via zero-token git pre-filter",
+                advanced_without_llm, linus_sha
+            );
+        }
+
         let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
-        let mut checked = 0;
-        for _ in 0..batch_size {
-            let claim_id = new_claim_id(&self.worker_id);
-            let claim_started = tokio::time::Instant::now();
-            let bug = match self
-                .db
-                .claim_open_bug_for_fix_check(&linus_sha, &claim_id, lease_ttl_seconds)
+        let mut llm_checked = 0;
+        if !llm_queue.is_empty() {
+            info!(
+                "Evaluating {} open bug(s) with candidate commits (batch limit {}) against mainline SHA {}...",
+                llm_queue.len(),
+                batch_size,
+                linus_sha
+            );
+        }
+        for (bug_id, precomputed_candidates) in llm_queue {
+            if self
+                .verify_single_bug_upstream(
+                    repo_path,
+                    &linus_sha,
+                    lease_ttl_seconds,
+                    bug_id,
+                    precomputed_candidates,
+                )
                 .await
             {
-                Ok(Some(b)) => b,
-                Ok(None) => break,
+                llm_checked += 1;
+            }
+        }
+
+        advanced_without_llm + llm_checked
+    }
+
+    async fn sweep_zero_token_fix_checks(
+        &self,
+        repo_path: &std::path::Path,
+        linus_sha: &str,
+        batch_size: usize,
+    ) -> (usize, Vec<(i64, Option<Vec<String>>)>) {
+        let mut range_cache: std::collections::HashMap<
+            String,
+            crate::workflows::linux_bug::CommitRangeLookup,
+        > = std::collections::HashMap::new();
+        let mut llm_queue: Vec<(i64, Option<Vec<String>>)> = Vec::new();
+        let mut cursor: Option<(i64, i64)> = None;
+        let mut total_advanced = 0usize;
+
+        for _ in 0..MAX_FIX_CHECK_SCAN_CHUNKS {
+            let chunk = match self
+                .db
+                .list_open_bugs_for_fix_check(linus_sha, cursor, FIX_CHECK_SCAN_CHUNK_SIZE)
+                .await
+            {
+                Ok(c) if c.is_empty() => break,
+                Ok(c) => c,
                 Err(e) => {
                     error!(
-                        "Failed to claim open bug for upstream fix check at {}: {}",
+                        "Failed to list open bugs for upstream fix check at {}: {}",
                         linus_sha, e
                     );
                     break;
                 }
             };
+            cursor = chunk.last().map(|b| (b.updated_at, b.id));
 
-            if checked == 0 {
-                info!(
-                    "Checking open bug(s) (batch limit {}) against mainline SHA {}...",
-                    batch_size, linus_sha
-                );
-            }
+            let mut untouched_linux = Vec::new();
+            let mut untouched_sashiko = Vec::new();
+            let mut skipped_ids = Vec::new();
 
-            let effective_project = crate::workflows::linux_bug::infer_project_from_bug_or_tool(
-                Some(&bug.bugid),
-                None,
-                self.project,
-            );
-            let scoped_db = self.db.with_bug_claim(bug.id, &claim_id);
-            let Some(res) = run_while_leased(
-                crate::workflows::linux_bug::check_bug_fixed_upstream_for_project(
-                    self.provider.as_ref(),
-                    repo_path,
-                    &scoped_db,
-                    &bug,
-                    &linus_sha,
-                    effective_project,
-                ),
-                maintain_lease(
-                    &scoped_db,
-                    bug.id,
-                    &claim_id,
-                    lease_ttl_seconds,
-                    lease_deadline(claim_started, lease_ttl_seconds),
-                ),
-            )
-            .await
-            else {
-                warn!(
-                    "Stopping upstream fix check for bug #{} ({}) after losing its lease",
-                    bug.id, bug.bugid
-                );
-                continue;
-            };
-
-            match res {
-                Ok(outcome) => {
-                    checked += 1;
-                    match outcome {
-                        crate::workflows::linux_bug::UpstreamFixCheckOutcome::FixedUpstream {
-                            fixing_commit_sha,
-                            ..
-                        } => {
-                            info!(
-                                "Marked open bug #{} ({}) as fixed upstream by commit {}",
-                                bug.id, bug.bugid, fixing_commit_sha
-                            );
+            for bug in chunk {
+                let classification = if llm_queue.len() >= batch_size {
+                    Self::classify_bug_from_cached_index(linus_sha, &bug, &range_cache)
+                } else {
+                    self.classify_bug_for_fix_check(repo_path, linus_sha, &bug, &mut range_cache)
+                        .await
+                };
+                match classification {
+                    FixCheckClassification::SkipAndTouch => skipped_ids.push(bug.id),
+                    FixCheckClassification::DeferredForNextSweep => {}
+                    FixCheckClassification::Untouched => {
+                        let proj = crate::workflows::linux_bug::infer_project_from_bug_or_tool(
+                            Some(&bug.bugid),
+                            None,
+                            self.project,
+                        );
+                        match proj {
+                            crate::project::ProjectId::Linux => untouched_linux.push(bug),
+                            crate::project::ProjectId::Sashiko => untouched_sashiko.push(bug),
                         }
-                        crate::workflows::linux_bug::UpstreamFixCheckOutcome::AdvancedWithoutLlm {
-                            ..
-                        } => {
-                            info!(
-                                "Advanced open bug #{} ({}) verified_on_sha to {} (0 commits touched affected files)",
-                                bug.id, bug.bugid, linus_sha
-                            );
-                        }
-                        crate::workflows::linux_bug::UpstreamFixCheckOutcome::StillPresentAfterLlm {
-                            ..
-                        } => {
-                            info!(
-                                "Open bug #{} ({}) confirmed still present at {}",
-                                bug.id, bug.bugid, linus_sha
-                            );
-                        }
-                        _ => {}
+                    }
+                    FixCheckClassification::NeedsLlm(candidates) => {
+                        llm_queue.push((bug.id, Some(candidates)));
                     }
                 }
+            }
+
+            total_advanced += self
+                .flush_zero_token_chunk(
+                    linus_sha,
+                    &untouched_linux,
+                    &untouched_sashiko,
+                    &skipped_ids,
+                )
+                .await;
+
+            if llm_queue.len() >= batch_size {
+                break;
+            }
+        }
+
+        (total_advanced, llm_queue)
+    }
+
+    fn classify_bug_from_cached_index(
+        linus_sha: &str,
+        bug: &crate::db::Bug,
+        range_cache: &std::collections::HashMap<
+            String,
+            crate::workflows::linux_bug::CommitRangeLookup,
+        >,
+    ) -> FixCheckClassification {
+        let Some(prev_sha) = bug.verified_on_sha() else {
+            return FixCheckClassification::SkipAndTouch;
+        };
+        let prev_trimmed = prev_sha.trim();
+        if prev_trimmed.is_empty() || prev_trimmed == linus_sha {
+            return FixCheckClassification::Untouched;
+        }
+        let files = crate::workflows::linux_bug::extract_bug_files(bug);
+        if files.is_empty() {
+            return FixCheckClassification::SkipAndTouch;
+        }
+        let intro_sha = bug.introducing_commit_sha();
+        match range_cache.get(prev_trimmed) {
+            Some(crate::workflows::linux_bug::CommitRangeLookup::NotAncestor) => {
+                FixCheckClassification::SkipAndTouch
+            }
+            Some(crate::workflows::linux_bug::CommitRangeLookup::Indexed(index)) => {
+                match index.find_candidates(&files, intro_sha.as_deref()) {
+                    None => FixCheckClassification::SkipAndTouch,
+                    Some(c) if c.is_empty() => FixCheckClassification::Untouched,
+                    Some(_) => FixCheckClassification::DeferredForNextSweep,
+                }
+            }
+            Some(crate::workflows::linux_bug::CommitRangeLookup::TooLarge) | None => {
+                FixCheckClassification::DeferredForNextSweep
+            }
+        }
+    }
+
+    async fn classify_bug_for_fix_check(
+        &self,
+        repo_path: &std::path::Path,
+        linus_sha: &str,
+        bug: &crate::db::Bug,
+        range_cache: &mut std::collections::HashMap<
+            String,
+            crate::workflows::linux_bug::CommitRangeLookup,
+        >,
+    ) -> FixCheckClassification {
+        let Some(prev_sha) = bug.verified_on_sha() else {
+            return FixCheckClassification::SkipAndTouch;
+        };
+        let prev_trimmed = prev_sha.trim();
+        if prev_trimmed.is_empty() || prev_trimmed == linus_sha {
+            return FixCheckClassification::Untouched;
+        }
+        let files = crate::workflows::linux_bug::extract_bug_files(bug);
+        if files.is_empty() {
+            return FixCheckClassification::SkipAndTouch;
+        }
+        let intro_sha = bug.introducing_commit_sha();
+
+        if !range_cache.contains_key(prev_trimmed)
+            && range_cache.len() < MAX_CACHED_RANGES_PER_SWEEP
+        {
+            let lookup = match crate::workflows::linux_bug::build_commit_range_index(
+                repo_path,
+                prev_trimmed,
+                linus_sha,
+            )
+            .await
+            {
+                Ok(l) => l,
                 Err(e) => {
                     warn!(
-                        "Upstream fix check failed for bug #{} ({}): {}",
-                        bug.id, bug.bugid, e
+                        "Failed to build commit range index for {}..{}: {}",
+                        prev_trimmed, linus_sha, e
                     );
-                    if let Err(db_err) = scoped_db.touch_bug_fix_check_timestamp(bug.id).await {
+                    crate::workflows::linux_bug::CommitRangeLookup::TooLarge
+                }
+            };
+            range_cache.insert(prev_trimmed.to_string(), lookup);
+        }
+
+        match range_cache.get(prev_trimmed) {
+            Some(crate::workflows::linux_bug::CommitRangeLookup::NotAncestor) => {
+                FixCheckClassification::SkipAndTouch
+            }
+            Some(crate::workflows::linux_bug::CommitRangeLookup::Indexed(index)) => {
+                match index.find_candidates(&files, intro_sha.as_deref()) {
+                    None => FixCheckClassification::SkipAndTouch,
+                    Some(c) if c.is_empty() => FixCheckClassification::Untouched,
+                    Some(c) => FixCheckClassification::NeedsLlm(c),
+                }
+            }
+            Some(crate::workflows::linux_bug::CommitRangeLookup::TooLarge) | None => {
+                match crate::workflows::linux_bug::find_candidate_fix_commits(
+                    repo_path,
+                    prev_trimmed,
+                    linus_sha,
+                    &files,
+                    intro_sha.as_deref(),
+                )
+                .await
+                {
+                    Ok(None) => FixCheckClassification::SkipAndTouch,
+                    Ok(Some(c)) if c.is_empty() => FixCheckClassification::Untouched,
+                    Ok(Some(c)) => FixCheckClassification::NeedsLlm(c),
+                    Err(e) => {
                         warn!(
-                            "Failed to update fix check timestamp for bug #{} ({}): {}",
-                            bug.id, bug.bugid, db_err
+                            "Failed to query candidate fix commits for bug {} in {}..{}: {}",
+                            bug.bugid, prev_trimmed, linus_sha, e
                         );
+                        FixCheckClassification::SkipAndTouch
                     }
                 }
             }
         }
-        checked
+    }
+
+    async fn flush_zero_token_chunk(
+        &self,
+        linus_sha: &str,
+        untouched_linux: &[crate::db::Bug],
+        untouched_sashiko: &[crate::db::Bug],
+        skipped_ids: &[i64],
+    ) -> usize {
+        let mut advanced = 0usize;
+        if !untouched_linux.is_empty() {
+            let db = self
+                .db
+                .with_bug_actor("sashiko", "sashiko:linux_bug:fix_check", None);
+            match db
+                .advance_open_bugs_without_llm_batch(untouched_linux, linus_sha)
+                .await
+            {
+                Ok(n) => advanced += n,
+                Err(e) => warn!("Failed to batch-advance untouched Linux bugs: {}", e),
+            }
+        }
+        if !untouched_sashiko.is_empty() {
+            let db = self
+                .db
+                .with_bug_actor("sashiko", "sashiko:sashiko_bug:fix_check", None);
+            match db
+                .advance_open_bugs_without_llm_batch(untouched_sashiko, linus_sha)
+                .await
+            {
+                Ok(n) => advanced += n,
+                Err(e) => warn!("Failed to batch-advance untouched Sashiko bugs: {}", e),
+            }
+        }
+        if !skipped_ids.is_empty()
+            && let Err(e) = self.db.touch_open_bugs_fix_check_batch(skipped_ids).await
+        {
+            warn!("Failed to batch-touch skipped fix-check bugs: {}", e);
+        }
+        advanced
+    }
+
+    async fn verify_single_bug_upstream(
+        &self,
+        repo_path: &std::path::Path,
+        linus_sha: &str,
+        lease_ttl_seconds: i64,
+        bug_id: i64,
+        precomputed_candidates: Option<Vec<String>>,
+    ) -> bool {
+        let claim_id = new_claim_id(&self.worker_id);
+        let claim_started = tokio::time::Instant::now();
+        let bug = match self
+            .db
+            .claim_specific_open_bug_for_fix_check(bug_id, linus_sha, &claim_id, lease_ttl_seconds)
+            .await
+        {
+            Ok(Some(b)) => b,
+            Ok(None) => return false,
+            Err(e) => {
+                error!(
+                    "Failed to claim open bug #{} for upstream fix check at {}: {}",
+                    bug_id, linus_sha, e
+                );
+                return false;
+            }
+        };
+
+        let effective_project = crate::workflows::linux_bug::infer_project_from_bug_or_tool(
+            Some(&bug.bugid),
+            None,
+            self.project,
+        );
+        let scoped_db = self.db.with_bug_claim(bug.id, &claim_id);
+        let Some(res) = run_while_leased(
+            crate::workflows::linux_bug::check_bug_fixed_upstream_with_candidates(
+                self.provider.as_ref(),
+                repo_path,
+                &scoped_db,
+                &bug,
+                linus_sha,
+                effective_project,
+                precomputed_candidates,
+            ),
+            maintain_lease(
+                &scoped_db,
+                bug.id,
+                &claim_id,
+                lease_ttl_seconds,
+                lease_deadline(claim_started, lease_ttl_seconds),
+            ),
+        )
+        .await
+        else {
+            warn!(
+                "Stopping upstream fix check for bug {} after losing its lease",
+                bug.bugid
+            );
+            return false;
+        };
+
+        match res {
+            Ok(outcome) => {
+                match outcome {
+                    crate::workflows::linux_bug::UpstreamFixCheckOutcome::FixedUpstream {
+                        fixing_commit_sha,
+                        ..
+                    } => {
+                        info!(
+                            "Marked open bug {} as fixed upstream by commit {}",
+                            bug.bugid, fixing_commit_sha
+                        );
+                    }
+                    crate::workflows::linux_bug::UpstreamFixCheckOutcome::AdvancedWithoutLlm {
+                        ..
+                    } => {
+                        info!(
+                            "Advanced open bug {} verified_on_sha to {} (0 commits touched affected files)",
+                            bug.bugid, linus_sha
+                        );
+                    }
+                    crate::workflows::linux_bug::UpstreamFixCheckOutcome::StillPresentAfterLlm {
+                        ..
+                    } => {
+                        info!(
+                            "Open bug {} confirmed still present at {}",
+                            bug.bugid, linus_sha
+                        );
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Err(e) => {
+                warn!("Upstream fix check failed for bug {}: {}", bug.bugid, e);
+                if let Err(db_err) = scoped_db.touch_bug_fix_check_timestamp(bug.id).await {
+                    warn!(
+                        "Failed to update fix check timestamp for bug {}: {}",
+                        bug.bugid, db_err
+                    );
+                }
+                false
+            }
+        }
     }
 
     pub async fn run(&self) {
@@ -270,15 +558,27 @@ impl BugWorker {
             );
         }
         let mut last_fix_check: Option<tokio::time::Instant> = None;
+        let mut fix_check_handle: Option<tokio::task::JoinHandle<usize>> = None;
 
         loop {
+            if fix_check_handle.as_ref().is_some_and(|h| h.is_finished())
+                && let Some(handle) = fix_check_handle.take()
+                && let Err(e) = handle.await
+            {
+                error!("Background upstream bug fix check task failed: {}", e);
+            }
+
             if fix_check_enabled
                 && fix_check_interval > 0
+                && fix_check_handle.is_none()
                 && last_fix_check
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(fix_check_interval))
             {
                 last_fix_check = Some(tokio::time::Instant::now());
-                self.check_open_bugs_upstream().await;
+                let worker = self.clone();
+                fix_check_handle = Some(tokio::spawn(async move {
+                    worker.check_open_bugs_upstream().await
+                }));
             }
 
             let claim_id = new_claim_id(&self.worker_id);
@@ -634,5 +934,201 @@ mod tests {
         let updated = db.get_bug(id).await.unwrap().unwrap();
         assert_eq!(updated.verified_on_sha().as_deref(), Some(sha2.as_str()));
         assert!(!updated.is_fixed());
+    }
+
+    struct CountingStillPresentProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for CountingStillPresentProvider {
+        async fn generate_content(
+            &self,
+            _req: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ai::AiResponse {
+                content: Some(
+                    r#"{"status":"still_present","fixing_commit_sha":null,"explanation":"Defect remains present after unrelated refactor."}"#
+                        .to_string(),
+                ),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "counting-mock".to_string(),
+                context_window_size: 8192,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn check_open_bugs_upstream_advances_all_untouched_while_capping_llm_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        let run_git = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_git(&["init", "-b", "master"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+
+        for i in 0..8 {
+            std::fs::write(repo.join(format!("untouched_{i}.c")), "int x = 0;\n").unwrap();
+        }
+        for i in 0..4 {
+            std::fs::write(repo.join(format!("touched_{i}.c")), "int y = 0;\n").unwrap();
+        }
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "initial"]);
+        let sha1 = run_git(&["rev-parse", "HEAD"]);
+
+        for i in 0..4 {
+            std::fs::write(repo.join(format!("touched_{i}.c")), "int y = 1;\n").unwrap();
+        }
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "modify touched files"]);
+        let sha2 = run_git(&["rev-parse", "HEAD"]);
+
+        let db = Arc::new(
+            Database::new(&crate::settings::DatabaseSettings {
+                url: ":memory:".into(),
+                token: String::new(),
+            })
+            .await
+            .unwrap(),
+        );
+        db.migrate().await.unwrap();
+
+        let mut untouched_ids = Vec::new();
+        for i in 0..8 {
+            let file = format!("untouched_{i}.c");
+            let id = db
+                .create_bug(&crate::db::NewBug {
+                    bugid: format!("linux-untouched-{i}"),
+                    title: format!("bug in {file}"),
+                    lifecycle_status: crate::db::BugLifecycleStatus::New,
+                    pipeline_state: crate::db::BugPipelineState::Pending,
+                    assignee: None,
+                    reporter: "sashiko".to_string(),
+                    reported_at: 1000 + i,
+                    discovered_in_patchset_id: None,
+                    discovered_in_patch_id: None,
+                    discovered_in_commit: Some(sha1.clone()),
+                    source_ref: Some(sha1.clone()),
+                    vector_json: None,
+                    duplicate_of_id: None,
+                    subsystems: vec![],
+                })
+                .await
+                .unwrap();
+            db.update_bug_outcome(
+                id,
+                crate::db::UpdateBugOutcomeParams {
+                    lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                    problem: Some("bug"),
+                    source_files: Some(std::slice::from_ref(&file)),
+                    severity: crate::db::Severity::Medium,
+                    inline_review: "report",
+                    verified_on_sha: Some(&sha1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            untouched_ids.push(id);
+        }
+
+        let mut touched_ids = Vec::new();
+        for i in 0..4 {
+            let file = format!("touched_{i}.c");
+            let id = db
+                .create_bug(&crate::db::NewBug {
+                    bugid: format!("linux-touched-{i}"),
+                    title: format!("bug in {file}"),
+                    lifecycle_status: crate::db::BugLifecycleStatus::New,
+                    pipeline_state: crate::db::BugPipelineState::Pending,
+                    assignee: None,
+                    reporter: "sashiko".to_string(),
+                    reported_at: 2000 + i,
+                    discovered_in_patchset_id: None,
+                    discovered_in_patch_id: None,
+                    discovered_in_commit: Some(sha1.clone()),
+                    source_ref: Some(sha1.clone()),
+                    vector_json: None,
+                    duplicate_of_id: None,
+                    subsystems: vec![],
+                })
+                .await
+                .unwrap();
+            db.update_bug_outcome(
+                id,
+                crate::db::UpdateBugOutcomeParams {
+                    lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                    problem: Some("bug"),
+                    source_files: Some(std::slice::from_ref(&file)),
+                    severity: crate::db::Severity::Medium,
+                    inline_review: "report",
+                    verified_on_sha: Some(&sha1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            touched_ids.push(id);
+        }
+
+        let provider = Arc::new(CountingStillPresentProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = BugWorker::new(
+            db.clone(),
+            provider.clone(),
+            repo.to_string_lossy().to_string(),
+        )
+        .with_settings(crate::settings::LinuxBugSettings {
+            enabled: true,
+            fix_check_enabled: true,
+            lease_ttl_seconds: 60,
+            max_attempts: 3,
+            fix_check_interval_seconds: 60,
+            fix_check_batch_size: 2,
+        });
+
+        // Sweep 1: all 8 untouched bugs advance without LLM, plus 2 of the 4
+        // touched bugs are evaluated via the LLM (capped by fix_check_batch_size = 2).
+        let checked_first = worker.check_open_bugs_upstream().await;
+        assert_eq!(checked_first, 10);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        for id in &untouched_ids {
+            let b = db.get_bug(*id).await.unwrap().unwrap();
+            assert_eq!(b.verified_on_sha().as_deref(), Some(sha2.as_str()));
+        }
+
+        // Sweep 2: the remaining 2 touched bugs are evaluated via the LLM.
+        let checked_second = worker.check_open_bugs_upstream().await;
+        assert_eq!(checked_second, 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+
+        for id in &touched_ids {
+            let b = db.get_bug(*id).await.unwrap().unwrap();
+            assert_eq!(b.verified_on_sha().as_deref(), Some(sha2.as_str()));
+        }
     }
 }

@@ -61,6 +61,16 @@ impl CappedOutput {
 /// A capped capture is cut back to the last complete line so callers never
 /// have to reason about a partial one.
 pub async fn capped_output(cmd: &mut Command) -> Result<CappedOutput> {
+    capped_output_with_limit(cmd, MAX_CAPTURED_STDOUT).await
+}
+
+/// Runs a command and captures its output, giving up on stdout beyond
+/// `max_stdout` bytes and terminating the child process early when the limit is
+/// exceeded.
+pub async fn capped_output_with_limit(
+    cmd: &mut Command,
+    max_stdout: usize,
+) -> Result<CappedOutput> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -79,19 +89,19 @@ pub async fn capped_output(cmd: &mut Command) -> Result<CappedOutput> {
     // Read one byte past the limit so a capture that lands exactly on it is
     // not mistaken for a truncated one.
     let mut stdout = Vec::new();
-    let mut out_reader = out_pipe.take(MAX_CAPTURED_STDOUT as u64 + 1);
+    let mut out_reader = out_pipe.take(max_stdout as u64 + 1);
     out_reader
         .read_to_end(&mut stdout)
         .await
         .context("failed to read git stdout")?;
 
-    let stdout_capped = stdout.len() > MAX_CAPTURED_STDOUT;
+    let stdout_capped = stdout.len() > max_stdout;
     if stdout_capped {
         // Everything after the last newline is half a line of no use to anyone.
-        let end = stdout[..MAX_CAPTURED_STDOUT]
+        let end = stdout[..max_stdout]
             .iter()
             .rposition(|b| *b == b'\n')
-            .map_or(MAX_CAPTURED_STDOUT, |i| i + 1);
+            .map_or(max_stdout, |i| i + 1);
         stdout.truncate(end);
 
         // The command has nothing left to tell us, and it would otherwise sit

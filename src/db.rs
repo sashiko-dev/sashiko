@@ -3752,6 +3752,233 @@ impl Database {
         }
     }
 
+    /// Lists a keyset-paginated chunk of open, canonical, succeeded bugs whose
+    /// `verified_on_sha` differs from `current_linus_sha` and that hold no
+    /// active lease, hydrating only the enrichments needed by the Tier-2
+    /// deterministic git pre-filter.
+    pub async fn list_open_bugs_for_fix_check(
+        &self,
+        current_linus_sha: &str,
+        after: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<Bug>> {
+        let linus = current_linus_sha.trim();
+        if linus.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let capped_limit = limit.clamp(1, 250) as i64;
+        let now = chrono::Utc::now().timestamp();
+        let (after_updated_at, after_id) = match after {
+            Some((u, id)) => (Some(u), Some(id)),
+            None => (None, None),
+        };
+
+        let select_sql = format!(
+            "SELECT {BUG_ROW_COLUMNS}
+               FROM bugs
+              WHERE lifecycle_status = 'open'
+                AND pipeline_state = 'succeeded'
+                AND duplicate_of_id IS NULL
+                AND verified_on_sha IS NOT NULL
+                AND verified_on_sha != ''
+                AND verified_on_sha != ?1
+                AND (lease_expires_at IS NULL OR lease_expires_at <= ?2)
+                AND (?3 IS NULL OR updated_at > ?3 OR (updated_at = ?3 AND id > ?4))
+              ORDER BY updated_at ASC, id ASC
+              LIMIT ?5"
+        );
+        let mut rows = self
+            .conn
+            .query(
+                &select_sql,
+                libsql::params![linus, now, after_updated_at, after_id, capped_limit],
+            )
+            .await?;
+        let mut bugs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            bugs.push(Self::parse_bug_row_core(&row)?);
+        }
+
+        if !bugs.is_empty() {
+            let bug_ids: Vec<i64> = bugs.iter().map(|b| b.id).collect();
+            let placeholders = vec!["?"; bug_ids.len()].join(", ");
+            let enrichments_sql = format!(
+                "SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json,
+                        tokens_in, tokens_out, tokens_cached, NULL as logs
+                   FROM bug_enrichments
+                  WHERE bug_id IN ({placeholders})
+                    AND kind IN ('verification', 'origin_discovery', 'candidate', 'raw_candidate')
+                  ORDER BY created_at ASC, id ASC"
+            );
+            let enr_params: Vec<libsql::Value> = bug_ids
+                .iter()
+                .map(|&id| libsql::Value::Integer(id))
+                .collect();
+            let mut enr_rows = self.conn.query(&enrichments_sql, enr_params).await?;
+            let mut enrichments_map: std::collections::HashMap<i64, Vec<BugEnrichment>> =
+                std::collections::HashMap::new();
+            while let Some(row) = enr_rows.next().await? {
+                let enrichment = Self::parse_bug_enrichment_row(&row)?;
+                enrichments_map
+                    .entry(enrichment.bug_id)
+                    .or_default()
+                    .push(enrichment);
+            }
+            for bug in &mut bugs {
+                if let Some(enrs) = enrichments_map.remove(&bug.id) {
+                    bug.enrichments = enrs;
+                }
+            }
+        }
+
+        Ok(bugs)
+    }
+
+    /// Atomically claims a specific open bug by `bug_id` for a Tier-3 LLM
+    /// upstream fix check when it still requires checking against
+    /// `current_linus_sha` and holds no active lease.
+    pub async fn claim_specific_open_bug_for_fix_check(
+        &self,
+        bug_id: i64,
+        current_linus_sha: &str,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<Option<Bug>> {
+        let linus = current_linus_sha.trim();
+        if linus.is_empty() {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let ttl = lease_ttl_seconds.clamp(1, 86_400);
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE bugs
+                    SET locked_by = ?1,
+                        lease_expires_at = ?2,
+                        updated_at = ?3
+                  WHERE id = ?4
+                    AND lifecycle_status = 'open'
+                    AND pipeline_state = 'succeeded'
+                    AND duplicate_of_id IS NULL
+                    AND verified_on_sha IS NOT NULL
+                    AND verified_on_sha != ''
+                    AND verified_on_sha != ?5
+                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)",
+                libsql::params![worker_id, now.saturating_add(ttl), now, bug_id, linus],
+            )
+            .await?;
+        if updated > 0 {
+            self.get_bug(bug_id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Advances `verified_on_sha` in short batched transactions for open bugs
+    /// that had zero candidate fix commits in the deterministic Tier-2 git
+    /// pre-filter, avoiding per-bug lease round-trips and per-bug fsyncs.
+    pub async fn advance_open_bugs_without_llm_batch(
+        &self,
+        bugs: &[Bug],
+        verified_on_sha: &str,
+    ) -> Result<usize> {
+        let target_sha = verified_on_sha.trim();
+        if bugs.is_empty() || target_sha.is_empty() {
+            return Ok(0);
+        }
+        const SUB_BATCH_SIZE: usize = 100;
+        let mut total_advanced = 0;
+
+        for chunk in bugs.chunks(SUB_BATCH_SIZE) {
+            let now = chrono::Utc::now().timestamp();
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let tx_db = self.with_connection((*tx).clone());
+            for bug in chunk {
+                let updated = tx_db
+                    .conn
+                    .execute(
+                        "UPDATE bugs
+                            SET verified_on_sha = ?1,
+                                updated_at = ?2,
+                                locked_by = NULL,
+                                lease_expires_at = NULL
+                          WHERE id = ?3
+                            AND lifecycle_status = 'open'
+                            AND pipeline_state = 'succeeded'
+                            AND duplicate_of_id IS NULL
+                            AND verified_on_sha IS NOT NULL
+                            AND verified_on_sha != ''
+                            AND verified_on_sha != ?1
+                            AND (lease_expires_at IS NULL OR lease_expires_at <= ?2)",
+                        libsql::params![target_sha, now, bug.id],
+                    )
+                    .await?;
+                if updated > 0 {
+                    let locations = bug.locations();
+                    let source_files = bug.source_files();
+                    tx_db
+                        .advance_latest_verification_sha(
+                            bug.id,
+                            now,
+                            &UpstreamFixCheckParams {
+                                verified_on_sha: target_sha,
+                                locations: locations.as_ref(),
+                                source_files: source_files.as_deref(),
+                                llm_checked: false,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    total_advanced += 1;
+                }
+            }
+            tx.commit().await?;
+        }
+
+        Ok(total_advanced)
+    }
+
+    /// Bumps `updated_at` and sets a short cooldown lease in batches for open
+    /// bugs whose `verified_on_sha` is not an ancestor of `current_linus_sha`
+    /// or that lack tracked source files.
+    pub async fn touch_open_bugs_fix_check_batch(&self, bug_ids: &[i64]) -> Result<usize> {
+        if bug_ids.is_empty() {
+            return Ok(0);
+        }
+        const SUB_BATCH_SIZE: usize = 100;
+        let mut total_touched = 0;
+
+        for chunk in bug_ids.chunks(SUB_BATCH_SIZE) {
+            let now = chrono::Utc::now().timestamp();
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            for &id in chunk {
+                let updated = tx
+                    .execute(
+                        "UPDATE bugs
+                            SET updated_at = ?1,
+                                locked_by = NULL,
+                                lease_expires_at = ?2
+                          WHERE id = ?3
+                            AND lifecycle_status = 'open'
+                            AND (lease_expires_at IS NULL OR lease_expires_at <= ?1)",
+                        libsql::params![now, now + 60, id],
+                    )
+                    .await?;
+                total_touched += updated as usize;
+            }
+            tx.commit().await?;
+        }
+
+        Ok(total_touched)
+    }
+
     /// Bumps `updated_at` and sets a short cooldown lease on an open bug when
     /// an upstream fix check could not advance `verified_on_sha` (for example,
     /// when `verified_on_sha` is on an unmerged subsystem branch or the LLM

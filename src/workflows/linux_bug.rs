@@ -2417,7 +2417,23 @@ pub enum UpstreamFixCheckOutcome {
     },
 }
 
-async fn run_git_query(repo_path: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+async fn run_git_query(
+    repo_path: &std::path::Path,
+    args: &[&str],
+) -> Result<crate::toolbox::command::CappedOutput> {
+    run_git_query_capped(
+        repo_path,
+        args,
+        crate::toolbox::command::MAX_CAPTURED_STDOUT,
+    )
+    .await
+}
+
+async fn run_git_query_capped(
+    repo_path: &std::path::Path,
+    args: &[&str],
+    max_stdout: usize,
+) -> Result<crate::toolbox::command::CappedOutput> {
     let mut cmd = crate::git_cmd::in_dir_async(repo_path);
     cmd.env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -2425,23 +2441,26 @@ async fn run_git_query(repo_path: &std::path::Path, args: &[&str]) -> Result<std
         .args(args)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    tokio::time::timeout(UPSTREAM_GIT_TIMEOUT, cmd.output())
-        .await
-        .with_context(|| {
-            format!(
-                "git command {:?} timed out after {:?} in {}",
-                args,
-                UPSTREAM_GIT_TIMEOUT,
-                repo_path.display()
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "failed to execute git command {:?} in {}",
-                args,
-                repo_path.display()
-            )
-        })
+    tokio::time::timeout(
+        UPSTREAM_GIT_TIMEOUT,
+        crate::toolbox::command::capped_output_with_limit(&mut cmd, max_stdout),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "git command {:?} timed out after {:?} in {}",
+            args,
+            UPSTREAM_GIT_TIMEOUT,
+            repo_path.display()
+        )
+    })?
+    .with_context(|| {
+        format!(
+            "failed to execute git command {:?} in {}",
+            args,
+            repo_path.display()
+        )
+    })
 }
 
 /// Resolves the current HEAD commit SHA of the upstream mainline tree in `repo_path`.
@@ -2627,6 +2646,178 @@ async fn commit_subject(repo_path: &std::path::Path, sha: &str) -> Option<String
     (!subject.is_empty()).then_some(subject)
 }
 
+/// Maximum number of non-merge commits in `verified_on_sha..linus_sha` to index
+/// in memory with a single `git log` invocation. Ranges larger than this fall
+/// back to per-bug `find_candidate_fix_commits`.
+pub const MAX_INDEXED_RANGE_COMMITS: usize = 2_000;
+
+/// Maximum byte size of a full candidate commit diff (`git show --stat --patch`)
+/// before falling back to filtering the patch hunks by the bug's tracked files.
+pub const MAX_FULL_COMMIT_PREFETCH_BYTES: usize = 12_000;
+
+/// In-memory index of modified file paths and commit messages across a commit
+/// range `from_sha..to_sha`, enabling $\mathcal{O}(1)$ per-bug candidate lookup
+/// across $\mathcal{O}(10\text{k})$ open bugs without spawning per-bug `git`
+/// subprocesses.
+#[derive(Debug, Clone, Default)]
+pub struct CommitRangeIndex {
+    files_to_commits: std::collections::HashMap<String, Vec<(usize, String)>>,
+    commit_messages: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CommitRangeLookup {
+    /// `from_sha` or `to_sha` could not be resolved or `from_sha` is not an
+    /// ancestor of `to_sha`.
+    NotAncestor,
+    /// `from_sha` is an ancestor of `to_sha`, but the range exceeds
+    /// `MAX_INDEXED_RANGE_COMMITS` so callers should fall back to per-bug
+    /// `find_candidate_fix_commits`.
+    TooLarge,
+    /// Complete in-memory index for `from_sha..to_sha`.
+    Indexed(CommitRangeIndex),
+}
+
+impl CommitRangeIndex {
+    /// Matches candidate fix commits for a bug touching `files` and optionally
+    /// introduced by `introducing_sha`, using the exact same semantics as
+    /// `find_candidate_fix_commits` with zero `git` subprocess calls.
+    pub fn find_candidates(
+        &self,
+        files: &[String],
+        introducing_sha: Option<&str>,
+    ) -> Option<Vec<String>> {
+        if files.is_empty() {
+            return None;
+        }
+        let mut matched_by_file: Vec<(usize, &str)> = Vec::new();
+        for f in files {
+            if let Some(entries) = self.files_to_commits.get(f.as_str()) {
+                for (idx, sha) in entries {
+                    matched_by_file.push((*idx, sha.as_str()));
+                }
+            }
+        }
+        matched_by_file.sort_unstable_by_key(|(idx, _)| *idx);
+        matched_by_file.dedup_by_key(|(idx, _)| *idx);
+
+        let mut candidates: Vec<String> = matched_by_file
+            .into_iter()
+            .take(100)
+            .map(|(_, sha)| sha.to_string())
+            .collect();
+
+        if let Some(intro) = introducing_sha {
+            let short_intro: String = intro
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .take(12)
+                .collect();
+            if short_intro.len() >= 7 {
+                let mut grep_matches = 0usize;
+                for (sha, body) in &self.commit_messages {
+                    if body.contains(&short_intro) {
+                        grep_matches += 1;
+                        if !candidates.iter().any(|c| c == sha) {
+                            candidates.push(sha.clone());
+                        }
+                        if grep_matches >= 100 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(candidates)
+    }
+}
+
+fn parse_commit_range_index_output(text: &str) -> CommitRangeLookup {
+    let mut index = CommitRangeIndex::default();
+    for (order_idx, record) in text
+        .split('\x1e')
+        .filter(|s| !s.trim().is_empty())
+        .enumerate()
+    {
+        if order_idx >= MAX_INDEXED_RANGE_COMMITS {
+            return CommitRangeLookup::TooLarge;
+        }
+        let Some((sha_raw, rest)) = record.split_once('\x1f') else {
+            return CommitRangeLookup::TooLarge;
+        };
+        let Some((body, files_raw)) = rest.split_once('\x1d') else {
+            return CommitRangeLookup::TooLarge;
+        };
+        let sha = sha_raw.trim();
+        if sha.len() < 7 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return CommitRangeLookup::TooLarge;
+        }
+        let sha_owned = sha.to_string();
+        for f in files_raw.split(['\0', '\n']) {
+            let clean = f.trim();
+            if clean.is_empty() {
+                continue;
+            }
+            let list = index.files_to_commits.entry(clean.to_string()).or_default();
+            if list.last().map(|(idx, _)| *idx) != Some(order_idx) {
+                list.push((order_idx, sha_owned.clone()));
+            }
+        }
+        index.commit_messages.push((sha_owned, body.to_string()));
+    }
+    CommitRangeLookup::Indexed(index)
+}
+
+/// Builds a single-pass `CommitRangeIndex` for `from_sha..to_sha` when the
+/// range contains at most `MAX_INDEXED_RANGE_COMMITS` non-merge commits.
+pub async fn build_commit_range_index(
+    repo_path: &std::path::Path,
+    from_sha: &str,
+    to_sha: &str,
+) -> Result<CommitRangeLookup> {
+    let Some(full_from_sha) = resolve_verified_commit_sha(repo_path, from_sha).await? else {
+        return Ok(CommitRangeLookup::NotAncestor);
+    };
+    let Some(full_to_sha) = resolve_verified_commit_sha(repo_path, to_sha).await? else {
+        return Ok(CommitRangeLookup::NotAncestor);
+    };
+    if full_from_sha == full_to_sha {
+        return Ok(CommitRangeLookup::Indexed(CommitRangeIndex::default()));
+    }
+    let anc = run_git_query(
+        repo_path,
+        &["merge-base", "--is-ancestor", &full_from_sha, &full_to_sha],
+    )
+    .await?;
+    if !anc.status.success() {
+        return Ok(CommitRangeLookup::NotAncestor);
+    }
+
+    let limit_str = (MAX_INDEXED_RANGE_COMMITS + 1).to_string();
+    let range = format!("{}..{}", full_from_sha, full_to_sha);
+    let out = run_git_query(
+        repo_path,
+        &[
+            "log",
+            "--no-merges",
+            "-n",
+            &limit_str,
+            "-z",
+            "--name-only",
+            "--format=%x1e%H%x1f%B%x1d",
+            &range,
+        ],
+    )
+    .await?;
+    if !out.status.success() || out.stdout_capped {
+        return Ok(CommitRangeLookup::TooLarge);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_commit_range_index_output(&stdout))
+}
+
 /// Deterministic Tier-2 git pre-filter for upstream fix checking.
 ///
 /// Returns:
@@ -2737,33 +2928,56 @@ async fn prefetch_candidate_fix_commits(
 ) -> String {
     let mut output = String::new();
     for sha in candidate_shas.iter().take(MAX_FIX_CANDIDATE_COMMITS) {
-        let mut args: Vec<&str> = vec!["show", "--stat", "--patch", "--unified=5", sha.as_str()];
-        if !files.is_empty() {
-            args.push("--");
+        let (mut commit_text, mut was_capped) = run_git_query_capped(
+            repo_path,
+            &["show", "--stat", "--patch", "--unified=5", sha.as_str()],
+            MAX_FULL_COMMIT_PREFETCH_BYTES,
+        )
+        .await
+        .ok()
+        .filter(|o| o.is_usable())
+        .map(|o| {
+            (
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                o.stdout_capped,
+            )
+        })
+        .unwrap_or_default();
+
+        if was_capped && !files.is_empty() {
+            let mut args: Vec<&str> = vec![
+                "show",
+                "--stat",
+                "--patch",
+                "--unified=5",
+                sha.as_str(),
+                "--",
+            ];
             for f in files {
                 args.push(f.as_str());
             }
-        }
-        let mut commit_text = run_git_query(repo_path, &args)
-            .await
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-
-        if commit_text.trim().is_empty() {
-            commit_text = run_git_query(
-                repo_path,
-                &["show", "--stat", "--patch", "--unified=5", sha.as_str()],
-            )
-            .await
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+            if let Some((filtered, filtered_capped)) =
+                run_git_query_capped(repo_path, &args, MAX_FIX_CHECK_PREFETCH_BYTES)
+                    .await
+                    .ok()
+                    .filter(|o| o.is_usable())
+                    .map(|o| {
+                        (
+                            String::from_utf8_lossy(&o.stdout).into_owned(),
+                            o.stdout_capped,
+                        )
+                    })
+                    .filter(|(s, _)| !s.trim().is_empty())
+            {
+                commit_text = filtered;
+                was_capped = filtered_capped;
+            }
         }
         if commit_text.trim().is_empty() {
             continue;
+        }
+        if was_capped {
+            commit_text.push_str("\n... (Candidate commit diff truncated)\n");
         }
 
         let entry = format!("=== Candidate Commit {} ===\n{}\n", sha, commit_text);
@@ -3082,6 +3296,19 @@ pub async fn check_bug_fixed_upstream_for_project(
     linus_sha: &str,
     project: ProjectId,
 ) -> Result<UpstreamFixCheckOutcome> {
+    check_bug_fixed_upstream_with_candidates(provider, repo_path, db, bug, linus_sha, project, None)
+        .await
+}
+
+pub async fn check_bug_fixed_upstream_with_candidates(
+    provider: &dyn AiProvider,
+    repo_path: &std::path::Path,
+    db: &Database,
+    bug: &Bug,
+    linus_sha: &str,
+    project: ProjectId,
+    precomputed_candidates: Option<Vec<String>>,
+) -> Result<UpstreamFixCheckOutcome> {
     let linus_sha = linus_sha.trim();
     let Some(prev_sha) = bug.verified_on_sha() else {
         db.touch_bug_fix_check_timestamp(bug.id).await?;
@@ -3097,17 +3324,23 @@ pub async fn check_bug_fixed_upstream_for_project(
     let locations = bug.locations();
     let source_files = bug.source_files();
 
-    let Some(candidates) = find_candidate_fix_commits(
-        repo_path,
-        &prev_sha,
-        linus_sha,
-        &files,
-        intro_sha.as_deref(),
-    )
-    .await?
-    else {
-        db.touch_bug_fix_check_timestamp(bug.id).await?;
-        return Ok(UpstreamFixCheckOutcome::SkippedNotAncestor);
+    let candidates = match precomputed_candidates {
+        Some(c) => c,
+        None => {
+            let Some(c) = find_candidate_fix_commits(
+                repo_path,
+                &prev_sha,
+                linus_sha,
+                &files,
+                intro_sha.as_deref(),
+            )
+            .await?
+            else {
+                db.touch_bug_fix_check_timestamp(bug.id).await?;
+                return Ok(UpstreamFixCheckOutcome::SkippedNotAncestor);
+            };
+            c
+        }
     };
 
     if candidates.is_empty() {
@@ -5282,6 +5515,97 @@ F:	drivers/net/ethernet/intel/e1000/
         assert_eq!(
             final_bug.fixed_in_commit().as_deref(),
             Some(format!("{} (api: bounds-check handle_query index)", &sha2[..12]).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_range_index_and_cross_file_prefetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        let run = |args: &[&str]| {
+            let out = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/reviewer.rs"), "pub fn run() {}\n").unwrap();
+        std::fs::write(repo.join("src/git_ops.rs"), "pub struct Worktree;\n").unwrap();
+        std::fs::write(repo.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+        let sha1 = run(&["rev-parse", "HEAD"]);
+
+        // Commit 2 modifies both src/reviewer.rs and src/git_ops.rs (cross-file fix).
+        std::fs::write(
+            repo.join("src/reviewer.rs"),
+            "pub fn run() { /* rely on Drop */ }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/git_ops.rs"),
+            "pub struct Worktree;\nimpl Drop for Worktree { fn drop(&mut self) {} }\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "git_ops: add Drop guard for Worktree"]);
+        let sha2 = run(&["rev-parse", "HEAD"]);
+
+        // Commit 3 modifies only src/other.rs but cites Fixes: <sha1[..12]>.
+        std::fs::write(repo.join("src/other.rs"), "pub fn other_fixed() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&[
+            "commit",
+            "-m",
+            &format!("other: fix regression\n\nFixes: {}", &sha1[..12]),
+        ]);
+        let sha3 = run(&["rev-parse", "HEAD"]);
+
+        let lookup = build_commit_range_index(repo, &sha1, &sha3).await.unwrap();
+        let CommitRangeLookup::Indexed(index) = lookup else {
+            panic!("Expected CommitRangeLookup::Indexed, got {:?}", lookup);
+        };
+
+        // Untouched file with no Fixes match -> 0 candidates.
+        assert_eq!(
+            index.find_candidates(&["src/untouched.rs".to_string()], None),
+            Some(Vec::new())
+        );
+
+        // File touched in sha2 -> [sha2].
+        assert_eq!(
+            index.find_candidates(&["src/reviewer.rs".to_string()], None),
+            Some(vec![sha2.clone()])
+        );
+
+        // File touched in sha2 + introducing sha1 cited in sha3 -> [sha2, sha3].
+        assert_eq!(
+            index.find_candidates(&["src/reviewer.rs".to_string()], Some(&sha1)),
+            Some(vec![sha2.clone(), sha3.clone()])
+        );
+
+        // Cross-file prefetching: even when bug only tracks src/reviewer.rs,
+        // prefetch_candidate_fix_commits includes the Drop implementation in
+        // src/git_ops.rs because the full commit diff fits within MAX_FULL_COMMIT_PREFETCH_BYTES.
+        let prefetched = prefetch_candidate_fix_commits(
+            repo,
+            std::slice::from_ref(&sha2),
+            &["src/reviewer.rs".to_string()],
+        )
+        .await;
+        assert!(
+            prefetched.contains("impl Drop for Worktree"),
+            "Expected cross-file hunk from src/git_ops.rs in prefetched diff, got:\n{prefetched}"
         );
     }
 }
