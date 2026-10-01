@@ -237,16 +237,13 @@ mod tests {
         );
 
         // Also verify redaction when `git remote` itself fails with a secret in stderr.
-        // Include the secret token in both the working directory path and the `gitdir:`
-        // target path so Git's error message contains it whether Git prints the `.git`
-        // file path or the resolved `gitdir` target path.
+        // Writing a non-`gitdir:` content into `.git` triggers `invalid gitfile format: <path>`,
+        // which echoes the `.git` file path across all Git versions (including Git 2.55+, where
+        // a nonexistent `gitdir:` target prints `not a git repository: (null)`).
         let bad_dir = tempfile::tempdir()?;
         let sub_dir = bad_dir.path().join("token=api_secret_456");
         std::fs::create_dir(&sub_dir)?;
-        std::fs::write(
-            sub_dir.join(".git"),
-            "gitdir: /nonexistent/token=api_secret_456\n",
-        )?;
+        std::fs::write(sub_dir.join(".git"), "invalid-gitfile\n")?;
         let bad_buffer = LogBuffer::default();
         let bad_subscriber = tracing_subscriber::fmt()
             .with_writer(bad_buffer.clone())
