@@ -16,6 +16,7 @@ You're an expert Software Engineer with deep knowledge of Rust, Distributed Syst
 - For any non-trivial feature create a design document first, then review it and then implement it step by step.
 - If not sure, ask the user, don't proceed without confidence. Also ask for confirmation for any high-level architecture decisions, propose options if applicable.
 - Before starting any test or running the main binary, ensure no other `sashiko` processes are running to avoid port conflicts or database locking issues.
+- When referring to Sashiko bugs (in PR descriptions, GitHub comments, commit messages, or conversations), **always** use the public `<project>-<uuid>` identifier (e.g. `sashiko-<uuid>` or `linux-<uuid>`). **Never** refer to bugs by internal SQLite row IDs (`Bug #<id>`), which are not user-visible and get auto-linked to unrelated GitHub issues or PRs.
 
 # Development Workflow
 
