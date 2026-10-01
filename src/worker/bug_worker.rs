@@ -90,6 +90,7 @@ pub struct BugWorker {
 
 impl BugWorker {
     pub fn new(db: Arc<Database>, provider: Arc<dyn AiProvider>, repo_path: String) -> Self {
+        let db = Arc::new(db.with_bug_actor("system", "sashiko:linux_bug", None));
         Self {
             db,
             provider,
@@ -110,6 +111,11 @@ impl BugWorker {
 
     pub fn with_project(mut self, project: crate::project::ProjectId) -> Self {
         self.project = project;
+        let bug_tool = match project {
+            crate::project::ProjectId::Linux => "sashiko:linux_bug",
+            crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
+        };
+        self.db = Arc::new(self.db.with_bug_actor("system", bug_tool, None));
         self
     }
 

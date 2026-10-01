@@ -2712,7 +2712,7 @@ impl Database {
     ) -> Result<std::collections::HashMap<i64, serde_json::Value>> {
         let mut rows = self.conn.query(
             "WITH RECURSIVE ancestors(root, id, parent) AS (
-                SELECT b.id, b.id, b.duplicate_of_id FROM bugs b JOIN json_each(?) requested ON b.id = requested.value
+                SELECT b.id, b.id, b.duplicate_of_id FROM bugs b JOIN json_each(?1) requested ON b.id = requested.value
                 UNION SELECT a.root, b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
              ), family(root, id) AS (
                 SELECT root, id FROM ancestors
@@ -2725,15 +2725,16 @@ impl Database {
                           (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
                       ) AS model,
                       COALESCE(
-                          NULLIF(trim(e.tool), ''),
-                          (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id LIMIT 1),
-                          (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                          (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                          NULLIF(NULLIF(trim(e.tool), ''), 'sashiko'),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = f.id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1),
+                          NULLIF(trim(e.tool), '')
                       ) AS tool
                FROM family f
                JOIN bugs b ON b.id = f.id
                LEFT JOIN bug_enrichments e ON e.bug_id = f.id AND e.kind IN ('candidate', 'discovery')",
-            libsql::params![serde_json::to_string(ids)?]).await?;
+            libsql::params![serde_json::to_string(ids)?, self.bug_tool.as_str()]).await?;
         #[derive(Default, Serialize)]
         struct Summary {
             count: usize,
@@ -2781,12 +2782,12 @@ impl Database {
                         (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
                     ) AS model,
                     COALESCE(
-                        (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id LIMIT 1),
-                        (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                        (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.id LIMIT 1),
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
                     ) AS tool
-                 FROM bugs b WHERE b.id = ?",
-                libsql::params![bug_id],
+                 FROM bugs b WHERE b.id = ?1",
+                libsql::params![bug_id, self.bug_tool.as_str()],
             )
             .await?;
         if let Some(row) = rows.next().await? {
@@ -3277,7 +3278,7 @@ impl Database {
                         attempt_count = attempt_count + 1,
                         updated_at = ?3,
                         audit_author = 'system',
-                        audit_tool = 'sashiko:linux_bug',
+                        audit_tool = CASE WHEN ?5 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE id = (
                       SELECT id FROM bugs
@@ -3290,7 +3291,13 @@ impl Database {
                        LIMIT 1
                   )
                   RETURNING id",
-                libsql::params![worker_id, now + lease_ttl_seconds, now, max_attempts],
+                libsql::params![
+                    worker_id,
+                    now + lease_ttl_seconds,
+                    now,
+                    max_attempts,
+                    self.bug_tool.as_str()
+                ],
             )
             .await?;
         match rows.next().await? {
@@ -3361,13 +3368,13 @@ impl Database {
                         lease_expires_at = NULL,
                         updated_at = ?1,
                         audit_author = 'system',
-                        audit_tool = 'sashiko:linux_bug',
+                        audit_tool = CASE WHEN ?3 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE attempt_count >= ?2
                     AND (pipeline_state IN ('pending', 'failed')
                          OR (pipeline_state = 'running'
                              AND (lease_expires_at IS NULL OR lease_expires_at < ?1)))",
-                libsql::params![now, max_attempts],
+                libsql::params![now, max_attempts, self.bug_tool.as_str()],
             )
             .await?;
         if count > 0 {
@@ -3404,11 +3411,11 @@ impl Database {
                         lease_expires_at = NULL,
                         updated_at = ?1,
                         audit_author = 'system',
-                        audit_tool = 'sashiko:linux_bug',
+                        audit_tool = CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE pipeline_state = 'running'
                     AND (lease_expires_at IS NULL OR lease_expires_at < ?1)",
-                libsql::params![now],
+                libsql::params![now, self.bug_tool.as_str()],
             )
             .await?;
         if count > 0 {
@@ -10103,6 +10110,199 @@ mod tests {
         assert_eq!(evidence["count"], 1);
         assert_eq!(evidence["models"], json!(["test-model"]));
         assert_eq!(evidence["unknown_models"], 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sashiko_bug_tool_fallbacks_and_lease_audit_tool() -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("t-sashiko", "subj", 100).await?;
+        db.create_message(
+            "m-sashiko",
+            thread_id,
+            None,
+            "auth",
+            "subj",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "m-sashiko",
+                "subj",
+                "auth",
+                100,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let rev_id = db
+            .create_review(ps_id, None, "gemini", "sashiko-model", None, None)
+            .await?;
+
+        // Create a sashiko-* bug with an empty enrichment tool so COALESCE must
+        // exercise the CASE WHEN SQL fallback in bug_discovery_summaries.
+        let sashiko_bug = NewBug {
+            bugid: "sashiko-fallback-test".to_string(),
+            title: "Sashiko fallback test".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 1000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_path_prefix("db")],
+        };
+        let bug_id = db
+            .create_bug_with_enrichment(
+                &sashiko_bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: String::new(),
+                    model: None,
+                    created_at: 1000,
+                    content: Some("unattributed candidate".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, bug_id, true).await?;
+
+        let summaries = db.bug_discovery_summaries(&[bug_id]).await?;
+        assert_eq!(
+            summaries[&bug_id]["tools"],
+            json!(["sashiko:sashiko_patch_review"])
+        );
+        assert_eq!(summaries[&bug_id]["models"], json!(["sashiko-model"]));
+
+        let resolved = db.resolve_bug_model_and_tool(bug_id).await?;
+        assert_eq!(
+            resolved,
+            Some((
+                Some("sashiko-model".to_string()),
+                Some("sashiko:sashiko_patch_review".to_string()),
+            ))
+        );
+
+        // Verify claim_pending_bug, recover_stale_running_bugs, and abandon_exhausted_bugs
+        // set audit_tool = 'sashiko:sashiko_bug' for sashiko-* bugs.
+        let claimed = db
+            .claim_pending_bug("worker-1", 60, 2)
+            .await?
+            .expect("expected pending sashiko bug to be claimed");
+        assert_eq!(claimed.id, bug_id);
+
+        let get_audit_tool = || async {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT audit_tool FROM bugs WHERE id = ?",
+                    libsql::params![bug_id],
+                )
+                .await?;
+            let row = rows.next().await?.unwrap();
+            Ok::<String, anyhow::Error>(row.get(0)?)
+        };
+        assert_eq!(get_audit_tool().await?, "sashiko:sashiko_bug");
+
+        // Expire the lease and verify recover_stale_running_bugs preserves sashiko:sashiko_bug.
+        db.conn
+            .execute(
+                "UPDATE bugs SET lease_expires_at = 0, audit_tool = 'sashiko' WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await?;
+        assert_eq!(db.recover_stale_running_bugs().await?, 1);
+        assert_eq!(get_audit_tool().await?, "sashiko:sashiko_bug");
+
+        // Exhaust attempts and verify abandon_exhausted_bugs preserves sashiko:sashiko_bug.
+        db.conn
+            .execute(
+                "UPDATE bugs SET attempt_count = 2, audit_tool = 'sashiko' WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await?;
+        assert_eq!(db.abandon_exhausted_bugs(2).await?, 1);
+        assert_eq!(get_audit_tool().await?, "sashiko:sashiko_bug");
+
+        // Also verify a legacy linux-* bug on a Sashiko instance (scoped with
+        // sashiko:sashiko_bug) gets Sashiko tool attribution.
+        let sashiko_worker_db = db.with_bug_actor("system", "sashiko:sashiko_bug", None);
+        let legacy_bug = NewBug {
+            bugid: "linux-legacy-on-sashiko".to_string(),
+            title: "Legacy Sashiko bug".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 2000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_path_prefix("db")],
+        };
+        let legacy_id = sashiko_worker_db
+            .create_bug_with_enrichment(
+                &legacy_bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko".to_string(),
+                    model: None,
+                    created_at: 2000,
+                    content: Some("legacy candidate".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        sashiko_worker_db
+            .link_review_to_bug(rev_id, legacy_id, true)
+            .await?;
+        let legacy_summaries = sashiko_worker_db
+            .bug_discovery_summaries(&[legacy_id])
+            .await?;
+        assert_eq!(
+            legacy_summaries[&legacy_id]["tools"],
+            json!(["sashiko:sashiko_patch_review"])
+        );
+        let claimed_legacy = sashiko_worker_db
+            .claim_pending_bug("worker-1", 60, 2)
+            .await?
+            .expect("expected legacy bug to be claimed");
+        assert_eq!(claimed_legacy.id, legacy_id);
+        let mut legacy_rows = db
+            .conn
+            .query(
+                "SELECT audit_tool FROM bugs WHERE id = ?",
+                libsql::params![legacy_id],
+            )
+            .await?;
+        let legacy_audit: String = legacy_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(legacy_audit, "sashiko:sashiko_bug");
 
         Ok(())
     }

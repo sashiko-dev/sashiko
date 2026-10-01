@@ -1318,7 +1318,8 @@ pub fn infer_project_from_bug_or_tool(
     tool: Option<&str>,
     default_project: ProjectId,
 ) -> ProjectId {
-    if bugid.is_some_and(|id| id.starts_with("sashiko-"))
+    if default_project == ProjectId::Sashiko
+        || bugid.is_some_and(|id| id.starts_with("sashiko-"))
         || tool.is_some_and(|t| t.starts_with("sashiko:sashiko"))
     {
         ProjectId::Sashiko
@@ -3110,24 +3111,36 @@ pub async fn check_bug_fixed_upstream_for_project(
         return Ok(UpstreamFixCheckOutcome::SkippedNotAncestor);
     };
 
+    let fix_tool = match project {
+        ProjectId::Linux => "sashiko:linux_bug:fix_check",
+        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
+    };
+
     if candidates.is_empty() {
-        db.record_upstream_fix_check(
-            bug.id,
-            crate::db::UpstreamFixCheckParams {
-                verified_on_sha: linus_sha,
-                fixing_commit_sha: None,
-                explanation: None,
-                locations: locations.as_ref(),
-                source_files: source_files.as_deref(),
-                llm_checked: false,
-                ..Default::default()
-            },
-        )
-        .await?;
+        db.with_bug_actor("sashiko", fix_tool, None)
+            .record_upstream_fix_check(
+                bug.id,
+                crate::db::UpstreamFixCheckParams {
+                    verified_on_sha: linus_sha,
+                    fixing_commit_sha: None,
+                    explanation: None,
+                    locations: locations.as_ref(),
+                    source_files: source_files.as_deref(),
+                    llm_checked: false,
+                    ..Default::default()
+                },
+            )
+            .await?;
         return Ok(UpstreamFixCheckOutcome::AdvancedWithoutLlm {
             verified_on_sha: linus_sha.to_string(),
         });
     }
+
+    let attributed_db = db.with_bug_actor(
+        "sashiko",
+        fix_tool,
+        Some(provider.get_capabilities().model_name),
+    );
 
     let mut tb = ToolBox::new(repo_path.to_path_buf(), None);
     tb.set_virtual_head(linus_sha.to_string());
@@ -3154,16 +3167,6 @@ pub async fn check_bug_fixed_upstream_for_project(
     let session_result = runner.run(&mut session).await?;
     let verdict = session_result.output;
     let logs = serde_json::to_string(&session_result.history).ok();
-
-    let fix_tool = match project {
-        ProjectId::Linux => "sashiko:linux_bug:fix_check",
-        ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
-    };
-    let attributed_db = db.with_bug_actor(
-        "sashiko",
-        fix_tool,
-        Some(provider.get_capabilities().model_name),
-    );
 
     match verdict.status.as_str() {
         "fixed" => {
@@ -5282,6 +5285,22 @@ F:	drivers/net/ethernet/intel/e1000/
         assert_eq!(
             final_bug.fixed_in_commit().as_deref(),
             Some(format!("{} (api: bounds-check handle_query index)", &sha2[..12]).as_str())
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(Some("linux-legacy-id"), None, ProjectId::Sashiko),
+            ProjectId::Sashiko
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(Some("sashiko-123"), None, ProjectId::Linux),
+            ProjectId::Sashiko
+        );
+        let summaries = db
+            .bug_discovery_summaries(&[verified_bug.id])
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries[&verified_bug.id]["tools"],
+            json!(["sashiko:sashiko_patch_review"])
         );
     }
 }
