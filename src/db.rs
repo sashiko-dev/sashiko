@@ -1182,6 +1182,7 @@ impl EmailKind {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct EmailOutboxRow {
     pub id: i64,
     pub patch_id: Option<i64>,
@@ -1198,6 +1199,7 @@ pub struct EmailOutboxRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone)]
 pub struct PatchworkOutboxRow {
     pub id: i64,
     pub patch_msg_id: String,
@@ -8202,7 +8204,7 @@ impl Database {
             .await?;
 
         let mut diffs = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
             let index: i64 = row.get(1).unwrap_or(0);
             let diff: String = crate::compression::get_compressed_string(&row, 2)?;
@@ -8253,7 +8255,7 @@ impl Database {
         ).await?;
 
         let mut patchsets = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await? {
             patchsets.push(PatchsetRow {
                 id: row.get(0).unwrap_or_default(),
                 subject: row.get(1).ok(),
@@ -8311,47 +8313,38 @@ impl Database {
             .await?;
 
         let mut patchsets = Vec::new();
-        loop {
-            match rows.next().await {
-                Ok(Some(row)) => {
-                    patchsets.push(PatchsetRow {
-                        id: row.get(0).unwrap_or_default(),
-                        subject: row.get(1).ok(),
-                        status: row.get(2).ok(),
-                        thread_id: row.get(3).ok(),
-                        author: row.get(4).ok(),
-                        date: row.get(5).ok(),
-                        message_id: row.get(6).ok(),
-                        total_parts: row.get(7).ok(),
-                        received_parts: row.get(8).ok(),
-                        mailing_lists: Vec::new(),
-                        subsystems: Vec::new(),
-                        findings_low: None,
-                        findings_medium: None,
-                        findings_high: None,
-                        findings_critical: None,
-                        baseline_id: row.get(9).ok(),
-                        failed_reason: row.get(10).ok(),
-                        target_review_count: row.get(11).ok(),
-                        skip_filters: row.get(12).ok(),
-                        only_filters: row.get(13).ok(),
-                        model_name: None,
-                        prompts_git_hash: None,
-                        baseline_logs: None,
-                        provider: None,
-                        embargo_until: row.get(14).ok(),
-                        slug: row.get(15).ok(),
-                        mr_url: row.get(16).ok(),
-                        mr_title: row.get(17).ok(),
-                        mr_number: row.get(18).ok(),
-                    });
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::error!("Error fetching row: {:?}", e);
-                    break;
-                }
-            }
+        while let Some(row) = rows.next().await? {
+            patchsets.push(PatchsetRow {
+                id: row.get(0).unwrap_or_default(),
+                subject: row.get(1).ok(),
+                status: row.get(2).ok(),
+                thread_id: row.get(3).ok(),
+                author: row.get(4).ok(),
+                date: row.get(5).ok(),
+                message_id: row.get(6).ok(),
+                total_parts: row.get(7).ok(),
+                received_parts: row.get(8).ok(),
+                mailing_lists: Vec::new(),
+                subsystems: Vec::new(),
+                findings_low: None,
+                findings_medium: None,
+                findings_high: None,
+                findings_critical: None,
+                baseline_id: row.get(9).ok(),
+                failed_reason: row.get(10).ok(),
+                target_review_count: row.get(11).ok(),
+                skip_filters: row.get(12).ok(),
+                only_filters: row.get(13).ok(),
+                model_name: None,
+                prompts_git_hash: None,
+                baseline_logs: None,
+                provider: None,
+                embargo_until: row.get(14).ok(),
+                slug: row.get(15).ok(),
+                mr_url: row.get(16).ok(),
+                mr_title: row.get(17).ok(),
+                mr_number: row.get(18).ok(),
+            });
         }
         Ok(patchsets)
     }
@@ -8484,7 +8477,7 @@ impl Database {
             .await?;
 
         let mut temp_reviews = Vec::new();
-        while let Ok(Some(row)) = rows.next().await {
+        while let Some(row) = rows.next().await? {
             let review_id: i64 = row.get(0)?;
             let patch_id: i64 = row.get(1)?;
             let inline_review: String = crate::compression::get_compressed_string_opt(&row, 2)
@@ -8514,7 +8507,7 @@ impl Database {
             ).await?;
 
             let mut findings = Vec::new();
-            while let Ok(Some(f_row)) = findings_rows.next().await {
+            while let Some(f_row) = findings_rows.next().await? {
                 let severity_int: i64 = f_row.get(0).unwrap_or(1);
                 let severity = match severity_int {
                     4 => "Critical",
@@ -8898,11 +8891,11 @@ impl Database {
             )
             .await?;
 
-        let mut current_status = None;
-        if let Ok(Some(row)) = rows.next().await {
-            let status: String = row.get(0)?;
-            current_status = Some(status);
-        }
+        let current_status = if let Some(row) = rows.next().await? {
+            row.get::<Option<String>>(0)?
+        } else {
+            None
+        };
 
         let should_increment = current_status.as_deref() == Some("Reviewed");
 
@@ -8971,7 +8964,7 @@ impl Database {
                     libsql::params![clid.clone()],
                 )
                 .await?;
-            if rows.next().await.ok().flatten().is_some() {
+            if rows.next().await?.is_some() {
                 return Ok(true);
             }
 
@@ -9037,9 +9030,9 @@ impl Database {
                 )
                 .await?;
 
-            if let Ok(Some(row)) = rows.next().await {
+            if let Some(row) = rows.next().await? {
                 let id: i64 = row.get(0)?;
-                let status: String = row.get(1).unwrap_or_default();
+                let status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
                 drop(rows);
 
                 // Only reset to Fetching if it failed or is currently fetching.
@@ -9080,7 +9073,7 @@ impl Database {
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
+        if let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
             drop(rows);
             self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
@@ -9179,8 +9172,8 @@ impl Database {
             .await?;
 
         let mut counts = std::collections::HashMap::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let status: Option<String> = row.get(0).ok();
+        while let Some(row) = rows.next().await? {
+            let status: Option<String> = row.get(0)?;
             let count: i64 = row.get(1)?;
             let status_key = status.unwrap_or_else(|| "Unknown".to_string());
             counts.insert(status_key, count as usize);
@@ -9212,7 +9205,7 @@ impl Database {
             )
             .await?;
 
-        if let Ok(Some(_)) = rows.next().await {
+        if rows.next().await?.is_some() {
             tracing::info!(
                 "Email outbox entry already exists for patch_id {}, skipping to prevent duplicates.",
                 patch_id
@@ -9240,64 +9233,71 @@ impl Database {
     }
 
     pub async fn lock_pending_email(&self) -> Result<Option<EmailOutboxRow>> {
-        self.conn
-            .execute(
-                "UPDATE email_outbox
-                 SET status = 'Cancelled',
-                     error_log = 'Cancelled because patchset was cancelled',
-                     locked_at = NULL
-                 WHERE status IN ('Pending', 'Embargoed')
-                   AND EXISTS (
-                       SELECT 1 FROM patches p
-                       JOIN patchsets ps ON ps.id = p.patchset_id
-                       WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
-                   )",
-                (),
-            )
+        let tx = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await?;
+        tx.execute(
+            "UPDATE email_outbox
+             SET status = 'Cancelled',
+                 error_log = 'Cancelled because patchset was cancelled',
+                 locked_at = NULL
+             WHERE status IN ('Pending', 'Embargoed')
+               AND EXISTS (
+                   SELECT 1 FROM patches p
+                   JOIN patchsets ps ON ps.id = p.patchset_id
+                   WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+               )",
+            (),
+        )
+        .await?;
 
         let now = chrono::Utc::now().timestamp();
-        let mut rows = self.conn.query(
-            "UPDATE email_outbox 
-             SET status = 'Sending', locked_at = ? 
-             WHERE id = (SELECT id FROM email_outbox WHERE status = 'Pending' LIMIT 1)
-             RETURNING id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
-            libsql::params![now]
-        ).await?;
+        let claimed = {
+            let mut rows = tx.query(
+                "UPDATE email_outbox 
+                 SET status = 'Sending', locked_at = ? 
+                 WHERE id = (SELECT id FROM email_outbox WHERE status = 'Pending' LIMIT 1)
+                 RETURNING id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
+                libsql::params![now]
+            ).await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            let patch_id: Option<i64> = row.get::<i64>(1).ok();
-            let kind = EmailKind::from_stored(&row.get::<String>(2)?);
-            let status: String = row.get(3)?;
-            let to_addresses: String = row.get(4)?;
-            let cc_addresses: String = row.get(5)?;
-            let subject: String = row.get(6)?;
-            let in_reply_to: String = row.get(7)?;
-            let references_hdr: String = row.get(8)?;
-            let body: String = row.get(9)?;
-            let locked_at: Option<i64> = row.get(10).ok();
-            let error_log: Option<String> = row.get(11).ok();
-            let created_at: i64 = row.get(12)?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let patch_id: Option<i64> = row.get(1)?;
+                let kind = EmailKind::from_stored(&row.get::<String>(2)?);
+                let status: String = row.get(3)?;
+                let to_addresses: String = row.get(4)?;
+                let cc_addresses: String = row.get(5)?;
+                let subject: String = row.get(6)?;
+                let in_reply_to: String = row.get(7)?;
+                let references_hdr: String = row.get(8)?;
+                let body: String = row.get(9)?;
+                let locked_at: Option<i64> = row.get(10)?;
+                let error_log: Option<String> = row.get(11)?;
+                let created_at: i64 = row.get(12)?;
 
-            Ok(Some(EmailOutboxRow {
-                id,
-                patch_id,
-                kind,
-                status,
-                to_addresses,
-                cc_addresses,
-                subject,
-                in_reply_to,
-                references_hdr,
-                body,
-                locked_at,
-                error_log,
-                created_at,
-            }))
-        } else {
-            Ok(None)
-        }
+                Some(EmailOutboxRow {
+                    id,
+                    patch_id,
+                    kind,
+                    status,
+                    to_addresses,
+                    cc_addresses,
+                    subject,
+                    in_reply_to,
+                    references_hdr,
+                    body,
+                    locked_at,
+                    error_log,
+                    created_at,
+                })
+            } else {
+                None
+            }
+        };
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     pub async fn mark_email_sent(&self, id: i64) -> Result<()> {
@@ -9367,72 +9367,78 @@ impl Database {
     }
 
     pub async fn lock_pending_patchwork(&self) -> Result<Option<PatchworkOutboxRow>> {
-        self.conn
-            .execute(
-                "UPDATE patchwork_outbox
-                 SET status = 'Cancelled',
-                     error_log = 'Cancelled because patchset was cancelled',
-                     locked_at = NULL
-                 WHERE status = 'Pending'
-                   AND EXISTS (
-                       SELECT 1 FROM patches p
-                       JOIN patchsets ps ON ps.id = p.patchset_id
-                       WHERE p.message_id = patchwork_outbox.patch_msg_id AND ps.status = 'Cancelled'
-                   )",
-                (),
-            )
+        let tx = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await?;
+        tx.execute(
+            "UPDATE patchwork_outbox
+             SET status = 'Cancelled',
+                 error_log = 'Cancelled because patchset was cancelled',
+                 locked_at = NULL
+             WHERE status = 'Pending'
+               AND EXISTS (
+                   SELECT 1 FROM patches p
+                   JOIN patchsets ps ON ps.id = p.patchset_id
+                   WHERE p.message_id = patchwork_outbox.patch_msg_id AND ps.status = 'Cancelled'
+               )",
+            (),
+        )
+        .await?;
 
         let now = chrono::Utc::now().timestamp();
-        let mut rows = self
-            .conn
-            .query(
-                "UPDATE patchwork_outbox
-                 SET status = 'Sending', locked_at = ?
-                 WHERE id = (
-                     SELECT id FROM patchwork_outbox
-                     WHERE status = 'Pending'
-                       AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                     LIMIT 1
-                 )
-                 RETURNING id, patch_msg_id, api_url, check_state, description, target_url, context, status, retry_count, next_retry_at, locked_at, error_log, created_at",
-                libsql::params![now, now],
-            )
-            .await?;
+        let claimed = {
+            let mut rows = tx
+                .query(
+                    "UPDATE patchwork_outbox
+                     SET status = 'Sending', locked_at = ?
+                     WHERE id = (
+                         SELECT id FROM patchwork_outbox
+                         WHERE status = 'Pending'
+                           AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                         LIMIT 1
+                     )
+                     RETURNING id, patch_msg_id, api_url, check_state, description, target_url, context, status, retry_count, next_retry_at, locked_at, error_log, created_at",
+                    libsql::params![now, now],
+                )
+                .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            let patch_msg_id: String = row.get(1)?;
-            let api_url: String = row.get(2)?;
-            let check_state: String = row.get(3)?;
-            let description: String = row.get(4)?;
-            let target_url: String = row.get(5)?;
-            let context: String = row.get(6)?;
-            let status: String = row.get(7)?;
-            let retry_count: i64 = row.get(8)?;
-            let next_retry_at: Option<i64> = row.get::<i64>(9).ok();
-            let locked_at: Option<i64> = row.get::<i64>(10).ok();
-            let error_log: Option<String> = row.get::<String>(11).ok();
-            let created_at: i64 = row.get(12)?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let patch_msg_id: String = row.get(1)?;
+                let api_url: String = row.get(2)?;
+                let check_state: String = row.get(3)?;
+                let description: String = row.get(4)?;
+                let target_url: String = row.get(5)?;
+                let context: String = row.get(6)?;
+                let status: String = row.get(7)?;
+                let retry_count: i64 = row.get(8)?;
+                let next_retry_at: Option<i64> = row.get(9)?;
+                let locked_at: Option<i64> = row.get(10)?;
+                let error_log: Option<String> = row.get(11)?;
+                let created_at: i64 = row.get(12)?;
 
-            Ok(Some(PatchworkOutboxRow {
-                id,
-                patch_msg_id,
-                api_url,
-                check_state,
-                description,
-                target_url,
-                context,
-                status,
-                retry_count,
-                next_retry_at,
-                locked_at,
-                error_log,
-                created_at,
-            }))
-        } else {
-            Ok(None)
-        }
+                Some(PatchworkOutboxRow {
+                    id,
+                    patch_msg_id,
+                    api_url,
+                    check_state,
+                    description,
+                    target_url,
+                    context,
+                    status,
+                    retry_count,
+                    next_retry_at,
+                    locked_at,
+                    error_log,
+                    created_at,
+                })
+            } else {
+                None
+            }
+        };
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     pub async fn mark_patchwork_sent(&self, id: i64) -> Result<()> {
@@ -9564,71 +9570,77 @@ impl Database {
     }
 
     pub async fn lock_pending_forge_outbox(&self) -> Result<Option<ForgeOutboxRow>> {
-        self.conn
-            .execute(
-                "UPDATE forge_outbox
-                 SET status = 'Cancelled',
-                     error_log = 'Cancelled: patchset was cancelled or superseded by a newer PR version',
-                     locked_at = NULL
-                 WHERE status IN ('Pending', 'Embargoed')
-                   AND (
-                       EXISTS (
-                           SELECT 1 FROM patchsets ps
-                           WHERE ps.id = forge_outbox.patchset_id AND ps.status = 'Cancelled'
-                       )
-                       OR EXISTS (
-                           SELECT 1 FROM patchsets ps2
-                           WHERE ps2.mr_number = forge_outbox.pr_number
-                             AND ps2.id > forge_outbox.patchset_id
-                             AND ps2.mr_url IS NOT NULL
-                             AND (
-                                 ps2.mr_url LIKE '%/' || forge_outbox.repo || '/pull/%'
-                                 OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/-/merge_requests/%'
-                                 OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/merge_requests/%'
-                             )
-                       )
-                   )",
-                (),
-            )
+        let tx = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await?;
+        tx.execute(
+            "UPDATE forge_outbox
+             SET status = 'Cancelled',
+                 error_log = 'Cancelled: patchset was cancelled or superseded by a newer PR version',
+                 locked_at = NULL
+             WHERE status IN ('Pending', 'Embargoed')
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM patchsets ps
+                       WHERE ps.id = forge_outbox.patchset_id AND ps.status = 'Cancelled'
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM patchsets ps2
+                       WHERE ps2.mr_number = forge_outbox.pr_number
+                         AND ps2.id > forge_outbox.patchset_id
+                         AND ps2.mr_url IS NOT NULL
+                         AND (
+                             ps2.mr_url LIKE '%/' || forge_outbox.repo || '/pull/%'
+                             OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/-/merge_requests/%'
+                             OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/merge_requests/%'
+                         )
+                   )
+               )",
+            (),
+        )
+        .await?;
 
         let now = chrono::Utc::now().timestamp();
-        let mut rows = self
-            .conn
-            .query(
-                "UPDATE forge_outbox
-                 SET status = 'Sending', locked_at = ?
-                 WHERE id = (
-                     SELECT id FROM forge_outbox
-                     WHERE status = 'Pending'
-                       AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                     LIMIT 1
-                 )
-                 RETURNING id, patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, retry_count, next_retry_at, locked_at, error_log, created_at",
-                libsql::params![now, now],
-            )
-            .await?;
+        let claimed = {
+            let mut rows = tx
+                .query(
+                    "UPDATE forge_outbox
+                     SET status = 'Sending', locked_at = ?
+                     WHERE id = (
+                         SELECT id FROM forge_outbox
+                         WHERE status = 'Pending'
+                           AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                         LIMIT 1
+                     )
+                     RETURNING id, patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, retry_count, next_retry_at, locked_at, error_log, created_at",
+                    libsql::params![now, now],
+                )
+                .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(Some(ForgeOutboxRow {
-                id: row.get(0)?,
-                patchset_id: row.get(1)?,
-                provider: row.get(2)?,
-                repo: row.get(3)?,
-                pr_number: row.get(4)?,
-                head_sha: row.get::<String>(5).ok(),
-                body: row.get(6)?,
-                target_url: row.get(7)?,
-                status: row.get(8)?,
-                retry_count: row.get(9)?,
-                next_retry_at: row.get::<i64>(10).ok(),
-                locked_at: row.get::<i64>(11).ok(),
-                error_log: row.get::<String>(12).ok(),
-                created_at: row.get(13)?,
-            }))
-        } else {
-            Ok(None)
-        }
+            if let Some(row) = rows.next().await? {
+                Some(ForgeOutboxRow {
+                    id: row.get(0)?,
+                    patchset_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    repo: row.get(3)?,
+                    pr_number: row.get(4)?,
+                    head_sha: row.get(5)?,
+                    body: row.get(6)?,
+                    target_url: row.get(7)?,
+                    status: row.get(8)?,
+                    retry_count: row.get(9)?,
+                    next_retry_at: row.get(10)?,
+                    locked_at: row.get(11)?,
+                    error_log: row.get(12)?,
+                    created_at: row.get(13)?,
+                })
+            } else {
+                None
+            }
+        };
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     pub async fn mark_forge_outbox_sent(&self, id: i64) -> Result<()> {
@@ -20943,5 +20955,260 @@ mod tests {
                 .unwrap(),
             Some(main_thread)
         );
+    }
+
+    #[tokio::test]
+    async fn test_outbox_and_release_queries_propagate_cursor_step_errors() {
+        let db = setup_db().await;
+
+        let thread_id = db
+            .create_thread("msg-outbox-step", "Subject", 1000)
+            .await
+            .unwrap();
+        let ps_cancelled = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg-outbox-cancelled",
+                "[PATCH] Cancelled patch",
+                "Author <a@b.c>",
+                1000,
+                1,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let ps_pending = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg-outbox-pending",
+                "[PATCH] Pending patch",
+                "Author <a@b.c>",
+                1001,
+                1,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_message(
+            "msg-outbox-cancelled",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "Subject",
+            1000,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "msg-outbox-pending",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "Subject",
+            1001,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let patch_cancelled = db
+            .create_patch(ps_cancelled, "msg-outbox-cancelled", 1, "diff")
+            .await
+            .unwrap();
+        let patch_pending = db
+            .create_patch(ps_pending, "msg-outbox-pending", 1, "diff")
+            .await
+            .unwrap();
+
+        // Insert outbox rows for both patchsets while both are still active, then mark
+        // `ps_cancelled` as Cancelled so `lock_pending_*` will update its outbox row in the
+        // first statement before stepping the `UPDATE ... RETURNING` cursor in the second.
+        db.insert_email_outbox(
+            patch_cancelled,
+            "Pending",
+            "[\"a@b.c\"]",
+            "[]",
+            "Subj",
+            "<reply-cancelled>",
+            "[]",
+            "Body",
+        )
+        .await
+        .unwrap();
+        db.insert_email_outbox(
+            patch_pending,
+            "Pending",
+            "[\"a@b.c\"]",
+            "[]",
+            "Subj",
+            "<reply-pending>",
+            "[]",
+            "Body",
+        )
+        .await
+        .unwrap();
+
+        db.insert_patchwork_outbox(
+            "msg-outbox-cancelled",
+            "https://pw.example/api/patches/1/checks/",
+            "success",
+            "ok",
+            "https://sashiko.example/patch/1",
+            "sashiko",
+        )
+        .await
+        .unwrap();
+        db.insert_patchwork_outbox(
+            "msg-outbox-pending",
+            "https://pw.example/api/patches/2/checks/",
+            "success",
+            "ok",
+            "https://sashiko.example/patch/2",
+            "sashiko",
+        )
+        .await
+        .unwrap();
+
+        db.insert_forge_outbox(
+            ps_cancelled,
+            "github",
+            "owner/repo",
+            1,
+            Some("deadbeef"),
+            "Body",
+            "https://sashiko.example/patch/1",
+            "Pending",
+        )
+        .await
+        .unwrap();
+        db.insert_forge_outbox(
+            ps_pending,
+            "github",
+            "owner/repo",
+            2,
+            Some("feedface"),
+            "Body",
+            "https://sashiko.example/patch/2",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Cancelled' WHERE id = ?",
+                libsql::params![ps_cancelled],
+            )
+            .await
+            .unwrap();
+
+        // Install BEFORE UPDATE triggers that fire only when transitioning to 'Sending'
+        // (i.e. during `rows.next().await` of the second `UPDATE ... RETURNING` query).
+        for table in ["email_outbox", "patchwork_outbox", "forge_outbox"] {
+            db.conn
+                .execute(
+                    &format!(
+                        "CREATE TRIGGER fail_{table}_sending
+                         BEFORE UPDATE ON {table}
+                         WHEN NEW.status = 'Sending'
+                         BEGIN
+                             SELECT RAISE(ABORT, 'simulated step failure on {table}');
+                         END"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+
+        let email_err = db
+            .lock_pending_email()
+            .await
+            .expect_err("lock_pending_email must propagate cursor step errors");
+        assert!(
+            email_err
+                .to_string()
+                .contains("simulated step failure on email_outbox"),
+            "unexpected error: {email_err}"
+        );
+
+        let pw_err = db
+            .lock_pending_patchwork()
+            .await
+            .expect_err("lock_pending_patchwork must propagate cursor step errors");
+        assert!(
+            pw_err
+                .to_string()
+                .contains("simulated step failure on patchwork_outbox"),
+            "unexpected error: {pw_err}"
+        );
+
+        let forge_err = db
+            .lock_pending_forge_outbox()
+            .await
+            .expect_err("lock_pending_forge_outbox must propagate cursor step errors");
+        assert!(
+            forge_err
+                .to_string()
+                .contains("simulated step failure on forge_outbox"),
+            "unexpected error: {forge_err}"
+        );
+
+        // Verify that the earlier `SET status = 'Cancelled'` update in each method was rolled
+        // back when the transaction aborted on the `UPDATE ... RETURNING` step error.
+        for (table, col, val) in [
+            ("email_outbox", "patch_id", patch_cancelled.to_string()),
+            (
+                "patchwork_outbox",
+                "patch_msg_id",
+                "msg-outbox-cancelled".to_string(),
+            ),
+            ("forge_outbox", "patchset_id", ps_cancelled.to_string()),
+        ] {
+            let mut rows = db
+                .conn
+                .query(
+                    &format!("SELECT status FROM {table} WHERE {col} = ?"),
+                    libsql::params![val],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            let status: String = row.get(0).unwrap();
+            assert_eq!(
+                status, "Pending",
+                "{table} cancellation should have rolled back on claim failure"
+            );
+        }
     }
 }
