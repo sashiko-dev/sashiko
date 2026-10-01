@@ -166,7 +166,10 @@ impl Ingestor {
                         let epoch_path = base_path.join(epoch.to_string());
                         info!(
                             "Bootstrapping group {} epoch {} from {} to {:?}",
-                            group, epoch, url, epoch_path
+                            group,
+                            epoch,
+                            crate::utils::redact_secret(&url),
+                            epoch_path
                         );
 
                         if let Err(e) = self
@@ -268,11 +271,12 @@ impl Ingestor {
     }
 
     async fn bootstrap_repo(&self, url: &str, path: &std::path::Path, n: usize) -> Result<()> {
+        let redacted_url = crate::utils::redact_secret(url);
         // 1. Ensure repo exists
         if !path.exists() {
             info!(
                 "Cloning archive from {} to {:?} with depth {}",
-                url, path, n
+                redacted_url, path, n
             );
             // Parent directory must exist
             if let Some(parent) = path.parent() {
@@ -291,7 +295,7 @@ impl Ingestor {
             if !output.status.success() {
                 return Err(anyhow!(
                     "Git clone failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    crate::utils::redact_secret(String::from_utf8_lossy(&output.stderr).trim())
                 ));
             }
         } else {
@@ -310,7 +314,11 @@ impl Ingestor {
                     .trim()
                     .to_string();
                 if current_url != url {
-                    info!("Updating remote origin from {} to {}", current_url, url);
+                    info!(
+                        "Updating remote origin from {} to {}",
+                        crate::utils::redact_secret(&current_url),
+                        redacted_url
+                    );
                     let set_url_output = crate::git_cmd::in_dir_async(path)
                         .arg("-c")
                         .arg("safe.bareRepository=all")
@@ -324,7 +332,9 @@ impl Ingestor {
                     if !set_url_output.status.success() {
                         warn!(
                             "Failed to update remote url: {}",
-                            String::from_utf8_lossy(&set_url_output.stderr)
+                            crate::utils::redact_secret(
+                                String::from_utf8_lossy(&set_url_output.stderr).trim()
+                            )
                         );
                     }
                 }
@@ -345,7 +355,7 @@ impl Ingestor {
                 // Warn but continue, maybe we are offline
                 warn!(
                     "Git fetch failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    crate::utils::redact_secret(String::from_utf8_lossy(&output.stderr).trim())
                 );
             }
         }
@@ -1258,5 +1268,39 @@ index bbc440c93e08..1123ef3ccf90 100644
         let low_high: u64 = 50;
         let low_recovered = low_high.saturating_sub(100);
         assert_eq!(low_recovered, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_repo_redacts_secrets_on_failure() {
+        let mut settings = Settings::new().unwrap();
+        settings.database.url = ":memory:".into();
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let ingestor = Ingestor::new(settings, db, sender, None, true);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().join("archive.git");
+        let secret_url =
+            "https://gituser:s3cr3t_p4ss@127.0.0.1:1/nonexistent.git?token=secret_tok_123";
+
+        let err = ingestor
+            .bootstrap_repo(secret_url, &repo_path, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("[REDACTED]"),
+            "expected redacted error, got: {err}"
+        );
+        assert!(
+            !err.contains("s3cr3t_p4ss"),
+            "leaked password in error: {err}"
+        );
+        assert!(
+            !err.contains("secret_tok_123"),
+            "leaked token in error: {err}"
+        );
     }
 }
