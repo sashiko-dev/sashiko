@@ -6,9 +6,15 @@ SQLite/libsql concurrent access (`src/db.rs`), and shared git repository
 operations (`src/git_ops.rs`).
 
 Sashiko's concurrency model spans **two levels**:
-1. **In-process concurrency**: Multiple Tokio tasks running inside the main
-   daemon (`Ingestor`, `Reviewer` dispatcher, HTTP API handlers, background
-   housekeeping workers).
+1. **In-process concurrency**: Multiple Tokio tasks running inside the single
+   main daemon (`Ingestor`, `Reviewer` dispatcher, `BugWorker`, HTTP API
+   handlers, background housekeeping workers). Because `BugWorker`
+   (`src/worker/bug_worker.rs`) executes bug-pipeline tasks (`linux_bug` /
+   `sashiko_bug`) as in-process Tokio tasks inside the single `sashiko` server
+   daemon (recording `HOSTNAME:pid` in `bugs.locked_by` solely for crash
+   recovery across daemon restarts), process-wide async locks such as
+   `BUG_DEDUP_LOCK` (`tokio::sync::Mutex`) serialize all concurrent bug
+   deduplication checks without cross-process contention.
 2. **Cross-process concurrency**: The `Reviewer` spawns isolated child
    processes (`sashiko review <id>`) that concurrently access the same SQLite
    database (`sashiko.db`) and the same base git repository (`review_trees/`).

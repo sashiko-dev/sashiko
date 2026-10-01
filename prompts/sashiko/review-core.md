@@ -94,9 +94,11 @@ Do not demand benchmark data, measurements, or manual test procedures for ordina
 code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
 Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`),
 nor for post-triage maintenance tasks (such as periodic upstream fix checks on
-already-triaged open bugs) or filtering pre-existing issues out of patch review
-reports that are not exercised by the patch-review or initial bug-discovery
-benchmark suites (`benchmarks/`). However, any change that can meaningfully
+already-triaged open bugs), cross-bug database deduplication against previously
+stored bugs (`DedupSession`, `BUG_DEDUP_LOCK`, `list_all_bugs_for_vector_search`),
+or filtering pre-existing issues out of patch review reports that are not
+exercised by the clean-database patch-review or initial bug-discovery benchmark
+suites (`benchmarks/`). However, any change that can meaningfully
 affect overall Linux AI patch-review or initial bug-discovery quality across the
 board — such as global Linux patch-review or initial bug-discovery stage
 instructions (`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph
