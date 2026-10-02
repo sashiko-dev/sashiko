@@ -320,6 +320,12 @@ impl<'a> SessionRunner<'a> {
             };
 
             if resp.truncated {
+                // Giving up, as when the answers are rejected below: forget
+                // this cut-off answer and any the stage rejected before it, so
+                // that a retry asks the model again.
+                for request in rejected.iter().chain(std::iter::once(&sent)) {
+                    self.provider.forget(request).await;
+                }
                 anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");
             }
 

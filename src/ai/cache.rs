@@ -446,6 +446,123 @@ mod tests {
         assert_eq!(per_run, vec![2, 0], "calls per run");
     }
 
+    /// Answers every request with a response the provider marked as cut off
+    /// at the output limit, and counts how often it was actually asked.
+    struct TruncatedAnswers {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl AiProvider for TruncatedAnswers {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AiResponse {
+                content: Some("{\"conc".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: true,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_retry_after_a_truncated_answer_reaches_the_model() {
+        // The runner gives up on a truncated answer before validating it.
+        // The answer was still a successful API response, so it is cached,
+        // and a retry must not be handed it again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let calls = Arc::new(AtomicU64::new(0));
+
+        let mut per_attempt = Vec::new();
+        for _attempt in 1..=2 {
+            let before = calls.load(Ordering::SeqCst);
+            let provider = CachingAiProvider::new(
+                Arc::new(TruncatedAnswers {
+                    calls: calls.clone(),
+                }),
+                path.to_str().unwrap(),
+                30,
+            )
+            .await
+            .unwrap();
+            let result = SessionRunner::new(&provider).run(&mut JsonSession).await;
+            assert!(result.is_err(), "a truncated answer ends the session");
+            per_attempt.push(calls.load(Ordering::SeqCst) - before);
+        }
+
+        assert_eq!(per_attempt, vec![1, 1], "calls per attempt");
+    }
+
+    /// Rejects the first answer of a conversation, then cuts the next one
+    /// off, and counts how often it was actually asked.
+    struct RejectedThenTruncated {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl AiProvider for RejectedThenTruncated {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let first_answer = request.messages.len() == 1;
+            Ok(AiResponse {
+                content: Some(if first_answer { "not json" } else { "{\"conc" }.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: !first_answer,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_giving_up_on_a_truncated_answer_also_forgets_the_rejected_ones() {
+        // A rejected answer, then a truncated one: the stage gives up, and a
+        // retry must be asked both again rather than be served the rejection.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let calls = Arc::new(AtomicU64::new(0));
+
+        let mut per_attempt = Vec::new();
+        for _attempt in 1..=2 {
+            let before = calls.load(Ordering::SeqCst);
+            let provider = CachingAiProvider::new(
+                Arc::new(RejectedThenTruncated {
+                    calls: calls.clone(),
+                }),
+                path.to_str().unwrap(),
+                30,
+            )
+            .await
+            .unwrap();
+            let result = SessionRunner::new(&provider).run(&mut JsonSession).await;
+            assert!(
+                result.is_err(),
+                "the stage gives up on the truncated answer"
+            );
+            per_attempt.push(calls.load(Ordering::SeqCst) - before);
+        }
+
+        assert_eq!(per_attempt, vec![2, 2], "calls per attempt");
+    }
+
     #[tokio::test]
     async fn test_a_retry_after_rejected_answers_reaches_the_model() {
         // local_review retries a failed patch review by building a fresh
