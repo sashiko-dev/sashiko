@@ -35,6 +35,8 @@ send_positive_review = true
 lists = ["b.a.t.m.a.n@lists.open-mesh.org"]
 reply_to_author = true
 cc = ["marek.lindner@mailbox.org", "sw@simonwunderlich.de", "antonio@mandelbit.com", "sven@narfation.org"]
+embargo_hours = 0
+subject_prefixes = ["batadv", "batadv-next"]
 
 [subsystems.bpf]
 lists = ["bpf@vger.kernel.org"]
