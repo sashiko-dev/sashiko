@@ -73,8 +73,13 @@ impl<C> ToolRegistry<C> {
     /// - `description`: Its description
     /// - `parameters`: Its parameter schema
     pub fn declarations(&self) -> Vec<Value> {
-        self.tools
-            .values()
+        // Sorted by name. The map's iteration order is random for every
+        // registry, and this list goes into every request, so without the
+        // sort two identical requests differ between runs and retries.
+        let mut tools: Vec<_> = self.tools.values().collect();
+        tools.sort_by_key(|t| t.name());
+        tools
+            .into_iter()
             .map(|t| {
                 serde_json::json!({
                     "name": t.name(),

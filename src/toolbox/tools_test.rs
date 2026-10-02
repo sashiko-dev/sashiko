@@ -751,4 +751,24 @@ mod tests {
             .unwrap();
         assert!(show_res["content"].as_str().unwrap().contains("old_func"));
     }
+
+    #[test]
+    fn test_tool_declarations_come_in_a_stable_order() {
+        // The declarations go into every request, so their order is part of
+        // the response cache key and of the prompt prefix a provider can
+        // cache. They must not depend on the registry's hash map order,
+        // which is random for every new registry.
+        let (repo, prompts) = get_test_paths();
+        let names = |tb: &ToolBox| -> Vec<String> {
+            tb.get_declarations_generic()
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        let first = names(&ToolBox::new(repo.clone(), Some(prompts.clone())));
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "declarations are not in name order");
+        assert_eq!(first, names(&ToolBox::new(repo, Some(prompts))));
+    }
 }
