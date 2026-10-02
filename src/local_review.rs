@@ -1550,6 +1550,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
         fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
@@ -1570,6 +1571,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,

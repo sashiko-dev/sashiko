@@ -3328,6 +3328,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
         fn get_capabilities(&self) -> ProviderCapabilities {
@@ -3620,6 +3621,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
@@ -4326,6 +4328,7 @@ fi
                     cached_tokens: Some(self.cached_tokens),
                 }),
                 truncated: false,
+                provider_metadata: None,
             })
         }
         fn get_capabilities(&self) -> ProviderCapabilities {

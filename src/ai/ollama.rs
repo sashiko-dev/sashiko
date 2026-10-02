@@ -336,6 +336,7 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
         tool_calls,
         usage,
         truncated: false,
+        provider_metadata: None,
     })
 }
 
@@ -434,6 +435,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: Some(0.7),
@@ -472,6 +474,7 @@ mod tests {
                     thought_signature: None,
                 }]),
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -605,6 +608,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: Some(0.5),
@@ -632,6 +636,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
