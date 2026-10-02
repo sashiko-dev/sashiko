@@ -2767,6 +2767,21 @@ async fn run_review_tool_with_cmd(
                                         });
                                         spawned_tasks.push(handle);
                                     }
+                                    "ai_forget" => {
+                                        // The worker rejected, or was cut off in, an answer this
+                                        // side served. Drop it from the cache so a retry asks the
+                                        // model again. Handled inline so that it is done before
+                                        // anything the worker sends after it.
+                                        match serde_json::from_value::<AiRequest>(json_msg["payload"].clone()) {
+                                            Ok(req) => {
+                                                // Under the request's log context, as for ai_request,
+                                                // so the cache's log line names the review.
+                                                let ctx_tag = req.context_tag.clone().unwrap_or_default();
+                                                crate::ai::LOG_CONTEXT.scope(ctx_tag, provider.forget(&req)).await
+                                            }
+                                            Err(e) => tracing::warn!("Ignoring malformed ai_forget: {}", e),
+                                        }
+                                    }
                                     _ => {
                                         // Unknown type. Assume it's result if it matches result structure.
                                         if json_msg.get("patchset_id").is_some() {
@@ -3796,6 +3811,70 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         assert_eq!(result.unwrap()["patchset_id"], 1);
 
         child.wait().await?;
+        Ok(())
+    }
+
+    /// Records every request it is asked to forget.
+    struct ForgetRecorder {
+        forgotten: std::sync::Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for ForgetRecorder {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            unreachable!("the worker in this test only forgets")
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "forget-recorder".to_string(),
+                context_window_size: 1000,
+            }
+        }
+
+        async fn forget(&self, request: &AiRequest) {
+            self.forgotten.lock().unwrap().push(request.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_review_tool_passes_a_worker_forget_to_the_provider() -> Result<()> {
+        // A worker's cache is the daemon's, on the far side of the stdio
+        // link, so a forget from the worker's session runner must cross it.
+        // The line is built by the same function the worker uses.
+        let request = AiRequest {
+            system: None,
+            messages: vec![crate::ai::AiMessage {
+                role: crate::ai::AiRole::User,
+                content: Some("hello".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+        let line = serde_json::to_string(&crate::ai::forget_envelope(&request))?;
+        let mock_script = format!(
+            r#"#!/bin/bash
+read -r input
+echo '{line}'
+echo '{{"patchset_id":1,"patches":[{{"index":1,"status":"done"}}]}}'
+"#
+        );
+
+        let provider = Arc::new(ForgetRecorder {
+            forgotten: std::sync::Mutex::new(Vec::new()),
+        });
+        let result = run_single_ai_request_mock(&mock_script, provider.clone()).await?;
+
+        assert_eq!(result["patches"][0]["status"], "done");
+        let forgotten = provider.forgotten.lock().unwrap();
+        assert_eq!(forgotten.len(), 1, "the daemon did not pass the forget on");
+        assert_eq!(forgotten[0].messages[0].content.as_deref(), Some("hello"));
         Ok(())
     }
 

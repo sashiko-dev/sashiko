@@ -75,6 +75,26 @@ If a transient or fatal error occurs, the parent mirrors the `tx_id` so the corr
 }
 ```
 
+### 3.4. Forget Envelope (Child -> Parent)
+When the child's session runner gives up on a stage because its answers were
+rejected or cut off, it asks the parent to drop each of those requests from its
+response cache, so that a retry asks the model again. One envelope carries one
+request, exactly as the matching `ai_request` did, and no `tx_id`: nothing is
+sent back. The parent handles it inline, before reading the child's next line,
+and a parent that does not know the type ignores it.
+```json
+{
+  "type": "ai_forget",
+  "payload": {
+    "system": "Optional system instructions...",
+    "messages": [
+      { "role": "user", "content": "..." }
+    ],
+    "tools": [ ... ]
+  }
+}
+```
+
 ---
 
 ## 4. Process Architecture & Multiplexing Data Flow
@@ -228,7 +248,7 @@ In [src/reviewer.rs:run_review_tool](../src/reviewer.rs#L1456), instead of block
 
 1.  Maintain an `Arc<Mutex<StdinWriter>>` to allow thread-safe, atomic writes to the child's `stdin`.
 2.  Continuously read lines from `stdout`.
-3.  For each `"ai_request"`, immediately extract the `tx_id` and spawn a new tokio task:
+3.  For each `"ai_request"`, immediately extract the `tx_id` and spawn a new tokio task (an `"ai_forget"` is instead handled inline, before the next line is read; see 3.4):
 
 ```rust
 let stdin_writer = Arc::new(Mutex::new(stdin)); // Async writer wrap

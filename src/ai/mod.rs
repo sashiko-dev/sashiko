@@ -903,6 +903,26 @@ pub(crate) fn ipc_writer() -> Arc<AtomicWriter> {
         .clone()
 }
 
+/// The message a worker sends to ask the daemon to forget a request.
+pub(crate) fn forget_envelope(request: &AiRequest) -> serde_json::Value {
+    serde_json::json!({ "type": "ai_forget", "payload": request })
+}
+
+/// Asks the daemon on the other end of a worker's stdio link to forget a
+/// request, so that its response cache does not hand a retry the same
+/// answer. Nothing comes back: the daemon handles the message before it
+/// reads the worker's next line.
+pub(crate) async fn ipc_forget(request: &AiRequest) {
+    match serde_json::to_string(&forget_envelope(request)) {
+        Ok(line) => {
+            if let Err(e) = ipc_writer().write_line(&line).await {
+                tracing::warn!("Failed to send ai_forget to the daemon: {}", e);
+            }
+        }
+        Err(e) => tracing::warn!("Failed to encode ai_forget: {}", e),
+    }
+}
+
 /// Spawns the stdin reader unless one is already running on this runtime.
 pub(crate) fn ensure_stdin_reader() {
     let registry = ipc_registry();

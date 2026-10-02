@@ -754,6 +754,10 @@ impl AiProvider for StdioGeminiClient {
             context_window_size: 1_000_000,
         }
     }
+
+    async fn forget(&self, request: &AiRequest) {
+        crate::ai::ipc_forget(request).await
+    }
 }
 
 // --- Translation Helpers ---

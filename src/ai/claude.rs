@@ -739,6 +739,10 @@ impl AiProvider for StdioClaudeClient {
             context_window_size: 200_000,
         }
     }
+
+    async fn forget(&self, request: &AiRequest) {
+        crate::ai::ipc_forget(request).await
+    }
 }
 
 #[cfg(test)]
