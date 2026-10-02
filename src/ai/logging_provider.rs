@@ -121,4 +121,8 @@ impl AiProvider for LoggingProvider {
     fn cache_stats(&self) -> Option<CacheStats> {
         self.inner.cache_stats()
     }
+
+    async fn forget(&self, request: &AiRequest) {
+        self.inner.forget(request).await
+    }
 }

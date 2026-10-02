@@ -217,6 +217,9 @@ impl<'a> SessionRunner<'a> {
 
         let mut turns = 0;
         let mut validation_attempts = 0;
+        // Requests whose answers were rejected, forgotten only if the stage
+        // gives up.
+        let mut rejected: Vec<AiRequest> = Vec::new();
         let mut transient_retries = 0;
         let mut provider_error_retries = 0;
         let mut total_prompt_tokens = 0;
@@ -260,6 +263,8 @@ impl<'a> SessionRunner<'a> {
                 context_tag: session.context_tag(),
             };
 
+            // Kept so that a rejected answer can be forgotten below.
+            let sent = request.clone();
             let resp = match self.provider.generate_content(request).await {
                 Ok(r) => r,
                 Err(e) => match classify_ai_error(&e) {
@@ -377,8 +382,14 @@ impl<'a> SessionRunner<'a> {
                     });
                 }
                 Result::Err(ValidationError::FormatViolation(violation)) => {
+                    rejected.push(sent);
                     validation_attempts += 1;
                     if validation_attempts >= self.max_validation_attempts {
+                        // Giving up: forget the rejected answers, or a
+                        // retry would be handed them and fail the same way.
+                        for request in &rejected {
+                            self.provider.forget(request).await;
+                        }
                         anyhow::bail!(
                             "Failed to generate valid response after {} validation attempts. Last violation: {}",
                             self.max_validation_attempts,

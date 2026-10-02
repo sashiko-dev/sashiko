@@ -1737,6 +1737,57 @@ mod tests {
         assert_eq!(extract_inline_review(1, Some(&no_findings)).unwrap(), None);
     }
 
+    /// Counts the requests it was asked to forget.
+    struct ForgetCounter {
+        forgotten: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for ForgetCounter {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> Result<crate::ai::AiResponse> {
+            unreachable!("this test only forgets")
+        }
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "forget-counter".into(),
+                context_window_size: 1000,
+            }
+        }
+        async fn forget(&self, _request: &crate::ai::AiRequest) {
+            self.forgotten
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decorated_provider_passes_forget_to_the_cache() -> Result<()> {
+        // The response cache sits innermost, under every wrapper added here.
+        // forget defaults to doing nothing, so a wrapper that does not pass
+        // it on would silently let a retry replay a rejected answer again.
+        let mut settings = Settings::new()?;
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.log_turns = true;
+        let sem = Arc::new(Semaphore::new(1));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+        let forgotten = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let inner: Arc<dyn crate::ai::AiProvider> = Arc::new(ForgetCounter {
+            forgotten: forgotten.clone(),
+        });
+
+        let decorated = decorate_provider(inner, &settings.ai, &sem, &quota, &None);
+        decorated.forget(&dummy_request()).await;
+
+        assert_eq!(
+            forgotten.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "forget did not reach the innermost provider"
+        );
+        Ok(())
+    }
+
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
         let output = crate::git_cmd::in_dir(repo_path).args(args).output()?;
         if !output.status.success() {
