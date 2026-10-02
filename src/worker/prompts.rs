@@ -99,6 +99,7 @@ pub struct WorkerConfig {
     pub baseline_sha: Option<String>,
     pub stages: Option<Vec<String>>,
     pub skip_report: bool,
+    pub report_preexisting: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +181,7 @@ pub struct Worker {
     stages: Option<Vec<String>>,
     custom_prompt: Option<String>,
     skip_report: bool,
+    report_preexisting: bool,
 }
 
 impl Worker {
@@ -203,6 +205,7 @@ impl Worker {
             stages: config.stages,
             custom_prompt: config.custom_prompt,
             skip_report: config.skip_report,
+            report_preexisting: config.report_preexisting,
         }
     }
 
@@ -349,6 +352,7 @@ impl Worker {
             custom_prompt: self.custom_prompt.clone(),
             planned_stages: Vec::new(),
             skip_report: self.skip_report,
+            report_preexisting: self.report_preexisting,
             all_concerns: Vec::new(),
             all_dismissed_concerns: Vec::new(),
             deduplicated_concerns: Vec::new(),
@@ -1142,6 +1146,7 @@ mod tests {
             custom_prompt: None,
             stages: None,
             skip_report: false,
+            report_preexisting: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1290,6 +1295,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            report_preexisting: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1326,6 +1332,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            report_preexisting: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1366,6 +1373,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            report_preexisting: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1465,6 +1473,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            report_preexisting: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1638,6 +1647,7 @@ mod tests {
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: true,
+                report_preexisting: false,
             };
             let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1656,5 +1666,135 @@ mod tests {
             assert_eq!(output["review_inline"], "");
             assert_eq!(output["summary"], "");
         }
+    }
+
+    #[tokio::test]
+    async fn test_report_preexisting_runs_verification_and_report_when_only_preexisting_concerns_exist()
+     {
+        struct MockPreexistingOnlyProvider;
+
+        #[async_trait::async_trait]
+        impl crate::ai::AiProvider for MockPreexistingOnlyProvider {
+            async fn generate_content(
+                &self,
+                request: crate::ai::AiRequest,
+            ) -> anyhow::Result<crate::ai::AiResponse> {
+                let last_user = request
+                    .messages
+                    .iter()
+                    .rfind(|m| m.role == crate::ai::AiRole::User)
+                    .and_then(|m| m.content.as_deref())
+                    .unwrap_or_default();
+
+                let content = if last_user.contains("# Analyze commit main goal")
+                    || last_user.contains("# Deduplication and Consolidation")
+                {
+                    r#"{"concerns": [{"type": "Memory Leak", "description": "Pre-existing leak in foo()", "reasoning": "Missing kfree", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "dismissed_concerns": []}"#
+                } else if last_user.contains("# Concern/dismissed-concern conflict resolution") {
+                    r#"{"concerns": [{"type": "Memory Leak", "description": "Pre-existing leak in foo()", "reasoning": "Missing kfree", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}]}"#
+                } else if last_user.contains("# Verification and severity estimation") {
+                    r#"{"findings": [{"problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}]}"#
+                } else if last_user.contains("# LKML-friendly report generation") {
+                    "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\nSummary.\n\n> +int x;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but foo() leaks buf on error.\n"
+                } else {
+                    r#"{"concerns": [], "dismissed_concerns": []}"#
+                };
+
+                Ok(crate::ai::AiResponse {
+                    content: Some(content.to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"index": 1, "diff": "diff --git a/foo.c b/foo.c\n+int x;", "commit_id": "sha1"}]
+        });
+
+        // With report_preexisting: false, workflow exits after conflict-resolution with 0 findings.
+        let mut worker_default = Worker::new(
+            std::sync::Arc::new(MockPreexistingOnlyProvider),
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(
+                temp_dir.path().to_path_buf(),
+                None,
+            )),
+            PromptRegistry::new(prompts_dir.clone()),
+            WorkerConfig {
+                project: ProjectId::Linux,
+                max_input_tokens: 10000,
+                max_interactions: 3,
+                temperature: 0.0,
+                series_range: None,
+                baseline_sha: Some("base_sha".to_string()),
+                custom_prompt: None,
+                stages: Some(vec!["goal".to_string()]),
+                skip_report: false,
+                report_preexisting: false,
+            },
+        );
+        let out_default = worker_default
+            .run(patchset.clone(), None)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert!(out_default["findings"].as_array().unwrap().is_empty());
+        assert_eq!(out_default["concerns"].as_array().unwrap().len(), 1);
+        assert_eq!(out_default["review_inline"], "No issues found.");
+
+        // With report_preexisting: true, verification and report stages run and produce findings + inline report.
+        let mut worker_preexisting = Worker::new(
+            std::sync::Arc::new(MockPreexistingOnlyProvider),
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(
+                temp_dir.path().to_path_buf(),
+                None,
+            )),
+            PromptRegistry::new(prompts_dir),
+            WorkerConfig {
+                project: ProjectId::Linux,
+                max_input_tokens: 10000,
+                max_interactions: 3,
+                temperature: 0.0,
+                series_range: None,
+                baseline_sha: Some("base_sha".to_string()),
+                custom_prompt: None,
+                stages: Some(vec!["goal".to_string()]),
+                skip_report: false,
+                report_preexisting: true,
+            },
+        );
+        let out_preexisting = worker_preexisting
+            .run(patchset, None)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        let findings = out_preexisting["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["problem"], "mm: memory leak in foo()");
+        assert_eq!(findings[0]["preexisting"], true);
+        assert!(
+            out_preexisting["review_inline"]
+                .as_str()
+                .unwrap()
+                .contains("wasn't introduced by this patch")
+        );
     }
 }

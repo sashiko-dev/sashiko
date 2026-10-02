@@ -231,13 +231,14 @@ For each remaining concern, use the available Git and file tools to inspect the 
 4. DESIGN & DOCUMENTATION RULE: If a concern targets illustrative pseudo-code or abbreviated struct snippets in documentation (`designs/*.md`, `README.md`, `prompts/*.md`), inspect the actual Rust implementation in `src/` at the series head (`Series End Commit` / `HEAD`). If the actual Rust code properly enforces the invariant (e.g., `#[serde(default)]`, validation, or auth checks), discard the documentation concern as a false positive.
 5. When referring to other patches within this series in your explanation, DO NOT use ephemeral git hashes. Instead, refer to them by their patch subject (e.g., 'commit "auth: add max_bug_access claim"').
 6. If concrete code proves the concern is a false positive, drop it.
-7. If the problem already existed in the codebase before this commit/series was applied, mark `"preexisting": true` so it is routed exclusively to the bugs database and NOT reported as a finding on this patch.
+7. If the problem already existed in the codebase before this commit/series was applied, still include it in the `findings` array if valid and mark `"preexisting": true` (otherwise mark `"preexisting": false`) so the workflow can route it appropriately.
 8. For each verified issue, assign an accurate severity (`Critical`, `High`, `Medium`, or `Low`) strictly following `severity.md`, and formulate a concise bug title (`problem`) under 80 characters starting with a Sashiko component prefix (e.g. `workflow:`, `db:`, `reviewer:`, `toolbox:`, `api:`, `cli:`)."#;
 
 const STAGE_REPORT_INSTRUCTION: &str = r#"# Generate plain-text inline review report
 
 Generate the plain-text inline review report following the exact formatting rules and structure in `github-summary-template.md`.
 - Output ONLY a plain bulleted list of ALL findings ordered from highest severity to lowest (`- [CRITICAL] ...`, `- [HIGH] ...`, `- [MEDIUM] ...`, `- [LOW] ...`), or `No issues found.` if there are no findings.
+- If any finding has `"preexisting": true`, state explicitly in its explanation that the issue was not introduced by this change.
 - Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
 - Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
 
@@ -1005,13 +1006,17 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if is_preexisting {
-                    preexisting.push(concern);
+                    if state.report_preexisting {
+                        new_concerns.push(concern);
+                    } else {
+                        preexisting.push(concern);
+                    }
                 } else {
                     new_concerns.push(concern);
                 }
             }
             state.patch_concerns = new_concerns;
-            state.concerns = preexisting;
+            state.concerns.extend(preexisting);
         })
         .build()
 }
@@ -1065,10 +1070,14 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
                         "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
                         "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
                         "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
+                        "severity": finding.get("severity").and_then(|v| v.as_str()).unwrap_or("Unknown"),
                         "preexisting": true,
                         "locations": finding.get("locations").cloned().unwrap_or(json!([])),
                     });
                     state.concerns.push(concern);
+                    if state.report_preexisting {
+                        new_findings.push(finding);
+                    }
                 } else {
                     new_findings.push(finding);
                 }
@@ -1414,6 +1423,31 @@ mod tests {
             "db: pre-existing missing index on patches table"
         );
         assert_eq!(state.concerns[0]["preexisting"], true);
+
+        // When report_preexisting is true, the verified pre-existing finding is also retained in findings,
+        // and state.concerns appends without clearing earlier items.
+        let mut state_with_preexisting = SashikoPatchReviewState {
+            report_preexisting: true,
+            patch_concerns: vec![json!({"description": "candidate"})],
+            concerns: vec![json!({"description": "earlier concern", "preexisting": true})],
+            ..Default::default()
+        };
+        stage
+            .execute(&env, &mut state_with_preexisting, None)
+            .await
+            .unwrap();
+        assert_eq!(state_with_preexisting.findings.len(), 2);
+        assert_eq!(state_with_preexisting.findings[0]["preexisting"], true);
+        assert_eq!(state_with_preexisting.findings[1]["preexisting"], false);
+        assert_eq!(state_with_preexisting.concerns.len(), 2);
+        assert_eq!(
+            state_with_preexisting.concerns[0]["description"],
+            "earlier concern"
+        );
+        assert_eq!(
+            state_with_preexisting.concerns[1]["description"],
+            "db: pre-existing missing index on patches table"
+        );
     }
 
     #[test]

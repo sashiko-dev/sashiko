@@ -54,6 +54,8 @@ pub struct LinuxPatchReviewState {
     pub planned_stages: Vec<String>,
     /// Skip plain-text report and summary generation stages (e.g. in `--agent` mode).
     pub skip_report: bool,
+    /// Retain pre-existing concerns through verification and inline report generation.
+    pub report_preexisting: bool,
 
     /// Aggregated raw concerns collected from the analysis stages.
     pub all_concerns: Vec<Value>,
@@ -263,7 +265,7 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 3. SERIES VALIDATION RULE: If follow-up patches in this series are provided in the context, check if each identified concern is resolved or fixed in the final state of the series. If the problem has been resolved, fixed, or the code was rewritten in a subsequent patch in this series, you MUST discard the concern and NOT report it as a finding. You MUST verify this by checking the actual code at the end of the series using tools; do not trust promises or claims in commit messages.
 4. When referring to other patches within this series in your explanation, DO NOT use git hashes (they are ephemeral/unstable). Instead, refer to them by their patch subject (e.g., 'commit "mm: fix allocation"'). Existing historical commits in the tree should still be referenced by their standard hash.
 5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
-6. If the problem is determined to have already existed in the code before the patch was applied, mark `"preexisting": true`. Pre-existing issues will be routed to a dedicated pipeline and separate review.
+6. If the problem is determined to have already existed in the code before the patch was applied, mark `"preexisting": true` (otherwise mark `"preexisting": false`). When validating a pre-existing concern, still include it in `findings` with `"preexisting": true` if it is a valid defect (discarding false positives).
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
 8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown."#;
 
@@ -273,7 +275,9 @@ You are an automated review bot generating a report for the Linux Kernel Mailing
 
 Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
 
-SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition."#;
+SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition.
+
+PRE-EXISTING ISSUES: If any finding has `"preexisting": true`, include it in the report and state explicitly at the start of its comment that the problem was not introduced by this patch (for example: "This problem wasn't introduced by this patch, but...")."#;
 
 const STAGE_JSON_SCHEMA_EXAMPLE: &str = r#"
 TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
@@ -1149,14 +1153,14 @@ Example Output:
                     .get("preexisting")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if is_preexisting {
+                if is_preexisting && !state.report_preexisting {
                     preexisting.push(concern);
                 } else {
                     new_concerns.push(concern);
                 }
             }
             state.patch_concerns = new_concerns;
-            state.concerns = preexisting;
+            state.concerns.extend(preexisting);
         })
         .build()
 }
@@ -1232,10 +1236,14 @@ Example Output:
                         "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
                         "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
                         "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
+                        "severity": finding.get("severity").and_then(|v| v.as_str()).unwrap_or("Unknown"),
                         "preexisting": true,
                         "locations": finding.get("locations").cloned().unwrap_or(json!([])),
                     });
                     state.concerns.push(concern);
+                    if state.report_preexisting {
+                        new_findings.push(finding);
+                    }
                 } else {
                     new_findings.push(finding);
                 }
@@ -1743,6 +1751,67 @@ mod tests {
         assert_eq!(state.concerns[1]["reasoning"], "Old leak");
         assert_eq!(state.findings.len(), 1);
         assert_eq!(state.findings[0]["problem"], "new regression");
+    }
+
+    #[test]
+    fn test_report_preexisting_keeps_preexisting_through_conflict_resolution_and_verification() {
+        let cr_stage = conflict_resolution_stage(20, 0.0);
+        let ver_stage = verification_stage(20, 0.0);
+
+        let mut state = LinuxPatchReviewState {
+            report_preexisting: true,
+            ..Default::default()
+        };
+
+        let cr_output = ConflictResolutionOutput {
+            concerns: vec![
+                json!({
+                    "type": "Pre-existing Race",
+                    "description": "Old race condition",
+                    "reasoning": "Missing lock",
+                    "preexisting": true,
+                    "locations": [{"file": "net/foo.c", "function_or_symbol": "foo_tx", "line": 42, "code_snippet": "x++;", "why_this_location_matters": "unlocked"}]
+                }),
+                json!({
+                    "type": "Pre-existing False Positive",
+                    "description": "Disproved later",
+                    "reasoning": "Suspected leak",
+                    "preexisting": true,
+                    "locations": []
+                }),
+            ],
+        };
+
+        (cr_stage.reducer)(&mut state, cr_output);
+        // Both pre-existing concerns are routed into patch_concerns so verification runs,
+        // without populating state.concerns before verification completes.
+        assert_eq!(state.patch_concerns.len(), 2);
+        assert_eq!(state.concerns.len(), 0);
+
+        let ver_output = VerificationOutput {
+            findings: vec![json!({
+                "problem": "net: unlocked access in foo_tx()",
+                "severity": "High",
+                "severity_explanation": "foo_tx() mutates x without holding foo_lock",
+                "preexisting": true,
+                "locations": [{"file": "net/foo.c", "function_or_symbol": "foo_tx", "line": 42, "code_snippet": "x++;", "why_this_location_matters": "unlocked"}]
+            })],
+        };
+
+        (ver_stage.reducer)(&mut state, ver_output);
+        // Only the verified pre-existing finding is appended to both findings (for report_stage) and concerns.
+        assert_eq!(state.findings.len(), 1);
+        assert_eq!(
+            state.findings[0]["problem"],
+            "net: unlocked access in foo_tx()"
+        );
+        assert_eq!(state.findings[0]["preexisting"], true);
+        assert_eq!(state.concerns.len(), 1);
+        assert_eq!(
+            state.concerns[0]["description"],
+            "net: unlocked access in foo_tx()"
+        );
+        assert_eq!(state.concerns[0]["severity"], "High");
     }
 
     #[test]

@@ -43,8 +43,9 @@ Run `sashiko review` from inside your Linux kernel checkout:
 # Review the latest commit
 sashiko review
 
-# Review a range of commits
+# Review a range of commits (pass --report-preexisting to also report pre-existing bugs)
 sashiko review HEAD~3..HEAD
+sashiko review --report-preexisting
 ```
 
 Local review uses a temporary scratch clone for patch application, leaving your working tree and git metadata untouched.

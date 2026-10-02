@@ -91,6 +91,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: false,
+                report_preexisting: false,
             },
         );
         worker

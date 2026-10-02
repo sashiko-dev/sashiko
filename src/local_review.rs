@@ -51,6 +51,7 @@ pub struct WorkerOptions {
     pub scratch_clone: bool,
     pub current_tree: bool,
     pub agent: bool,
+    pub report_preexisting: bool,
 }
 
 impl Default for WorkerOptions {
@@ -72,6 +73,7 @@ impl Default for WorkerOptions {
             scratch_clone: false,
             current_tree: false,
             agent: false,
+            report_preexisting: false,
         }
     }
 }
@@ -87,6 +89,7 @@ pub struct ReviewOptions {
     pub custom_prompt: Option<String>,
     pub stages: Option<Vec<String>>,
     pub agent: bool,
+    pub report_preexisting: bool,
 }
 
 impl Default for ReviewOptions {
@@ -101,6 +104,7 @@ impl Default for ReviewOptions {
             custom_prompt: None,
             stages: None,
             agent: false,
+            report_preexisting: false,
         }
     }
 }
@@ -278,6 +282,7 @@ pub async fn run_git_review(
             stages: options.stages,
             current_tree: true,
             agent: options.agent,
+            report_preexisting: options.report_preexisting,
             ..WorkerOptions::default()
         },
         Some(repo_path),
@@ -628,6 +633,7 @@ async fn review_single_patch(
                 baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
                 skip_report: options.agent,
+                report_preexisting: options.report_preexisting,
             },
         );
 

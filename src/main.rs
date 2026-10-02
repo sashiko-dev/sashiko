@@ -131,7 +131,7 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
 
-        /// Show candidate pre-existing concerns in text output
+        /// Verify and report pre-existing bugs in the touched code
         #[arg(long)]
         report_preexisting: bool,
 
@@ -218,6 +218,10 @@ enum Commands {
         /// Agent mode: skip plain-text report generation
         #[arg(long, hide = true)]
         agent: bool,
+
+        /// Include pre-existing bugs in verification and report generation
+        #[arg(long, hide = true)]
+        report_preexisting: bool,
     },
 }
 
@@ -357,6 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 custom_prompt,
                 stages,
                 agent,
+                report_preexisting,
             } => {
                 std::panic::set_hook(Box::new(|info| {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
@@ -379,6 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scratch_clone: false,
                     current_tree: false,
                     agent: *agent,
+                    report_preexisting: *report_preexisting,
                 })
                 .await;
 
@@ -2280,6 +2286,7 @@ async fn handle_review_command(
             custom_prompt,
             stages,
             agent,
+            report_preexisting,
         },
         Some(&progress),
     )
@@ -2345,126 +2352,80 @@ fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 fn print_review_result(
     result: &Value,
-    _input: &str,
+    input: &str,
     color_choice: ColorChoice,
+    report_preexisting: bool,
+) -> std::io::Result<()> {
+    let mut stdout = StandardStream::stdout(color_choice);
+    write_review_result(&mut stdout, result, input, report_preexisting)
+}
+
+fn write_review_result(
+    out: &mut impl WriteColor,
+    result: &Value,
+    _input: &str,
     report_preexisting: bool,
 ) -> std::io::Result<()> {
     if let Some(error) = result.get("error").and_then(|v| v.as_str())
         && !error.is_empty()
     {
-        println!();
-        print_colored(color_choice, Color::Red, "Error: ")?;
-        println!("{}", error);
+        writeln!(out)?;
+        write_colored(out, Color::Red, "Error: ")?;
+        writeln!(out, "{}", error)?;
     }
 
     let Some(review) = result.get("review") else {
         return Ok(());
     };
     let Some(findings) = review.get("findings").and_then(|v| v.as_array()) else {
-        print_colored(color_choice, Color::Green, "\nNo AI review was run.\n")?;
+        write_colored(out, Color::Green, "\nNo AI review was run.\n")?;
         return Ok(());
     };
-    let concerns = review
-        .get("concerns")
-        .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let (preexisting_findings, patch_findings): (Vec<&Value>, Vec<&Value>) =
+        findings.iter().partition(|f| is_preexisting_finding(f));
 
-    let counts = count_findings(findings);
+    let counts = count_findings_slice(&patch_findings);
     let total = counts.critical + counts.high + counts.medium + counts.low;
+    let has_preexisting = report_preexisting && !preexisting_findings.is_empty();
+
     if total == 0 && !result_has_error(result) {
-        print_colored(
-            color_choice,
+        write_colored(
+            out,
             Color::Green,
-            no_patch_findings_message(report_preexisting && !concerns.is_empty()),
+            no_patch_findings_message(has_preexisting),
         )?;
     } else if total > 0 {
-        println!("\nFindings:");
-        print!("  Critical: ");
-        print_colored(color_choice, Color::Red, &counts.critical.to_string())?;
-        print!("  High: ");
-        print_colored(color_choice, Color::Red, &counts.high.to_string())?;
-        print!("  Medium: ");
-        print_colored(color_choice, Color::Yellow, &counts.medium.to_string())?;
-        print!("  Low: ");
-        print_colored(color_choice, Color::Cyan, &counts.low.to_string())?;
-        println!("\n");
-
-        let mut grouped_findings: std::collections::BTreeMap<i64, Vec<&Value>> =
-            std::collections::BTreeMap::new();
-        let mut ungrouped_findings = Vec::new();
-
-        for finding in findings {
-            if let Some(p_idx) = finding.get("patch_index").and_then(|v| v.as_i64()) {
-                grouped_findings.entry(p_idx).or_default().push(finding);
-            } else {
-                ungrouped_findings.push(finding);
-            }
-        }
-
-        for (p_idx, patch_findings) in grouped_findings {
-            let subject = patch_findings
-                .first()
-                .and_then(|f| f.get("patch_subject"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            print!("  --- Patch [{}] ", p_idx);
-            if !subject.is_empty() {
-                print_colored(color_choice, Color::Cyan, subject)?;
-            }
-            println!(" ---");
-            for finding in patch_findings {
-                print_finding(finding, color_choice)?;
-            }
-            println!();
-        }
-
-        if !ungrouped_findings.is_empty() {
-            println!("  --- General Findings ---");
-            for finding in ungrouped_findings {
-                print_finding(finding, color_choice)?;
-            }
-        }
+        writeln!(out, "\nFindings:")?;
+        write_finding_counts(out, &counts)?;
+        write_grouped_findings(out, &patch_findings, false)?;
     }
 
-    if report_preexisting && !concerns.is_empty() {
-        println!("\nCandidate pre-existing concerns (pending separate verification):");
-        for concern in concerns {
-            let concern_type = concern.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let description = concern
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            match (concern_type.is_empty(), description.is_empty()) {
-                (false, false) if concern_type != description => {
-                    println!("  - {}: {}", concern_type, description);
-                }
-                (false, _) => println!("  - {}", concern_type),
-                (_, false) => println!("  - {}", description),
-                _ => println!("  - Unnamed pre-existing concern"),
-            }
-        }
+    if report_preexisting && !preexisting_findings.is_empty() {
+        let preexisting_counts = count_findings_slice(&preexisting_findings);
+        writeln!(out, "\nPre-existing Findings:")?;
+        write_finding_counts(out, &preexisting_counts)?;
+        write_grouped_findings(out, &preexisting_findings, true)?;
     }
 
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
         && !inline.trim().is_empty()
         && inline.trim() != "No issues found."
     {
-        println!("\nInline Review:");
+        writeln!(out, "\nInline Review:")?;
         for line in inline.lines() {
             if line.starts_with("diff ") || line.starts_with("+++") || line.starts_with("---") {
-                println!("{}", line);
+                writeln!(out, "{}", line)?;
             } else if line.starts_with('+') {
-                print_colored(color_choice, Color::Green, line)?;
-                println!();
+                write_colored(out, Color::Green, line)?;
+                writeln!(out)?;
             } else if line.starts_with('-') {
-                print_colored(color_choice, Color::Red, line)?;
-                println!();
+                write_colored(out, Color::Red, line)?;
+                writeln!(out)?;
             } else if line.starts_with("@@") {
-                print_colored(color_choice, Color::Cyan, line)?;
-                println!();
+                write_colored(out, Color::Cyan, line)?;
+                writeln!(out)?;
             } else {
-                println!("{}", line);
+                writeln!(out, "{}", line)?;
             }
         }
     }
@@ -2482,34 +2443,172 @@ fn print_review_result(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     if tokens_in > 0 || tokens_out > 0 || tokens_cached > 0 {
-        println!(
+        writeln!(
+            out,
             "\nTokens: {} in / {} out / {} cached",
             tokens_in, tokens_out, tokens_cached
-        );
+        )?;
     }
 
     Ok(())
 }
 
-fn print_finding(finding: &Value, color_choice: ColorChoice) -> std::io::Result<()> {
-    let severity = finding
-        .get("severity")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let color = match severity.to_ascii_lowercase().as_str() {
+fn write_finding_counts(out: &mut impl WriteColor, counts: &FindingCounts) -> std::io::Result<()> {
+    write!(out, "  Critical: ")?;
+    write_colored(out, Color::Red, &counts.critical.to_string())?;
+    write!(out, "  High: ")?;
+    write_colored(out, Color::Red, &counts.high.to_string())?;
+    write!(out, "  Medium: ")?;
+    write_colored(out, Color::Yellow, &counts.medium.to_string())?;
+    write!(out, "  Low: ")?;
+    write_colored(out, Color::Cyan, &counts.low.to_string())?;
+    writeln!(out, "\n")
+}
+
+fn write_grouped_findings(
+    out: &mut impl WriteColor,
+    findings: &[&Value],
+    include_details: bool,
+) -> std::io::Result<()> {
+    let mut grouped_findings: std::collections::BTreeMap<i64, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    let mut ungrouped_findings = Vec::new();
+
+    for &finding in findings {
+        if let Some(p_idx) = finding.get("patch_index").and_then(|v| v.as_i64()) {
+            grouped_findings.entry(p_idx).or_default().push(finding);
+        } else {
+            ungrouped_findings.push(finding);
+        }
+    }
+
+    for (p_idx, patch_findings) in grouped_findings {
+        let subject = patch_findings
+            .first()
+            .and_then(|f| f.get("patch_subject"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        write!(out, "  --- Patch [{}] ", p_idx)?;
+        if !subject.is_empty() {
+            write_colored(out, Color::Cyan, subject)?;
+        }
+        writeln!(out, " ---")?;
+        for finding in patch_findings {
+            write_finding(out, finding, include_details)?;
+        }
+        writeln!(out)?;
+    }
+
+    if !ungrouped_findings.is_empty() {
+        writeln!(out, "  --- General Findings ---")?;
+        for finding in ungrouped_findings {
+            write_finding(out, finding, include_details)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn severity_color(severity: &str) -> Color {
+    match severity.to_ascii_lowercase().as_str() {
         "critical" | "high" => Color::Red,
         "medium" => Color::Yellow,
         "low" => Color::Cyan,
         _ => Color::White,
-    };
+    }
+}
+
+fn write_finding(
+    out: &mut impl WriteColor,
+    finding: &Value,
+    include_details: bool,
+) -> std::io::Result<()> {
+    let severity = finding
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let color = severity_color(severity);
     let problem = finding
         .get("problem")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    print!("  ");
-    print_colored(color_choice, color, &format!("[{}] ", severity))?;
-    println!("{}", problem);
+    write!(out, "  ")?;
+    write_colored(out, color, &format!("[{}] ", severity))?;
+    writeln!(out, "{}", problem)?;
+
+    if include_details {
+        write_locations(out, finding)?;
+        if let Some(rationale) = finding
+            .get("severity_explanation")
+            .or_else(|| finding.get("reasoning"))
+            .and_then(|v| v.as_str())
+        {
+            write_indented_field(out, "Rationale", rationale)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn format_location(loc: &Value) -> Option<String> {
+    let file = loc
+        .get("file")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let line = loc.get("line").and_then(|v| v.as_i64()).filter(|&l| l > 0);
+    let symbol = loc
+        .get("function_or_symbol")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let formatted = match (line, symbol) {
+        (Some(l), Some(s)) => format!("{file}:{l} ({s})"),
+        (Some(l), None) => format!("{file}:{l}"),
+        (None, Some(s)) => format!("{file} ({s})"),
+        (None, None) => file.to_string(),
+    };
+    Some(formatted)
+}
+
+fn write_locations(out: &mut impl WriteColor, item: &Value) -> std::io::Result<()> {
+    if let Some(locations) = item.get("locations").and_then(|v| v.as_array()) {
+        let mut wrote_any = false;
+        for loc in locations {
+            if let Some(formatted) = format_location(loc) {
+                writeln!(out, "    Location: {}", formatted)?;
+                wrote_any = true;
+            }
+        }
+        if wrote_any {
+            return Ok(());
+        }
+    }
+
+    if let Some(formatted) = format_location(item) {
+        writeln!(out, "    Location: {}", formatted)?;
+    }
+    Ok(())
+}
+
+fn write_indented_field(
+    out: &mut impl WriteColor,
+    label: &str,
+    value: &str,
+) -> std::io::Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let mut lines = trimmed.lines();
+    if let Some(first) = lines.next() {
+        writeln!(out, "    {}: {}", label, first)?;
+        for line in lines {
+            writeln!(out, "      {}", line)?;
+        }
+    }
     Ok(())
 }
 
@@ -2529,16 +2628,16 @@ fn no_patch_findings_message(report_preexisting: bool) -> &'static str {
     }
 }
 
-fn count_findings(findings: &[Value]) -> FindingCounts {
+fn is_preexisting_finding(finding: &Value) -> bool {
+    finding
+        .get("preexisting")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn count_findings_slice(findings: &[&Value]) -> FindingCounts {
     let mut counts = FindingCounts::default();
     for finding in findings {
-        if finding
-            .get("preexisting")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            continue;
-        }
         match finding
             .get("severity")
             .and_then(|v| v.as_str())
@@ -2556,11 +2655,10 @@ fn count_findings(findings: &[Value]) -> FindingCounts {
     counts
 }
 
-fn print_colored(color_choice: ColorChoice, color: Color, text: &str) -> std::io::Result<()> {
-    let mut stdout = StandardStream::stdout(color_choice);
-    stdout.set_color(ColorSpec::new().set_fg(Some(color)))?;
-    write!(&mut stdout, "{}", text)?;
-    stdout.reset()
+fn write_colored(out: &mut impl WriteColor, color: Color, text: &str) -> std::io::Result<()> {
+    out.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    write!(out, "{}", text)?;
+    out.reset()
 }
 
 fn eprint_colored(color_choice: ColorChoice, color: Color, text: &str) -> std::io::Result<()> {
@@ -3379,6 +3477,75 @@ mod tests {
             "\nNo patch-introduced issues found.\n"
         );
     }
+
+    #[test]
+    fn write_review_result_renders_verified_preexisting_findings_and_inline_report() {
+        let result = serde_json::json!({
+            "review": {
+                "findings": [
+                    {
+                        "patch_index": 1,
+                        "patch_subject": "hwmon: (nct6775) clean up probe",
+                        "problem": "hwmon: nct6775: missing mutex unlock on error path in nct6775_probe()",
+                        "severity": "High",
+                        "severity_explanation": "data->update_lock is acquired before superio_select() and not released if it returns -ENODEV.",
+                        "preexisting": true,
+                        "locations": [
+                            {
+                                "file": "drivers/hwmon/nct6775-core.c",
+                                "line": 412,
+                                "function_or_symbol": "nct6775_probe"
+                            }
+                        ]
+                    }
+                ],
+                "concerns": [
+                    {
+                        "type": "hwmon: nct6775: missing mutex unlock on error path in nct6775_probe()",
+                        "description": "hwmon: nct6775: missing mutex unlock on error path in nct6775_probe()",
+                        "reasoning": "data->update_lock is acquired before superio_select() and not released if it returns -ENODEV.",
+                        "severity": "High",
+                        "preexisting": true,
+                        "locations": [
+                            {
+                                "file": "drivers/hwmon/nct6775-core.c",
+                                "line": 412,
+                                "function_or_symbol": "nct6775_probe"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "inline_review": "Commit: abc123456789\nSubject: hwmon: (nct6775) clean up probe\n\n> \tmutex_lock(&data->update_lock);\n> \tret = superio_select(sio_data);\n> \tif (ret)\n> \t\treturn ret;\n\nThis problem wasn't introduced by this patch, but nct6775_probe() returns\nwithout unlocking data->update_lock when superio_select() fails.",
+            "tokens_in": 1000,
+            "tokens_out": 200,
+            "tokens_cached": 500
+        });
+
+        let mut buf = Buffer::no_color();
+        write_review_result(&mut buf, &result, "HEAD", true).unwrap();
+        let output = String::from_utf8(buf.into_inner()).unwrap();
+
+        assert!(output.contains("No patch-introduced issues found."));
+        assert!(output.contains("Pre-existing Findings:"));
+        assert!(output.contains("Critical: 0  High: 1  Medium: 0  Low: 0"));
+        assert!(output.contains(
+            "[High] hwmon: nct6775: missing mutex unlock on error path in nct6775_probe()"
+        ));
+        assert!(output.contains("Location: drivers/hwmon/nct6775-core.c:412 (nct6775_probe)"));
+        assert!(output.contains(
+            "Rationale: data->update_lock is acquired before superio_select() and not released if it returns -ENODEV."
+        ));
+        assert!(output.contains("Inline Review:"));
+        assert!(output.contains("This problem wasn't introduced by this patch, but"));
+
+        let mut default_buf = Buffer::no_color();
+        write_review_result(&mut default_buf, &result, "HEAD", false).unwrap();
+        let default_output = String::from_utf8(default_buf.into_inner()).unwrap();
+        assert!(default_output.contains("\nNo issues found.\n"));
+        assert!(!default_output.contains("Pre-existing Findings:"));
+    }
+
     use termcolor::Buffer;
 
     /// The terminfo entry for `term`, where this machine has one.
