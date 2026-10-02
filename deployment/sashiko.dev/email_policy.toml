@@ -33,6 +33,7 @@ send_positive_review = true
 
 [subsystems.batman]
 lists = ["b.a.t.m.a.n@lists.open-mesh.org"]
+reply_to_author = true
 cc = ["marek.lindner@mailbox.org", "sw@simonwunderlich.de", "antonio@mandelbit.com", "sven@narfation.org"]
 
 [subsystems.bpf]
