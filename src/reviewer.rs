@@ -22,7 +22,7 @@ use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_fi
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
-use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
+use crate::git_ops::{GitWorktree, PatchApplyFailure, ensure_remote, get_commit_hash};
 use crate::prerequisites::{PrerequisitePatch, resolve_prerequisites_from_lore};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
@@ -1488,8 +1488,14 @@ impl Reviewer {
                     };
 
                     // Try git am
-                    if (worktree.apply_patch(&mbox).await).is_ok() {
-                        applied = true;
+                    match worktree.apply_patch(&mbox).await {
+                        Ok(()) => applied = true,
+                        Err(e) => {
+                            apply_logs.push_str(&format!(
+                                "Patch application error: {}\n",
+                                PatchApplyFailure::from_error(&e).public_message()
+                            ));
+                        }
                     }
                 }
 
@@ -4135,6 +4141,80 @@ fi
             .collect()
     }
 
+    async fn assert_baseline_failure_log(
+        ctx: &ReviewContext,
+        diff: &str,
+        expected_message: &str,
+    ) -> Result<()> {
+        let mut patches = one_patch(diff);
+        patches[0].3 =
+            "[PATCH] test https://test-user:test-password@example.com/?key=stdout-secret"
+                .to_string();
+
+        let (chosen, patch_commits, logs) = Reviewer::prepare_baseline_worktree(
+            ctx,
+            1,
+            &[BaselineResolution::LocalRef("origin/master".to_string())],
+            &patches,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(chosen.is_none());
+        assert!(patch_commits.is_empty());
+        let attempts: Vec<Value> = serde_json::from_str(&logs)?;
+        let baseline = run_git(
+            Path::new(&ctx.settings.git.repository_path),
+            &["rev-parse", "origin/master"],
+        )?;
+        assert_eq!(
+            attempts,
+            vec![json!({
+                "baseline": format!("origin/master ({baseline})"),
+                "status": "Failed",
+                "log": format!(
+                    "Trying baseline: origin/master ({baseline})\n\
+                     Patch application error: {expected_message}\n\
+                     Patch 1/1 (ID: 1) failed to apply.\n\
+                     Application failed.\n"
+                ),
+            })]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prepare_baseline_logs_only_classified_git_am_errors() -> Result<()> {
+        let root = tempdir()?;
+        let repo = stale_head_fixture(root.path());
+        let ctx = stale_head_context(root.path(), &repo).await?;
+        let diff = "diff --git a/missing-token=stderr-secret.txt b/missing-token=stderr-secret.txt\n\
+                    --- a/missing-token=stderr-secret.txt\n\
+                    +++ b/missing-token=stderr-secret.txt\n\
+                    @@ -1 +1 @@\n-old\n+new\n";
+        assert_baseline_failure_log(&ctx, diff, "A required file is missing from the index.").await
+    }
+
+    #[tokio::test]
+    async fn test_prepare_baseline_unknown_errors_do_not_publish_output() -> Result<()> {
+        let root = tempdir()?;
+        let repo = stale_head_fixture(root.path());
+        let ctx = stale_head_context(root.path(), &repo).await?;
+        let hook = repo.join(".git/hooks/applypatch-msg");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s\\n' 'private stdout'\n\
+             printf '%s\\n' 'private stderr <script>example</script>' >&2\nexit 1\n",
+        )?;
+        std::fs::set_permissions(&hook, Permissions::from_mode(0o755))?;
+        let diff = "diff --git a/mainline.txt b/mainline.txt\n\
+                    --- a/mainline.txt\n\
+                    +++ b/mainline.txt\n\
+                    @@ -1 +1 @@\n-new\n+newer\n";
+        assert_baseline_failure_log(&ctx, diff, "Unrecognized patch application failure.").await
+    }
+
     #[tokio::test]
     async fn test_merged_default_head_is_tried_after_mainline() -> Result<()> {
         // tytso/ext4.git: HEAD is a master mainline passed years ago,
@@ -4199,6 +4279,17 @@ fi
                 ("stale/HEAD".to_string(), "Applied".to_string()),
             ]
         );
+        let attempts: Vec<Value> = serde_json::from_str(&logs)?;
+        let failed_log = attempts[1]["log"].as_str().unwrap();
+        assert!(
+            failed_log.contains("Patch application error: Patch context does not match.\n"),
+            "{failed_log}"
+        );
+        assert!(!failed_log.contains("mainline.txt"));
+        assert!(!failed_log.contains("git am failed"));
+        let applied_log = attempts[2]["log"].as_str().unwrap();
+        assert!(applied_log.ends_with("Application successful.\n"));
+        assert!(!applied_log.contains("Patch application error:"));
         worktree.remove().await?;
         Ok(())
     }

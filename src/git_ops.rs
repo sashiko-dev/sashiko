@@ -23,6 +23,10 @@ use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
+mod apply_error;
+use apply_error::GitAmError;
+pub use apply_error::PatchApplyFailure;
+
 pub const GIT_PROTOCOL_RESTRICTIONS: &[&str] = &[
     "-c",
     "protocol.allow=never",
@@ -187,6 +191,7 @@ impl GitWorktree {
         info!("Applying patch in {:?}", self.path);
 
         let mut child = crate::git_cmd::in_dir_async(&self.path)
+            .env("LC_ALL", "C")
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
             .env("GIT_COMMITTER_NAME", "Sashiko Bot")
@@ -214,11 +219,7 @@ impl GitWorktree {
                 .output()
                 .await;
 
-            return Err(anyhow!(
-                "git am failed. stdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            return Err(GitAmError::new(&output.stdout, &output.stderr).into());
         }
 
         Ok(())
@@ -1956,6 +1957,57 @@ mod tests {
         assert!(err_msg.contains("stderr:"));
         assert!(err_msg.contains("git am failed"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_classifies_failures_and_aborts() -> Result<()> {
+        let repo = commit_resolution_repo().await?;
+        let head = get_commit_hash(repo.path(), "HEAD").await?;
+        let worktree = GitWorktree::new(repo.path(), &head, None).await?;
+
+        for (diff, expected) in [
+            (
+                "diff --git a/missing.txt b/missing.txt\n--- a/missing.txt\n+++ b/missing.txt\n@@ -1 +1 @@\n-old\n+new\n",
+                PatchApplyFailure::MissingFile,
+            ),
+            (
+                "diff --git a/value.txt b/value.txt\nnew file mode 100644\n--- /dev/null\n+++ b/value.txt\n@@ -0,0 +1 @@\n+new\n",
+                PatchApplyFailure::ExistingFile,
+            ),
+            (
+                "diff --git a/value.txt b/value.txt\n--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-other\n+new\n",
+                PatchApplyFailure::ContextMismatch,
+            ),
+            (
+                "diff --git a/value.txt b/value.txt\n--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n",
+                PatchApplyFailure::MalformedPatch,
+            ),
+            (
+                "---\n@@ -1 +1 @@\n-base\n+new\n",
+                PatchApplyFailure::MalformedPatch,
+            ),
+            ("", PatchApplyFailure::EmptyPatch),
+        ] {
+            let mbox = format!(
+                "From: Test User <test@example.com>\n\
+                 Date: Tue, 14 Nov 2023 22:13:20 +0000\n\
+                 Subject: [PATCH] example\n\n{diff}"
+            );
+            let error = worktree.apply_patch(&mbox).await.unwrap_err();
+            assert_eq!(PatchApplyFailure::from_error(&error), expected, "{error:#}");
+            assert!(error.to_string().contains("git am failed. stdout:"));
+            assert!(error.to_string().contains("stderr:"));
+            assert_eq!(get_commit_hash(&worktree.path, "HEAD").await?, head);
+            assert_eq!(
+                std::fs::read_to_string(worktree.path.join("value.txt"))?,
+                "base\n"
+            );
+            let am_state =
+                run_test_git(&worktree.path, &["rev-parse", "--git-path", "rebase-apply"]).await?;
+            assert!(!worktree.path.join(am_state).exists());
+        }
+        worktree.remove().await?;
         Ok(())
     }
 
