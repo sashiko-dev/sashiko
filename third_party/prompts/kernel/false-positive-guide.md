@@ -65,6 +65,35 @@ Do not confuse **mandatory kernel API error-handling** with "defensive programmi
 - **No speculative driver/caller footguns**: Do not report that a new or refactored internal helper could fail if a hypothetical or out-of-tree caller passes an invalid argument (e.g., a stack-allocated array where a persistent array is required, a tail page where an order-0 page or head page is required, `nr_pages = 0` or an overflowing `nr_pages`, or a current-EL syndrome to a lower-EL trap helper) unless a caller in the patch series actually violates the contract.
 - **Internal API contract `WARN_ON_ONCE` / `VM_WARN_ON_ONCE`**: Do not report `WARN_ON_ONCE()` or `VM_WARN_ON_ONCE()` checks that enforce kernel driver API contracts as user-triggerable `panic_on_warn` Denial-of-Service bugs unless you can prove an actual in-tree driver violates the contract on a user-reachable path.
 
+### 2.1 Symbol Existence and Linkage Claims
+**Before reporting** that a newly referenced function, macro, type, or global is
+undefined or does not exist:
+
+1. Search for the exact identifier across the full review worktree, not only
+   the files touched by the patch. Read the complete `git_grep` summary and all
+   relevant matches before drawing a conclusion.
+2. Inspect matching declarations, definitions, and exports. A declaration in a
+   header or a definition outside the patched subsystem disproves a claim that
+   the symbol does not exist.
+3. Distinguish three different failures: a missing include or declaration at
+   the call site, a definition excluded by Kconfig or Makefile conditions, and
+   a definition that is unavailable across a module boundary. Do not turn one
+   into a generic "undefined symbol" claim.
+4. For a configuration-dependent finding, name the exact configuration and
+   build/link path that excludes the required definition while compiling the
+   new reference.
+
+If the source search is unavailable, fails, or is incomplete, that is not
+evidence that the identifier is absent. Do not report nonexistence as fact
+without a successful whole-tree search and the concrete declaration/build
+analysis above.
+
+*Output Verification:*
+- Exact identifier searched: [ identifier ]
+- Declaration/definition/export matches: [ locations or "none in complete search" ]
+- Relevant include, Kconfig, Makefile, and module boundary: [ evidence ]
+- Proven failure mode: [ compile, link, module load, or "no failure proven" ]
+
 ### 3. Unverifiable Assumptions
 **Assume the author is wrong** and require proof they are correct
 - Untrusted sources (network/user) always need concrete proof of correctness
