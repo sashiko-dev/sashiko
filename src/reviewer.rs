@@ -3288,8 +3288,6 @@ mod tests {
     use crate::settings::Settings;
     use async_trait::async_trait;
     use std::collections::HashSet;
-    use std::fs::Permissions;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -3678,8 +3676,7 @@ mod tests {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
-        std::fs::write(&bin_path, mock_script)?;
-        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+        crate::test_support::write_executable_script(&bin_path, mock_script);
 
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
@@ -3766,8 +3763,7 @@ read -r ai_response
 echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 "#;
 
-        std::fs::write(&bin_path, mock_script)?;
-        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+        crate::test_support::write_executable_script(&bin_path, mock_script);
 
         // Setup Sashiko dependencies
         let mut settings = Settings::new()?;
@@ -3931,8 +3927,7 @@ read -r input
 sleep 30
 "#;
 
-        std::fs::write(&bin_path, mock_script)?;
-        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+        crate::test_support::write_executable_script(&bin_path, mock_script);
 
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
@@ -4202,12 +4197,11 @@ fi
         let repo = stale_head_fixture(root.path());
         let ctx = stale_head_context(root.path(), &repo).await?;
         let hook = repo.join(".git/hooks/applypatch-msg");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &hook,
             "#!/bin/sh\nprintf '%s\\n' 'private stdout'\n\
              printf '%s\\n' 'private stderr <script>example</script>' >&2\nexit 1\n",
-        )?;
-        std::fs::set_permissions(&hook, Permissions::from_mode(0o755))?;
+        );
         let diff = "diff --git a/mainline.txt b/mainline.txt\n\
                     --- a/mainline.txt\n\
                     +++ b/mainline.txt\n\
@@ -4541,8 +4535,7 @@ read -r ai_response
 sleep 1  # make less sensitive to race condition
 echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 "#;
-        std::fs::write(&bin_path, mock_script)?;
-        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+        crate::test_support::write_executable_script(&bin_path, mock_script);
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;

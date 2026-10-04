@@ -56,6 +56,8 @@ pub mod reviewer;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod settings;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod toolbox;
 pub mod utils;
 pub mod worker;

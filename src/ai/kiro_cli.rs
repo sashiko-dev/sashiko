@@ -326,7 +326,7 @@ mod tests {
     async fn test_generate_content_with_fake_acp_server() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = tmp.path().join("fake-kiro-cli");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake,
             r#"#!/bin/sh
 i=0
@@ -343,14 +343,7 @@ while IFS= read -r line; do
   i=$((i + 1))
 done
 "#,
-        )
-        .unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
 
         let provider = KiroCliProvider {
             model: "test".to_string(),
@@ -371,7 +364,7 @@ done
         // client always reaches the read and reports the exit. Letting it
         // exit on a timer instead lets a loaded machine turn the write into
         // a broken pipe and report that instead.
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake,
             r#"#!/bin/sh
 printf '%s\n' 'authentication failed token=abc123' >&2
@@ -379,14 +372,7 @@ IFS= read -r line
 sleep 0.1
 exit 2
 "#,
-        )
-        .unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
 
         let provider = KiroCliProvider {
             model: "test".to_string(),

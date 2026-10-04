@@ -472,7 +472,7 @@ mod tests {
     /// Fake ACP agent: replies to initialize, session/new and session/prompt.
     fn fake_goose(dir: &std::path::Path) -> std::path::PathBuf {
         let fake = dir.join("fake-goose");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake,
             r#"#!/bin/sh
 i=0
@@ -489,15 +489,7 @@ while IFS= read -r line; do
   i=$((i + 1))
 done
 "#,
-        )
-        .unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
+        );
         fake
     }
 
@@ -522,7 +514,7 @@ done
         // client always reaches the read and reports the exit. Letting it
         // exit on a timer instead lets a loaded machine turn the write into
         // a broken pipe and report that instead.
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake,
             r#"#!/bin/sh
 printf '%s\n' 'provider rejected request api_key=abc123' >&2
@@ -530,14 +522,7 @@ IFS= read -r line
 sleep 0.1
 exit 2
 "#,
-        )
-        .unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
 
         let provider = test_provider(&fake.to_string_lossy(), "openai");
         let err = provider
