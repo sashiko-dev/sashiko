@@ -19,6 +19,16 @@ mod tests {
     use std::path::PathBuf;
     use tokio::runtime::Runtime;
 
+    /// The number of lines in a page git_show returns for a line range.
+    ///
+    /// Not str::lines: the page is its lines joined with '\n', so one that
+    /// ends on a blank line ends in '\n', and lines() does not count a blank
+    /// last line. These tests page through this repository's own README, so
+    /// which line is blank changes with every edit to it.
+    fn page_line_count(page: &str) -> usize {
+        page.split('\n').count()
+    }
+
     fn get_test_paths() -> (PathBuf, PathBuf) {
         let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         // Use current repo as the test repo
@@ -216,7 +226,7 @@ mod tests {
 
         assert_eq!(start_line, 1);
         assert_eq!(end_line, 5);
-        let lines_count = content.lines().count();
+        let lines_count = page_line_count(content);
         assert_eq!(lines_count, 5);
     }
 
@@ -237,7 +247,7 @@ mod tests {
 
         assert_eq!(start_line, 10);
         assert_eq!(end_line, 110);
-        let lines_count = content.lines().count();
+        let lines_count = page_line_count(content);
         assert_eq!(lines_count, 101); // 10 to 110 inclusive is 101 lines
     }
 
