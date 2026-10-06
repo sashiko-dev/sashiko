@@ -893,6 +893,132 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+/// Remote Model Context Protocol servers whose tools review stages may call.
+///
+/// Empty by default: with no servers, no MCP traffic happens and no tools are
+/// added. See designs/DESIGN_MCP_CLIENT_TOOLS.md.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct McpSettings {
+    #[serde(default)]
+    pub servers: Vec<McpServerSettings>,
+}
+
+/// One remote MCP server reached over the Streamable HTTP transport.
+///
+/// Tool calls send model-chosen arguments, which can carry patch text, to this
+/// server, so only configure servers trusted with the code under review.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerSettings {
+    /// Short identifier: lowercase letters, digits and '_'. Tools appear to
+    /// the model as mcp_<name>_<tool>.
+    pub name: String,
+    /// The server's MCP endpoint. Plain http is accepted only for loopback.
+    pub url: String,
+    /// Environment variable holding a bearer token, if the server needs one.
+    /// The token itself never goes in the settings file.
+    pub bearer_token_env: Option<String>,
+    /// The server tools that may be exposed. Required and not empty, so a
+    /// server that later adds a tool does not silently widen what the model
+    /// can call.
+    pub allowed_tools: Vec<String>,
+    /// Review stages that see this server's tools.
+    #[serde(default = "default_mcp_stages")]
+    pub stages: Vec<String>,
+    /// One line added to the system prompt of those stages, describing when
+    /// to use the tools.
+    pub prompt_hint: Option<String>,
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Cap on the text of a single tool result.
+    #[serde(default = "default_mcp_max_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+fn default_mcp_stages() -> Vec<String> {
+    vec!["hardware".to_string()]
+}
+
+fn default_mcp_timeout_secs() -> u64 {
+    30
+}
+
+fn default_mcp_max_output_bytes() -> usize {
+    32 * 1024
+}
+
+/// Longest server name, which keeps mcp_<name>_<tool> within the 64 bytes
+/// providers accept for a tool name.
+const MCP_SERVER_NAME_MAX: usize = 16;
+
+impl McpSettings {
+    /// Rejects settings that cannot work or would widen what the model can
+    /// reach, so a typo fails at startup rather than mid-review.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut names = std::collections::HashSet::new();
+        for server in &self.servers {
+            server.validate()?;
+            if !names.insert(server.name.as_str()) {
+                return Err(format!("mcp.servers: duplicate name {:?}", server.name));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl McpServerSettings {
+    fn validate(&self) -> Result<(), String> {
+        let name_ok = !self.name.is_empty()
+            && self.name.len() <= MCP_SERVER_NAME_MAX
+            && self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !name_ok {
+            return Err(format!(
+                "mcp.servers: name {:?} must be 1-{} lowercase letters, digits or '_'",
+                self.name, MCP_SERVER_NAME_MAX
+            ));
+        }
+        let ctx = format!("mcp.servers {:?}", self.name);
+        if !is_acceptable_mcp_url(&self.url) {
+            return Err(format!(
+                "{}: url must be https, or http to a loopback host",
+                ctx
+            ));
+        }
+        if self.allowed_tools.is_empty() {
+            return Err(format!("{}: allowed_tools must not be empty", ctx));
+        }
+        if self.stages.is_empty() {
+            return Err(format!("{}: stages must not be empty", ctx));
+        }
+        if self.timeout_secs == 0 || self.max_output_bytes == 0 {
+            return Err(format!(
+                "{}: timeout_secs and max_output_bytes must be positive",
+                ctx
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_acceptable_mcp_url(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return url.len() > "https://".len();
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -989,6 +1115,8 @@ pub struct Settings {
     pub review: ReviewSettings,
     #[serde(default, alias = "bugs")]
     pub linux_bug: LinuxBugSettings,
+    #[serde(default)]
+    pub mcp: McpSettings,
 }
 
 /// What a command line can say that a settings file says too.
@@ -1172,7 +1300,9 @@ impl Settings {
             .add_source(Environment::with_prefix("SASHIKO").separator("__"))
             .build()?;
 
-        s.try_deserialize()
+        let settings: Self = s.try_deserialize()?;
+        settings.mcp.validate().map_err(ConfigError::Message)?;
+        Ok(settings)
     }
 
     pub fn local_review_path() -> PathBuf {
@@ -1786,5 +1916,76 @@ mod tests {
         assert!(custom.fix_check_enabled);
         assert_eq!(custom.fix_check_interval_seconds, 3600);
         assert_eq!(custom.fix_check_batch_size, 20);
+    }
+
+    fn mcp_server(toml_body: &str) -> Result<(), String> {
+        let mcp: McpSettings = toml::from_str(toml_body).map_err(|e| e.to_string())?;
+        mcp.validate()
+    }
+
+    #[test]
+    fn test_mcp_settings_default_to_no_servers() {
+        assert!(McpSettings::default().servers.is_empty());
+        let settings = Settings::new().unwrap();
+        assert!(settings.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_server_settings_fill_defaults() {
+        let mcp: McpSettings = toml::from_str(
+            "[[servers]]\nname = \"docs\"\nurl = \"https://mcp.example.com/mcp\"\nallowed_tools = [\"search\"]\n",
+        )
+        .unwrap();
+        mcp.validate().unwrap();
+        let server = &mcp.servers[0];
+        assert_eq!(server.stages, ["hardware"]);
+        assert_eq!(server.timeout_secs, 30);
+        assert_eq!(server.max_output_bytes, 32 * 1024);
+        assert!(server.bearer_token_env.is_none());
+        assert!(server.prompt_hint.is_none());
+    }
+
+    #[test]
+    fn test_mcp_server_settings_reject_unsafe_or_broken_servers() {
+        let ok = "allowed_tools = [\"t\"]";
+        let case = |name: &str, url: &str, rest: &str| {
+            mcp_server(&format!(
+                "[[servers]]\nname = \"{name}\"\nurl = \"{url}\"\n{rest}\n"
+            ))
+        };
+        assert!(case("docs", "https://x.example/mcp", ok).is_ok());
+        assert!(case("docs", "http://127.0.0.1:8080/mcp", ok).is_ok());
+        assert!(case("docs", "http://[::1]:8080/mcp", ok).is_ok());
+        // Plain http to a remote host would send the token in the clear.
+        assert!(case("docs", "http://x.example/mcp", ok).is_err());
+        assert!(case("docs", "ftp://x.example/mcp", ok).is_err());
+        assert!(case("docs", "https://", ok).is_err());
+        // Names become part of tool names.
+        assert!(case("DOCS", "https://x.example/mcp", ok).is_err());
+        assert!(case("docs-site", "https://x.example/mcp", ok).is_err());
+        assert!(case("", "https://x.example/mcp", ok).is_err());
+        assert!(case("a_very_long_server_name", "https://x.example/mcp", ok).is_err());
+        assert!(case("docs", "https://x.example/mcp", "allowed_tools = []").is_err());
+        assert!(
+            case(
+                "docs",
+                "https://x.example/mcp",
+                "allowed_tools = [\"t\"]\nstages = []"
+            )
+            .is_err()
+        );
+        assert!(
+            case(
+                "docs",
+                "https://x.example/mcp",
+                "allowed_tools = [\"t\"]\ntimeout_secs = 0"
+            )
+            .is_err()
+        );
+        assert!(case("docs", "https://x.example/mcp", "").is_err());
+
+        let duplicate = "[[servers]]\nname = \"docs\"\nurl = \"https://a.example/mcp\"\nallowed_tools = [\"t\"]\n\
+                         [[servers]]\nname = \"docs\"\nurl = \"https://b.example/mcp\"\nallowed_tools = [\"t\"]\n";
+        assert!(mcp_server(duplicate).unwrap_err().contains("duplicate"));
     }
 }

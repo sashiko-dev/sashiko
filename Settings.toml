@@ -238,5 +238,16 @@ fix_check_enabled = false
 # Maximum number of open bugs to evaluate per upstream fix check cycle.
 # fix_check_batch_size = 50
 
-
-
+# Remote MCP servers whose tools review stages may call (default: none).
+# Tool calls send model-chosen arguments, which can carry patch text, to the
+# server, so only add servers trusted with the code under review.
+# See designs/DESIGN_MCP_CLIENT_TOOLS.md.
+# [[mcp.servers]]
+# name = "docs"                       # tools appear as mcp_docs_<tool>
+# url = "https://mcp.example.com/mcp"
+# bearer_token_env = "DOCS_MCP_TOKEN"  # token read from this variable
+# allowed_tools = ["search", "read"]
+# stages = ["hardware"]               # stages that see these tools
+# prompt_hint = "Look up register definitions in the hardware documentation."
+# timeout_secs = 30
+# max_output_bytes = 32768

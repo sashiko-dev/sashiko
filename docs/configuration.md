@@ -295,6 +295,41 @@ reviews are ignored and the background bug worker is not started.
 | `fix_check_interval_seconds` | integer | `21600` | Interval in seconds between periodic upstream fix checks against the mainline tree. Set to `0` to disable periodic checks. |
 | `fix_check_batch_size` | integer | `50` | Maximum number of open bugs evaluated per upstream fix check cycle. |
 
+### `[[mcp.servers]]`
+
+Remote [Model Context Protocol](https://modelcontextprotocol.io) servers
+whose tools review stages may call, next to the built-in `git_*` tools.
+Useful for reference material that cannot be vendored into the prompts,
+such as a licensed hardware specification. With no servers configured
+(the default), nothing is contacted and no tools are added. Servers are
+reached over the Streamable HTTP transport once per review worker; a
+server that cannot be reached is logged and its tools are skipped.
+
+Tool calls send arguments chosen by the model, which can include text
+from the patch under review, to the server. Only configure servers you
+trust with the code you review.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | required | Short identifier (1-16 lowercase letters, digits or `_`). Tools are exposed to the model as `mcp_<name>_<tool>`. |
+| `url` | string | required | The server's MCP endpoint. Must be `https`, or `http` to a loopback host. |
+| `bearer_token_env` | string | none | Environment variable holding a bearer token sent as `Authorization: Bearer`. The token is never read from the settings file or logged. |
+| `allowed_tools` | array | required | Server tools that may be exposed. Must not be empty; tools the server lists but this array omits are never declared or callable. |
+| `stages` | array | `["hardware"]` | Review stages that see this server's tools (e.g. `hardware`, `verification`, `post-verification`). |
+| `prompt_hint` | string | none | One line added to the system prompt of those stages, describing when to use the tools. |
+| `timeout_secs` | integer | `30` | Timeout for each request to the server. |
+| `max_output_bytes` | integer | `32768` | Cap on the text of one tool result; longer results are truncated and marked `"truncated": true`. |
+
+```toml
+[[mcp.servers]]
+name = "docs"
+url = "https://mcp.example.com/mcp"
+bearer_token_env = "DOCS_MCP_TOKEN"
+allowed_tools = ["search", "read"]
+stages = ["hardware", "verification", "post-verification"]
+prompt_hint = "Look up register definitions in the hardware documentation."
+```
+
 ### `[subsystems]`
 
 Controls how patches and emails are categorized into subsystems for targeted reviews and specific email policies. By default, this section is empty, meaning the system relies on fallback heuristics (like identifying `@vger.kernel.org` addresses) to determine subsystems.
@@ -476,5 +511,6 @@ Downstream tools can parse this format with simple line splitting.
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
 | `SASHIKO__FORGE__WEBHOOK_SECRET` | Override webhook secret from Settings.toml. Avoids storing the secret on disk. |
 | `SASHIKO_PATCHWORK_TOKEN` | Patchwork API token. Fills in `patchwork.token` for enabled subsystems that have `api_url` set but no explicit token in TOML. |
+| *(per `[[mcp.servers]]`)* | The variable named by `bearer_token_env` holds that MCP server's bearer token. |
 | `NO_COLOR` | Disable ANSI color output. |
 | `SASHIKO_LOG_PLAIN` | Use plain log format (no level/target/timestamp). |
