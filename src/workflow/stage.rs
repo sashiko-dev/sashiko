@@ -317,6 +317,23 @@ struct StageSession<'a, S, T> {
     last_tool_call: Option<(String, Value)>,
 }
 
+impl<S, T> StageSession<'_, S, T> {
+    /// The error returned for a tool this stage may not call, such as an MCP
+    /// tool configured for other stages. A model that guesses its name gets
+    /// this instead of a call.
+    fn refuse_hidden_tool(&self, name: &str) -> Option<Value> {
+        if self.tools.is_tool_visible_in_stage(name, self.stage.name) {
+            return None;
+        }
+        tracing::warn!(
+            "Refused call to tool {} hidden from stage {}",
+            name,
+            self.stage.name
+        );
+        Some(json!({ "error": format!("Tool {} is not available in this stage.", name) }))
+    }
+}
+
 #[async_trait]
 impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSession
     for StageSession<'a, S, T>
@@ -340,16 +357,19 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     fn tools(&self) -> Option<Vec<AiTool>> {
+        let visible = self
+            .tools
+            .get_declarations_generic()
+            .into_iter()
+            .filter(|t| {
+                self.tools
+                    .is_tool_visible_in_stage(&t.name, self.stage.name)
+            });
         match &self.stage.policy.tools {
             ToolScope::None => None,
-            ToolScope::All => Some(self.tools.get_declarations_generic()),
+            ToolScope::All => Some(visible.collect()),
             ToolScope::Selected(names) => {
-                let all = self.tools.get_declarations_generic();
-                Some(
-                    all.into_iter()
-                        .filter(|t| names.contains(&t.name))
-                        .collect(),
-                )
+                Some(visible.filter(|t| names.contains(&t.name)).collect())
             }
         }
     }
@@ -385,6 +405,9 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
                 "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
             }));
         }
+        if let Some(refused) = self.refuse_hidden_tool(name) {
+            return Ok(refused);
+        }
         self.last_tool_call = Some((name.to_string(), args.clone()));
         match self.tools.call(name, args).await {
             Ok(v) => Ok(v),
@@ -413,6 +436,8 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
                         "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
                     }),
                 ));
+            } else if let Some(refused) = self.refuse_hidden_tool(&call.function_name) {
+                results[idx] = Some((call.id, refused));
             } else {
                 self.last_tool_call = Some((call.function_name.clone(), call.arguments.clone()));
                 to_run.push((idx, call));
@@ -504,11 +529,19 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             });
         }
 
-        let system_prompt = if let Some(sys) = &self.system_prompt {
+        let mut system_prompt = if let Some(sys) = &self.system_prompt {
             sys.render_for_model(state, env.base_dir).await?
         } else {
             String::new()
         };
+        if self.policy.tools != ToolScope::None
+            && let Some(section) = env.tools.mcp_prompt_section(self.name)
+        {
+            if !system_prompt.is_empty() {
+                system_prompt.push_str("\n\n");
+            }
+            system_prompt.push_str(&section);
+        }
 
         let user_prompt = self
             .user_prompt
@@ -741,6 +774,113 @@ mod tests {
             .await
             .expect("the batch must run concurrently; a sequential loop never clears the barrier")
             .expect("the stage must not end");
+    }
+
+    fn mcp_toolbox(dir: &std::path::Path) -> ToolBox {
+        let settings = crate::settings::McpServerSettings {
+            name: "docs".to_string(),
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            bearer_token_env: None,
+            allowed_tools: vec!["lookup".to_string()],
+            stages: vec!["hardware".to_string()],
+            prompt_hint: Some("Check registers against the documentation.".to_string()),
+            timeout_secs: 1,
+            max_output_bytes: 1024,
+        };
+        let mut toolbox = ToolBox::new(dir.to_path_buf(), None);
+        toolbox.add_mcp_tools(&crate::toolbox::mcp::McpTools::offline(
+            &settings,
+            &["lookup"],
+        ));
+        toolbox
+    }
+
+    fn mcp_stage(name: &'static str) -> Stage<EmptyState, String> {
+        Stage::builder(name)
+            .system_prompt(PromptTemplate::new("base"))
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_mcp_tools_are_exposed_only_to_their_stages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(mcp_toolbox(tmp.path()));
+
+        // A configured stage is offered the tool and told about it.
+        let provider = Arc::new(ToolCallingProvider {
+            turn: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+            calls: Vec::new(),
+            calling_turns: 0,
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: tools.clone(),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+        let (_outcome, _mutation) = mcp_stage("hardware")
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .unwrap();
+        {
+            let seen = provider.seen.lock().unwrap();
+            let offered: Vec<&str> = seen[0]
+                .tools
+                .iter()
+                .flatten()
+                .map(|t| t.name.as_str())
+                .collect();
+            assert!(offered.contains(&"mcp_docs_lookup"));
+            assert!(offered.contains(&"git_grep"));
+            let system = seen[0].system.as_deref().unwrap_or_default();
+            assert!(system.starts_with("base"));
+            assert!(system.contains("- mcp_docs_lookup: Check registers against the documentation."));
+        }
+
+        // Any other stage is neither offered the tool nor allowed to call it,
+        // and the server is never contacted.
+        let provider = Arc::new(ToolCallingProvider {
+            turn: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+            calls: vec![ToolCall {
+                id: "call_0".to_string(),
+                function_name: "mcp_docs_lookup".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            }],
+            calling_turns: 1,
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+        let (_outcome, _mutation) = mcp_stage("goal")
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .unwrap();
+        let seen = provider.seen.lock().unwrap();
+        let offered: Vec<&str> = seen[0]
+            .tools
+            .iter()
+            .flatten()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(!offered.contains(&"mcp_docs_lookup"));
+        assert!(offered.contains(&"git_grep"));
+        assert_eq!(seen[0].system.as_deref(), Some("base"));
+        let reply = seen[1]
+            .messages
+            .iter()
+            .find(|m| m.role == AiRole::Tool)
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default();
+        assert!(reply.contains("not available in this stage"), "{}", reply);
     }
 
     #[tokio::test]

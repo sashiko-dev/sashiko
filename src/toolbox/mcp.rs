@@ -550,6 +550,29 @@ impl McpTools {
     }
 }
 
+#[cfg(test)]
+impl McpTools {
+    /// Tools for a server that is never contacted, for tests of how tools
+    /// are exposed rather than how they are called.
+    pub(crate) fn offline(settings: &McpServerSettings, remote_names: &[&str]) -> Self {
+        let client = Arc::new(McpClient::new(settings, None).expect("a client builds offline"));
+        let tools: Vec<McpTool> = remote_names
+            .iter()
+            .map(|name| {
+                McpTool::from_listing(&client, settings, &json!({ "name": name }))
+                    .expect("test tool names are valid")
+            })
+            .collect();
+        let hints = vec![McpPromptHint {
+            server: settings.name.clone(),
+            hint: settings.prompt_hint.clone(),
+            tools: tools.iter().map(|t| t.name.clone()).collect(),
+            stages: settings.stages.clone(),
+        }];
+        Self { tools, hints }
+    }
+}
+
 /// Reads the bearer token from the variable the settings name, if any.
 fn resolve_token(settings: &McpServerSettings) -> Result<Option<String>> {
     let Some(var) = &settings.bearer_token_env else {

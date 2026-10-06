@@ -782,3 +782,14 @@ mod tests {
         assert_eq!(first, names(&ToolBox::new(repo, Some(prompts))));
     }
 }
+
+#[test]
+fn test_mcp_stage_names_match_numbered_instances() {
+    use super::stage_matches;
+    assert!(stage_matches("hardware", "hardware"));
+    assert!(stage_matches("post-verification-2", "post-verification"));
+    assert!(!stage_matches("post-verification-x", "post-verification"));
+    assert!(!stage_matches("post-verification-", "post-verification"));
+    assert!(!stage_matches("hardware2", "hardware"));
+    assert!(!stage_matches("verification", "post-verification"));
+}

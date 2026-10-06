@@ -15,7 +15,7 @@
 use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     settings::{AiSettings, Settings},
-    toolbox::ToolBox,
+    toolbox::{ToolBox, mcp::McpTools},
     worker::{
         PatchInput, ReviewInput, Worker, WorkerConfig, calculate_series_range,
         prompts::PromptRegistry,
@@ -485,6 +485,7 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
 async fn review_single_patch(
     worktree: &GitWorktree,
     settings: &Settings,
+    mcp_tools: &McpTools,
     patchset_id: i64,
     subject: &str,
     p: &PatchInput,
@@ -561,6 +562,7 @@ async fn review_single_patch(
         );
 
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        tools.add_mcp_tools(mcp_tools);
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
@@ -955,6 +957,10 @@ async fn run_worker_in_worktree(
     ));
     // Shared so a rate-limit response from one request backs the whole run off.
     let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+    // Discovered once for the whole run, so every patch sees the same tools
+    // and the servers are contacted once rather than once per patch.
+    let mcp_tools = McpTools::discover(&settings.mcp).await;
+    let mcp_tools = &mcp_tools;
     // Execute patch reviews concurrently with a limit
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
@@ -968,6 +974,7 @@ async fn run_worker_in_worktree(
             let result = review_single_patch(
                 worktree,
                 settings,
+                mcp_tools,
                 patchset_id,
                 &subject_clone,
                 p,
