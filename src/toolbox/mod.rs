@@ -31,6 +31,7 @@ pub mod git_log;
 pub mod git_ls;
 pub mod git_read_files;
 pub mod git_show;
+pub mod mcp;
 pub mod read_prompt;
 
 /// The Sashiko-specific context passed to LLM tools.
