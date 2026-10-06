@@ -140,8 +140,32 @@ operation appears to guard a section of code rather than express state —
 i.e., where the flag is set on entry and cleared on exit of a code region
 to prevent concurrent access, instead of using a proper lock or RCU.
 
+## Hardware Error Handling
+
+For configuration-register concurrency claims, first look for an actual
+software writer, a documented firmware update, or documented clear-on-read or
+latch behavior. If none is visible, state which hardware behavior would need
+to be confirmed instead of treating concurrent modification as established.
+
+Before reporting host-side cleanup as invalid, check whether the command or
+registration step that transfers ownership to the device or firmware actually
+succeeded. Cleanup before a successful transfer can be intentional.
+
+A failed or timed-out stop command can leave uncertainty about whether a device
+may continue DMA. Do not suggest leaking DMA buffers indefinitely as the fix.
+Check the driver's documented reset and teardown sequence and the subsystem's
+established recovery practice. Retain the finding when the driver skips a
+safe, available quiesce or reset step, violates a documented teardown order, or
+can affect memory after recovery should have completed.
+
+When the hardware premise is established, rate severity from the demonstrated
+impact. Do not use uncertainty about the premise to raise or lower severity.
+
 ## Quick Checks
 
 - **u64_stats_sync writers**: must be mutually exclusive per `syncp` and run with preemption disabled; use the `_irqsave` variant when IRQ context also touches the same `syncp`
 - **Ethtool -S stat duplication**: check whether any new `ethtool -S` counters cover values for which a standard uAPI exists (rtnl_link_stats64, page pool stats, per-queue stats via netlink), regardless of whether the driver currently uses that standard interface
 - **Flags used as locks**: flag/atomic/bit set-on-entry clear-on-exit patterns that guard code sections are ad-hoc locks; use real locks or RCU instead
+- **Configuration-register concurrency**: identify a software writer or documented hardware or firmware behavior before treating concurrent modification as established
+- **Ownership transfer**: verify that registration or command completion transferred ownership before rejecting host-side cleanup
+- **DMA teardown after stop failure**: check available reset and quiesce steps; do not propose leaking DMA buffers indefinitely
