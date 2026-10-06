@@ -534,6 +534,15 @@ async fn run_daemon(
         return Err(reason.into());
     }
 
+    if let Some(Err(reason)) = settings
+        .smtp
+        .as_ref()
+        .map(sashiko::worker::email::EmailWorker::check_sendmail_path)
+    {
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
+    }
+
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;

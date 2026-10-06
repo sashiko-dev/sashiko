@@ -3447,10 +3447,12 @@ mod tests {
         settings.server.public_base_url = Some("https://sashiko.dev".to_string());
         settings.server.acl.admins = vec!["maintainer@example.org".to_string()];
         settings.smtp = Some(crate::settings::SmtpSettings {
-            server: "smtp.example.org".to_string(),
-            port: 587,
+            transport: crate::settings::MailTransport::Smtp,
+            server: Some("smtp.example.org".to_string()),
+            port: Some(587),
             username: None,
             password: None,
+            sendmail_path: None,
             sender_address: "sashiko@sashiko.dev".to_string(),
             reply_to: None,
             dry_run: false,
@@ -3527,10 +3529,12 @@ mod tests {
 
         let mut settings = crate::settings::Settings::new().unwrap();
         settings.smtp = Some(crate::settings::SmtpSettings {
-            server: "smtp.example.org".to_string(),
-            port: 587,
+            transport: crate::settings::MailTransport::Smtp,
+            server: Some("smtp.example.org".to_string()),
+            port: Some(587),
             username: None,
             password: None,
+            sendmail_path: None,
             sender_address: "sashiko@sashiko.dev".to_string(),
             reply_to: None,
             dry_run: false,
@@ -3690,10 +3694,12 @@ mod tests {
 
         let mut settings = crate::settings::Settings::new().unwrap();
         settings.smtp = Some(crate::settings::SmtpSettings {
-            server: "smtp.example.org".to_string(),
-            port: 587,
+            transport: crate::settings::MailTransport::Smtp,
+            server: Some("smtp.example.org".to_string()),
+            port: Some(587),
             username: None,
             password: None,
+            sendmail_path: None,
             sender_address: "sashiko@sashiko.dev".to_string(),
             reply_to: None,
             dry_run: false,
