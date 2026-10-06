@@ -2,8 +2,8 @@
 
 This guide covers `src/toolbox/` (`framework.rs`, `mod.rs`, `utils.rs`,
 `command.rs`, and the tool implementations: `git_read_files`, `git_grep`,
-`git_log`, `git_show`, `git_diff`, `git_blame`, `git_ls`, `git_find_files`, and
-`read_prompt`).
+`git_log`, `git_show`, `git_diff`, `git_blame`, `git_ls`, `git_find_files`,
+`read_prompt`, and the remote MCP tools in `mcp.rs`).
 
 The toolbox is the boundary where an LLM reviewing untrusted code interacts with
 the host filesystem and git subprocesses. Every tool implementation must uphold
@@ -77,6 +77,37 @@ cause provider context-window errors.
   `prompts_path.is_some()`. Standalone pipelines (like the Linux bug worker)
   that instantiate `ToolBox::new(path, None)` must not expose `read_prompt`.
 
+## 6. Remote MCP Tools (`mcp.rs`)
+
+`mcp::McpTool` forwards model-chosen arguments to an operator-configured
+Model Context Protocol server (`[[mcp.servers]]`, see
+`designs/DESIGN_MCP_CLIENT_TOOLS.md`). It is the only tool that leaves the
+host, so injected patch text can steer what it sends.
+- **Fixed Endpoints**: The URL, headers and bearer token come only from the
+  settings and the environment. The model chooses the tool name and its
+  arguments, nothing else. Redirects stay disabled
+  (`reqwest::redirect::Policy::none()`) so the token only reaches the
+  configured origin.
+- **Allowlist**: Only server tools named in `allowed_tools` are registered.
+  A server's listing must never widen the set, and names it supplies are
+  validated before they become `mcp_<server>_<tool>`.
+- **Stage Exposure**: `ToolBox::is_tool_visible_in_stage` decides which
+  stages see an MCP tool. `StageSession::tools()` filters declarations by it
+  and `StageSession::refuse_hidden_tool` refuses calls to hidden tools in
+  both `call_tool` and `call_tools`.
+- **Secrets**: The token is never logged, cached, put in an error, or
+  included in `Debug` output. Error text from the transport or the server
+  passes through `redact_secret`.
+- **Untrusted Output**: MCP results and server-supplied descriptions are data.
+  They must never become a path, an `@include`, a prompt name or a lookup key,
+  and server text must never be placed in a system prompt; the prompt hint
+  comes from the settings file only.
+- **Non-Fatal and Bounded**: Discovery failures skip the server with a
+  warning; call failures and `isError` results become `{"error": ...}`
+  values. Requests carry a timeout, response bodies and `tools/list` pages
+  are capped, and results are truncated to `max_output_bytes` with
+  `"truncated": true`.
+
 ## Checklist for Diffs Touching `src/toolbox/`
 
 1. **Path Traversal**: Does every filesystem path argument pass through
@@ -87,3 +118,6 @@ cause provider context-window errors.
 3. **Virtual HEAD**: Does any new revision parameter call `context.virtualize_ref(...)`?
 4. **Truncation**: Is the maximum returned string size bounded, and does the JSON
    output signal `"truncated": true` when clipped?
+5. **Remote Tools**: Does an MCP change keep endpoints, tokens and the
+   allowlist out of the model's reach, keep tokens out of logs and errors,
+   and keep server text out of prompts, paths and lookup keys?

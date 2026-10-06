@@ -37,7 +37,7 @@ Review, the core loop:
 | `src/worker/prompts.rs` | Builds the workflow state and runs the engine |
 | `src/workflow/` | The generic, project-agnostic stage engine |
 | `src/workflows/` | The actual pipelines, per project |
-| `src/toolbox/` | The tools a stage can call: git grep, log, show, blame, read files, read prompt |
+| `src/toolbox/` | The tools a stage can call: git grep, log, show, blame, read files, read prompt, remote MCP tools |
 | `src/ai/` | Provider abstraction, sessions, token budget, truncation, backoff, caching |
 | `src/baseline.rs` | Baseline commit detection |
 | `src/git_ops.rs` | Worktrees, clones, fetches, repository maintenance |
