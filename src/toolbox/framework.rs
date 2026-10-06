@@ -25,10 +25,13 @@ use std::sync::Arc;
 #[async_trait]
 pub trait LlmTool<C>: Send + Sync {
     /// The unique name of the tool (e.g., "git_grep").
-    fn name(&self) -> &'static str;
+    ///
+    /// Borrowed from the tool rather than static, so a tool discovered at run
+    /// time (such as one served by an MCP server) can own its name.
+    fn name(&self) -> &str;
 
     /// A detailed description of what the tool does, used by the LLM to understand when to call it.
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
 
     /// The JSON Schema defining the parameters this tool accepts.
     fn parameters(&self) -> Value;
@@ -45,7 +48,7 @@ pub trait LlmTool<C>: Send + Sync {
 
 /// A registry that manages a set of LLM tools and handles dynamic dispatching.
 pub struct ToolRegistry<C> {
-    tools: HashMap<&'static str, Arc<dyn LlmTool<C>>>,
+    tools: HashMap<String, Arc<dyn LlmTool<C>>>,
 }
 
 impl<C> ToolRegistry<C> {
@@ -58,12 +61,12 @@ impl<C> ToolRegistry<C> {
 
     /// Registers a tool in the registry.
     pub fn register(&mut self, tool: impl LlmTool<C> + 'static) {
-        self.tools.insert(tool.name(), Arc::new(tool));
+        self.tools.insert(tool.name().to_string(), Arc::new(tool));
     }
 
     /// Registers a boxed tool in the registry.
     pub fn register_boxed(&mut self, tool: Box<dyn LlmTool<C>>) {
-        self.tools.insert(tool.name(), Arc::from(tool));
+        self.tools.insert(tool.name().to_string(), Arc::from(tool));
     }
 
     /// Returns the list of tool declarations in a format suitable for the LLM API.
@@ -77,7 +80,7 @@ impl<C> ToolRegistry<C> {
         // registry, and this list goes into every request, so without the
         // sort two identical requests differ between runs and retries.
         let mut tools: Vec<_> = self.tools.values().collect();
-        tools.sort_by_key(|t| t.name());
+        tools.sort_by(|a, b| a.name().cmp(b.name()));
         tools
             .into_iter()
             .map(|t| {
