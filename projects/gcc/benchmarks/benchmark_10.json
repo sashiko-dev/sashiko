@@ -1,0 +1,62 @@
+[
+    {
+        "Commit": "5b40e9d181bfe268ee9922c6af525bc5dab2604c",
+        "Fixed-by": "17c7aeffec9e1f7576957fdcb21e380d4e209c6f",
+        "subsystem": "tree-optimization",
+        "problem_description": "forwprop: Reset the range of a rewritten MOD result [PR101179] (PR tree-optimization/101179): When X may be negative, r17-3791 still rewrites M = X % PHI <2^a, 2^b> into M = X & PHI <2^a-1, 2^b-1> because M is only compared with zero. That keeps the zero-ness of M but not its value, yet the range recorded for M before the rewrite stays, so VRP folded M to 0 in the testcase. Reset the flow-sensitive info of M in that case. Bootstrapped and regression tested on... [Fix details: * tree-ssa-forwprop.cc (simplify_phi_result_movdiv): Reset the flow-sensitive info of the result when its value changes.]"
+    },
+    {
+        "Commit": "edb9556068ae47e1a3cbad69249424ab7cce5b7c",
+        "Fixed-by": "c8aaf14bf6882705d2515a5eb9c15de7f4034c5b",
+        "subsystem": "tree-optimization",
+        "problem_description": "match.pd: Check that a - c does not wrap in minmax (a - c, b) + c [PR127103] (PR tree-optimization/127103): r17-4378 folds minmax (a - c, b) + c to minmax (a, b + c) when b + c cannot overflow.  The fold also needs a - c not to wrap: for unsigned a = 0, b = 0, c = 1, MIN (a - c, b) + c is 1 but MIN (a, b + c) is 0, and the MAX form gives 0 against 1.  Require that with range_op_handler (MINUS_EXPR).overflow_free_p on the ranges of a and c. The std::vector::push_back case from the... [Fix details: * match.pd (minmax (a - c, b) + c): Also require that a - c does not overflow.]"
+    },
+    {
+        "Commit": "885ad73e630ca23d1810d55fd480f6ff519d42bf",
+        "Fixed-by": "b70a80cfff503060f48a12c090e5b4983d3c6156",
+        "subsystem": "tree-optimization",
+        "problem_description": "match.pd: fix comparison in the ((X >> C1) & C2) << C3 pattern [PR127552] (PR tree-optimization/127552): In this simplification rule added in r17-4511-g885ad73e630ca2, we assume that C1 and C3 are of the same type and call wi::leu_p () with those constants converted to wide_int.  This leads to a triggered assert on wide-int.h:1049 whenever C1 and C3 have different precision, which causes an ICE reported in PR127552.  Fix this by converting to widest_int instead. To test the... [Fix details: * match.pd: Fix constant comparison in ((X >> C1) & C2) << C3.]"
+    },
+    {
+        "Commit": "f1e596c9526fbb4cf0bfa56b07d3c52aab9c9938",
+        "Fixed-by": "318e6a4640420d5cc213df779bf751485fa56063",
+        "subsystem": "c++",
+        "problem_description": "c++: Fix ICE during explanation of failed __has_unique_object_representation [PR126867] (PR c++/126867): The following testcase ICEs since r16-5520 added explain arguments to type_has_unique_obj_representations and record_has_unique_obj_representations.  Most of the location_t arguments in that change look correct, either DECL_SOURCE_LOCATION of some FIELD_DECL or in type_has_unique_obj_representations use loc, which is initialized to location_t loc = input_location; if (tree... [Fix details: * tree.cc (record_has_unique_obj_representations): Use location_of (const_cast <tree> (t)) rather than DECL_SOURCE_LOCATION (t).]"
+    },
+    {
+        "Commit": "5fbcd8a57a0f2524259df87db5c6c82b757bf2e6",
+        "Fixed-by": "a03b3ab4b0a6a446fe9a1d7e6e82967a8dd3edcf",
+        "subsystem": "c++",
+        "problem_description": "c++/modules: ICE with GMF variable later defined inline [PR126783] (PR c++/126783): Here transfer_defining_module (added in r16-5213) assumes that if a redeclaration has DECL_LANG_SPECIFIC allocated, then so must the original declaration, but this isn't true for q below.  Instead we should call retrofit_lang_decl to allocate DECL_LANG_SPECIFIC as needed; other parts of duplicate_decls do the same. [Fix details: * module.cc (transfer_defining_module): Call retrofit_lang_decl instead of assuming the old declaration already has DECL_LANG_SPECIFIC allocated.]"
+    },
+    {
+        "Commit": "4182cf11e1e3d2ebcf4f5c3dff157f844a635bf8",
+        "Fixed-by": "aa141f17fbab704e17e6c6cc046db91155b7bd21",
+        "subsystem": "target",
+        "problem_description": "aarch64: Fix aarch64_evpc_rev64_ext for testing_p case [PR127599] (PR target/127599): r17-3712-g4182cf11e1e3d2 added some code to expand a perm based on if we are in a loop or not.  The problem is in the testing case, the expanding stmt might not have a bb associated with it and that causes an ICE. This fixes the issue by moving the check for testing before the test of inside the loop. Pushed as obvious after bootstrapped and testing on aarch64-linux-gnu. [Fix details: * config/aarch64/aarch64.cc (aarch64_evpc_rev64_ext): Move the testing_p after the is_bb_in_loop test.]"
+    },
+    {
+        "Commit": "3b99fd4bdc7005333b0c760630f5db6ceeb81e5a",
+        "Fixed-by": "1fc2416ddc96a2fb1492642823f67e64488a153a",
+        "subsystem": "target",
+        "problem_description": "fix: riscv: Restore previous --param=riscv-autovec-mode behaviour [PR 127494] (PR target/127494): Fixed riscv regressions introduced in r17-4413-g3b99fd4bdc7005. Restores previous behaviour by only overriding autovec mode if it is one of the available autovec modes. [Fix details: * config/riscv/riscv-v.cc (autovectorize_vector_modes): Restore previous behaviour.]"
+    },
+    {
+        "Commit": "1002a7ace111d746249fdea71af9b8e039cea0eb",
+        "Fixed-by": "89b2fa7a74ef1f7b8f0f8f1abc3bbc412d59302a",
+        "subsystem": "middle-end",
+        "problem_description": "lto.cc: OpenMP's offload_handle_link_vars - fix for global variables (2/2) [PR127273] (PR middle-end/127273): Commit r12-7776-g1002a7ace111d7 LTO: Fixes for renaming issues with offload/OpenMP [PR104285] moved the call to offload_handle_link_vars after the renaming of same-named static variables happened. However, it missed to remove the original call - such that the function is always called twice, walking the same node twice. In offload_handle_link_vars, the call to... [Fix details: * lto.cc (offload_handle_link_vars): Remove has-value-expr check; store link vars and processing them after walking the varpool. (lto_main): Remove duplicated offload_handle_link_vars call.]"
+    },
+    {
+        "Commit": "594f2cbf30f0a36cd7891ec915abf4de08630e49",
+        "Fixed-by": "04159cca134b196d07bcbe7b71e8096ba1f3eda3",
+        "subsystem": "rtl-optimization",
+        "problem_description": "ifcvt: Fix rtl checking due to reversed_comparison_code returning UNKNOWN [PR124062] (PR rtl-optimization/124062): This was an oversight on my part (after r16-6435-g594f2cbf30f0a3) where I forgot that sometimes reversed_comparison_code will return UNKNOWN when the floating point comparison can't be reversed. This seems only to show up with RTL checking only; at least as far as I can tell because it is rejected later on but I could be wrong. Bootstrapped and tested on x86_64-linux-gnu. [Fix details: * ifcvt.cc (noce_try_cond_arith): Check the conditional code for UNKNOWN.] [Target commit function(s): noce_try_cond_zero_arith]"
+    },
+    {
+        "Commit": "1cf8c5913bfe8016b8b2436cc17a7577be1b295f",
+        "Fixed-by": "75136eabafd2028a04d47720ea87548df47e2578",
+        "subsystem": "fortran",
+        "problem_description": "fortran: [PR126872] BIND(C) entities must keep default ELF visibility (PR fortran/125430): A binding label gives an entity external linkage, so PRIVATE hides only the Fortran name and must not lower the symbol's ELF visibility.  Three sites gave hidden visibility to PRIVATE module entities without exempting binding labels, so a BIND(C) procedure or variable in a module with a PRIVATE default was not exported from a shared library. The procedure case is a... [Fix details: * trans-decl.cc (gfc_finish_var_decl): Drop the unreachable hidden-visibility case in the BIND(C) block.  Do not give hidden visibility to a PRIVATE module variable with a binding label. (build_function_decl): Do not give hidden visibility to a PRIVATE...]"
+    }
+]
