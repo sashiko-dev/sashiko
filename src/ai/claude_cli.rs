@@ -124,6 +124,8 @@ impl AiProvider for ClaudeCliProvider {
             "--output-format".to_string(),
             "json".to_string(),
             "--no-session-persistence".to_string(),
+            "--settings".to_string(),
+            r#"{"verbose":false}"#.to_string(),
         ];
 
         args.push("--model".to_string());
