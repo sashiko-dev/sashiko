@@ -195,3 +195,46 @@ async fn revision_prefetch_isolation_and_edge_cases() {
     fs::remove_file(path.join("helper:impl.c")).unwrap();
     assert_eq!(fixture.context().await, expected, "missing working files");
 }
+
+#[tokio::test]
+async fn cpp_class_and_gty_struct_definitions_are_prefetched() {
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path();
+    git(path, &["init", "-q"]);
+    git(path, &["config", "user.name", "Test"]);
+    git(path, &["config", "user.email", "test@example.com"]);
+    fs::create_dir(path.join("gcc")).unwrap();
+    fs::write(
+        path.join("gcc/cgraph.h"),
+        "class cgraph_node;\n\nstruct GTY((chain_next (\"%h.next\"))) cgraph_node : public symtab_node {\n    bool analyzed;\n    static cgraph_node *get(int decl);\n};\n\nclass Value_Range {\npublic:\n    int kind;\n    void set_varying(int t);\n};\n\nclass OpaqueHandle;\n",
+    )
+    .unwrap();
+    fs::write(
+        path.join("gcc/ipa.cc"),
+        "#include \"cgraph.h\"\n\nbool check_node(int decl, OpaqueHandle *unused)\n{\n    (void)unused;\n    return false;\n}\n",
+    )
+    .unwrap();
+    let _base = commit(path);
+
+    fs::write(
+        path.join("gcc/ipa.cc"),
+        "#include \"cgraph.h\"\n\nbool check_node(int decl, OpaqueHandle *unused)\n{\n    (void)unused;\n    cgraph_node *node = cgraph_node::get(decl);\n    Value_Range vr;\n    vr.set_varying(decl);\n    return node && node->analyzed && vr.kind != 0;\n}\n",
+    )
+    .unwrap();
+    let target = commit(path);
+    let diff = git(path, &["show", "--format=", &target]);
+
+    let context = prefetch_context(path, &target, &diff).await.unwrap();
+    assert!(
+        context.contains("bool analyzed;"),
+        "expected GTY cgraph_node definition in prefetched context:\n{context}"
+    );
+    assert!(
+        context.contains("void set_varying(int t);"),
+        "expected C++ class Value_Range definition in prefetched context:\n{context}"
+    );
+    assert!(
+        !context.contains("class OpaqueHandle;"),
+        "opaque forward-declared class must not be prefetched:\n{context}"
+    );
+}

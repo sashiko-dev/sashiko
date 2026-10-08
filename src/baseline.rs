@@ -378,8 +378,15 @@ impl BaselineRegistry {
             candidates.push(BaselineResolution::Commit(commit));
         }
 
+        // When a non-Linux mainline remote (such as GCC or Sashiko) was explicitly
+        // identified, skip Linux-specific stable and linux-next candidate remotes.
+        let has_non_linux_mainline = self
+            .mainline_remote
+            .as_ref()
+            .is_some_and(|(url, _)| is_non_linux_project_url(url));
+
         // 1.5 Version Tag from Subject
-        candidates.extend(subject_version_candidates(subject));
+        candidates.extend(subject_version_candidates(subject, has_non_linux_mainline));
 
         // 2. Subsystem Heuristic
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
@@ -436,8 +443,10 @@ impl BaselineRegistry {
             }
         }
 
-        // 4. Linux Next
-        candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        // 4. Linux Next (skip when a non-Linux mainline remote was identified)
+        if !has_non_linux_mainline {
+            candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        }
 
         // 5. Mainline
         // Use the identified mainline remote (Linus tree or origin) as a
@@ -720,6 +729,14 @@ impl BaselineRegistry {
     }
 }
 
+fn is_non_linux_project_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("gcc.gnu.org")
+        || lower.contains("gnutools/gcc")
+        || lower.contains("gcc-mirror/gcc")
+        || lower.contains("sashiko")
+}
+
 pub fn extract_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
     for line in diff.lines() {
@@ -749,7 +766,10 @@ pub fn extract_version_tag(subject: &str) -> Option<String> {
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
 }
 
-fn subject_version_candidates(subject: &str) -> Vec<BaselineResolution> {
+fn subject_version_candidates(
+    subject: &str,
+    has_non_linux_mainline: bool,
+) -> Vec<BaselineResolution> {
     let version = extract_version_tag(subject);
     let stable_versions = explicit_stable_versions(subject).or_else(|| {
         let version = version.as_deref()?;
@@ -757,7 +777,7 @@ fn subject_version_candidates(subject: &str) -> Vec<BaselineResolution> {
             .then(|| (version.strip_suffix(".y").unwrap_or(version), None))
     });
     let mut candidates = Vec::new();
-    if let Some((first, last)) = stable_versions {
+    if !has_non_linux_mainline && let Some((first, last)) = stable_versions {
         for version in std::iter::once(first).chain(last) {
             candidates.push(BaselineResolution::RemoteTarget {
                 url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git".to_string(),
@@ -1662,5 +1682,33 @@ F: patterns/
             std::ffi::OsStr::new("GIT_NO_LAZY_FETCH"),
             Some(std::ffi::OsStr::new("1"))
         )));
+    }
+    #[tokio::test]
+    async fn test_non_linux_mainline_skips_linux_next() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: Some((
+                "https://gcc.gnu.org/git/gcc.git".to_string(),
+                "origin".to_string(),
+            )),
+        };
+
+        let candidates = registry
+            .resolve_candidates(&[], "[PATCH] tree-optimization: fix vrp", None)
+            .await;
+        assert_eq!(
+            candidates,
+            vec![BaselineResolution::RemoteTarget {
+                url: "https://gcc.gnu.org/git/gcc.git".to_string(),
+                name: "origin".to_string(),
+                branch: Some("master".to_string()),
+            }]
+        );
     }
 }

@@ -4225,17 +4225,15 @@ fn identify_subsystems(
             }
         }
 
-        // Fallback for known kernel lists if no mapping is provided
+        // Fallback for known mailing lists if no mapping is provided
         if !matched {
             let bare_email = sashiko::email_policy::extract_bare_email(&lower_email);
             if bare_email == "linux-kernel@vger.kernel.org" {
                 subsystems.push(("LKML".to_string(), bare_email));
             } else if bare_email == "netdev@vger.kernel.org" {
                 subsystems.push(("netdev".to_string(), bare_email));
-            } else if let Some((name, domain)) = bare_email.split_once('@')
-                && sashiko::email_router::KNOWN_MAILING_LIST_DOMAINS
-                    .iter()
-                    .any(|&d| d.eq_ignore_ascii_case(domain))
+            } else if sashiko::email_router::is_known_mailing_list_bare(&bare_email)
+                && let Some((name, _)) = bare_email.split_once('@')
             {
                 subsystems.push((name.to_string(), bare_email));
             }
@@ -5458,6 +5456,21 @@ mod tests {
             "b.a.t.m.a.n".to_string(),
             "b.a.t.m.a.n@lists.open-mesh.org".to_string()
         )));
+
+        // GCC shared domain: public mailing lists match, personal developer emails do not.
+        let gcc_to = "gcc-patches@gcc.gnu.org, fortran@gcc.gnu.org";
+        let gcc_cc = "Jakub Jelinek <jakub@gcc.gnu.org>, rguenth@gcc.gnu.org";
+        let gcc_subsystems = identify_subsystems(gcc_to, gcc_cc, &[]);
+        assert_eq!(
+            gcc_subsystems,
+            vec![
+                ("fortran".to_string(), "fortran@gcc.gnu.org".to_string()),
+                (
+                    "gcc-patches".to_string(),
+                    "gcc-patches@gcc.gnu.org".to_string()
+                ),
+            ]
+        );
     }
 
     #[cfg(feature = "server")]

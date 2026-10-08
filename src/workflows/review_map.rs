@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 
 use crate::project::ProjectId;
 use crate::workflow::StageRunRecord;
+use crate::workflows::gcc_patch_review;
 use crate::workflows::guard::sanitize_prompt_relpath;
 use crate::workflows::linux_patch_review::{self, LinuxPatchReviewState};
 use crate::workflows::sashiko_patch_review;
@@ -252,6 +253,8 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
     let analysis_def = match project {
         ProjectId::Linux => linux_patch_review::any_analysis_stage_by_name(stage_name),
         ProjectId::Sashiko => sashiko_patch_review::any_analysis_stage_by_name(stage_name),
+        ProjectId::Gcc => gcc_patch_review::analysis_stage_by_name(stage_name)
+            .or_else(|| linux_patch_review::any_analysis_stage_by_name(stage_name)),
     };
     if let Some(def) = analysis_def {
         for g in def.guides {
@@ -274,7 +277,7 @@ fn static_stage_guides(project: ProjectId, stage_name: &str) -> Vec<String> {
             push_unique(&mut guides, "severity.md");
         }
         "report" => match project {
-            ProjectId::Linux => push_unique(&mut guides, "inline-template.md"),
+            ProjectId::Linux | ProjectId::Gcc => push_unique(&mut guides, "inline-template.md"),
             ProjectId::Sashiko => push_unique(&mut guides, "github-summary-template.md"),
         },
         _ => {}
@@ -292,7 +295,7 @@ fn build_prompts_manifest(
             "false-positive-guide.md".to_string(),
             "severity.md".to_string(),
         ],
-        ProjectId::Sashiko => vec![
+        ProjectId::Sashiko | ProjectId::Gcc => vec![
             "review-core.md".to_string(),
             "false-positive-guide.md".to_string(),
             "severity.md".to_string(),

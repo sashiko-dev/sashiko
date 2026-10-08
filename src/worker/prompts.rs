@@ -54,6 +54,9 @@ impl ClassifyAiError for ReviewError {
 
 use crate::project::ProjectId;
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
+use crate::workflows::gcc_patch_review::{
+    build_gcc_patch_review_workflow_with_effort, gcc_system_prompt,
+};
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, build_linux_cover_review_workflow_with_effort,
     build_linux_patch_review_workflow_with_effort, linux_system_prompt,
@@ -442,7 +445,7 @@ impl Worker {
             None
         } else {
             match self.project {
-                ProjectId::Linux => build_follow_up_series_context(
+                ProjectId::Linux | ProjectId::Gcc => build_follow_up_series_context(
                     self.series_range.as_deref(),
                     &patchset,
                     &target_commit_sha,
@@ -523,6 +526,7 @@ impl Worker {
             let sys_template = match self.project {
                 ProjectId::Linux => linux_system_prompt(true),
                 ProjectId::Sashiko => sashiko_system_prompt(true),
+                ProjectId::Gcc => gcc_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -552,6 +556,16 @@ impl Worker {
                 self.effort,
             ),
             (ProjectId::Sashiko, false) => build_sashiko_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            (ProjectId::Gcc, true) => build_linux_cover_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            (ProjectId::Gcc, false) => build_gcc_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,

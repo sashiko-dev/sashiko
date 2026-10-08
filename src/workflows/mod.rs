@@ -15,6 +15,7 @@
 use crate::project::ProjectId;
 
 pub mod code_notes;
+pub mod gcc_patch_review;
 pub mod guard;
 #[cfg(feature = "server")]
 pub mod linux_bug;
@@ -29,6 +30,8 @@ pub fn stage_short_label(project: ProjectId, stage: &str) -> Option<&'static str
     match project {
         ProjectId::Linux => linux_patch_review::stage_short_label(stage),
         ProjectId::Sashiko => sashiko_patch_review::stage_short_label(stage),
+        ProjectId::Gcc => gcc_patch_review::stage_short_label(stage)
+            .or_else(|| linux_patch_review::stage_short_label(stage)),
     }
 }
 
@@ -43,6 +46,9 @@ pub fn default_stage_count(project: ProjectId) -> usize {
         ProjectId::Sashiko => {
             sashiko_patch_review::ANALYSIS_STAGES.len()
                 + sashiko_patch_review::CONSOLIDATION_STAGES.len()
+        }
+        ProjectId::Gcc => {
+            gcc_patch_review::ANALYSIS_STAGES.len() + gcc_patch_review::CONSOLIDATION_STAGES.len()
         }
     }
 }
@@ -94,6 +100,29 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
                         .iter()
                         .map(|s| s.name.to_string()),
                 );
+            }
+            planned
+        }
+        ProjectId::Gcc => {
+            let mut planned: Vec<String> = stage_names
+                .iter()
+                .filter(|n| {
+                    gcc_patch_review::analysis_stage_by_name(n).is_some()
+                        || **n == linux_patch_review::SERIES_ANALYSIS.name
+                })
+                .map(|n| n.to_string())
+                .collect();
+            if !planned.is_empty() {
+                let is_cover_only =
+                    planned.len() == 1 && planned[0] == linux_patch_review::SERIES_ANALYSIS.name;
+                planned.extend(
+                    gcc_patch_review::CONSOLIDATION_STAGES
+                        .iter()
+                        .map(|s| s.name.to_string()),
+                );
+                if is_cover_only {
+                    planned.push(linux_patch_review::SUMMARY.name.to_string());
+                }
             }
             planned
         }

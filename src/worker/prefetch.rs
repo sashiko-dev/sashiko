@@ -143,14 +143,25 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
 
     // Phase 1: modified code — find enclosing blocks, types, and called functions.
     for (file, ranges) in &file_ranges {
-        if !file.ends_with(".c") && !file.ends_with(".h") {
+        if !is_prefetchable_source_file(file) {
             continue;
         }
         let file_path = PathBuf::from(file);
         let content = snapshot.read(&file_path).await?;
         for &(start, end) in ranges {
-            for (blk_start, blk_end) in overlapping_definitions(&content, start, end) {
-                add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+            let defs = overlapping_definitions(&content, start, end);
+            if defs.is_empty() && !file.ends_with(".c") {
+                let total_lines = content.lines().count();
+                if total_lines > 0 {
+                    let blk_start = start.saturating_sub(50);
+                    let blk_end =
+                        std::cmp::min(end.saturating_add(50), total_lines.saturating_sub(1));
+                    add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+                }
+            } else {
+                for (blk_start, blk_end) in defs {
+                    add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+                }
             }
             already_extracted.extend(extract_defined_names(&content, start, end));
             symbols_to_lookup.extend(extract_type_names(&content, start, end));
@@ -185,7 +196,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
     // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
     if !symbols.is_empty() {
         let regex_pattern = format!(
-            "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
+            "^((struct|class|enum|union)\\s+(?:GTY\\s*\\(\\(.*?\\)\\)\\s+)?({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*:<>]+\\s+)?({0})\\s*\\()",
             symbols.join("|")
         );
 
@@ -206,8 +217,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
             .arg(&regex_pattern)
             .arg(&snapshot.sha)
             .arg("--")
-            .arg("*.c")
-            .arg("*.h")
+            .args(PREFETCH_GREP_PATHSPECS)
             .kill_on_drop(true);
 
         let output = match cmd.output().await {
@@ -233,7 +243,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
                 && let Ok(line_num) = line_num_str.parse::<u64>()
             {
                 let path = PathBuf::from(path_str);
-                if is_noisy_tree(path_str) {
+                if !is_prefetchable_source_file(path_str) {
                     continue;
                 }
 
@@ -445,9 +455,45 @@ pub fn extract_enclosing_block(
 // Git grep + tree-sitter symbol lookup
 // ---------------------------------------------------------------------------
 
+const PREFETCH_GREP_PATHSPECS: &[&str] = &[
+    "*.c", "*.h", "*.cc", "*.cpp", "*.cxx", "*.C", "*.hh", "*.hpp", "*.tcc", "*.inc", "*.def",
+    "*.pd", "*.f90", "*.F90", "*.md",
+];
+
 // These directories contain userspace reimplementations of kernel primitives
 // (e.g. tools/virtio/ringtest/ has a toy spin_lock) that shadow the real
 // definitions and provide no signal for patch review.
+fn is_prefetchable_source_file(file: &str) -> bool {
+    if is_noisy_tree(file) {
+        return false;
+    }
+    const SOURCE_EXTS: &[&str] = &[
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".C", ".hh", ".hpp", ".tcc", ".inc", ".def", ".pd",
+        ".f90", ".F90",
+    ];
+    if SOURCE_EXTS.iter().any(|ext| file.ends_with(ext)) {
+        return true;
+    }
+    // GCC RTL machine description files live under gcc/config/ or gcc/*.md.
+    file.starts_with("gcc/") && file.ends_with(".md")
+}
+
+fn is_cpp_source_or_header(file: &str) -> bool {
+    const CPP_EXTS: &[&str] = &[".cc", ".cpp", ".cxx", ".C", ".hh", ".hpp", ".tcc", ".h"];
+    CPP_EXTS.iter().any(|ext| file.ends_with(ext))
+}
+
+fn is_c_or_cpp_impl_file(file: &str) -> bool {
+    const IMPL_EXTS: &[&str] = &[".c", ".cc", ".cpp", ".cxx", ".C"];
+    IMPL_EXTS.iter().any(|ext| file.ends_with(ext))
+}
+
+fn is_non_c_dsl_or_table_file(file: &str) -> bool {
+    const DSL_EXTS: &[&str] = &[".inc", ".def", ".pd", ".f90", ".F90"];
+    DSL_EXTS.iter().any(|ext| file.ends_with(ext))
+        || (file.starts_with("gcc/") && file.ends_with(".md"))
+}
+
 fn is_noisy_tree(path_str: &str) -> bool {
     const NOISY_PREFIXES: &[&str] = &[
         "tools/",
@@ -455,8 +501,12 @@ fn is_noisy_tree(path_str: &str) -> bool {
         "Documentation/",
         "scripts/",
         "LICENSES/",
+        "testsuite/",
     ];
     NOISY_PREFIXES.iter().any(|p| path_str.starts_with(p))
+        || path_str.contains("/testsuite/")
+        || path_str.ends_with("ChangeLog")
+        || path_str.contains("/ChangeLog")
 }
 
 fn line_matches_symbol(line: &str, sym: &str) -> bool {
@@ -545,22 +595,45 @@ async fn best_definition_range(
     snapshot: &mut SourceSnapshot<'_>,
     caller_dirs: &HashSet<&str>,
 ) -> Result<Option<(PathBuf, usize, usize)>> {
-    let mut seen = HashSet::new();
+    let mut tree_sitter_checked = HashSet::new();
+    let mut tree_sitter_matched = HashSet::new();
     let mut best: Option<(i32, PathBuf, usize, usize)> = None;
 
-    for (path, _line) in hits {
-        if !seen.insert(path.clone()) {
+    for (path, line) in hits {
+        if tree_sitter_matched.contains(path) {
             continue;
         }
         let content = snapshot.read(path).await?;
-        let Some((def_score, is_static, start, end)) = score_best_in_file_for_sym(&content, sym)
-        else {
+        let rel_path = path.to_string_lossy();
+        let Ok(line_usize) = usize::try_from(*line) else {
+            continue;
+        };
+        let line_0 = line_usize.saturating_sub(1);
+        let ts_scored = if tree_sitter_checked.insert(path.clone()) {
+            score_best_in_file_for_sym(&content, sym)
+        } else {
+            None
+        };
+        let (def_score, is_static, start, end) = if let Some(scored) = ts_scored {
+            tree_sitter_matched.insert(path.clone());
+            scored
+        } else if let Some(cpp_scored) = cpp_fallback_definition_range(&rel_path, &content, line_0)
+        {
+            cpp_scored
+        } else if is_non_c_dsl_or_table_file(&rel_path) {
+            let total_lines = content.lines().count();
+            if total_lines == 0 {
+                continue;
+            }
+            let start = line_0.saturating_sub(5);
+            let end = line_0.saturating_add(35).min(total_lines.saturating_sub(1));
+            (60, false, start, end)
+        } else {
             continue;
         };
         if def_score == 0 {
             continue;
         }
-        let rel_path = path.to_string_lossy();
         let score = def_score + proximity_score(&rel_path, is_static, caller_dirs);
         match &best {
             Some((best_score, _, _, _)) if *best_score >= score => {}
@@ -570,10 +643,157 @@ async fn best_definition_range(
     Ok(best.map(|(_, p, s, e)| (p, s, e)))
 }
 
+/// Fallback definition range scorer for C++ constructs (`class`, derived
+/// `struct : Base`, templates, and `Class::method` definitions) that
+/// `tree-sitter-c` cannot parse into valid C AST definition nodes.
+///
+/// Rejects forward declarations (`class Foo;`) and function prototypes
+/// (`void foo(int);`) by requiring an opening `{` before any `;`.
+fn cpp_fallback_definition_range(
+    rel_path: &str,
+    content: &str,
+    line_0: usize,
+) -> Option<(i32, bool, usize, usize)> {
+    if !is_cpp_source_or_header(rel_path) {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let hit_trimmed = lines.get(line_0)?.trim_start();
+    let prev_trimmed = line_0
+        .checked_sub(1)
+        .and_then(|i| lines.get(i))
+        .map(|l| l.trim_start())
+        .unwrap_or("");
+
+    // Shared `.h` headers are also used by plain C code, where `tree-sitter-c`
+    // already scores all valid C definitions and returns `None` only on forward
+    // declarations/prototypes or unparsed C++ syntax. Restrict `.h` fallback to
+    // lines using C++-specific syntax or `GTY((...))` annotations.
+    if rel_path.ends_with(".h") && !line_has_cpp_or_gty_syntax(hit_trimmed, prev_trimmed) {
+        return None;
+    }
+
+    let (open_row, open_col) = find_open_brace_before_semicolon(&lines, line_0, 15)?;
+    let max_end = (line_0 + 200).min(lines.len().saturating_sub(1));
+    let end_row = find_matching_close_brace(&lines, open_row, open_col, max_end);
+    let start_row = if line_0 > 0 && prev_trimmed.starts_with("template") {
+        line_0 - 1
+    } else {
+        line_0
+    };
+    let is_type_def = ["class ", "struct ", "union ", "enum "]
+        .iter()
+        .any(|kw| hit_trimmed.starts_with(kw));
+    let score = if is_type_def { 100 } else { 90 };
+    let is_static = hit_trimmed.starts_with("static ");
+    Some((score, is_static, start_row, end_row))
+}
+
+fn line_has_cpp_or_gty_syntax(hit_trimmed: &str, prev_trimmed: &str) -> bool {
+    hit_trimmed.starts_with("class ")
+        || hit_trimmed.starts_with("template")
+        || prev_trimmed.starts_with("template")
+        || hit_trimmed.contains("::")
+        || hit_trimmed.contains("GTY")
+        || ((hit_trimmed.starts_with("struct ") || hit_trimmed.contains(" struct "))
+            && hit_trimmed.contains(':'))
+}
+
+/// Scans non-comment, non-literal code tokens across `lines[start_row..=end_row]`,
+/// starting at `start_col` on `start_row`, invoking `on_byte(row, col, byte)` until
+/// it returns `Some(T)`.
+fn scan_code_bytes<T>(
+    lines: &[&str],
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    mut on_byte: impl FnMut(usize, usize, u8) -> Option<T>,
+) -> Option<T> {
+    let mut in_block_comment = false;
+    for (row, line_str) in lines.iter().enumerate().take(end_row + 1).skip(start_row) {
+        let bytes = line_str.as_bytes();
+        let mut col = if row == start_row { start_col } else { 0 };
+        while col < bytes.len() {
+            if in_block_comment {
+                if col + 1 < bytes.len() && bytes[col] == b'*' && bytes[col + 1] == b'/' {
+                    in_block_comment = false;
+                    col += 2;
+                } else {
+                    col += 1;
+                }
+                continue;
+            }
+            if col + 1 < bytes.len() && bytes[col] == b'/' && bytes[col + 1] == b'/' {
+                break;
+            }
+            if col + 1 < bytes.len() && bytes[col] == b'/' && bytes[col + 1] == b'*' {
+                in_block_comment = true;
+                col += 2;
+                continue;
+            }
+            if bytes[col] == b'"' || bytes[col] == b'\'' {
+                let quote = bytes[col];
+                col += 1;
+                while col < bytes.len() {
+                    if bytes[col] == b'\\' {
+                        col += 2;
+                    } else if bytes[col] == quote {
+                        col += 1;
+                        break;
+                    } else {
+                        col += 1;
+                    }
+                }
+                continue;
+            }
+            if let Some(done) = on_byte(row, col, bytes[col]) {
+                return Some(done);
+            }
+            col += 1;
+        }
+    }
+    None
+}
+
+fn find_open_brace_before_semicolon(
+    lines: &[&str],
+    line_0: usize,
+    max_lines: usize,
+) -> Option<(usize, usize)> {
+    let end_row = (line_0 + max_lines).min(lines.len()).saturating_sub(1);
+    scan_code_bytes(lines, line_0, 0, end_row, |row, col, b| match b {
+        b';' => Some(None),
+        b'{' => Some(Some((row, col))),
+        _ => None,
+    })
+    .flatten()
+}
+
+fn find_matching_close_brace(
+    lines: &[&str],
+    open_row: usize,
+    open_col: usize,
+    max_end: usize,
+) -> usize {
+    let mut depth: i32 = 0;
+    scan_code_bytes(lines, open_row, open_col, max_end, |row, _, b| match b {
+        b'{' => {
+            depth += 1;
+            None
+        }
+        b'}' => {
+            depth -= 1;
+            (depth == 0).then_some(row)
+        }
+        _ => None,
+    })
+    .unwrap_or(max_end)
+}
+
 fn proximity_score(def_path: &str, is_static: bool, caller_dirs: &HashSet<&str>) -> i32 {
-    // Static .c definitions outside caller directories are almost certainly
-    // wrong-file matches (e.g. mkregtable.c reimplements list_add_tail).
-    if is_static && def_path.ends_with(".c") {
+    // Static C/C++ implementation definitions outside caller directories are
+    // almost certainly wrong-file matches (e.g. mkregtable.c reimplements list_add_tail).
+    if is_static && is_c_or_cpp_impl_file(def_path) {
         let def_dir = def_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         if !caller_dirs.contains(def_dir) {
             return -200;
@@ -675,8 +895,9 @@ fn is_common_c_word(word: &str) -> bool {
 /// Identifies types that are only used as opaque containers in the modified files.
 ///
 /// A type is "opaque" if, across all modified files:
-///   - no variable of that type is ever dereferenced (`var->member`), OR
-///   - every dereferenced member name contains "priv"
+///   - no variable of that type has any member accessed (`var->member`, `var.member`,
+///     or `Type::member`), OR
+///   - every accessed member name contains "priv"
 fn find_opaque_types(
     types: &HashSet<String>,
     file_ranges: &HashMap<String, Vec<(usize, usize)>>,
@@ -691,7 +912,15 @@ fn find_opaque_types(
         type_members.insert(t, HashSet::new());
     }
 
-    let decl_re = Regex::new(r"struct\s+(\w+)\s+\*(\w+)").unwrap();
+    let ptr_decl_re = Regex::new(
+        r"\b(?:(?:const|volatile)\s+)*(?:(?:struct|class|union)\s+)?([A-Za-z_]\w*)\s*(?:const\s*)?(?:\*+|&+)\s*([A-Za-z_]\w*)\b",
+    )
+    .unwrap();
+    let val_decl_re = Regex::new(
+        r"\b(?:(?:const|volatile)\s+)*(?:(?:struct|class|union)\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*[;=,)\[(]",
+    )
+    .unwrap();
+    let scoped_re = Regex::new(r"\b([A-Za-z_]\w*)\s*::\s*(\w+)").unwrap();
 
     for file in file_ranges.keys() {
         let Some(content) = snapshot.blobs.get(Path::new(file)) else {
@@ -699,16 +928,24 @@ fn find_opaque_types(
         };
 
         let mut var_to_type: Vec<(String, String)> = Vec::new();
-        for cap in decl_re.captures_iter(content) {
-            let type_name = cap[1].to_string();
-            let var_name = cap[2].to_string();
-            if type_members.contains_key(type_name.as_str()) {
-                var_to_type.push((var_name, type_name));
+        for decl_re in [&ptr_decl_re, &val_decl_re] {
+            for cap in decl_re.captures_iter(content) {
+                let type_name = &cap[1];
+                let var_name = &cap[2];
+                if type_members.contains_key(type_name) && !is_common_c_word(var_name) {
+                    var_to_type.push((var_name.to_string(), type_name.to_string()));
+                }
+            }
+        }
+
+        for cap in scoped_re.captures_iter(content) {
+            if let Some(members) = type_members.get_mut(&cap[1]) {
+                members.insert(cap[2].to_string());
             }
         }
 
         for (var, typ) in &var_to_type {
-            let pattern = format!(r"{}\s*->\s*(\w+)", regex::escape(var));
+            let pattern = format!(r"\b{}\s*(?:->|\.)\s*(\w+)", regex::escape(var));
             if let Ok(re) = Regex::new(&pattern) {
                 for cap in re.captures_iter(content) {
                     let member = cap[1].to_string();
@@ -947,5 +1184,29 @@ struct MyStruct {
         ranges.insert((50, 60)); // gap of 19 — does not merge
         let merged = merge_ranges(&ranges, 3);
         assert_eq!(merged, vec![(10, 30), (50, 60)]);
+    }
+
+    #[test]
+    fn test_is_prefetchable_source_file() {
+        assert!(is_prefetchable_source_file("mm/page_alloc.c"));
+        assert!(is_prefetchable_source_file("gcc/tree-vect-stmts.cc"));
+        assert!(is_prefetchable_source_file("gcc/match.pd"));
+        assert!(is_prefetchable_source_file("gcc/config/i386/i386.md"));
+        assert!(is_prefetchable_source_file("gcc/fortran/resolve.f90"));
+        assert!(!is_prefetchable_source_file("README.md"));
+        assert!(!is_prefetchable_source_file("Documentation/foo.md"));
+        assert!(!is_prefetchable_source_file(
+            "gcc/testsuite/gcc.dg/pr12345.c"
+        ));
+        assert!(!is_prefetchable_source_file("gcc/ChangeLog"));
+
+        assert!(PREFETCH_GREP_PATHSPECS.contains(&"*.pd"));
+        assert!(PREFETCH_GREP_PATHSPECS.contains(&"*.f90"));
+        assert!(PREFETCH_GREP_PATHSPECS.contains(&"*.F90"));
+        assert!(PREFETCH_GREP_PATHSPECS.contains(&"*.md"));
+        assert!(is_non_c_dsl_or_table_file("gcc/match.pd"));
+        assert!(is_non_c_dsl_or_table_file("gcc/config/i386/i386.md"));
+        assert!(is_non_c_dsl_or_table_file("gcc/fortran/resolve.f90"));
+        assert!(!is_non_c_dsl_or_table_file("gcc/tree-vect-stmts.cc"));
     }
 }

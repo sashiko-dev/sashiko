@@ -22,6 +22,57 @@ pub const KNOWN_MAILING_LIST_DOMAINS: &[&str] = &[
     "lists.ozlabs.org",
 ];
 
+/// Known public mailing-list addresses hosted on shared project domains (such as
+/// `gcc.gnu.org` and `sourceware.org`) where personal developer accounts also
+/// use the same domain.
+pub const KNOWN_MAILING_LIST_ADDRESSES: &[&str] = &[
+    "algol68@gcc.gnu.org",
+    "cobol@gcc.gnu.org",
+    "fortran@gcc.gnu.org",
+    "gcc-bugs@gcc.gnu.org",
+    "gcc-cvs@gcc.gnu.org",
+    "gcc-help@gcc.gnu.org",
+    "gcc-patches@gcc.gnu.org",
+    "gcc-prs@gcc.gnu.org",
+    "gcc-regression@gcc.gnu.org",
+    "gcc-rust@gcc.gnu.org",
+    "gcc-testresults@gcc.gnu.org",
+    "gcc@gcc.gnu.org",
+    "gccadmin@gcc.gnu.org",
+    "java-patches@gcc.gnu.org",
+    "jit@gcc.gnu.org",
+    "libstdc++-cvs@gcc.gnu.org",
+    "libstdc++@gcc.gnu.org",
+    "binutils@sourceware.org",
+    "cgen@sourceware.org",
+    "cygwin-patches@sourceware.org",
+    "dwz@sourceware.org",
+    "elfutils-devel@sourceware.org",
+    "gdb-patches@sourceware.org",
+    "libabigail@sourceware.org",
+    "libc-alpha@sourceware.org",
+    "newlib@sourceware.org",
+    "overseers@sourceware.org",
+    "systemtap@sourceware.org",
+];
+
+/// Returns true if `bare` (`local@domain`) belongs to a dedicated mailing-list
+/// domain or matches a known public mailing-list address on a shared domain.
+pub fn is_known_mailing_list_bare(bare: &str) -> bool {
+    if KNOWN_MAILING_LIST_ADDRESSES
+        .iter()
+        .any(|&addr| addr.eq_ignore_ascii_case(bare))
+    {
+        return true;
+    }
+    if let Some((_, domain)) = bare.split_once('@') {
+        return KNOWN_MAILING_LIST_DOMAINS
+            .iter()
+            .any(|&d| d.eq_ignore_ascii_case(domain));
+    }
+    false
+}
+
 /// The largest number of individual To/Cc addresses a review is relayed to
 /// under the "recipients" reply target; past it, none of them is, and the
 /// lists, the author and the configured cc addresses still get the review.
@@ -114,15 +165,7 @@ impl EmailRouter {
 
     fn is_mailing_list_address(addr: &str, configured_lists: &HashSet<String>) -> bool {
         let bare = extract_bare_email(addr);
-        if configured_lists.contains(&bare) {
-            return true;
-        }
-        if let Some((_, domain)) = bare.split_once('@')
-            && KNOWN_MAILING_LIST_DOMAINS.contains(&domain)
-        {
-            return true;
-        }
-        false
+        configured_lists.contains(&bare) || is_known_mailing_list_bare(&bare)
     }
 
     fn dedup_addresses(
@@ -1453,5 +1496,62 @@ mod tests {
                 positive_review: PositiveReviewPolicy::None,
             }
         );
+    }
+
+    #[test]
+    fn test_gcc_shared_domain_lists_vs_personal_accounts() {
+        assert!(is_known_mailing_list_bare("gcc-patches@gcc.gnu.org"));
+        assert!(is_known_mailing_list_bare("fortran@gcc.gnu.org"));
+        assert!(is_known_mailing_list_bare("libstdc++@gcc.gnu.org"));
+        assert!(is_known_mailing_list_bare("libc-alpha@sourceware.org"));
+        assert!(!is_known_mailing_list_bare("jakub@gcc.gnu.org"));
+        assert!(!is_known_mailing_list_bare("rguenth@gcc.gnu.org"));
+        assert!(!is_known_mailing_list_bare("maintainer@sourceware.org"));
+
+        let mut lists = HashMap::new();
+        lists.insert(
+            "gcc-patches@gcc.gnu.org".to_string(),
+            MailingListPolicy {
+                mute_all: Some(false),
+                reply_to: Some(vec![
+                    ReplyTarget::Author,
+                    ReplyTarget::List,
+                    ReplyTarget::Recipients,
+                ]),
+                ..Default::default()
+            },
+        );
+        let policy = EmailPolicyConfig {
+            defaults: DefaultListPolicy {
+                mute_all: true,
+                ..Default::default()
+            },
+            lists,
+        };
+        let to = vec![
+            "gcc-patches@gcc.gnu.org".to_string(),
+            "fortran@gcc.gnu.org".to_string(),
+        ];
+        let cc = vec!["Jakub Jelinek <jakub@gcc.gnu.org>".to_string()];
+        let action = EmailRouter::resolve_recipients(
+            &policy,
+            &to,
+            &cc,
+            "Author <author@example.com>",
+            "sashiko@sashiko.dev",
+        );
+        match action {
+            Action::Send { to, cc, .. } => {
+                assert_eq!(
+                    to,
+                    vec![
+                        "Author <author@example.com>".to_string(),
+                        "gcc-patches@gcc.gnu.org".to_string(),
+                    ]
+                );
+                assert_eq!(cc, vec!["Jakub Jelinek <jakub@gcc.gnu.org>".to_string()]);
+            }
+            Action::Mute => panic!("expected Action::Send"),
+        }
     }
 }

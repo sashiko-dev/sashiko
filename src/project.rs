@@ -39,6 +39,7 @@ pub enum ProjectId {
     #[default]
     Linux,
     Sashiko,
+    Gcc,
 }
 
 impl ProjectId {
@@ -48,6 +49,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "linux",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::Gcc => "gcc",
         }
     }
 
@@ -56,6 +58,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "Linux",
             ProjectId::Sashiko => "Sashiko",
+            ProjectId::Gcc => "GCC",
         }
     }
 
@@ -72,6 +75,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "kernel",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::Gcc => "gcc",
         }
     }
 
@@ -82,7 +86,7 @@ impl ProjectId {
     pub fn uses_maintainers(self) -> bool {
         match self {
             ProjectId::Linux => true,
-            ProjectId::Sashiko => false,
+            ProjectId::Sashiko | ProjectId::Gcc => false,
         }
     }
 
@@ -92,6 +96,7 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "projects/linux/mailing_lists.toml",
             ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
+            ProjectId::Gcc => "projects/gcc/mailing_lists.toml",
         }
     }
 
@@ -110,6 +115,10 @@ impl ProjectId {
             ProjectId::Sashiko => Upstream {
                 url: "https://github.com/sashiko-dev/sashiko.git",
                 seed: Seed::None,
+            },
+            ProjectId::Gcc => Upstream {
+                url: "git://gcc.gnu.org/git/gcc.git",
+                seed: Seed::Mirror("https://github.com/gnutools/gcc.git"),
             },
         }
     }
@@ -154,6 +163,7 @@ impl FromStr for ProjectId {
         match s.trim().to_ascii_lowercase().as_str() {
             "linux" => Ok(ProjectId::Linux),
             "sashiko" => Ok(ProjectId::Sashiko),
+            "gcc" => Ok(ProjectId::Gcc),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -187,7 +197,7 @@ impl ProjectId {
     /// Every project, for error messages and for tests that must cover them
     /// all. Adding a variant without adding it here fails the exhaustiveness
     /// test below.
-    pub const ALL: &'static [ProjectId] = &[ProjectId::Linux, ProjectId::Sashiko];
+    pub const ALL: &'static [ProjectId] = &[ProjectId::Linux, ProjectId::Sashiko, ProjectId::Gcc];
 }
 
 #[cfg(test)]
@@ -218,10 +228,10 @@ mod tests {
         // checked against a match the compiler forces to stay exhaustive.
         for project in ProjectId::ALL {
             match project {
-                ProjectId::Linux | ProjectId::Sashiko => {}
+                ProjectId::Linux | ProjectId::Sashiko | ProjectId::Gcc => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 2);
+        assert_eq!(ProjectId::ALL.len(), 3);
     }
 
     #[test]
@@ -236,6 +246,7 @@ mod tests {
     fn test_display_name() {
         assert_eq!(ProjectId::Linux.display_name(), "Linux");
         assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
+        assert_eq!(ProjectId::Gcc.display_name(), "GCC");
     }
 
     #[test]

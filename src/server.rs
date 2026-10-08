@@ -2703,13 +2703,12 @@ fn is_notifiable_address(
     smtp: &crate::settings::SmtpSettings,
     address: &str,
 ) -> bool {
-    let Ok(parsed) = address.parse::<lettre::Address>() else {
+    if address.parse::<lettre::Address>().is_err() {
         return false;
-    };
-    let domain = parsed.domain().to_ascii_lowercase();
-    !crate::email_router::KNOWN_MAILING_LIST_DOMAINS.contains(&domain.as_str())
-        && crate::email_policy::extract_bare_email(&smtp.sender_address)
-            != address.to_ascii_lowercase()
+    }
+    let bare = address.to_ascii_lowercase();
+    !crate::email_router::is_known_mailing_list_bare(&bare)
+        && crate::email_policy::extract_bare_email(&smtp.sender_address) != bare
         && !state.settings.server.acl.is_blocklisted(address)
 }
 
