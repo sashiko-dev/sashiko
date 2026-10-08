@@ -1,0 +1,16 @@
+# SHARED SERVICE SKELETON
+# The selector is added via patches in 'routing' or 'maintenance' folders.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sashiko-gcc-service
+  namespace: sashiko-self
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    beta.cloud.google.com/backend-config: '{"default":"sashiko-gcc-backend-config"}'
+spec:
+  type: NodePort
+  ports:
+    - protocol: TCP
+      port: 8081
+      targetPort: 8081

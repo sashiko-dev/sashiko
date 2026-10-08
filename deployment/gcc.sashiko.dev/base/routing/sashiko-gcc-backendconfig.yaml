@@ -1,0 +1,12 @@
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: sashiko-gcc-backend-config
+  namespace: sashiko-self
+spec:
+  healthCheck:
+    checkIntervalSec: 15
+    timeoutSec: 10
+    port: 8081
+    type: HTTP
+    requestPath: /health
