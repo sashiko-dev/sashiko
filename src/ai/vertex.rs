@@ -23,7 +23,8 @@
 //! via the `generateContent` endpoint.
 
 use crate::ai::claude::{
-    self, ClaudeError, ClaudeMessage, ClaudeResponse, ClaudeTool, SystemBlock, ThinkingConfig,
+    self, ClaudeError, ClaudeMessage, ClaudeResponse, ClaudeTool, OutputConfig, SystemBlock,
+    ThinkingConfig,
 };
 use crate::ai::gemini::{self, GenerateContentRequest, GenerateContentResponse};
 use crate::ai::{AiProvider, AiRequest, AiResponse, ProviderCapabilities};
@@ -76,6 +77,30 @@ struct VertexClaudeRequest {
     tools: Option<Vec<ClaudeTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// Translate a request into the rawPredict body, through the same Claude
+/// translation the direct API uses.
+fn claude_request_body(
+    request: &AiRequest,
+    enable_caching: bool,
+    max_tokens: u32,
+    thinking: Option<String>,
+    effort: Option<String>,
+) -> Result<VertexClaudeRequest> {
+    let claude_req =
+        claude::translate_ai_request(request, enable_caching, max_tokens, thinking, effort)?;
+    Ok(VertexClaudeRequest {
+        anthropic_version: "vertex-2023-10-16".to_string(),
+        messages: claude_req.messages,
+        max_tokens: claude_req.max_tokens,
+        system: claude_req.system,
+        tools: claude_req.tools,
+        thinking: claude_req.thinking,
+        output_config: claude_req.output_config,
+    })
 }
 
 // --- Endpoint construction ---
@@ -254,22 +279,13 @@ impl VertexClient {
     }
 
     async fn generate_claude(&self, request: AiRequest) -> Result<AiResponse> {
-        let claude_req = claude::translate_ai_request(
+        let vertex_req = claude_request_body(
             &request,
             self.enable_caching,
             self.max_tokens,
             self.thinking.clone(),
             self.effort.clone(),
         )?;
-
-        let vertex_req = VertexClaudeRequest {
-            anthropic_version: "vertex-2023-10-16".to_string(),
-            messages: claude_req.messages,
-            max_tokens: claude_req.max_tokens,
-            system: claude_req.system,
-            tools: claude_req.tools,
-            thinking: claude_req.thinking,
-        };
 
         let response = self.post_claude_request(&vertex_req).await?;
         claude::translate_ai_response(&response)
@@ -452,7 +468,7 @@ mod tests {
     }
 
     fn hello_request() -> VertexClaudeRequest {
-        let claude_req = claude::translate_ai_request(
+        claude_request_body(
             &AiRequest {
                 system: None,
                 messages: vec![AiMessage {
@@ -473,15 +489,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
-        VertexClaudeRequest {
-            anthropic_version: "vertex-2023-10-16".to_string(),
-            messages: claude_req.messages,
-            max_tokens: claude_req.max_tokens,
-            system: claude_req.system,
-            tools: claude_req.tools,
-            thinking: claude_req.thinking,
-        }
+        .unwrap()
     }
 
     async fn send_to(url: &str) -> Result<ClaudeResponse> {
@@ -738,6 +746,7 @@ mod tests {
             system: None,
             tools: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -754,6 +763,7 @@ mod tests {
             system: None,
             tools: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -780,16 +790,7 @@ mod tests {
             context_tag: None,
         };
 
-        let claude_req = claude::translate_ai_request(&ai_req, false, 4096, None, None).unwrap();
-
-        let vertex_req = VertexClaudeRequest {
-            anthropic_version: "vertex-2023-10-16".to_string(),
-            messages: claude_req.messages,
-            max_tokens: claude_req.max_tokens,
-            system: claude_req.system,
-            tools: claude_req.tools,
-            thinking: claude_req.thinking,
-        };
+        let vertex_req = claude_request_body(&ai_req, false, 4096, None, None).unwrap();
 
         let json = serde_json::to_value(&vertex_req).unwrap();
         assert_eq!(json["anthropic_version"], "vertex-2023-10-16");
@@ -797,8 +798,43 @@ mod tests {
         assert!(json["system"].is_array());
         assert!(json["messages"].is_array());
         assert_eq!(json["max_tokens"], 4096);
-        // thinking should be absent (both None)
+        // thinking and output_config should be absent (both None)
         assert!(!json.as_object().unwrap().contains_key("thinking"));
+        assert!(!json.as_object().unwrap().contains_key("output_config"));
+    }
+
+    #[test]
+    fn test_vertex_claude_request_carries_effort_at_top_level() {
+        use crate::ai::{AiMessage, AiRole};
+
+        let ai_req = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Hello".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let vertex_req = claude_request_body(
+            &ai_req,
+            false,
+            4096,
+            Some("adaptive".to_string()),
+            Some("high".to_string()),
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(&vertex_req).unwrap();
+        assert_eq!(json["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(json["output_config"], serde_json::json!({"effort": "high"}));
     }
 
     // --- Context window detection ---

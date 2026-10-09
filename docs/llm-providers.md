@@ -56,8 +56,8 @@ cp docs/examples/Settings.claude.toml Settings.toml
 - Automatic retry on rate limits and API overload
 - 200K context window (use `max_input_tokens = 40000` for cost-conscious
   defaults)
-- Extended thinking via the `thinking` and `effort` settings in
-  `[ai.claude]`
+- Adaptive thinking and effort via the `thinking` and `effort` settings
+  in `[ai.claude]`
 
 ## Claude Code CLI
 

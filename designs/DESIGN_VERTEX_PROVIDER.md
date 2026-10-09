@@ -180,7 +180,7 @@ max_input_tokens = 40000
 # project_id = "my-gcp-project"  # Falls back to the env vars above
 # region = "us-east5"            # Falls back to the env vars above
 prompt_caching = true
-# thinking = "enabled"
+# thinking = "adaptive"
 # effort = "high"
 ```
 
