@@ -56,6 +56,8 @@ pub mod reviewer;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod settings;
+#[cfg(feature = "cache")]
+pub(crate) mod sqlite_transaction;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod toolbox;

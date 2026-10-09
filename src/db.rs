@@ -191,84 +191,8 @@ pub struct Database {
     bug_claim: Option<BugAnalysisClaim>,
 }
 
-/// Guards an open transaction on the transaction `libsql::Connection` so
-/// concurrent tasks cannot start a nested transaction before the active one
-/// finishes, and suppresses `libsql`'s drop-time rollback `.unwrap()` panic.
 #[cfg(feature = "server")]
-pub struct DatabaseTransaction {
-    tx: Option<libsql::Transaction>,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-}
-
-#[cfg(feature = "server")]
-impl std::ops::Deref for DatabaseTransaction {
-    type Target = libsql::Transaction;
-
-    fn deref(&self) -> &Self::Target {
-        self.tx
-            .as_ref()
-            .expect("transaction accessed after completion")
-    }
-}
-
-#[cfg(feature = "server")]
-impl DatabaseTransaction {
-    fn drop_quietly(tx: libsql::Transaction) {
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(tx))).is_err() {
-            warn!("Suppressed libsql transaction rollback panic during drop");
-        }
-    }
-
-    /// Commits the transaction while keeping `self.tx` inside `self` across `.await`.
-    ///
-    /// We intentionally execute `COMMIT` directly instead of calling
-    /// `libsql::Transaction::commit(self)`:
-    /// 1. `libsql::Transaction::commit(self)` takes `local::Transaction` out of its
-    ///    `Option` and drops it *inside* `commit()` before returning `Err`, so a
-    ///    failed `COMMIT` triggers `local::Transaction::drop`'s `do_rollback().unwrap()`
-    ///    panic before the caller can intercept it.
-    /// 2. `local::Transaction::drop` checks `if self.conn.is_autocommit() { return; }`
-    ///    (`sqlite3_get_autocommit`) on its first line. Once `COMMIT` succeeds,
-    ///    SQLite returns to autocommit mode (`tx.is_autocommit() == true`), so
-    ///    dropping `self.tx` in `DatabaseTransaction::drop` is a no-op that never
-    ///    runs `ROLLBACK` or panics.
-    pub async fn commit(self) -> Result<()> {
-        if let Some(tx) = self.tx.as_ref() {
-            if let Err(err) = tx.execute("COMMIT", ()).await {
-                if !tx.is_autocommit() {
-                    let _ = tx.execute("ROLLBACK", ()).await;
-                }
-                return Err(err.into());
-            }
-            debug_assert!(tx.is_autocommit());
-        }
-        Ok(())
-    }
-
-    /// Rolls back the transaction while keeping `self.tx` inside `self` across `.await`.
-    ///
-    /// Once `ROLLBACK` succeeds, `tx.is_autocommit()` (`sqlite3_get_autocommit`)
-    /// is `true`, so `local::Transaction::drop` returns immediately without
-    /// issuing a second `ROLLBACK` or panicking.
-    pub async fn rollback(self) -> Result<()> {
-        if let Some(tx) = self.tx.as_ref()
-            && !tx.is_autocommit()
-        {
-            tx.execute("ROLLBACK", ()).await?;
-            debug_assert!(tx.is_autocommit());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "server")]
-impl Drop for DatabaseTransaction {
-    fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            Self::drop_quietly(tx);
-        }
-    }
-}
+pub use crate::sqlite_transaction::SqliteTransaction as DatabaseTransaction;
 
 /// Ownership of one analysis attempt, separate from its audit attribution.
 #[cfg(feature = "server")]
@@ -1465,15 +1389,7 @@ impl Database {
 
     /// Opens an IMMEDIATE write transaction after acquiring the connection's transaction lock.
     pub async fn begin_immediate_transaction(&self) -> Result<DatabaseTransaction> {
-        let guard = self.tx_lock.clone().lock_owned().await;
-        let tx = self
-            .tx_conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await?;
-        Ok(DatabaseTransaction {
-            tx: Some(tx),
-            _guard: guard,
-        })
+        DatabaseTransaction::begin(&self.tx_conn, self.tx_lock.clone()).await
     }
 
     /// Checks ownership under the same write lock as the ensuing mutation.

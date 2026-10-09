@@ -63,7 +63,7 @@ pub async fn handle_generate(
                         tokio::time::sleep(backoff).await;
                         continue;
                     }
-                    AiErrorClass::Fatal => {}
+                    AiErrorClass::Fatal | AiErrorClass::InvalidResponse => {}
                 }
 
                 error!("Gemini Proxy Error: {}", e);

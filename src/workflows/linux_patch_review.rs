@@ -1166,7 +1166,8 @@ pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
                     "items": { "type": "string" }
                 }
             },
-            "required": ["selected_prompts"]
+            "required": ["selected_prompts"],
+            "additionalProperties": false
         })))
         .policy(StagePolicy {
             tools: ToolScope::None,
@@ -1221,7 +1222,8 @@ You MUST respond with ONLY a JSON object, no other text. Use the names exactly a
                     }
                 }
             },
-            "required": ["relevant_stages"]
+            "required": ["relevant_stages"],
+            "additionalProperties": false
         })))
         .policy(StagePolicy {
             tools: ToolScope::None,
@@ -2942,6 +2944,7 @@ mod tests {
                         },
                     ]),
                     tool_call_id: None,
+                    provider_metadata: None,
                 },
                 crate::ai::AiMessage {
                     role: crate::ai::AiRole::Tool,
@@ -2950,6 +2953,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("read_prompt".to_string()),
+                    provider_metadata: None,
                 },
                 crate::ai::AiMessage {
                     role: crate::ai::AiRole::Tool,
@@ -2958,6 +2962,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("read_prompt".to_string()),
+                    provider_metadata: None,
                 },
                 crate::ai::AiMessage {
                     role: crate::ai::AiRole::Tool,
@@ -2968,6 +2973,7 @@ mod tests {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: Some("read_prompt".to_string()),
+                    provider_metadata: None,
                 },
             ],
         };

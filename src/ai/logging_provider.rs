@@ -26,9 +26,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::ai::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities};
+use crate::ai::{
+    AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities, rejected_ai_output,
+};
 
 /// Wraps any [`AiProvider`], logging each request/response turn. All other
 /// behaviour is delegated unchanged to the inner provider.
@@ -75,7 +77,17 @@ impl AiProvider for LoggingProvider {
             }
         }
 
-        let response = self.inner.generate_content(request).await?;
+        let response = match self.inner.generate_content(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    rejected_output = ?rejected_ai_output(&error),
+                    "{tag}← Turn {turn} provider error"
+                );
+                return Err(error);
+            }
+        };
 
         // Log the response: text, any tool calls, and token usage.
         if let Some(content) = &response.content {

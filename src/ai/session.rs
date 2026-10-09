@@ -15,10 +15,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 
 use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
-    AiUsage, ToolCall, classify_ai_error,
+    AiUsage, MAX_PROVIDER_METADATA_BYTES, ToolCall, classify_ai_error, provider_metadata_size,
+    rejected_ai_output,
 };
 
 /// The unified result of executing an [`LlmSession`].
@@ -146,6 +148,56 @@ pub struct SessionRunner<'a> {
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
 }
 
+fn retain_for_continuation(
+    history: &mut Vec<AiMessage>,
+    provider_metadata_bytes: &mut usize,
+    message: AiMessage,
+) -> Result<()> {
+    if let Some(metadata) = message.provider_metadata.as_ref() {
+        let metadata_bytes = provider_metadata_size(metadata)?;
+        let cumulative_bytes = provider_metadata_bytes.saturating_add(metadata_bytes);
+        if cumulative_bytes > MAX_PROVIDER_METADATA_BYTES {
+            anyhow::bail!(
+                "provider continuation metadata is {} bytes, exceeding the limit of {}",
+                cumulative_bytes,
+                MAX_PROVIDER_METADATA_BYTES
+            );
+        }
+        *provider_metadata_bytes = cumulative_bytes;
+    }
+    history.push(message);
+    Ok(())
+}
+
+fn validate_tool_results(calls: &[ToolCall], results: &[(String, Value)]) -> Result<()> {
+    let mut remaining = HashMap::with_capacity(calls.len());
+    for call in calls {
+        *remaining.entry(call.id.as_str()).or_insert(0usize) += 1;
+    }
+
+    for (call_id, _) in results {
+        match remaining.get_mut(call_id.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                anyhow::bail!("tool execution returned unmatched or duplicate call ID {call_id:?}")
+            }
+        }
+    }
+
+    let mut missing: Vec<&str> = remaining
+        .into_iter()
+        .filter_map(|(call_id, count)| (count > 0).then_some(call_id))
+        .collect();
+    missing.sort_unstable();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "tool execution returned no result for call IDs: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 impl<'a> SessionRunner<'a> {
     /// Creates a new `SessionRunner` with default limits.
     pub fn new(provider: &'a dyn AiProvider) -> Self {
@@ -204,6 +256,7 @@ impl<'a> SessionRunner<'a> {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }];
 
         let mut log_history = vec![AiMessage {
@@ -213,6 +266,7 @@ impl<'a> SessionRunner<'a> {
             thought_signature: None,
             tool_calls: None,
             tool_call_id: None,
+            provider_metadata: None,
         }];
 
         let mut turns = 0;
@@ -225,6 +279,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        let mut provider_metadata_bytes = 0usize;
 
         loop {
             turns += 1;
@@ -247,6 +302,7 @@ impl<'a> SessionRunner<'a> {
                     thought_signature: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_metadata: None,
                 };
                 history.push(final_prompt.clone());
                 log_history.push(final_prompt);
@@ -289,8 +345,33 @@ impl<'a> SessionRunner<'a> {
                         turns = turns.saturating_sub(1);
                         continue;
                     }
-                    AiErrorClass::Fatal => {
-                        match session.handle_provider_error(&e, provider_error_retries) {
+                    class @ (AiErrorClass::Fatal | AiErrorClass::InvalidResponse) => {
+                        if let Some(output) = rejected_ai_output(&e) {
+                            tracing::warn!(rejected_output = %output, "Provider rejected model output");
+                            let message = AiMessage {
+                                role: AiRole::Assistant,
+                                content: Some(format!(
+                                    "Rejected model output (no tools executed): {output}"
+                                )),
+                                thought: None,
+                                thought_signature: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                provider_metadata: None,
+                            };
+                            history.push(message.clone());
+                            log_history.push(message);
+                        }
+                        let action = if class == AiErrorClass::InvalidResponse {
+                            ErrorAction::RetryWithFeedback(format!(
+                                "Your previous response was invalid: {e}. \
+                                 Regenerate the response with valid JSON object arguments \
+                                 for every function call. No tools from that response were executed."
+                            ))
+                        } else {
+                            session.handle_provider_error(&e, provider_error_retries)
+                        };
+                        match action {
                             ErrorAction::RetryWithFeedback(feedback) => {
                                 provider_error_retries += 1;
                                 if provider_error_retries > self.max_provider_error_retries {
@@ -307,6 +388,7 @@ impl<'a> SessionRunner<'a> {
                                     thought_signature: None,
                                     tool_calls: None,
                                     tool_call_id: None,
+                                    provider_metadata: None,
                                 };
                                 history.push(msg.clone());
                                 log_history.push(msg);
@@ -335,16 +417,22 @@ impl<'a> SessionRunner<'a> {
                 total_cached_tokens += usage.cached_tokens.unwrap_or(0);
             }
 
-            let assistant_msg = AiMessage {
+            let mut assistant_msg = AiMessage {
                 role: AiRole::Assistant,
                 content: resp.content.clone(),
                 thought: resp.thought.clone(),
                 thought_signature: resp.thought_signature.clone(),
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
+                provider_metadata: resp.provider_metadata.clone(),
             };
-            history.push(assistant_msg.clone());
-            log_history.push(assistant_msg);
+            // Provider metadata can include encrypted reasoning items. It is
+            // needed for the in-memory continuation but not for the human
+            // readable history persisted after this session completes.
+            log_history.push(AiMessage {
+                provider_metadata: None,
+                ..assistant_msg.clone()
+            });
 
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls
@@ -354,8 +442,18 @@ impl<'a> SessionRunner<'a> {
                     tracing::warn!(
                         "Model emitted tool calls on final turn; ignoring tools to force validation."
                     );
+                    // Discard unresolved continuation state so a format retry
+                    // does not fail with missing tool results.
+                    assistant_msg.provider_metadata = None;
+                    assistant_msg.tool_calls = None;
                 } else {
+                    retain_for_continuation(
+                        &mut history,
+                        &mut provider_metadata_bytes,
+                        assistant_msg,
+                    )?;
                     let results = session.call_tools(tool_calls.clone()).await?;
+                    validate_tool_results(tool_calls, &results)?;
                     for (call_id, result) in results {
                         let tool_msg = AiMessage {
                             role: AiRole::Tool,
@@ -364,6 +462,7 @@ impl<'a> SessionRunner<'a> {
                             thought_signature: None,
                             tool_calls: None,
                             tool_call_id: Some(call_id),
+                            provider_metadata: None,
                         };
                         history.push(tool_msg.clone());
                         log_history.push(tool_msg);
@@ -402,6 +501,11 @@ impl<'a> SessionRunner<'a> {
                             violation
                         );
                     }
+                    retain_for_continuation(
+                        &mut history,
+                        &mut provider_metadata_bytes,
+                        assistant_msg,
+                    )?;
                     let feedback = session.format_validation_feedback(&violation);
                     let msg = AiMessage {
                         role: AiRole::User,
@@ -410,6 +514,7 @@ impl<'a> SessionRunner<'a> {
                         thought_signature: None,
                         tool_calls: None,
                         tool_call_id: None,
+                        provider_metadata: None,
                     };
                     history.push(msg.clone());
                     log_history.push(msg);
@@ -426,7 +531,8 @@ impl<'a> SessionRunner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::ProviderCapabilities;
+    use crate::ai::{AiProviderMetadata, ProviderCapabilities};
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -484,6 +590,212 @@ mod tests {
         }
     }
 
+    struct MetadataSession;
+
+    struct InvalidResponseProvider {
+        requests: Mutex<Vec<AiRequest>>,
+        invalid_responses: usize,
+        remote: bool,
+    }
+
+    #[async_trait]
+    impl AiProvider for InvalidResponseProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            if requests.len() <= self.invalid_responses {
+                let error = super::super::openai_responses::OpenAiError::InvalidToolArguments {
+                    call_id: "call_1".to_string(),
+                    message: "has invalid JSON arguments".to_string(),
+                    rejected_output: "{\"path\": broken".to_string(),
+                };
+                let error = anyhow::Error::from(error);
+                return Err(if self.remote {
+                    serde_json::from_value::<super::super::RemoteAiErrorPayload>(
+                        serde_json::to_value(super::super::RemoteAiErrorPayload::from_error(
+                            &error,
+                        ))?,
+                    )?
+                    .into_error()
+                    .into()
+                } else {
+                    error
+                });
+            }
+            Ok(AiResponse {
+                content: Some("corrected".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+                provider_metadata: None,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test".to_string(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_receive_correction_feedback_locally_and_over_stdio()
+    -> Result<()> {
+        for remote in [false, true] {
+            use tracing::instrument::WithSubscriber;
+            let provider = std::sync::Arc::new(InvalidResponseProvider {
+                requests: Mutex::new(Vec::new()),
+                invalid_responses: 1,
+                remote,
+            });
+            let log = tempfile::NamedTempFile::new()?;
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(log.reopen()?)
+                .with_ansi(false)
+                .finish();
+            let logging = super::super::logging_provider::LoggingProvider::new(provider.clone());
+            let result = SessionRunner::new(&logging)
+                .run(&mut DummySession)
+                .with_subscriber(subscriber)
+                .await?;
+            assert_eq!(result.output, "corrected");
+            let logged = std::fs::read_to_string(log.path())?;
+            assert!(logged.contains("provider error"));
+            assert!(logged.contains("broken"));
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let rejected = &requests[1].messages[requests[1].messages.len() - 2];
+            assert_eq!(rejected.role, AiRole::Assistant);
+            assert!(
+                rejected
+                    .content
+                    .as_ref()
+                    .unwrap()
+                    .contains("{\"path\": broken")
+            );
+            assert!(rejected.tool_calls.is_none());
+            assert!(
+                result
+                    .history
+                    .iter()
+                    .any(|message| message.role == AiRole::Assistant
+                        && message.content == rejected.content)
+            );
+            let feedback = requests[1].messages.last().unwrap();
+            assert_eq!(feedback.role, AiRole::User);
+            assert!(
+                feedback
+                    .content
+                    .as_ref()
+                    .unwrap()
+                    .contains("invalid JSON arguments")
+            );
+            assert!(
+                requests[1]
+                    .messages
+                    .iter()
+                    .all(|message| message.provider_metadata.is_none())
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_argument_retries_are_bounded() {
+        let provider = InvalidResponseProvider {
+            requests: Mutex::new(Vec::new()),
+            invalid_responses: usize::MAX,
+            remote: false,
+        };
+        let error = SessionRunner::new(&provider)
+            .with_max_provider_error_retries(1)
+            .run(&mut DummySession)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("failed after 1 provider error retries")
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    }
+
+    #[async_trait]
+    impl LlmSession for MetadataSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "user".to_string()
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(json!({"ok": true}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            response
+                .content
+                .clone()
+                .ok_or_else(|| ValidationError::Fatal("missing final response".to_string()))
+        }
+    }
+
+    struct MetadataProvider {
+        requests: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for MetadataProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            if requests.len() == 1 {
+                return Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }]),
+                    usage: None,
+                    truncated: false,
+                    provider_metadata: Some(AiProviderMetadata {
+                        provider: "test.provider".to_string(),
+                        version: 1,
+                        data: json!({"encrypted_content": "opaque"}),
+                    }),
+                });
+            }
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+                provider_metadata: None,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test".to_string(),
+                context_window_size: 1,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_call_tools_captures_errors_as_json() {
         let mut session = DummySession;
@@ -513,6 +825,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_tool_results_must_match_requested_call_ids() {
+        let calls = vec![
+            ToolCall {
+                id: "call_1".to_string(),
+                function_name: "first".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            },
+            ToolCall {
+                id: "call_2".to_string(),
+                function_name: "second".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            },
+        ];
+
+        assert!(
+            validate_tool_results(
+                &calls,
+                &[
+                    ("call_2".to_string(), json!(2)),
+                    ("call_1".to_string(), json!(1)),
+                ]
+            )
+            .is_ok()
+        );
+
+        for results in [
+            vec![("call_1".to_string(), json!(1))],
+            vec![
+                ("call_1".to_string(), json!(1)),
+                ("call_1".to_string(), json!(2)),
+            ],
+            vec![
+                ("call_1".to_string(), json!(1)),
+                ("unexpected".to_string(), json!(2)),
+            ],
+        ] {
+            assert!(validate_tool_results(&calls, &results).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn test_session_runner_survives_tool_error() {
         let responses = vec![
@@ -528,6 +883,7 @@ mod tests {
                 }]),
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             },
             AiResponse {
                 content: Some("Recovered after tool error".to_string()),
@@ -536,6 +892,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             },
         ];
 
@@ -574,6 +931,7 @@ mod tests {
                 }]),
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             },
             // Turn 2 (max turns): synthesized output
             AiResponse {
@@ -583,6 +941,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             },
         ];
 
@@ -602,5 +961,80 @@ mod tests {
                     .contains("TURN BUDGET EXHAUSTED")
         });
         assert!(exhausted_msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn preserves_metadata_for_continuation_but_not_persisted_history() -> Result<()> {
+        let provider = MetadataProvider {
+            requests: Mutex::new(Vec::new()),
+        };
+        let result = SessionRunner::new(&provider)
+            .run(&mut MetadataSession)
+            .await?;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == AiRole::Assistant)
+            .unwrap();
+        assert_eq!(
+            assistant.provider_metadata.as_ref().unwrap().data["encrypted_content"],
+            "opaque"
+        );
+        assert!(
+            result
+                .history
+                .iter()
+                .all(|message| message.provider_metadata.is_none())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_response_metadata_is_not_charged_as_continuation() -> Result<()> {
+        let responses = vec![
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "ok_tool".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+                provider_metadata: Some(AiProviderMetadata {
+                    provider: "test.provider".to_string(),
+                    version: 1,
+                    data: json!({
+                        "opaque": "x".repeat(MAX_PROVIDER_METADATA_BYTES / 2)
+                    }),
+                }),
+            },
+            AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+                provider_metadata: Some(AiProviderMetadata {
+                    provider: "test.provider".to_string(),
+                    version: 1,
+                    data: json!({
+                        "opaque": "y".repeat(MAX_PROVIDER_METADATA_BYTES / 2)
+                    }),
+                }),
+            },
+        ];
+        let provider = MockProvider::new(responses);
+        let result = SessionRunner::new(&provider).run(&mut DummySession).await?;
+
+        assert_eq!(result.output, "done");
+        Ok(())
     }
 }

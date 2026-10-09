@@ -15,8 +15,7 @@
 use crate::ReviewStatus;
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
-    create_provider_cached,
+    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
@@ -2744,9 +2743,7 @@ async fn run_review_tool_with_cmd(
                                                     }))
                                                 }
                                                 Err(e) => {
-                                                    let class = classify_ai_error(&e);
-                                                    let message = e.to_string();
-                                                    let payload = RemoteAiErrorPayload::new(message, class);
+                                                    let payload = RemoteAiErrorPayload::from_error(&e);
                                                     let reply = json!({
                                                         "type": "error",
                                                         "tx_id": tx_id,
@@ -3355,6 +3352,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
         fn get_capabilities(&self) -> ProviderCapabilities {
@@ -3668,6 +3666,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
@@ -3882,6 +3881,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
@@ -4521,6 +4521,7 @@ fi
                     cached_tokens: Some(self.cached_tokens),
                 }),
                 truncated: false,
+                provider_metadata: None,
             })
         }
         fn get_capabilities(&self) -> ProviderCapabilities {

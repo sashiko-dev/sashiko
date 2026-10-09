@@ -205,7 +205,7 @@ impl AiProvider for BackoffProvider {
                             );
                             sleep(jittered).await;
                         }
-                        AiErrorClass::Fatal => return Err(e),
+                        AiErrorClass::Fatal | AiErrorClass::InvalidResponse => return Err(e),
                     }
                 }
             }
@@ -266,6 +266,7 @@ mod tests {
                 tool_calls: None,
                 usage: None,
                 truncated: false,
+                provider_metadata: None,
             })
         }
 
@@ -312,6 +313,7 @@ mod tests {
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
+                provider_metadata: None,
             }],
             tools: None,
             temperature: None,
