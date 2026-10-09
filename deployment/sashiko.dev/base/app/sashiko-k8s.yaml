@@ -127,23 +127,6 @@ spec:
               value: "gemini-3.1-pro-preview"
             - name: SASHIKO__AI__MAX_INTERACTIONS
               value: "100"
-            - name: SASHIKO__MAILING_LISTS__TRACK
-              value: >-
-                bpf,cgroups,damon,dmaengine,dri-devel,driver-core,dwarves,fuse-devel,kvm,
-                linux-bluetooth,linux-clk,linux-cifs,linux-ext4,linux-hwmon,linux-input,
-                linux-kernel,linux-media,linux-mm,linux-nfs,linux-pci,linux-perf-users,linux-phy,
-                linux-pwm,linux-rdma,linux-trace-kernel,linux-watchdog,mptcp,netdev,
-                rust-for-linux,kvmarm,linux-arm-kernel,linux-block,linux-scsi,
-                linux-crypto,linux-riscv,intel-gfx,intel-xe,linux-kselftest,
-                kexec,linux-iio,netfilter-devel,linux-renesas-soc,linux-omap,linux-xfs,
-                linux-cxl,nvdimm,linux-ide,linux-btrfs,rcu,sched-ext,oe-linux-nfc,
-                batman,linux-s390,linux-devicetree,imx,linux-sunxi,linux-amlogic,
-                live-patching,openvpn-devel,platform-driver-x86,linux-arm-msm,
-                linux-modules,nouveau,nova-gpu,ntb,selinux,linux-raid,linux-rt-devel,linux-rtc,
-                linux-can,target-devel,linux-hardening,linux-security-module,linux-unionfs,mfd,linux-leds,mhi,
-                linux-mtd,audit,linux-integrity,linux-fscrypt,fsverity,ocfs2-devel,
-                linux-serial,virtualization,amd-gfx,linux-f2fs-devel,linux-pm,linux-acpi,intel-wired-lan,linux-gpio,
-                linux-usb,linux-kbuild
             - name: SASHIKO__REVIEW__CONCURRENCY
               value: "24"
             - name: SASHIKO__LINUX_BUG__ENABLED
@@ -162,8 +145,6 @@ spec:
               value: "sashiko-reviews@lists.linux.dev"
             - name: SASHIKO__SMTP__DRY_RUN
               value: "false"
-            - name: SASHIKO__REVIEW__EMAIL_POLICY_PATH
-              value: "/app/email_policy.toml"
             - name: GIT_CONFIG_COUNT
               value: "1"
             - name: GIT_CONFIG_KEY_0

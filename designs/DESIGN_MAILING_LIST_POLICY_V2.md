@@ -232,6 +232,7 @@ Given incoming `To:` (`incoming_to`), `Cc:` (`incoming_cc`), and `From:` (`patch
    * If `policy.nntp_group` is explicitly set (for lists whose lore.kernel.org NNTP group name does not match their email address), use it directly:
      * `devicetree@vger.kernel.org` $\rightarrow$ `nntp_group = "org.kernel.vger.linux-devicetree"`
      * `b.a.t.m.a.n@lists.open-mesh.org` $\rightarrow$ `nntp_group = "org.open-mesh.lists.batman"`
+     * `intel-wired-lan@lists.osuosl.org` $\rightarrow$ `nntp_group = "org.osuosl.intel-wired-lan"`
    * Otherwise, convert `local@d1.d2...dn` to `dn...d2.d1.local`:
      * `linux-kbuild@vger.kernel.org` $\rightarrow$ `org.kernel.vger.linux-kbuild`
      * `linux-mm@kvack.org` $\rightarrow$ `org.kvack.linux-mm`
@@ -245,10 +246,11 @@ Given incoming `To:` (`incoming_to`), `Cc:` (`incoming_cc`), and `From:` (`patch
 
 1. **NNTP Group Name Mismatches & High-Water Mark Reset (`mailing_lists` table):**
    * **Risk:** In SQLite (`src/migrations/001_initial.sql`, `ensure_mailing_list` in `src/db.rs`), the `mailing_lists` table stores `last_article_num` keyed by `nntp_group TEXT NOT NULL UNIQUE`. If a list's resolved `nntp_group` string changes, Sashiko either fails `GROUP <name>` on `nntp.lore.kernel.org` or inserts a new row with `last_article_num = 0` and re-ingests up to `max_catchup` (4,000) old messages (`src/ingestor.rs`).
-   * **Finding:** Querying `LIST` on `nntp.lore.kernel.org` across all 88 tracked lists showed that 86 lists match `<reversed-domain>.<local-part>` identically, while **2 lists do not**:
+   * **Finding:** Querying `LIST` on `nntp.lore.kernel.org` across all 95 tracked lists showed that 92 lists match `<reversed-domain>.<local-part>` identically, while **3 lists do not**:
      * `devicetree@vger.kernel.org` is hosted at NNTP group `org.kernel.vger.linux-devicetree` (not `org.kernel.vger.devicetree`).
      * `b.a.t.m.a.n@lists.open-mesh.org` is hosted at NNTP group `org.open-mesh.lists.batman` (not `org.open-mesh.lists.b.a.t.m.a.n`).
-   * **Mitigation:** Support an optional `nntp_group` field on `MailingListPolicy` and set it on those two entries (`nntp_group = "org.kernel.vger.linux-devicetree"` and `nntp_group = "org.open-mesh.lists.batman"`), plus keep `LIST` verification in `Ingestor::resolve_tracked_group`. This guarantees all 88 `nntp_group` keys in SQLite remain byte-for-byte identical after migration.
+     * `intel-wired-lan@lists.osuosl.org` is hosted at NNTP group `org.osuosl.intel-wired-lan` (not `org.osuosl.lists.intel-wired-lan`).
+   * **Mitigation:** Support an optional `nntp_group` field on `MailingListPolicy` and set it on those three entries, plus keep `LIST` verification in `Ingestor::resolve_tracked_group`. This guarantees all `nntp_group` keys in SQLite remain byte-for-byte identical after migration.
 
 2. **`subsystems` Table `UNIQUE` Constraints & Web UI Tag Continuity:**
    * **Risk:** `identify_subsystems` in `src/main.rs` populates the `subsystems` table (`name TEXT NOT NULL UNIQUE, mailing_list_address TEXT NOT NULL UNIQUE`), which drives the "Mailing Lists" tags in the Web UI. Currently, `linux-kernel@vger.kernel.org` is special-cased to name `"LKML"`, while all other lists use the local-part before `@`.

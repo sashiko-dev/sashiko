@@ -82,7 +82,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `--no-default-features`: Minimal build for `sashiko` local review (`sashiko init`, `sashiko review`) and `sashiko-cli` without `libsql`, `axum`, `lettre`, or `jsonwebtoken` (`--features cache` adds the local AI response cache).
 
 ## Configuration, Prompts & Docs
-- `Settings.toml` & `email_policy.toml`: Main application and email policy configuration.
+- `Settings.toml` & `projects/linux/mailing_lists.toml`: Main application and per-mailing-list tracking/delivery policy configuration.
 - `projects/sashiko/prompts/`: First-party review prompts, subsystem invariants, and pattern guides for reviewing Sashiko itself (`--project sashiko`).
 - `third_party/prompts/`: Vendored prompts for upstream projects (`kernel/`, `systemd/`, `iproute/`).
 - `static/`: Web UI assets (`static/index.html`, images).

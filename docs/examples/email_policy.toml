@@ -1,79 +1,68 @@
-# Sashiko Email Policy Example
+# Sashiko Mailing Lists & Email Policy Example
 #
-# Copy this file to your project root as email_policy.toml and adjust.
-# This file controls how Sashiko sends (or suppresses) review emails.
+# By default, Sashiko loads `projects/<project>/mailing_lists.toml`
+# (or the path configured via `review.email_policy_path`).
+# Each section key is a mailing list email address, and omitted fields
+# inherit from `[defaults]`.
 
 [defaults]
-# Whether the bot is allowed to send emails to public mailing lists.
-# If false, emails will be restricted to private recipients (author/maintainers).
-reply_all = false
+# Whether listed mailing lists are tracked via NNTP by default.
+track = true
 
-# Whether to send the review email to the author of the patch.
-reply_to_author = false
+# Hours to wait before publishing a review with findings.
+embargo_hours = 2
 
-# Whether to include individual recipients (non-mailing-list) in the review email.
-cc_individuals = false
+# Who receives review emails when findings are present:
+# - "author": patch author
+# - "list": the mailing list itself
+# - "recipients": individual non-mailing-list recipients from To/Cc
+reply_to = ["author"]
 
-# If true, the bot will completely mute (not send) emails for this scope.
+# Who receives a review email when 0 issues are found:
+# - "none": do not send email on clean reviews
+# - "author": send positive review only to the patch author
+# - "all": send positive review to normal reply_to + cc recipients
+positive_review = "none"
+
+# If true, completely mutes email notifications for this scope.
 mute_all = true
 
-# A list of static email addresses that should always receive a copy (CC'd).
+# Static email addresses that should always receive a copy (CC'd).
 cc = []
 
-# A list of author email addresses that will be completely ignored by the system,
-# meaning their submissions will never be considered as patches and will never be reviewed.
+# Author email addresses whose submissions will never receive review emails.
 ignored_emails = []
 
-# Whether to send an email even when no issues are found.
-# If true, Sashiko will send a reply indicating that the review was positive.
-send_positive_review = false
+# --- Author-only delivery (inherits defaults when mute_all = false) ---
+# ["intel-xe@lists.freedesktop.org"]
+# mute_all = false
 
-# --- Author-only delivery ---
-# To TRACK a subsystem's list (so its patches are reviewed) but NOT ping the
-# list with the review email, send only to the patch author. No extra flag is
-# needed; combine reply_all=false (strips the list) with reply_to_author=true
-# and cc_individuals=false.
-#
-# [subsystems.drm-intel]
-# lists = ["intel-xe@lists.freedesktop.org"]
-# reply_all = false
-# reply_to_author = true
-# cc_individuals = false
+# --- Public list + author + CC'd individuals ---
+# ["bpf@vger.kernel.org"]
+# mute_all = false
+# embargo_hours = 0
+# subject_prefixes = ["bpf", "bpf-next"]
+# reply_to = ["author", "list", "recipients"]
+
+# --- Custom NNTP group override ---
+# ["devicetree@vger.kernel.org"]
+# nntp_group = "org.kernel.vger.linux-devicetree"
 
 # --- Patchwork integration examples ---
 #
 # API mode: direct REST API calls with retry-queuing (3 attempts).
-# Requires a maintainer API token. The token can also be injected via
-# the SASHIKO_PATCHWORK_TOKEN environment variable.
+# Requires a maintainer API token (or SASHIKO_PATCHWORK_TOKEN env var).
 #
-# [subsystems.net.patchwork]
+# ["netdev@vger.kernel.org".patchwork]
 # enabled = true
 # api_url = "https://patchwork.kernel.org/api/1.3"
 # token = "your-api-token"
-
+# min_severity = "Medium"
+# fail_severity = "High"
+#
 # Email mode: sends a structured notification email that a local script
 # (e.g. pw_tools) can parse and use to post the check.
 #
-# [subsystems.linux-media.patchwork]
+# ["linux-media@vger.kernel.org".patchwork]
 # enabled = true
 # email = "pw-bot@lists.example.org"
-
-# Both modes simultaneously:
-#
-# [subsystems.dri-devel.patchwork]
-# enabled = true
-# api_url = "https://patchwork.freedesktop.org/api/1.3"
-# token = "your-api-token"
-# email = "backup-bot@lists.example.org"
-
-# Severity filtering and check state mapping:
-# min_severity excludes findings below the threshold entirely.
-# fail_severity controls which new findings trigger "fail" vs "warning".
-# Pre-existing findings are shown in the description but never affect state.
-# Default fail_severity is "High" (High+ new = fail, Medium/Low new = warning).
-#
-# [subsystems.net.patchwork]
-# enabled = true
-# api_url = "https://patchwork.kernel.org/api/1.3"
-# min_severity = "Medium"
-# fail_severity = "High"

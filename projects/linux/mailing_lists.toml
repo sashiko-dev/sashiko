@@ -1,0 +1,314 @@
+[defaults]
+# Whether lists in this file are tracked and ingested via NNTP by default.
+track = true
+
+# Who from the original patch receives the review email:
+# - "author": the patch author (From: header -> To:)
+# - "list": this block's mailing list address (-> To:/Cc:)
+# - "recipients": all individual (non-mailing-list) To:/Cc: recipients on the patch
+reply_to = []
+
+# When a review finds no issues, who receives the positive review email:
+# - "none": do not send positive review emails (default)
+# - "author": send positive review only to the patch author (To: author, no list/CCs)
+# - "all": send positive review to the full resolved recipient set
+positive_review = "none"
+
+# If true, completely mutes (suppresses) outbound emails for this scope.
+mute_all = false
+
+# Static email addresses that always receive a copy (CC'd).
+cc = []
+
+# Hours to hold reviews with findings before sending (0 = immediate).
+embargo_hours = 0
+
+# Author email addresses whose submissions are ignored and never reviewed.
+ignored_emails = ["patchwork@emeril.freedesktop.org"]
+
+# --- Tracked for Web UI only (no outbound emails) ---
+
+["amd-gfx@lists.freedesktop.org"]
+["driver-core@lists.linux.dev"]
+["dwarves@vger.kernel.org"]
+["fuse-devel@lists.linux.dev"]
+["linux-acpi@vger.kernel.org"]
+["linux-arm-kernel@lists.infradead.org"]
+["linux-arm-msm@vger.kernel.org"]
+["linux-block@vger.kernel.org"]
+["linux-bluetooth@vger.kernel.org"]
+["linux-cifs@vger.kernel.org"]
+["linux-crypto@vger.kernel.org"]
+["linux-f2fs-devel@lists.sourceforge.net"]
+["linux-hardening@vger.kernel.org"]
+["linux-iio@vger.kernel.org"]
+["linux-integrity@vger.kernel.org"]
+["linux-kernel@vger.kernel.org"]
+["linux-kselftest@vger.kernel.org"]
+["linux-mm@kvack.org"]
+["linux-omap@vger.kernel.org"]
+["linux-pm@vger.kernel.org"]
+["linux-pwm@vger.kernel.org"]
+["linux-riscv@lists.infradead.org"]
+["linux-unionfs@vger.kernel.org"]
+["linux-xfs@vger.kernel.org"]
+["mhi@lists.linux.dev"]
+["netfilter-devel@vger.kernel.org"]
+["nouveau@lists.freedesktop.org"]
+["oe-linux-nfc@lists.linux.dev"]
+["platform-driver-x86@vger.kernel.org"]
+["rcu@vger.kernel.org"]
+
+# --- Tracked with Email / Embargo / Patchwork Policies ---
+
+["linux-hwmon@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+
+["linux-perf-users@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+
+["b.a.t.m.a.n@lists.open-mesh.org"]
+nntp_group = "org.open-mesh.lists.batman"
+reply_to = ["author"]
+cc = ["marek.lindner@mailbox.org", "sw@simonwunderlich.de", "antonio@mandelbit.com", "sven@narfation.org"]
+embargo_hours = 0
+subject_prefixes = ["batadv", "batadv-next"]
+
+["bpf@vger.kernel.org"]
+reply_to = ["author", "list"]
+embargo_hours = 0
+subject_prefixes = ["bpf", "bpf-next"]
+
+["damon@lists.linux.dev"]
+reply_to = ["author", "list"]
+positive_review = "all"
+
+["devicetree@vger.kernel.org"]
+nntp_group = "org.kernel.vger.linux-devicetree"
+reply_to = ["author", "list"]
+cc = ["robh@kernel.org", "conor+dt@kernel.org"]
+
+["dri-devel@lists.freedesktop.org"]
+reply_to = ["author", "list"]
+
+["intel-gfx@lists.freedesktop.org"]
+reply_to = ["author", "list"]
+
+["intel-xe@lists.freedesktop.org"]
+reply_to = ["author", "list"]
+
+["linux-ext4@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+cc = ["tytso@mit.edu"]
+
+["linux-kbuild@vger.kernel.org"]
+reply_to = ["author", "list", "recipients"]
+cc = ["nathan@kernel.org", "nsc@kernel.org"]
+embargo_hours = 24
+
+["netdev@vger.kernel.org"]
+embargo_hours = 24
+subject_prefixes = ["net", "net-next"]
+
+["mptcp@lists.linux.dev"]
+reply_to = ["author", "list"]
+embargo_hours = 0
+subject_prefixes = ["mptcp", "mptcp-net", "mptcp-next"]
+["mptcp@lists.linux.dev".patchwork]
+enabled = true
+api_url = "https://patchwork.kernel.org/api/1.3"
+
+["cgroups@vger.kernel.org"]
+reply_to = ["author"]
+cc = ["tj@kernel.org", "hannes@cmpxchg.org", "mkoutny@suse.com"]
+
+["linux-renesas-soc@vger.kernel.org"]
+cc = ["wsa+renesas@sang-engineering.com"]
+
+["rust-for-linux@vger.kernel.org"]
+reply_to = ["author"]
+cc = ["ojeda@kernel.org", "gary@garyguo.net"]
+
+["sched-ext@lists.linux.dev"]
+reply_to = ["author", "list"]
+
+["openvpn-devel@lists.sourceforge.net"]
+cc = ["antonio@mandelbit.com", "ralf@mandelbit.com", "sd@queasysnail.net"]
+
+["live-patching@vger.kernel.org"]
+reply_to = ["author", "list", "recipients"]
+
+["linux-pci@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+
+["linux-watchdog@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["linux-ide@vger.kernel.org"]
+reply_to = ["author", "list"]
+cc = ["dlemoal@kernel.org", "cassel@kernel.org"]
+
+["linux-input@vger.kernel.org"]
+reply_to = ["author", "list"]
+cc = ["dmitry.torokhov@gmail.com"]
+
+["dmaengine@vger.kernel.org"]
+reply_to = ["author", "list"]
+cc = ["vkoul@kernel.org", "Frank.Li@kernel.org"]
+
+["linux-phy@lists.infradead.org"]
+reply_to = ["author", "list"]
+cc = ["vkoul@kernel.org", "neil.armstrong@linaro.org", "olteanv@gmail.com"]
+
+["imx@lists.linux.dev"]
+reply_to = ["author", "list"]
+cc = ["Frank.Li@kernel.org"]
+
+["linux-sunxi@lists.linux.dev"]
+reply_to = ["author", "list"]
+
+["linux-amlogic@lists.infradead.org"]
+reply_to = ["author", "list"]
+cc = ["neil.armstrong@linaro.org"]
+
+["linux-hyperv@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["linux-nfs@vger.kernel.org"]
+cc = ["Chuck Lever <cel@kernel.org>", "Jeff Layton <jlayton@kernel.org>", "Anna Schumaker <anna@kernel.org>"]
+
+["kexec@lists.infradead.org"]
+reply_to = ["author", "list", "recipients"]
+positive_review = "all"
+
+["virtualization@lists.linux.dev"]
+reply_to = ["author", "list"]
+positive_review = "all"
+cc = ["Michael S. Tsirkin <mst@redhat.com>", "Eugenio Perez <eperezma@redhat.com>"]
+
+["kvm@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["linux-modules@vger.kernel.org"]
+reply_to = ["author", "list"]
+cc = ["Petr Pavlu <petr.pavlu@suse.com>"]
+
+["nova-gpu@lists.linux.dev"]
+reply_to = ["author", "list", "recipients"]
+cc = ["Danilo Krummrich <dakr@kernel.org>", "Alexandre Courbot <acourbot@nvidia.com>"]
+
+["linux-btrfs@vger.kernel.org"]
+cc = ["dsterba@suse.cz"]
+
+["linux-clk@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["linux-cxl@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["ntb@lists.linux.dev"]
+reply_to = ["author", "list"]
+
+["selinux@vger.kernel.org"]
+reply_to = ["list"]
+positive_review = "all"
+
+["linux-i3c@lists.infradead.org"]
+reply_to = ["author", "list"]
+cc = ["Frank.Li@kernel.org", "Alexandre Belloni <alexandre.belloni@bootlin.com>"]
+
+["linux-raid@vger.kernel.org"]
+reply_to = ["author", "list"]
+cc = ["yukuai@fygo.io"]
+
+["linux-rt-devel@lists.linux.dev"]
+reply_to = ["author", "list"]
+cc = ["linux-kernel@vger.kernel.org"]
+
+["linux-can@vger.kernel.org"]
+reply_to = ["author", "list"]
+cc = ["Marc Kleine-Budde <mkl@pengutronix.de>", "Oliver Hartkopp <socketcan@hartkopp.net>", "Vincent Mailhol <mailhol@kernel.org>", "Oleksij Rempel <o.rempel@pengutronix.de>"]
+
+["linux-scsi@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["target-devel@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["linux-trace-kernel@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["linux-s390@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+cc = ["Heiko Carstens <hca@linux.ibm.com>", "Vasily Gorbik <gor@linux.ibm.com>", "Alexander Gordeev <agordeev@linux.ibm.com>", "Christian Borntraeger <borntraeger@linux.ibm.com>"]
+
+["kvmarm@lists.linux.dev"]
+reply_to = ["author", "list"]
+cc = ["Oliver Upton <oupton@kernel.org>", "Marc Zyngier <maz@kernel.org>"]
+
+["nvdimm@lists.linux.dev"]
+reply_to = ["author", "list"]
+
+["mfd@lists.linux.dev"]
+reply_to = ["author", "list"]
+positive_review = "all"
+cc = ["lee@kernel.org"]
+
+["linux-leds@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+cc = ["lee@kernel.org"]
+
+["linux-rtc@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+cc = ["Alexandre Belloni <alexandre.belloni@bootlin.com>"]
+
+["linux-media@vger.kernel.org"]
+cc = ["media-ci@linuxtv.org"]
+
+["linux-mtd@lists.infradead.org"]
+reply_to = ["author", "list", "recipients"]
+
+["audit@vger.kernel.org"]
+reply_to = ["list"]
+positive_review = "all"
+
+["ocfs2-devel@lists.linux.dev"]
+reply_to = ["author"]
+positive_review = "all"
+cc = ["Mark Fasheh <mark@fasheh.com>", "Joel Becker <jlbec@evilplan.org>", "Joseph Qi <joseph.qi@linux.alibaba.com>"]
+
+["linux-serial@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+
+["linux-rdma@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+
+["linux-security-module@vger.kernel.org"]
+reply_to = ["list"]
+positive_review = "all"
+
+["intel-wired-lan@lists.osuosl.org"]
+nntp_group = "org.osuosl.intel-wired-lan"
+reply_to = ["author", "list"]
+
+["linux-gpio@vger.kernel.org"]
+reply_to = ["author", "list"]
+
+["linux-usb@vger.kernel.org"]
+reply_to = ["author", "list"]
+positive_review = "all"
+
+["linux-fscrypt@vger.kernel.org"]
+reply_to = ["author", "list", "recipients"]
+
+["fsverity@lists.linux.dev"]
+reply_to = ["author", "list", "recipients"]

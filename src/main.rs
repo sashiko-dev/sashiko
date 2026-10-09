@@ -515,6 +515,12 @@ async fn run_daemon(
     // from here on, including the reviewer that has to pass it to its worker
     // subprocesses, sees the same answer rather than re-deriving it.
     settings.project.kind = Some(project);
+    if settings.review.email_policy_path == ProjectId::Linux.mailing_lists_path()
+        || settings.review.email_policy_path == "email_policy.toml"
+        || settings.review.email_policy_path == "/app/email_policy.toml"
+    {
+        settings.review.email_policy_path = project.mailing_lists_path().to_string();
+    }
     info!("Reviewing project: {project}");
 
     for line in &overridden {
@@ -915,6 +921,9 @@ async fn run_daemon(
     // DB Worker (Transactional Batching)
     let worker_db = db.clone();
     let mapping = settings.subsystems.mapping.clone();
+    let email_policy_path = settings.review.email_policy_path.clone();
+    let mut policy =
+        sashiko::email_policy::EmailPolicyConfig::load_async(&email_policy_path).await?;
     let db_worker_handle = tokio::spawn(async move {
         info!("DB Worker started");
 
@@ -923,13 +932,18 @@ async fn run_daemon(
         let mut total_ingested = 0;
         let mut total_errors = 0;
 
-        let policy = sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml")
-            .expect("Failed to parse email_policy.toml");
-
         loop {
             let count = parsed_rx.recv_many(&mut buffer, 100).await;
             if count == 0 {
                 break;
+            }
+
+            match sashiko::email_policy::EmailPolicyConfig::load_async(&email_policy_path).await {
+                Ok(fresh_policy) => policy = fresh_policy,
+                Err(e) => error!(
+                    "Failed to reload mailing list policy from {}, keeping previous policy: {}",
+                    email_policy_path, e
+                ),
             }
 
             let patch_ids = sashiko::prerequisites::calculate_git_patch_id_batch(
@@ -3554,9 +3568,10 @@ fn calculate_embargo_hours(
     let mut matched_subsystem_policies = Vec::new();
 
     for (_, email) in subsystems {
-        for sp in policy.subsystems.values() {
-            #[allow(clippy::collapsible_if)]
-            if sp.lists.iter().any(|list| email.contains(list)) {
+        let email_bare = sashiko::email_policy::extract_bare_email(email);
+        for (list_key, sp) in &policy.lists {
+            let list_bare = sashiko::email_policy::extract_bare_email(list_key);
+            if email_bare == list_bare || email.to_ascii_lowercase().contains(&list_bare) {
                 matched_subsystem_policies.push(sp);
             }
         }
@@ -3593,7 +3608,7 @@ fn calculate_embargo_hours(
     if !delays_to_consider.is_empty() {
         *delays_to_consider.iter().min().unwrap()
     } else {
-        policy.defaults.embargo_hours.unwrap_or(0)
+        policy.defaults.embargo_hours
     }
 }
 
@@ -3660,17 +3675,17 @@ fn identify_subsystems(
 
         // Fallback for known kernel lists if no mapping is provided
         if !matched {
-            if lower_email.contains("linux-kernel@vger.kernel.org") {
-                subsystems.push(("LKML".to_string(), lower_email));
-            } else if lower_email.contains("netdev@vger.kernel.org") {
-                subsystems.push(("netdev".to_string(), lower_email));
-            } else if (lower_email.ends_with("@vger.kernel.org")
-                || lower_email.ends_with("@lists.linux.dev")
-                || lower_email.ends_with("@lists.infradead.org")
-                || lower_email.ends_with("@kvack.org"))
-                && let Some(name) = lower_email.split('@').next()
+            let bare_email = sashiko::email_policy::extract_bare_email(&lower_email);
+            if bare_email == "linux-kernel@vger.kernel.org" {
+                subsystems.push(("LKML".to_string(), bare_email));
+            } else if bare_email == "netdev@vger.kernel.org" {
+                subsystems.push(("netdev".to_string(), bare_email));
+            } else if let Some((name, domain)) = bare_email.split_once('@')
+                && sashiko::email_router::KNOWN_MAILING_LIST_DOMAINS
+                    .iter()
+                    .any(|&d| d.eq_ignore_ascii_case(domain))
             {
-                subsystems.push((name.to_string(), lower_email));
+                subsystems.push((name.to_string(), bare_email));
             }
         }
     }
@@ -4800,6 +4815,23 @@ mod tests {
         let to = "linux-mm@kvack.org";
         let subsystems = identify_subsystems(to, "", &[]);
         assert!(subsystems.contains(&("linux-mm".to_string(), "linux-mm@kvack.org".to_string())));
+
+        // Test freedesktop, osuosl, open-mesh, and display-name wrapped list addresses
+        let to = "DRI Devel <dri-devel@lists.freedesktop.org>, intel-wired-lan@lists.osuosl.org";
+        let cc = "b.a.t.m.a.n@lists.open-mesh.org";
+        let subsystems = identify_subsystems(to, cc, &[]);
+        assert!(subsystems.contains(&(
+            "dri-devel".to_string(),
+            "dri-devel@lists.freedesktop.org".to_string()
+        )));
+        assert!(subsystems.contains(&(
+            "intel-wired-lan".to_string(),
+            "intel-wired-lan@lists.osuosl.org".to_string()
+        )));
+        assert!(subsystems.contains(&(
+            "b.a.t.m.a.n".to_string(),
+            "b.a.t.m.a.n@lists.open-mesh.org".to_string()
+        )));
     }
 
     #[cfg(feature = "server")]
@@ -4843,35 +4875,39 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn test_calculate_embargo_hours() {
-        use sashiko::email_policy::{EmailPolicyConfig, SubsystemPolicy};
+        use sashiko::email_policy::{DefaultListPolicy, EmailPolicyConfig, MailingListPolicy};
         use std::collections::HashMap;
 
-        let mut subsystems_policy = HashMap::new();
-        subsystems_policy.insert(
-            "net".to_string(),
-            SubsystemPolicy {
-                lists: vec!["netdev@vger.kernel.org".to_string()],
+        let mut lists_policy = HashMap::new();
+        lists_policy.insert(
+            "netdev@vger.kernel.org".to_string(),
+            MailingListPolicy {
                 embargo_hours: Some(24),
                 subject_prefixes: vec!["net".to_string(), "net-next".to_string()],
                 ..Default::default()
             },
         );
-        subsystems_policy.insert(
-            "bpf".to_string(),
-            SubsystemPolicy {
-                lists: vec!["bpf@vger.kernel.org".to_string()],
+        lists_policy.insert(
+            "bpf@vger.kernel.org".to_string(),
+            MailingListPolicy {
                 embargo_hours: Some(0),
                 subject_prefixes: vec!["bpf".to_string(), "bpf-next".to_string()],
                 ..Default::default()
             },
         );
-
-        let policy = EmailPolicyConfig {
-            defaults: SubsystemPolicy {
-                embargo_hours: Some(1),
+        lists_policy.insert(
+            "dri-devel@lists.freedesktop.org".to_string(),
+            MailingListPolicy {
                 ..Default::default()
             },
-            subsystems: subsystems_policy,
+        );
+
+        let policy = EmailPolicyConfig {
+            defaults: DefaultListPolicy {
+                embargo_hours: 1,
+                ..Default::default()
+            },
+            lists: lists_policy,
         };
 
         // Case 1: No matching subsystems -> falls back to default
@@ -4891,7 +4927,7 @@ mod tests {
             24
         );
 
-        // Case 3: Multiple matches without subject prefix match -> takes minimum
+        // Case 3: Multiple matches without subject prefix -> takes minimum
         let subs = vec![
             ("netdev".to_string(), "netdev@vger.kernel.org".to_string()),
             ("bpf".to_string(), "bpf@vger.kernel.org".to_string()),

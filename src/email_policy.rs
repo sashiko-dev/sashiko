@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PatchworkPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -84,26 +85,71 @@ impl PatchworkPolicy {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, Default)]
-pub struct EmailPolicyConfig {
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplyTarget {
+    Author,
+    List,
+    Recipients,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PositiveReviewPolicy {
+    #[default]
+    None,
+    Author,
+    All,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultListPolicy {
+    #[serde(default = "default_true")]
+    pub track: bool,
     #[serde(default)]
-    pub defaults: SubsystemPolicy,
+    pub reply_to: Vec<ReplyTarget>,
     #[serde(default)]
-    pub subsystems: HashMap<String, SubsystemPolicy>,
+    pub positive_review: PositiveReviewPolicy,
+    #[serde(default)]
+    pub mute_all: bool,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub ignored_emails: Vec<String>,
+    #[serde(default)]
+    pub patchwork: PatchworkPolicy,
+    #[serde(default)]
+    pub embargo_hours: u32,
+}
+
+impl Default for DefaultListPolicy {
+    fn default() -> Self {
+        Self {
+            track: true,
+            reply_to: Vec::new(),
+            positive_review: PositiveReviewPolicy::None,
+            mute_all: false,
+            cc: Vec::new(),
+            ignored_emails: Vec::new(),
+            patchwork: PatchworkPolicy::default(),
+            embargo_hours: 0,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
-pub struct SubsystemPolicy {
-    #[serde(default)]
-    pub lists: Vec<String>,
-    #[serde(default)]
-    pub reply_all: bool,
-    #[serde(default)]
-    pub reply_to_author: bool,
-    #[serde(default)]
-    pub cc_individuals: bool,
-    #[serde(default)]
-    pub mute_all: bool,
+#[serde(deny_unknown_fields)]
+pub struct MailingListPolicy {
+    pub track: Option<bool>,
+    pub nntp_group: Option<String>,
+    pub reply_to: Option<Vec<ReplyTarget>>,
+    pub positive_review: Option<PositiveReviewPolicy>,
+    pub mute_all: Option<bool>,
     #[serde(default)]
     pub cc: Vec<String>,
     #[serde(default)]
@@ -112,32 +158,149 @@ pub struct SubsystemPolicy {
     pub subject_prefixes: Vec<String>,
     #[serde(default)]
     pub patchwork: PatchworkPolicy,
-    #[serde(default)]
     pub embargo_hours: Option<u32>,
+}
+
+pub type SubsystemPolicy = MailingListPolicy;
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct EmailPolicyConfig {
     #[serde(default)]
-    pub send_positive_review: bool,
+    pub defaults: DefaultListPolicy,
+    #[serde(flatten)]
+    pub lists: HashMap<String, MailingListPolicy>,
+}
+
+pub type MailingListsConfig = EmailPolicyConfig;
+
+/// Extracts the normalized lowercase email address from either a formatted
+/// `"Display Name <user@domain>"` string or a bare `"user@domain"` string.
+pub fn extract_bare_email(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(start) = trimmed.find('<')
+        && let Some(end) = trimmed[start + 1..].find('>')
+    {
+        return trimmed[start + 1..start + 1 + end]
+            .trim()
+            .to_ascii_lowercase();
+    }
+    trimmed.to_ascii_lowercase()
+}
+
+/// Derives the standard lore.kernel.org NNTP group name for a mailing list
+/// email address by reversing its domain components and appending the local
+/// part (`local@d1.d2...dn` -> `dn...d2.d1.local`).
+pub fn derive_nntp_group(email: &str) -> String {
+    let bare = extract_bare_email(email);
+    match bare.as_str() {
+        "devicetree@vger.kernel.org" => return "org.kernel.vger.linux-devicetree".to_string(),
+        "b.a.t.m.a.n@lists.open-mesh.org" => return "org.open-mesh.lists.batman".to_string(),
+        "intel-wired-lan@lists.osuosl.org" => return "org.osuosl.intel-wired-lan".to_string(),
+        _ => {}
+    }
+    if let Some((local, domain)) = bare.split_once('@') {
+        let mut parts: Vec<&str> = domain.split('.').collect();
+        parts.reverse();
+        parts.push(local);
+        parts.join(".")
+    } else {
+        bare
+    }
 }
 
 impl EmailPolicyConfig {
-    /// Loads the email policy configuration from a TOML file.
-    /// Returns a default configuration if the file does not exist.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self {
-                defaults: SubsystemPolicy::default(),
-                subsystems: HashMap::new(),
-            });
-        }
-
-        let content = fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&content)?;
+    /// Parses and validates a mailing list & email policy configuration from a
+    /// TOML string, applying environment overrides and URL normalization.
+    pub fn parse_content(content: &str) -> anyhow::Result<Self> {
+        let mut config: Self = toml::from_str(content)?;
+        config.validate().map_err(anyhow::Error::msg)?;
 
         let env_token = std::env::var("SASHIKO_PATCHWORK_TOKEN").ok();
         config.apply_token_override(env_token.as_deref());
         config.normalize_patchwork_urls();
 
         Ok(config)
+    }
+
+    /// Loads the mailing list & email policy configuration from a TOML file.
+    /// Returns a default configuration if the file does not exist.
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        match fs::read_to_string(path) {
+            Ok(content) => Self::parse_content(&content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Asynchronously loads the mailing list & email policy configuration from
+    /// a TOML file without blocking Tokio worker threads.
+    /// Returns a default configuration if the file does not exist.
+    pub async fn load_async(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => Self::parse_content(&content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Validates that every top-level table key (other than `[defaults]`) is a
+    /// well-formed email address and that no list repeats its own address in
+    /// its static `cc` list.
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, policy) in &self.lists {
+            let trimmed = key.trim();
+            let Some((local, domain)) = trimmed.split_once('@') else {
+                return Err(format!(
+                    "Invalid mailing list key {:?}: expected an email address \
+                     (e.g. [\"linux-kbuild@vger.kernel.org\"])",
+                    key
+                ));
+            };
+            if local.is_empty()
+                || domain.is_empty()
+                || !domain.contains('.')
+                || trimmed.contains(char::is_whitespace)
+            {
+                return Err(format!(
+                    "Invalid mailing list email address {:?}: must be of the form \"list@domain.tld\"",
+                    key
+                ));
+            }
+
+            let list_bare = extract_bare_email(trimmed);
+            for cc_entry in &policy.cc {
+                if extract_bare_email(cc_entry) == list_bare {
+                    return Err(format!(
+                        "Mailing list {:?} repeats its own address in `cc` ({:?}); \
+                         include \"list\" in `reply_to` instead",
+                        key, cc_entry
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `(short_name, nntp_group)` pairs for all lists in this config
+    /// where `track` is enabled (`policy.track.unwrap_or(self.defaults.track)`).
+    pub fn tracked_nntp_groups(&self) -> Vec<(String, String)> {
+        let mut groups: Vec<(String, String)> = self
+            .lists
+            .iter()
+            .filter(|(_, policy)| policy.track.unwrap_or(self.defaults.track))
+            .map(|(email, policy)| {
+                let group = policy
+                    .nntp_group
+                    .clone()
+                    .unwrap_or_else(|| derive_nntp_group(email));
+                let short_name = group.split('.').next_back().unwrap_or(email).to_string();
+                (short_name, group)
+            })
+            .collect();
+        groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        groups
     }
 
     /// Apply a fallback patchwork token to any enabled patchwork policy
@@ -152,7 +315,7 @@ impl EmailPolicyConfig {
         {
             self.defaults.patchwork.token = Some(token.to_string());
         }
-        for sub in self.subsystems.values_mut() {
+        for sub in self.lists.values_mut() {
             if sub.patchwork.enabled
                 && sub.patchwork.api_url.is_some()
                 && sub.patchwork.token.is_none()
@@ -165,7 +328,7 @@ impl EmailPolicyConfig {
     /// Normalize patchwork URLs across all policies.
     fn normalize_patchwork_urls(&mut self) {
         self.defaults.patchwork.normalize();
-        for sub in self.subsystems.values_mut() {
+        for sub in self.lists.values_mut() {
             sub.patchwork.normalize();
         }
     }
@@ -181,31 +344,23 @@ mod tests {
     fn test_load_policy() {
         let toml_content = r#"
             [defaults]
-            reply_all = false
-            reply_to_author = true
-            cc_individuals = true
+            track = true
+            reply_to = ["author", "recipients"]
             mute_all = false
             cc = []
 
-            [subsystems.mm]
-            lists = ["linux-mm@kvack.org", "linux-mm@vger.kernel.org"]
-            reply_all = true
-            reply_to_author = true
-            cc_individuals = true
-            send_positive_review = true
+            ["linux-mm@kvack.org"]
+            reply_to = ["author", "list", "recipients"]
+            positive_review = "all"
 
-            [subsystems.bpf]
-            lists = ["bpf@vger.kernel.org"]
-            reply_all = false
-            reply_to_author = true
-            cc_individuals = false
-            send_positive_review = false
+            ["bpf@vger.kernel.org"]
+            reply_to = ["author"]
+            positive_review = "none"
 
-            [subsystems.net]
-            lists = ["netdev@vger.kernel.org"]
+            ["netdev@vger.kernel.org"]
             mute_all = true
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.2"
         "#;
@@ -215,28 +370,46 @@ mod tests {
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
 
-        assert!(!config.defaults.reply_all);
-        assert!(config.defaults.reply_to_author);
-        assert!(!config.defaults.patchwork.enabled);
-        assert!(!config.defaults.send_positive_review);
-
-        let mm_policy = config.subsystems.get("mm").expect("mm subsystem missing");
+        assert!(config.defaults.track);
         assert_eq!(
-            mm_policy.lists,
-            vec!["linux-mm@kvack.org", "linux-mm@vger.kernel.org"]
+            config.defaults.reply_to,
+            vec![ReplyTarget::Author, ReplyTarget::Recipients]
         );
-        assert!(mm_policy.reply_all);
+        assert!(!config.defaults.patchwork.enabled);
+        assert_eq!(config.defaults.positive_review, PositiveReviewPolicy::None);
+
+        let mm_policy = config
+            .lists
+            .get("linux-mm@kvack.org")
+            .expect("mm list missing");
+        assert_eq!(
+            mm_policy.reply_to.as_deref(),
+            Some(
+                &[
+                    ReplyTarget::Author,
+                    ReplyTarget::List,
+                    ReplyTarget::Recipients
+                ][..]
+            )
+        );
         assert!(!mm_policy.patchwork.enabled);
-        assert!(mm_policy.send_positive_review);
+        assert_eq!(mm_policy.positive_review, Some(PositiveReviewPolicy::All));
 
-        let bpf_policy = config.subsystems.get("bpf").expect("bpf subsystem missing");
-        assert!(!bpf_policy.reply_all);
-        assert!(bpf_policy.reply_to_author);
-        assert!(!bpf_policy.cc_individuals);
-        assert!(!bpf_policy.send_positive_review);
+        let bpf_policy = config
+            .lists
+            .get("bpf@vger.kernel.org")
+            .expect("bpf list missing");
+        assert_eq!(
+            bpf_policy.reply_to.as_deref(),
+            Some(&[ReplyTarget::Author][..])
+        );
+        assert_eq!(bpf_policy.positive_review, Some(PositiveReviewPolicy::None));
 
-        let net_policy = config.subsystems.get("net").expect("net subsystem missing");
-        assert!(net_policy.mute_all);
+        let net_policy = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("netdev list missing");
+        assert_eq!(net_policy.mute_all, Some(true));
         assert!(net_policy.patchwork.enabled);
         assert_eq!(
             net_policy.patchwork.api_url.as_deref(),
@@ -245,11 +418,91 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_unknown_fields_and_invalid_keys() {
+        // Unknown field inside a list block
+        let bad_field = r#"
+            ["bpf@vger.kernel.org"]
+            reply_all = true
+        "#;
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", bad_field).unwrap();
+        assert!(
+            EmailPolicyConfig::load(file.path()).is_err(),
+            "unknown field reply_all must be rejected"
+        );
+
+        // Non-email top-level section key (e.g. old [subsystems.bpf] or typo [default])
+        let bad_key = r#"
+            [default]
+            mute_all = true
+        "#;
+        let mut file2 = NamedTempFile::new().unwrap();
+        write!(file2, "{}", bad_key).unwrap();
+        let err = EmailPolicyConfig::load(file2.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid mailing list key"), "{err}");
+
+        // Self-CC duplication
+        let self_cc = r#"
+            ["bpf@vger.kernel.org"]
+            reply_to = ["author"]
+            cc = ["bpf@vger.kernel.org"]
+        "#;
+        let mut file3 = NamedTempFile::new().unwrap();
+        write!(file3, "{}", self_cc).unwrap();
+        let err = EmailPolicyConfig::load(file3.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repeats its own address in `cc`"), "{err}");
+    }
+
+    #[test]
+    fn test_derive_nntp_group_and_tracked_groups() {
+        assert_eq!(
+            derive_nntp_group("linux-kbuild@vger.kernel.org"),
+            "org.kernel.vger.linux-kbuild"
+        );
+        assert_eq!(
+            derive_nntp_group("linux-mm@kvack.org"),
+            "org.kvack.linux-mm"
+        );
+        assert_eq!(
+            derive_nntp_group("mptcp@lists.linux.dev"),
+            "dev.linux.lists.mptcp"
+        );
+
+        let toml_content = r#"
+            [defaults]
+            track = true
+
+            ["bpf@vger.kernel.org"]
+            ["devicetree@vger.kernel.org"]
+            nntp_group = "org.kernel.vger.linux-devicetree"
+            ["untracked@vger.kernel.org"]
+            track = false
+        "#;
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", toml_content).unwrap();
+        let config = EmailPolicyConfig::load(file.path()).unwrap();
+        assert_eq!(
+            config.tracked_nntp_groups(),
+            vec![
+                ("bpf".to_string(), "org.kernel.vger.bpf".to_string()),
+                (
+                    "linux-devicetree".to_string(),
+                    "org.kernel.vger.linux-devicetree".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn test_load_missing_policy() {
         let config = EmailPolicyConfig::load("non_existent_file.toml")
             .expect("Failed to load default policy");
-        assert!(!config.defaults.reply_to_author);
-        assert!(config.subsystems.is_empty());
+        assert!(config.defaults.reply_to.is_empty());
+        assert!(config.lists.is_empty());
     }
 
     #[test]
@@ -257,10 +510,9 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.media]
-            lists = ["linux-media@vger.kernel.org"]
+            ["linux-media@vger.kernel.org"]
 
-            [subsystems.media.patchwork]
+            ["linux-media@vger.kernel.org".patchwork]
             enabled = true
             email = "pw-bot@lists.example.org"
         "#;
@@ -269,7 +521,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let media = config.subsystems.get("media").expect("media missing");
+        let media = config
+            .lists
+            .get("linux-media@vger.kernel.org")
+            .expect("media missing");
         assert!(media.patchwork.enabled);
         assert_eq!(
             media.patchwork.email.as_deref(),
@@ -284,7 +539,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.3"
         "#;
@@ -293,7 +548,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert!(net.patchwork.enabled);
         assert!(net.patchwork.email.is_none());
         assert!(net.patchwork.api_url.is_some());
@@ -304,7 +562,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.3/"
         "#;
@@ -313,7 +571,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert_eq!(
             net.patchwork.api_url.as_deref(),
             Some("https://patchwork.kernel.org/api/1.3")
@@ -325,7 +586,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.3///"
         "#;
@@ -334,7 +595,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert_eq!(
             net.patchwork.api_url.as_deref(),
             Some("https://patchwork.kernel.org/api/1.3")
@@ -346,7 +610,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "ftp://patchwork.kernel.org/api/1.3"
         "#;
@@ -355,7 +619,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         // Invalid scheme should be cleared
         assert!(net.patchwork.api_url.is_none());
     }
@@ -365,7 +632,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "http://localhost:8000/api/1.3"
         "#;
@@ -374,7 +641,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert_eq!(
             net.patchwork.api_url.as_deref(),
             Some("http://localhost:8000/api/1.3")
@@ -386,10 +656,10 @@ mod tests {
         api_url: Option<&str>,
         token: Option<&str>,
     ) -> EmailPolicyConfig {
-        let mut subsystems = HashMap::new();
-        subsystems.insert(
-            "net".to_string(),
-            SubsystemPolicy {
+        let mut lists = HashMap::new();
+        lists.insert(
+            "netdev@vger.kernel.org".to_string(),
+            MailingListPolicy {
                 patchwork: PatchworkPolicy {
                     enabled,
                     api_url: api_url.map(String::from),
@@ -400,8 +670,8 @@ mod tests {
             },
         );
         EmailPolicyConfig {
-            defaults: SubsystemPolicy::default(),
-            subsystems,
+            defaults: DefaultListPolicy::default(),
+            lists,
         }
     }
 
@@ -411,7 +681,7 @@ mod tests {
             make_config_with_patchwork(true, Some("https://patchwork.kernel.org/api/1.3"), None);
         config.apply_token_override(Some("injected-token"));
 
-        let net = config.subsystems.get("net").unwrap();
+        let net = config.lists.get("netdev@vger.kernel.org").unwrap();
         assert_eq!(net.patchwork.token.as_deref(), Some("injected-token"));
     }
 
@@ -424,7 +694,7 @@ mod tests {
         );
         config.apply_token_override(Some("injected-token"));
 
-        let net = config.subsystems.get("net").unwrap();
+        let net = config.lists.get("netdev@vger.kernel.org").unwrap();
         assert_eq!(
             net.patchwork.token.as_deref(),
             Some("toml-explicit-token"),
@@ -438,7 +708,7 @@ mod tests {
             make_config_with_patchwork(false, Some("https://patchwork.kernel.org/api/1.3"), None);
         config.apply_token_override(Some("injected-token"));
 
-        let net = config.subsystems.get("net").unwrap();
+        let net = config.lists.get("netdev@vger.kernel.org").unwrap();
         assert!(
             net.patchwork.token.is_none(),
             "disabled patchwork should not get override token"
@@ -450,7 +720,7 @@ mod tests {
         let mut config = make_config_with_patchwork(true, None, None);
         config.apply_token_override(Some("injected-token"));
 
-        let net = config.subsystems.get("net").unwrap();
+        let net = config.lists.get("netdev@vger.kernel.org").unwrap();
         assert!(
             net.patchwork.token.is_none(),
             "patchwork without api_url should not get override token"
@@ -463,7 +733,7 @@ mod tests {
             make_config_with_patchwork(true, Some("https://patchwork.kernel.org/api/1.3"), None);
         config.apply_token_override(None);
 
-        let net = config.subsystems.get("net").unwrap();
+        let net = config.lists.get("netdev@vger.kernel.org").unwrap();
         assert!(net.patchwork.token.is_none());
     }
 
@@ -526,7 +796,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.3"
             min_severity = "Medium"
@@ -536,7 +806,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert_eq!(net.patchwork.min_severity.as_deref(), Some("Medium"));
     }
 
@@ -545,7 +818,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.3"
         "#;
@@ -554,7 +827,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert!(net.patchwork.min_severity.is_none());
     }
 
@@ -563,7 +839,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.3"
         "#;
@@ -572,7 +848,10 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert_eq!(net.patchwork.fail_severity, "High");
     }
 
@@ -581,7 +860,7 @@ mod tests {
         let toml_content = r#"
             [defaults]
 
-            [subsystems.net.patchwork]
+            ["netdev@vger.kernel.org".patchwork]
             enabled = true
             api_url = "https://patchwork.kernel.org/api/1.3"
             fail_severity = "Critical"
@@ -591,15 +870,41 @@ mod tests {
         write!(file, "{}", toml_content).unwrap();
 
         let config = EmailPolicyConfig::load(file.path()).expect("Failed to load policy");
-        let net = config.subsystems.get("net").expect("net missing");
+        let net = config
+            .lists
+            .get("netdev@vger.kernel.org")
+            .expect("net missing");
         assert_eq!(net.patchwork.fail_severity, "Critical");
     }
 
     #[test]
     fn test_production_policy_is_valid() {
-        let path = "deployment/sashiko.dev/email_policy.toml";
-        if std::path::Path::new(path).exists() {
-            let _ = EmailPolicyConfig::load(path).expect("Production email policy failed to parse");
-        }
+        let linux_config = EmailPolicyConfig::load("projects/linux/mailing_lists.toml")
+            .expect("Production projects/linux/mailing_lists.toml failed to parse");
+        assert!(!linux_config.lists.is_empty());
+        assert!(!linux_config.tracked_nntp_groups().is_empty());
+        assert!(linux_config.lists.contains_key("bpf@vger.kernel.org"));
+        assert!(
+            linux_config
+                .lists
+                .contains_key("devicetree@vger.kernel.org")
+        );
+
+        let sashiko_config = EmailPolicyConfig::load("projects/sashiko/mailing_lists.toml")
+            .expect("Production projects/sashiko/mailing_lists.toml failed to parse");
+        assert!(sashiko_config.tracked_nntp_groups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_async() {
+        let linux_config = EmailPolicyConfig::load_async("projects/linux/mailing_lists.toml")
+            .await
+            .expect("Async load of projects/linux/mailing_lists.toml failed");
+        assert!(linux_config.lists.contains_key("bpf@vger.kernel.org"));
+
+        let missing = EmailPolicyConfig::load_async("non_existent_file.toml")
+            .await
+            .expect("Async load of missing policy file should return default");
+        assert!(missing.lists.is_empty());
     }
 }

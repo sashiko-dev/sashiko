@@ -39,12 +39,20 @@ impl PatchworkWorker {
     /// Tokens are never stored in the database -- they are resolved
     /// from the config file (and SASHIKO_PATCHWORK_TOKEN env var) at
     /// delivery time.
-    fn resolve_token(&self, api_url: &str) -> Option<String> {
-        let config = EmailPolicyConfig::load(&self.email_policy_path)
-            .expect("Failed to load email policy for token resolution");
+    async fn resolve_token(&self, api_url: &str) -> Option<String> {
+        let config = match EmailPolicyConfig::load_async(&self.email_policy_path).await {
+            Ok(config) => config,
+            Err(e) => {
+                error!(
+                    "Failed to load email policy from {} for token resolution: {}",
+                    self.email_policy_path, e
+                );
+                return None;
+            }
+        };
 
-        // Check subsystem policies for a matching api_url
-        for sub in config.subsystems.values() {
+        // Check mailing list policies for a matching api_url
+        for sub in config.lists.values() {
             if sub.patchwork.enabled && sub.patchwork.api_url.as_deref() == Some(api_url) {
                 return sub.patchwork.token.clone();
             }
@@ -86,7 +94,7 @@ impl PatchworkWorker {
 
                     // Resolve the token from config at delivery time,
                     // not from the database row.
-                    let token = self.resolve_token(&entry.api_url);
+                    let token = self.resolve_token(&entry.api_url).await;
 
                     match crate::patchwork::post_patchwork_check(
                         &client,

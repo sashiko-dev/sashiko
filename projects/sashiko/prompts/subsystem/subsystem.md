@@ -23,7 +23,7 @@ trigger is enough.
 | API and Authorization | `src/api.rs`, `src/auth.rs`, `src/access.rs`, axum routes and handlers, JWT, `LocalToken`, `[server.acl]`, capabilities, `read_only`, `enable_unsafe_all_submit` | api-auth.md |
 | Forge and Webhooks | `src/forge.rs`, `src/fetcher.rs`, webhook handlers, HMAC or signature verification, `ForgeProvider`, `ForgeMetadata`, `is_safe_repo_url`, repo URLs, PR or MR handling, forge API tokens | forge.md |
 | Git Operations | `src/git_ops.rs`, `GitWorktree`, worktrees, `worktree_dir`, clones, fetches, `git am`, repack, gc, commit-graph, any new `git` invocation | git-ops.md |
-| Email and Delivery | `src/email_policy.rs`, `src/email_router.rs`, `src/worker/email.rs`, `src/patchwork.rs`, `src/worker/patchwork.rs`, `email_policy.toml`, outbox rows, recipients, `dry_run`, embargo, loop prevention, SMTP | email-policy.md |
+| Email and Delivery | `src/email_policy.rs`, `src/email_router.rs`, `src/worker/email.rs`, `src/patchwork.rs`, `src/worker/patchwork.rs`, `projects/linux/mailing_lists.toml`, outbox rows, recipients, `dry_run`, embargo, loop prevention, SMTP | email-policy.md |
 | Settings | `src/settings.rs`, `Settings.toml`, `docs/examples/Settings.example.toml`, `deny_unknown_fields`, any added, renamed or removed configuration key, `SASHIKO__` environment overrides | settings.md |
 
 ## Cross-Cutting Patterns

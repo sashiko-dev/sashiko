@@ -84,12 +84,20 @@ impl Ingestor {
     }
 
     async fn get_tracked_groups(&self) -> Result<Vec<(String, String)>> {
-        let needs_dynamic_resolution = self
-            .settings
-            .mailing_lists
-            .track
-            .iter()
-            .any(|entry| !entry.contains(':') && !entry.contains('.') && entry != "linux-mm");
+        if self.settings.mailing_lists.track.is_empty() {
+            let policy = crate::email_policy::EmailPolicyConfig::load_async(
+                &self.settings.review.email_policy_path,
+            )
+            .await?;
+            return Ok(policy.tracked_nntp_groups());
+        }
+
+        let needs_dynamic_resolution = self.settings.mailing_lists.track.iter().any(|entry| {
+            !entry.contains(':')
+                && !entry.contains('@')
+                && !entry.contains('.')
+                && entry != "linux-mm"
+        });
 
         let mut available_groups: Option<Vec<String>> = None;
         if needs_dynamic_resolution {
@@ -670,6 +678,10 @@ impl Ingestor {
 pub fn resolve_tracked_group(entry: &str, available_groups: Option<&[String]>) -> (String, String) {
     if let Some((name, group)) = entry.split_once(':') {
         (name.to_string(), group.to_string())
+    } else if entry.contains('@') {
+        let group = crate::email_policy::derive_nntp_group(entry);
+        let name = group.split('.').next_back().unwrap_or(entry).to_string();
+        (name, group)
     } else if entry.contains('.') {
         (entry.to_string(), entry.to_string())
     } else {
@@ -1267,6 +1279,12 @@ index bbc440c93e08..1123ef3ccf90 100644
                 "unknown-list".to_string(),
                 "org.kernel.vger.unknown-list".to_string()
             )
+        );
+
+        // Email address resolution via derive_nntp_group
+        assert_eq!(
+            resolve_tracked_group("bpf@vger.kernel.org", None),
+            ("bpf".to_string(), "org.kernel.vger.bpf".to_string())
         );
     }
 

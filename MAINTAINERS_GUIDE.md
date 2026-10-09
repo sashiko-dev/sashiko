@@ -14,7 +14,7 @@ If you have questions, feedback, or need assistance, please reach out through th
 
 To request tracking for a new lore or NNTP mailing list, you can either:
 
-1.  **Submit a Pull Request:** Directly update the tracking configuration by adding your lore or NNTP details to the `SASHIKO__MAILING_LISTS__TRACK` environment variable in [`deployment/sashiko.dev/base/app/sashiko-k8s.yaml`](deployment/sashiko.dev/base/app/sashiko-k8s.yaml).
+1.  **Submit a Pull Request:** Add a `["<list-email>"]` section to [`projects/linux/mailing_lists.toml`](projects/linux/mailing_lists.toml). Sashiko automatically derives the Lore NNTP group name by reversing the domain components and appending the list's local part (e.g., `bpf@vger.kernel.org` becomes `org.kernel.vger.bpf`). If the NNTP group name on `nntp.lore.kernel.org` does not follow this convention, set `nntp_group = "..."` explicitly in the section.
 2.  **Send an Email:** Contact the Sashiko development mailing list (`sashiko@lists.linux.dev`) and `Cc: Roman Gushchin <roman.gushchin@linux.dev>` with your request.
 
 ## Adding Subsystem-Specific Prompts
@@ -45,31 +45,40 @@ If the subject does not carry `-next` and the subsystem lists both a stable and 
 
 You can add additional baseline trees (and restrict to specific branches) with `[[git.custom_remotes]]` in your Sashiko config; see [`docs/configuration.md`](docs/configuration.md) for the schema.
 
-## Configuring Email Delivery Options
+## Configuring Mailing List & Email Delivery Options
 
-Sashiko provides flexible delivery mechanisms that can be configured per mailing list or per individual maintainer.
+All per-mailing-list ingestion, embargo, email delivery, and Patchwork settings for Linux live in [`projects/linux/mailing_lists.toml`](projects/linux/mailing_lists.toml). Each section key is the mailing list's email address (e.g. `["bpf@vger.kernel.org"]`), and omitted fields inherit from `[defaults]`:
 
-*   **`reply_all`:** Controls whether Sashiko can reply directly to the public mailing list. If set to `false`, reviews are restricted to private recipients (the author and/or maintainers).
-*   **`reply_to_author`:** Determines whether the review email should be sent directly to the author of the patch.
-*   **`cc_individuals`:** Controls whether other maintainers and users in the CC list of the patch should be included in the review email.
-*   **`mute_all`:** Completely mutes Sashiko for the given scope, preventing any review emails from being sent.
-*   **`cc`:** A static list of email addresses that should always receive a copy of the review.
-*   **`ignored_emails`:** A list of author email addresses whose submissions will never be reviewed by the system.
-*   **`embargo_hours`:** The number of hours to wait before publishing a review with findings. Reviews with no findings are released immediately after the complete patchset review succeeds. When a patch is sent to multiple mailing lists, the shortest explicitly configured embargo period among the matched subsystems will be used. If no matched subsystems explicitly configure this value, it falls back to the default policy.
-*   **`send_positive_review`**: Determines whether to send a review email even when no issues are found. If set to `true`, Sashiko will send a reply indicating that the review was positive. Defaults to `false`.
+*   **`track`:** Whether Sashiko ingests patches from this list via NNTP (default: `true`). Set `track = false` to configure delivery rules for an external list without polling NNTP for it.
+*   **`nntp_group`:** Optional explicit Lore NNTP group override when the group name cannot be derived from the email address (e.g., `devicetree@vger.kernel.org` -> `org.kernel.vger.linux-devicetree`).
+*   **`reply_to`:** List of recipient groups to include on review emails (`"author"`, `"list"`, `"recipients"`). Defaults to `[]` (tracked for the Web UI only, with no outbound emails sent unless `reply_to` or `cc` is configured). Set `reply_to = ["author"]` to send reviews only to the patch author without pinging the public list, or `reply_to = ["author", "list", "recipients"]` to reply to the public list and CC'd individuals.
+*   **`positive_review`:** Who receives a review email when 0 issues are found: `"none"` (default), `"author"` (send positive confirmation only to the patch author), or `"all"` (use the normal `reply_to` and `cc` recipients).
+*   **`mute_all`:** Completely mutes Sashiko for the mailing list, preventing any review emails from being sent.
+*   **`cc`:** Static email addresses that should always receive a copy of the review.
+*   **`ignored_emails`:** Author email addresses whose submissions will be muted.
+*   **`embargo_hours`:** Hours to wait before publishing a review with findings (default: `0`). Clean reviews are released immediately after the complete patchset review succeeds.
+*   **`subject_prefixes`:** Optional subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` when a patch is cross-posted to multiple mailing lists.
 
-**Author-only delivery:** To *track* a subsystem's list (so its patches are
-ingested and reviewed) without *pinging* the list, send the review only to
-the patch author. No extra flag is needed — combine `reply_all = false`
-(strips the list from recipients), `reply_to_author = true`, and
-`cc_individuals = false`:
+**Web UI tracking only (default):** Adding an empty section `["amd-gfx@lists.freedesktop.org"]` tracks and reviews patches from the list for the Web UI without sending outbound emails (`reply_to = []`):
 
 ```toml
-[subsystems.drm-intel]
-lists = ["intel-xe@lists.freedesktop.org"]
-reply_all = false
-reply_to_author = true
-cc_individuals = false
+["amd-gfx@lists.freedesktop.org"]
 ```
 
-**Configuration:** The email policies and delivery preferences are defined in the [`deployment/sashiko.dev/email_policy.toml`](deployment/sashiko.dev/email_policy.toml) file. To request a change to your configuration, please open a GitHub Issue or email the development mailing list (`sashiko@lists.linux.dev`).
+**Author-only delivery:** Set `reply_to = ["author"]` to send reviews with findings directly to the patch author without pinging the public mailing list:
+
+```toml
+["intel-xe@lists.freedesktop.org"]
+reply_to = ["author"]
+```
+
+**Public list delivery:**
+
+```toml
+["bpf@vger.kernel.org"]
+embargo_hours = 0
+subject_prefixes = ["bpf", "bpf-next"]
+reply_to = ["author", "list", "recipients"]
+```
+
+**Configuration:** To request a change to your mailing list configuration in [`projects/linux/mailing_lists.toml`](projects/linux/mailing_lists.toml), please open a GitHub Pull Request or Issue, or email the development mailing list (`sashiko@lists.linux.dev`).

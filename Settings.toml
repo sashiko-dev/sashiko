@@ -34,7 +34,9 @@ url = "sashiko.db"
 token = ""
 
 [mailing_lists]
-track = ["linux-kernel"]
+# Tracked mailing lists are configured in projects/<project>/mailing_lists.toml
+# by default. Set `track` here (or via SASHIKO__MAILING_LISTS__TRACK) to override.
+# track = ["linux-kernel"]
 
 [nntp]
 server = "nntp.lore.kernel.org"

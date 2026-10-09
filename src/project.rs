@@ -83,6 +83,15 @@ impl ProjectId {
             ProjectId::Sashiko => false,
         }
     }
+
+    /// The path to the file holding this project's tracked mailing lists and
+    /// outbound email routing policy.
+    pub fn mailing_lists_path(self) -> &'static str {
+        match self {
+            ProjectId::Linux => "projects/linux/mailing_lists.toml",
+            ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
+        }
+    }
 }
 
 impl fmt::Display for ProjectId {

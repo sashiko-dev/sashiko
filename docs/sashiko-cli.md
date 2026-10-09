@@ -244,14 +244,14 @@ reviewing your own patches during development.
 
 ### 2. Daemon with email disabled (local with persistence)
 
-Run the daemon normally but leave SMTP unconfigured (default) and set
-`mute_all = true` in `email_policy.toml` (also default). Submit patches
+Run the daemon normally but leave SMTP unconfigured (default) or set
+`mute_all = true` in `projects/<project>/mailing_lists.toml`. Submit patches
 with `sashiko-cli submit` or `sashiko-cli local`.
 
 - **Requires:** a running `sashiko` daemon.
 - **Provides:** database persistence, web UI at `http://localhost:8080`,
   review history, re-runs.
-- **Emails:** none sent (SMTP commented out, `mute_all = true`).
+- **Emails:** none sent (SMTP commented out or `mute_all = true`).
 
 This mode is useful when you want to review multiple patch series over
 time and compare results.
@@ -277,26 +277,27 @@ This will:
 
 ### 3. Full deployment (daemon + email)
 
-Configure SMTP in `Settings.toml` and adjust `email_policy.toml` to
+Configure SMTP in `Settings.toml` and adjust `projects/<project>/mailing_lists.toml` to
 control delivery. The daemon will send review emails to authors,
 maintainers, and/or mailing lists.
 
-- **Requires:** full SMTP configuration, careful email policy setup.
+- **Requires:** full SMTP configuration, careful mailing list policy setup.
 - **Provides:** everything in mode 2, plus automated email delivery.
-- **Emails:** sent per the policy in `email_policy.toml`.
+- **Emails:** sent per the policy in `projects/<project>/mailing_lists.toml`.
 
 See the [Guide for Kernel Maintainers](../MAINTAINERS_GUIDE.md) for
-email policy configuration.
+mailing list policy configuration.
 
 ## Configuration
 
-Configuration files live in the project root. Per-provider example
+Configuration files live in the repository root and under `projects/`. Per-provider example
 configurations are in [docs/examples/](examples/).
 
 - **Settings.toml** -- main application config (AI provider, server,
   git repo path, review settings). Copy one of the provider-specific
   examples from [docs/examples/](examples/) as a starting point.
-- **email_policy.toml** -- email delivery policy. See
+- **projects/\<project\>/mailing_lists.toml** -- per-mailing-list tracking and email delivery policy. See
+  [projects/linux/mailing_lists.toml](../projects/linux/mailing_lists.toml) and
   [docs/examples/email_policy.toml](examples/email_policy.toml).
 
 ### Minimal Settings.toml for local review

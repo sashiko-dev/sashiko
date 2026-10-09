@@ -1,9 +1,9 @@
 # Configuration Reference
 
-Sashiko is configured through two files in the project root:
+Sashiko is configured through two files:
 
 - **Settings.toml** -- application settings (AI, server, git, review)
-- **email_policy.toml** -- email delivery policy
+- **projects/\<project\>/mailing_lists.toml** -- per-mailing-list tracking, embargo, email delivery, and Patchwork policy
 
 Both can be bootstrapped from the examples in [docs/examples/](examples/).
 All settings can also be overridden via environment variables using the
@@ -68,7 +68,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `track` | string or list | -- | Mailing lists to monitor. Accepts a TOML array or a comma-separated string. |
+| `track` | string or list | `[]` | Optional override for mailing lists to monitor via NNTP. When empty (default), tracked lists are loaded from `projects/<project>/mailing_lists.toml` (all entries with `track = true`). Accepts a TOML array or a comma-separated string. |
 
 ### `[nntp]`
 
@@ -275,7 +275,7 @@ pass.
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |
-| `email_policy_path` | string | `"email_policy.toml"` | Path to the email policy file. |
+| `email_policy_path` | string | `"projects/linux/mailing_lists.toml"` | Path to the per-project mailing list and email delivery policy file (`projects/<project>/mailing_lists.toml`). |
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
@@ -313,7 +313,7 @@ Each mapping object in the list requires two fields:
 - **For Git Forges (Webhooks):** The system applies the `pattern` against the **file paths** modified by a pull request (e.g., matching `^drivers/net/.*`).
 - **For Mailing Lists (NNTP):** The system applies the `pattern` against the **To and Cc email addresses** of the incoming patch email.
 
-When a patch is tagged with a subsystem, it can trigger subsystem-specific AI review rules (context loading) and specific email/embargo policies defined in `email_policy.toml`.
+When a patch is tagged with a subsystem, it can trigger subsystem-specific AI review rules (context loading) and specific email/embargo policies defined in `projects/<project>/mailing_lists.toml`.
 
 ```toml
 [subsystems]
@@ -325,32 +325,34 @@ mapping = [
 ]
 ```
 
-## email_policy.toml
+## `projects/<project>/mailing_lists.toml`
 
-Controls how Sashiko sends (or suppresses) review emails. See
-[docs/examples/email_policy.toml](examples/email_policy.toml) for an
-annotated example.
+Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashiko routes or suppresses review emails, and Patchwork check delivery. See [projects/linux/mailing_lists.toml](../projects/linux/mailing_lists.toml) and [docs/examples/email_policy.toml](examples/email_policy.toml).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `defaults.reply_all` | bool | `false` | Allow sending to public mailing lists. |
-| `defaults.reply_to_author` | bool | `false` | Send review to the patch author. |
-| `defaults.cc_individuals` | bool | `false` | CC individual recipients (non-mailing-list) on review emails. |
-| `defaults.mute_all` | bool | `true` | Suppress all email sending. |
-| `defaults.cc` | list | `[]` | Static CC addresses. |
-| `defaults.ignored_emails` | list | `[]` | Author addresses to ignore entirely. |
-| `defaults.subject_prefixes` | list | `[]` | Subject prefix patterns to match for this scope. |
-| `defaults.embargo_hours` | integer | -- | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. When a patch matches multiple subsystems, the shortest configured embargo wins. |
-| `defaults.send_positive_review` | bool | `false` | Send email even when no issues are found. |
+| `defaults.track` | bool | `true` | Whether listed mailing lists are tracked via NNTP by default. |
+| `defaults.embargo_hours` | integer | `0` | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. |
+| `defaults.reply_to` | list | `[]` | Recipient targets when findings are present: `"author"`, `"list"`, `"recipients"`. |
+| `defaults.positive_review` | string | `"none"` | Who receives a review email when 0 issues are found: `"none"`, `"author"`, or `"all"`. |
+| `defaults.mute_all` | bool | `false` | Suppress all email sending for this scope. |
+| `defaults.cc` | list | `[]` | Static CC addresses always included on review emails. |
+| `defaults.ignored_emails` | list | `[]` | Author addresses to mute entirely. |
 
-The email policy also supports per-subsystem overrides via
-`[subsystems.<name>]` sections. Each subsystem section accepts the same
-fields as `[defaults]`, plus:
+Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.kernel.org"]`). Omitted fields inherit from `[defaults]`. Each mailing list section accepts:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `lists` | list | `[]` | Mailing list addresses that map to this subsystem. |
-| `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this subsystem. |
+| `track` | bool | `defaults.track` | Whether Sashiko ingests patches from this mailing list via NNTP. |
+| `nntp_group` | string | derived from email | Explicit Lore NNTP group override when the group name cannot be derived by reversing the email domain and appending the list's local part. |
+| `embargo_hours` | integer | `defaults.embargo_hours` | Hours to wait before publishing a review with findings. |
+| `subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` on cross-posted series. |
+| `reply_to` | list | `defaults.reply_to` | Recipient targets for this list (`"author"`, `"list"`, `"recipients"`). |
+| `positive_review` | string | `defaults.positive_review` | Positive review delivery mode (`"none"`, `"author"`, `"all"`). |
+| `mute_all` | bool | `defaults.mute_all` | Suppress all email sending for patches matching this list. |
+| `cc` | list | `[]` | Additional static CC addresses for this list (merged with `defaults.cc`). |
+| `ignored_emails` | list | `[]` | Additional author addresses to mute for this list. |
+| `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this mailing list. |
 | `patchwork.api_url` | string | -- | Patchwork REST API URL (e.g. `https://patchwork.kernel.org/api/1.3`). Trailing slashes are stripped automatically. Invalid schemes are rejected with a warning. |
 | `patchwork.token` | string | -- | Patchwork API token. Can also be set via `SASHIKO_PATCHWORK_TOKEN` env var (fills in where token is omitted in TOML). |
 | `patchwork.email` | string | -- | Email address for email-based Patchwork notifications. |
@@ -359,33 +361,19 @@ fields as `[defaults]`, plus:
 
 ### Author-only delivery
 
-A subsystem can **track** a mailing list (its patches are ingested and
-reviewed) while **not pinging** that list with the review email — sending
-only to the patch author instead. This is useful for silent /
-dashboard-only lists where individual contributors want direct reviews of
-their own patches without spamming the whole list.
-
-It is achieved with the existing flags, no extra key needed:
+A mailing list can be **tracked** (its patches are ingested and reviewed) while **not pinging** that list with the review email — sending only to the patch author instead:
 
 ```toml
-[subsystems.drm-intel]
-lists = ["intel-xe@lists.freedesktop.org"]
-reply_all = false          # never send to the public list
-reply_to_author = true     # send the review to the patch author
-cc_individuals = false     # drop non-list individual recipients
+["intel-xe@lists.freedesktop.org"]
+reply_to = ["author"]
 ```
-
-The list address is still matched via `lists` (so reviews happen), but
-`reply_all = false` strips it from the outgoing recipients, leaving only
-the author. Because each review targets exactly one author, this delivers
-reviews to individual developers without pinging the list.
 
 ### Patchwork integration
 
 Sashiko can report review results as
 [checks](https://patchwork.readthedocs.io/en/latest/usage/overview/#checks)
 on a Patchwork instance. Two delivery modes are available and can be
-enabled simultaneously for the same subsystem.
+enabled simultaneously for the same mailing list.
 
 **API mode** posts checks directly to the Patchwork REST API with
 retry-queuing (3 attempts, exponential backoff). Requires a maintainer
@@ -393,7 +381,7 @@ API token. Note: Patchwork tokens grant full project-maintainer
 permissions (state changes, delegation, etc.), not just check access.
 
 ```toml
-[subsystems.net.patchwork]
+["netdev@vger.kernel.org".patchwork]
 enabled = true
 api_url = "https://patchwork.kernel.org/api/1.3"
 token = "your-api-token"   # or set SASHIKO_PATCHWORK_TOKEN env var
@@ -405,7 +393,7 @@ A local script (such as
 posts the check. This avoids giving Sashiko a write token.
 
 ```toml
-[subsystems.linux-media.patchwork]
+["linux-media@vger.kernel.org".patchwork]
 enabled = true
 email = "pw-bot@lists.example.org"
 ```
@@ -428,7 +416,7 @@ pre-existing counts in parentheses, dropping zero-count severities.
 For example: `Critical: 1 · High: 2 (1 pre-existing)`.
 
 ```toml
-[subsystems.net.patchwork]
+["netdev@vger.kernel.org".patchwork]
 enabled = true
 api_url = "https://patchwork.kernel.org/api/1.3"
 min_severity = "Medium"    # exclude Low findings entirely

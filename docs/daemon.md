@@ -4,7 +4,7 @@ While `sashiko review` runs standalone local reviews without a server or databas
 
 See also:
 - [Main README](../README.md) for an overview and local review quick start
-- [Configuration Reference](configuration.md) for all `Settings.toml` and `email_policy.toml` options
+- [Configuration Reference](configuration.md) for all `Settings.toml` and `projects/<project>/mailing_lists.toml` options
 - [sashiko-cli Reference](sashiko-cli.md) for interacting with a running daemon
 
 ## Prerequisites

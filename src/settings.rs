@@ -888,7 +888,7 @@ fn default_max_retries() -> u32 {
 }
 
 fn default_email_policy_path() -> String {
-    "email_policy.toml".to_string()
+    ProjectId::Linux.mailing_lists_path().to_string()
 }
 
 fn default_log_level() -> String {
@@ -1081,12 +1081,43 @@ impl Settings {
                     .to_string(),
             );
         }
+        #[cfg(feature = "server")]
+        if let Err(e) = crate::email_policy::EmailPolicyConfig::load(&self.review.email_policy_path)
+        {
+            return Err(format!(
+                "[review] email_policy_path ({}) is invalid: {}",
+                self.review.email_policy_path, e
+            ));
+        }
         Ok(())
     }
 
     /// Whether NNTP server and tracked mailing lists are configured.
     pub fn has_nntp_config(&self) -> bool {
-        !self.nntp.server.trim().is_empty() && !self.mailing_lists.track.is_empty()
+        if self.nntp.server.trim().is_empty() {
+            return false;
+        }
+        if !self.mailing_lists.track.is_empty() {
+            return true;
+        }
+        #[cfg(feature = "server")]
+        {
+            match crate::email_policy::EmailPolicyConfig::load(&self.review.email_policy_path) {
+                Ok(cfg) => !cfg.tracked_nntp_groups().is_empty(),
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse mailing list policy {}: {}",
+                        self.review.email_policy_path,
+                        e
+                    );
+                    false
+                }
+            }
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            false
+        }
     }
 }
 

@@ -274,10 +274,11 @@ or `"sashiko"`.
 
 A diff adding a `ProjectId` variant must also add it to `ProjectId::ALL`
 (`test_all_lists_every_project` asserts the count), give it a `prompt_dir()`
-that actually exists in the bundle, and decide `uses_maintainers()`. Note
-`prompt_dir()` is deliberately not `as_str()` — Linux maps to `kernel` — and
-`test_prompt_dir_is_not_the_project_name` exists to stop that being
-"simplified".
+that actually exists in the bundle, define `mailing_lists_path()`, and decide
+`uses_maintainers()`. Note `prompt_dir()` is deliberately not `as_str()` —
+Linux maps to `third_party/prompts/kernel` while Sashiko maps to
+`projects/sashiko/prompts` — and `test_prompt_dir_is_not_the_project_name`
+exists to stop that being "simplified".
 
 ## 8. Parse failures must stay loud
 
@@ -303,9 +304,11 @@ failure back into a localhost fallback. If you see the `config` dependency
 move in `Cargo.toml`, check this site.
 
 The same "fail loud on a malformed file" rule is enforced elsewhere for the
-sibling config: `fe706adb7b23` replaced `EmailPolicyConfig::load(...)
-.unwrap_or_default()` with a hard failure, because an empty default has
-`mute_all = true` and silently muted every reply.
+sibling mailing list policy config (`projects/<project>/mailing_lists.toml`):
+`fe706adb7b23` replaced `EmailPolicyConfig::load(...).unwrap_or_default()`
+with a hard failure, and `EmailPolicyConfig::validate()` rejects unknown fields
+(`#[serde(deny_unknown_fields)]`), non-email section keys, and lists that CC
+their own address.
 
 ## Checklist for a diff that adds, renames or removes a setting
 

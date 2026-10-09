@@ -2,7 +2,7 @@
 
 This guide covers `src/email_policy.rs`, `src/email_router.rs`,
 `src/worker/email.rs`, `src/patchwork.rs`, `src/worker/patchwork.rs`, and
-`email_policy.toml`.
+`projects/linux/mailing_lists.toml`.
 
 This subsystem sends automated emails to public mailing lists (such as LKML) and
 posts status checks to Patchwork. A defect here can spam thousands of kernel
@@ -20,8 +20,8 @@ writes rows to `email_outbox` and `patchwork_outbox`.
     transmit it over SMTP.
   - `Muted`: Policy (`EmailAction::Mute`) or ignored author rules suppressed the
     notification.
-  - `Skipped`: 0 findings and positive reviews (`send_positive_review`) are not
-    enabled for the subsystem.
+  - `Skipped`: 0 findings and positive reviews (`positive_review`) are set to
+    `"none"` for the matched mailing lists.
   - `Pending`: Queued for actual delivery by `EmailWorker::run`.
   - `Sent` / `Failed`: Terminal states after delivery attempts.
 - **Invariant**: Any change to `EmailWorker::run` (`src/worker/email.rs`) or
@@ -46,6 +46,14 @@ out or posted to public Patchwork instances until the embargo is explicitly
 released (`release_embargoed_results`).
 - **Invariant**: In `Reviewer::complete_review`, if a patchset is embargoed,
   `queue_notifications` must be skipped completely until embargo release.
+- **Subject-Aware Delay Calculation (`calculate_embargo_hours`)**: Per
+  `designs/subject_embargo.md`, `embargo_hours` in `mailing_lists.toml` is a
+  maintainer-requested review grace period (not a security vulnerability
+  boundary). When a patch is cross-posted across multiple lists,
+  `calculate_embargo_hours` intentionally prioritizes `subject_prefixes`-matched
+  lists and falls back to `.min()` among explicit delays so cross-posted patches
+  are not held back by unrelated lists. Do not flag `subject_prefixes` filtering
+  or `.min()` in `calculate_embargo_hours` as an embargo bypass.
 
 ## 4. Patchwork Check Delivery & Secret Resolution
 
@@ -53,7 +61,7 @@ released (`release_embargoed_results`).
 check statuses via HTTP (`patchwork::post_patchwork_check`).
 - **Runtime Token Resolution**: `patchwork_outbox` stores `api_url` and `msgid`,
   *never* the API token. `PatchworkWorker::resolve_token` looks up the token from
-  `email_policy.toml` at delivery time.
+  `projects/<project>/mailing_lists.toml` at delivery time.
 - **Bounded Retries & Backoff**: Failed HTTP deliveries increment retry counts
   with exponential backoff (5s, 30s, 180s) and transition to a terminal failure
   state after max retries so a down server does not cause an infinite retry storm.

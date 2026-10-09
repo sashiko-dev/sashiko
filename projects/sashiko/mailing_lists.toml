@@ -1,0 +1,11 @@
+# Per-mailing-list configuration for Sashiko (--project sashiko).
+# Sashiko reviews are ingested via GitHub webhooks rather than NNTP mailing lists.
+
+[defaults]
+track = false
+embargo_hours = 0
+reply_to = []
+positive_review = "none"
+mute_all = true
+cc = []
+ignored_emails = []
