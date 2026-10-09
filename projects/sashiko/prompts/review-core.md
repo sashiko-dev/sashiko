@@ -92,7 +92,7 @@ authentication is a security boundary.
 **5. Benchmark Backing for Linux Review-Quality Changes (HIGH Severity).**
 Do not demand benchmark data, measurements, or manual test procedures for ordinary
 code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
-Sashiko's own self-review prompts (`prompts/sashiko/`, `sashiko_patch_review.rs`),
+Sashiko's own self-review prompts (`projects/sashiko/prompts/`, `sashiko_patch_review.rs`),
 nor for post-triage maintenance tasks (such as periodic upstream fix checks on
 already-triaged open bugs), cross-bug database deduplication against previously
 stored bugs (`DedupSession`, `BUG_DEDUP_LOCK`, `list_all_bugs_for_vector_search`),

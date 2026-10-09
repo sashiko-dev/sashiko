@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=third_party/prompts");
-    println!("cargo:rerun-if-changed=prompts");
+    println!("cargo:rerun-if-changed=projects");
 
     track_git_changes();
 
@@ -42,7 +42,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendored_dir = manifest_dir.join("third_party/prompts");
-    let first_party_dir = manifest_dir.join("prompts");
+    let projects_dir = manifest_dir.join("projects");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let generated = out_dir.join("prompts_generated.rs");
 
@@ -50,12 +50,12 @@ fn main() {
     // appearing in both would have one copy silently win depending on
     // collection order. Collect them separately to name the offender.
     let vendored = collect_root(&vendored_dir);
-    let first_party = collect_root(&first_party_dir);
+    let first_party = collect_projects_prompts(&projects_dir);
 
     for (relative, _) in &first_party {
         if vendored.iter().any(|(other, _)| other == relative) {
             panic!(
-                "prompt {relative} exists in both third_party/prompts and prompts; \
+                "prompt {relative} exists in both third_party/prompts and projects; \
                  they share one bundle namespace, so one would silently shadow the other"
             );
         }
@@ -123,6 +123,39 @@ fn collect_root(root: &Path) -> Vec<(String, PathBuf)> {
             root.display()
         )
     });
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+/// Every file under `projects/<project>/prompts/`, as (`<project>/<relative>`, source path).
+fn collect_projects_prompts(projects_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    let entries = fs::read_dir(projects_dir).unwrap_or_else(|e| {
+        panic!(
+            "failed to read projects root {}: {e}",
+            projects_dir.display()
+        )
+    });
+    for entry in entries {
+        let entry = entry
+            .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", projects_dir.display()));
+        let project_path = entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let project_name = entry.file_name().to_string_lossy().into_owned();
+        let prompts_dir = project_path.join("prompts");
+        if !prompts_dir.is_dir() {
+            continue;
+        }
+        let mut project_files = Vec::new();
+        collect_files(&prompts_dir, &prompts_dir, &mut project_files).unwrap_or_else(|e| {
+            panic!("failed to read prompt root {}: {e}", prompts_dir.display())
+        });
+        for (rel, abs) in project_files {
+            files.push((format!("{project_name}/{rel}"), abs));
+        }
+    }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }

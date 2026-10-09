@@ -157,7 +157,7 @@ or non-Unix portability issues (such as `tokio::signal::unix`, `rustix`,
 
 Do not ask authors to add manual test procedures, validation logs, or benchmark
 numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits, nor
-for changes to Sashiko's own self-review prompts (`prompts/sashiko/`,
+for changes to Sashiko's own self-review prompts (`projects/sashiko/prompts/`,
 `sashiko_patch_review.rs`), nor for post-triage maintenance tasks (such as
 periodic upstream fix checks on already-triaged open bugs) or filtering
 pre-existing issues out of patch review reports that are not exercised by the

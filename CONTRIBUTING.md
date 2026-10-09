@@ -39,9 +39,9 @@ If you are modifying Linux kernel review prompts (`third_party/prompts/`) or rev
 
 ## Sashiko-for-Sashiko Review Workflow
 
-Sashiko reviews changes to its own repository using the `--project sashiko` profile, driven by first-party prompt guides under [`prompts/sashiko/`](prompts/sashiko/README.md) and the workflow in [`src/workflows/sashiko_patch_review.rs`](src/workflows/sashiko_patch_review.rs).
+Sashiko reviews changes to its own repository using the `--project sashiko` profile, driven by first-party prompt guides under [`projects/sashiko/prompts/`](projects/sashiko/prompts/README.md) and the workflow in [`src/workflows/sashiko_patch_review.rs`](src/workflows/sashiko_patch_review.rs).
 
-While deterministic checks (compilation, borrow checking, formatting, clippy lints) are enforced by `make check-pr`, Sashiko-for-Sashiko audits semantic and architectural invariants across subsystems (`prompts/sashiko/subsystem/*.md`) and cross-cutting patterns (`prompts/sashiko/patterns/*.md`), including:
+While deterministic checks (compilation, borrow checking, formatting, clippy lints) are enforced by `make check-pr`, Sashiko-for-Sashiko audits semantic and architectural invariants across subsystems (`projects/sashiko/prompts/subsystem/*.md`) and cross-cutting patterns (`projects/sashiko/prompts/patterns/*.md`), including:
 
 - User experience and CLI/UI consistency
 - SQLite schema migrations and query scaling
@@ -81,7 +81,7 @@ When you open or update a pull request on GitHub, the upstream Sashiko service (
    - Push the updated branch and reply on the PR confirming the resolution.
 2. **False positive:**
    - Reply on the PR with concrete code evidence explaining why the finding does not apply.
-   - Where appropriate, propose an accompanying or follow-up update to the Sashiko-for-Sashiko prompts (`prompts/sashiko/`) or workflow (`src/workflows/sashiko_patch_review.rs`) so future reviews do not repeat the false positive.
+   - Where appropriate, propose an accompanying or follow-up update to the Sashiko-for-Sashiko prompts (`projects/sashiko/prompts/`) or workflow (`src/workflows/sashiko_patch_review.rs`) so future reviews do not repeat the false positive.
 
 ## Coding Standards & AI Coding Agents
 
