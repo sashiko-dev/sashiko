@@ -1428,11 +1428,90 @@
             font-size: 0.9em;
         }
     
+        /* What's New Banner */
+        .whats-new-banner {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            background: var(--bugs-btn-bg);
+            border: 1px solid var(--bugs-btn-border);
+            border-radius: 6px;
+            padding: 8px 12px;
+            margin-bottom: 12px;
+            cursor: pointer;
+            transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+            box-shadow: 0 1px 4px var(--bugs-btn-glow);
+        }
+        .whats-new-banner:hover {
+            background: var(--bugs-btn-bg-hover);
+            border-color: var(--bugs-btn-border-hover);
+            box-shadow: 0 2px 6px var(--bugs-btn-glow-hover);
+        }
+        .whats-new-banner-main {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+            flex: 1;
+        }
+        .whats-new-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: var(--card-bg);
+            color: var(--bugs-btn-text);
+            border: 1px solid var(--bugs-btn-border);
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .whats-new-headline {
+            font-weight: 600;
+            color: var(--text);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .whats-new-cta {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--bugs-btn-text);
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .whats-new-close {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            font-size: 16px;
+            line-height: 1;
+            padding: 2px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .whats-new-close:hover {
+            background: var(--hover);
+            color: var(--text);
+        }
+        .whats-new-modal-body {
+            white-space: pre-wrap;
+            line-height: 1.6;
+            font-size: 1.05em;
+            color: var(--text);
+        }
+
         /* Auth UI */
         #auth-header {
             position: absolute;
-            top: 32px;
-            right: 16px;
+            top: 20px;
+            right: 0;
             display: flex;
             align-items: center;
             gap: 8px;
@@ -1724,15 +1803,35 @@
 </head>
 
 <body>
-    <div id="auth-header">
-        <div id="auth-user">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-                <circle cx="12" cy="7" r="4"></circle>
-            </svg>
-            <span id="auth-email">Guest</span>
+    <div id="whatsNewBanner" class="whats-new-banner" onclick="openWhatsNewModal()">
+        <div class="whats-new-banner-main" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openWhatsNewModal();}">
+            <span class="whats-new-badge">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"></path>
+                </svg>
+                What's New
+            </span>
+            <span id="whatsNewBannerHeadline" class="whats-new-headline"></span>
         </div>
-        <button id="auth-btn" class="btn" onclick="toggleAuth()">Login</button>
+        <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+            <span class="whats-new-cta">Read announcement &rarr;</span>
+            <button type="button" class="whats-new-close" title="Dismiss announcement" aria-label="Dismiss announcement" onclick="dismissWhatsNew(event)">&times;</button>
+        </div>
+    </div>
+
+    <div id="app-shell" style="position: relative;">
+        <div id="auth-header">
+            <div id="auth-user">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="12" cy="7" r="4"></circle>
+                </svg>
+                <span id="auth-email">Guest</span>
+            </div>
+            <button id="auth-btn" class="btn" onclick="toggleAuth()">Login</button>
+        </div>
+
+        <div id="app"></div>
     </div>
 
     <div id="authModal" class="modal-overlay" onclick="if(event.target===this) closeAuthModal()">
@@ -1752,8 +1851,6 @@
             </div>
         </div>
     </div>
-
-    <div id="app"></div>
 
     <div class="kbd-hint">
         <kbd>/</kbd> search
@@ -1900,7 +1997,50 @@
         </div>
     </div>
 
+    <div id="whatsNewModal" class="modal-overlay" onclick="if(event.target===this) closeWhatsNewModal()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeWhatsNewModal()">&times;</span>
+            <div class="about-logo" style="margin-bottom: 16px;">
+                <span class="whats-new-badge" style="font-size: 12px; padding: 3px 10px; margin-right: 10px;">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                        <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"></path>
+                    </svg>
+                    What's New
+                </span>
+                <span id="whatsNewModalDate" style="font-size: 0.55em; font-weight: normal; color: var(--text-muted);"></span>
+            </div>
+            <h2 id="whatsNewModalHeadline" style="font-size: 1.3em; margin: 0 0 12px 0; border-bottom: none; padding-bottom: 0;"></h2>
+            <div id="whatsNewModalBody" class="whats-new-modal-body"></div>
+            <div style="margin-top: 24px; display: flex; justify-content: flex-end;">
+                <button type="button" class="btn primary" onclick="closeWhatsNewModal()">Got it</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // =====================================================================
+        // WHAT'S NEW ANNOUNCEMENT BANNER
+        // =====================================================================
+        // Populate `headline` (and optionally `body` / `date` / `id`) to show a
+        // top-level announcement banner. Once a user clicks the banner to read
+        // the announcement or dismisses it with `×`, it stays hidden in their
+        // browser until `id`, `headline`, or `body` is updated.
+        // Leave `headline` and `body` empty to keep the banner hidden.
+        //
+        // Example:
+        // const WHATS_NEW = {
+        //     id: '2026-10-embargo-release',
+        //     date: '2026-10-09',
+        //     headline: 'Maintainers can now release patchset embargoes early',
+        //     body: 'Subsystem maintainers and operators can now click "Release Embargo" on an embargoed patchset page to immediately publish held findings.'
+        // };
+        const WHATS_NEW = {
+            id: '',
+            date: '',
+            headline: '',
+            body: ''
+        };
+
         // =====================================================================
         // STATE
         // =====================================================================
@@ -2575,6 +2715,76 @@
             document.getElementById('aboutModal').classList.remove('open');
         }
 
+        const WHATS_NEW_STORAGE_KEY = 'sashiko_whats_new_dismissed';
+
+        function getWhatsNewDigest() {
+            const headline = (WHATS_NEW.headline || '').trim();
+            const body = (WHATS_NEW.body || '').trim();
+            if (!headline && !body) return '';
+            const id = (WHATS_NEW.id || '').trim();
+            return id ? `${id}:${headline}:${body}` : `${headline}:${body}`;
+        }
+
+        function initWhatsNewBanner() {
+            const banner = document.getElementById('whatsNewBanner');
+            if (!banner) return;
+            const digest = getWhatsNewDigest();
+            if (!digest || safeStorage.getItem(WHATS_NEW_STORAGE_KEY) === digest) {
+                banner.style.display = 'none';
+                return;
+            }
+            const headline = (WHATS_NEW.headline || WHATS_NEW.body || '').trim();
+            const headlineEl = document.getElementById('whatsNewBannerHeadline');
+            if (headlineEl) headlineEl.textContent = headline;
+            banner.style.display = 'flex';
+        }
+
+        function markWhatsNewRead() {
+            const digest = getWhatsNewDigest();
+            if (digest) {
+                safeStorage.setItem(WHATS_NEW_STORAGE_KEY, digest);
+            }
+            const banner = document.getElementById('whatsNewBanner');
+            if (banner) banner.style.display = 'none';
+        }
+
+        function openWhatsNewModal() {
+            const digest = getWhatsNewDigest();
+            if (!digest) return;
+            const headline = (WHATS_NEW.headline || '').trim();
+            const body = (WHATS_NEW.body || '').trim();
+            const date = (WHATS_NEW.date || '').trim();
+
+            const dateEl = document.getElementById('whatsNewModalDate');
+            if (dateEl) dateEl.textContent = date;
+
+            const headlineEl = document.getElementById('whatsNewModalHeadline');
+            if (headlineEl) {
+                headlineEl.textContent = headline;
+                headlineEl.style.display = headline ? 'block' : 'none';
+            }
+
+            const bodyEl = document.getElementById('whatsNewModalBody');
+            if (bodyEl) {
+                bodyEl.textContent = body;
+                bodyEl.style.display = body ? 'block' : 'none';
+            }
+
+            markWhatsNewRead();
+            const modal = document.getElementById('whatsNewModal');
+            if (modal) modal.classList.add('open');
+        }
+
+        function closeWhatsNewModal() {
+            const modal = document.getElementById('whatsNewModal');
+            if (modal) modal.classList.remove('open');
+        }
+
+        function dismissWhatsNew(event) {
+            if (event) event.stopPropagation();
+            markWhatsNewRead();
+        }
+
         function parseAuthor(authorStr) {
             if (!authorStr) return { name: '', email: 'unknown' };
             authorStr = authorStr.trim();
@@ -2612,7 +2822,10 @@
         }
 
         document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') closeAbout();
+            if (e.key === 'Escape') {
+                closeAbout();
+                closeWhatsNewModal();
+            }
         });
 
         function getSeverityColor(sev) {
@@ -6668,6 +6881,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         });
 
         loadSettings();
+        initWhatsNewBanner();
         fetchConfig().then(router);
         function openBugActionModal(action, id) {
             if (action === 'comment') {
