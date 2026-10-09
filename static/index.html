@@ -6309,8 +6309,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 return;
             }
 
-            // If input is focused, don't handle other keys
-            if (isInputFocused) return;
+            // If input is focused or a modal is open, don't handle navigation keys
+            if (isInputFocused || e.defaultPrevented || document.querySelector('.modal-overlay.open')) return;
 
             // Focus search with /
             if (e.key === '/' && state.view === 'list') {
