@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# ENVIRONMENT-SPECIFIC CONFIGURATION EXAMPLE
+# Copy this to 'kustomization.yaml' and modify IDs.
+# This file is ignored by git.
+#
+# Co-located in the 'sashiko-self' namespace alongside sashiko.sashiko.dev,
+# sharing the 'sashiko-self-secrets' Secret, 'sashiko-self-ksa' ServiceAccount,
+# 'sashiko-self-data-pvc' PersistentVolumeClaim, and 'sashiko-self-ingress'
+# on lb-ipv4-bugrepo.
+
+patches:
+  # 1. Deployment: Update image
+  - target:
+      kind: Deployment
+      name: sashiko-gcc-deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: us-docker.pkg.dev/gcp-project-xxxxx/sashiko-repository/sashiko:next
+
+  # 2. CronJob: Inject Bucket ID
+  - target:
+      kind: CronJob
+      name: sashiko-gcc-nightly-backup
+    patch: |-
+      - op: add
+        path: /spec/jobTemplate/spec/template/spec/containers/0/env
+        value:
+          - name: BACKUP_BUCKET
+            value: gs://bucket-xxxxx/sashiko-gcc
+
+  # 3. Ingress: Real IP and Certificate names
+  - target:
+      kind: Ingress
+      name: sashiko-self-ingress
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/kubernetes.io~1ingress.global-static-ip-name
+        value: "lb-ipv4-bugrepo"
+      - op: replace
+        path: /metadata/annotations/networking.gke.io~1managed-certificates
+        value: "sashiko-self-cert,sashiko-gcc-cert"

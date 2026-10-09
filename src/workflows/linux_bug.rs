@@ -173,7 +173,13 @@ impl LlmSession for VerifySession<'_> {
             ),
             ProjectId::Sashiko => format!(
                 "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
-                You are an expert Sashiko maintainer and Rust systems engineer. Your task is to rigorously verify a candidate Sashiko defect or vulnerability against the top-of-trunk of the Sashiko repository (`origin/main`).\n\
+                You are an expert Rust and distributed systems maintainer. Your task is to rigorously verify a candidate Sashiko defect or vulnerability against the top-of-trunk of the Sashiko repository.\n\
+                Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
+                CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+            ),
+            ProjectId::Gcc => format!(
+                "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
+                You are an expert GCC compiler maintainer. Your task is to rigorously verify a candidate GCC defect against the top-of-trunk of the GCC repository.\n\
                 Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
                 CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
             ),
@@ -238,7 +244,7 @@ Return ONLY a valid JSON object matching this schema:
                 locations = loc_str,
                 prefetch_block = prefetch_block,
             ),
-            ProjectId::Sashiko => format!(
+            ProjectId::Sashiko | ProjectId::Gcc => format!(
                 "{stage_heading}
 
 Candidate Defect to Verify:
@@ -250,7 +256,7 @@ Locations:
 {locations}
 {prefetch_block}
 Task:
-1. Verify the problem against the mainline code shown above and top-of-trunk of the Sashiko `main` branch (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `main` to check the actual top-of-trunk.
+1. Verify the problem against the mainline code shown above and top-of-trunk of the repository (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `main` to check the actual top-of-trunk.
 2. Scope your verification to the relevant functions and modules. Do not wander across unrelated files.
 3. Determine if the issue is a genuine, reachable defect in the codebase.
 4. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
@@ -344,6 +350,15 @@ impl LlmSession for NormalizeSession<'_> {
                 - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional module commit prefix used in Sashiko (e.g. 'workflows:', 'db:', 'reviewer:', 'api:', 'toolbox:', 'worker:').",
                 master_sha = self.master_sha
             ),
+            ProjectId::Gcc => format!(
+                "You are an expert GCC global reviewer and technical editor. Your role is to normalize a candidate GCC defect into canonical form.\n\
+                You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
+                The target codebase is the GCC repository at top-of-trunk commit `{master_sha}`.\n\
+                Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
+                - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
+                - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional component commit prefix used in GCC (e.g. 'tree-optimization:', 'c++:', 'target:', 'middle-end:', 'rtl-optimization:', 'fortran:', 'ipa:', 'libstdc++:', 'c:').",
+                master_sha = self.master_sha
+            ),
         }
     }
 
@@ -403,14 +418,14 @@ Reported Locations:
 Target Mainline Commit: {master_sha}
 
 Task:
-1. Determine the conventional module commit prefix for this defect (e.g. 'workflows', 'db', 'reviewer', 'api', 'toolbox', 'worker', 'cli', 'prompts', 'settings', 'forge'). Use git_log on the affected file(s) at revision '{master_sha}' to observe the standard commit prefix used in Sashiko.
-2. Formulate a canonical title matching Sashiko commit conventions: '<subsystem_prefix>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+1. Determine the conventional Sashiko module commit prefix for this defect (e.g. 'workflows', 'db', 'reviewer', 'api', 'toolbox', 'worker', 'ingestor', 'cli'). Use git_log on the affected file(s) at revision '{master_sha}' to observe the standard commit prefix used in the repository.
+2. Formulate a canonical title matching Sashiko conventions: '<module_prefix>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
    - CRITICAL: This is a bug report title describing an existing defect, NOT a patch or commit title. Do NOT use patch/fix action verbs like 'fix', 'resolve', 'prevent', 'avoid', or 'handle'. State the defect directly (e.g. 'reviewer: leaked worktree on early return in run_review()', NEVER 'reviewer: fix leaked worktree in run_review()').
 3. Provide a detailed, structured canonical description:
    - Trigger / Preconditions: Specific conditions, inputs, or states required to trigger the defect.
    - Call Chain / Execution Path: Detail the complete chain of events/calls leading up to the problem.
    - Failure Mechanism: Detail the exact root cause and how the fault, state inconsistency, or resource leak occurs.
-   - Impact: Consequence of the failure (e.g. stuck review, panic, database lock contention, leaked worktree, silent data drop).
+   - Impact: Consequence of the failure (e.g. stuck review, panic, dropped finding, database lock contention, leaked resource).
 4. Verify and list the affected source files and symbols in the mainline tree at commit '{master_sha}'.
 
 Return ONLY a valid JSON object matching this schema:
@@ -419,6 +434,42 @@ Return ONLY a valid JSON object matching this schema:
   \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
   \"affected_source_files\": [\"src/reviewer.rs\"],
   \"affected_symbols\": [\"run_review\"]
+}}",
+                stage_heading = BugStage::Normalization.heading(),
+                problem = self.problem,
+                reasoning = self.reasoning,
+                locations = self.locations,
+                hint = hint_section,
+                master_sha = self.master_sha
+            ),
+            ProjectId::Gcc => format!(
+                "{stage_heading}
+
+Candidate Bug Details:
+Original Problem: {problem}
+Reasoning: {reasoning}
+Reported Locations:
+{locations}
+{hint}
+Target Mainline Commit: {master_sha}
+
+Task:
+1. Determine the conventional GCC component commit prefix for this defect (e.g. 'tree-optimization', 'c++', 'target', 'middle-end', 'rtl-optimization', 'fortran', 'ipa', 'libstdc++', 'c'). Use git_log on the affected file(s) at revision '{master_sha}' to observe the standard commit prefix used in the repository.
+2. Formulate a canonical title matching GCC conventions: '<component_prefix>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+   - CRITICAL: This is a bug report title describing an existing defect, NOT a patch or commit title. Do NOT use patch/fix action verbs like 'fix', 'resolve', 'prevent', 'avoid', or 'handle'. State the defect directly.
+3. Provide a detailed, structured canonical description:
+   - Trigger / Preconditions: Specific conditions, inputs, or compiler flags required to trigger the defect.
+   - Call Chain / Execution Path: Detail the complete chain of events/calls leading up to the problem.
+   - Failure Mechanism: Detail the exact root cause and how the fault or wrong transformation occurs.
+   - Impact: Consequence of the failure (e.g. wrong-code miscompilation, ICE, rejects-valid, accepts-invalid, GGC memory corruption).
+4. Verify and list the affected source files and symbols in the mainline tree at commit '{master_sha}'.
+
+Return ONLY a valid JSON object matching this schema:
+{{
+  \"canonical_title\": \"tree-optimization: missing reset_flow_sensitive_info in fold_stmt()\",
+  \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
+  \"affected_source_files\": [\"gcc/tree-ssa-phiopt.cc\"],
+  \"affected_symbols\": [\"fold_stmt\"]
 }}",
                 stage_heading = BugStage::Normalization.heading(),
                 problem = self.problem,
@@ -532,7 +583,7 @@ pub fn extract_directory_subsystems_for_project(
     for file in files {
         let parts: Vec<&str> = file.split('/').filter(|p| !p.is_empty()).collect();
         let sub = match project {
-            ProjectId::Linux => {
+            ProjectId::Linux | ProjectId::Gcc => {
                 if parts.len() >= 2 {
                     format!("{}/{}", parts[0], parts[1])
                 } else if !parts.is_empty() {
@@ -561,6 +612,7 @@ pub fn extract_directory_subsystems_for_project(
         match project {
             ProjectId::Linux => vec!["kernel".to_string()],
             ProjectId::Sashiko => vec!["sashiko".to_string()],
+            ProjectId::Gcc => vec!["gcc".to_string()],
         }
     } else {
         subs
@@ -812,8 +864,14 @@ impl LlmSession for DedupSession<'_> {
         IMPORTANT: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
         Output raw JSON only."
                 .to_string(),
-            ProjectId::Sashiko => "You are an expert Sashiko maintainer responsible for defect tracking and deduplication.\n\
+            ProjectId::Sashiko => "You are an expert Rust and distributed systems maintainer responsible for defect tracking and deduplication.\n\
         You will compare a newly verified Sashiko bug against a list of known Sashiko bugs in the codebase.\n\
+        Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
+        IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
+        Output raw JSON only."
+                .to_string(),
+            ProjectId::Gcc => "You are an expert GCC compiler maintainer responsible for defect tracking and deduplication.\n\
+        You will compare a newly verified GCC bug against a list of known GCC bugs in the codebase.\n\
         Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
         IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
         Output raw JSON only."
@@ -868,6 +926,7 @@ impl LlmSession for DedupSession<'_> {
         let bug_header = match self.project {
             ProjectId::Linux => "Newly Verified Linux Kernel Bug:",
             ProjectId::Sashiko => "Newly Verified Sashiko Bug:",
+            ProjectId::Gcc => "Newly Verified GCC Bug:",
         };
 
         format!(
@@ -961,6 +1020,9 @@ impl LlmSession for TracingSession<'_> {
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
             ProjectId::Sashiko => "You are an expert Sashiko maintainer. Your task is to determine the exact commit that introduced a verified Sashiko defect.\n\
+        Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
+        EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
+            ProjectId::Gcc => "You are an expert GCC compiler maintainer. Your task is to determine the exact commit that introduced a verified GCC defect.\n\
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
         }
@@ -1063,6 +1125,7 @@ impl LlmSession for SeveritySession<'_> {
         let target_name = match self.project {
             ProjectId::Linux => "the Linux kernel",
             ProjectId::Sashiko => "Sashiko",
+            ProjectId::Gcc => "GCC",
         };
         format!(
             "{}\n\nAssess the severity and impact of a verified defect in {} following the severity definitions and calibration guidance above.\n\
@@ -1076,6 +1139,7 @@ impl LlmSession for SeveritySession<'_> {
         let defect_header = match self.project {
             ProjectId::Linux => "Verified Linux Kernel Defect:",
             ProjectId::Sashiko => "Verified Sashiko Defect:",
+            ProjectId::Gcc => "Verified GCC Defect:",
         };
         format!(
             "{stage_heading}
@@ -1338,6 +1402,21 @@ unresolvable AB-BA deadlock.
 - Output Format:
   100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
                 .to_string(),
+            ProjectId::Gcc => r#"You are an expert GCC compiler maintainer drafting a concise, standalone technical defect description for a verified bug in the GCC codebase.
+
+# PRINCIPLES & STRUCTURE
+- Maintainer Voice: Write for an experienced compiler engineer. Focus strictly on the broken contract or invariant in this code.
+- Zero Boilerplate: Do NOT include greetings, conversational preamble, or section headers ("Defect Report:", "Description:", or the bug title). Start immediately with the technical description.
+- Scope Boundary: Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue or write a patch.
+- Narrative Flow (1 to 2 cohesive paragraphs):
+  1. Opening Sentence: State what goes wrong, in which function/pass and file, and under what condition.
+  2. Failure Mechanics: Trace the precise cause-and-effect chain (precondition -> triggering input/flag -> faulty IR transformation / missing check -> failure).
+  3. Concrete Consequence: State the direct impact (e.g. wrong-code miscompilation, ICE, rejects-valid, accepts-invalid, GGC memory corruption).
+- Code Presentation:
+  Include a concise code snippet (`// <filepath>:<start_line>-<end_line>`) starting at column 0 with `< ... >` omission markers when localized code proves the defect.
+- Output Format:
+  100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
+                .to_string(),
         }
     }
 
@@ -1364,6 +1443,7 @@ unresolvable AB-BA deadlock.
         let details_header = match self.project {
             ProjectId::Linux => "Linux Kernel Defect Details:",
             ProjectId::Sashiko => "Sashiko Defect Details:",
+            ProjectId::Gcc => "GCC Defect Details:",
         };
 
         format!(
@@ -1472,6 +1552,11 @@ pub fn infer_project_from_bug_or_tool(
         || tool.is_some_and(|t| t.starts_with("sashiko:sashiko"))
     {
         ProjectId::Sashiko
+    } else if default_project == ProjectId::Gcc
+        || bugid.is_some_and(|id| id.starts_with("gcc-"))
+        || tool.is_some_and(|t| t.starts_with("sashiko:gcc"))
+    {
+        ProjectId::Gcc
     } else if bugid.is_some_and(|id| id.starts_with("linux-"))
         || tool.is_some_and(|t| t.starts_with("sashiko:linux"))
     {
@@ -1524,6 +1609,7 @@ pub async fn process_issue_for_project(
     let default_tool = match project {
         ProjectId::Linux => "sashiko:linux_patch_review",
         ProjectId::Sashiko => "sashiko:sashiko_patch_review",
+        ProjectId::Gcc => "sashiko:gcc_patch_review",
     };
     let reviewer_db;
     let db = if db.has_bug_actor() && db.bug_model().is_some() {
@@ -2214,6 +2300,7 @@ pub async fn process_issue_worker_for_project(
     let project_label = match project {
         ProjectId::Linux => "Linux kernel",
         ProjectId::Sashiko => "Sashiko",
+        ProjectId::Gcc => "GCC",
     };
     info!(
         "Processing candidate {} issue: '{}' in subsystems '{:?}'",
@@ -2233,6 +2320,7 @@ pub async fn process_issue_worker_for_project(
         match project {
             ProjectId::Linux => "sashiko:linux_bug".to_string(),
             ProjectId::Sashiko => "sashiko:sashiko_bug".to_string(),
+            ProjectId::Gcc => "sashiko:gcc_bug".to_string(),
         }
     };
     let attributed_db =
@@ -2691,9 +2779,9 @@ async fn run_git_query_capped(
 
 /// Resolves the current HEAD commit SHA of the upstream mainline tree in `repo_path`.
 ///
-/// Prefers a remote whose URL matches `torvalds/linux` (`{name}/master`) or
-/// `sashiko-dev/sashiko` (`{name}/main`), falling back to `origin/master`,
-/// `origin/main`, `master`, `main`, and `HEAD`.
+/// Prefers a remote whose URL matches `torvalds/linux` or `gcc.gnu.org/git/gcc`
+/// (`{name}/master`) or `sashiko-dev/sashiko` (`{name}/main`), falling back to
+/// `origin/master`, `origin/main`, `master`, `main`, and `HEAD`.
 pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
     let mut candidate_refs = Vec::new();
     match run_git_query(repo_path, &["remote", "-v"]).await {
@@ -2702,7 +2790,10 @@ pub async fn resolve_linus_sha(repo_path: &std::path::Path) -> Option<String> {
             for line in stdout.lines() {
                 let mut parts = line.split_whitespace();
                 if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
-                    if url.contains("torvalds/linux") {
+                    if url.contains("torvalds/linux")
+                        || url.contains("gcc.gnu.org/git/gcc")
+                        || url.contains("gcc-mirror/gcc")
+                    {
                         let r = format!("{}/master", name);
                         if !candidate_refs.contains(&r) {
                             candidate_refs.push(r);
@@ -3260,6 +3351,13 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 Output raw JSON only."
                     .to_string()
             }
+            ProjectId::Gcc => {
+                "You are an expert GCC compiler maintainer auditing whether a previously verified GCC bug has been fixed on upstream GCC trunk.\n\
+                Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
+                If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
+                Output raw JSON only."
+                    .to_string()
+            }
         }
     }
 
@@ -3311,6 +3409,11 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 "Current Upstream Main SHA",
                 "Open Sashiko Bug",
                 "the upstream main branch",
+            ),
+            ProjectId::Gcc => (
+                "Current Upstream Trunk SHA",
+                "Open GCC Bug",
+                "upstream GCC trunk",
             ),
         };
 
@@ -3572,6 +3675,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
     let fix_tool = match project {
         ProjectId::Linux => "sashiko:linux_bug:fix_check",
         ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
+        ProjectId::Gcc => "sashiko:gcc_bug:fix_check",
     };
 
     if candidates.is_empty() {

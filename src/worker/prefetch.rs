@@ -143,14 +143,25 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
 
     // Phase 1: modified code — find enclosing blocks, types, and called functions.
     for (file, ranges) in &file_ranges {
-        if !file.ends_with(".c") && !file.ends_with(".h") {
+        if !is_prefetchable_source_file(file) {
             continue;
         }
         let file_path = PathBuf::from(file);
         let content = snapshot.read(&file_path).await?;
         for &(start, end) in ranges {
-            for (blk_start, blk_end) in overlapping_definitions(&content, start, end) {
-                add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+            let defs = overlapping_definitions(&content, start, end);
+            if defs.is_empty() && !file.ends_with(".c") && !file.ends_with(".h") {
+                let total_lines = content.lines().count();
+                if total_lines > 0 {
+                    let blk_start = start.saturating_sub(50);
+                    let blk_end =
+                        std::cmp::min(end.saturating_add(50), total_lines.saturating_sub(1));
+                    add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+                }
+            } else {
+                for (blk_start, blk_end) in defs {
+                    add_range(&mut range_map, file_path.clone(), blk_start, blk_end);
+                }
             }
             already_extracted.extend(extract_defined_names(&content, start, end));
             symbols_to_lookup.extend(extract_type_names(&content, start, end));
@@ -185,7 +196,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
     // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
     if !symbols.is_empty() {
         let regex_pattern = format!(
-            "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
+            "^((struct|class|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*:<>]+\\s+)?({0})\\s*\\()",
             symbols.join("|")
         );
 
@@ -208,6 +219,14 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
             .arg("--")
             .arg("*.c")
             .arg("*.h")
+            .arg("*.cc")
+            .arg("*.cpp")
+            .arg("*.cxx")
+            .arg("*.C")
+            .arg("*.hh")
+            .arg("*.hpp")
+            .arg("*.inc")
+            .arg("*.def")
             .kill_on_drop(true);
 
         let output = match cmd.output().await {
@@ -448,6 +467,21 @@ pub fn extract_enclosing_block(
 // These directories contain userspace reimplementations of kernel primitives
 // (e.g. tools/virtio/ringtest/ has a toy spin_lock) that shadow the real
 // definitions and provide no signal for patch review.
+fn is_prefetchable_source_file(file: &str) -> bool {
+    if is_noisy_tree(file) {
+        return false;
+    }
+    const SOURCE_EXTS: &[&str] = &[
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".C", ".hh", ".hpp", ".inc", ".def", ".pd", ".f90",
+        ".F90",
+    ];
+    if SOURCE_EXTS.iter().any(|ext| file.ends_with(ext)) {
+        return true;
+    }
+    // GCC RTL machine description files live under gcc/config/ or gcc/*.md.
+    file.starts_with("gcc/") && file.ends_with(".md")
+}
+
 fn is_noisy_tree(path_str: &str) -> bool {
     const NOISY_PREFIXES: &[&str] = &[
         "tools/",
@@ -455,8 +489,12 @@ fn is_noisy_tree(path_str: &str) -> bool {
         "Documentation/",
         "scripts/",
         "LICENSES/",
+        "testsuite/",
     ];
     NOISY_PREFIXES.iter().any(|p| path_str.starts_with(p))
+        || path_str.contains("/testsuite/")
+        || path_str.ends_with("ChangeLog")
+        || path_str.contains("/ChangeLog")
 }
 
 fn line_matches_symbol(line: &str, sym: &str) -> bool {
@@ -947,5 +985,20 @@ struct MyStruct {
         ranges.insert((50, 60)); // gap of 19 — does not merge
         let merged = merge_ranges(&ranges, 3);
         assert_eq!(merged, vec![(10, 30), (50, 60)]);
+    }
+
+    #[test]
+    fn test_is_prefetchable_source_file() {
+        assert!(is_prefetchable_source_file("mm/page_alloc.c"));
+        assert!(is_prefetchable_source_file("gcc/tree-vect-stmts.cc"));
+        assert!(is_prefetchable_source_file("gcc/match.pd"));
+        assert!(is_prefetchable_source_file("gcc/config/i386/i386.md"));
+        assert!(is_prefetchable_source_file("gcc/fortran/resolve.f90"));
+        assert!(!is_prefetchable_source_file("README.md"));
+        assert!(!is_prefetchable_source_file("Documentation/foo.md"));
+        assert!(!is_prefetchable_source_file(
+            "gcc/testsuite/gcc.dg/pr12345.c"
+        ));
+        assert!(!is_prefetchable_source_file("gcc/ChangeLog"));
     }
 }

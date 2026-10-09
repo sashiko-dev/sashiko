@@ -378,10 +378,19 @@ impl BaselineRegistry {
             candidates.push(BaselineResolution::Commit(commit));
         }
 
+        // When a non-Linux mainline remote (such as GCC or Sashiko) was explicitly
+        // identified, skip Linux-specific stable and linux-next candidate remotes.
+        let has_non_linux_mainline = self
+            .mainline_remote
+            .as_ref()
+            .is_some_and(|(url, _)| !url.contains("linux"));
+
         // 1.5 Version Tag from Subject
         if let Some(version) = extract_version_tag(subject) {
             let base_version = version.strip_suffix(".y").unwrap_or(&version);
-            if version.ends_with(".y") || is_stable_series_prefix(subject, &version) {
+            if !has_non_linux_mainline
+                && (version.ends_with(".y") || is_stable_series_prefix(subject, &version))
+            {
                 candidates.push(BaselineResolution::RemoteTarget {
                     url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
                         .to_string(),
@@ -447,8 +456,10 @@ impl BaselineRegistry {
             }
         }
 
-        // 4. Linux Next
-        candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        // 4. Linux Next (skip when a non-Linux mainline remote was identified)
+        if !has_non_linux_mainline {
+            candidates.push(self.resolve_url(LINUX_NEXT_URL, None));
+        }
 
         // 5. Mainline
         // Use the identified mainline remote (Linus tree or origin) as a
@@ -1577,6 +1588,35 @@ F: patterns/
             pos_custom,
             pos_next,
             names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_linux_mainline_skips_linux_next() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: Some((
+                "https://gcc.gnu.org/git/gcc.git".to_string(),
+                "origin".to_string(),
+            )),
+        };
+
+        let candidates = registry
+            .resolve_candidates(&[], "[PATCH] tree-optimization: fix vrp", None)
+            .await;
+        assert_eq!(
+            candidates,
+            vec![BaselineResolution::RemoteTarget {
+                url: "https://gcc.gnu.org/git/gcc.git".to_string(),
+                name: "origin".to_string(),
+                branch: Some("master".to_string()),
+            }]
         );
     }
 }

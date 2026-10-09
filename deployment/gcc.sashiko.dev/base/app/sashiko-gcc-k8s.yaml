@@ -1,0 +1,172 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sashiko-gcc-deployment
+  namespace: sashiko-self
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sashiko-gcc
+  template:
+    metadata:
+      labels:
+        app: sashiko-gcc
+    spec:
+      # Co-located on the same pool-256gb node and namespace as
+      # sashiko.sashiko.dev so both instances share the node, volume,
+      # credentials, and global load balancer IP while isolating the main
+      # Linux instance on n2d-pool.
+      nodeSelector:
+        cloud.google.com/gke-nodepool: pool-256gb
+      securityContext:
+        fsGroup: 1000
+      serviceAccountName: sashiko-self-ksa
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: sashiko
+          image: us-docker.pkg.dev/GCP_PROJECT_ID/sashiko-repository/sashiko:next
+          command: ["/bin/bash", "/usr/local/bin/sashiko-gcc-entrypoint.sh"]
+          args: ["--debug", "--track"]
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+            limits:
+              cpu: "16"
+              memory: "64Gi"
+          ports:
+            - containerPort: 8081
+          # Startup is allowed up to thirty minutes on first boot because the
+          # entrypoint clones the GCC repository (~4.3 GB) before the binary
+          # migrates the database and opens the HTTP listener on port 8081.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 180
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          env:
+            - name: SASHIKO_LOG_PLAIN
+              value: "true"
+            - name: NO_COLOR
+              value: "true"
+            - name: SASHIKO__PROJECT__KIND
+              value: "gcc"
+            - name: SASHIKO__PROJECT__NAME
+              value: "GCC"
+            - name: SASHIKO__PROJECT__DESCRIPTION
+              value: "Sashiko reviewing GCC"
+            - name: SASHIKO__PROJECT__DOMAIN
+              value: "gcc.sashiko.dev"
+            - name: SASHIKO__DATABASE__URL
+              value: "/data/db/sashiko-gcc.db"
+            - name: SASHIKO_GCC_SEED_URL
+              value: "https://github.com/gcc-mirror/gcc.git"
+            - name: SASHIKO_GCC_REPOSITORY_URL
+              value: "git://gcc.gnu.org/git/gcc.git"
+            - name: SASHIKO__GIT__REPOSITORY_PATH
+              value: "/app/third_party/gcc"
+            - name: SASHIKO__REVIEW__WORKTREE_DIR
+              value: "/mnt/worktrees"
+            - name: SASHIKO__REVIEW__CONCURRENCY
+              value: "12"
+            - name: SASHIKO__SERVER__PORT
+              value: "8081"
+            - name: SASHIKO__SERVER__PUBLIC_BASE_URL
+              value: "https://gcc.sashiko.dev"
+            - name: SASHIKO__SERVER__ACL__ADMINS
+              value: "roman.gushchin@linux.dev"
+            - name: SASHIKO__AI__MODEL
+              value: "gemini-3.1-pro-preview"
+            - name: SASHIKO__AI__MAX_INTERACTIONS
+              value: "100"
+            - name: SASHIKO__NNTP__SERVER
+              value: "inbox.sourceware.org"
+            - name: SASHIKO__NNTP__PORT
+              value: "119"
+            - name: SASHIKO__MAILING_LISTS__TRACK
+              value: "gcc-patches:inbox.gcc.gcc-patches"
+            - name: SASHIKO__LINUX_BUG__ENABLED
+              value: "true"
+            - name: SASHIKO__LINUX_BUG__FIX_CHECK_ENABLED
+              value: "true"
+            - name: SASHIKO__REVIEW__EMAIL_POLICY_PATH
+              value: "/app/email_policy.toml"
+            - name: SASHIKO__SMTP__SENDER_ADDRESS
+              value: "sashiko-bot@kernel.org"
+            - name: SASHIKO__SMTP__SERVER
+              value: "mail.kernel.org"
+            - name: SASHIKO__SMTP__PORT
+              value: "465"
+            - name: SASHIKO__SMTP__USERNAME
+              value: "sashiko-bot@kernel.org"
+            - name: SASHIKO__SMTP__REPLY_TO
+              value: "sashiko-reviews@lists.linux.dev"
+            - name: SASHIKO__SMTP__DRY_RUN
+              value: "false"
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: "grep.threads"
+            - name: GIT_CONFIG_VALUE_0
+              value: "1"
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: LLM_API_KEY
+            - name: SASHIKO__SMTP__PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO_SMTP__PASSWORD
+            - name: SASHIKO__SERVER__JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__SERVER__JWT_SECRET
+          volumeMounts:
+            - name: sashiko-self-storage
+              mountPath: /data
+              subPath: data-dir
+            - name: sashiko-self-storage
+              mountPath: /app/third_party/gcc
+              subPath: gcc-repo
+            - name: entrypoint
+              mountPath: /usr/local/bin/sashiko-gcc-entrypoint.sh
+              subPath: sashiko-gcc-entrypoint.sh
+            - name: worktrees
+              mountPath: /mnt/worktrees
+            - name: tmp-volume
+              mountPath: /tmp
+      volumes:
+        - name: sashiko-self-storage
+          persistentVolumeClaim:
+            claimName: sashiko-self-data-pvc
+        - name: worktrees
+          emptyDir: {}
+        - name: tmp-volume
+          emptyDir: {}
+        - name: entrypoint
+          configMap:
+            name: sashiko-gcc-entrypoint
+            defaultMode: 0755

@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sashiko-gcc-entrypoint
+  namespace: sashiko-self
+data:
+  sashiko-gcc-entrypoint.sh: |
+    #!/bin/bash
+    #
+    # Entrypoint for the instance that reviews GCC.
+    #
+    # Seeds the initial clone from the GitHub mirror for fast provisioning,
+    # then points origin at gcc.gnu.org and fetches the latest trunk refs
+    # before starting the sashiko daemon.
+    set -euo pipefail
+
+    REPO_DIR="${SASHIKO__GIT__REPOSITORY_PATH:-/app/third_party/gcc}"
+    SEED_URL="${SASHIKO_GCC_SEED_URL:-https://github.com/gcc-mirror/gcc.git}"
+    REPO_URL="${SASHIKO_GCC_REPOSITORY_URL:-git://gcc.gnu.org/git/gcc.git}"
+
+    mkdir -p /data/db "$(dirname "$REPO_DIR")"
+
+    # The volume is owned by the fsGroup while the process runs as root, and
+    # git refuses to work in a tree it considers owned by someone else.
+    git config --global --add safe.directory "$REPO_DIR"
+
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        echo "Cloning ${SEED_URL} into ${REPO_DIR}..."
+        git clone "$SEED_URL" "$REPO_DIR"
+        git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
+        git -C "$REPO_DIR" fetch --prune origin \
+            || echo "Warning: upstream fetch failed, using mirror clone."
+    else
+        echo "Updating the existing clone in ${REPO_DIR}..."
+        git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
+        git -C "$REPO_DIR" fetch --prune origin \
+            || echo "Warning: fetch failed, continuing with the existing clone."
+        git -C "$REPO_DIR" gc --auto || true
+    fi
+
+    git -C "$REPO_DIR" remote set-head origin --auto \
+        || git -C "$REPO_DIR" remote set-head origin master || true
+    mkdir -p "$REPO_DIR/.sashiko/fetch_timestamps"
+    rm -f "$REPO_DIR/.sashiko/fetch_timestamps/origin.fail"
+    touch "$REPO_DIR/.sashiko/fetch_timestamps/origin"
+
+    # Every relative path in the settings resolves against /app.
+    cd /app
+
+    echo "Starting Sashiko (GCC review instance)..."
+    exec /usr/local/bin/sashiko "$@"

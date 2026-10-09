@@ -3658,7 +3658,7 @@ fn identify_subsystems(
             }
         }
 
-        // Fallback for known kernel lists if no mapping is provided
+        // Fallback for known mailing lists if no mapping is provided
         if !matched {
             if lower_email.contains("linux-kernel@vger.kernel.org") {
                 subsystems.push(("LKML".to_string(), lower_email));
@@ -3667,7 +3667,9 @@ fn identify_subsystems(
             } else if (lower_email.ends_with("@vger.kernel.org")
                 || lower_email.ends_with("@lists.linux.dev")
                 || lower_email.ends_with("@lists.infradead.org")
-                || lower_email.ends_with("@kvack.org"))
+                || lower_email.ends_with("@kvack.org")
+                || lower_email.ends_with("@gcc.gnu.org")
+                || lower_email.ends_with("@sourceware.org"))
                 && let Some(name) = lower_email.split('@').next()
             {
                 subsystems.push((name.to_string(), lower_email));

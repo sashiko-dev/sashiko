@@ -53,6 +53,7 @@ COPY --from=builder /usr/src/sashiko/target/release/sashiko-cli /usr/local/bin/s
 COPY Settings.toml /app/Settings.toml
 COPY deployment/sashiko.dev/email_policy.toml /app/email_policy.toml
 COPY third_party/prompts /app/third_party/prompts
+COPY prompts /app/prompts
 COPY static /app/static
 
 # Copy entrypoint script

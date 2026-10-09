@@ -1,8 +1,4 @@
-# Stable IPv4 Ingress
-#
-# Both sashiko.sashiko.dev (port 8080) and gcc.sashiko.dev (port 8081) resolve
-# to lb-ipv4-bugrepo (136.110.177.184) and are routed by host header through
-# this shared Ingress in the sashiko-self namespace.
+# Shared IPv4 Ingress for sashiko.sashiko.dev (8080) and gcc.sashiko.dev (8081)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

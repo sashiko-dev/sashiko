@@ -126,6 +126,7 @@ impl BugWorker {
         let bug_tool = match project {
             crate::project::ProjectId::Linux => "sashiko:linux_bug",
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
+            crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
         };
         self.db = Arc::new(self.db.with_bug_actor("system", bug_tool, None));
         self
@@ -152,7 +153,7 @@ impl BugWorker {
             return 0;
         }
         let repo_path = std::path::Path::new(&self.repo_path);
-        let Some(linus_sha) = crate::workflows::linux_bug::resolve_linus_sha(repo_path).await
+        let Some(mainline_sha) = crate::workflows::linux_bug::resolve_linus_sha(repo_path).await
         else {
             warn!(
                 "Skipping upstream bug fix check: could not resolve mainline tree SHA in {}",
@@ -162,12 +163,12 @@ impl BugWorker {
         };
 
         let (advanced_without_llm, llm_queue) = self
-            .sweep_zero_token_fix_checks(repo_path, &linus_sha, batch_size)
+            .sweep_zero_token_fix_checks(repo_path, &mainline_sha, batch_size)
             .await;
         if advanced_without_llm > 0 {
             info!(
                 "Advanced {} open bug(s) verified_on_sha to {} via zero-token git pre-filter",
-                advanced_without_llm, linus_sha
+                advanced_without_llm, mainline_sha
             );
         }
 
@@ -178,14 +179,14 @@ impl BugWorker {
                 "Evaluating {} open bug(s) with candidate commits (batch limit {}) against mainline SHA {}...",
                 llm_queue.len(),
                 batch_size,
-                linus_sha
+                mainline_sha
             );
         }
         for (bug_id, precomputed_candidates) in llm_queue {
             if self
                 .verify_single_bug_upstream(
                     repo_path,
-                    &linus_sha,
+                    &mainline_sha,
                     lease_ttl_seconds,
                     bug_id,
                     precomputed_candidates,
@@ -202,7 +203,7 @@ impl BugWorker {
     async fn sweep_zero_token_fix_checks(
         &self,
         repo_path: &std::path::Path,
-        linus_sha: &str,
+        mainline_sha: &str,
         batch_size: usize,
     ) -> (usize, Vec<(i64, Option<Vec<String>>)>) {
         let mut range_cache: std::collections::HashMap<
@@ -216,7 +217,7 @@ impl BugWorker {
         for _ in 0..MAX_FIX_CHECK_SCAN_CHUNKS {
             let chunk = match self
                 .db
-                .list_open_bugs_for_fix_check(linus_sha, cursor, FIX_CHECK_SCAN_CHUNK_SIZE)
+                .list_open_bugs_for_fix_check(mainline_sha, cursor, FIX_CHECK_SCAN_CHUNK_SIZE)
                 .await
             {
                 Ok(c) if c.is_empty() => break,
@@ -224,7 +225,7 @@ impl BugWorker {
                 Err(e) => {
                     error!(
                         "Failed to list open bugs for upstream fix check at {}: {}",
-                        linus_sha, e
+                        mainline_sha, e
                     );
                     break;
                 }
@@ -233,13 +234,14 @@ impl BugWorker {
 
             let mut untouched_linux = Vec::new();
             let mut untouched_sashiko = Vec::new();
+            let mut untouched_gcc = Vec::new();
             let mut skipped_ids = Vec::new();
 
             for bug in chunk {
                 let classification = if llm_queue.len() >= batch_size {
-                    Self::classify_bug_from_cached_index(linus_sha, &bug, &range_cache)
+                    Self::classify_bug_from_cached_index(mainline_sha, &bug, &range_cache)
                 } else {
-                    self.classify_bug_for_fix_check(repo_path, linus_sha, &bug, &mut range_cache)
+                    self.classify_bug_for_fix_check(repo_path, mainline_sha, &bug, &mut range_cache)
                         .await
                 };
                 match classification {
@@ -254,6 +256,7 @@ impl BugWorker {
                         match proj {
                             crate::project::ProjectId::Linux => untouched_linux.push(bug),
                             crate::project::ProjectId::Sashiko => untouched_sashiko.push(bug),
+                            crate::project::ProjectId::Gcc => untouched_gcc.push(bug),
                         }
                     }
                     FixCheckClassification::NeedsLlm(candidates) => {
@@ -264,9 +267,10 @@ impl BugWorker {
 
             total_advanced += self
                 .flush_zero_token_chunk(
-                    linus_sha,
+                    mainline_sha,
                     &untouched_linux,
                     &untouched_sashiko,
+                    &untouched_gcc,
                     &skipped_ids,
                 )
                 .await;
@@ -280,7 +284,7 @@ impl BugWorker {
     }
 
     fn classify_bug_from_cached_index(
-        linus_sha: &str,
+        mainline_sha: &str,
         bug: &crate::db::Bug,
         range_cache: &std::collections::HashMap<
             String,
@@ -291,7 +295,7 @@ impl BugWorker {
             return FixCheckClassification::SkipAndTouch;
         };
         let prev_trimmed = prev_sha.trim();
-        if prev_trimmed.is_empty() || prev_trimmed == linus_sha {
+        if prev_trimmed.is_empty() || prev_trimmed == mainline_sha {
             return FixCheckClassification::Untouched;
         }
         let files = crate::workflows::linux_bug::extract_bug_files(bug);
@@ -319,7 +323,7 @@ impl BugWorker {
     async fn classify_bug_for_fix_check(
         &self,
         repo_path: &std::path::Path,
-        linus_sha: &str,
+        mainline_sha: &str,
         bug: &crate::db::Bug,
         range_cache: &mut std::collections::HashMap<
             String,
@@ -330,7 +334,7 @@ impl BugWorker {
             return FixCheckClassification::SkipAndTouch;
         };
         let prev_trimmed = prev_sha.trim();
-        if prev_trimmed.is_empty() || prev_trimmed == linus_sha {
+        if prev_trimmed.is_empty() || prev_trimmed == mainline_sha {
             return FixCheckClassification::Untouched;
         }
         let files = crate::workflows::linux_bug::extract_bug_files(bug);
@@ -345,7 +349,7 @@ impl BugWorker {
             let lookup = match crate::workflows::linux_bug::build_commit_range_index(
                 repo_path,
                 prev_trimmed,
-                linus_sha,
+                mainline_sha,
             )
             .await
             {
@@ -353,7 +357,7 @@ impl BugWorker {
                 Err(e) => {
                     warn!(
                         "Failed to build commit range index for {}..{}: {}",
-                        prev_trimmed, linus_sha, e
+                        prev_trimmed, mainline_sha, e
                     );
                     crate::workflows::linux_bug::CommitRangeLookup::TooLarge
                 }
@@ -376,7 +380,7 @@ impl BugWorker {
                 match crate::workflows::linux_bug::find_candidate_fix_commits(
                     repo_path,
                     prev_trimmed,
-                    linus_sha,
+                    mainline_sha,
                     &files,
                     intro_sha.as_deref(),
                 )
@@ -388,7 +392,7 @@ impl BugWorker {
                     Err(e) => {
                         warn!(
                             "Failed to query candidate fix commits for bug {} in {}..{}: {}",
-                            bug.bugid, prev_trimmed, linus_sha, e
+                            bug.bugid, prev_trimmed, mainline_sha, e
                         );
                         FixCheckClassification::SkipAndTouch
                     }
@@ -397,11 +401,15 @@ impl BugWorker {
         }
     }
 
+    // Each Sashiko deployment instance tracks a single project repository
+    // (`self.repo_path`) whose upstream mainline HEAD is `mainline_sha`; bugs
+    // are grouped by project prefix solely to record the matching audit_tool.
     async fn flush_zero_token_chunk(
         &self,
-        linus_sha: &str,
+        mainline_sha: &str,
         untouched_linux: &[crate::db::Bug],
         untouched_sashiko: &[crate::db::Bug],
+        untouched_gcc: &[crate::db::Bug],
         skipped_ids: &[i64],
     ) -> usize {
         let mut advanced = 0usize;
@@ -410,7 +418,7 @@ impl BugWorker {
                 .db
                 .with_bug_actor("sashiko", "sashiko:linux_bug:fix_check", None);
             match db
-                .advance_open_bugs_without_llm_batch(untouched_linux, linus_sha)
+                .advance_open_bugs_without_llm_batch(untouched_linux, mainline_sha)
                 .await
             {
                 Ok(n) => advanced += n,
@@ -422,11 +430,23 @@ impl BugWorker {
                 .db
                 .with_bug_actor("sashiko", "sashiko:sashiko_bug:fix_check", None);
             match db
-                .advance_open_bugs_without_llm_batch(untouched_sashiko, linus_sha)
+                .advance_open_bugs_without_llm_batch(untouched_sashiko, mainline_sha)
                 .await
             {
                 Ok(n) => advanced += n,
                 Err(e) => warn!("Failed to batch-advance untouched Sashiko bugs: {}", e),
+            }
+        }
+        if !untouched_gcc.is_empty() {
+            let db = self
+                .db
+                .with_bug_actor("sashiko", "sashiko:gcc_bug:fix_check", None);
+            match db
+                .advance_open_bugs_without_llm_batch(untouched_gcc, mainline_sha)
+                .await
+            {
+                Ok(n) => advanced += n,
+                Err(e) => warn!("Failed to batch-advance untouched GCC bugs: {}", e),
             }
         }
         if !skipped_ids.is_empty()
@@ -440,7 +460,7 @@ impl BugWorker {
     async fn verify_single_bug_upstream(
         &self,
         repo_path: &std::path::Path,
-        linus_sha: &str,
+        mainline_sha: &str,
         lease_ttl_seconds: i64,
         bug_id: i64,
         precomputed_candidates: Option<Vec<String>>,
@@ -449,7 +469,12 @@ impl BugWorker {
         let claim_started = tokio::time::Instant::now();
         let bug = match self
             .db
-            .claim_specific_open_bug_for_fix_check(bug_id, linus_sha, &claim_id, lease_ttl_seconds)
+            .claim_specific_open_bug_for_fix_check(
+                bug_id,
+                mainline_sha,
+                &claim_id,
+                lease_ttl_seconds,
+            )
             .await
         {
             Ok(Some(b)) => b,
@@ -457,7 +482,7 @@ impl BugWorker {
             Err(e) => {
                 error!(
                     "Failed to claim open bug #{} for upstream fix check at {}: {}",
-                    bug_id, linus_sha, e
+                    bug_id, mainline_sha, e
                 );
                 return false;
             }
@@ -475,7 +500,7 @@ impl BugWorker {
                 repo_path,
                 &scoped_db,
                 &bug,
-                linus_sha,
+                mainline_sha,
                 effective_project,
                 precomputed_candidates,
             ),
@@ -513,7 +538,7 @@ impl BugWorker {
                     } => {
                         info!(
                             "Advanced open bug {} verified_on_sha to {} (0 commits touched affected files)",
-                            bug.bugid, linus_sha
+                            bug.bugid, mainline_sha
                         );
                     }
                     crate::workflows::linux_bug::UpstreamFixCheckOutcome::StillPresentAfterLlm {
@@ -521,7 +546,7 @@ impl BugWorker {
                     } => {
                         info!(
                             "Open bug {} confirmed still present at {}",
-                            bug.bugid, linus_sha
+                            bug.bugid, mainline_sha
                         );
                     }
                     _ => {}
@@ -621,6 +646,7 @@ impl BugWorker {
                         let bug_tool = match effective_project {
                             crate::project::ProjectId::Linux => "sashiko:linux_bug",
                             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
+                            crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
                         };
                         let actor = if !bug.reporter.is_empty() {
                             bug.reporter.as_str()
