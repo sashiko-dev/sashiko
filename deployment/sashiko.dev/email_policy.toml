@@ -384,3 +384,9 @@ lists = ["fsverity@lists.linux.dev"]
 reply_all = true
 reply_to_author = true
 cc = ["fsverity@lists.linux.dev"]
+
+[subsystems.wireguard]
+lists = ["wireguard@lists.zx2c4.com"]
+reply_all = true
+reply_to_author = true
+cc = ["wireguard@lists.zx2c4.com"]
