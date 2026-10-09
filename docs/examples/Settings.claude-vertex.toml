@@ -8,5 +8,5 @@ prompt_caching = true
 max_tokens = 8192
 # project_id = "my-gcp-project" # Optional: Falls back to ANTHROPIC_VERTEX_PROJECT_ID
 # region = "us-east5"           # Optional: Falls back to CLOUD_ML_REGION
-# thinking = "enabled"
+# thinking = "adaptive"
 # effort = "high"

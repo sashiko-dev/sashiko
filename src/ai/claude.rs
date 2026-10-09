@@ -96,15 +96,21 @@ pub struct ClaudeRequest {
     pub tools: Option<Vec<ClaudeTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ThinkingConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "type")]
-    pub thinking: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    pub thinking_type: String,
+}
+
+/// Effort is a top-level request field: the API rejects it inside `thinking`
+/// with "thinking.adaptive.effort: Extra inputs are not permitted".
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutputConfig {
+    pub effort: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -504,11 +510,8 @@ pub fn translate_ai_request(
             Some(system_blocks)
         },
         tools,
-        thinking: if thinking.is_some() || effort.is_some() {
-            Some(ThinkingConfig { thinking, effort })
-        } else {
-            None
-        },
+        thinking: thinking.map(|thinking_type| ThinkingConfig { thinking_type }),
+        output_config: effort.map(|effort| OutputConfig { effort }),
     };
 
     // Apply cache control if enabled
@@ -1072,9 +1075,11 @@ mod tests {
 
         let claude_req = translate_ai_request(&req, false, 4096, None, None).unwrap();
         assert!(claude_req.thinking.is_none());
+        assert!(claude_req.output_config.is_none());
 
         let json = serde_json::to_value(&claude_req).unwrap();
         assert!(!json.as_object().unwrap().contains_key("thinking"));
+        assert!(!json.as_object().unwrap().contains_key("output_config"));
     }
 
     #[test]
@@ -1089,11 +1094,9 @@ mod tests {
         }]);
 
         let claude_req =
-            translate_ai_request(&req, false, 4096, Some("enabled".to_string()), None).unwrap();
-        assert!(claude_req.thinking.is_some());
-        let tc = claude_req.thinking.unwrap();
-        assert_eq!(tc.thinking.as_deref(), Some("enabled"));
-        assert!(tc.effort.is_none());
+            translate_ai_request(&req, false, 4096, Some("adaptive".to_string()), None).unwrap();
+        assert_eq!(claude_req.thinking.unwrap().thinking_type, "adaptive");
+        assert!(claude_req.output_config.is_none());
     }
 
     #[test]
@@ -1107,12 +1110,12 @@ mod tests {
             tool_call_id: None,
         }]);
 
+        // Effort alone must not emit a thinking object, which would lack
+        // the "type" the API requires.
         let claude_req =
             translate_ai_request(&req, false, 4096, None, Some("high".to_string())).unwrap();
-        assert!(claude_req.thinking.is_some());
-        let tc = claude_req.thinking.unwrap();
-        assert!(tc.thinking.is_none());
-        assert_eq!(tc.effort.as_deref(), Some("high"));
+        assert!(claude_req.thinking.is_none());
+        assert_eq!(claude_req.output_config.unwrap().effort, "high");
     }
 
     #[test]
@@ -1130,14 +1133,16 @@ mod tests {
             &req,
             false,
             4096,
-            Some("enabled".to_string()),
-            Some("high".to_string()),
+            Some("adaptive".to_string()),
+            Some("xhigh".to_string()),
         )
         .unwrap();
         let json = serde_json::to_value(&claude_req).unwrap();
-        let thinking = &json["thinking"];
-        assert_eq!(thinking["type"], "enabled");
-        assert_eq!(thinking["effort"], "high");
+        assert_eq!(json["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(
+            json["output_config"],
+            serde_json::json!({"effort": "xhigh"})
+        );
     }
 
     // --- Request translation tests ---

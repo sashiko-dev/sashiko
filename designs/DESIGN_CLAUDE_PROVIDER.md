@@ -17,7 +17,7 @@ providers. Vertex AI and Bedrock have their own design documents.
 - Request/response translation between Sashiko's generic `AiRequest`/`AiResponse`
   and Claude's wire format (`ClaudeRequest`/`ClaudeResponse`)
 - Prompt caching via ephemeral cache control markers
-- Extended thinking via `ThinkingConfig`
+- Thinking via `ThinkingConfig`, and effort via `OutputConfig`
 - Rate limit and overload retry signaling
 
 #### Wire Format Types
@@ -26,11 +26,12 @@ All Claude-compatible providers (direct API, Vertex AI) share these types:
 
 | Type | Purpose |
 |------|---------|
-| `ClaudeRequest` | Top-level request body (model, messages, system, tools, thinking) |
+| `ClaudeRequest` | Top-level request body (model, messages, system, tools, thinking, output_config) |
 | `ClaudeMessage` | A message with role and content blocks |
 | `ClaudeContent` | Tagged enum: Text, Thinking, ToolUse, ToolResult |
 | `ClaudeResponse` | Response with content blocks and usage |
-| `ThinkingConfig` | Optional thinking type and effort level |
+| `ThinkingConfig` | Thinking type |
+| `OutputConfig` | Effort level |
 | `SystemBlock` | System prompt text with optional cache control |
 | `ClaudeTool` | Tool definition with input schema |
 | `ClaudeError` | Typed errors: rate limit, overload, invalid request, auth |
@@ -44,15 +45,17 @@ These are `pub` for reuse by Vertex AI:
 - `apply_cache_control()` -- adds ephemeral cache markers to last system/tool/message
 - `estimate_tokens_generic()` -- token estimation using cl100k_base tokenizer
 
-#### ThinkingConfig Handling
+#### Thinking and Effort
 
-The `ThinkingConfig` struct has two optional fields: `type` (renamed via serde
-from `thinking`) and `effort`. Both use `skip_serializing_if = "Option::is_none"`.
+The two settings go to different places in the request. The thinking mode is
+`ThinkingConfig`, serialized as `"thinking": {"type": "adaptive"}`. Effort is
+`OutputConfig`, a top-level `"output_config": {"effort": "high"}`; the API
+rejects an effort nested inside `thinking`.
 
-The outer `ClaudeRequest.thinking` field is `Option<ThinkingConfig>` with
-`skip_serializing_if = "Option::is_none"`. When both inner fields are None,
-the entire config is set to `None` to avoid emitting an empty `"thinking": {}`
-object, which the API rejects.
+`ClaudeRequest.thinking` and `ClaudeRequest.output_config` are both `Option`s
+with `skip_serializing_if = "Option::is_none"`, each set only when its setting
+is. An unset thinking mode therefore emits no `thinking` object at all: the API
+rejects one without a `type`.
 
 #### Authentication
 
@@ -101,8 +104,8 @@ for structured error messages.
 prompt_caching = true              # Default: true
 max_tokens = 4096                  # Max output tokens per request
 base_url = "https://..."           # Override API endpoint
-thinking = "enabled"               # "enabled" or "adaptive"
-effort = "high"                    # "low", "medium", "high"
+thinking = "adaptive"              # Sent as thinking.type
+effort = "high"                    # Sent as output_config.effort: "low", "medium", "high", "xhigh", "max"
 ```
 
 ## Error Handling
@@ -117,7 +120,7 @@ effort = "high"                    # "low", "medium", "high"
 ## Testing
 
 Tests are in `src/ai/claude.rs` and `src/ai/claude_cli.rs`:
-- ThinkingConfig serialization (omitted when both None, present when set)
+- Thinking and effort serialization (each omitted when unset, effort at the top level)
 - Request translation (system, user, assistant, tool calls, tool results)
 - Response translation (text, tool calls, thinking, usage with cache)
 - Cache control (applied when enabled, absent when disabled)
