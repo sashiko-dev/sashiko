@@ -1916,50 +1916,13 @@ pub fn batch_hard_cases_by_severity(hard_cases: &[Value]) -> Vec<Vec<Value>> {
     batches
 }
 
-fn mint_finding_uuid(project: &str) -> String {
-    let prefix = if project.trim().is_empty() {
-        "linux"
-    } else {
-        project.trim()
-    };
-    format!("{prefix}-{}", uuid::Uuid::new_v4())
-}
-
-/// Serializes verified `findings` for downstream prompt templates (`report`)
-/// with non-deterministic per-run UUID fields (`id` and `finding_id`) removed
-/// so `CachingAiProvider` cache keys remain deterministic across reruns.
-pub fn serialize_findings_for_prompt(findings: &[Value]) -> String {
-    let cleaned: Vec<Value> = findings
-        .iter()
-        .map(|item| {
-            let mut obj = item.clone();
-            if let Some(map) = obj.as_object_mut() {
-                map.remove("id");
-                map.remove("finding_id");
-            }
-            obj
-        })
-        .collect();
-    serde_json::to_string_pretty(&cleaned).unwrap_or_default()
-}
-
 pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findings: Vec<Value>) {
     for mut finding in findings {
-        let finding_id = finding
-            .get("finding_id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| mint_finding_uuid(&state.project));
-
-        if let Some(map) = finding.as_object_mut() {
-            if let Some(existing_id) = map.get("id").and_then(Value::as_str)
-                && (existing_id.starts_with("VF") || existing_id.starts_with("PVF"))
-            {
-                map.insert("stage_item_id".to_string(), json!(existing_id));
-            }
-            map.insert("id".to_string(), json!(finding_id));
-            map.insert("finding_id".to_string(), json!(finding_id));
+        if let Some(map) = finding.as_object_mut()
+            && let Some(existing_id) = map.get("id").and_then(Value::as_str).map(str::to_string)
+            && (existing_id.starts_with("VF") || existing_id.starts_with("PVF"))
+        {
+            map.insert("stage_item_id".to_string(), json!(existing_id));
         }
 
         let is_preexisting = finding
@@ -1968,8 +1931,6 @@ pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findin
             .unwrap_or(false);
         if is_preexisting {
             let mut concern = json!({
-                "id": finding_id,
-                "finding_id": finding_id,
                 "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
                 "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
                 "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1979,6 +1940,7 @@ pub(crate) fn record_verified_findings(state: &mut LinuxPatchReviewState, findin
             });
             if let Some(map) = concern.as_object_mut() {
                 for key in [
+                    "id",
                     "stage_item_id",
                     "source_ids",
                     "raw_source_ids",
@@ -2010,12 +1972,6 @@ pub fn apply_verification_stage_output(
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
     enrich_verification_output(state, &mut out, outcome, stage_lookup);
-    for finding in &mut out.findings {
-        let finding_id = mint_finding_uuid(&state.project);
-        if let Some(map) = finding.as_object_mut() {
-            map.insert("finding_id".to_string(), json!(finding_id));
-        }
-    }
     state.verification_findings.extend(out.findings.clone());
     state
         .verification_dismissed
@@ -2045,13 +2001,11 @@ pub fn apply_post_verification_stage_output(
     for finding in &mut out.findings {
         let pv_idx = state.post_verification_findings.len().saturating_add(1);
         let pvf_id = format!("PVF{pv_idx}");
-        let finding_id = mint_finding_uuid(&state.project);
         if let Some(map) = finding.as_object_mut() {
-            map.insert("id".to_string(), json!(pvf_id));
-            map.insert("stage_item_id".to_string(), json!(pvf_id));
-            map.insert("finding_id".to_string(), json!(finding_id));
             map.insert("origin".to_string(), json!(stage_name));
             map.insert("post_verification_stage".to_string(), json!(stage_name));
+            map.insert("id".to_string(), json!(pvf_id));
+            map.insert("stage_item_id".to_string(), json!(pvf_id));
         }
         state.post_verification_findings.push(finding.clone());
     }
@@ -2343,7 +2297,7 @@ Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
-                serialize_findings_for_prompt(&s.findings)
+                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -3672,19 +3626,10 @@ mod tests {
             analysis_stage_by_name,
         );
         assert_eq!(state.verification_findings[0]["id"], "VF1");
-        assert!(
-            state.verification_findings[0]["finding_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("linux-")
-        );
         assert_eq!(state.hard_cases[0]["id"], "H1");
         assert_eq!(state.hard_cases[0]["assigned_stage"], "post-verification-1");
         assert_eq!(state.verification_dismissed[0]["id"], "VD1");
-        assert_eq!(
-            state.findings[0]["id"],
-            state.verification_findings[0]["finding_id"]
-        );
+        assert_eq!(state.findings[0]["id"], "VF1");
 
         // Post-verification validator checks H1 coverage.
         let batch = state.hard_cases.clone();
@@ -3746,16 +3691,8 @@ mod tests {
             json!(["C2"])
         );
         assert_eq!(state.findings.len(), 2);
-        assert!(
-            state.findings[1]["finding_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("linux-")
-        );
-        let prompt_findings = serialize_findings_for_prompt(&state.findings);
-        assert!(!prompt_findings.contains("\"finding_id\""));
-        assert!(!prompt_findings.contains("\"id\""));
-        assert!(prompt_findings.contains("\"stage_item_id\": \"VF1\""));
-        assert!(prompt_findings.contains("\"stage_item_id\": \"PVF1\""));
+        assert_eq!(state.findings[1]["id"], "PVF1");
+        assert_eq!(state.findings[0]["stage_item_id"], "VF1");
+        assert_eq!(state.findings[1]["stage_item_id"], "PVF1");
     }
 }

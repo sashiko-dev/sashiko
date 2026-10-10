@@ -1581,222 +1581,14 @@
         }
 
         /* Review Map View (#/map/<id>) */
-        .rm-strip {
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 12px 14px;
-            margin-bottom: 12px;
+        tr.rm-detail-row,
+        tr.rm-detail-row:hover {
+            background: var(--bg);
+            cursor: default;
         }
-        .rm-strip-title {
-            font-size: 0.8em;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            color: var(--text-muted);
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .rm-prompts-grid {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px 18px;
-            font-size: 0.85em;
-        }
-        .rm-prompt-group {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 4px;
-        }
-        .rm-prompt-group-label {
-            font-weight: 600;
-            color: var(--text-muted);
-            margin-right: 2px;
-        }
-        .rm-prompt-pill {
-            font-family: monospace;
-            font-size: 0.9em;
-            background: var(--code-bg);
-            border: 1px solid var(--code-border);
-            border-radius: 4px;
-            padding: 1px 6px;
-            color: var(--text);
-        }
-        .rm-stages-bar {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-        }
-        .rm-stage-pill {
-            display: inline-flex;
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 2px;
-            padding: 6px 10px;
-            border-radius: 5px;
-            border: 1px solid var(--border);
-            background: var(--btn-bg);
-            color: var(--text);
-            cursor: pointer;
-            font-size: 0.82em;
-            text-align: left;
-            transition: all 0.12s ease;
-        }
-        .rm-stage-pill:hover {
-            border-color: var(--link);
-            background: var(--hover);
-        }
-        .rm-stage-pill.active {
-            border-color: var(--link);
-            box-shadow: 0 0 0 1px var(--link);
-            background: var(--selected);
-        }
-        .rm-stage-pill.skipped {
-            opacity: 0.55;
-            border-style: dashed;
-        }
-        .rm-stage-name {
-            font-weight: 700;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .rm-stage-meta {
-            font-size: 0.9em;
-            color: var(--text-muted);
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .rm-stage-drawer {
-            margin-top: 10px;
-            border-top: 1px solid var(--border);
-            padding-top: 10px;
-        }
-        .rm-table-wrap {
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            overflow-x: auto;
-        }
-        .rm-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.88em;
-        }
-        .rm-table th {
-            background: var(--th-bg);
-            color: var(--text-muted);
-            font-weight: 700;
-            text-align: left;
-            padding: 8px 10px;
+        tr.rm-detail-row > td {
+            padding: 6px 8px 14px 22px;
             border-bottom: 1px solid var(--border);
-            white-space: nowrap;
-        }
-        .rm-table td {
-            padding: 8px 10px;
-            border-bottom: 1px solid var(--border-light);
-            vertical-align: top;
-        }
-        .rm-row {
-            cursor: pointer;
-            transition: background 0.1s ease;
-        }
-        .rm-row:hover {
-            background: var(--hover);
-        }
-        .rm-row.expanded {
-            background: var(--selected);
-        }
-        .rm-detail-row td {
-            padding: 0;
-            background: var(--bg);
-            border-bottom: 2px solid var(--border);
-        }
-        .rm-detail-grid {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 12px;
-            padding: 12px;
-        }
-        @media (max-width: 960px) {
-            .rm-detail-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        .rm-detail-col {
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 10px 12px;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            min-width: 0;
-        }
-        .rm-detail-col-title {
-            font-size: 0.82em;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.03em;
-            color: var(--text-muted);
-            border-bottom: 1px solid var(--border-light);
-            padding-bottom: 6px;
-        }
-        .rm-item-card {
-            border: 1px solid var(--border-light);
-            border-radius: 5px;
-            padding: 8px 10px;
-            background: var(--code-bg);
-            font-size: 0.92em;
-            line-height: 1.45;
-        }
-        .rm-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            padding: 1px 6px;
-            border-radius: 4px;
-            font-size: 0.84em;
-            font-weight: 600;
-            font-family: monospace;
-            margin: 1px 2px 1px 0;
-            white-space: nowrap;
-        }
-        .rm-badge-concern {
-            background: var(--error-bg);
-            color: var(--error-text);
-            border: 1px solid var(--error-border);
-        }
-        .rm-badge-dismissed {
-            background: var(--code-bg);
-            color: var(--text-muted);
-            border: 1px solid var(--code-border);
-        }
-        .rm-badge-hard {
-            background: var(--warn-bg);
-            color: var(--warn-text);
-            border: 1px solid var(--warn-border);
-        }
-        .rm-badge-confirmed {
-            background: var(--diff-add-bg);
-            color: var(--status-reviewed);
-            border: 1px solid var(--status-reviewed);
-        }
-        .rm-code-snippet {
-            font-family: monospace;
-            font-size: 0.88em;
-            background: var(--bg);
-            border: 1px solid var(--code-border);
-            border-radius: 4px;
-            padding: 6px 8px;
-            margin-top: 6px;
-            overflow-x: auto;
-            white-space: pre-wrap;
-            word-break: break-word;
         }
 </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
@@ -4560,7 +4352,7 @@
             const tokensOut = (r.tokens_out || 0);
             const tokensCached = (r.tokens_cached || 0);
             const tokensIn = Math.max(0, (r.tokens_in || 0) - tokensCached);
-            const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
+            const tokenStr = `In: ${formatTokenCount(tokensIn)} &middot; Cached: ${formatTokenCount(tokensCached)} &middot; Out: ${formatTokenCount(tokensOut)}`;
 
             const summaryText = (r.summary || (outputJson && outputJson.summary) || '').trim();
             let summaryHtml = '';
@@ -5263,8 +5055,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return String(record.kind || 'stage').replace(/_run$/, '').replace(/_/g, ' ');
         }
 
+        // Format token counts >= 1000 as rounded whole thousands with a lowercase
+        // 'k' suffix (e.g. 625k, 1128k) rather than Intl.NumberFormat compact
+        // notation so stage tables, review headers, and stat cards share a single
+        // uniform thousand-token unit without mixed K/M scales or decimals.
         function formatTokenCount(value) {
-            return Number(value || 0).toLocaleString();
+            const n = Number(value || 0);
+            if (!Number.isFinite(n) || n <= 0) return '0';
+            const rounded = Math.round(n);
+            if (rounded < 1000) return String(rounded);
+            return `${Math.round(rounded / 1000)}k`;
         }
 
         // Shows the agent stages that ran for a bug and its duplicates, in the
@@ -5568,7 +5368,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         let currentReviewMapState = {
             logs: [],
             stages: [],
-            activeStageIdx: null,
+            expandedStages: new Set(),
             expandedThreads: new Set(),
             totalThreads: 0
         };
@@ -5585,8 +5385,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 id: d.id || `D${idx + 1}`
             }));
             const stampedFindings = findings.map((f, idx) => Object.assign({}, f, {
-                stage_item_id: f.stage_item_id || `VF${idx + 1}`,
-                finding_id: f.finding_id || f.id || null
+                stage_item_id: f.stage_item_id || `VF${idx + 1}`
             }));
 
             const threads = [];
@@ -5595,7 +5394,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 threads.push({
                     thread_id: `T${threads.length + 1}`,
                     outcome: preexisting ? 'preexisting_concern' : 'finding',
-                    finding_id: f.finding_id,
                     title: f.problem || f.description || f.type || 'Finding',
                     type: f.type || '',
                     severity: f.severity || '',
@@ -5618,7 +5416,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     threads.push({
                         thread_id: `T${threads.length + 1}`,
                         outcome: 'unverified_concern',
-                        finding_id: null,
                         title: c.description || c.problem || c.type || 'Concern',
                         type: c.type || '',
                         severity: c.severity || '',
@@ -5641,7 +5438,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 threads.push({
                     thread_id: `T${threads.length + 1}`,
                     outcome: 'dismissed_1b',
-                    finding_id: null,
                     title: d.description || d.type || 'Dismissed concern',
                     type: d.type || '',
                     severity: '',
@@ -5666,123 +5462,140 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 stages: [],
                 raw_concerns: stampedConcerns,
                 raw_dismissed_concerns: stampedDismissed,
-                verification_findings: stampedFindings,
-                hard_cases: [],
-                verification_dismissed: stampedDismissed.map((d, idx) => Object.assign({}, d, { id: `VD${idx + 1}` })),
-                post_verification_findings: [],
-                post_verification_dismissed: [],
-                final_findings: stampedFindings,
+                verification: {
+                    findings: stampedFindings,
+                    hard_cases: [],
+                    dismissed_concerns: stampedDismissed.map((d, idx) => Object.assign({}, d, { id: `VD${idx + 1}` }))
+                },
+                post_verification: {
+                    findings: [],
+                    dismissed_concerns: []
+                },
                 threads
             };
         }
 
-        function formatReviewMapLocations(locations) {
-            if (!Array.isArray(locations) || locations.length === 0) {
-                return '<span style="color:var(--text-dim);">—</span>';
+        function dedentCodeSnippet(raw) {
+            if (typeof raw !== 'string') return '';
+            const rawLines = raw.replace(/\r\n/g, '\n').split('\n');
+            while (rawLines.length > 0 && rawLines[0].trim() === '') rawLines.shift();
+            while (rawLines.length > 0 && rawLines[rawLines.length - 1].trim() === '') rawLines.pop();
+            if (rawLines.length === 0) return '';
+
+            const lines = rawLines.map(l => l.replace(/^[\t ]+/, m => m.replace(/\t/g, '    ')));
+            const nonEmpty = lines.filter(l => l.trim() !== '');
+            const leadingSpaces = (s) => {
+                let n = 0;
+                while (n < s.length && s[n] === ' ') n++;
+                return n;
+            };
+
+            const minSpacesAll = Math.min(...nonEmpty.map(leadingSpaces));
+            if (minSpacesAll > 0) {
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].trim() !== '') lines[i] = lines[i].slice(minSpacesAll);
+                }
+            } else if (lines.length > 1 && leadingSpaces(lines[0]) === 0) {
+                const restNonEmpty = lines.slice(1).filter(l => l.trim() !== '');
+                if (restNonEmpty.length > 0) {
+                    const minSpacesRest = Math.min(...restNonEmpty.map(leadingSpaces));
+                    if (minSpacesRest > 4) {
+                        const stripSpaces = minSpacesRest - 4;
+                        for (let i = 1; i < lines.length; i++) {
+                            if (lines[i].trim() !== '') lines[i] = lines[i].slice(stripSpaces);
+                        }
+                    }
+                }
             }
-            return locations.map(loc => {
-                if (!loc || typeof loc !== 'object') return '';
-                const file = loc.file ? String(loc.file) : '';
-                const line = (loc.line !== null && loc.line !== undefined && loc.line !== '') ? `:${loc.line}` : '';
-                const sym = loc.function_or_symbol ? String(loc.function_or_symbol) : '';
-                const filePart = file ? `<code>${escapeHtml(file + line)}</code>` : '';
-                const symPart = sym ? `<span style="color:var(--fn-name); font-family:monospace; font-size:0.92em;">${escapeHtml(sym)}</span>` : '';
-                if (filePart && symPart) return `${filePart} <span style="color:var(--text-dim);">&middot;</span> ${symPart}`;
-                return filePart || symPart || '';
-            }).filter(Boolean).join('<br>');
+
+            return lines.join('\n');
         }
 
         function renderReviewMapCodeSnippets(locations) {
             if (!Array.isArray(locations) || locations.length === 0) return '';
-            const snippets = locations
-                .filter(loc => loc && typeof loc.code_snippet === 'string' && loc.code_snippet.trim() !== '')
+            const validLocs = locations
+                .filter(loc => loc && typeof loc === 'object')
                 .map(loc => {
-                    const header = [
-                        loc.file ? `${loc.file}${loc.line ? ':' + loc.line : ''}` : '',
-                        loc.function_or_symbol || ''
-                    ].filter(Boolean).join(' · ');
-                    return `
-                        <div class="rm-code-snippet">
-                            ${header ? `<div style="color:var(--text-muted); font-size:0.85em; margin-bottom:3px;">${escapeHtml(header)}</div>` : ''}
-                            <div>${escapeHtml(loc.code_snippet)}</div>
-                        </div>
-                    `;
-                });
-            return snippets.join('');
+                    const fileLine = loc.file ? `${loc.file}${loc.line ? ':' + loc.line : ''}` : '';
+                    const sym = loc.function_or_symbol || loc.symbol || '';
+                    const why = typeof loc.why_this_location_matters === 'string' && loc.why_this_location_matters.trim() !== ''
+                        ? loc.why_this_location_matters.trim()
+                        : '';
+                    const snippet = dedentCodeSnippet(loc.code_snippet);
+                    if (!fileLine && !sym && !why && !snippet) return null;
+                    return { fileLine, sym, why, snippet };
+                })
+                .filter(Boolean);
+            if (validLocs.length === 0) return '';
+
+            const stepsHtml = validLocs.map((item, idx) => {
+                const stepNum = validLocs.length > 1 ? `<span style="color:var(--text-muted); font-weight:bold;">${idx + 1}.</span> ` : '';
+                const locParts = [];
+                if (item.fileLine) locParts.push(`<strong>${escapeHtml(item.fileLine)}</strong>`);
+                if (item.sym) locParts.push(`<span class="fn-name">${escapeHtml(item.sym)}</span>`);
+                const headerHtml = locParts.length > 0
+                    ? `<div>${stepNum}${locParts.join(' <span style="color:var(--text-dim);">&middot;</span> ')}</div>`
+                    : '';
+                const snippetHtml = item.snippet
+                    ? `<pre style="margin:6px 0 0 0; padding:6px 10px; background:var(--card-bg); border:1px solid var(--border-light); border-left:3px solid var(--border); border-radius:3px; white-space:pre-wrap;">${escapeHtml(item.snippet)}</pre>`
+                    : '';
+                const whyHtml = item.why
+                    ? `<div style="color:var(--text-muted); margin-top:6px;">${escapeHtml(item.why)}</div>`
+                    : '';
+                const sepStyle = idx > 0 ? 'border-top:1px solid var(--border-light); padding-top:10px; margin-top:10px;' : '';
+                return `<div style="${sepStyle}">${headerHtml}${snippetHtml}${whyHtml}</div>`;
+            }).join('');
+
+            return `
+                <div style="margin-top:12px;">
+                    <div style="font-weight:bold; margin-bottom:4px;">Code Trace</div>
+                    <div class="log-inline-block" style="white-space:normal;">
+                        ${stepsHtml}
+                    </div>
+                </div>
+            `;
         }
 
         function toggleReviewMapStageLog(stageIdx) {
-            if (currentReviewMapState.activeStageIdx === stageIdx) {
-                currentReviewMapState.activeStageIdx = null;
+            const row = document.getElementById(`rm-stage-row-${stageIdx}`);
+            const detail = document.getElementById(`rm-stage-detail-${stageIdx}`);
+            const chevron = document.getElementById(`rm-stage-chevron-${stageIdx}`);
+            const body = document.getElementById(`rm-stage-log-body-${stageIdx}`);
+            if (!row || !detail) return;
+
+            if (currentReviewMapState.expandedStages.has(stageIdx)) {
+                currentReviewMapState.expandedStages.delete(stageIdx);
+                row.classList.remove('selected');
+                detail.style.display = 'none';
+                if (chevron) chevron.textContent = '▶';
             } else {
-                currentReviewMapState.activeStageIdx = stageIdx;
+                currentReviewMapState.expandedStages.add(stageIdx);
+                row.classList.add('selected');
+                detail.style.display = 'table-row';
+                if (chevron) chevron.textContent = '▼';
+                if (body && !body.dataset.rendered) {
+                    const stage = currentReviewMapState.stages[stageIdx];
+                    if (stage) {
+                        const start = typeof stage.log_start === 'number' ? stage.log_start : 0;
+                        const end = typeof stage.log_end === 'number' ? stage.log_end : 0;
+                        const slice = currentReviewMapState.logs.slice(start, end);
+                        body.innerHTML = slice.length > 0
+                            ? renderInteractionLogEntries(slice, `rm-stage-${stageIdx}-`)
+                            : '<div class="status-placeholder" style="padding:8px;">No transcript entries recorded for this stage.</div>';
+                        body.dataset.rendered = '1';
+                    }
+                }
             }
-            updateReviewMapStageDrawerDOM();
         }
 
         function openReviewMapStageLog(stageIdx) {
-            currentReviewMapState.activeStageIdx = stageIdx;
-            updateReviewMapStageDrawerDOM();
-            const barEl = document.getElementById('rm-stages-strip');
-            if (barEl) {
-                barEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            if (!currentReviewMapState.expandedStages.has(stageIdx)) {
+                toggleReviewMapStageLog(stageIdx);
             }
-        }
-
-        function updateReviewMapStageDrawerDOM() {
-            const pills = document.querySelectorAll('.rm-stage-pill[data-stage-idx]');
-            pills.forEach(pill => {
-                const idx = parseInt(pill.getAttribute('data-stage-idx'), 10);
-                if (idx === currentReviewMapState.activeStageIdx) {
-                    pill.classList.add('active');
-                } else {
-                    pill.classList.remove('active');
-                }
-            });
-
-            const drawer = document.getElementById('rm-stage-drawer');
-            if (!drawer) return;
-
-            const idx = currentReviewMapState.activeStageIdx;
-            if (idx === null || idx === undefined || !currentReviewMapState.stages[idx]) {
-                drawer.style.display = 'none';
-                drawer.innerHTML = '';
-                return;
+            const row = document.getElementById(`rm-stage-row-${stageIdx}`);
+            if (row) {
+                row.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }
-
-            const stage = currentReviewMapState.stages[idx];
-            const start = typeof stage.log_start === 'number' ? stage.log_start : 0;
-            const end = typeof stage.log_end === 'number' ? stage.log_end : 0;
-            const slice = currentReviewMapState.logs.slice(start, end);
-
-            const tokensIn = Math.max(0, (stage.tokens_in || 0) - (stage.tokens_cached || 0));
-            const tokensCached = stage.tokens_cached || 0;
-            const tokensOut = stage.tokens_out || 0;
-            const promptsRead = Array.isArray(stage.prompts_read) && stage.prompts_read.length > 0
-                ? stage.prompts_read.map(p => `<span class="rm-prompt-pill">${escapeHtml(p)}</span>`).join(' ')
-                : '<span style="color:var(--text-dim);">none</span>';
-
-            drawer.style.display = 'block';
-            drawer.innerHTML = `
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
-                    <div>
-                        <strong>Stage Transcript: ${escapeHtml(stage.label || stage.name)}</strong>
-                        <span style="color:var(--text-muted); font-size:0.88em; margin-left:8px;">
-                            (<code>${escapeHtml(stage.name)}</code> &middot; ${stage.turns || 0} turns &middot; log entries ${start}..${end} &middot;
-                            In: ${tokensIn.toLocaleString()} / Cached: ${tokensCached.toLocaleString()} / Out: ${tokensOut.toLocaleString()})
-                        </span>
-                    </div>
-                    <button class="btn" onclick="toggleReviewMapStageLog(${idx})" style="font-size:0.8em; padding:2px 8px;">✕ Close Stage Log</button>
-                </div>
-                <div style="font-size:0.84em; color:var(--text-muted); margin-bottom:8px;">
-                    <strong>Prompts read via tools in this stage:</strong> ${promptsRead}
-                </div>
-                <div style="max-height:520px; overflow-y:auto; border:1px solid var(--border); border-radius:4px; background:var(--bg);">
-                    ${stage.skipped
-                        ? '<div style="padding:16px; color:var(--text-dim); text-align:center;">This stage was skipped by the workflow policy or stage filter.</div>'
-                        : renderInteractionLogEntries(slice, `rm-stage-${idx}-`)}
-                </div>
-            `;
         }
 
         function toggleReviewMapThread(idx) {
@@ -5793,12 +5606,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             if (currentReviewMapState.expandedThreads.has(idx)) {
                 currentReviewMapState.expandedThreads.delete(idx);
-                row.classList.remove('expanded');
+                row.classList.remove('selected');
                 detail.style.display = 'none';
                 if (chevron) chevron.textContent = '▶';
             } else {
                 currentReviewMapState.expandedThreads.add(idx);
-                row.classList.add('expanded');
+                row.classList.add('selected');
                 detail.style.display = 'table-row';
                 if (chevron) chevron.textContent = '▼';
             }
@@ -5823,7 +5636,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!btn) return;
             const total = currentReviewMapState.totalThreads || 0;
             const allOpen = total > 0 && currentReviewMapState.expandedThreads.size >= total;
-            btn.textContent = allOpen ? 'Collapse All Details' : 'Expand All Details';
+            btn.textContent = allOpen ? '▼ Collapse All' : '▶ Expand All';
         }
 
         async function renderReviewMapView(id) {
@@ -5857,15 +5670,29 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             currentReviewMapState = {
                 logs,
                 stages,
-                activeStageIdx: null,
+                expandedStages: new Set(),
                 expandedThreads: new Set(),
                 totalThreads: threads.length
             };
 
             const stageIdxByName = new Map();
             stages.forEach((s, idx) => {
-                if (s && s.name) stageIdxByName.set(String(s.name), idx);
+                if (s && s.name && !s.skipped) stageIdxByName.set(String(s.name), idx);
             });
+
+            const verifObj = (reviewMap.verification && typeof reviewMap.verification === 'object') ? reviewMap.verification : {};
+            const postVerifObj = (reviewMap.post_verification && typeof reviewMap.post_verification === 'object') ? reviewMap.post_verification : {};
+
+            const verifFindings = Array.isArray(verifObj.findings) ? verifObj.findings
+                : (Array.isArray(reviewMap.verification_findings) ? reviewMap.verification_findings : []);
+            const hardCases = Array.isArray(verifObj.hard_cases) ? verifObj.hard_cases
+                : (Array.isArray(reviewMap.hard_cases) ? reviewMap.hard_cases : []);
+            const verifDismissed = Array.isArray(verifObj.dismissed_concerns) ? verifObj.dismissed_concerns
+                : (Array.isArray(reviewMap.verification_dismissed) ? reviewMap.verification_dismissed : []);
+            const postVerifFindings = Array.isArray(postVerifObj.findings) ? postVerifObj.findings
+                : (Array.isArray(reviewMap.post_verification_findings) ? reviewMap.post_verification_findings : []);
+            const postVerifDismissed = Array.isArray(postVerifObj.dismissed_concerns) ? postVerifObj.dismissed_concerns
+                : (Array.isArray(reviewMap.post_verification_dismissed) ? reviewMap.post_verification_dismissed : []);
 
             const rawConcernsById = new Map();
             (Array.isArray(reviewMap.raw_concerns) ? reviewMap.raw_concerns : []).forEach(c => {
@@ -5876,489 +5703,410 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 if (d && d.id) rawDismissedById.set(String(d.id), d);
             });
             const vfById = new Map();
-            (Array.isArray(reviewMap.verification_findings) ? reviewMap.verification_findings : []).forEach(vf => {
+            verifFindings.forEach(vf => {
                 const key = vf?.stage_item_id || vf?.id;
                 if (key) vfById.set(String(key), vf);
             });
             const hcById = new Map();
-            (Array.isArray(reviewMap.hard_cases) ? reviewMap.hard_cases : []).forEach(hc => {
+            hardCases.forEach(hc => {
                 if (hc && hc.id) hcById.set(String(hc.id), hc);
             });
             const vdById = new Map();
-            (Array.isArray(reviewMap.verification_dismissed) ? reviewMap.verification_dismissed : []).forEach(vd => {
+            verifDismissed.forEach(vd => {
                 if (vd && vd.id) vdById.set(String(vd.id), vd);
             });
             const pvfById = new Map();
-            (Array.isArray(reviewMap.post_verification_findings) ? reviewMap.post_verification_findings : []).forEach(pvf => {
+            postVerifFindings.forEach(pvf => {
                 const key = pvf?.stage_item_id || pvf?.id;
                 if (key) pvfById.set(String(key), pvf);
             });
             const pvdById = new Map();
-            (Array.isArray(reviewMap.post_verification_dismissed) ? reviewMap.post_verification_dismissed : []).forEach(pvd => {
+            postVerifDismissed.forEach(pvd => {
                 if (pvd && pvd.id) pvdById.set(String(pvd.id), pvd);
             });
 
-            // 1. Prompts Included Strip
             const prompts = reviewMap.prompts || {};
-            const basePrompts = Array.isArray(prompts.base) ? prompts.base : [];
             const preScreenPrompts = Array.isArray(prompts.pre_screen) ? prompts.pre_screen : [];
             const stageGuidesObj = (prompts.stage_guides && typeof prompts.stage_guides === 'object') ? prompts.stage_guides : {};
-            const toolReadPrompts = Array.isArray(prompts.tool_read) ? prompts.tool_read : [];
 
-            const renderPills = (arr, emptyText = 'none') => {
-                if (!arr || arr.length === 0) return `<span style="color:var(--text-dim);">${escapeHtml(emptyText)}</span>`;
-                return arr.map(p => `<span class="rm-prompt-pill">${escapeHtml(String(p))}</span>`).join('');
-            };
-
-            const stageGuidesPills = Object.entries(stageGuidesObj).flatMap(([stageName, guides]) => {
-                if (!Array.isArray(guides)) return [];
-                return guides.map(g => `<span class="rm-prompt-pill" title="Stage: ${escapeHtml(stageName)}">${escapeHtml(String(g))} <span style="color:var(--text-dim);">(${escapeHtml(stageName)})</span></span>`);
-            });
-
-            const toolReadPills = toolReadPrompts.map(item => {
-                const path = item?.path ? String(item.path) : '';
-                const st = Array.isArray(item?.stages) ? item.stages.join(', ') : '';
-                return `<span class="rm-prompt-pill" title="Read by: ${escapeHtml(st)}">${escapeHtml(path)}${st ? ` <span style="color:var(--text-dim);">(${escapeHtml(st)})</span>` : ''}</span>`;
-            });
-
-            const promptsStripHtml = `
-                <div class="rm-strip">
-                    <div class="rm-strip-title">
-                        <span>Prompts Included</span>
-                        ${data.prompts_hash ? `<span style="font-family:monospace; font-weight:normal; text-transform:none;">prompts rev: ${escapeHtml(String(data.prompts_hash).substring(0, 8))}</span>` : ''}
-                    </div>
-                    <div class="rm-prompts-grid">
-                        <div class="rm-prompt-group">
-                            <span class="rm-prompt-group-label">[base]</span>
-                            ${renderPills(basePrompts)}
-                        </div>
-                        <div class="rm-prompt-group">
-                            <span class="rm-prompt-group-label">[pre-screen]</span>
-                            ${renderPills(preScreenPrompts)}
-                        </div>
-                        <div class="rm-prompt-group">
-                            <span class="rm-prompt-group-label">[stage]</span>
-                            ${stageGuidesPills.length > 0 ? stageGuidesPills.join('') : '<span style="color:var(--text-dim);">none</span>'}
-                        </div>
-                        <div class="rm-prompt-group">
-                            <span class="rm-prompt-group-label">[tool-read]</span>
-                            ${toolReadPills.length > 0 ? toolReadPills.join('') : '<span style="color:var(--text-dim);">none</span>'}
-                        </div>
-                    </div>
-                </div>
-            `;
-
-            // 2. Stage Execution Bar
-            let stagesBarHtml = '';
-            if (stages.length > 0) {
-                const pillsHtml = stages.map((s, idx) => {
-                    const skippedClass = s.skipped ? 'skipped' : '';
-                    const cCount = s.concerns_count || 0;
-                    const dCount = s.dismissed_count || 0;
-                    let signalHtml = '';
-                    if (!s.skipped && (cCount > 0 || dCount > 0)) {
-                        signalHtml = `<span>&middot; <span style="${cCount > 0 ? 'color:var(--error-text);font-weight:700;' : ''}">${cCount}C</span> <span style="color:var(--text-muted);">${dCount}D</span></span>`;
-                    }
-                    return `
-                        <button type="button" class="rm-stage-pill ${skippedClass}" data-stage-idx="${idx}" onclick="toggleReviewMapStageLog(${idx})" title="Click to view raw LLM transcript for stage: ${escapeHtml(s.name)}">
-                            <div class="rm-stage-name">${escapeHtml(s.label || s.name)}</div>
-                            <div class="rm-stage-meta">
-                                <span>${s.skipped ? 'skipped' : `${s.turns || 0}t`}</span>
-                                ${signalHtml}
-                            </div>
-                        </button>
-                    `;
-                }).join('');
-
-                stagesBarHtml = `
-                    <div class="rm-strip" id="rm-stages-strip">
-                        <div class="rm-strip-title">
-                            <span>Stage Execution Pipeline <span style="font-weight:normal; text-transform:none; color:var(--text-dim);">(click any stage to inspect its raw LLM transcript slice)</span></span>
-                            <span>${stages.filter(s => !s.skipped).length} / ${stages.length} stages active</span>
-                        </div>
-                        <div class="rm-stages-bar">${pillsHtml}</div>
-                        <div id="rm-stage-drawer" class="rm-stage-drawer" style="display:none;"></div>
-                    </div>
-                `;
-            }
-
-            // 3. Concern Lineage Table
-            const renderStageLogBtn = (stageName) => {
+            const renderStageLogLink = (stageName, label = 'View stage log') => {
                 if (!stageName || !stageIdxByName.has(String(stageName))) return '';
                 const sIdx = stageIdxByName.get(String(stageName));
-                return `<button type="button" class="btn" onclick="event.stopPropagation(); openReviewMapStageLog(${sIdx})" style="font-size:0.78em; padding:1px 6px;">Open ${escapeHtml(String(stageName))} log</button>`;
+                return `<a href="javascript:void(0)" onclick="event.stopPropagation(); openReviewMapStageLog(${sIdx})" style="font-weight:600; color:var(--text-dim); font-size:0.9em; text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${escapeHtml(label)}</a>`;
             };
 
-            const rowsHtml = threads.length === 0
-                ? `<tr><td colspan="5" style="text-align:center; padding:24px; color:var(--text-muted);">No concerns or dismissed concerns were raised across any stage.</td></tr>`
+            // 1. Findings & Dismissed Concerns Table
+            const threadRowsHtml = threads.length === 0
+                ? `<tr><td colspan="3" class="status-placeholder" style="text-align:center; padding:16px;">No concerns or dismissed concerns were raised across any stage.</td></tr>`
                 : threads.map((t, idx) => {
                     const rawCIds = Array.isArray(t.raw_concern_ids) ? t.raw_concern_ids : [];
                     const rawDIds = Array.isArray(t.raw_dismissed_ids) ? t.raw_dismissed_ids : [];
-
-                    // Column 1 summary badges (Raw C* and D*)
-                    const rawBadges = [
-                        ...rawCIds.map(cid => {
-                            const item = rawConcernsById.get(String(cid));
-                            const st = item?.stage ? `: ${item.stage}` : '';
-                            return `<span class="rm-badge rm-badge-concern" title="${escapeHtml(item?.description || '')}">${escapeHtml(String(cid) + st)}</span>`;
-                        }),
-                        ...rawDIds.map(did => {
-                            const item = rawDismissedById.get(String(did));
-                            const st = item?.stage ? `: ${item.stage}` : '';
-                            return `<span class="rm-badge rm-badge-dismissed" title="${escapeHtml(item?.description || '')}">${escapeHtml(String(did) + st)}</span>`;
-                        })
-                    ].join(' ') || '<span style="color:var(--text-dim);">—</span>';
-
-                    // Column 2 summary (Verification Triage)
-                    let verifCellHtml = '<span style="color:var(--text-dim);">—</span>';
                     const vKind = t.verification_kind || '';
                     const vIds = Array.isArray(t.verification_ids) && t.verification_ids.length > 0
                         ? t.verification_ids
                         : (t.verification_id ? [t.verification_id] : []);
+                    const outcome = t.outcome || '';
+                    const sev = t.severity || 'Unknown';
+                    const sevColor = getSeverityColor(sev);
 
-                    if (vKind === 'finding_1a') {
-                        const sev = t.severity || 'Unknown';
-                        const sevColor = getSeverityColor(sev);
-                        verifCellHtml = `
-                            ${vIds.map(id => `<span class="rm-badge rm-badge-confirmed">${escapeHtml(String(id))}</span>`).join('')}
-                            <span style="font-weight:600;">Direct 1a</span>
-                            <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; background:transparent; font-weight:700;">${escapeHtml(sev)}</span>
-                        `;
-                    } else if (vKind === 'hard_case') {
-                        const firstHc = vIds.length > 0 ? hcById.get(String(vIds[0])) : null;
-                        const sigReason = firstHc?.signal_reason || 'hard_case';
-                        const estSev = firstHc?.estimated_severity || t.severity || '';
-                        verifCellHtml = `
-                            ${vIds.map(id => `<span class="rm-badge rm-badge-hard">${escapeHtml(String(id))}</span>`).join('')}
-                            <div style="font-size:0.86em; margin-top:2px;">
-                                <span style="font-weight:600; color:var(--warn-text);">${escapeHtml(sigReason)}</span>
-                                ${estSev ? `<span style="color:var(--text-muted);"> (est. ${escapeHtml(estSev)})</span>` : ''}
-                            </div>
-                        `;
-                    } else if (vKind === 'dismissed_1b') {
-                        verifCellHtml = `
-                            ${vIds.map(id => `<span class="rm-badge rm-badge-dismissed">${escapeHtml(String(id))}</span>`).join('')}
-                            <span style="color:var(--text-muted);">Direct 1b Dismissal</span>
-                        `;
+                    // Column 1: Outcome
+                    let outcomeCellHtml = '';
+                    if (outcome === 'finding') {
+                        outcomeCellHtml = `<span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; background:transparent; font-weight:bold;">${escapeHtml(sev)}</span>`;
+                    } else if (outcome === 'preexisting_concern') {
+                        outcomeCellHtml = `<span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; background:transparent; font-weight:bold;">${escapeHtml(sev)}</span> <span class="tag">Pre-existing</span>`;
+                    } else if (outcome === 'refuted_hard_case') {
+                        outcomeCellHtml = `<span style="color:var(--text-muted);">Refuted</span>`;
+                    } else if (outcome === 'dismissed_1b' || outcome === 'unverified_dismissed') {
+                        outcomeCellHtml = `<span style="color:var(--text-muted);">Dismissed</span>`;
+                    } else if (outcome === 'unresolved_hard_case') {
+                        outcomeCellHtml = `<span style="color:var(--warn-text);">Unresolved</span>`;
+                    } else {
+                        outcomeCellHtml = `<span style="color:var(--text-muted);">${escapeHtml(outcome || 'Unverified')}</span>`;
                     }
 
-                    // Column 3 summary (Post-Verification)
-                    let pvCellHtml = '<span style="color:var(--text-dim);">—</span>';
+                    // Column 2: Stage tags (chronological pipeline progression)
+                    const stageList = [];
+                    if (Array.isArray(t.stages)) {
+                        t.stages.forEach(s => { if (s && !stageList.includes(String(s))) stageList.push(String(s)); });
+                    }
+                    rawCIds.forEach(cid => {
+                        const st = rawConcernsById.get(String(cid))?.stage;
+                        if (st && !stageList.includes(String(st))) stageList.push(String(st));
+                    });
+                    rawDIds.forEach(did => {
+                        const st = rawDismissedById.get(String(did))?.stage;
+                        if (st && !stageList.includes(String(st))) stageList.push(String(st));
+                    });
+                    if (vKind && vKind !== 'none' && !stageList.includes('verification')) {
+                        stageList.push('verification');
+                    }
+                    const pvStageTag = t.post_verification_stage || (t.post_verification_id ? 'post-verification' : '');
+                    if (pvStageTag && !stageList.includes(String(pvStageTag))) {
+                        stageList.push(String(pvStageTag));
+                    }
+                    const stageCellHtml = stageList.length > 0
+                        ? stageList.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
+                        : '<span style="color:var(--text-dim);">—</span>';
+
+                    // 1. Chronological Pipeline History (initial stage -> verification -> post-verification)
+                    let primaryLocations = Array.isArray(t.locations) && t.locations.length > 0 ? t.locations : null;
+                    const historySteps = [];
+
+                    const rawItems = [
+                        ...rawCIds.map(cid => ({ kind: 'Raised concern', item: rawConcernsById.get(String(cid)) })).filter(x => x.item),
+                        ...rawDIds.map(did => ({ kind: 'Dismissed in stage', item: rawDismissedById.get(String(did)) })).filter(x => x.item)
+                    ];
+
+                    rawItems.forEach(({ kind, item }) => {
+                        const st = item.stage || (Array.isArray(item.stages) ? item.stages[0] : '');
+                        if (!primaryLocations && Array.isArray(item.locations) && item.locations.length > 0) {
+                            primaryLocations = item.locations;
+                        }
+                        const desc = (item.description || item.problem || '').trim();
+                        const reasoning = (item.reasoning || '').trim();
+                        const titleStr = String(t.title || '').trim();
+                        const bodyParts = [];
+                        if (desc && desc !== titleStr) bodyParts.push(desc);
+                        if (reasoning) bodyParts.push(reasoning);
+                        const bodyText = bodyParts.join('\n\n');
+                        historySteps.push(`
+                            <div style="margin-top:8px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                    <span>
+                                        ${st ? `<span class="tag">${escapeHtml(String(st))}</span>` : ''}
+                                        <span class="text-muted-sm">${escapeHtml(kind)}</span>
+                                    </span>
+                                    ${renderStageLogLink(st)}
+                                </div>
+                                ${bodyText ? `<div class="log-inline-block">${escapeHtml(bodyText)}</div>` : ''}
+                            </div>
+                        `);
+                    });
+
+                    if (vKind === 'finding_1a') {
+                        vIds.forEach(vid => {
+                            const vf = vfById.get(String(vid));
+                            if (!vf) return;
+                            if (Array.isArray(vf.locations) && vf.locations.length > 0) primaryLocations = vf.locations;
+                            historySteps.push(`
+                                <div style="margin-top:8px;">
+                                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                        <span>
+                                            <span class="tag">verification</span>
+                                            <span class="text-muted-sm">Verified</span>
+                                        </span>
+                                        ${renderStageLogLink('verification')}
+                                    </div>
+                                    ${vf.severity_explanation ? `<div class="log-inline-block">${escapeHtml(String(vf.severity_explanation))}</div>` : ''}
+                                </div>
+                            `);
+                        });
+                    } else if (vKind === 'dismissed_1b') {
+                        vIds.forEach(vid => {
+                            const vd = vdById.get(String(vid));
+                            if (!vd) return;
+                            if (Array.isArray(vd.locations) && vd.locations.length > 0) primaryLocations = vd.locations;
+                            historySteps.push(`
+                                <div style="margin-top:8px;">
+                                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                        <span>
+                                            <span class="tag">verification</span>
+                                            <span class="text-muted-sm">Dismissed</span>
+                                        </span>
+                                        ${renderStageLogLink('verification')}
+                                    </div>
+                                    ${vd.reasoning ? `<div class="log-inline-block">${escapeHtml(String(vd.reasoning))}</div>` : ''}
+                                </div>
+                            `);
+                        });
+                    } else if (vKind === 'hard_case') {
+                        const pvStage = t.post_verification_stage ? String(t.post_verification_stage) : 'post-verification';
+                        const isSingleUncontestedConcern = rawCIds.length === 1 && rawDIds.length === 0;
+                        vIds.forEach(hid => {
+                            const hc = hcById.get(String(hid));
+                            if (!hc) return;
+                            if (Array.isArray(hc.locations) && hc.locations.length > 0) primaryLocations = hc.locations;
+                            // For a single uncontested raw concern (1 C*, 0 D*, empty dismissal_arguments),
+                            // the raw stage's full reasoning is already shown in the step immediately above;
+                            // for merged concerns, contested signals, or promoted dismissals, include
+                            // verification's synthesized concern_arguments and dismissal_arguments.
+                            const hcParts = [];
+                            const hasSynthesis = !isSingleUncontestedConcern || Boolean(hc.dismissal_arguments);
+                            if (hasSynthesis && hc.concern_arguments) {
+                                hcParts.push(`Concern arguments: ${String(hc.concern_arguments).trim()}`);
+                            }
+                            if (hc.dismissal_arguments) {
+                                hcParts.push(`Dismissal arguments: ${String(hc.dismissal_arguments).trim()}`);
+                            }
+                            if (hc.verification_question) {
+                                hcParts.push(hcParts.length > 0
+                                    ? `Verification question: ${String(hc.verification_question).trim()}`
+                                    : String(hc.verification_question).trim());
+                            }
+                            const hcBody = hcParts.join('\n\n');
+                            historySteps.push(`
+                                <div style="margin-top:8px;">
+                                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                        <span>
+                                            <span class="tag">verification</span>
+                                            <span class="text-muted-sm">Escalated${t.post_verification_id ? ` to <code>${escapeHtml(pvStage)}</code>` : ''} &mdash; verification question</span>
+                                        </span>
+                                        ${renderStageLogLink('verification')}
+                                    </div>
+                                    ${hcBody ? `<div class="log-inline-block">${escapeHtml(hcBody)}</div>` : ''}
+                                </div>
+                            `);
+                        });
+                    }
+
                     if (t.post_verification_id) {
                         const pvId = String(t.post_verification_id);
                         const pvStage = t.post_verification_stage ? String(t.post_verification_stage) : 'post-verification';
                         if (pvId.startsWith('PVF')) {
-                            pvCellHtml = `
-                                <span class="rm-badge rm-badge-confirmed">${escapeHtml(pvId)}</span>
-                                <span style="color:var(--status-reviewed); font-weight:600;">Confirmed</span>
-                                <div style="font-size:0.82em; color:var(--text-muted); font-family:monospace;">${escapeHtml(pvStage)}</div>
-                            `;
-                        } else {
-                            pvCellHtml = `
-                                <span class="rm-badge rm-badge-dismissed">${escapeHtml(pvId)}</span>
-                                <span style="color:var(--text-muted); font-weight:600;">Refuted</span>
-                                <div style="font-size:0.82em; color:var(--text-muted); font-family:monospace;">${escapeHtml(pvStage)}</div>
-                            `;
-                        }
-                    } else if (vKind === 'finding_1a') {
-                        pvCellHtml = '<span style="color:var(--text-dim); font-size:0.86em;">— (1a Direct)</span>';
-                    } else if (vKind === 'dismissed_1b') {
-                        pvCellHtml = '<span style="color:var(--text-dim); font-size:0.86em;">— (1b Direct)</span>';
-                    }
-
-                    // Column 4 summary (Final Outcome + <project>-<uuid>)
-                    const outcome = t.outcome || '';
-                    const sev = t.severity || 'Unknown';
-                    const sevColor = getSeverityColor(sev);
-                    let outcomeCellHtml = '';
-                    if (outcome === 'finding') {
-                        outcomeCellHtml = `
-                            <div>
-                                <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; background:transparent; font-weight:700;">REPORTED (${escapeHtml(sev)})</span>
-                            </div>
-                            ${t.finding_id ? `
-                                <div style="margin-top:4px;">
-                                    <button type="button" class="copy-btn rm-badge" data-copy="${escapeHtml(String(t.finding_id))}" title="Click to copy permanent finding UUID" style="cursor:pointer; background:var(--code-bg); border:1px solid var(--border); color:var(--text);">
-                                        📋 ${escapeHtml(String(t.finding_id))}
-                                    </button>
-                                </div>
-                            ` : ''}
-                        `;
-                    } else if (outcome === 'preexisting_concern') {
-                        outcomeCellHtml = `
-                            <div>
-                                <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; background:transparent; font-weight:700;">PRE-EXISTING (${escapeHtml(sev)})</span>
-                            </div>
-                            ${t.finding_id ? `
-                                <div style="margin-top:4px;">
-                                    <button type="button" class="copy-btn rm-badge" data-copy="${escapeHtml(String(t.finding_id))}" title="Click to copy permanent finding UUID" style="cursor:pointer; background:var(--code-bg); border:1px solid var(--border); color:var(--text);">
-                                        📋 ${escapeHtml(String(t.finding_id))}
-                                    </button>
-                                </div>
-                            ` : ''}
-                        `;
-                    } else if (outcome === 'refuted_hard_case') {
-                        outcomeCellHtml = `<span class="rm-badge rm-badge-dismissed">DISMISSED (Post-Verif)</span>`;
-                    } else if (outcome === 'dismissed_1b') {
-                        outcomeCellHtml = `<span class="rm-badge rm-badge-dismissed">DISMISSED (1b)</span>`;
-                    } else {
-                        outcomeCellHtml = `<span class="rm-badge rm-badge-dismissed">${escapeHtml(outcome.toUpperCase())}</span>`;
-                    }
-
-                    // Detail Drawer Column 1: Raw Stage Arguments
-                    const rawDetailCards = [
-                        ...rawCIds.map(cid => {
-                            const item = rawConcernsById.get(String(cid));
-                            if (!item) return `<div class="rm-item-card"><span class="rm-badge rm-badge-concern">${escapeHtml(String(cid))}</span></div>`;
-                            const st = item.stage || (Array.isArray(item.stages) ? item.stages[0] : '');
-                            return `
-                                <div class="rm-item-card">
-                                    <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:4px;">
-                                        <span>
-                                            <span class="rm-badge rm-badge-concern">${escapeHtml(String(cid))} · CONCERN</span>
-                                            ${st ? `<code style="font-size:0.88em;">${escapeHtml(String(st))}</code>` : ''}
-                                        </span>
-                                        ${renderStageLogBtn(st)}
-                                    </div>
-                                    ${item.type ? `<div style="font-size:0.84em; color:var(--text-muted); margin-bottom:3px;"><strong>Type:</strong> <code>${escapeHtml(String(item.type))}</code></div>` : ''}
-                                    <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(item.description || item.problem || ''))}</div>
-                                    ${item.reasoning ? `<div style="color:var(--text); white-space:pre-wrap;">${escapeHtml(String(item.reasoning))}</div>` : ''}
-                                    ${renderReviewMapCodeSnippets(item.locations)}
-                                </div>
-                            `;
-                        }),
-                        ...rawDIds.map(did => {
-                            const item = rawDismissedById.get(String(did));
-                            if (!item) return `<div class="rm-item-card"><span class="rm-badge rm-badge-dismissed">${escapeHtml(String(did))}</span></div>`;
-                            const st = item.stage || (Array.isArray(item.stages) ? item.stages[0] : '');
-                            return `
-                                <div class="rm-item-card">
-                                    <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:4px;">
-                                        <span>
-                                            <span class="rm-badge rm-badge-dismissed">${escapeHtml(String(did))} · DISMISSED</span>
-                                            ${st ? `<code style="font-size:0.88em;">${escapeHtml(String(st))}</code>` : ''}
-                                        </span>
-                                        ${renderStageLogBtn(st)}
-                                    </div>
-                                    ${item.type ? `<div style="font-size:0.84em; color:var(--text-muted); margin-bottom:3px;"><strong>Type:</strong> <code>${escapeHtml(String(item.type))}</code></div>` : ''}
-                                    <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(item.description || ''))}</div>
-                                    ${item.reasoning ? `<div style="color:var(--text); white-space:pre-wrap;">${escapeHtml(String(item.reasoning))}</div>` : ''}
-                                    ${renderReviewMapCodeSnippets(item.locations)}
-                                </div>
-                            `;
-                        })
-                    ].join('') || '<div style="color:var(--text-dim);">No raw stage items linked.</div>';
-
-                    // Detail Drawer Column 2: Verification Triage
-                    let verifDetailCards = '';
-                    if (vKind === 'finding_1a') {
-                        verifDetailCards = vIds.map(vid => {
-                            const vf = vfById.get(String(vid));
-                            if (!vf) return '';
-                            return `
-                                <div class="rm-item-card">
-                                    <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:4px;">
-                                        <span class="rm-badge rm-badge-confirmed">${escapeHtml(String(vid))} · Category 1a (Direct Finding)</span>
-                                        ${renderStageLogBtn('verification')}
-                                    </div>
-                                    <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(vf.problem || ''))}</div>
-                                    <div style="white-space:pre-wrap;">${escapeHtml(String(vf.severity_explanation || ''))}</div>
-                                    ${renderReviewMapCodeSnippets(vf.locations)}
-                                </div>
-                            `;
-                        }).join('');
-                    } else if (vKind === 'hard_case') {
-                        verifDetailCards = vIds.map(hid => {
-                            const hc = hcById.get(String(hid));
-                            if (!hc) return '';
-                            return `
-                                <div class="rm-item-card">
-                                    <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:4px;">
-                                        <span class="rm-badge rm-badge-hard">${escapeHtml(String(hid))} · Category 2 (Hard Case)</span>
-                                        ${renderStageLogBtn('verification')}
-                                    </div>
-                                    <div style="font-size:0.86em; margin-bottom:4px;">
-                                        <strong>Signal:</strong> <code>${escapeHtml(String(hc.signal_reason || ''))}</code>
-                                        &middot; <strong>Est. Severity:</strong> ${escapeHtml(String(hc.estimated_severity || ''))}
-                                    </div>
-                                    <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(hc.description || ''))}</div>
-                                    ${hc.concern_arguments ? `<div style="margin-top:4px;"><strong>Concern Arguments:</strong><div style="white-space:pre-wrap; margin-top:2px;">${escapeHtml(String(hc.concern_arguments))}</div></div>` : ''}
-                                    ${hc.dismissal_arguments ? `<div style="margin-top:6px;"><strong>Dismissal Arguments:</strong><div style="white-space:pre-wrap; margin-top:2px;">${escapeHtml(String(hc.dismissal_arguments))}</div></div>` : ''}
-                                    ${hc.verification_question ? `<div style="margin-top:6px; padding:6px 8px; border-left:3px solid var(--warn-border); background:var(--bg);"><strong>Verification Question:</strong><div style="white-space:pre-wrap; margin-top:2px;">${escapeHtml(String(hc.verification_question))}</div></div>` : ''}
-                                </div>
-                            `;
-                        }).join('');
-                    } else if (vKind === 'dismissed_1b') {
-                        verifDetailCards = vIds.map(vdId => {
-                            const vd = vdById.get(String(vdId));
-                            if (!vd) return '';
-                            return `
-                                <div class="rm-item-card">
-                                    <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:4px;">
-                                        <span class="rm-badge rm-badge-dismissed">${escapeHtml(String(vdId))} · Category 1b (Direct Dismissal)</span>
-                                        ${renderStageLogBtn('verification')}
-                                    </div>
-                                    <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(vd.description || ''))}</div>
-                                    ${vd.reasoning ? `<div style="white-space:pre-wrap;">${escapeHtml(String(vd.reasoning))}</div>` : ''}
-                                    ${renderReviewMapCodeSnippets(vd.locations)}
-                                </div>
-                            `;
-                        }).join('');
-                    }
-                    if (!verifDetailCards) {
-                        verifDetailCards = '<div style="color:var(--text-dim);">Not evaluated by verification stage.</div>';
-                    }
-
-                    // Detail Drawer Column 3: Post-Verification & Final Outcome
-                    let pvDetailCards = '';
-                    if (t.post_verification_id) {
-                        const pvId = String(t.post_verification_id);
-                        const pvStage = t.post_verification_stage ? String(t.post_verification_stage) : '';
-                        if (pvId.startsWith('PVF')) {
                             const pvf = pvfById.get(pvId);
                             if (pvf) {
-                                pvDetailCards = `
-                                    <div class="rm-item-card">
-                                        <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:4px;">
-                                            <span class="rm-badge rm-badge-confirmed">${escapeHtml(pvId)} · Confirmed in ${escapeHtml(pvStage || 'post-verification')}</span>
-                                            ${renderStageLogBtn(pvStage)}
+                                if (Array.isArray(pvf.locations) && pvf.locations.length > 0) primaryLocations = pvf.locations;
+                                historySteps.push(`
+                                    <div style="margin-top:8px;">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                            <span>
+                                                <span class="tag">${escapeHtml(pvStage)}</span>
+                                                <span class="text-muted-sm">Confirmed</span>
+                                            </span>
+                                            ${renderStageLogLink(pvStage)}
                                         </div>
-                                        ${t.finding_id ? `<div style="font-size:0.86em; margin-bottom:4px;"><strong>Permanent Finding ID:</strong> <code>${escapeHtml(String(t.finding_id))}</code></div>` : ''}
-                                        <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(pvf.problem || ''))}</div>
-                                        <div style="white-space:pre-wrap;">${escapeHtml(String(pvf.severity_explanation || ''))}</div>
-                                        ${renderReviewMapCodeSnippets(pvf.locations)}
+                                        ${pvf.severity_explanation ? `<div class="log-inline-block">${escapeHtml(String(pvf.severity_explanation))}</div>` : ''}
                                     </div>
-                                `;
+                                `);
                             }
                         } else {
                             const pvd = pvdById.get(pvId);
                             if (pvd) {
-                                pvDetailCards = `
-                                    <div class="rm-item-card">
-                                        <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:4px;">
-                                            <span class="rm-badge rm-badge-dismissed">${escapeHtml(pvId)} · Refuted in ${escapeHtml(pvStage || 'post-verification')}</span>
-                                            ${renderStageLogBtn(pvStage)}
+                                if (Array.isArray(pvd.locations) && pvd.locations.length > 0) primaryLocations = pvd.locations;
+                                historySteps.push(`
+                                    <div style="margin-top:8px;">
+                                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                            <span>
+                                                <span class="tag">${escapeHtml(pvStage)}</span>
+                                                <span class="text-muted-sm">Refuted</span>
+                                            </span>
+                                            ${renderStageLogLink(pvStage)}
                                         </div>
-                                        <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(pvd.description || ''))}</div>
-                                        ${pvd.reasoning ? `<div style="white-space:pre-wrap;">${escapeHtml(String(pvd.reasoning))}</div>` : ''}
-                                        ${renderReviewMapCodeSnippets(pvd.locations)}
+                                        ${pvd.reasoning ? `<div class="log-inline-block">${escapeHtml(String(pvd.reasoning))}</div>` : ''}
                                     </div>
-                                `;
+                                `);
                             }
                         }
-                    } else if (vKind === 'finding_1a') {
-                        const vf = vIds.length > 0 ? vfById.get(String(vIds[0])) : null;
-                        pvDetailCards = `
-                            <div class="rm-item-card">
-                                <div style="margin-bottom:4px;"><span class="rm-badge rm-badge-confirmed">Direct 1a Finding (No Post-Verification Needed)</span></div>
-                                ${t.finding_id ? `<div style="font-size:0.86em; margin-bottom:4px;"><strong>Permanent Finding ID:</strong> <code>${escapeHtml(String(t.finding_id))}</code></div>` : ''}
-                                ${vf ? `<div style="font-weight:600; margin-bottom:4px;">${escapeHtml(String(vf.problem || ''))}</div><div style="white-space:pre-wrap;">${escapeHtml(String(vf.severity_explanation || ''))}</div>` : ''}
-                            </div>
-                        `;
-                    } else if (vKind === 'dismissed_1b') {
-                        pvDetailCards = `<div style="color:var(--text-dim);">Dropped at Verification as a well-justified Category 1b dismissal (not routed to Post-Verification).</div>`;
-                    } else {
-                        pvDetailCards = `<div style="color:var(--text-dim);">No post-verification stage ran for this item.</div>`;
                     }
 
-                    const promptsFooter = Array.isArray(t.prompts) && t.prompts.length > 0
-                        ? `<div style="margin-top:6px; font-size:0.82em; color:var(--text-muted);"><strong>Prompts:</strong> ${t.prompts.map(p => `<span class="rm-prompt-pill">${escapeHtml(String(p))}</span>`).join(' ')}</div>`
+                    const pipelineHistoryHtml = historySteps.length > 0
+                        ? `
+                            <div>
+                                <div style="font-weight:bold; margin-bottom:4px;">Pipeline History</div>
+                                ${historySteps.join('')}
+                            </div>
+                        `
                         : '';
+                    const codeTraceHtml = renderReviewMapCodeSnippets(primaryLocations);
 
                     return `
-                        <tr id="rm-row-${idx}" class="rm-row" onclick="toggleReviewMapThread(${idx})">
-                            <td>
-                                <div style="display:flex; align-items:flex-start; gap:6px;">
-                                    <span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.8em; margin-top:2px; width:12px; display:inline-block;">▶</span>
-                                    <div>
-                                        <div style="font-weight:600; color:var(--text); margin-bottom:2px;">
-                                            <span style="color:var(--text-dim); font-family:monospace; font-size:0.88em; margin-right:4px;">[${escapeHtml(String(t.thread_id || `T${idx + 1}`))}]</span>
-                                            ${escapeHtml(String(t.title || 'Candidate issue'))}
-                                        </div>
-                                        <div style="font-size:0.86em;">${formatReviewMapLocations(t.locations)}</div>
-                                    </div>
-                                </div>
-                            </td>
-                            <td>${rawBadges}</td>
-                            <td>${verifCellHtml}</td>
-                            <td>${pvCellHtml}</td>
+                        <tr id="rm-row-${idx}" onclick="toggleReviewMapThread(${idx})">
+                            <td><span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(String(t.title || 'Candidate issue').trim())}</span></td>
+                            <td>${stageCellHtml}</td>
                             <td>${outcomeCellHtml}</td>
                         </tr>
                         <tr id="rm-detail-${idx}" class="rm-detail-row" style="display:none;">
-                            <td colspan="5">
-                                <div class="rm-detail-grid">
-                                    <div class="rm-detail-col">
-                                        <div class="rm-detail-col-title">1. Analysis Stage Arguments (${rawCIds.length}C &middot; ${rawDIds.length}D)</div>
-                                        ${rawDetailCards}
-                                    </div>
-                                    <div class="rm-detail-col">
-                                        <div class="rm-detail-col-title">2. Verification Triage</div>
-                                        ${verifDetailCards}
-                                    </div>
-                                    <div class="rm-detail-col">
-                                        <div class="rm-detail-col-title">3. Post-Verification &amp; Final Outcome</div>
-                                        ${pvDetailCards}
-                                        ${promptsFooter}
-                                    </div>
+                            <td colspan="3">
+                                <div class="review-card" style="margin-bottom:0;">
+                                    ${pipelineHistoryHtml}
+                                    ${codeTraceHtml}
                                 </div>
                             </td>
                         </tr>
                     `;
                 }).join('');
 
+            // 2. Stages Table
+            const activeStages = stages.map((s, idx) => ({ s, idx })).filter(x => !x.s.skipped);
+            const skippedStages = stages.filter(s => s.skipped);
+
+            let stagesSectionHtml = '';
+            if (stages.length > 0) {
+                const stageRowsHtml = activeStages.map(({ s, idx }) => {
+                    const tokensIn = Math.max(0, (s.tokens_in || 0) - (s.tokens_cached || 0));
+                    const tokensCached = s.tokens_cached || 0;
+                    const tokensOut = s.tokens_out || 0;
+
+                    const staticGuides = Array.isArray(stageGuidesObj[s.name]) ? stageGuidesObj[s.name] : [];
+                    const readGuides = Array.isArray(s.prompts_read) ? s.prompts_read : [];
+                    const allStageGuides = [...new Set([...staticGuides, ...readGuides])];
+                    const promptsCellHtml = allStageGuides.length > 0
+                        ? allStageGuides.map(g => `<span class="tag">${escapeHtml(String(g))}</span>`).join('')
+                        : '<span style="color:var(--text-dim);">—</span>';
+
+                    let outputCellHtml = '<span style="color:var(--text-dim);">—</span>';
+                    if (s.name === 'pre-screen') {
+                        if (preScreenPrompts.length > 0) {
+                            outputCellHtml = preScreenPrompts.map(g => `<span class="tag">${escapeHtml(String(g))}</span>`).join('');
+                        }
+                    } else {
+                        let outputParts = [];
+                        if (s.name === 'verification') {
+                            if (verifFindings.length > 0) outputParts.push(`${verifFindings.length} ${verifFindings.length === 1 ? 'finding' : 'findings'}`);
+                            if (hardCases.length > 0) outputParts.push(`${hardCases.length} ${hardCases.length === 1 ? 'hard case' : 'hard cases'}`);
+                            if (verifDismissed.length > 0) outputParts.push(`${verifDismissed.length} dismissed`);
+                        } else if (String(s.name || '').startsWith('post-verification')) {
+                            const cCount = s.concerns_count || 0;
+                            const dCount = s.dismissed_count || 0;
+                            if (cCount > 0) outputParts.push(`${cCount} confirmed`);
+                            if (dCount > 0) outputParts.push(`${dCount} refuted`);
+                        } else {
+                            const cCount = s.concerns_count || 0;
+                            const dCount = s.dismissed_count || 0;
+                            if (cCount > 0) outputParts.push(`${cCount} ${cCount === 1 ? 'concern' : 'concerns'}`);
+                            if (dCount > 0) outputParts.push(`${dCount} dismissed`);
+                        }
+                        if (outputParts.length > 0) {
+                            outputCellHtml = escapeHtml(outputParts.join(', '));
+                        }
+                    }
+
+                    const stageDisplayName = s.label || s.name;
+                    const showCodeName = s.label && s.label !== s.name;
+
+                    return `
+                        <tr id="rm-stage-row-${idx}" onclick="toggleReviewMapStageLog(${idx})">
+                            <td><span id="rm-stage-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><strong>${escapeHtml(String(stageDisplayName))}</strong>${showCodeName ? `<span class="text-muted-sm"> (<code>${escapeHtml(String(s.name))}</code>)</span>` : ''}</td>
+                            <td>${s.turns || 0}</td>
+                            <td class="text-muted-sm">${formatTokenCount(tokensIn)} / ${formatTokenCount(tokensCached)} / ${formatTokenCount(tokensOut)}</td>
+                            <td>${promptsCellHtml}</td>
+                            <td>${outputCellHtml}</td>
+                        </tr>
+                        <tr id="rm-stage-detail-${idx}" class="rm-detail-row" style="display:none;">
+                            <td colspan="5">
+                                <div class="review-card" style="margin-bottom:0;">
+                                    <div id="rm-stage-log-body-${idx}"></div>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+
+                const skippedFooterHtml = skippedStages.length > 0
+                    ? `<div class="text-muted-sm" style="margin-top:6px;">Skipped stages: ${skippedStages.map(s => `<code>${escapeHtml(String(s.name))}</code>`).join(', ')}</div>`
+                    : '';
+
+                stagesSectionHtml = `
+                    <div class="section">
+                        <h2>Stages (${activeStages.length})</h2>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Stage</th>
+                                    <th style="width:70px;">Turns</th>
+                                    <th style="width:200px;">Tokens (In / Cached / Out)</th>
+                                    <th>Prompts</th>
+                                    <th style="width:180px;">Output</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${stageRowsHtml}
+                            </tbody>
+                        </table>
+                        ${skippedFooterHtml}
+                    </div>
+                `;
+            }
+
             const tokensOut = data.tokens_out || 0;
             const tokensCached = data.tokens_cached || 0;
             const tokensIn = Math.max(0, (data.tokens_in || 0) - tokensCached);
+            const providerModel = data.model ? (data.provider ? `${data.provider}/${data.model}` : data.model) : '-';
+            const promptsHash = data.prompts_hash ? String(data.prompts_hash).substring(0, 8) : '';
 
-            const legacyNoticeHtml = reviewMap.legacy
-                ? `<div class="rm-strip" style="border-color:var(--warn-border); background:var(--warn-bg); color:var(--warn-text); font-size:0.88em;">
-                    This review was recorded before per-stage lineage IDs were persisted in <code>review_map</code>. Showing synthesized summary threads from final review output.
-                   </div>`
-                : '';
+            const statusRaw = data.status || 'Finished';
 
             document.getElementById('app').innerHTML = `
-                <div class="nav" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div class="nav" style="display:flex; justify-content:space-between; align-items:center;">
                     <div>
                         <a href="#/" onclick="event.preventDefault(); goBack();">← Back</a>
                         ${data.patchset_id ? `<span style="color:var(--text-dim); margin:0 6px;">&middot;</span><a href="#/patchset/${encodeURIComponent(data.patchset_id)}">Patchset #${escapeHtml(String(data.patchset_id))}</a>` : ''}
                     </div>
-                    <a href="#/log/${encodeURIComponent(id)}" style="font-weight:600;">View Full Raw Log →</a>
+                    <a href="#/log/${encodeURIComponent(id)}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">View Raw Log</a>
                 </div>
-                <h1 style="margin-bottom:6px;">
-                    <span>Review Map <span style="color:var(--text-muted); font-weight:normal;">#${escapeHtml(String(data.id || id))}</span></span>
-                    <span class="header-subtitle">
-                        ${data.model ? `${escapeHtml(data.provider ? data.provider + '/' + data.model : data.model)} &middot; ` : ''}
-                        In: ${tokensIn.toLocaleString()} / Cached: ${tokensCached.toLocaleString()} / Out: ${tokensOut.toLocaleString()} &middot;
-                        <span class="status-badge status-${(data.status || '').replace(/ /g, '')}">${escapeHtml(data.status || 'Finished')}</span>
-                    </span>
+                <h1>
+                    <span>${escapeHtml(data.subject || `Review #${data.id || id}`)}</span>
+                    <span class="status-badge status-${statusRaw.replace(/ /g, '')}">${escapeHtml(statusRaw)}</span>
                 </h1>
-                ${data.subject ? `<div style="color:var(--text-muted); font-size:0.95em; margin-bottom:12px;">${escapeHtml(String(data.subject))}</div>` : ''}
-                ${legacyNoticeHtml}
-                ${promptsStripHtml}
-                ${stagesBarHtml}
-                <div style="display:flex; justify-content:space-between; align-items:center; margin: 14px 0 8px 0;">
-                    <div style="font-weight:700; font-size:0.95em;">
-                        Concern &amp; Dismissal Lineage (${threads.length} consolidated ${threads.length === 1 ? 'thread' : 'threads'})
-                        <span style="font-weight:normal; color:var(--text-muted); font-size:0.88em; margin-left:6px;">Click any row to inspect stage-by-stage arguments and code proofs</span>
-                    </div>
-                    ${threads.length > 0 ? `<button type="button" id="rm-expand-all-btn" class="btn" onclick="toggleAllReviewMapThreads()" style="font-size:0.82em; padding:3px 10px;">Expand All Details</button>` : ''}
+
+                <div class="section">
+                    <div class="kv"><div class="label">Review:</div><div>#${escapeHtml(String(data.id || id))}${reviewMap.legacy ? ' <span class="text-muted-sm">(synthesized from final review output)</span>' : ''}</div></div>
+                    <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
+                    <div class="kv"><div class="label">Tokens:</div><div>In: ${formatTokenCount(tokensIn)} &middot; Cached: ${formatTokenCount(tokensCached)} &middot; Out: ${formatTokenCount(tokensOut)}</div></div>
+                    ${promptsHash ? `<div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>` : ''}
                 </div>
-                <div class="rm-table-wrap">
-                    <table class="rm-table">
+
+                <div class="section">
+                    <h2 style="display:flex; justify-content:space-between; align-items:center;">
+                        <span>Findings &amp; Concerns (${threads.length})</span>
+                        ${threads.length > 0 ? `<button type="button" id="rm-expand-all-btn" class="toggle-btn" onclick="toggleAllReviewMapThreads()" style="font-size:0.85em; font-weight:normal;">▶ Expand All</button>` : ''}
+                    </h2>
+                    <table>
                         <thead>
                             <tr>
-                                <th style="width:32%;">Location / Symbol</th>
-                                <th style="width:18%;">1. Analysis Stages</th>
-                                <th style="width:18%;">2. Verification (Triage)</th>
-                                <th style="width:16%;">3. Post-Verification</th>
-                                <th style="width:16%;">Final Outcome</th>
+                                <th>Issue</th>
+                                <th style="width:220px;">Stages</th>
+                                <th style="width:120px;">Outcome</th>
                             </tr>
                         </thead>
                         <tbody>
-                            ${rowsHtml}
+                            ${threadRowsHtml}
                         </tbody>
                     </table>
                 </div>
+
+                ${stagesSectionHtml}
             `;
         }
 
@@ -6685,9 +6433,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const avgTokensCached = tokenReviewCount ? Math.round(totalTokensCached / tokenReviewCount) : 0;
 
                 html += '<h3>Token Usage (last 1k reviews)</h3><div class="stat-card-grid">';
-                html += renderStatCard('Input tokens/patch', avgTokensIn);
-                html += renderStatCard('Cached tokens/patch', avgTokensCached);
-                html += renderStatCard('Out tokens/patch', avgTokensOut);
+                html += renderStatCard('Input tokens/patch', formatTokenCount(avgTokensIn));
+                html += renderStatCard('Cached tokens/patch', formatTokenCount(avgTokensCached));
+                html += renderStatCard('Out tokens/patch', formatTokenCount(avgTokensOut));
                 html += '</div>';
                 
                 html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
