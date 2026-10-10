@@ -4352,7 +4352,7 @@
             const tokensOut = (r.tokens_out || 0);
             const tokensCached = (r.tokens_cached || 0);
             const tokensIn = Math.max(0, (r.tokens_in || 0) - tokensCached);
-            const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
+            const tokenStr = `In: ${formatTokenCount(tokensIn)} &middot; Cached: ${formatTokenCount(tokensCached)} &middot; Out: ${formatTokenCount(tokensOut)}`;
 
             const summaryText = (r.summary || (outputJson && outputJson.summary) || '').trim();
             let summaryHtml = '';
@@ -5055,8 +5055,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return String(record.kind || 'stage').replace(/_run$/, '').replace(/_/g, ' ');
         }
 
+        // Format token counts >= 1000 as rounded whole thousands with a lowercase
+        // 'k' suffix (e.g. 625k, 1128k) rather than Intl.NumberFormat compact
+        // notation so stage tables, review headers, and stat cards share a single
+        // uniform thousand-token unit without mixed K/M scales or decimals.
         function formatTokenCount(value) {
-            return Number(value || 0).toLocaleString();
+            const n = Number(value || 0);
+            if (!Number.isFinite(n) || n <= 0) return '0';
+            const rounded = Math.round(n);
+            if (rounded < 1000) return String(rounded);
+            return `${Math.round(rounded / 1000)}k`;
         }
 
         // Shows the agent stages that ran for a bug and its duplicates, in the
@@ -6011,7 +6019,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <tr id="rm-stage-row-${idx}" onclick="toggleReviewMapStageLog(${idx})">
                             <td><span id="rm-stage-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><strong>${escapeHtml(String(stageDisplayName))}</strong>${showCodeName ? `<span class="text-muted-sm"> (<code>${escapeHtml(String(s.name))}</code>)</span>` : ''}</td>
                             <td>${s.turns || 0}</td>
-                            <td class="text-muted-sm">${tokensIn.toLocaleString()} / ${tokensCached.toLocaleString()} / ${tokensOut.toLocaleString()}</td>
+                            <td class="text-muted-sm">${formatTokenCount(tokensIn)} / ${formatTokenCount(tokensCached)} / ${formatTokenCount(tokensOut)}</td>
                             <td>${promptsCellHtml}</td>
                             <td>${outputCellHtml}</td>
                         </tr>
@@ -6037,7 +6045,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                 <tr>
                                     <th>Stage</th>
                                     <th style="width:70px;">Turns</th>
-                                    <th style="width:220px;">Tokens (In / Cached / Out)</th>
+                                    <th style="width:200px;">Tokens (In / Cached / Out)</th>
                                     <th>Prompts</th>
                                     <th style="width:180px;">Output</th>
                                 </tr>
@@ -6075,7 +6083,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <div class="section">
                     <div class="kv"><div class="label">Review:</div><div>#${escapeHtml(String(data.id || id))}${reviewMap.legacy ? ' <span class="text-muted-sm">(synthesized from final review output)</span>' : ''}</div></div>
                     <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
-                    <div class="kv"><div class="label">Tokens:</div><div>In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}</div></div>
+                    <div class="kv"><div class="label">Tokens:</div><div>In: ${formatTokenCount(tokensIn)} &middot; Cached: ${formatTokenCount(tokensCached)} &middot; Out: ${formatTokenCount(tokensOut)}</div></div>
                     ${promptsHash ? `<div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>` : ''}
                 </div>
 
@@ -6425,9 +6433,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const avgTokensCached = tokenReviewCount ? Math.round(totalTokensCached / tokenReviewCount) : 0;
 
                 html += '<h3>Token Usage (last 1k reviews)</h3><div class="stat-card-grid">';
-                html += renderStatCard('Input tokens/patch', avgTokensIn);
-                html += renderStatCard('Cached tokens/patch', avgTokensCached);
-                html += renderStatCard('Out tokens/patch', avgTokensOut);
+                html += renderStatCard('Input tokens/patch', formatTokenCount(avgTokensIn));
+                html += renderStatCard('Cached tokens/patch', formatTokenCount(avgTokensCached));
+                html += renderStatCard('Out tokens/patch', formatTokenCount(avgTokensOut));
                 html += '</div>';
                 
                 html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
