@@ -485,7 +485,9 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             let model = ai.model.clone();
             let enable_caching = ai.claude.as_ref().map(|c| c.prompt_caching).unwrap_or(true); // Default to enabled
             let claude = ai.claude.as_ref();
-            let max_tokens = claude.map(|c| c.max_tokens).unwrap_or(4096);
+            let max_tokens = claude
+                .map(|c| c.max_tokens)
+                .unwrap_or_else(crate::settings::default_claude_max_tokens);
             let base_url = claude
                 .and_then(|c| c.base_url.clone())
                 .unwrap_or_else(claude::ClaudeClient::default_base_url);

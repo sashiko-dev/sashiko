@@ -102,7 +102,7 @@ for structured error messages.
 ```toml
 [ai.claude]
 prompt_caching = true              # Default: true
-max_tokens = 4096                  # Max output tokens per request
+max_tokens = 32768                 # Default: 32768; max output tokens, thinking included
 base_url = "https://..."           # Override API endpoint
 thinking = "adaptive"              # Sent as thinking.type
 effort = "high"                    # Sent as output_config.effort: "low", "medium", "high", "xhigh", "max"

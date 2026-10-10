@@ -269,8 +269,10 @@ pub struct ClaudeSettings {
     pub effort: Option<String>,
 }
 
-fn default_claude_max_tokens() -> u32 {
-    4096
+/// Also the default when the `[ai.claude]` table is absent. Thinking counts
+/// toward it, so it leaves room for both the reasoning and the answer.
+pub(crate) fn default_claude_max_tokens() -> u32 {
+    32768
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1682,6 +1684,15 @@ mod tests {
         let opted_in: ServerSettings =
             toml::from_str("host = \"::\"\nport = 8080\nlog_sign_in_links = true").unwrap();
         assert!(opted_in.log_sign_in_links);
+    }
+
+    #[test]
+    fn test_claude_max_tokens_leaves_room_to_think() {
+        let claude: ClaudeSettings = toml::from_str("").unwrap();
+        assert_eq!(claude.max_tokens, 32768);
+
+        let capped: ClaudeSettings = toml::from_str("max_tokens = 4096").unwrap();
+        assert_eq!(capped.max_tokens, 4096);
     }
 
     #[test]
