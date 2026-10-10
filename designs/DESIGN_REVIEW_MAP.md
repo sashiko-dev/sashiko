@@ -185,29 +185,17 @@ Review #10 (Patch 2) [INLINE]   View Review Map · View Raw Log
 ```
 Clicking **`View Review Map`** navigates to `#/map/<review_id>`.
 
-### 4.2 Single-Screen Layout (Option A: Swimlane / Lineage Table)
-1. **Header Bar:**
-   - Breadcrumb navigation (`← Back to Patchset`), Review ID, patch index, model, inline status badge, total tokens/turns, and a quick link to `Full Raw Log →`.
-2. **Prompts Included Strip:**
-   - Compact pill badges grouped by source:
-     - `base` (`README.md`, `false-positives-guide.md`)
-     - `pre-screen` (`selected_guides` chosen by `pre-screen`)
-     - `stage` (stage-specific guides for stages that executed)
-     - `tool-read` (extra guides dynamically loaded via `read_prompt`)
-3. **Stage Execution Pipeline Bar:**
-   - Horizontal row of stage pills in execution order (`pre-screen`, `goal`, `implementation`, `execution-flow`, `resources`, `locking`, `security`, `hardware`, `verification`, `post-verification-1..N`, `report`).
-   - Each pill shows turn count (`3t`), raw signal counts (`1C · 2D`), or `skipped` (dimmed).
-   - Clicking any active stage pill toggles an inline **Stage Transcript Drawer** right below the bar, rendering only `logs.slice(stage.log_start, stage.log_end)` using the structured message/tool-call renderer.
-4. **Concern Lineage Table (All Consolidated Threads Visible):**
+### 4.2 Simplified Layout Matching Sashiko Visual Style
+1. **Header & Metadata Section:**
+   - Standard `patchset-header` with patchset/patch subject, Review ID, model, token summary, and `prompts_hash`.
+   - Pre-screen guides (`prompts.pre_screen`) are displayed inline right after the `pre-screen` stage output in the Stages table; per-stage static and tool-read guides appear in each stage row's `Prompts` column.
+2. **Findings & Concerns Table (`Issue` | `Stages` | `Outcome`):**
    - Sorted with confirmed findings first (ordered by severity `Critical` > `High` > `Medium` > `Low`), followed by hard cases refuted in `post-verification`, followed by `1b` direct dismissals.
-   - Columns:
-     - `Location / Symbol` (`file:line` and function/symbol)
-     - `1. Analysis Stages` (badges for each `C*` in amber/red and `D*` in green/slate with stage name)
-     - `2. Verification (Triage)` (`1a: Well-Justified Finding (VF*)`, `2: Contested / Speculative (H*)`, or `1b: Well-Justified Dismissal (VD*)`)
-     - `3. Post-Verification` (`PV-1 ✓ Confirmed`, `PV-2 ✗ Refuted`, or `— (Fast-Path)`)
-     - `Final Outcome` (`[HIGH] Introduced` + copyable `<project>-<uuid>` badge, `Refuted in Post-Verify`, or `Dismissed in Triage (1b)`)
-5. **Expandable 3-Column Detail Drawer (Hidden by Default):**
-   - Clicking any table row expands an inline 3-column comparison panel:
-     - **Column 1 — Raw Stage Arguments:** Full `description`, `reasoning`, `locations`, `code_snippet`, and `prompts_read` for every contributing `C*` and `D*`.
-     - **Column 2 — Verification Triage (`VF*` / `H*` / `VD*`):** Full `signal_reason`, `concern_arguments`, `dismissal_arguments`, `verification_question`, or direct finding/dismissal explanation.
-     - **Column 3 — Post-Verification & Final Finding (`PVF*` / `PVD*`):** Full `reasoning` / proof from `post-verification-N` (with a button to jump directly to that stage's transcript slice) and, if confirmed, the final `severity_explanation` and permanent `<project>-<uuid>`.
+   - Collapsed rows show only the 1-line issue title, the chronological list of stage tags (`locking`, `verification`, `post-verification-1`), and the final outcome (`High`, `Refuted`, `Dismissed`).
+3. **Expandable Issue Card (`Pipeline History` + `Code Trace`):**
+   - **Pipeline History:** Chronological progression across stages (`Raised concern` / `Dismissed in stage` -> `verification` -> `post-verification-N` confirmation or refutation), each with a `View stage log` link. For escalated hard cases (`H*`), `verification` displays `verification_question` and, whenever `verification` merged multiple concerns, resolved competing signals, or promoted a standalone dismissal, also displays the synthesized `concern_arguments` and `dismissal_arguments` (omitting `concern_arguments` only for a single uncontested concern whose reasoning is already shown in the immediately preceding step).
+   - **Code Trace:** Single clean container listing numbered call-stack/proof locations (`file:line (symbol)`), explanation, and dedented code snippets.
+4. **Stages Table (`Stage` | `Turns` | `Tokens (In / Cached / Out)` | `Prompts` | `Output`):**
+   - Lists active stages in execution order (with skipped stages summarized on a muted footer line).
+   - Clicking any stage row expands an inline transcript drawer rendering only `logs.slice(stage.log_start, stage.log_end)`.
+
