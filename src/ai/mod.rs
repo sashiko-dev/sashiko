@@ -315,8 +315,9 @@ pub struct AiUsage {
     /// Number of tokens served from cache.  A breakdown of `prompt_tokens`
     /// rather than an addend: a consumer subtracts it to get uncached input.
     /// A provider whose API reports the cached prefix outside its prompt
-    /// total folds it in before filling these fields.  None when the
-    /// provider reports no cache hit.
+    /// total folds it in before filling these fields. None when the provider
+    /// does not supply cache accounting; some providers normalize missing
+    /// or unusable counts to Some(0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<usize>,
 }
@@ -529,13 +530,31 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 _ => openai::OpenAiProviderType::OpenAiCompatible,
             };
 
+            let openai_settings = ai.openai.as_ref();
+
+            let api_type = match openai_settings.and_then(|s| s.api.as_deref()) {
+                None | Some("chat") => openai::OpenAiApiType::Chat,
+                Some("responses") => openai::OpenAiApiType::Responses,
+                Some(api) => bail!(
+                    "Invalid ai.openai.api '{}'. Allowed values: chat, responses",
+                    api
+                ),
+            };
+
+            let default_base_url = match api_type {
+                openai::OpenAiApiType::Responses => {
+                    openai::OpenAiCompatClient::default_base_url_for_responses()
+                }
+                openai::OpenAiApiType::Chat => {
+                    openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
+                }
+            };
+
             let base_url = ai
                 .openai_compat
                 .as_ref()
                 .and_then(|c| c.base_url.clone())
-                .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
-                });
+                .unwrap_or(default_base_url);
 
             let context_window = ai
                 .openai_compat
@@ -551,13 +570,28 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .and_then(|c| c.max_tokens)
                 .unwrap_or(4096);
 
+            let reasoning_effort = openai_settings.and_then(|s| s.reasoning_effort.clone());
+
+            if let Some(ref effort) = reasoning_effort {
+                const ALLOWED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+                if !ALLOWED_REASONING_EFFORTS.contains(&effort.as_str()) {
+                    bail!(
+                        "Invalid reasoning_effort '{}'. Allowed values: {:?}",
+                        effort,
+                        ALLOWED_REASONING_EFFORTS
+                    );
+                }
+            }
+
             let provider = openai::OpenAiCompatClient::new(
                 base_url,
                 provider_type,
+                api_type,
                 ai.model.clone(),
                 context_window,
                 max_tokens,
                 ai.api_timeout_secs,
+                reasoning_effort,
             )?;
 
             Ok(Arc::new(provider))
@@ -1463,6 +1497,54 @@ mod tests {
         let provider = create_provider_cached(&settings.ai, Some(&nested_db_str)).await?;
         assert_eq!(provider.get_capabilities().model_name, "gemini-1.5-flash");
         assert!(nested_db.parent().unwrap().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn regression_openai_defaults_to_chat() -> Result<()> {
+        for provider in ["openai", "openai-compatible"] {
+            let ai: crate::settings::AiSettings = toml::from_str(&format!(
+                "provider = '{provider}'\nmodel = 'o1'\n[openai_compat]\nbase_url = 'https://api.openai.com/v1/chat/completions'"
+            ))?;
+            let client = create_provider_from_ai(&ai)?;
+            assert!(client.cache_identity().contains("/chat/completions"));
+            assert!(!client.cache_identity().contains("reasoning_effort="));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn regression_openai_rejects_unknown_configuration() {
+        assert!(
+            toml::from_str::<crate::settings::OpenAiSettings>("reasoning_efort = 'high'").is_err()
+        );
+    }
+
+    #[test]
+    fn regression_openai_rejects_unknown_api() -> Result<()> {
+        let ai = toml::from_str("provider = 'openai'\nmodel = 'o1'\n[openai]\napi = 'response'")?;
+        assert!(create_provider_from_ai(&ai).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn regression_openai_explicit_responses_requires_matching_url() -> Result<()> {
+        let ai = toml::from_str("provider = 'openai'\nmodel = 'o1'\n[openai]\napi = 'responses'")?;
+        assert!(
+            create_provider_from_ai(&ai)?
+                .cache_identity()
+                .contains("/responses")
+        );
+        let ai = toml::from_str(
+            "provider = 'openai'\nmodel = 'o1'\n[openai]\napi = 'responses'\n[openai_compat]\nbase_url = 'https://api.openai.com/v1/chat/completions'",
+        )?;
+        assert!(
+            create_provider_from_ai(&ai)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("configure /responses or a base URL")
+        );
         Ok(())
     }
 }

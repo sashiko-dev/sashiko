@@ -141,6 +141,10 @@ prompt_caching = true
 # thinking = "adaptive"   # Adaptive thinking (Opus 4.6, Sonnet 4.6, and later)
 # effort = "high"         # Effort: "low", "medium", "high", "xhigh", "max"
 
+# [ai.openai]
+# api = "chat"  # Default for both OpenAI providers; opt in with "responses"
+# reasoning_effort = "high"  # Optional: low, medium, high, xhigh; omitted by default
+
 # [ai.claude_cli]
 # effort = "high"   # Thinking effort: "low", "medium", "high", "xhigh", "max"
 

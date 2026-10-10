@@ -150,15 +150,32 @@ Settings for the Gemini provider (`provider = "gemini"`).
 |-----|------|---------|-------------|
 | `explicit_prompt_caching` | bool | `false` | Use explicit caching hints in requests. |
 
+#### `[ai.openai]`
+
+Settings for `provider = "openai"` and `provider = "openai-compatible"`.
+Unknown keys and unsupported values are rejected at startup.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `api` | string | `"chat"` | API protocol: `"chat"` for Chat Completions or `"responses"` for the Responses API. Responses requires explicit opt-in for both providers. |
+| `reasoning_effort` | string | omitted | Optional reasoning effort: `"low"`, `"medium"`, `"high"`, `"xhigh"`. Omitted by default to preserve the model's own default. Choose a value supported by the model and endpoint. |
+
+With Responses, `ai.openai_compat.base_url` must be a full `/responses`
+endpoint or a base URL ending in `/v1`, `/api/v1`, or no path. An explicitly
+selected API rejects a URL for the other API with a configuration error;
+existing `/chat/completions` URLs keep working with the default Chat API.
+Responses conversation history is sent on each request rather than stored
+through a previous response ID.
+
 #### `[ai.openai_compat]`
 
 Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-compatible"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
+| `base_url` | string | model-derived | API endpoint URL. For Chat, derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. With `ai.openai.api = "responses"`, defaults to `https://api.openai.com/v1/responses`. |
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
-| `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
+| `max_tokens` | integer | `4096` | Max output tokens per response. Sent as `max_output_tokens` with Responses, `max_completion_tokens` with the OpenAI Chat provider, or `max_tokens` with compatible Chat providers. The OpenAI caps include reasoning tokens as well as the reply. |
 
 #### `[ai.kiro_cli]`
 

@@ -372,6 +372,13 @@ pub struct OpenAiCompatSettings {
     pub max_tokens: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiSettings {
+    pub api: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -541,6 +548,7 @@ pub struct AiSettings {
     pub openai_compat: Option<OpenAiCompatSettings>,
     pub ollama: Option<OllamaSettings>,
     pub vllm: Option<VllmSettings>,
+    pub openai: Option<OpenAiSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
     pub goose_cli: Option<GooseCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
