@@ -19,7 +19,6 @@ Previously, the only built-in way to inspect how a review arrived at its conclus
    - Stamp deterministic short IDs on all raw specialist concerns (`C1..Cn`) and dismissed concerns (`D1..Dm`).
    - Require `verification` to emit `"source_ids": ["C1", "D2", ...]` on every output item across `findings`, `hard_cases`, and `dismissed_concerns`, and enforce in `validate_verification_stage_output` that **every** input `C1..Cn` and `D1..Dm` is referenced at least once (and that Category `1b` `dismissed_concerns` only reference `D*` IDs, never `C*` IDs).
    - Stamp deterministic IDs (`VF1..`, `VD1..`, `H1..Hk`) on `verification` outputs and require each `post-verification-N` stage to emit `"source_ids": ["H1", ...]` referencing the hard case IDs in its batch, validated by `validate_post_verification_batch_output`.
-   - Mint a permanent `<project>-<uuid>` (`uuid::Uuid::new_v4()`) on every verified finding in `findings[]`.
 3. **Prompt Provenance & Per-Stage Transcript Slicing:**
    - Record a `StageRunRecord` for every executed or skipped stage in `WorkflowEngine`, including exact turn counts, token usage, `prompts_read`, and `[history_start, history_end)` indices into `reviews.logs`.
    - Clicking any stage pill in the Review Map opens an inline drawer displaying **only** that stage's LLM conversation slice from `reviews.logs`.
@@ -47,18 +46,12 @@ flowchart LR
         PVD["Refuted Hard Cases\nPVD1 .. PVDs\nsource_ids: [H*]"]
     end
 
-    subgraph Final ["4. Final Verified Findings"]
-        UUID["Verified Finding\nid: <project>-<uuid>"]
-    end
-
     C --> VF
     C --> H
     D --> H
     D --> VD
     H --> PVF
     H --> PVD
-    VF --> UUID
-    PVF --> UUID
 ```
 
 ### 2.1 Deterministic Stage Artifact IDs
@@ -67,10 +60,10 @@ flowchart LR
 | :--- | :--- | :--- | :--- | :--- |
 | Specialist Stages (`goal`, `implementation`, `execution-flow`, `resources`, `locking`, `security`, `hardware`) | `state.all_concerns` | `C1` .. `Cn` | `source_stage`, `prompts_read` | Must appear in `verification` (`VF*` or `H*`) |
 | Specialist Stages | `state.all_dismissed_concerns` | `D1` .. `Dm` | `source_stage`, `prompts_read` | Must appear in `verification` (`VD*` or `H*`) |
-| `verification` | `findings[]` (Category `1a`) | `VF1` .. `VFp` | `source_ids: ["C1", ...]` | Promoted directly to final `findings[]` with `<project>-<uuid>` |
+| `verification` | `findings[]` (Category `1a`) | `VF1` .. `VFp` | `source_ids: ["C1", ...]` | Promoted directly to final `findings[]` |
 | `verification` | `dismissed_concerns[]` (Category `1b`) | `VD1` .. `VDq` | `source_ids: ["D1", ...]` | Terminal `Dismissed (1b)` |
 | `verification` | `hard_cases[]` (Category `2`) | `H1` .. `Hk` | `source_ids: ["C2", "D1", ...]` | Routed to `post-verification-1..N` (`assigned_stage`) |
-| `post-verification-1..N` | `findings[]` | `PVF1` .. `PVFr` | `source_ids: ["H1", ...]` | Promoted to final `findings[]` with `<project>-<uuid>` |
+| `post-verification-1..N` | `findings[]` | `PVF1` .. `PVFr` | `source_ids: ["H1", ...]` | Promoted to final `findings[]` |
 | `post-verification-1..N` | `dismissed_concerns[]` | `PVD1` .. `PVDs` | `source_ids: ["H2", ...]` | Terminal `Refuted in Post-Verification` |
 
 ### 2.2 Validator Invariants
@@ -81,7 +74,6 @@ flowchart LR
    - **Category 1a Uncontested Rule:** An item in `output.findings` (Category `1a`) may **only** reference IDs in $C$. Any contested concern ($C_i + D_j$) or promoted dismissal ($D_j$) must be placed in `hard_cases`.
    - **No Unaudited Concern Drop Rule:** An item in `output.dismissed_concerns` (Category `1b`) may **only** reference IDs in $D$. If an item in `output.dismissed_concerns` references any ID in $C$, validation fails with an actionable error instructing the model that any concern $C_i$ that is contested or believed to be a false positive must be placed in `hard_cases` (`SpeculativeOrContested`) for tool-assisted verification rather than dropped in Category `1b`.
    - **100% Coverage Rule:** The union of `source_ids` across all items in `output.findings`, `output.hard_cases`, and `output.dismissed_concerns` must equal $C \cup D$. If any input ID is missing, validation fails and lists the exact unaccounted IDs (e.g., `["C3", "D2"]`) so the LLM retry includes them.
-   - **Prompt Cache Determinism:** When `record_verified_findings` mints a random `<project>-<uuid>` (`Uuid::new_v4()`) on confirmed findings in `state.findings`, trailing stages (`report_stage`, `summary_stage`) strip `"id"` and `"finding_id"` via `serialize_findings_for_prompt` before rendering `{{findings}}` so `CachingAiProvider` request hashes remain deterministic across reruns.
 
 2. **`validate_post_verification_batch_output`:**
    - Given the batch's expected hard case IDs $H_{\text{batch}} = \{h.\text{id} \mid h \in \text{batch}\}$, every item in `output.findings` and `output.dismissed_concerns` must have a non-empty `source_ids: Vec<String>` subset of $H_{\text{batch}}$.
@@ -159,7 +151,6 @@ When `Worker::run` constructs `self.global_history` (which begins with 1 system 
     {
       "thread_id": "T1",
       "outcome": "finding",
-      "finding_id": "linux-550e8400-e29b-41d4-a716-446655440000",
       "severity": "High",
       "preexisting": false,
       "locations": [{ "file": "net/core/sock.c", "line": 418, "symbol": "sk_free()" }],

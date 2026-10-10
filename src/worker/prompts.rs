@@ -1737,12 +1737,7 @@ mod tests {
                 .expect("worker should succeed");
             let output = res.output.expect("worker output");
             assert_eq!(output["findings"].as_array().unwrap().len(), 1);
-            assert!(
-                output["findings"][0]["finding_id"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with(&format!("{}-", project.as_str()))
-            );
+            assert_eq!(output["findings"][0]["id"], "VF1");
             assert_eq!(output["review_map"]["project"], project.as_str());
             assert_eq!(output["review_map"]["threads"].as_array().unwrap().len(), 1);
             assert_eq!(output["review_inline"], "");
