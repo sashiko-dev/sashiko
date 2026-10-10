@@ -5,6 +5,6 @@ max_input_tokens = 40000
 
 [ai.claude]
 prompt_caching = true
-max_tokens = 4096
+max_tokens = 32768
 # thinking = "adaptive"
 # effort = "high"

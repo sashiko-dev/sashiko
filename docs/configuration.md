@@ -121,7 +121,7 @@ Settings specific to the Claude API provider (`provider = "claude"`).
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `prompt_caching` | bool | `true` | Enable Anthropic prompt caching (5-minute TTL). |
-| `max_tokens` | integer | `4096` | Max output tokens per response, thinking included. A model that thinks needs more than the default. |
+| `max_tokens` | integer | `32768` | Max output tokens per response, thinking included. |
 | `base_url` | string | -- | Override the API base URL (optional, for proxies like Portkey). |
 | `thinking` | string | -- | Thinking mode, sent as `thinking.type`: `"adaptive"` (Opus 4.6, Sonnet 4.6, and later), or `"disabled"` where the model allows it. |
 | `effort` | string | -- | Effort level, sent as `output_config.effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Which levels a model accepts, and its default, vary by model. |
