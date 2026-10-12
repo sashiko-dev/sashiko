@@ -2308,6 +2308,23 @@ async fn forge_webhook(
         format!("{}-{}", repo, metadata.pr_number)
     });
 
+    // Written whenever the forge sent a body, empty included: a description
+    // the author cleared must not leave the previous text behind for the
+    // series review to read.
+    if let Some(ref pr_body) = metadata.pr_body {
+        state
+            .db
+            .update_message_body(&placeholder_id, pr_body.trim())
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to store PR description body for {}: {}",
+                    placeholder_id, e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
     state
         .db
         .create_fetching_patchset(
