@@ -30,8 +30,9 @@ use tracing::{info, warn};
 
 const MAX_MBOX_MESSAGES: usize = 500;
 const MAX_PREREQUISITE_PATCH_IDS: usize = 128;
+const MAX_PREREQUISITE_SERIES: usize = 128;
 const MAX_LORE_OPERATIONS: usize = 8;
-const MAX_BASED_ON_DEPTH: usize = 8;
+const MAX_PREREQUISITE_DEPTH: usize = 8;
 const MAX_CONCURRENT_GIT_PATCH_IDS: usize = 8;
 const GIT_PATCH_ID_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -53,6 +54,7 @@ enum PrerequisiteMetadata {
         patch_ids: Vec<String>,
         message_ids: Vec<String>,
     },
+    MessageIds(Vec<String>),
     BasedOn(String),
 }
 
@@ -64,51 +66,51 @@ struct PrerequisiteSeries {
     patches: Vec<PrerequisitePatch>,
 }
 
+fn metadata_values<'a>(body: &'a str, field: &'a str) -> impl Iterator<Item = &'a str> {
+    body.lines().filter_map(move |line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case(field).then(|| value.trim())
+    })
+}
+
+fn parse_message_id<'a>(value: &'a str, field: &str) -> Result<&'a str> {
+    let has_open = value.starts_with('<');
+    if has_open != value.ends_with('>') {
+        bail!("{field} metadata has unmatched angle brackets");
+    }
+    let message_id = if has_open {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if message_id.is_empty() {
+        bail!("{field} metadata has an empty message ID");
+    }
+    if message_id.len() > 998 {
+        bail!("{field} message ID exceeds 998 bytes");
+    }
+    if !message_id.is_ascii()
+        || message_id
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || message_id.contains(['<', '>'])
+    {
+        bail!("{field} metadata contains an invalid message ID");
+    }
+    let Some((local, domain)) = message_id.split_once('@') else {
+        bail!("{field} metadata does not contain a message ID");
+    };
+    if local.is_empty() || domain.is_empty() {
+        bail!("{field} metadata contains an invalid message ID");
+    }
+    Ok(message_id)
+}
+
 fn parse_based_on_message_id(body: &str) -> Result<Option<String>> {
     let mut based_on = None;
 
-    for line in body.lines() {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if !name.eq_ignore_ascii_case("based-on") {
-            continue;
-        }
-
-        let value = value.trim();
-        if value.is_empty() {
-            bail!("Based-on metadata has an empty message ID");
-        }
-        let has_open = value.starts_with('<');
-        let has_close = value.ends_with('>');
-        if has_open != has_close {
-            bail!("Based-on metadata has unmatched angle brackets");
-        }
-        let message_id = if has_open {
-            &value[1..value.len() - 1]
-        } else {
-            value
-        };
-        if message_id.is_empty() {
-            bail!("Based-on metadata has an empty message ID");
-        }
-        if message_id.len() > 998 {
-            bail!("Based-on message ID exceeds 998 bytes");
-        }
-        if !message_id.is_ascii()
-            || message_id
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-            || message_id.contains(['<', '>'])
-        {
-            bail!("Based-on metadata contains an invalid message ID");
-        }
-        let Some((local, domain)) = message_id.split_once('@') else {
-            bail!("Based-on metadata does not contain a message ID");
-        };
-        if local.is_empty() || domain.is_empty() {
-            bail!("Based-on metadata contains an invalid message ID");
-        }
+    for value in metadata_values(body, "Based-on") {
+        let message_id = parse_message_id(value, "Based-on")?;
 
         match based_on.as_deref() {
             Some(existing) if existing != message_id => {
@@ -125,43 +127,47 @@ fn parse_based_on_message_id(body: &str) -> Result<Option<String>> {
 fn parse_prerequisite_metadata(body: &str) -> Result<Option<PrerequisiteMetadata>> {
     let patch_ids = parse_prerequisite_patch_ids(body)?;
     if !patch_ids.is_empty() {
-        // Git's explicit patch list and order take precedence over Based-on.
+        // Git's explicit patch list and order take precedence over whole series.
         return Ok(Some(PrerequisiteMetadata::PatchIds {
             patch_ids,
-            message_ids: parse_prerequisite_message_ids(body),
+            message_ids: parse_prerequisite_thread_hints(body),
         }));
+    }
+    // Invalid patch-ID metadata must not broaden or silently drop dependencies.
+    if metadata_values(body, "prerequisite-patch-id")
+        .next()
+        .is_some()
+    {
+        bail!("prerequisite-patch-id metadata contains no valid patch IDs");
+    }
+    let message_ids = parse_prerequisite_series_ids(body)?;
+    if !message_ids.is_empty() {
+        return Ok(Some(PrerequisiteMetadata::MessageIds(message_ids)));
     }
     Ok(parse_based_on_message_id(body)?.map(PrerequisiteMetadata::BasedOn))
 }
 
-fn parse_prerequisite_message_ids(body: &str) -> Vec<String> {
+fn parse_prerequisite_series_ids(body: &str) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
     let mut seen = HashSet::new();
-    body.lines()
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            if !name.eq_ignore_ascii_case("prerequisite-message-id") {
-                return None;
+    for value in metadata_values(body, "prerequisite-message-id") {
+        let message_id = parse_message_id(value, "prerequisite-message-id")?;
+        if seen.insert(message_id) {
+            if ids.len() == MAX_PREREQUISITE_SERIES {
+                bail!(
+                    "metadata contains more than {MAX_PREREQUISITE_SERIES} unique prerequisite message IDs"
+                );
             }
-            let value = value.trim();
-            let message_id = if let Some(value) = value.strip_prefix('<') {
-                value.strip_suffix('>')?
-            } else {
-                value
-            };
-            let (local, domain) = message_id.split_once('@')?;
-            if local.is_empty()
-                || domain.is_empty()
-                || message_id.len() > 998
-                || !message_id.is_ascii()
-                || message_id.contains(['<', '>'])
-                || message_id
-                    .bytes()
-                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-            {
-                return None;
-            }
-            Some(message_id)
-        })
+            ids.push(message_id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn parse_prerequisite_thread_hints(body: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    metadata_values(body, "prerequisite-message-id")
+        .filter_map(|value| parse_message_id(value, "prerequisite-message-id").ok())
         .filter(|message_id| seen.insert(*message_id))
         // Hints are optional; retaining more than the request budget cannot
         // help resolution and would let unrelated metadata grow this cache.
@@ -174,15 +180,7 @@ pub(crate) fn parse_prerequisite_patch_ids(body: &str) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
 
-    for line in body.lines() {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if !name.eq_ignore_ascii_case("prerequisite-patch-id") {
-            continue;
-        }
-
-        let id = value.trim();
+    for id in metadata_values(body, "prerequisite-patch-id") {
         if id.len() != 40 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
@@ -413,19 +411,19 @@ fn select_series_head(
     let head_index = *head_index;
     let (head, head_patch) = &parsed[head_index];
     if !head.is_patch_or_cover {
-        bail!("Based-on message {requested_message_id} is not a patch series head");
+        bail!("prerequisite message {requested_message_id} is not a patch series head");
     }
     match head.index {
         0 if head_patch.is_none() => {}
         1 if head_patch.is_some() && !has_matching_cover_ancestor(parsed, head) => {}
-        _ => bail!("Based-on message {requested_message_id} is not the head of its series"),
+        _ => bail!("prerequisite message {requested_message_id} is not the head of its series"),
     }
     if head.total == 0 {
-        bail!("Based-on series {requested_message_id} has no patches");
+        bail!("prerequisite series {requested_message_id} has no patches");
     }
     if head.total as usize > MAX_PREREQUISITE_PATCH_IDS {
         bail!(
-            "Based-on series {requested_message_id} contains more than {MAX_PREREQUISITE_PATCH_IDS} patches"
+            "prerequisite series {requested_message_id} contains more than {MAX_PREREQUISITE_PATCH_IDS} patches"
         );
     }
 
@@ -465,14 +463,14 @@ fn select_series_patches(
         if metadata.index == 0 || metadata.index > head.total || metadata.index != patch.part_index
         {
             bail!(
-                "Based-on series {requested_message_id} has invalid part {}/{}",
+                "prerequisite series {requested_message_id} has invalid part {}/{}",
                 metadata.index,
                 head.total
             );
         }
         if !seen_parts.insert(metadata.index) {
             bail!(
-                "Based-on series {requested_message_id} has duplicate part {}/{}",
+                "prerequisite series {requested_message_id} has duplicate part {}/{}",
                 metadata.index,
                 head.total
             );
@@ -481,7 +479,7 @@ fn select_series_patches(
     }
     if selected.len() != head.total as usize {
         bail!(
-            "Based-on series {requested_message_id} is incomplete: found {} of {} patches",
+            "prerequisite series {requested_message_id} is incomplete: found {} of {} patches",
             selected.len(),
             head.total
         );
@@ -505,7 +503,7 @@ async fn materialize_series_patches(
     for ((metadata, patch), patch_id) in selected.into_iter().zip(patch_ids) {
         let git_patch_id = patch_id?.ok_or_else(|| {
             anyhow!(
-                "Based-on series {requested_message_id} part {} has no stable patch ID",
+                "prerequisite series {requested_message_id} part {} has no stable patch ID",
                 patch.part_index
             )
         })?;
@@ -674,6 +672,7 @@ struct PrerequisiteResolver<'a, R: ?Sized> {
     remote: &'a R,
     remote_operations: usize,
     series_cache: HashMap<String, PrerequisiteSeries>,
+    resolved_series: HashSet<String>,
     patch_cache: HashMap<String, PrerequisitePatch>,
     active_message_ids: HashSet<String>,
     active_patchset_ids: HashSet<i64>,
@@ -688,6 +687,7 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
             remote,
             remote_operations: 0,
             series_cache: HashMap::new(),
+            resolved_series: HashSet::new(),
             patch_cache: HashMap::new(),
             active_message_ids: HashSet::new(),
             active_patchset_ids: HashSet::new(),
@@ -710,6 +710,9 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
         let message_id = clean_message_id(message_id);
         if let Some(series) = self.series_cache.get(message_id) {
             return Ok(series.clone());
+        }
+        if self.series_cache.len() == MAX_PREREQUISITE_SERIES {
+            bail!("resolving prerequisites requires more than {MAX_PREREQUISITE_SERIES} series");
         }
 
         let series = if let Some(stored) = self
@@ -874,6 +877,12 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
                 patch_ids,
                 message_ids,
             } => self.resolve_patch_ids(&patch_ids, &message_ids).await,
+            PrerequisiteMetadata::MessageIds(message_ids) => {
+                for message_id in message_ids {
+                    self.resolve_series(message_id, depth).await?;
+                }
+                Ok(())
+            }
             PrerequisiteMetadata::BasedOn(message_id) => {
                 self.resolve_series(message_id, depth).await
             }
@@ -886,12 +895,15 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
         depth: usize,
     ) -> BoxFuture<'resolver, Result<()>> {
         Box::pin(async move {
-            if depth > MAX_BASED_ON_DEPTH {
-                bail!("Based-on dependency chain exceeds {MAX_BASED_ON_DEPTH} series");
+            if depth > MAX_PREREQUISITE_DEPTH {
+                bail!("prerequisite dependency chain exceeds {MAX_PREREQUISITE_DEPTH} series");
             }
             let requested_id = clean_message_id(&message_id).to_string();
             if self.active_message_ids.contains(&requested_id) {
-                bail!("Based-on dependency cycle includes {requested_id}");
+                bail!("prerequisite dependency cycle includes {requested_id}");
+            }
+            if self.resolved_series.contains(&requested_id) {
+                return Ok(());
             }
 
             let series = self.load_series(&requested_id).await?;
@@ -901,7 +913,7 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
                     .local_patchset_id
                     .is_some_and(|id| self.active_patchset_ids.contains(&id))
             {
-                bail!("Based-on dependency cycle includes {actual_id}");
+                bail!("prerequisite dependency cycle includes {actual_id}");
             }
 
             self.active_message_ids.insert(requested_id.clone());
@@ -925,6 +937,9 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
             self.active_message_ids.remove(&actual_id);
             if let Some(patchset_id) = series.local_patchset_id {
                 self.active_patchset_ids.remove(&patchset_id);
+            }
+            if result.is_ok() {
+                self.resolved_series.insert(actual_id);
             }
             result
         })
@@ -1331,24 +1346,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_based_on_without_valid_b4_patch_ids() -> Result<()> {
+    fn parses_series_without_active_patch_id_metadata() -> Result<()> {
         for b4_metadata in [
             "",
-            "prerequisite-patch-id: short",
             "> prerequisite-patch-id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             " prerequisite-patch-id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "+prerequisite-patch-id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "prerequisite-message-id: <other@example.com>\nprerequisite-change-id: other:v2",
+            "> prerequisite-patch-id: short",
+            "\tprerequisite-patch-id: short",
+            "+prerequisite-patch-id: short",
+            "prerequisite-change-id: other:v2",
         ] {
-            let body = format!(
-                "bAsEd-On: <base@example.com>\nBased-on: base@example.com\n{b4_metadata}\n"
-            );
-            assert_eq!(
-                parse_prerequisite_metadata(&body)?,
-                Some(PrerequisiteMetadata::BasedOn(
-                    "base@example.com".to_string()
-                ))
-            );
+            for (series_metadata, expected) in [
+                (
+                    "bAsEd-On: <base@example.com>\nBased-on: base@example.com",
+                    PrerequisiteMetadata::BasedOn("base@example.com".to_string()),
+                ),
+                (
+                    "prerequisite-message-id: <base@example.com>",
+                    PrerequisiteMetadata::MessageIds(vec!["base@example.com".to_string()]),
+                ),
+            ] {
+                let body = format!("{series_metadata}\n{b4_metadata}\n");
+                assert_eq!(parse_prerequisite_metadata(&body)?, Some(expected));
+            }
         }
         Ok(())
     }
@@ -1379,6 +1400,108 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_ordered_standalone_series_before_based_on() -> Result<()> {
+        let body = "prerequisite-message-id: <second@example.com>\r\n\
+                    Prerequisite-Message-Id: first/part%25@example.com\r\n\
+                    prerequisite-message-id: second@example.com\r\n\
+                    Based-on: malformed\r\n";
+        assert_eq!(
+            parse_prerequisite_metadata(body)?,
+            Some(PrerequisiteMetadata::MessageIds(vec![
+                "second@example.com".to_string(),
+                "first/part%25@example.com".to_string(),
+            ]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_patch_ids_keep_message_ids_optional() -> Result<()> {
+        let patch_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let body = format!(
+            "prerequisite-message-id: <series@example.com>\n\
+             prerequisite-message-id: malformed\n\
+             prerequisite-patch-id: invalid\n\
+             prerequisite-patch-id: {patch_id}\nBased-on: malformed"
+        );
+        assert_eq!(
+            parse_prerequisite_metadata(&body)?,
+            Some(PrerequisiteMetadata::PatchIds {
+                patch_ids: vec![patch_id.to_string()],
+                message_ids: vec!["series@example.com".to_string()],
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_standalone_message_ids() {
+        let too_long = format!("{}@example.com", "x".repeat(998));
+        for value in [
+            "",
+            "<>",
+            "no-at-sign",
+            "@example.com",
+            "local@",
+            "a b@example.com",
+            "a\t@example.com",
+            "a\0@example.com",
+            "é@example.com",
+            "<a@example.com",
+            "a@example.com>",
+            "<<a@example.com>>",
+            "a@example.com (comment)",
+            too_long.as_str(),
+        ] {
+            let body = format!(
+                "prerequisite-message-id: valid@example.com\n\
+                 prerequisite-message-id: {value}\nBased-on: fallback@example.com"
+            );
+            assert!(parse_prerequisite_metadata(&body).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn ignores_quoted_standalone_metadata() -> Result<()> {
+        let body = "> prerequisite-message-id: quoted@example.com\n\
+                    \tprerequisite-message-id: indented@example.com\n\
+                    +prerequisite-message-id: diff@example.com\n";
+        assert_eq!(parse_prerequisite_metadata(body)?, None);
+        assert_eq!(
+            parse_prerequisite_metadata(&format!("{body}Based-on: base@example.com"))?,
+            Some(PrerequisiteMetadata::BasedOn(
+                "base@example.com".to_string()
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounds_standalone_series_without_truncating() -> Result<()> {
+        let body = (0..MAX_PREREQUISITE_SERIES)
+            .flat_map(|index| {
+                [
+                    format!("prerequisite-message-id: <{index}@example.com>"),
+                    format!("prerequisite-message-id: {index}@example.com"),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ids = parse_prerequisite_series_ids(&body)?;
+        assert_eq!(ids.len(), MAX_PREREQUISITE_SERIES);
+        assert_eq!(
+            ids.last(),
+            Some(&format!("{}@example.com", MAX_PREREQUISITE_SERIES - 1))
+        );
+        let error = parse_prerequisite_metadata(&format!(
+            "{body}\nprerequisite-message-id: extra@example.com"
+        ))
+        .expect_err("standalone dependencies must not be silently truncated");
+        assert!(error.to_string().contains("more than 128"));
         Ok(())
     }
 
@@ -1424,7 +1547,7 @@ mod tests {
                     > prerequisite-message-id: quoted@example.com\r\n\
                     \tprerequisite-message-id: indented@example.com\r\n";
         assert_eq!(
-            parse_prerequisite_message_ids(body),
+            parse_prerequisite_thread_hints(body),
             vec!["first@example.com", "second/part%25@example.com"]
         );
     }
@@ -1448,12 +1571,12 @@ mod tests {
         for value in invalid {
             let body = format!("prerequisite-message-id: {value}");
             assert!(
-                parse_prerequisite_message_ids(&body).is_empty(),
+                parse_prerequisite_thread_hints(&body).is_empty(),
                 "{value:?}"
             );
         }
         let body = format!("prerequisite-message-id: {}@example.com", "x".repeat(998));
-        assert!(parse_prerequisite_message_ids(&body).is_empty());
+        assert!(parse_prerequisite_thread_hints(&body).is_empty());
     }
 
     #[test]
@@ -1467,22 +1590,42 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let hints = parse_prerequisite_message_ids(&body);
+        let hints = parse_prerequisite_thread_hints(&body);
         assert_eq!(hints.len(), MAX_LORE_OPERATIONS);
         assert_eq!(hints.last().unwrap(), "7@example.com");
     }
 
     #[tokio::test]
-    async fn bare_thread_hints_do_not_declare_prerequisite_patches() -> Result<()> {
+    async fn invalid_patch_ids_do_not_fall_back_or_drop_dependencies() -> Result<()> {
         let db = memory_db().await?;
-        let patches = resolve_prerequisites_from_lore(
-            &db,
-            99,
-            None,
-            "prerequisite-message-id: unused@example.com\nprerequisite-patch-id: invalid",
-        )
-        .await?;
-        assert!(patches.is_empty());
+        insert_local_single_series(&db, "base@example.com", "", &format!("{:040x}", 1)).await?;
+        let remote = FakeRemote::default();
+        let non_hex = "g".repeat(40);
+        let too_long = "a".repeat(41);
+        for series_metadata in [
+            "Based-on: base@example.com",
+            "prerequisite-message-id: base@example.com",
+            "Based-on: base@example.com\nprerequisite-message-id: base@example.com",
+            "Based-on: missing@example.com",
+            "prerequisite-message-id: missing@example.com",
+            "",
+        ] {
+            for invalid in ["short", "", non_hex.as_str(), too_long.as_str()] {
+                let patch_metadata = format!("PrErEqUiSiTe-PaTcH-Id: {invalid}");
+                for body in [
+                    format!("{patch_metadata}\n{series_metadata}"),
+                    format!("{series_metadata}\n{patch_metadata}"),
+                ] {
+                    let error = resolve_prerequisites(&db, &remote, 99, None, &body)
+                        .await
+                        .expect_err("invalid patch IDs must not broaden or drop dependencies");
+                    assert!(error.to_string().contains("no valid patch IDs"), "{error}");
+                }
+            }
+        }
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.thread_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.patch_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -1816,17 +1959,19 @@ mod tests {
         insert_local_single_series(&db, "base@example.com", "base body", patch_id).await?;
         let remote = FakeRemote::default();
 
-        let resolved = resolve_prerequisites(
-            &db,
-            &remote,
-            99,
-            Some("target@example.com"),
-            "Based-on: base@example.com",
-        )
-        .await?;
+        for field in ["Based-on", "prerequisite-message-id"] {
+            let resolved = resolve_prerequisites(
+                &db,
+                &remote,
+                99,
+                Some("target@example.com"),
+                &format!("{field}: base@example.com"),
+            )
+            .await?;
 
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].message_id, "base@example.com");
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].message_id, "base@example.com");
+        }
         assert_eq!(remote.series_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
@@ -1881,17 +2026,205 @@ mod tests {
             ..FakeRemote::default()
         };
 
-        let resolved = resolve_prerequisites(
+        for field in ["Based-on", "prerequisite-message-id"] {
+            let resolved = resolve_prerequisites(
+                &db,
+                &remote,
+                99,
+                Some("target@example.com"),
+                &format!("{field}: base@example.com"),
+            )
+            .await?;
+
+            assert_eq!(resolved[0].git_patch_id, remote_patch_id);
+        }
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolves_standalone_series_in_order_with_shared_dependencies() -> Result<()> {
+        let db = memory_db().await?;
+        let shared = sample_patch(&format!("{:040x}", 1), "shared-patch@example.com");
+        let first = sample_patch(&format!("{:040x}", 2), "first-patch@example.com");
+        let second = sample_patch(&format!("{:040x}", 3), "second-patch@example.com");
+        let remote = FakeRemote {
+            series: HashMap::from([
+                (
+                    "shared@example.com".to_string(),
+                    sample_series("shared@example.com", "", vec![shared.clone()]),
+                ),
+                (
+                    "first@example.com".to_string(),
+                    sample_series(
+                        "first@example.com",
+                        "Based-on: shared@example.com",
+                        vec![first.clone()],
+                    ),
+                ),
+                (
+                    "second@example.com".to_string(),
+                    sample_series(
+                        "second@example.com",
+                        "prerequisite-message-id: shared@example.com",
+                        vec![shared.clone(), second.clone()],
+                    ),
+                ),
+            ]),
+            ..FakeRemote::default()
+        };
+        let body = "prerequisite-message-id: first@example.com\n\
+                    prerequisite-message-id: second@example.com\n\
+                    prerequisite-message-id: first@example.com\n\
+                    Based-on: target@example.com";
+        let resolved =
+            resolve_prerequisites(&db, &remote, 99, Some("target@example.com"), body).await?;
+        assert_eq!(resolved, vec![shared, first, second]);
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(remote.thread_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.patch_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn does_not_revisit_completed_series() -> Result<()> {
+        let db = memory_db().await?;
+        let message_id = "shared@example.com";
+        let remote = FakeRemote {
+            series: HashMap::from([(
+                message_id.to_string(),
+                sample_series(
+                    message_id,
+                    "",
+                    vec![sample_patch(&format!("{:040x}", 1), "patch@example.com")],
+                ),
+            )]),
+            ..FakeRemote::default()
+        };
+        let mut resolver = PrerequisiteResolver::new(&db, &remote);
+        resolver.resolve_series(message_id.to_string(), 1).await?;
+        assert!(resolver.resolved_series.contains(message_id));
+        // Completed nodes must not traverse their dependencies again.
+        resolver.series_cache.get_mut(message_id).unwrap().body =
+            "prerequisite-message-id: missing@example.com".to_string();
+        resolver.resolve_series(message_id.to_string(), 2).await?;
+        assert_eq!(resolver.resolved.len(), 1);
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_standalone_series_does_not_fall_back_to_based_on() -> Result<()> {
+        let db = memory_db().await?;
+        insert_local_single_series(&db, "local@example.com", "", &format!("{:040x}", 1)).await?;
+        let remote = FakeRemote::default();
+        let error = resolve_prerequisites(
             &db,
             &remote,
             99,
-            Some("target@example.com"),
-            "Based-on: base@example.com",
+            None,
+            "prerequisite-message-id: missing@example.com\nBased-on: local@example.com",
         )
-        .await?;
-
-        assert_eq!(resolved[0].git_patch_id, remote_patch_id);
+        .await
+        .expect_err("an unavailable series must not change the dependency set");
+        assert!(error.to_string().contains("missing@example.com"));
         assert_eq!(remote.series_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounds_standalone_series_lore_operations() -> Result<()> {
+        let db = memory_db().await?;
+        let mut body = String::new();
+        let mut remote = FakeRemote::default();
+        for index in 0..=MAX_LORE_OPERATIONS {
+            let message_id = format!("series-{index}@example.com");
+            body.push_str(&format!("prerequisite-message-id: {message_id}\n"));
+            remote.series.insert(
+                message_id.clone(),
+                sample_series(
+                    &message_id,
+                    "",
+                    vec![sample_patch(&format!("{index:040x}"), &message_id)],
+                ),
+            );
+        }
+        let error = resolve_prerequisites(&db, &remote, 99, None, &body)
+            .await
+            .expect_err("series fetches must share the Lore operation budget");
+        assert!(
+            error
+                .to_string()
+                .contains("more than 8 remote Lore operations")
+        );
+        assert_eq!(
+            remote.series_calls.load(Ordering::SeqCst),
+            MAX_LORE_OPERATIONS
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounds_loaded_series_even_with_duplicate_patches() -> Result<()> {
+        let db = memory_db().await?;
+        let remote = FakeRemote::default();
+        let mut resolver = PrerequisiteResolver::new(&db, &remote);
+        let patch_id = format!("{:040x}", 1);
+        for index in 0..MAX_PREREQUISITE_SERIES {
+            let message_id = format!("series-{index}@example.com");
+            resolver.series_cache.insert(
+                message_id.clone(),
+                sample_series(&message_id, "", vec![sample_patch(&patch_id, &message_id)]),
+            );
+        }
+        // Cached nodes remain available at the limit, but no new node is loaded.
+        resolver.load_series("series-0@example.com").await?;
+        let error = resolver
+            .load_series("extra@example.com")
+            .await
+            .expect_err("distinct series must be bounded independently of patch IDs");
+        assert!(error.to_string().contains("more than 128 series"));
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounds_total_patches_across_standalone_series() -> Result<()> {
+        let db = memory_db().await?;
+        let first = (0..MAX_PREREQUISITE_PATCH_IDS)
+            .map(|index| sample_patch(&format!("{index:040x}"), &format!("{index}@example.com")))
+            .collect();
+        let remote = FakeRemote {
+            series: HashMap::from([
+                (
+                    "first@example.com".to_string(),
+                    sample_series("first@example.com", "", first),
+                ),
+                (
+                    "second@example.com".to_string(),
+                    sample_series(
+                        "second@example.com",
+                        "",
+                        vec![sample_patch(
+                            &format!("{:040x}", MAX_PREREQUISITE_PATCH_IDS),
+                            "extra@example.com",
+                        )],
+                    ),
+                ),
+            ]),
+            ..FakeRemote::default()
+        };
+        let error = resolve_prerequisites(
+            &db,
+            &remote,
+            99,
+            None,
+            "prerequisite-message-id: first@example.com\nprerequisite-message-id: second@example.com",
+        )
+        .await
+        .expect_err("separate series must share the patch limit");
+        assert!(error.to_string().contains("more than 128 unique patches"));
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
@@ -1919,6 +2252,7 @@ mod tests {
                     vec![first.clone(), second.clone(), extra.clone()],
                 ),
             )]),
+            thread_results: HashMap::from([("base@example.com".to_string(), vec![extra.clone()])]),
             patch_results: HashMap::from([(
                 second.git_patch_id.clone(),
                 vec![first.clone(), extra, second.clone()],
@@ -1926,7 +2260,7 @@ mod tests {
             ..FakeRemote::default()
         };
         let body = format!(
-            "Based-on: base@example.com\nprerequisite-patch-id: {}\nprerequisite-patch-id: {}\nprerequisite-patch-id: {}",
+            "Based-on: base@example.com\nprerequisite-message-id: base@example.com\nprerequisite-patch-id: {}\nprerequisite-patch-id: {}\nprerequisite-patch-id: {}",
             second.git_patch_id, first.git_patch_id, second.git_patch_id
         );
 
@@ -1934,6 +2268,7 @@ mod tests {
 
         assert_eq!(resolved, vec![second, first]);
         assert_eq!(remote.series_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.thread_calls.load(Ordering::SeqCst), 1);
         assert_eq!(remote.patch_calls.load(Ordering::SeqCst), 1);
         Ok(())
     }
@@ -1953,11 +2288,13 @@ mod tests {
             )]),
             ..FakeRemote::default()
         };
-        let body = format!("Based-on: base@example.com\nprerequisite-patch-id: {wanted}");
+        let body = format!(
+            "Based-on: base@example.com\nprerequisite-message-id: base@example.com\nprerequisite-patch-id: {wanted}"
+        );
 
         let error = resolve_prerequisites(&db, &remote, 99, None, &body)
             .await
-            .expect_err("a missing b4 prerequisite must not select Based-on instead");
+            .expect_err("a missing b4 prerequisite must not select a whole series instead");
 
         assert!(error.to_string().contains(wanted));
         assert_eq!(remote.series_calls.load(Ordering::SeqCst), 0);
@@ -2006,7 +2343,7 @@ mod tests {
             &remote,
             99,
             Some("target@example.com"),
-            "Based-on: middle@example.com",
+            "prerequisite-message-id: middle@example.com",
         )
         .await?;
 
@@ -2024,7 +2361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_nested_and_target_based_on_cycles() -> Result<()> {
+    async fn rejects_mixed_series_and_target_cycles() -> Result<()> {
         let db = memory_db().await?;
         let remote = FakeRemote {
             series: HashMap::from([
@@ -2032,7 +2369,7 @@ mod tests {
                     "one@example.com".to_string(),
                     sample_series(
                         "one@example.com",
-                        "Based-on: two@example.com",
+                        "prerequisite-message-id: two@example.com",
                         vec![sample_patch(
                             "1111111111111111111111111111111111111111",
                             "one-patch@example.com",
@@ -2066,28 +2403,35 @@ mod tests {
         assert!(nested.to_string().contains("cycle"));
 
         let target_remote = FakeRemote::default();
-        let target = resolve_prerequisites(
-            &db,
-            &target_remote,
-            99,
-            Some("target@example.com"),
-            "Based-on: target@example.com",
-        )
-        .await
-        .expect_err("a dependency on the target itself must fail");
-        assert!(target.to_string().contains("cycle"));
+        for field in ["Based-on", "prerequisite-message-id"] {
+            let target = resolve_prerequisites(
+                &db,
+                &target_remote,
+                99,
+                Some("target@example.com"),
+                &format!("{field}: target@example.com"),
+            )
+            .await
+            .expect_err("a dependency on the target itself must fail");
+            assert!(target.to_string().contains("cycle"));
+        }
         assert_eq!(target_remote.series_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn bounds_based_on_depth() -> Result<()> {
+    async fn bounds_mixed_series_depth() -> Result<()> {
         let db = memory_db().await?;
-        let series = (1..=MAX_BASED_ON_DEPTH + 1)
+        let series = (1..=MAX_PREREQUISITE_DEPTH + 1)
             .map(|depth| {
                 let message_id = format!("series-{depth}@example.com");
-                let body = if depth <= MAX_BASED_ON_DEPTH {
-                    format!("Based-on: series-{}@example.com", depth + 1)
+                let field = if depth % 2 == 0 {
+                    "Based-on"
+                } else {
+                    "prerequisite-message-id"
+                };
+                let body = if depth <= MAX_PREREQUISITE_DEPTH {
+                    format!("{field}: series-{}@example.com", depth + 1)
                 } else {
                     String::new()
                 };
@@ -2114,7 +2458,7 @@ mod tests {
             &remote,
             99,
             Some("target@example.com"),
-            "Based-on: series-1@example.com",
+            "prerequisite-message-id: series-1@example.com",
         )
         .await
         .expect_err("a chain deeper than the configured limit must fail");
@@ -2122,7 +2466,7 @@ mod tests {
         assert!(error.to_string().contains("exceeds 8 series"));
         assert_eq!(
             remote.series_calls.load(Ordering::SeqCst),
-            MAX_BASED_ON_DEPTH
+            MAX_PREREQUISITE_DEPTH
         );
         Ok(())
     }
@@ -2479,7 +2823,7 @@ mod tests {
         let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let extra = "cccccccccccccccccccccccccccccccccccccccc";
-        let hints = parse_prerequisite_message_ids(
+        let hints = parse_prerequisite_thread_hints(
             "prerequisite-message-id: <series@example.com>\n\
              prerequisite-message-id: series@example.com\n\
              prerequisite-message-id: unused@example.com",

@@ -3422,7 +3422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prepare_baseline_applies_b4_and_based_on_prerequisites() -> Result<()> {
+    async fn test_prepare_baseline_applies_patch_id_and_series_prerequisites() -> Result<()> {
         let temp_dir = tempdir()?;
         let repo = temp_dir.path().join("repo");
         std::fs::create_dir_all(&repo)?;
@@ -3531,9 +3531,15 @@ mod tests {
         for metadata in [
             prerequisite_metadata.clone(),
             "Based-on: prerequisite@example.com".to_string(),
+            "prerequisite-message-id: prerequisite@example.com".to_string(),
+            "prerequisite-message-id: prerequisite@example.com\nBased-on: target@example.com"
+                .to_string(),
             format!("{prerequisite_metadata}\nBased-on: prerequisite@example.com"),
             format!("{prerequisite_metadata}\nBased-on: target@example.com"),
             format!("{prerequisite_metadata}\nBased-on: malformed"),
+            format!(
+                "{prerequisite_metadata}\nprerequisite-message-id: target@example.com\nBased-on: target@example.com"
+            ),
         ] {
             let (found, patch_commits, logs) = Reviewer::prepare_baseline_worktree(
                 &ctx,
