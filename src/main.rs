@@ -216,6 +216,10 @@ enum Commands {
         #[arg(long)]
         reuse_worktree: Option<PathBuf>,
 
+        /// Review commits directly in the current repository tree without creating a worktree
+        #[arg(long)]
+        current_tree: bool,
+
         /// AI provider override
         #[arg(long)]
         ai_provider: Option<String>,
@@ -539,6 +543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 review_patch_index,
                 review_commit,
                 reuse_worktree,
+                current_tree,
                 custom_prompt,
                 agent,
                 report_preexisting,
@@ -566,7 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         reuse_worktree: reuse_worktree.clone(),
                         custom_prompt: custom_prompt.clone(),
                         scratch_clone: false,
-                        current_tree: false,
+                        current_tree: *current_tree,
                         agent: *agent,
                         report_preexisting: *report_preexisting,
                     },

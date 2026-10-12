@@ -755,6 +755,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_skipped_stage_emits_skipped_event_and_no_started_or_finished() {
+        let provider = Arc::new(MockProvider::single(r#"{"items": ["c1"]}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("skip_event_flow")
+            .stage(
+                Stage::builder("stage_skipped")
+                    .user_prompt(PromptTemplate::new("Skipped"))
+                    .output_format(OutputFormat::json())
+                    .skip_if(|_: &DummyState| true)
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .stage(
+                Stage::builder("stage_run")
+                    .user_prompt(PromptTemplate::new("Run"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .build();
+
+        let events = std::sync::Mutex::new(Vec::new());
+        let record = |event: WorkflowEvent| {
+            let label = match event {
+                WorkflowEvent::StageStarted { stage_name } => format!("started:{stage_name}"),
+                WorkflowEvent::StageFinished { stage_name, .. } => {
+                    format!("finished:{stage_name}")
+                }
+                WorkflowEvent::StageSkipped { stage_name } => format!("skipped:{stage_name}"),
+                _ => return,
+            };
+            events.lock().unwrap().push(label);
+        };
+        WorkflowEngine::execute(&workflow, &env, &mut state, Some(&record))
+            .await
+            .unwrap();
+
+        // A skipped stage says so once, and never claims to have started or
+        // finished, so a progress display can drop it from its plan.
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "skipped:stage_skipped".to_string(),
+                "started:stage_run".to_string(),
+                "finished:stage_run".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_workflow_failure_preserves_accumulated_outcome_on_sequential_error() {
         let provider = Arc::new(MockProvider::queued(vec![
             r#"{"items": ["c1"]}"#.to_string(),
