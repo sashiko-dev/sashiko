@@ -1293,12 +1293,19 @@ mod tests {
         let db = Database::new(&settings).await?;
         db.conn
             .execute_batch(
-                "CREATE TABLE patches (
+                "CREATE TABLE patchsets (id INTEGER PRIMARY KEY);
+                CREATE TABLE reviews (id INTEGER PRIMARY KEY);
+                CREATE TABLE patches (
                     id INTEGER PRIMARY KEY,
                     patchset_id INTEGER NOT NULL,
                     message_id TEXT NOT NULL UNIQUE,
                     part_index INTEGER,
                     diff TEXT
+                );
+                CREATE TABLE email_outbox (
+                    id INTEGER PRIMARY KEY,
+                    patch_id INTEGER,
+                    kind TEXT NOT NULL DEFAULT 'review_notification'
                 );
                 PRAGMA user_version = 11;",
             )
@@ -1326,7 +1333,7 @@ mod tests {
 
         let mut version = db.conn.query("PRAGMA user_version", ()).await?;
         let version: u32 = version.next().await?.expect("user version row").get(0)?;
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         Ok(())
     }
 

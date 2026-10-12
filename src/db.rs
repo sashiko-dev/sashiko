@@ -1271,6 +1271,8 @@ pub enum EmailKind {
     /// A review result or a patchwork notification, tied to a patch.
     #[default]
     ReviewNotification,
+    /// A series cover-letter review reply, tied to a patchset.
+    ReviewReply,
     /// A sign-in link, tied to a person.
     SignInLink,
     /// A notice to the person a bug was just assigned to.
@@ -1284,6 +1286,7 @@ impl EmailKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EmailKind::ReviewNotification => "review_notification",
+            EmailKind::ReviewReply => "review_reply",
             EmailKind::SignInLink => "sign_in_link",
             EmailKind::BugAssignment => "bug_assignment",
             EmailKind::Unrecognized => "unrecognized",
@@ -1294,7 +1297,9 @@ impl EmailKind {
     /// thread, or None for review notifications.
     pub fn transactional_list_label(self) -> Option<&'static str> {
         match self {
-            EmailKind::ReviewNotification | EmailKind::Unrecognized => None,
+            EmailKind::ReviewNotification | EmailKind::ReviewReply | EmailKind::Unrecognized => {
+                None
+            }
             EmailKind::SignInLink => Some("sashiko-auth"),
             EmailKind::BugAssignment => Some("sashiko-bugs"),
         }
@@ -1308,6 +1313,7 @@ impl EmailKind {
         match value {
             "sign_in_link" => EmailKind::SignInLink,
             "bug_assignment" => EmailKind::BugAssignment,
+            "review_reply" => EmailKind::ReviewReply,
             "review_notification" => EmailKind::ReviewNotification,
             other => {
                 tracing::warn!("Unrecognized email kind {:?}, delivering plainly", other);
@@ -2057,7 +2063,55 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 13.");
+        // Executed inside an atomic immediate transaction per the migration
+        // invariant so a mid-migration failure rolls back cleanly without
+        // stranding added columns before `PRAGMA user_version = 14` is recorded.
+        // Check `PRAGMA table_info(patchsets)` inside the write transaction so
+        // concurrent processes and migration tests that rewind `user_version`
+        // on an already migrated database cannot race or fail on duplicate
+        // columns.
+        if current_version < 14 {
+            info!(
+                "Applying database migration version 14 (patchset version lineage and cover outbox)..."
+            );
+            let tx = self.begin_immediate_transaction().await?;
+            // Another process may have migrated between the read of
+            // user_version above and this write lock; re-read under the lock
+            // so a late starter neither repeats the DDL nor writes an older
+            // version number over a newer schema.
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0).unwrap_or(0),
+                    None => 0,
+                }
+            };
+            if locked_version >= 14 {
+                info!(
+                    "Database already at version {} under the migration lock; skipping version 14.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_previous_patchset_id = {
+                    let mut columns = tx.query("PRAGMA table_info(patchsets)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "previous_patchset_id";
+                    }
+                    found
+                };
+                if !has_previous_patchset_id {
+                    tx.execute_batch(include_str!("migrations/014_patchset_version_lineage.sql"))
+                        .await?;
+                }
+                tx.execute("PRAGMA user_version = 14", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        info!("Database schema is up to date at version 14.");
 
         Ok(())
     }
@@ -22584,6 +22638,64 @@ mod tests {
             releasable.iter().map(|r| r.id).collect::<Vec<_>>(),
             vec![ps_id]
         );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v14_version_lineage_and_cover_outbox_columns() {
+        let db = setup_db().await;
+        let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
+        let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(version, 14);
+
+        for (table, expected_cols) in [
+            (
+                "patchsets",
+                &[
+                    "version",
+                    "change_id",
+                    "previous_patchset_id",
+                    "version_link_signal",
+                ][..],
+            ),
+            ("patches", &["previous_patch_id", "previous_patch_status"]),
+            ("email_outbox", &["patchset_id", "review_id"]),
+        ] {
+            let mut cols = db
+                .conn
+                .query(&format!("PRAGMA table_info({table})"), ())
+                .await
+                .unwrap();
+            let mut col_names = Vec::new();
+            while let Some(row) = cols.next().await.unwrap() {
+                col_names.push(row.get::<String>(1).unwrap());
+            }
+            for col in expected_cols {
+                assert!(
+                    col_names.iter().any(|c| c == col),
+                    "expected column {col} on table {table}, found {col_names:?}"
+                );
+            }
+        }
+
+        for expected_idx in [
+            "idx_patchsets_change_id",
+            "idx_patchsets_previous_patchset_id",
+            "idx_patches_previous_patch_id",
+            "idx_email_outbox_patchset_id",
+            "idx_email_outbox_review_id",
+            "idx_email_outbox_cover_reply_unique",
+        ] {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    libsql::params![expected_idx],
+                )
+                .await
+                .unwrap();
+            let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(count, 1, "expected index {expected_idx} to exist");
+        }
     }
 
     fn collect_rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
