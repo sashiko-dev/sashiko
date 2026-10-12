@@ -207,10 +207,16 @@ look.
 ## 4. `skip_if` and the event contract
 
 `skip_if` is evaluated at the top of `execute_isolated`, **before**
-`WorkflowEvent::StageStarted` is emitted. A skipped stage emits no events at
-all, returns an all-zero `StageOutcome`, and returns `Box::new(|_| {})` as its
-mutation — its reducer never runs, so every field it would have written stays
-at its `Default`.
+`WorkflowEvent::StageStarted` is emitted. A skipped stage emits exactly one
+event, `WorkflowEvent::StageSkipped { stage_name }`, and never
+`StageStarted`, `StageTurn`, or `StageFinished`; it returns an all-zero
+`StageOutcome` with `skipped: true` and `Box::new(|_| {})` as its mutation —
+its reducer never runs, so every field it would have written stays at its
+`Default`. The progress adapter in `src/worker/prompts.rs` consumes
+`StageSkipped` by removing that stage from `planned_stages` and re-emitting
+`WorkerProgressEvent::ReviewStarted`, which is how a skipped `verification`
+or `report` stage leaves the denominator rather than wedging the bar short
+of 100%.
 
 `prescreen_stage()` and `planning_stage()` both carry
 `.skip_if(|s| s.manual_stages.is_some())`. So with `--stages`,
@@ -224,12 +230,13 @@ denominator came from an event emitted when the planner *finished*; a review
 with an explicit stage list skipped the planner, so the event never fired and
 the bar had no plan. The fix moved the announcement into the engine as
 `WorkflowEvent::ParallelResolved`, emitted by
-`WorkflowStep::DynamicParallel` *after* the resolver runs and
-unconditionally — including when the resolver returned nothing.
+`WorkflowStep::DynamicParallel` and `WorkflowStep::ResolveParallel` *after*
+the resolver runs and unconditionally — including when the resolver returned
+nothing.
 
 **Check in a diff:** new UI, metrics, or database writes hung off
 `StageStarted`/`StageFinished` for a stage that can be skipped. Derive from
-`ParallelResolved` or from state instead. `src/worker/prompts.rs`'s
+`ParallelResolved`, `StageSkipped`, or from state instead. `src/worker/prompts.rs`'s
 `is_counted_stage`, `planned_stages_from`, and
 `refine_planned_stages_with_post_verification` are the reference: they read the
 stage tables in `linux_patch_review.rs` rather than the event stream's shape,

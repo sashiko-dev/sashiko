@@ -198,17 +198,46 @@ pub async fn build_review_input_from_git(
         vec![get_commit_hash(repo_path, input).await?]
     };
 
-    let mut patches = Vec::new();
-    let mut summaries = Vec::new();
-
-    for (i, sha) in shas.iter().enumerate() {
+    let mut extracted = Vec::with_capacity(shas.len());
+    for sha in &shas {
         let meta = extract_patch_metadata(repo_path, sha)
             .await
             .with_context(|| format!("Failed to extract metadata for commit {}", sha))?;
-        let index = (i + 1) as i64;
+        extracted.push((sha.clone(), meta));
+    }
+
+    let has_non_tracker = extracted.iter().any(|(_, m)| {
+        crate::patch::parse_b4_submit_tracking(&m.subject, &m.message, &m.diff).is_none()
+    });
+
+    let mut patches = Vec::new();
+    let mut summaries = Vec::new();
+    let mut tracker_subject: Option<String> = None;
+    let mut cover_letter: Option<Value> = None;
+
+    for (sha, meta) in extracted {
+        if has_non_tracker
+            && let Some(tracker) =
+                crate::patch::parse_b4_submit_tracking(&meta.subject, &meta.message, &meta.diff)
+        {
+            if let Some(subj) = tracker.edited_subject {
+                tracker_subject = Some(subj);
+            }
+            if let Some(body) = tracker.edited_body {
+                cover_letter = Some(json!({
+                    "subject": tracker_subject.clone().unwrap_or_else(|| meta.subject.clone()),
+                    "author": meta.author,
+                    "date": meta.timestamp,
+                    "body": body,
+                }));
+            }
+            continue;
+        }
+
+        let index = (patches.len() + 1) as i64;
         summaries.push(CommitSummary {
             index,
-            sha: short_sha(sha),
+            sha: short_sha(&sha),
             subject: meta.subject.clone(),
             author: meta.author.clone(),
         });
@@ -219,8 +248,32 @@ pub async fn build_review_input_from_git(
             author: Some(meta.author),
             date: Some(meta.timestamp),
             message_id: None,
-            commit_id: Some(sha.clone()),
+            commit_id: Some(sha),
+            review_summary: None,
+            review_findings: None,
         });
+    }
+
+    let subject = tracker_subject
+        .clone()
+        .or_else(|| patches.first().and_then(|p| p.subject.clone()))
+        .unwrap_or_else(|| input.to_string());
+    if tracker_subject.is_none()
+        && let Some(ref mut cl) = cover_letter
+    {
+        cl["subject"] = json!(subject.clone());
+    }
+
+    if let Some(ref cl) = cover_letter {
+        summaries.insert(
+            0,
+            CommitSummary {
+                index: 0,
+                sha: "cover".to_string(),
+                subject: cl["subject"].as_str().unwrap_or(&subject).to_string(),
+                author: cl["author"].as_str().unwrap_or_default().to_string(),
+            },
+        );
     }
 
     emit(
@@ -228,16 +281,13 @@ pub async fn build_review_input_from_git(
         ProgressEvent::ResolvedCommits { commits: summaries },
     );
 
-    let subject = patches
-        .first()
-        .and_then(|p| p.subject.clone())
-        .unwrap_or_else(|| input.to_string());
-
     Ok((
         ReviewInput {
             id: 0,
             subject,
             patches,
+            cover_letter,
+            previous_version: None,
         },
         shas,
     ))
@@ -289,6 +339,8 @@ pub async fn run_worker(
     let patchset_id = input.id;
     let subject = input.subject;
     let patches = input.patches;
+    let cover_letter = input.cover_letter;
+    let previous_version = input.previous_version;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
     } else {
@@ -375,6 +427,8 @@ pub async fn run_worker(
         patchset_id,
         subject,
         patches,
+        cover_letter,
+        previous_version,
         &baseline_arg,
         &baseline_sha,
         &options,
@@ -481,6 +535,15 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
     Ok(inline_content)
 }
 
+fn is_safe_git_rev(rev: &str) -> bool {
+    let trimmed = rev.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('-')
+        && !trimmed
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
@@ -491,6 +554,8 @@ async fn review_single_patch(
     all_patches: &[PatchInput],
     rich_patches: &[Value],
     patch_shas: &HashMap<i64, String>,
+    cover_letter: Option<&Value>,
+    previous_version: Option<&Value>,
     options: &WorkerOptions,
     baseline_sha: &str,
     llm_semaphore: &Arc<Semaphore>,
@@ -537,12 +602,27 @@ async fn review_single_patch(
         // The directory itself: read_prompt resolves a name against it.
         let prompts_tool_path = Some(options.prompts.clone());
 
+        // A cover review (index 0) spans the whole series, so its active
+        // files come from baseline..tip; without a usable baseline it is
+        // left unrestricted rather than narrowed to the tip commit alone.
         let mut patch_files = Vec::new();
-        if let Some(sha) = patch_shas.get(&p.index) {
-            let output = crate::git_cmd::in_dir_async(&worktree.path)
-                .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
-                .output()
-                .await;
+        if let Some(sha) = patch_shas.get(&p.index).filter(|s| is_safe_git_rev(s))
+            && (p.index != 0 || is_safe_git_rev(baseline_sha))
+        {
+            let mut cmd = crate::git_cmd::in_dir_async(&worktree.path);
+            if p.index == 0 {
+                cmd.args(["diff", "--name-only", baseline_sha, sha, "--"]);
+            } else {
+                cmd.args([
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    sha,
+                    "--",
+                ]);
+            }
+            let output = cmd.output().await;
             if let Ok(out) = output
                 && out.status.success()
             {
@@ -648,7 +728,9 @@ async fn review_single_patch(
             "subject": subject,
             "patches": rich_patches,
             "patch_index": Some(p.index),
-            "baseline": baseline_sha
+            "baseline": baseline_sha,
+            "cover_letter": cover_letter,
+            "previous_version": previous_version,
         });
 
         match worker
@@ -833,6 +915,8 @@ async fn run_worker_in_worktree(
     patchset_id: i64,
     subject: String,
     patches: Vec<PatchInput>,
+    cover_letter: Option<Value>,
+    previous_version: Option<Value>,
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
@@ -870,12 +954,20 @@ async fn run_worker_in_worktree(
         for p in &patches {
             if let Some(sha) = &p.commit_id {
                 patch_shas.insert(p.index, sha.clone());
+                if let Ok(msg) = worktree.get_commit_message(sha).await {
+                    patch_messages.insert(p.index, msg);
+                }
             }
         }
         if let Some(idx) = options.review_patch_index {
             patch_shas.insert(idx, commit_hash.clone());
             if let Ok(show) = worktree.get_commit_show(commit_hash).await {
                 patch_shows.insert(idx, show);
+            }
+            if idx > 0
+                && let Ok(msg) = worktree.get_commit_message(commit_hash).await
+            {
+                patch_messages.insert(idx, msg);
             }
             let subject = patches
                 .iter()
@@ -938,15 +1030,91 @@ async fn run_worker_in_worktree(
         applied
     };
 
+    let mut synthesize_cover_patch = || -> PatchInput {
+        let series_tip_sha = options
+            .review_commit
+            .clone()
+            .filter(|s| is_safe_git_rev(s))
+            .or_else(|| {
+                patches.iter().max_by_key(|p| p.index).and_then(|p| {
+                    patch_shas
+                        .get(&p.index)
+                        .cloned()
+                        .or_else(|| p.commit_id.clone().filter(|s| is_safe_git_rev(s)))
+                })
+            });
+        if let Some(ref tip) = series_tip_sha {
+            patch_shas.entry(0).or_insert_with(|| tip.clone());
+        }
+        if !patch_results.iter().any(|r| r["index"] == 0) {
+            patch_results.insert(
+                0,
+                json!({
+                    "index": 0,
+                    "status": "applied",
+                    "method": "cover-letter",
+                    "subject": subject,
+                }),
+            );
+        }
+        let author = cover_letter
+            .as_ref()
+            .and_then(|c| c["author"].as_str().map(str::to_string));
+        emit(
+            progress,
+            ProgressEvent::ResolvedCommits {
+                commits: vec![CommitSummary {
+                    index: 0,
+                    sha: "cover".to_string(),
+                    subject: subject.clone(),
+                    author: author.clone().unwrap_or_default(),
+                }],
+            },
+        );
+        PatchInput {
+            index: 0,
+            diff: String::new(),
+            subject: Some(subject.clone()),
+            author,
+            date: cover_letter.as_ref().and_then(|c| c["date"].as_i64()),
+            message_id: cover_letter
+                .as_ref()
+                .and_then(|c| c["message_id"].as_str().map(str::to_string)),
+            commit_id: series_tip_sha,
+            review_summary: None,
+            review_findings: None,
+        }
+    };
+
     let mut patches_to_review: Vec<PatchInput> =
         if let Some(target_idx) = options.review_patch_index {
-            patches
+            let mut matched: Vec<PatchInput> = patches
                 .iter()
                 .filter(|p| p.index == target_idx)
                 .cloned()
-                .collect()
+                .collect();
+            if matched.is_empty() && target_idx == 0 {
+                matched.push(synthesize_cover_patch());
+            }
+            matched
         } else {
-            patches.clone()
+            let mut all = Vec::with_capacity(patches.len() + 1);
+            // Synthesize the series-level review (`index = 0`) when a cover letter or
+            // previous-version context is present, or when reviewing a multi-patch
+            // mbox/JSON series (`!options.current_tree && patches.len() > 1`) so missing
+            // cover letters and series-wide cohesion are audited. Pure local git
+            // commit-range reviews (`options.current_tree`) have no 0/N email cover
+            // letter in git history and review commits 1..N directly unless `--patch 0`
+            // is explicitly requested.
+            if (cover_letter.is_some()
+                || previous_version.is_some()
+                || (!options.current_tree && patches.len() > 1))
+                && !patches.iter().any(|p| p.index == 0)
+            {
+                all.push(synthesize_cover_patch());
+            }
+            all.extend(patches.iter().cloned());
+            all
         };
 
     if settings.ai.no_ai {
@@ -1009,7 +1177,9 @@ async fn run_worker_in_worktree(
                 "diff": p.diff,
                 "commit_id": patch_shas.get(&p.index).cloned().or_else(|| p.commit_id.clone()),
                 "git_show": patch_shows.get(&p.index).cloned(),
-                "commit_message_full": patch_messages.get(&p.index).cloned()
+                "commit_message_full": patch_messages.get(&p.index).cloned(),
+                "review_summary": p.review_summary,
+                "review_findings": p.review_findings
             })
         })
         .collect();
@@ -1027,6 +1197,8 @@ async fn run_worker_in_worktree(
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
+        let cover_letter = cover_letter.as_ref();
+        let previous_version = previous_version.as_ref();
         let options = &options;
         let subject_clone = subject.clone();
         let all_patches = &patches;
@@ -1042,6 +1214,8 @@ async fn run_worker_in_worktree(
                 all_patches,
                 &rich_patches,
                 patch_shas,
+                cover_letter,
+                previous_version,
                 options,
                 baseline_sha,
                 llm_semaphore,
@@ -1917,6 +2091,8 @@ mod tests {
             date: None,
             message_id: Some("some-msg-id".to_string()),
             commit_id: Some(feature_sha),
+            review_summary: None,
+            review_findings: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -1955,6 +2131,8 @@ mod tests {
             date: None,
             message_id: Some("some-msg-id".to_string()),
             commit_id: Some("0000000000000000000000000000000000000000".to_string()),
+            review_summary: None,
+            review_findings: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -1992,6 +2170,8 @@ mod tests {
             date: None,
             message_id: Some(feature_sha),
             commit_id: None,
+            review_summary: None,
+            review_findings: None,
         };
 
         let mut patch_shas = HashMap::new();
@@ -2027,6 +2207,8 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha1".to_string()),
+            review_summary: None,
+            review_findings: None,
         };
         let p2 = PatchInput {
             index: 2,
@@ -2036,6 +2218,8 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha2".to_string()),
+            review_summary: None,
+            review_findings: None,
         };
         let all_patches = vec![p1.clone(), p2.clone()];
         let mut patch_shas = HashMap::new();
@@ -2071,6 +2255,8 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha1".to_string()),
+            review_summary: None,
+            review_findings: None,
         };
         let p2 = PatchInput {
             index: 2,
@@ -2080,6 +2266,8 @@ mod tests {
             date: None,
             message_id: None,
             commit_id: Some("sha2".to_string()),
+            review_summary: None,
+            review_findings: None,
         };
         let all_patches = vec![p1.clone(), p2.clone()];
         let mut patch_shas = HashMap::new();
@@ -2359,5 +2547,89 @@ mod tests {
         assert_eq!(formatted_err["status"], "error");
         assert_eq!(formatted_err["partial"], true);
         assert_eq!(formatted_err["error"], "patch 1: timed out");
+    }
+
+    #[tokio::test]
+    async fn test_build_review_input_from_git_filters_b4_tracker_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "Test Dev"],
+            vec!["config", "user.email", "dev@example.com"],
+        ] {
+            let status = crate::git_cmd::in_dir_async(repo)
+                .args(&args)
+                .status()
+                .await
+                .unwrap();
+            assert!(status.success());
+        }
+
+        std::fs::write(repo.join("foo.c"), "int a = 1;\n").unwrap();
+        crate::git_cmd::in_dir_async(repo)
+            .args(["add", "foo.c"])
+            .status()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(repo)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .await
+            .unwrap();
+
+        // 1. Create an edited b4 tracker commit (empty commit with --- b4-submit-tracking ---)
+        let tracker_msg = "net: foo: series cover title\n\nExplain series architecture across patches.\n\nSigned-off-by: Test Dev <dev@example.com>\n\n--- b4-submit-tracking ---\n{\n  \"series\": {\n    \"revision\": 1,\n    \"change-id\": \"20261012-b4-local-1234\"\n  }\n}\n";
+        crate::git_cmd::in_dir_async(repo)
+            .args(["commit", "--allow-empty", "-m", tracker_msg])
+            .status()
+            .await
+            .unwrap();
+
+        // 2. Create a real code commit on top
+        std::fs::write(repo.join("foo.c"), "int a = 2;\n").unwrap();
+        crate::git_cmd::in_dir_async(repo)
+            .args(["add", "foo.c"])
+            .status()
+            .await
+            .unwrap();
+        crate::git_cmd::in_dir_async(repo)
+            .args(["commit", "-m", "net: foo: update value"])
+            .status()
+            .await
+            .unwrap();
+
+        let resolved_indices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolved_clone = resolved_indices.clone();
+        let cb = move |event: ProgressEvent| {
+            if let ProgressEvent::ResolvedCommits { commits } = event {
+                *resolved_clone.lock().unwrap() = commits.into_iter().map(|c| c.index).collect();
+            }
+        };
+        let (review_input, shas) = build_review_input_from_git(repo, "HEAD~2..HEAD", Some(&cb))
+            .await
+            .unwrap();
+        assert_eq!(*resolved_indices.lock().unwrap(), vec![0, 1]);
+        // Both SHAs are returned so `shas.first()^` still resolves to the parent of the tracker commit
+        assert_eq!(shas.len(), 2);
+        // Only the real commit is in `patches`, numbered 1
+        assert_eq!(review_input.patches.len(), 1);
+        assert_eq!(review_input.patches[0].index, 1);
+        assert_eq!(
+            review_input.patches[0].subject.as_deref(),
+            Some("net: foo: update value")
+        );
+        // The edited tracker commit populates `subject` and `cover_letter`
+        assert_eq!(review_input.subject, "net: foo: series cover title");
+        let cover = review_input
+            .cover_letter
+            .expect("expected cover_letter from edited b4 tracker commit");
+        assert!(
+            cover["body"]
+                .as_str()
+                .unwrap()
+                .contains("Explain series architecture across patches.")
+        );
     }
 }

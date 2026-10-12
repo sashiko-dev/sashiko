@@ -31,7 +31,9 @@ use crate::workflow::stage::{ExecutableStage, Stage};
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
 pub struct LinuxPatchReviewState {
+    /// Database `patchset_id` (or `"unknown"` in local CLI review).
     pub ps_id: String,
+    /// Series `patch_index` (`"0"` for cover letter / PR review, `"1".."N"` for individual commits).
     pub p_id: String,
     pub target_commit_sha: String,
     pub baseline_sha: String,
@@ -104,6 +106,13 @@ pub struct LinuxPatchReviewState {
 }
 
 impl LinuxPatchReviewState {
+    /// Returns true when reviewing a series cover letter or PR description (`patch_index == 0`).
+    /// `self.p_id` holds the series `patch_index` (`"0"` for cover letters), whereas `self.ps_id`
+    /// holds the database `patchset_id`.
+    pub fn is_cover_review(&self) -> bool {
+        self.p_id == "0"
+    }
+
     /// Resolves and grounds finding line numbers, character offsets, and diff overlap
     /// in place across all finding and concern collections using the worktree post-image.
     pub fn resolve_locations(&mut self) {
@@ -139,7 +148,6 @@ impl LinuxPatchReviewState {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Typed Output Structures for Stage Serialization
 // ---------------------------------------------------------------------------
@@ -295,6 +303,39 @@ You are a Red Team security researcher auditing a Linux kernel patch. Look for s
 const STAGE_HARDWARE_INSTRUCTION: &str = r#"# Hardware engineer's review
 
 You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. When 32-bit code (such as RV32 or 32-bit ARM) writes a 64-bit hardware timer/comparator register pair (High/Low CSRs or MMIO registers such as `stimecmp`/`stimecmph` or `vstimecmp`/`vstimecmph`) or reads a two-part hardware counter/timestamp, verify that the two-step write sequence cannot trigger a spurious intermediate comparator match (e.g., writing Low before High when the old High equals the new High, or writing `ULONG_MAX` to only the low 32-bit register when masking/clearing the timer on `vcpu_put`) and that two-part timestamp reconstruction handles rollover/carry between parts cleanly. Cross-check register offsets, bitmasks, clock parents, and DT properties against in-tree headers, DT bindings, and sibling SoC drivers rather than assuming magic numbers are unverifiable without an external datasheet. If the patch is purely generic software logic (e.g., VFS, core networking), return {"concerns": [], "dismissed_concerns": []}."#;
+
+const STAGE_SERIES_ANALYSIS_INSTRUCTION: &str = r#"# Series cover letter, cohesion, and version changelog review
+
+You are a senior Linux kernel maintainer reviewing a patch series cover letter (0/N) or Pull Request description and the overall structure of the series across `Baseline SHA..Target Commit SHA`.
+Audit the series across the following three dimensions:
+
+1. **Problem Statement & Motivation ("Why", Not Just "What"):**
+   - Check whether the cover letter / PR description clearly explains the problem being solved, the motivation ("why"), and any user-visible or system-level impact.
+   - Flag unfilled `b4` / `git format-patch` boilerplate placeholders such as `*** BLURB HERE ***` or `*** SUBJECT HERE ***` (`"file": "cover_letter"`).
+   - Flag empty or purely tautological cover letters on non-trivial multi-patch series (`>= 3` patches or cross-subsystem changes where the overall architecture and motivation cannot be understood from individual patch subjects alone). Do NOT flag a missing cover letter on a self-explanatory 1-2 patch series or trivial cleanup/fix series.
+
+2. **Cover Letter Claims vs. Actual Code & Series Cohesion:**
+   - Use Git tools (`git_diff` with `base_revision` set to `Baseline SHA` and `target_revision` set to `Target Commit SHA`, `git_show`, `git_read_files`) to verify that high-level architectural, behavioral, performance, and scope claims in the cover letter / PR description match the actual code changes across the series.
+   - Check series cohesion: flag unrelated drive-by changes bundled into the series without justification.
+   - Check commit ordering and bisectability across `1/N .. N/N`:
+     - Flag series where an earlier patch breaks compilation or introduces a regression that a later patch in the same series fixes.
+     - When a series adds or modifies Device Tree bindings (`Documentation/devicetree/bindings/`), verify that `dt-bindings:` patches precede the driver patches that use the new bindings.
+
+3. **Revision Changelog (`v2+`) & Prior Version Findings:**
+   - For `v2+` email series (indicated by `[PATCH v2 ...]`, `v3`, etc. in the subject or `=== Previous Series Version Context ===`), check that a revision changelog (`Changes in v2:`, `v1 -> v2:`, etc.) is present in the cover letter or patch notes explaining what changed since the prior version.
+   - When `=== Previous Series Version Context ===` is present:
+     - Cross-check the author's changelog claims against the `Per-Patch Lineage` (`unchanged`, `modified`, `added`, `removed`) and code diffs. Flag false changelog claims (for example, claiming a patch or function was updated when its status is `unchanged` or the code was not modified).
+     - Inspect each item in `Previous Verified Findings` using Git tools at `Target Commit SHA` to verify whether the cover letter / changelog makes a false or incomplete claim of addressing it, or whether a prior series-level (`Patch 0`) or removed-patch finding remains unaddressed. Do NOT re-report an ordinary single-patch code defect on a patch still present in `1..N` when the cover letter / changelog makes no false claim of fixing it, because the per-patch review of `1..N` audits each patch directly.
+
+4. **Strict Anti-Duplication Scope Rule:**
+   - Do NOT report ordinary single-patch local code bugs that do not involve cover letter claims, cross-patch ordering/bisectability, series cohesion, or false `v2+` changelog claims. Individual patches (`1..N`) are reviewed separately."#;
+
+const STAGE_SERIES_SUMMARY_INSTRUCTION: &str = r#"# Summarize the patch series
+
+Provide a concise 2-4 sentence plain-text summary of the overall patch series or pull request, explaining what the series accomplishes as a whole, its high-level motivation, and (when `Previous Series Version Context` is present) the key changes compared to the previous version.
+- Use strictly plain text: no markdown, no backticks, no markdown headings ('#'), and no bullet points.
+- Wrap prose lines at 78 characters or fewer.
+- Summarize the series itself (do not list review findings or issues here)."#;
 
 const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verification and severity estimation
 
@@ -925,26 +966,31 @@ pub fn format_post_verification_feedback(violation: &str) -> String {
     )
 }
 
-fn validate_inline_format(content: &str, _state: &LinuxPatchReviewState) -> Result<(), String> {
+fn validate_inline_format(content: &str, state: &LinuxPatchReviewState) -> Result<(), String> {
     if content.lines().any(|l| l.trim_start().starts_with("```")) {
         return Err("The output contains Markdown code blocks ('```'). It must be plain text as per `inline-template.md`.".to_string());
     }
     if !content.lines().any(|l| l.trim_start().starts_with('>')) {
         return Err("The output does not appear to quote any code or context using '>'. Please follow the quoting style in `inline-template.md`.".to_string());
     }
-    let has_commit_header = content
-        .lines()
-        .take(20)
-        .any(|l| l.trim_start().to_lowercase().starts_with("commit "));
-    if !has_commit_header {
-        return Err("The output is missing the 'commit <hash>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
-    }
-    let has_author_header = content
-        .lines()
-        .take(20)
-        .any(|l| l.trim_start().to_lowercase().starts_with("author:"));
-    if !has_author_header {
-        return Err("The output is missing the 'Author: <name>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
+    // Cover letter / PR series reviews (`patch_index == 0`, stored in `state.p_id`)
+    // review the cover letter as a whole rather than a single commit, so they omit
+    // the single-commit `commit <hash>` / `Author:` preamble.
+    if !state.is_cover_review() {
+        let has_commit_header = content
+            .lines()
+            .take(20)
+            .any(|l| l.trim_start().to_lowercase().starts_with("commit "));
+        if !has_commit_header {
+            return Err("The output is missing the 'commit <hash>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
+        }
+        let has_author_header = content
+            .lines()
+            .take(20)
+            .any(|l| l.trim_start().to_lowercase().starts_with("author:"));
+        if !has_author_header {
+            return Err("The output is missing the 'Author: <name>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
+        }
     }
     let has_comments = content.lines().any(|l| {
         let trimmed = l.trim();
@@ -966,6 +1012,49 @@ fn validate_inline_format(content: &str, _state: &LinuxPatchReviewState) -> Resu
 fn format_inline_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. Please fix the formatting to match the standard plain text LKML review format with proper headers and '> ' quoted context.",
+        violation
+    )
+}
+
+pub fn validate_series_summary_format(
+    content: &str,
+    _state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("The series summary cannot be empty.".to_string());
+    }
+    if trimmed.contains('`') {
+        return Err(
+            "The series summary contains backticks ('`'). Use strictly plain text without backticks or markdown code blocks."
+                .to_string(),
+        );
+    }
+    for line in trimmed.lines() {
+        let l = line.trim_start();
+        let is_indented = line.starts_with("  ") || line.starts_with('\t');
+        if !is_indented {
+            if l.starts_with('#') || l.starts_with("Summary:") {
+                return Err(
+                    "Do not use markdown headings ('#') or 'Summary:' prefixes in the series summary."
+                        .to_string(),
+                );
+            }
+            if line.chars().count() > 84 {
+                return Err(format!(
+                    "Line exceeds 78-character terminal width ({} chars): \"{}...\". Wrap prose lines at 78 characters.",
+                    line.chars().count(),
+                    line.chars().take(40).collect::<String>()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn format_series_summary_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. Provide a plain-text series summary without backticks, markdown headings, or 'Summary:' prefixes, wrapped at 78 characters.",
         violation
     )
 }
@@ -1872,6 +1961,16 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
     },
 ];
 
+pub static SERIES_ANALYSIS: AnalysisStage = AnalysisStage {
+    name: "series-analysis",
+    short: "Series Analysis",
+    instruction: STAGE_SERIES_ANALYSIS_INSTRUCTION,
+    guides: &[],
+    uses_commit_log: true,
+    optional: false,
+    wants_series_context: false,
+};
+
 /// The consolidation stages, in the order the workflow runs them. They take no
 /// per-stage configuration, so a name and a display label is all there is to
 /// hold, but holding it once keeps the list from being restated wherever a
@@ -1899,6 +1998,12 @@ pub static POST_VERIFICATION: ConsolidationStage = ConsolidationStage {
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
+    wants_series_context: false,
+};
+
+pub static SUMMARY: ConsolidationStage = ConsolidationStage {
+    name: "summary",
+    short: "Change Summary",
     wants_series_context: false,
 };
 
@@ -1965,6 +2070,9 @@ pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationS
     if POST_VERIFICATION_STAGE_NAMES.contains(&normalized.as_str()) {
         return Some(&POST_VERIFICATION);
     }
+    if normalized == SUMMARY.name {
+        return Some(&SUMMARY);
+    }
     CONSOLIDATION_STAGES
         .iter()
         .copied()
@@ -1973,7 +2081,7 @@ pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationS
 
 /// Display label for any stage the pipeline runs.
 pub fn stage_short_label(name: &str) -> Option<&'static str> {
-    if let Some(def) = analysis_stage_by_name(name) {
+    if let Some(def) = any_analysis_stage_by_name(name) {
         return Some(def.short);
     }
     consolidation_stage_by_name(name).map(|s| s.short)
@@ -1998,11 +2106,19 @@ pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
     ANALYSIS_STAGES.iter().find(|s| s.name == normalized)
 }
 
+pub fn any_analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
+    let normalized = normalize_stage_name(name);
+    if normalized == SERIES_ANALYSIS.name {
+        return Some(&SERIES_ANALYSIS);
+    }
+    ANALYSIS_STAGES.iter().find(|s| s.name == normalized)
+}
+
 /// Every stage name a review can produce, analysis and consolidation alike,
 /// for validating what a caller or the planner asked for.
 pub fn is_known_stage(name: &str) -> bool {
     let normalized = normalize_stage_name(name);
-    analysis_stage_by_name(&normalized).is_some()
+    any_analysis_stage_by_name(&normalized).is_some()
         || consolidation_stage_by_name(&normalized).is_some()
         || matches!(normalized.as_str(), "pre-screen" | "planning")
 }
@@ -2089,6 +2205,13 @@ pub fn resolve_analysis_stages_with_options(
 
     let mut stages = Vec::new();
     for name in selected_stages {
+        if normalize_stage_name(&name) == SERIES_ANALYSIS.name {
+            tracing::info!(
+                "Skipping cover-only stage {:?} during per-patch review",
+                name
+            );
+            continue;
+        }
         match analysis_stage_by_name(&name) {
             Some(def) => {
                 let effort = resolve_stage_effort(state, def.name);
@@ -2100,6 +2223,42 @@ pub fn resolve_analysis_stages_with_options(
         }
     }
     stages
+}
+
+pub fn resolve_cover_analysis_stages_with_options(
+    state: &LinuxPatchReviewState,
+    max_turns: usize,
+    temperature: f32,
+) -> Vec<Box<dyn ExecutableStage<LinuxPatchReviewState>>> {
+    let effort = resolve_stage_effort(state, SERIES_ANALYSIS.name);
+    if let Some(ref manual) = state.manual_stages {
+        let mut stages = Vec::new();
+        for name in manual {
+            if normalize_stage_name(name) == SERIES_ANALYSIS.name {
+                if stages.is_empty() {
+                    stages.push(analysis_stage(
+                        &SERIES_ANALYSIS,
+                        max_turns,
+                        temperature,
+                        effort,
+                    ));
+                }
+            } else {
+                tracing::warn!(
+                    "Ignoring stage {:?} not applicable to cover/series review",
+                    name
+                );
+            }
+        }
+        stages
+    } else {
+        vec![analysis_stage(
+            &SERIES_ANALYSIS,
+            max_turns,
+            temperature,
+            effort,
+        )]
+    }
 }
 
 fn estimated_severity_rank(item: &Value) -> u8 {
@@ -2371,7 +2530,7 @@ Example Output:
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
         .include_files_from_state(|s: &LinuxPatchReviewState| {
-            extra_prompt_paths_for_state(s, analysis_stage_by_name)
+            extra_prompt_paths_for_state(s, any_analysis_stage_by_name)
         }),
         VERIFICATION.wants_series_context,
     )
@@ -2400,8 +2559,13 @@ Example Output:
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
             ..Default::default()
         })
+        // When skipped in cover reviews (where `early_exit_if` is not used so
+        // `series_summary_stage` still runs), `Stage::execute_isolated` emits
+        // `WorkflowEvent::StageSkipped`, which removes `"verification"` from
+        // `planned_stages` so the progress bar denominator stays accurate.
+        .skip_if(|s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty())
         .reduce_with_outcome(|state, out: VerificationOutput, outcome| {
-            apply_verification_stage_output(state, out, outcome, analysis_stage_by_name);
+            apply_verification_stage_output(state, out, outcome, any_analysis_stage_by_name);
         })
         .build()
 }
@@ -2494,7 +2658,11 @@ Example Output:
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
         .include_files_from_state(move |s: &LinuxPatchReviewState| {
-            extra_prompt_paths_for_items(&s.selected_guides, &batch_for_prompts, analysis_stage_by_name)
+            extra_prompt_paths_for_items(
+                &s.selected_guides,
+                &batch_for_prompts,
+                any_analysis_stage_by_name,
+            )
         }),
         POST_VERIFICATION.wants_series_context,
     )
@@ -2526,7 +2694,7 @@ Example Output:
                 &batch_for_reduce,
                 out,
                 outcome,
-                analysis_stage_by_name,
+                any_analysis_stage_by_name,
             );
         })
         .build()
@@ -2609,10 +2777,86 @@ Return raw text output, not JSON."#
             },
             ..Default::default()
         })
-        .skip_if(|s| s.skip_report)
+        // When skipped (e.g., `--agent` or clean cover reviews with 0 findings),
+        // `Stage::execute_isolated` emits `WorkflowEvent::StageSkipped`, which
+        // removes `"report"` from `planned_stages` so the progress bar reaches 100%.
+        .skip_if(|s| s.skip_report || s.findings.is_empty())
         .reduce(|state, out: String| {
             state.review_inline = out;
         })
+        .build()
+}
+
+pub fn series_summary_stage(
+    max_turns: usize,
+    temperature: f32,
+) -> Stage<LinuxPatchReviewState, String> {
+    series_summary_stage_with_effort(max_turns, temperature, None)
+}
+
+pub fn series_summary_stage_with_effort(
+    _max_turns: usize,
+    temperature: f32,
+    effort: Option<crate::ai::EffortMode>,
+) -> Stage<LinuxPatchReviewState, String> {
+    Stage::builder(SUMMARY.name)
+        .system_prompt(linux_system_prompt(true))
+        .user_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
+            STAGE_SERIES_SUMMARY_INSTRUCTION,
+        ))
+        .output_format(OutputFormat::text_with_validator(
+            validate_series_summary_format,
+            format_series_summary_feedback,
+        ))
+        .policy(StagePolicy {
+            tools: ToolScope::None,
+            max_turns: 1,
+            temperature,
+            reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
+            recitation_policy: RecitationPolicy::RetryWithReminder(
+                "Summarize the series concisely in plain text (no backticks, max 84 characters per line) without quoting verbatim."
+                    .to_string(),
+            ),
+            ..Default::default()
+        })
+        .skip_if(|s| s.skip_report)
+        .reduce(|state, out: String| {
+            state.summary = out.trim().to_string();
+        })
+        .build()
+}
+
+/// Constructs the declarative workflow for reviewing a series cover letter (`patch_index == 0`).
+pub fn build_linux_cover_review_workflow_with_options(
+    max_turns: usize,
+    temperature: f32,
+) -> Workflow<LinuxPatchReviewState> {
+    build_linux_cover_review_workflow_with_effort(max_turns, temperature, None)
+}
+
+pub fn build_linux_cover_review_workflow_with_effort(
+    max_turns: usize,
+    temperature: f32,
+    effort: Option<crate::ai::EffortMode>,
+) -> Workflow<LinuxPatchReviewState> {
+    Workflow::builder("linux_cover_review")
+        .resolve_parallel(
+            move |state| resolve_cover_analysis_stages_with_options(state, max_turns, temperature),
+            ParallelPolicy::BestEffort,
+        )
+        .dynamic_parallel(
+            verification_stage_with_effort(max_turns, temperature, effort),
+            move |state| {
+                resolve_post_verification_stages_with_options(state, max_turns, temperature)
+            },
+            ParallelPolicy::BestEffort,
+        )
+        .stage(report_stage_with_effort(max_turns, temperature, effort))
+        .stage(series_summary_stage_with_effort(
+            max_turns,
+            temperature,
+            effort,
+        ))
         .build()
 }
 
@@ -4328,7 +4572,6 @@ mod tests {
         assert_eq!(state.findings[0]["stage_item_id"], "VF1");
         assert_eq!(state.findings[1]["stage_item_id"], "PVF1");
     }
-
     #[test]
     fn test_apply_verification_resolves_finding_locations_with_worktree() {
         let dir = tempfile::tempdir().unwrap();
@@ -4416,5 +4659,211 @@ mod tests {
         assert_eq!(state.concerns[0]["locations"][0]["in_diff"], false);
         assert_eq!(state.hard_cases[0]["locations"][0]["line"], 1);
         assert_eq!(state.hard_cases[0]["locations"][0]["in_diff"], false);
+    }
+
+    #[test]
+    fn test_series_summary_validator_rejects_markdown_and_long_lines() {
+        let state = LinuxPatchReviewState::default();
+        assert!(
+            validate_series_summary_format(
+                "This 2-patch series refactors foo subsystem.\n\nBefore:\n  foo() leaked.\n\nAfter:\n  foo() frees its buffer.",
+                &state
+            )
+            .is_ok()
+        );
+        assert!(validate_series_summary_format("   ", &state).is_err());
+        assert!(validate_series_summary_format("Uses `foo()` in summary.", &state).is_err());
+        assert!(validate_series_summary_format("# Series heading", &state).is_err());
+        assert!(validate_series_summary_format("Summary: prefixed.", &state).is_err());
+        let long_line = "a".repeat(90);
+        assert!(validate_series_summary_format(&long_line, &state).is_err());
+        // Indented example lines may exceed the prose width.
+        assert!(validate_series_summary_format(&format!("Short.\n  {long_line}"), &state).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cover_review_workflow_runs_series_analysis_and_verifies() {
+        struct MockCoverProvider {
+            call_idx: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::ai::AiProvider for MockCoverProvider {
+            async fn generate_content(
+                &self,
+                _req: crate::ai::AiRequest,
+            ) -> anyhow::Result<crate::ai::AiResponse> {
+                let mut idx = self.call_idx.lock().unwrap();
+                let step = *idx;
+                *idx += 1;
+                let content = match step {
+                    0 => r#"{
+                        "concerns": [
+                            {
+                                "type": "Cover Letter / Series Cohesion",
+                                "description": "Cover letter claims foo() is removed, but patch 2 leaves it defined",
+                                "reasoning": "foo() remains in foo.c",
+                                "locations": [
+                                    {
+                                        "file": "foo.c",
+                                        "function_or_symbol": "foo",
+                                        "line": 10,
+                                        "code_snippet": "void foo(void) {}",
+                                        "side": "REVISION",
+                                        "why_this_location_matters": "Still defined at series tip"
+                                    }
+                                ]
+                            }
+                        ],
+                        "dismissed_concerns": []
+                    }"#
+                    .to_string(),
+                    1 => r#"{
+                        "findings": [
+                            {
+                                "source_ids": ["C1"],
+                                "problem": "cover-letter: stale removal claim for foo()",
+                                "severity": "Low",
+                                "severity_explanation": "Cover letter contradicts final code state.",
+                                "preexisting": false,
+                                "locations": [
+                                    {
+                                        "file": "foo.c",
+                                        "function_or_symbol": "foo",
+                                        "line": 10,
+                                        "code_snippet": "void foo(void) {}",
+                                        "side": "REVISION",
+                                        "why_this_location_matters": "Still defined at series tip"
+                                    }
+                                ]
+                            }
+                        ],
+                        "hard_cases": [],
+                        "dismissed_concerns": []
+                    }"#
+                    .to_string(),
+                    2 => "> Remove foo()\n\nCover letter claims foo() is removed, but foo.c still defines it.".to_string(),
+                    _ => "This 2-patch series refactors foo subsystem.".to_string(),
+                };
+                Ok(crate::ai::AiResponse {
+                    content: Some(content),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        for f in [
+            "false-positive-guide.md",
+            "severity.md",
+            "inline-template.md",
+        ] {
+            std::fs::write(prompts_dir.join(f), "").unwrap();
+        }
+
+        let provider = std::sync::Arc::new(MockCoverProvider {
+            call_idx: std::sync::Mutex::new(0),
+        });
+        let tools = std::sync::Arc::new(crate::toolbox::ToolBox::new(
+            temp_dir.path().to_path_buf(),
+            None,
+        ));
+        let env = crate::workflow::stage::WorkflowEnv {
+            provider,
+            tools,
+            base_dir: &prompts_dir,
+            context_tag: None,
+        };
+
+        let mut state = LinuxPatchReviewState {
+            p_id: "0".to_string(),
+            target_commit_diff: "=== Series Cover Letter ===\nRemove foo()".to_string(),
+            target_commit_diff_only: "=== Series Cover Letter ===\nRemove foo()".to_string(),
+            ..Default::default()
+        };
+        let resolved_batches: std::sync::Mutex<Vec<Vec<&'static str>>> =
+            std::sync::Mutex::new(Vec::new());
+        let event_cb = |ev: crate::workflow::WorkflowEvent| {
+            if let crate::workflow::WorkflowEvent::ParallelResolved { stage_names } = ev {
+                resolved_batches.lock().unwrap().push(stage_names);
+            }
+        };
+        let workflow = build_linux_cover_review_workflow_with_options(1, 0.0);
+        let outcome = crate::workflow::engine::WorkflowEngine::execute(
+            &workflow,
+            &env,
+            &mut state,
+            Some(&event_cb),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *resolved_batches.lock().unwrap(),
+            vec![vec!["series-analysis"], Vec::<&str>::new()]
+        );
+        assert_eq!(outcome.early_exit_reason, None);
+        assert_eq!(state.findings.len(), 1);
+        assert_eq!(state.findings[0]["stage"], "series-analysis");
+        assert_eq!(
+            state.findings[0]["problem"],
+            "cover-letter: stale removal claim for foo()"
+        );
+        assert!(state.review_inline.contains("Cover letter claims foo()"));
+        assert_eq!(
+            state.summary,
+            "This 2-patch series refactors foo subsystem."
+        );
+    }
+
+    #[test]
+    fn test_series_analysis_excluded_from_per_patch_stages() {
+        assert!(analysis_stage_by_name("series-analysis").is_none());
+        assert!(any_analysis_stage_by_name("series-analysis").is_some());
+        assert!(is_known_stage("series-analysis"));
+
+        let state = LinuxPatchReviewState {
+            manual_stages: Some(vec!["series-analysis".to_string(), "goal".to_string()]),
+            ..Default::default()
+        };
+        let per_patch = resolve_analysis_stages_with_options(&state, 5, 0.2);
+        let per_patch_names: Vec<&str> = per_patch.iter().map(|s| s.name()).collect();
+        assert_eq!(per_patch_names, vec!["goal"]);
+
+        let cover = resolve_cover_analysis_stages_with_options(&state, 5, 0.2);
+        let cover_names: Vec<&str> = cover.iter().map(|s| s.name()).collect();
+        assert_eq!(cover_names, vec!["series-analysis"]);
+    }
+
+    #[test]
+    fn test_series_summary_stage_avoids_duplicating_context_or_findings() {
+        let state = LinuxPatchReviewState {
+            target_commit_diff: "=== Series Cover Letter ===\nUNIQUE_SERIES_MARKER".to_string(),
+            findings: vec![serde_json::json!({"problem": "UNIQUE_FINDING_MARKER"})],
+            ..Default::default()
+        };
+        let stage = series_summary_stage(1, 0.0);
+        let sys = stage
+            .system_prompt
+            .as_ref()
+            .expect("system_prompt")
+            .render_for_log(&state);
+        let usr = stage.user_prompt.render_for_log(&state);
+        assert!(sys.contains("UNIQUE_SERIES_MARKER"));
+        assert!(!usr.contains("UNIQUE_SERIES_MARKER"));
+        assert!(!usr.contains("UNIQUE_FINDING_MARKER"));
     }
 }

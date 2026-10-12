@@ -40,6 +40,12 @@ pub enum WorkflowStep<S: Send + Sync> {
         policy: ParallelPolicy,
     },
 
+    /// Resolve stages from state without a preceding LLM planner stage and execute concurrently.
+    ResolveParallel {
+        resolver: StageResolver<S>,
+        policy: ParallelPolicy,
+    },
+
     /// Conditional branching.
     Branch {
         condition: Box<dyn Fn(&S) -> bool + Send + Sync>,
@@ -120,6 +126,19 @@ impl<S: Send + Sync + 'static> WorkflowBuilder<S> {
     {
         self.steps.push(WorkflowStep::DynamicParallel {
             planner: Box::new(planner),
+            resolver: Box::new(resolver),
+            policy,
+        });
+        self
+    }
+
+    /// Appends a state-resolved parallel fan-out step without a preceding planner stage.
+    pub fn resolve_parallel<R>(mut self, resolver: R, policy: ParallelPolicy) -> Self
+    where
+        S: Send + Sync,
+        R: Fn(&S) -> Vec<Box<dyn ExecutableStage<S>>> + Send + Sync + 'static,
+    {
+        self.steps.push(WorkflowStep::ResolveParallel {
             resolver: Box::new(resolver),
             policy,
         });

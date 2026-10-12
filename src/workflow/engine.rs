@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::ai::AiMessage;
 
 use super::events::WorkflowEvent;
-use super::graph::{Workflow, WorkflowStep};
+use super::graph::{StageResolver, Workflow, WorkflowStep};
 use super::policy::ParallelPolicy;
 use super::stage::{ExecutableStage, StageOutcome, WorkflowEnv};
 
@@ -200,24 +200,13 @@ impl WorkflowEngine {
                         }
                     };
                     record_stage_outcome(outcome, planner.name(), planner_outcome);
-
-                    let dynamic_stages = resolver(state);
-                    if let Some(cb) = event_cb {
-                        cb(WorkflowEvent::ParallelResolved {
-                            stage_names: dynamic_stages.iter().map(|s| s.name()).collect(),
-                        });
-                    }
-                    if !dynamic_stages.is_empty() {
-                        execute_parallel_batch(
-                            &dynamic_stages,
-                            *policy,
-                            env,
-                            state,
-                            event_cb,
-                            outcome,
-                        )
+                    resolve_and_execute_parallel(resolver, *policy, env, state, event_cb, outcome)
                         .await?;
-                    }
+                }
+
+                WorkflowStep::ResolveParallel { resolver, policy } => {
+                    resolve_and_execute_parallel(resolver, *policy, env, state, event_cb, outcome)
+                        .await?;
                 }
 
                 WorkflowStep::Branch {
@@ -270,6 +259,26 @@ impl WorkflowEngine {
         }
         Ok(())
     }
+}
+
+async fn resolve_and_execute_parallel<S: Send + Sync + 'static>(
+    resolver: &StageResolver<S>,
+    policy: ParallelPolicy,
+    env: &WorkflowEnv<'_>,
+    state: &mut S,
+    event_cb: Option<&(dyn Fn(WorkflowEvent) + Send + Sync)>,
+    outcome: &mut WorkflowOutcome,
+) -> Result<()> {
+    let dynamic_stages = resolver(state);
+    if let Some(cb) = event_cb {
+        cb(WorkflowEvent::ParallelResolved {
+            stage_names: dynamic_stages.iter().map(|s| s.name()).collect(),
+        });
+    }
+    if !dynamic_stages.is_empty() {
+        execute_parallel_batch(&dynamic_stages, policy, env, state, event_cb, outcome).await?;
+    }
+    Ok(())
 }
 
 async fn execute_parallel_batch<S: Send + Sync + 'static>(
@@ -752,6 +761,69 @@ mod tests {
         assert_eq!(outcome.stage_runs[2].history_start, 2);
         assert_eq!(outcome.stage_runs[2].history_end, 4);
         assert_eq!(outcome.history.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_skipped_stage_emits_skipped_event_and_no_started_or_finished() {
+        let provider = Arc::new(MockProvider::single(r#"{"items": ["c1"]}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("skip_event_flow")
+            .stage(
+                Stage::builder("stage_skipped")
+                    .user_prompt(PromptTemplate::new("Skipped"))
+                    .output_format(OutputFormat::json())
+                    .skip_if(|_: &DummyState| true)
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .stage(
+                Stage::builder("stage_run")
+                    .user_prompt(PromptTemplate::new("Run"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .build();
+
+        let events = std::sync::Mutex::new(Vec::new());
+        let record = |event: WorkflowEvent| {
+            let label = match event {
+                WorkflowEvent::StageStarted { stage_name } => format!("started:{stage_name}"),
+                WorkflowEvent::StageFinished { stage_name, .. } => {
+                    format!("finished:{stage_name}")
+                }
+                WorkflowEvent::StageSkipped { stage_name } => format!("skipped:{stage_name}"),
+                _ => return,
+            };
+            events.lock().unwrap().push(label);
+        };
+        WorkflowEngine::execute(&workflow, &env, &mut state, Some(&record))
+            .await
+            .unwrap();
+
+        // A skipped stage says so once, and never claims to have started or
+        // finished, so a progress display can drop it from its plan.
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "skipped:stage_skipped".to_string(),
+                "started:stage_run".to_string(),
+                "finished:stage_run".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
