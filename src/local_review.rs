@@ -238,6 +238,8 @@ pub async fn build_review_input_from_git(
             id: 0,
             subject,
             patches,
+            cover_letter: None,
+            previous_version: None,
         },
         shas,
     ))
@@ -289,6 +291,8 @@ pub async fn run_worker(
     let patchset_id = input.id;
     let subject = input.subject;
     let patches = input.patches;
+    let cover_letter = input.cover_letter;
+    let previous_version = input.previous_version;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
     } else {
@@ -375,6 +379,8 @@ pub async fn run_worker(
         patchset_id,
         subject,
         patches,
+        cover_letter,
+        previous_version,
         &baseline_arg,
         &baseline_sha,
         &options,
@@ -481,6 +487,15 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
     Ok(inline_content)
 }
 
+fn is_safe_git_rev(rev: &str) -> bool {
+    let trimmed = rev.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('-')
+        && !trimmed
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
@@ -491,6 +506,8 @@ async fn review_single_patch(
     all_patches: &[PatchInput],
     rich_patches: &[Value],
     patch_shas: &HashMap<i64, String>,
+    cover_letter: Option<&Value>,
+    previous_version: Option<&Value>,
     options: &WorkerOptions,
     baseline_sha: &str,
     llm_semaphore: &Arc<Semaphore>,
@@ -537,12 +554,27 @@ async fn review_single_patch(
         // The directory itself: read_prompt resolves a name against it.
         let prompts_tool_path = Some(options.prompts.clone());
 
+        // A cover review (index 0) spans the whole series, so its active
+        // files come from baseline..tip; without a usable baseline it is
+        // left unrestricted rather than narrowed to the tip commit alone.
         let mut patch_files = Vec::new();
-        if let Some(sha) = patch_shas.get(&p.index) {
-            let output = crate::git_cmd::in_dir_async(&worktree.path)
-                .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
-                .output()
-                .await;
+        if let Some(sha) = patch_shas.get(&p.index).filter(|s| is_safe_git_rev(s))
+            && (p.index != 0 || is_safe_git_rev(baseline_sha))
+        {
+            let mut cmd = crate::git_cmd::in_dir_async(&worktree.path);
+            if p.index == 0 {
+                cmd.args(["diff", "--name-only", baseline_sha, sha, "--"]);
+            } else {
+                cmd.args([
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    sha,
+                    "--",
+                ]);
+            }
+            let output = cmd.output().await;
             if let Ok(out) = output
                 && out.status.success()
             {
@@ -645,7 +677,9 @@ async fn review_single_patch(
             "subject": subject,
             "patches": rich_patches,
             "patch_index": Some(p.index),
-            "baseline": baseline_sha
+            "baseline": baseline_sha,
+            "cover_letter": cover_letter,
+            "previous_version": previous_version,
         });
 
         match worker
@@ -803,6 +837,8 @@ async fn run_worker_in_worktree(
     patchset_id: i64,
     subject: String,
     patches: Vec<PatchInput>,
+    cover_letter: Option<Value>,
+    previous_version: Option<Value>,
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
@@ -908,15 +944,77 @@ async fn run_worker_in_worktree(
         applied
     };
 
+    let mut synthesize_cover_patch = || -> PatchInput {
+        let series_tip_sha = options
+            .review_commit
+            .clone()
+            .filter(|s| is_safe_git_rev(s))
+            .or_else(|| {
+                patches.iter().max_by_key(|p| p.index).and_then(|p| {
+                    patch_shas
+                        .get(&p.index)
+                        .cloned()
+                        .or_else(|| p.commit_id.clone().filter(|s| is_safe_git_rev(s)))
+                })
+            });
+        if let Some(ref tip) = series_tip_sha {
+            patch_shas.entry(0).or_insert_with(|| tip.clone());
+        }
+        if !patch_results.iter().any(|r| r["index"] == 0) {
+            patch_results.insert(
+                0,
+                json!({
+                    "index": 0,
+                    "status": "applied",
+                    "method": "cover-letter",
+                    "subject": subject,
+                }),
+            );
+        }
+        PatchInput {
+            index: 0,
+            diff: String::new(),
+            subject: Some(subject.clone()),
+            author: cover_letter
+                .as_ref()
+                .and_then(|c| c["author"].as_str().map(str::to_string)),
+            date: cover_letter.as_ref().and_then(|c| c["date"].as_i64()),
+            message_id: cover_letter
+                .as_ref()
+                .and_then(|c| c["message_id"].as_str().map(str::to_string)),
+            commit_id: series_tip_sha,
+        }
+    };
+
     let mut patches_to_review: Vec<PatchInput> =
         if let Some(target_idx) = options.review_patch_index {
-            patches
+            let mut matched: Vec<PatchInput> = patches
                 .iter()
                 .filter(|p| p.index == target_idx)
                 .cloned()
-                .collect()
+                .collect();
+            if matched.is_empty() && target_idx == 0 {
+                matched.push(synthesize_cover_patch());
+            }
+            matched
         } else {
-            patches.clone()
+            let mut all = Vec::with_capacity(patches.len() + 1);
+            // Synthesize the series-level review (`index = 0`) when a cover letter or
+            // previous-version context is present, or when reviewing a multi-patch
+            // mbox/JSON series (`!options.current_tree && patches.len() > 1`) so missing
+            // cover letters and series-wide cohesion are audited. Pure local git
+            // commit-range reviews (`options.current_tree`) have no 0/N email cover
+            // letter in git history and review commits 1..N directly unless `--patch 0`
+            // is explicitly requested.
+            if (cover_letter.is_some()
+                || previous_version.is_some()
+                || (!options.current_tree && patches.len() > 1))
+                && !patches.iter().any(|p| p.index == 0)
+            {
+                all.push(synthesize_cover_patch());
+            }
+            all.extend(patches.iter().cloned());
+            all
         };
 
     if settings.ai.no_ai {
@@ -997,6 +1095,8 @@ async fn run_worker_in_worktree(
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
+        let cover_letter = cover_letter.as_ref();
+        let previous_version = previous_version.as_ref();
         let options = &options;
         let subject_clone = subject.clone();
         let all_patches = &patches;
@@ -1012,6 +1112,8 @@ async fn run_worker_in_worktree(
                 all_patches,
                 &rich_patches,
                 patch_shas,
+                cover_letter,
+                previous_version,
                 options,
                 baseline_sha,
                 llm_semaphore,

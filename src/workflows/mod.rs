@@ -71,6 +71,12 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
                         .iter()
                         .map(|s| s.name.to_string()),
                 );
+                if planned
+                    .iter()
+                    .any(|s| s == linux_patch_review::SERIES_ANALYSIS.name)
+                {
+                    planned.push(linux_patch_review::SUMMARY.name.to_string());
+                }
             }
             planned
         }

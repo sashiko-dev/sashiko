@@ -34,6 +34,8 @@ pub enum WorkflowEvent {
         tokens_out: u32,
         tokens_cached: u32,
     },
+    /// A stage was skipped because its `skip_if` predicate returned true.
+    StageSkipped { stage_name: &'static str },
     /// A dynamic fan-out resolved the stages it will run. Emitted whether or
     /// not the planning stage ran, so a skipped planner still reports a plan.
     ParallelResolved { stage_names: Vec<&'static str> },

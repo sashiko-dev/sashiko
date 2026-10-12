@@ -2059,6 +2059,8 @@ async fn handle_local(
                 .and_then(|p| p.subject.clone())
                 .unwrap_or_else(|| input.clone()),
             patches,
+            cover_letter: None,
+            previous_version: None,
         };
 
         let review_json =
