@@ -407,6 +407,9 @@ impl Reviewer {
             .await?;
 
         for review in reviews {
+            let Some(patch_id) = review.patch_id else {
+                continue;
+            };
             let ps_msg_id = patchset
                 .message_id
                 .as_deref()
@@ -415,7 +418,7 @@ impl Reviewer {
                 ctx,
                 patchset.id,
                 Some(review.id),
-                review.patch_id,
+                patch_id,
                 &review.patch_message_id,
                 ps_msg_id,
                 review.index,
@@ -465,7 +468,7 @@ impl Reviewer {
         for (patch_id, idx, _diff, subj, _auth, _date, msg_id) in diffs {
             let matching_review = reviews
                 .iter()
-                .find(|r| r.patch_id == *patch_id || r.index == *idx);
+                .find(|r| r.patch_id == Some(*patch_id) || r.index == *idx);
             if *idx == 0 {
                 if let Some(r) = matching_review
                     && !r.summary.trim().is_empty()
@@ -1616,7 +1619,7 @@ impl Reviewer {
 
         let successful_count = ctx
             .db
-            .count_successful_reviews(patchset_id, patch_id, baseline_id)
+            .count_successful_reviews(patchset_id, Some(patch_id), baseline_id)
             .await?;
 
         if successful_count >= ctx.target_review_count {
@@ -1634,7 +1637,7 @@ impl Reviewer {
 
         if ctx
             .db
-            .has_failed_review(patchset_id, patch_id, baseline_id)
+            .has_failed_review(patchset_id, Some(patch_id), baseline_id)
             .await?
         {
             info!(
