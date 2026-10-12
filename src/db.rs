@@ -11826,6 +11826,52 @@ impl Database {
             .await?;
         Ok(id)
     }
+
+    pub async fn update_message_body(&self, message_id: &str, body: &str) -> Result<()> {
+        let body_owned = body.to_string();
+        let compressed_body = tokio::task::spawn_blocking(move || {
+            crate::compression::compress_string_if_needed(&body_owned)
+        })
+        .await
+        .context("message body compression task failed")?;
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.begin_immediate_transaction().await?;
+        for clid in Self::get_msgid_candidates(message_id) {
+            let res = tx
+                .execute(
+                    "UPDATE messages SET body = ? WHERE message_id = ?",
+                    libsql::params![compressed_body.clone(), clid],
+                )
+                .await?;
+            if res > 0 {
+                tx.commit().await?;
+                return Ok(());
+            }
+        }
+        let thread_id = {
+            let mut rows = tx
+                .query(
+                    "INSERT INTO threads (root_message_id, subject, last_updated) VALUES (?, '(placeholder)', ?) RETURNING id",
+                    libsql::params![message_id, now],
+                )
+                .await?;
+            let val = match rows.next().await? {
+                Some(row) => Some(row.get::<i64>(0)?),
+                None => None,
+            };
+            drop(rows);
+            val.ok_or_else(|| anyhow::anyhow!("Failed to get thread ID"))?
+        };
+        tx.execute(
+            "INSERT INTO messages (message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr)
+             VALUES (?, ?, NULL, 'unknown', '(placeholder)', ?, ?, '', '', NULL, NULL, NULL)",
+            libsql::params![message_id, thread_id, now, compressed_body],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
@@ -26864,6 +26910,83 @@ mod tests {
             "mm: fix page_alloc race",
             &[]
         ));
+    }
+
+    #[tokio::test]
+    async fn test_update_message_body_prefers_existing_alias_before_placeholder() {
+        let db = setup_db().await;
+        db.ensure_thread_for_message("<pr-body-alias@example.com>", 1700000000)
+            .await
+            .unwrap();
+
+        db.update_message_body("pr-body-alias@example.com", "Updated PR description")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_message_body("<pr-body-alias@example.com>")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Updated PR description")
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM messages WHERE message_id IN ('pr-body-alias@example.com', '<pr-body-alias@example.com>')",
+                (),
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_message_body_creates_placeholder_when_message_is_unknown() {
+        let db = setup_db().await;
+        let msgid = "mr-7-aaaa..bbbb@sashiko.local";
+
+        db.update_message_body(msgid, "Fresh PR description")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_message_body(msgid).await.unwrap().as_deref(),
+            Some("Fresh PR description")
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT m.subject, t.subject FROM messages m JOIN threads t ON t.id = m.thread_id WHERE m.message_id = ?",
+                libsql::params![msgid],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("placeholder message row");
+        assert_eq!(row.get::<String>(0).unwrap(), "(placeholder)");
+        assert_eq!(row.get::<String>(1).unwrap(), "(placeholder)");
+        drop(rows);
+
+        // A second write updates the same row instead of adding another.
+        db.update_message_body(msgid, "").await.unwrap();
+        assert!(
+            db.get_message_body(msgid)
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM messages WHERE message_id = ?",
+                libsql::params![msgid],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 1);
     }
 
     fn collect_rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
