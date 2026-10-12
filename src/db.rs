@@ -1271,6 +1271,8 @@ pub enum EmailKind {
     /// A review result or a patchwork notification, tied to a patch.
     #[default]
     ReviewNotification,
+    /// A series cover-letter review reply, tied to a patchset.
+    ReviewReply,
     /// A sign-in link, tied to a person.
     SignInLink,
     /// A notice to the person a bug was just assigned to.
@@ -1284,6 +1286,7 @@ impl EmailKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EmailKind::ReviewNotification => "review_notification",
+            EmailKind::ReviewReply => "review_reply",
             EmailKind::SignInLink => "sign_in_link",
             EmailKind::BugAssignment => "bug_assignment",
             EmailKind::Unrecognized => "unrecognized",
@@ -1294,7 +1297,9 @@ impl EmailKind {
     /// thread, or None for review notifications.
     pub fn transactional_list_label(self) -> Option<&'static str> {
         match self {
-            EmailKind::ReviewNotification | EmailKind::Unrecognized => None,
+            EmailKind::ReviewNotification | EmailKind::ReviewReply | EmailKind::Unrecognized => {
+                None
+            }
             EmailKind::SignInLink => Some("sashiko-auth"),
             EmailKind::BugAssignment => Some("sashiko-bugs"),
         }
@@ -1308,6 +1313,7 @@ impl EmailKind {
         match value {
             "sign_in_link" => EmailKind::SignInLink,
             "bug_assignment" => EmailKind::BugAssignment,
+            "review_reply" => EmailKind::ReviewReply,
             "review_notification" => EmailKind::ReviewNotification,
             other => {
                 tracing::warn!("Unrecognized email kind {:?}, delivering plainly", other);
@@ -2057,7 +2063,55 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 13.");
+        // Executed inside an atomic immediate transaction per the migration
+        // invariant so a mid-migration failure rolls back cleanly without
+        // stranding added columns before `PRAGMA user_version = 14` is recorded.
+        // Check `PRAGMA table_info(patchsets)` inside the write transaction so
+        // concurrent processes and migration tests that rewind `user_version`
+        // on an already migrated database cannot race or fail on duplicate
+        // columns.
+        if current_version < 14 {
+            info!(
+                "Applying database migration version 14 (patchset version lineage and cover outbox)..."
+            );
+            let tx = self.begin_immediate_transaction().await?;
+            // Another process may have migrated between the read of
+            // user_version above and this write lock; re-read under the lock
+            // so a late starter neither repeats the DDL nor writes an older
+            // version number over a newer schema.
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 14 {
+                info!(
+                    "Database already at version {} under the migration lock; skipping version 14.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_previous_patchset_id = {
+                    let mut columns = tx.query("PRAGMA table_info(patchsets)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "previous_patchset_id";
+                    }
+                    found
+                };
+                if !has_previous_patchset_id {
+                    tx.execute_batch(include_str!("migrations/014_patchset_version_lineage.sql"))
+                        .await?;
+                }
+                tx.execute("PRAGMA user_version = 14", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        info!("Database schema is up to date at version 14.");
 
         Ok(())
     }
@@ -6944,6 +6998,24 @@ impl Database {
                     )
                     .await?;
 
+                    // Preserve Sent/Sending outbox status when merging duplicate patches
+                    // or patchsets so an already-delivered or in-flight email is never
+                    // replaced by a Pending duplicate.
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE status NOT IN ('Sent', 'Sending', 'Locked')
+                            AND patch_id IN (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                      JOIN email_outbox meo ON meo.patch_id = mp.id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.patchset_id = ?
+                                       AND meo.status IN ('Sent', 'Sending', 'Locked')
+                                )",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
                     tx.execute(
                         "UPDATE email_outbox
                             SET patch_id = (
@@ -6981,6 +7053,36 @@ impl Database {
                         libsql::params![merge_from_id, target_id],
                     )
                     .await?;
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE patchset_id = ?
+                            AND patch_id IS NULL
+                            AND status NOT IN ('Sent', 'Sending', 'Locked')
+                            AND EXISTS (
+                                    SELECT 1 FROM email_outbox meo
+                                     WHERE meo.patchset_id = ?
+                                       AND meo.patch_id IS NULL
+                                       AND meo.status IN ('Sent', 'Sending', 'Locked')
+                                )",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE patchset_id = ?
+                            AND patch_id IS NULL
+                            AND EXISTS (
+                                    SELECT 1 FROM email_outbox teo
+                                     WHERE teo.patchset_id = ? AND teo.patch_id IS NULL
+                                )",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE email_outbox SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
 
                     tx.execute(
                         "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id)
@@ -7002,6 +7104,66 @@ impl Database {
                                        AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
                                 )",
                         libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Clear any intra-merge previous_patch_id links between target_id and
+                    // merge_from_id first so they neither block inheriting valid upstream
+                    // patch lineage nor get copied onto the surviving row.
+                    tx.execute(
+                        "UPDATE patches
+                            SET previous_patch_id = NULL, previous_patch_status = NULL
+                          WHERE patchset_id IN (?, ?)
+                            AND previous_patch_id IN (SELECT id FROM patches WHERE patchset_id IN (?, ?))",
+                        libsql::params![target_id, merge_from_id, target_id, merge_from_id],
+                    )
+                    .await?;
+
+                    tx.execute(
+                        "UPDATE patches
+                            SET previous_patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = patches.previous_patch_id
+                                )
+                          WHERE previous_patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Preserve per-patch version lineage from duplicate rows on merge_from_id
+                    // when the surviving row on target_id has not been linked yet.
+                    tx.execute(
+                        "UPDATE patches
+                            SET previous_patch_id = (
+                                    SELECT mp.previous_patch_id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id = patches.message_id
+                                ),
+                                previous_patch_status = (
+                                    SELECT mp.previous_patch_status
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id = patches.message_id
+                                )
+                          WHERE patchset_id = ?
+                            AND previous_patch_id IS NULL
+                            AND EXISTS (
+                                    SELECT 1
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id = patches.message_id
+                                       AND mp.previous_patch_id IS NOT NULL
+                                )",
+                        libsql::params![merge_from_id, merge_from_id, target_id, merge_from_id],
                     )
                     .await?;
 
@@ -7112,6 +7274,46 @@ impl Database {
                         )
                         .await?;
                     }
+
+                    // Preserve lineage metadata across merged rows and re-point any
+                    // patchsets whose previous_patchset_id referenced merge_from_id.
+                    tx.execute(
+                        "UPDATE patchsets
+                            SET change_id = COALESCE(change_id, (SELECT change_id FROM patchsets WHERE id = ?)),
+                                version = COALESCE(version, (SELECT version FROM patchsets WHERE id = ?)),
+                                previous_patchset_id = COALESCE(
+                                    CASE WHEN previous_patchset_id = ? THEN NULL ELSE previous_patchset_id END,
+                                    (SELECT previous_patchset_id FROM patchsets WHERE id = ? AND previous_patchset_id != ?)
+                                ),
+                                version_link_signal = CASE
+                                    WHEN previous_patchset_id IS NOT NULL AND previous_patchset_id != ? THEN version_link_signal
+                                    ELSE (
+                                        SELECT version_link_signal
+                                          FROM patchsets
+                                         WHERE id = ?
+                                           AND previous_patchset_id IS NOT NULL
+                                           AND previous_patchset_id != ?
+                                    )
+                                END
+                          WHERE id = ?",
+                        libsql::params![
+                            merge_from_id,
+                            merge_from_id,
+                            merge_from_id,
+                            merge_from_id,
+                            target_id,
+                            merge_from_id,
+                            merge_from_id,
+                            target_id,
+                            target_id
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE patchsets SET previous_patchset_id = ? WHERE previous_patchset_id = ? AND id != ?",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
 
                     // Delete the merged patchset
                     tx.execute(
@@ -9211,8 +9413,8 @@ impl Database {
             "UPDATE email_outbox
                  SET status = 'Cancelled', error_log = ?, locked_at = NULL
                  WHERE status IN ('Pending', 'Embargoed')
-                   AND patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)",
-            libsql::params![reason.to_string(), id],
+                   AND (patchset_id = ? OR patch_id IN (SELECT id FROM patches WHERE patchset_id = ?))",
+            libsql::params![reason.to_string(), id, id],
         )
         .await?;
 
@@ -9868,10 +10070,16 @@ impl Database {
                  error_log = 'Cancelled because patchset was cancelled',
                  locked_at = NULL
              WHERE status IN ('Pending', 'Embargoed')
-               AND EXISTS (
-                   SELECT 1 FROM patches p
-                   JOIN patchsets ps ON ps.id = p.patchset_id
-                   WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM patches p
+                       JOIN patchsets ps ON ps.id = p.patchset_id
+                       WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM patchsets ps
+                       WHERE ps.id = email_outbox.patchset_id AND ps.status = 'Cancelled'
+                   )
                )",
             (),
         )
@@ -22518,6 +22726,754 @@ mod tests {
         assert_eq!(
             releasable.iter().map(|r| r.id).collect::<Vec<_>>(),
             vec![ps_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v14_version_lineage_and_cover_outbox_columns() {
+        let db = setup_db().await;
+        let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
+        let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(version, 14);
+
+        for (table, expected_cols) in [
+            (
+                "patchsets",
+                &[
+                    "version",
+                    "change_id",
+                    "previous_patchset_id",
+                    "version_link_signal",
+                ][..],
+            ),
+            ("patches", &["previous_patch_id", "previous_patch_status"]),
+            ("email_outbox", &["patchset_id", "review_id"]),
+        ] {
+            let mut cols = db
+                .conn
+                .query(&format!("PRAGMA table_info({table})"), ())
+                .await
+                .unwrap();
+            let mut col_names = Vec::new();
+            while let Some(row) = cols.next().await.unwrap() {
+                col_names.push(row.get::<String>(1).unwrap());
+            }
+            for col in expected_cols {
+                assert!(
+                    col_names.iter().any(|c| c == col),
+                    "expected column {col} on table {table}, found {col_names:?}"
+                );
+            }
+        }
+
+        for expected_idx in [
+            "idx_patchsets_change_id",
+            "idx_patchsets_previous_patchset_id",
+            "idx_patchsets_author_email_date",
+            "idx_patches_previous_patch_id",
+            "idx_email_outbox_patchset_id",
+            "idx_email_outbox_review_id",
+            "idx_email_outbox_cover_reply_unique",
+        ] {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    libsql::params![expected_idx],
+                )
+                .await
+                .unwrap();
+            let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(count, 1, "expected index {expected_idx} to exist");
+        }
+
+        // Verify duplicate patchset merge preserves Sent cover-letter outbox rows,
+        // re-points previous_patchset_id and previous_patch_id without FK violations,
+        // and cancels cover-letter outbox rows on patchset cancellation.
+        let m0 = "20261012220000.12345-0-a@kernel.org";
+        let m1 = "20261012220000.12345-1-a@kernel.org";
+        let m2 = "20261012220000.12345-2-a@kernel.org";
+        let t1 = db
+            .create_thread(m1, "[PATCH 1/2] foo: part 1", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            m1,
+            t1,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 1/2] foo: part 1",
+            1000,
+            "body1",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                t1,
+                None,
+                m1,
+                "[PATCH 1/2] foo: part 1",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _patch1_ps1 = db.create_patch(ps1, m1, 1, "diff1").await.unwrap();
+
+        let t2 = db
+            .create_thread("other-root@kernel.org", "[PATCH 2/2] foo: part 2", 1001)
+            .await
+            .unwrap();
+        db.create_message(
+            m2,
+            t2,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 2/2] foo: part 2",
+            1001,
+            "body2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Force ps2 to be created as a separate incomplete patchset before the cover letter links them
+        let ps2 = db
+            .query_returning_i64(
+                "INSERT INTO patchsets (thread_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, version)
+                 VALUES (?, '[PATCH 2/2] foo: part 2', 'Author <a@kernel.org>', 1001, 2, 0, 'Incomplete', 1, '', '', 2, 1) RETURNING id",
+                libsql::params![t2],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch2_ps2 = db.create_patch(ps2, m2, 2, "diff2").await.unwrap();
+
+        // Point a downstream patchset and patch at ps2 / patch2_ps2 before merging ps2 into ps1
+        let t3 = db
+            .create_thread("v2@kernel.org", "[PATCH 1/2] bar: downstream", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "v2@kernel.org",
+            t3,
+            None,
+            "Other <b@kernel.org>",
+            "[PATCH 0/2] bar: downstream",
+            2000,
+            "cover-v2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "v2-p2@kernel.org",
+            t3,
+            Some("v2@kernel.org"),
+            "Other <b@kernel.org>",
+            "[PATCH 2/2] bar: downstream",
+            2000,
+            "body2-v2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps3 = db
+            .create_patchset(
+                t3,
+                Some("v2@kernel.org"),
+                "v2@kernel.org",
+                "[PATCH 1/2] bar: downstream",
+                "Other <b@kernel.org>",
+                2000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch2_ps3 = db
+            .create_patch(ps3, "v2-p2@kernel.org", 2, "diff2-v2")
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, change_id = 'cid-1', version = 1 WHERE id = ?",
+                libsql::params![ps1, ps2],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ? WHERE id = ?",
+                libsql::params![ps2, ps3],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET previous_patch_id = ?, previous_patch_status = 'unchanged' WHERE id = ?",
+                libsql::params![patch2_ps2, patch2_ps3],
+            )
+            .await
+            .unwrap();
+
+        // Target ps1 has Pending cover outbox; merged ps2 has Sent cover outbox
+        db.conn
+            .execute(
+                "INSERT INTO email_outbox (patchset_id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES (?, NULL, 'review_reply', 'Pending', 'a@kernel.org', '', 'Re: cover', '<c>', '<c>', 'pending body', 1000)",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO email_outbox (patchset_id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES (?, NULL, 'review_reply', 'Sent', 'a@kernel.org', '', 'Re: cover', '<c>', '<c>', 'sent body', 1001)",
+                libsql::params![ps2],
+            )
+            .await
+            .unwrap();
+
+        // Arriving cover letter merges ps2 into ps1
+        db.create_message(
+            m0,
+            t1,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 0/2] foo: cover",
+            1000,
+            "cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let merged_id = db
+            .create_patchset(
+                t1,
+                Some(m0),
+                m0,
+                "[PATCH 0/2] foo: cover",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged_id, ps1);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, body FROM email_outbox WHERE patchset_id = ? AND patch_id IS NULL",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "Sent");
+        assert_eq!(row.get::<String>(1).unwrap(), "sent body");
+        drop(rows);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id FROM patchsets WHERE id = ?",
+                libsql::params![ps3],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            ps1
+        );
+        drop(rows);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patch_id FROM patches WHERE id = ?",
+                libsql::params![patch2_ps3],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            patch2_ps2
+        );
+        drop(rows);
+
+        // Verify cover outbox cancellation via cancel_outbox_for_patchset and lock_pending_email
+        db.conn
+            .execute(
+                "INSERT INTO email_outbox (patchset_id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES (?, NULL, 'review_reply', 'Pending', 'a@kernel.org', '', 'Re: v2', '<v2>', '<v2>', 'v2 body', 2000)",
+                libsql::params![ps3],
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps3, "Cancelled").await.unwrap();
+        assert!(db.lock_pending_email().await.unwrap().is_none());
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status FROM email_outbox WHERE patchset_id = ? AND patch_id IS NULL",
+                libsql::params![ps3],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "Cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_self_linked_patchsets_clears_signal_and_preserves_upstream_patch_lineage() {
+        let db = setup_db().await;
+
+        // Case 1: Two partial patchsets temporarily linked to each other with no
+        // external previous version; merging them must clear BOTH previous_patchset_id
+        // and version_link_signal rather than leaving a dangling version_link_signal.
+        let s0 = "20261012230000.11111-0-a@kernel.org";
+        let s1 = "20261012230000.11111-1-a@kernel.org";
+        let s2 = "20261012230000.11111-2-a@kernel.org";
+        let t_self = db
+            .create_thread(s1, "[PATCH 1/2] self-link: part 1", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            s1,
+            t_self,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 1/2] self-link: part 1",
+            1000,
+            "body1",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_a = db
+            .create_patchset(
+                t_self,
+                None,
+                s1,
+                "[PATCH 1/2] self-link: part 1",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = db.create_patch(ps_a, s1, 1, "diff1").await.unwrap();
+
+        let t_self2 = db
+            .create_thread(
+                "other-self@kernel.org",
+                "[PATCH 2/2] self-link: part 2",
+                1001,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            s2,
+            t_self2,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 2/2] self-link: part 2",
+            1001,
+            "body2",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_b = db
+            .query_returning_i64(
+                "INSERT INTO patchsets (thread_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, version)
+                 VALUES (?, '[PATCH 2/2] self-link: part 2', 'Author <a@kernel.org>', 1001, 2, 0, 'Incomplete', 1, 'to@kernel.org', '', 2, 1) RETURNING id",
+                libsql::params![t_self2],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = db.create_patch(ps_b, s2, 2, "diff2").await.unwrap();
+        assert_ne!(ps_a, ps_b);
+
+        // Temporarily link ps_a <-> ps_b before cover-letter arrival merges them.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'subject_author' WHERE id = ?",
+                libsql::params![ps_b, ps_a],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'subject_author' WHERE id = ?",
+                libsql::params![ps_a, ps_b],
+            )
+            .await
+            .unwrap();
+
+        db.create_message(
+            s0,
+            t_self,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 0/2] self-link: cover",
+            1000,
+            "cover",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let merged_self = db
+            .create_patchset(
+                t_self,
+                Some(s0),
+                s0,
+                "[PATCH 0/2] self-link: cover",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(1),
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged_self, ps_a);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id, version_link_signal FROM patchsets WHERE id = ?",
+                libsql::params![merged_self],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<Option<i64>>(0).unwrap(), None);
+        assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
+        drop(rows);
+
+        // Case 2: Surviving target patch row temporarily pointed to merge_from's
+        // duplicate patch row while merge_from's patch row pointed to the real
+        // upstream v1 patch; merging must preserve the upstream v1 patch link and
+        // the upstream version_link_signal.
+        let t_v1 = db
+            .create_thread("v1_up@kernel.org", "[PATCH] upstream", 900)
+            .await
+            .unwrap();
+        db.create_message(
+            "v1_up@kernel.org",
+            t_v1,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH] upstream",
+            900,
+            "v1",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v1 = db
+            .create_patchset(
+                t_v1,
+                Some("v1_up@kernel.org"),
+                "v1_up@kernel.org",
+                "[PATCH] upstream",
+                "Author <a@kernel.org>",
+                900,
+                1,
+                1,
+                "to@kernel.org",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p_v1 = db
+            .create_patch(ps_v1, "v1_up@kernel.org", 1, "diff --git a/u.c b/u.c")
+            .await
+            .unwrap();
+
+        let u0 = "20261012231000.22222-0-a@kernel.org";
+        let u1 = "20261012231000.22222-1-a@kernel.org";
+        let u2 = "20261012231000.22222-2-a@kernel.org";
+        let t_v2_a = db
+            .create_thread(u1, "[PATCH v2 1/2] upstream: part 1", 1100)
+            .await
+            .unwrap();
+        db.create_message(
+            u1,
+            t_v2_a,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH v2 1/2] upstream: part 1",
+            1100,
+            "p1",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v2_target = db
+            .create_patchset(
+                t_v2_a,
+                None,
+                u1,
+                "[PATCH v2 1/2] upstream: part 1",
+                "Author <a@kernel.org>",
+                1100,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(2),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p_v2_target = db
+            .create_patch(ps_v2_target, u1, 1, "diff --git a/u.c b/u.c")
+            .await
+            .unwrap();
+
+        let t_v2_b = db
+            .create_thread(
+                "other-up@kernel.org",
+                "[PATCH v2 2/2] upstream: part 2",
+                1101,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            u2,
+            t_v2_b,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH v2 2/2] upstream: part 2",
+            1101,
+            "p2",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v2_from = db
+            .query_returning_i64(
+                "INSERT INTO patchsets (thread_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, version)
+                 VALUES (?, '[PATCH v2 2/2] upstream: part 2', 'Author <a@kernel.org>', 1101, 2, 0, 'Incomplete', 1, 'to@kernel.org', '', 2, 2) RETURNING id",
+                libsql::params![t_v2_b],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p_v2_from = db
+            .create_patch(ps_v2_from, u1, 1, "diff --git a/u.c b/u.c")
+            .await
+            .unwrap();
+        let _ = db
+            .create_patch(ps_v2_from, u2, 2, "diff --git a/u2.c b/u2.c")
+            .await
+            .unwrap();
+
+        // Target temporarily linked to merge_from, while merge_from holds the real upstream v1 lineage.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'subject_author' WHERE id = ?",
+                libsql::params![ps_v2_from, ps_v2_target],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'b4_change_id' WHERE id = ?",
+                libsql::params![ps_v1, ps_v2_from],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET previous_patch_id = ?, previous_patch_status = 'unchanged' WHERE id = ?",
+                libsql::params![p_v2_from, p_v2_target],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET previous_patch_id = ?, previous_patch_status = 'modified' WHERE id = ?",
+                libsql::params![p_v1, p_v2_from],
+            )
+            .await
+            .unwrap();
+
+        db.create_message(
+            u0,
+            t_v2_a,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH v2 0/2] upstream: cover",
+            1100,
+            "cover",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let merged_v2 = db
+            .create_patchset(
+                t_v2_a,
+                Some(u0),
+                u0,
+                "[PATCH v2 0/2] upstream: cover",
+                "Author <a@kernel.org>",
+                1100,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(2),
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged_v2, ps_v2_target);
+
+        let mut ps_rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id, version_link_signal FROM patchsets WHERE id = ?",
+                libsql::params![merged_v2],
+            )
+            .await
+            .unwrap();
+        let ps_row = ps_rows.next().await.unwrap().unwrap();
+        assert_eq!(ps_row.get::<Option<i64>>(0).unwrap(), Some(ps_v1));
+        assert_eq!(
+            ps_row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("b4_change_id")
+        );
+        drop(ps_rows);
+
+        let mut p_rows = db
+            .conn
+            .query(
+                "SELECT previous_patch_id, previous_patch_status FROM patches WHERE patchset_id = ? AND part_index = 1",
+                libsql::params![merged_v2],
+            )
+            .await
+            .unwrap();
+        let p_row = p_rows.next().await.unwrap().unwrap();
+        assert_eq!(p_row.get::<Option<i64>>(0).unwrap(), Some(p_v1));
+        assert_eq!(
+            p_row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("modified")
         );
     }
 
