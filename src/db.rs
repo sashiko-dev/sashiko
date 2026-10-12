@@ -343,7 +343,7 @@ pub(crate) struct StoredPrerequisiteSeries {
 #[derive(Debug, Clone)]
 pub struct ReleaseReview {
     pub id: i64,
-    pub patch_id: i64,
+    pub patch_id: Option<i64>,
     pub patch_message_id: String,
     pub index: i64,
     pub inline_review: String,
@@ -368,6 +368,23 @@ const CLEAN_PATCHSET_PREDICATE: &str = "
         SELECT 1 FROM reviews r
         WHERE r.patchset_id = p.id AND r.status = 'Skipped'
           AND r.result_description = 'Skipped AI review via --no-ai'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id
+          AND r.patch_id IS NULL
+          AND (
+              r.status IN ('Pending', 'In Review', 'Applying')
+              OR (
+                  r.status IN ('Failed', 'FailedToApply')
+                  AND (
+                      SELECT COUNT(*) FROM reviews completed
+                      WHERE completed.patchset_id = p.id
+                        AND completed.patch_id IS NULL
+                        AND completed.status = 'Reviewed'
+                  ) < COALESCE(p.target_review_count, 1)
+              )
+          )
     )
     AND NOT EXISTS (
         SELECT 1 FROM patches pa
@@ -2111,7 +2128,35 @@ impl Database {
             }
         }
 
-        info!("Database schema is up to date at version 14.");
+        if current_version < 15 {
+            info!(
+                "Applying database migration version 15 (index reviews patchset patch status)..."
+            );
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 15 {
+                info!(
+                    "Database already at version {} under the migration lock; skipping version 15.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!(
+                    "migrations/015_index_reviews_patchset_patch_status.sql"
+                ))
+                .await?;
+                tx.execute("PRAGMA user_version = 15", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        info!("Database schema is up to date at version 15.");
 
         Ok(())
     }
@@ -2280,7 +2325,7 @@ impl Database {
     pub async fn has_successful_review(
         &self,
         patchset_id: i64,
-        patch_id: i64,
+        patch_id: Option<i64>,
         baseline_id: Option<i64>,
     ) -> Result<bool> {
         Ok(self
@@ -2292,12 +2337,12 @@ impl Database {
     pub async fn count_successful_reviews(
         &self,
         patchset_id: i64,
-        patch_id: i64,
+        patch_id: Option<i64>,
         _baseline_id: Option<i64>,
     ) -> Result<usize> {
         let mut rows = self.conn
             .query(
-                "SELECT COUNT(*) FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status = 'Reviewed'",
+                "SELECT COUNT(*) FROM reviews WHERE patchset_id = ? AND patch_id IS ? AND status = 'Reviewed'",
                 libsql::params![patchset_id, patch_id],
             )
             .await?;
@@ -2313,12 +2358,12 @@ impl Database {
     pub async fn has_failed_review(
         &self,
         patchset_id: i64,
-        patch_id: i64,
+        patch_id: Option<i64>,
         _baseline_id: Option<i64>,
     ) -> Result<bool> {
         let mut rows = self.conn
             .query(
-                "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
+                "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id IS ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
                 libsql::params![patchset_id, patch_id],
             )
             .await?;
@@ -8983,6 +9028,8 @@ impl Database {
                 .map(|(bug, is_new)| bug_reference_json(&bug, is_new))
                 .collect::<Vec<_>>();
             let versions = self.get_patchset_version_chain(pid, now).await?;
+            let (cover_email_status, cover_email_to, cover_email_cc) =
+                self.get_cover_email_status(pid).await?;
 
             Ok(Some(serde_json::json!({
                 "id": pid,
@@ -9016,7 +9063,10 @@ impl Database {
                 "version": effective_version,
                 "previous_patchset_id": previous_patchset_id,
                 "version_link_signal": version_link_signal,
-                "versions": versions
+                "versions": versions,
+                "cover_email_status": cover_email_status,
+                "cover_email_to": cover_email_to,
+                "cover_email_cc": cover_email_cc
             })))
         } else {
             Ok(None)
@@ -9239,6 +9289,8 @@ impl Database {
                 }
             }
             let versions = self.get_patchset_version_chain(pid, now).await?;
+            let (cover_email_status, cover_email_to, cover_email_cc) =
+                self.get_cover_email_status(pid).await?;
 
             Ok(Some(serde_json::json!({
                 "id": pid,
@@ -9271,7 +9323,10 @@ impl Database {
                 "version": effective_version,
                 "previous_patchset_id": previous_patchset_id,
                 "version_link_signal": version_link_signal,
-                "versions": versions
+                "versions": versions,
+                "cover_email_status": cover_email_status,
+                "cover_email_to": cover_email_to,
+                "cover_email_cc": cover_email_cc
             })))
         } else {
             Ok(None)
@@ -9817,6 +9872,34 @@ impl Database {
             return Ok(PatchsetReviewOutcome::Incomplete);
         }
 
+        let mut incomplete_cover_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews r
+                 WHERE r.patchset_id = ?
+                   AND r.patch_id IS NULL
+                   AND (
+                       r.status IN ('Pending', 'In Review', 'Applying')
+                       OR (
+                           r.status IN ('Failed', 'FailedToApply')
+                           AND (
+                               SELECT COUNT(*) FROM reviews completed
+                               WHERE completed.patchset_id = r.patchset_id
+                                 AND completed.patch_id IS NULL
+                                 AND completed.status = 'Reviewed'
+                           ) < ?
+                       )
+                   )
+                 LIMIT 1",
+                libsql::params![patchset_id, target_review_count],
+            )
+            .await?;
+        let has_incomplete_cover = incomplete_cover_rows.next().await?.is_some();
+        drop(incomplete_cover_rows);
+        if has_incomplete_cover {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
         let mut incomplete_rows = self
             .conn
             .query(
@@ -9899,12 +9982,15 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT r.id, r.patch_id, r.inline_review, r.summary, m.message_id, p.part_index
+                "SELECT r.id, r.patch_id, r.inline_review, r.summary,
+                        COALESCE(m.message_id, ps.cover_letter_message_id, ''),
+                        COALESCE(p.part_index, 0)
              FROM reviews r
-             JOIN patches p ON r.patch_id = p.id
-             JOIN messages m ON p.message_id = m.message_id
+             JOIN patchsets ps ON ps.id = r.patchset_id
+             LEFT JOIN patches p ON r.patch_id = p.id
+             LEFT JOIN messages m ON m.message_id = COALESCE(p.message_id, ps.cover_letter_message_id)
              WHERE r.patchset_id = ? AND r.status = 'Reviewed'
-             ORDER BY p.part_index ASC, r.id ASC",
+             ORDER BY COALESCE(p.part_index, 0) ASC, r.id ASC",
                 libsql::params![patchset_id],
             )
             .await?;
@@ -9912,7 +9998,7 @@ impl Database {
         let mut temp_reviews = Vec::new();
         while let Some(row) = rows.next().await? {
             let review_id: i64 = row.get(0)?;
-            let patch_id: i64 = row.get(1)?;
+            let patch_id: Option<i64> = row.get(1)?;
             let inline_review: String = crate::compression::get_compressed_string_opt(&row, 2)
                 .unwrap_or(None)
                 .unwrap_or_default();
@@ -12034,8 +12120,8 @@ impl Database {
         body: &str,
     ) -> Result<()> {
         // Prevent duplicate emails for the same patch
-        let mut rows = self
-            .conn
+        let tx = self.begin_immediate_transaction().await?;
+        let mut rows = tx
             .query(
                 "SELECT 1 FROM email_outbox WHERE patch_id = ?",
                 libsql::params![patch_id],
@@ -12043,15 +12129,17 @@ impl Database {
             .await?;
 
         if rows.next().await?.is_some() {
+            drop(rows);
             tracing::info!(
                 "Email outbox entry already exists for patch_id {}, skipping to prevent duplicates.",
                 patch_id
             );
             return Ok(());
         }
+        drop(rows);
 
         let created_at = chrono::Utc::now().timestamp();
-        self.execute(
+        tx.execute(
             "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
@@ -12065,8 +12153,93 @@ impl Database {
                 body,
                 created_at,
             ],
-        ).await?;
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_cover_email_outbox(
+        &self,
+        patchset_id: i64,
+        review_id: Option<i64>,
+        status: &str,
+        to_addresses: &str,
+        cc_addresses: &str,
+        subject: &str,
+        in_reply_to: &str,
+        references_hdr: &str,
+        body: &str,
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let mut rows = tx
+            .query(
+                "SELECT 1 FROM email_outbox
+                 WHERE patchset_id = ? AND patch_id IS NULL AND kind = ?",
+                libsql::params![patchset_id, EmailKind::ReviewReply.as_str()],
+            )
+            .await?;
+
+        if rows.next().await?.is_some() {
+            drop(rows);
+            tracing::info!(
+                "Cover letter email outbox entry already exists for patchset_id {}, skipping to prevent duplicates.",
+                patchset_id
+            );
+            return Ok(());
+        }
+        drop(rows);
+
+        let created_at = chrono::Utc::now().timestamp();
+        tx.execute(
+            "INSERT OR IGNORE INTO email_outbox (
+                 patchset_id, review_id, patch_id, kind, status,
+                 to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at
+             )
+             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                patchset_id,
+                review_id,
+                EmailKind::ReviewReply.as_str(),
+                status,
+                to_addresses,
+                cc_addresses,
+                subject,
+                in_reply_to,
+                references_hdr,
+                body,
+                created_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn get_cover_email_status(
+        &self,
+        patchset_id: i64,
+    ) -> Result<(Option<String>, Option<String>, Option<String>)> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status, to_addresses, cc_addresses
+                 FROM email_outbox
+                 WHERE patchset_id = ? AND patch_id IS NULL AND kind = ?
+                 ORDER BY id DESC LIMIT 1",
+                libsql::params![patchset_id, EmailKind::ReviewReply.as_str()],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok((
+                row.get::<Option<String>>(0)?,
+                row.get::<Option<String>>(1)?,
+                row.get::<Option<String>>(2)?,
+            ))
+        } else {
+            Ok((None, None, None))
+        }
     }
 
     pub async fn lock_pending_email(&self) -> Result<Option<EmailOutboxRow>> {
@@ -15625,7 +15798,11 @@ mod tests {
         let patch_id = db.create_patch(ps_id, "msg1", 1, "diff").await.unwrap();
 
         // 1. Initial State: No reviews
-        assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert!(
+            !db.has_failed_review(ps_id, Some(patch_id), None)
+                .await
+                .unwrap()
+        );
 
         // 2. Failed Review (No interaction) -> Should be detected
         let review_id = db
@@ -15636,19 +15813,31 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert!(
+            db.has_failed_review(ps_id, Some(patch_id), None)
+                .await
+                .unwrap()
+        );
 
         // 3. Status "Failed" (No interaction) -> Should be detected
         db.update_review_status(review_id, "Failed", None)
             .await
             .unwrap();
-        assert!(db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert!(
+            db.has_failed_review(ps_id, Some(patch_id), None)
+                .await
+                .unwrap()
+        );
 
         // 4. Status "Reviewed" (Success) -> Should NOT be detected
         db.update_review_status(review_id, "Reviewed", None)
             .await
             .unwrap();
-        assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert!(
+            !db.has_failed_review(ps_id, Some(patch_id), None)
+                .await
+                .unwrap()
+        );
 
         // 5. Status "Failed" WITH interaction_id -> Should NOT be detected (reached AI)
         // Revert to Failed first
@@ -15685,7 +15874,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert!(
+            !db.has_failed_review(ps_id, Some(patch_id), None)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -15971,7 +16164,7 @@ mod tests {
 
         // Verify blocking review is present
         assert!(
-            db.has_failed_review(ps_failed, patch_id, None)
+            db.has_failed_review(ps_failed, Some(patch_id), None)
                 .await
                 .unwrap()
         );
@@ -16017,7 +16210,7 @@ mod tests {
 
         // Verify blocking review is NO LONGER blocking
         assert!(
-            !db.has_failed_review(ps_failed, patch_id, None)
+            !db.has_failed_review(ps_failed, Some(patch_id), None)
                 .await
                 .unwrap()
         );
@@ -24868,7 +25061,7 @@ mod tests {
         let db = setup_db().await;
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         for (table, expected_cols) in [
             (
@@ -26987,6 +27180,217 @@ mod tests {
             .unwrap();
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cover_letter_review_release_and_outbox() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("cover@kernel.org", "[PATCH 0/1] test: series", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover@kernel.org",
+            thread_id,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 0/1] test: series",
+            1000,
+            "Cover body",
+            "linux-kernel@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "patch1@kernel.org",
+            thread_id,
+            Some("cover@kernel.org"),
+            "Author <a@kernel.org>",
+            "[PATCH 1/1] test: change",
+            1001,
+            "Patch body",
+            "linux-kernel@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("cover@kernel.org"),
+                "cover@kernel.org",
+                "[PATCH 0/1] test: series",
+                "Author <a@kernel.org>",
+                1000,
+                1,
+                1,
+                "linux-kernel@vger.kernel.org",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "patch1@kernel.org", 1, "diff")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.count_successful_reviews(ps_id, None, None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!db.has_failed_review(ps_id, None, None).await.unwrap());
+
+        let failed_cover_review_id = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await
+            .unwrap();
+        db.update_review_status(failed_cover_review_id, "Failed", None)
+            .await
+            .unwrap();
+        assert!(db.has_failed_review(ps_id, None, None).await.unwrap());
+
+        let patch_review_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "test-model", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            patch_review_id,
+            "Reviewed",
+            "Completed",
+            Some("{}"),
+            None,
+            Some("Patch inline review"),
+            Some("Patch summary"),
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+
+        // Retry creates a new cover review row while leaving the failed attempt row intact
+        let cover_review_id = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            cover_review_id,
+            "Reviewed",
+            "Completed",
+            Some("{}"),
+            None,
+            Some("Cover inline review"),
+            Some("Series summary text"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.count_successful_reviews(ps_id, None, None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+
+        let released = db.get_completed_reviews_for_release(ps_id).await.unwrap();
+        assert_eq!(released.len(), 2);
+        assert_eq!(released[0].id, cover_review_id);
+        assert_eq!(released[0].patch_id, None);
+        assert_eq!(released[0].index, 0);
+        assert_eq!(released[0].patch_message_id, "cover@kernel.org");
+        assert_eq!(released[1].id, patch_review_id);
+        assert_eq!(released[1].patch_id, Some(patch_id));
+        assert_eq!(released[1].index, 1);
+        assert_eq!(released[1].patch_message_id, "patch1@kernel.org");
+
+        db.insert_cover_email_outbox(
+            ps_id,
+            Some(cover_review_id),
+            "Pending",
+            "Author <a@kernel.org>",
+            "linux-kernel@vger.kernel.org",
+            "Re: [PATCH 0/1] test: series",
+            "<cover@kernel.org>",
+            "<cover@kernel.org>",
+            "Cover review body",
+        )
+        .await
+        .unwrap();
+        // Duplicate insert is a no-op
+        db.insert_cover_email_outbox(
+            ps_id,
+            Some(cover_review_id),
+            "Pending",
+            "Author <a@kernel.org>",
+            "linux-kernel@vger.kernel.org",
+            "Re: [PATCH 0/1] test: series",
+            "<cover@kernel.org>",
+            "<cover@kernel.org>",
+            "Duplicate body",
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["cover_email_status"], "Pending");
+        assert_eq!(details["cover_email_to"], "Author <a@kernel.org>");
+        assert_eq!(details["cover_email_cc"], "linux-kernel@vger.kernel.org");
+
+        db.cancel_outbox_for_patchset(ps_id, "Superseded")
+            .await
+            .unwrap();
+        let details_after = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details_after["cover_email_status"], "Cancelled");
+
+        let mut plan_rows = db
+            .conn
+            .query(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM reviews
+                 WHERE patchset_id = ? AND patch_id IS NULL AND status = 'Reviewed'",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let mut plan_details = Vec::new();
+        while let Some(row) = plan_rows.next().await.unwrap() {
+            plan_details.push(row.get::<String>(3).unwrap());
+        }
+        assert!(
+            plan_details
+                .iter()
+                .any(|d| d.contains("idx_reviews_patchset_patch_status")),
+            "expected composite index idx_reviews_patchset_patch_status in query plan: {:?}",
+            plan_details
+        );
     }
 
     fn collect_rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
