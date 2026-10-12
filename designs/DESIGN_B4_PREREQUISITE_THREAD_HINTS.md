@@ -1,5 +1,9 @@
 # B4 prerequisite thread hints
 
+[Standalone prerequisite message IDs](DESIGN_STANDALONE_PREREQUISITE_MESSAGE_IDS.md)
+extends this design when no patch-ID metadata is present. The optional-hint
+behavior described here remains unchanged when explicit patch IDs exist.
+
 ## Problem
 
 Patch-ID searches currently expand every matching Lore thread with `t=1`.
