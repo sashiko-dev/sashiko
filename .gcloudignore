@@ -5,6 +5,8 @@ target/
 review_trees/
 archives/
 third_party/linux/
+third_party/sashiko/
+third_party/gcc/
 benchmarks/smoke-repo/
 benchmark_results.json
 *.db

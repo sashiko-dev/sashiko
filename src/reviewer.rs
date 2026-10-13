@@ -2058,6 +2058,9 @@ impl Reviewer {
                                             crate::project::ProjectId::Sashiko => {
                                                 "sashiko:sashiko_patch_review"
                                             }
+                                            crate::project::ProjectId::Gcc => {
+                                                "sashiko:gcc_patch_review"
+                                            }
                                         };
                                         let discovery_db = ctx.db.with_bug_actor(
                                             ctx.settings.project.attribution(),

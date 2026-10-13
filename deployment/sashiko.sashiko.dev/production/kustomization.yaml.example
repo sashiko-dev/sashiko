@@ -67,4 +67,4 @@ patches:
         value: "load-balancer"
       - op: replace
         path: /metadata/annotations/networking.gke.io~1managed-certificates
-        value: "certificate"
+        value: "sashiko-self-cert,sashiko-gcc-cert"

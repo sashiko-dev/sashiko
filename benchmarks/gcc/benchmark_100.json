@@ -1,0 +1,602 @@
+[
+    {
+        "Commit": "5b40e9d181bfe268ee9922c6af525bc5dab2604c",
+        "Fixed-by": "17c7aeffec9e1f7576957fdcb21e380d4e209c6f",
+        "subsystem": "tree-optimization",
+        "problem_description": "forwprop: Reset the range of a rewritten MOD result [PR101179] (PR tree-optimization/101179): When X may be negative, r17-3791 still rewrites M = X % PHI <2^a, 2^b> into M = X & PHI <2^a-1, 2^b-1> because M is only compared with zero. That keeps the zero-ness of M but not its value, yet the range recorded for M before the rewrite stays, so VRP folded M to 0 in the testcase. Reset the flow-sensitive info of M in that case. Bootstrapped and regression tested on... [Fix details: * tree-ssa-forwprop.cc (simplify_phi_result_movdiv): Reset the flow-sensitive info of the result when its value changes.]"
+    },
+    {
+        "Commit": "edb9556068ae47e1a3cbad69249424ab7cce5b7c",
+        "Fixed-by": "c8aaf14bf6882705d2515a5eb9c15de7f4034c5b",
+        "subsystem": "tree-optimization",
+        "problem_description": "match.pd: Check that a - c does not wrap in minmax (a - c, b) + c [PR127103] (PR tree-optimization/127103): r17-4378 folds minmax (a - c, b) + c to minmax (a, b + c) when b + c cannot overflow.  The fold also needs a - c not to wrap: for unsigned a = 0, b = 0, c = 1, MIN (a - c, b) + c is 1 but MIN (a, b + c) is 0, and the MAX form gives 0 against 1.  Require that with range_op_handler (MINUS_EXPR).overflow_free_p on the ranges of a and c. The std::vector::push_back case from the... [Fix details: * match.pd (minmax (a - c, b) + c): Also require that a - c does not overflow.]"
+    },
+    {
+        "Commit": "885ad73e630ca23d1810d55fd480f6ff519d42bf",
+        "Fixed-by": "b70a80cfff503060f48a12c090e5b4983d3c6156",
+        "subsystem": "tree-optimization",
+        "problem_description": "match.pd: fix comparison in the ((X >> C1) & C2) << C3 pattern [PR127552] (PR tree-optimization/127552): In this simplification rule added in r17-4511-g885ad73e630ca2, we assume that C1 and C3 are of the same type and call wi::leu_p () with those constants converted to wide_int.  This leads to a triggered assert on wide-int.h:1049 whenever C1 and C3 have different precision, which causes an ICE reported in PR127552.  Fix this by converting to widest_int instead. To test the... [Fix details: * match.pd: Fix constant comparison in ((X >> C1) & C2) << C3.]"
+    },
+    {
+        "Commit": "1aceceb1e2d6e86ce183c8cc448750fa03b6f79e",
+        "Fixed-by": "46ee9bbc9a7d92eb3435999b59c3d8b42254f88a",
+        "subsystem": "tree-optimization",
+        "problem_description": "tree-optimization: Restrict (X {+,-} M*N) / N optimization. [PR127406] (PR tree-optimization/127406): When X is INT_MIN and N is -1, then r14-3644 converts ((X {+,-} M*N) / N) to ((X / N) {+,-} M). But INT_MIN / -1 overflows where ((X {+,-} M*N) / N) does not. Add a check for ((X {+,-} M*N) / N) via X > INT_MIN and N != -1. Bootstrapped and regtested on x86_64-pc-linux-gnu. [Fix details: * match.pd: Restrict (X {+,-} M*N) / N optimization.]"
+    },
+    {
+        "Commit": "629ce1fc63967f5b8944e32854f359833b76646f",
+        "Fixed-by": "2c87d96c31157ef45c0bb80b04c444d6891ef108",
+        "subsystem": "tree-optimization",
+        "problem_description": "tree-optimization/127152 - wrong-code with vectorized reduction (PR tree-optimization/127152): The following avoids a mistake with r17-3692 by restoring the way vectype_in was computed, pushing down the vec_in_num compute before the input array is possibly mangled. [Fix details: * tree-vect-loop.cc (vect_transform_reduction): Restore vectype_in computation, compute vec_in_num from unaltered vec_oprnds.]"
+    },
+    {
+        "Commit": "d118738e71cf4615f170fff8dabe66442206d008",
+        "Fixed-by": "58bf8a355a73b7fbc6d7bfebcc7281b3cdadd4da",
+        "subsystem": "tree-optimization",
+        "problem_description": "tree-optimization: hoist shifts by an in-range constant count (PR tree-optimization/111000): movement_possibility_1 restricts shifts and rotates to MOVE_PRESERVE_EXECUTION so that a count which is out of range is never speculatively executed.  The test was inverted: wi::ltu_p (count, precision) is true exactly when the count is in range and the shift is perfectly well defined, so it was the well-defined shifts that were pinned, while a constant count >= precision -... [Fix details: * tree-ssa-loop-im.cc (movement_possibility_1): Require MOVE_PRESERVE_EXECUTION for an out-of-range constant shift count, not an in-range one.]"
+    },
+    {
+        "Commit": "e02ce3b8c4574c81a943eb1084b0e0bf6a9955d5",
+        "Fixed-by": "1374c269134364e5241051c45363e1b0c381f550",
+        "subsystem": "tree-optimization",
+        "problem_description": "dce: Don't remove lhs for calls for no_delete case [PR126815] (PR tree-optimization/126815): r17-3204-ge02ce3b8c4574c added a no_delete to simple_dce_from_worklist. With the no_delete option, for calls where the lhs would be removed, simple_dce_from_worklist would insert an assignment after the call. But with exceptions the call is required to be last stmt in the basic block. Note inserting before the call would not work either because of requirements of returns... [Fix details: * tree-ssa-dce.cc (simple_dce_from_worklist): Just don't remove the lhs for no_delete case rather than adding a new stmt.]"
+    },
+    {
+        "Commit": "ca2920882be034bbe5a487f06792fbbc15dbc246",
+        "Fixed-by": "fdfe1570235b1bddc4572255ff161b5dc25cc460",
+        "subsystem": "tree-optimization",
+        "problem_description": "middle-end: fix condition on multiple negate pattern [PR126602] (PR tree-optimization/126602): The optimization added in r17-527-gca2920882be has a bogus constraint which allows floating point FMAs through and folds them into integer ones. i.e. we produce Matching expression match.pd:159, gimple-match-10.cc:33 Matching expression match.pd:159, gimple-match-10.cc:33 Applying pattern match.pd:10328, gimple-match-5.cc:8685 gimple_simplified to _15 = (vector(8) unsigned... [Fix details: * match.pd: Fix constraints.]"
+    },
+    {
+        "Commit": "8ca1e887847e2f51dabc9f49be8471ca10ee3cc8",
+        "Fixed-by": "7decbb57670c3c0f6136be00456fe9c8a41f7aed",
+        "subsystem": "tree-optimization",
+        "problem_description": "match: Fix incorrect identification of POPCOUNT pattern [PR126466] (PR tree-optimization/126466): This fixes r17-489-g8ca1e887847e2f, which added a third 32-bit Hacker's Delight popcount matcher.  Its predicate checked compare_tree_int (@5, 0x0F0F0F0F) twice and never validated the final outer AND constant (@7), so any mask was accepted once the earlier constants matched. Require compare_tree_int (@7, 0x0000003F) so only the intended popcount idiom is folded to... [Fix details: * match.pd: Fix incorrect POPCOUNT identification in the third 32-bit Hacker's Delight matcher.]"
+    },
+    {
+        "Commit": "a4e033fb51d566019f8605d132f81bf66037b811",
+        "Fixed-by": "667c1b70ac3955c9ac7ccab60cc10b32d4bed5ff",
+        "subsystem": "tree-optimization",
+        "problem_description": "match: Fix min/max patterns for `((signed)a) < 0` [PR126458] (PR tree-optimization/126458): In r16-4585-ga4e033fb51d566, I accidently used the wrong type to form SIGNED_TYPE_MIN. This was ok most of the time except if the two types differ only by one precision. When they diff by one precision, we would incorrectly detect the wrong thing and think it should be a min/max.  This fixes the problem by using the precision of the constant (0) rather then the final type.... [Fix details: * match.pd (min/max detection): Fix precision of the signed type min.]"
+    },
+    {
+        "Commit": "b7960a3f966a0f87888de0fc588999d026918449",
+        "Fixed-by": "3754582630fa1eeff44a39f656ba0c7db6e58d0d",
+        "subsystem": "tree-optimization",
+        "problem_description": "range-op-float: Fix up inf handling in reverse narrowing float to float cast [PR126464] (PR tree-optimization/126464): The following testcase is miscompiled since my r16-1108 change. The problem is if we handle a reverse of a narrowing float to float cast (in the example there are double -> float and long double -> double cast) and the lhs range is [-inf, -inf] or [+inf, +inf] (note, regardless of whether some NaNs are allowed or not, so not necessarily lhs.known_isinf ()), then handling... [Fix details: * range-op-float.cc (float_widen_lhs_range): Add also_inf argument defaulted to false, if true, extend even lb of +inf and ub of -inf. (operator_cast::op1_range): Adjust float_widen_lhs_range caller.] [Additional upstream fix for this commit: range-op-float: Fix up inf handling in other reverse ops [PR126464] (PR tree-optimization/126464): On Thu, Jul 30, 2026 at 09:31:17AM +0200, Richard Biener wrote: > > The following testcase is miscompiled since my r16-1108 change. > > The problem is if we handle a reverse of a narrowing float to float cast > > (in the example there are double -> float and long double -> double > > cast) and the lhs range is [-inf, -inf] or [+inf, +inf] (note, regardless > > of whether... [Fix details: * range-op-float.cc (float_widen_lhs_range): Remove also_inf argument, replace its uses as if it was always true. (operator_cast::op1_range): Don't pass third argument to float_widen_lhs_range.]]"
+    },
+    {
+        "Commit": "f33cc3af8fd9c498bd02623168054d76a0989ed6",
+        "Fixed-by": "b13db033a4ee22e920756be0e182c001a1e99dce",
+        "subsystem": "tree-optimization",
+        "problem_description": "match: Fix some incorrect vector fp comparison combines [PR 126455] (PR tree-optimization/126455): This fixes r16-2134-gf33cc3af8fd9c4 which extended some patterns to support vector types but these patterns are only valid for integral types and the check that was used was VECTOR_TYPE. This fixes it by using VECTOR_INTEGRAL_TYPE || VECTOR_BOOLCEAN_TYPE which prevent the, for vector floating point types. Pushed as obvious after bootstrap/test on x86_64-linux-gnu. [Fix details: * match.pd: Fix up patterns dealing with bitwise AND/OR/XOR and comparisons for floating point types.]"
+    },
+    {
+        "Commit": "6c5543d3d9c4bbcd19f0ae2b7ed7e523c978a9a8",
+        "Fixed-by": "366b7772dd5424bc2b09c0796395d63d22710939",
+        "subsystem": "tree-optimization",
+        "problem_description": "match: Fix up expr_no_side_effects_p call for `(a != 0) ? (a / b) : 0` pattern [PR126470] (PR tree-optimization/126470): r15-3870-g6c5543d3d9c4bb introduced a fix for this pattern to use expr_no_side_effects_p but I was testing the wrong operand here which allowed b to become unconditional even if that expression traps. Puhsed as obvious after bootstrap/test on x86_64-linux-gnu. [Fix details: * match.pd (`(a != 0) ? (a / b) : 0`): Fix argument to expr_no_side_effects_p.]"
+    },
+    {
+        "Commit": "772b847d99d5e3d6caf40cead5ecf15575125059",
+        "Fixed-by": "e6e3290cddbf1da000bfc6fcd2a1e5a2b2cd27fb",
+        "subsystem": "tree-optimization",
+        "problem_description": "middle-end: fix COND_FMS foldings [PR126465] (PR tree-optimization/126465): in r16-6508-g772b847d99d5e3 I made some typos 1. I forgot to negate the else value 2. one of the patterns was missing the mask. This fixes it. The patterns moving the COND inwards are still useful because they allow FMA forwarding as most micro-architectures don't forward FMA when there's a random instruction like fneg in between. Sorry for the mistakes. I added more tests... [Fix details: * match.pd: Fix FMS patterns.]"
+    },
+    {
+        "Commit": "e2c4fc6b1cff0d32dd7e6e4049d87c5193fea6dc",
+        "Fixed-by": "6d5d980f76c3057cc90b1343a679e7eea3ad2a50",
+        "subsystem": "tree-optimization",
+        "problem_description": "match.pd: Make the (trunc)abs(extend x) guard vector-safe [PR126291] (PR tree-optimization/126291): The (convert (abs (convert@1 @0))) -> (abs @0) rule added by r17-2276-ge2c4fc6b1cff evaluates TYPE_PRECISION on the outer and inner types after only types_match, so a vectorized abs-of-narrowed chain like vect_1 = (vector(2) int) vect_0; vect_2 = ABS_EXPR <vect_1>; vect_3 = (vector(2) signed long) vect_2; trips the vector_type tree check when gimple_simplify visits the... [Fix details: * match.pd ((trunc)abs (extend x) -> abs (x)): Use element_precision. Require target ABS support for the vector case.]"
+    },
+    {
+        "Commit": "43356828d897ad96c5359e03f8f4aad2c283b81f",
+        "Fixed-by": "3b443e764144526748d2b51d017d745f1956377e",
+        "subsystem": "tree-optimization",
+        "problem_description": "match: Fix #ifdef GIMPLE typo [PR125641] (PR tree-optimization/125641): r17-1683-g43356828d897ad uses #ifdef GIMPLE but it should be #if GIMPLE. Bootstrapped and tested on x86_64-pc-linux-gnu. [Fix details: * match.pd: Fix #ifdef GIMPLE typo.]"
+    },
+    {
+        "Commit": "c36539e6fd0dfa6bd1ebb891df68da9a5bd96163",
+        "Fixed-by": "f2a4e2540221cb731e5b4296885279da6c58576f",
+        "subsystem": "tree-optimization",
+        "problem_description": "tree-optimization/126008 - redo PR125730 fix (PR tree-optimization/126008): This reverts r17-1586, keeping its testcase and adding the one that regressed, fixing PR125730 in a different way, recognizing the issue at hand there is the emitted POINTER_PLUS_EXPRs that we should not have generated due to association done by IVOPTs via using tree-affine and by create_mem_ref as part of distributing the pieces. [Fix details: * tree-ssa-loop-ivopts.cc (alloc_iv): Revert last change. * tree-ssa-address.cc (add_to_parts): Use unsigned arithmetic to accumulate to base.]"
+    },
+    {
+        "Commit": "8d6d6d537fdc754a429b08091422c307188f3c82",
+        "Fixed-by": "a4afea80fce5f1aafdd1174e48e9ebfc9ec8155d",
+        "subsystem": "tree-optimization",
+        "problem_description": "phiopt: Fix is_factor_profitable for debug stmts [PR125776] (PR tree-optimization/125776): This is a latent bug in is_factor_profitable where we would consider a debug statement as an use for lifetime usage afterwards. So you would get a compare debug failure in some cases. pr125776-2.c fails since r15-4503-g8d6d6d537fdc75. Pushed as obvious after a bootstrap/test. [Fix details: * tree-ssa-phiopt.cc (is_factor_profitable): An usage in a debug stmt should be ignored.]"
+    },
+    {
+        "Commit": "8e3eff39a4564c76e3b12ae30e370f48200f962c",
+        "Fixed-by": "4ab2c727829c53b87a8be43dc2d0d036d23a1700",
+        "subsystem": "tree-optimization",
+        "problem_description": "backprop: Avoid early return for abnormal phis [PR125653] (PR tree-optimization/125653): r17-1238-g8e3eff39a4564c added an early return for SSA names that occur in abnormal phis.  That had the effect of bypassing the later: /* If STMT is a phi, remove any information recorded for its arguments.  */ if (is_a <gphi *> (stmt)) reprocess_inputs (stmt); That reprocessing is important since (by design) the pass initially makes optimistic assumptions about backedges. [Fix details: * gimple-ssa-backprop.cc (backprop::process_var): Avoid early return for SSA names that occur in abnormal phis.]"
+    },
+    {
+        "Commit": "391ee229b737eb9a0cf3b705f41476f56d12d1e3",
+        "Fixed-by": "cd33e5ad1945f19b5b1b2429ee62d1b3c8919914",
+        "subsystem": "tree-optimization",
+        "problem_description": "cselim: Prevent cselim doing store sinking when there are loads in the middle bb [PR125612] (PR tree-optimization/125612): r17-1273-g391ee229b737eb added support for the case where the middle bb was non-empty but with a trailing store. This meant if there was a load in the middle bb, it might cause nontrapping to have the lhs in it. So we now need to check for a load in the middle-bb to reject this case. Bootstrapped and tested on x86_64-linux-gnu. [Fix details: * tree-ssa-phiopt.cc (cond_store_replacement): For the case where lhs is \"known\" to be nontrapping make sure there are no loads in the middle bb.]"
+    },
+    {
+        "Commit": "1c9808a71207eb217f4e190c60f2755a796b90d4",
+        "Fixed-by": "44c5f9a37aa3dffac654c743147021df917daab0",
+        "subsystem": "tree-optimization",
+        "problem_description": "match: Fix up `(smaller)a ==/!= (smaller) b` pattern for pointers [PR125453] (PR tree-optimization/125453): While reviewing r17-632-g1c9808a71207eb, I missed that it was valid (in gimple) to cast from a pointer to a smaller integral type. That meant with that pattern we would get `ptr ^ ptr` which is invalid gimple. This adds a check for integral type before applying this pattern. Pushed as obvious after a bootstrap/test on x86_64-linux-gnu. [Fix details: * match.pd (`(smaller)a ==/!= (smaller) b`): Reject non integral types.]"
+    },
+    {
+        "Commit": "cba74d2cde528af210e37a06652493b2ca38079c",
+        "Fixed-by": "26aae2119eb79bfbea23b86ea1a58f9a3a0911a6",
+        "subsystem": "tree-optimization",
+        "problem_description": "scev: Sign extend step in peeled converted IV handling [PR 125291] (PR tree-optimization/125291): For 3 iterations of unsigned char flagbits; _877 = flagbits_832 + 254; _879 = (int) _877; # prephitmp_880 = PHI <_879(40), 6(41)> _70 = _68 >> prephitmp_880; The peeled converted IV handling added in r16-3562 incorrectly analyzes it as [6, 6 + 254, 6 + 254 * 2] instead of [6, 4, 2].  Then VRP uses the intersect of {6, 560, 514} and {2, 4, 6}, i.e. {6} as the possible value... [Fix details: * tree-scalar-evolution.cc (simplify_peeled_chrec): Sign-extend the step for peeled converted IV.]"
+    },
+    {
+        "Commit": "c65691bc5a2873e0e2ffbfcaa80eb9bdc6e1f7b8",
+        "Fixed-by": "5e933bd275f0e6eef18692ef351cb5d617f48d51",
+        "subsystem": "tree-optimization",
+        "problem_description": "match: Fix merged patterns for a!=b implies a and b are not zero [PR125234] (PR tree-optimization/125234): In r17-231-gc65691bc5a2873, I messed up the resulting constant for `(a != b) & ((a | b) == 0)` and `(a == b) | ((a | b) != 0)`. I had swapped which one was resulting in true/false. This fixes the issue and adds a testcase to make sure it does not regress again. Pushed as obvious after a bootstrap/test on x86_64-linux-gnu. [Fix details: * match.pd (`(a !=/== b) &\\| ((a|b) ==/!= 0)`): Fix resulting constant form.]"
+    },
+    {
+        "Commit": "7a4e57ffc9a97f172487dab81123ad62bebd4997",
+        "Fixed-by": "62d5880b9599c3bdbc22b80d522b0bea14f4beaf",
+        "subsystem": "tree-optimization",
+        "problem_description": "range-op-float: Fix ICE on undefined_p ranges [PR125039] (PR tree-optimization/125039): The following testcase ICEs at -O1 since r14-4153. lower_bound/upper_bound methods on frange (and others) assert they aren't called on undefined_p () ranges, because such ranges don't really have any lower or upper bound. Most fold_range virtual methods call empty_range_varying early which checks if the operand ranges aren't undefined and in that case return true and set r... [Fix details: * range-op-float.cc (operator_not_equal::fold_range): Call empty_range_varying when not calling frelop_early_resolve.]"
+    },
+    {
+        "Commit": "f1e596c9526fbb4cf0bfa56b07d3c52aab9c9938",
+        "Fixed-by": "318e6a4640420d5cc213df779bf751485fa56063",
+        "subsystem": "c++",
+        "problem_description": "c++: Fix ICE during explanation of failed __has_unique_object_representation [PR126867] (PR c++/126867): The following testcase ICEs since r16-5520 added explain arguments to type_has_unique_obj_representations and record_has_unique_obj_representations.  Most of the location_t arguments in that change look correct, either DECL_SOURCE_LOCATION of some FIELD_DECL or in type_has_unique_obj_representations use loc, which is initialized to location_t loc = input_location; if (tree... [Fix details: * tree.cc (record_has_unique_obj_representations): Use location_of (const_cast <tree> (t)) rather than DECL_SOURCE_LOCATION (t).]"
+    },
+    {
+        "Commit": "5fbcd8a57a0f2524259df87db5c6c82b757bf2e6",
+        "Fixed-by": "a03b3ab4b0a6a446fe9a1d7e6e82967a8dd3edcf",
+        "subsystem": "c++",
+        "problem_description": "c++/modules: ICE with GMF variable later defined inline [PR126783] (PR c++/126783): Here transfer_defining_module (added in r16-5213) assumes that if a redeclaration has DECL_LANG_SPECIFIC allocated, then so must the original declaration, but this isn't true for q below.  Instead we should call retrofit_lang_decl to allocate DECL_LANG_SPECIFIC as needed; other parts of duplicate_decls do the same. [Fix details: * module.cc (transfer_defining_module): Call retrofit_lang_decl instead of assuming the old declaration already has DECL_LANG_SPECIFIC allocated.]"
+    },
+    {
+        "Commit": "515045254f5dbdea5208035a0352acc12c381088",
+        "Fixed-by": "da9cb50722ba0341bab9d0bf29d1cfa12be18f42",
+        "subsystem": "c++",
+        "problem_description": "c++: anonymous namespace in module partition [PR126209] (PR c++/126209): Here since r16-4484 we include all namespaces in the current purview in a module, even if the namespace comes from another partition.  That breaks for an anonymous namespace, which is local to the TU (and added to the definition of TU-local entity by P2996 Reflection); here _c ended up representing the anonymous namespace from _a separately from the same one passed along... [Fix details: * module.cc (depset::hash::add_namespace_entities): Don't force out anonymous namespaces.]"
+    },
+    {
+        "Commit": "4afb257fc29f72a34eb1328aa217d891f975d631",
+        "Fixed-by": "6791a54109c33394a9ab5ef603cec5e8ecbd9953",
+        "subsystem": "c++",
+        "problem_description": "c++: Fix up __PRETTY_FUNCTION__ initializer translation [PR91155] (PR c++/91155): In r16-4399 I've added reencoding of __PRETTY_FUNCTION__ initializer from the source character set to execution character set. I've used cpp_translate_string for that, which unfortunately interprets some escape sequences in the string, and as this testcase shows, those can appear in __PRETTY_FUNCTION__ and in this case made an old bug reappear. What didn't help is that the... [Fix details: * decl.cc (cp_make_fname_decl): Use cpp_translate_string instead of cpp_interpret_string, don't prefix name strname.text with \" and suffix with \" and NUL. the strings are the same.]"
+    },
+    {
+        "Commit": "28749321d32e513b9da3ab2f7ff51df8f9d3811f",
+        "Fixed-by": "b66fd30e4b3943460a6cc030491043502bd3b65d",
+        "subsystem": "c++",
+        "problem_description": "c++/modules: some dependent ADL fixes (PR c++/125334): When looking at the stream-in performance regression PR c++/125334 (caused by the dependent ADL patch r16-6311) I spotted some issues with add_dependent_adl_entities: 1. Fix memory leak in add_dependent_adl_entities when it exits early. 2. Only consider type-dependent calls/operator expressions. 3. Fix early exit test for when all args are type-dependent. 4. Add assert... [Fix details: * module.cc (dep_adl_info::args): Initializer to nullptr instead of immediately allocating. (depset::hash::add_dependent_adl_entities): Exit early for non-type-dependent calls and operator expressions. Only allocate dep_adl_info::args if we're not exiting...]"
+    },
+    {
+        "Commit": "78d19ea3fea308a08d2844de88d43154465daa78",
+        "Fixed-by": "a33b41d895f55fd95f8c9f486f6ef23c71a7a1e5",
+        "subsystem": "c++",
+        "problem_description": "c++: fix infinite looping with arr[arr] [PR125454] (PR c++/125454): Here r16-3466 moved the canonicalization step that transforms idx[array] to array[idx] to the beginning of cp_build_array_ref. When we have array[array], we'll be swapping till we blow the stack. Previously, we'd give the !INTEGRAL_OR_UNSCOPED_ENUMERATION_TYPE_P error so there was no problem. [Fix details: * typeck.cc (cp_build_array_ref): Don't recurse for array[array].]"
+    },
+    {
+        "Commit": "5fd9f0f77f2bdb9a2843bb9b9b55ab6bd2cbd5c8",
+        "Fixed-by": "b6fd2fdd3887658e4212dc4945d8a41dd36cb21a",
+        "subsystem": "c++",
+        "problem_description": "c++: fix bogus error with xobj member function [PR125330] (PR c++/125330): In this test since r17-472 we issue a bogus \"not declared in this scope\" error when parsing the requires because we failed to pushdecl.  Xobj parameters reuse the default argument field (in _parameter_declaration) so we also have to check this_identifier. [Fix details: * parser.cc (cp_parser_parameter_declaration_list): Also pushdecl when parameter->default_argument is this_identifier.]"
+    },
+    {
+        "Commit": "611d59589d8c48db051b31e727d7f52910a4cbcd",
+        "Fixed-by": "4491ee5688d0bcd69956af4126e9e4643d951178",
+        "subsystem": "c++",
+        "problem_description": "c++: this capture in template [PR125384] (PR c++/125384): The r16-1019 change to special-case 'this' capture handling dropped the 'const' qualifier from the capture proxy, so the call to rvalue in finish_this_expr no longer built a NOP_EXPR to express dropping that 'const'. [Fix details: * lambda.cc (build_capture_proxy): 'this' capture proxy is const.]"
+    },
+    {
+        "Commit": "82c2acd0bc4411524a8248fcdce219927d921a71",
+        "Fixed-by": "d063d7dd7d460ccc426579cc792013fe657f7b89",
+        "subsystem": "c++",
+        "problem_description": "c++: template-id typedef with lambda targ [PR123700] (PR c++/123700): A typedef to a template-id with a lambda targ must not be stripped by strip_typedefs because it can cause the lambda to leak into a deeper template context, which breaks substituting into the lambda later. For example in the below testcases zero<inner> gets stripped to zero<Type<[](auto) {}>>, and we end up substituting through this lambda targ twice (with args {double}... [Fix details: * pt.cc (dependent_opaque_alias_p): Return true for a template-id typedef with a lambda targ.]"
+    },
+    {
+        "Commit": "96e0370f4daef29b918aafcff68c7f5e4ef397fd",
+        "Fixed-by": "2581e76a4a00023f81353b01ff9f7f3967205cf7",
+        "subsystem": "c++",
+        "problem_description": "c++: ICE with structured bindings and arrays [PR120285] (PR c++/120285): In r15-3933 I started using a CONSTRUCTOR to signal direct-init to build_vec_init rather than a TREE_LIST.  That broke struct S { int a = 1; }; void foo() { S arr[2]; auto [x, y](arr); } because we pass that new CONSTRUCTOR not to build_vec_init but to build_aggr_init which then crashes in digest_init_r because the new CONSTRUCTOR wasn't reshaped.  It should work to reshape... [Fix details: * init.cc (build_vec_init): Only build up a CONSTRUCTOR for arrays, otherwise use a TREE_LIST like prior to r15-3933.]"
+    },
+    {
+        "Commit": "12f461009b0e833e4a0404ab348c0fe5b7bbfc75",
+        "Fixed-by": "d0d3d4dde0b4712a3c39970ec8dcfe0782434d3e",
+        "subsystem": "c++",
+        "problem_description": "c++: ICE mangling C auto... tparm [PR124297] (PR c++/124297): After r16-7491, the constraint on a C auto... tparm is represented as a fold-expression (in TEMPLATE_PARM_CONSTRAINTS) instead of a concept-id (in PLACEHOLDER_TYPE_CONSTRAINTS).  So we now need to strip this fold-expression before calling write_type_constraint, like we do in the type template parameter case a few lines below. [Fix details: * mangle.cc (write_template_param_decl) <case PARM_DECL>: Strip fold-expression before calling write_type_constraint.]"
+    },
+    {
+        "Commit": "f2fddc4b84a843d32399fe457acabb73fca9869b",
+        "Fixed-by": "9fdccdaa54a176fc710972fa65caadee57b5f9c3",
+        "subsystem": "c++",
+        "problem_description": "c++: non-dep reversed <=> returning int [PR123601] (PR c++/123601): The code path for non-dependent operator expressions rewritten from a <=> returning a non-class type (added in r16-3727-gf2fddc4b84a843) is also reached for a reversed such <=> expression with the form 0 @ (y <=> x) where the @ is <=>, so we need to relax the relevant assert accordingly. [Fix details: * tree.cc (build_min_non_dep_op_overload): Relax COMPARISON_CLASS_P assert to accept SPACESHIP_EXPR too.]"
+    },
+    {
+        "Commit": "3b7e865779d03b4d29375a3c28dfaa2172eced4a",
+        "Fixed-by": "6dc335c506aca39af537180b2a0b23e640e5346e",
+        "subsystem": "c++",
+        "problem_description": "c++: Fix up is_late_template_attribute for [[maybe_unused]] [PR123277] (PR c++/123277): is_late_template_attribute wants to return false for gnu::unused, gnu::used and maybe_unused attributes, so that -Wunused-local-typedefs sees those attributes applied even to typedefs to dependent types. Before my recent r16-5937 change, for maybe_unused this happened to work through the lookup_attribute_spec returning NULL in that case because there is no gnu::maybe_unused... [Fix details: * decl2.cc (is_late_template_attribute): Return false also for [[maybe_unused]] attribute on TYPE_DECLs to dependent types.]"
+    },
+    {
+        "Commit": "6b7f4b587b5cb95ea3ed2f543841a3d1ed6f580d",
+        "Fixed-by": "4a718209d448f6a0b609421f7df7ad2761182c72",
+        "subsystem": "c++",
+        "problem_description": "c++: delay noexcept parsing for templated friends [PR122668] (PR c++/122668): The r16-5425 workaround to delay current-instantiation name lookup within a friend's noexcept-spec is unsound because it considers the flag cp_noexcept_operand but that indicates a noexcept-expr, not a noexcept-spec.  We don't currently have a flag for indicating a noexcept-spec context (and I don't think we really want one). This patch reverts that workaround and instead... [Fix details: * parser.cc (cp_parser_class_specifier): Adjust after changing the element type of unparsed_noexcepts.  Pass the class type to noexcept_override_late_checks. (cp_parser_member_declaration): Set CP_PARSER_FLAGS_DELAY_NOEXCEPT also for templated friends....]"
+    },
+    {
+        "Commit": "24d51e749570dcb85bd43d3b528f58ad6141de26",
+        "Fixed-by": "1804554a11d4dcdc0d513926f90fb1f33b0eeba9",
+        "subsystem": "c++",
+        "problem_description": "c++: Fix up error recovery for invalid designators [PR122836] (PR c++/122836): The following testcase ICEs since r12-7741 on the newly added gcc_assert. We've diagnosed the designator is invalid before, but kept it as is. The following patch changes it into error_mark_node, so that don't ICE on it. [Fix details: * decl.cc (check_array_designated_initializer): Change ce->index to error_mark_node after emitting an error for it.] [Target commit function(s): reshape_init_class, reshape_init_r]"
+    },
+    {
+        "Commit": "6a83030557ccceef5c12e8b45d6bcd5ba274232b",
+        "Fixed-by": "58305f56176bb1f1f1050211e42eff0056ac1c9c",
+        "subsystem": "c++",
+        "problem_description": "c++/modules: Remove incorrect is_import check in using-directives (PR c++/122915): When I wrote this check in r16-5811 I was thinking of checking if the using-directive was imported, but this just checks if the target namespace was imported, which is not what we want.  We don't build deps to see if the using-directive itself was imported, so just remove the check.  I haven't been able to come up with a testcase this breaks but it still seems reasonable to... [Fix details: * module.cc (module_state::write_using_directives): Correct condition.]"
+    },
+    {
+        "Commit": "7921bb4afcb7a3be8e10e63b10acfc2bfa477cae",
+        "Fixed-by": "4d1bfc66f84de6b37b175a191cba8cdd552c4383",
+        "subsystem": "c++",
+        "problem_description": "c++: Fix ODR regressions caused by P2115R0 changes [PR122905] (PR c++/122905): The following testcase fails due to ODR warnings starting with the r16-3233 change (P2115R0 PR120503 implementation). The problem is that for C++20 we mangle differently the anonymous union at the class scope from C++17, in C++17 the unnamed enumeration that has an enumerator as a name for linkage purposes before it is counted as TYPE_UNNAMED_P in nested_anon_class_index,... [Fix details: * decl.cc (enum_with_enumerator_for_linkage_p): Only return true for namespace scope types.]"
+    },
+    {
+        "Commit": "d64447946b0c8964dfd9731c3792af0fe4158cda",
+        "Fixed-by": "856fae983bca6a934b74f47c7cd21e6919035fc0",
+        "subsystem": "c++",
+        "problem_description": "c++: fix crash with pack indexing in noexcept [PR121325] (PR c++/121325): In my r15-6792 patch I added a call to tsubst in tsubst_pack_index to fully instantiate args#N in the pack. Here we are in an unevaluated context, but since the pack is a TREE_VEC, we call tsubst_template_args which has cp_evaluated at the beginning.  That causes a crash because we trip on the assert in tsubst_expr/PARM_DECL: gcc_assert (cp_unevaluated_operand); because... [Fix details: * pt.cc (tsubst_tree_vec): New. (tsubst_pack_index): Call it.]"
+    },
+    {
+        "Commit": "fd5c057c2d01346d69119f88ca94debf27842e4e",
+        "Fixed-by": "4711901000ab141dbf3995ec4541f9d9a2351472",
+        "subsystem": "c++",
+        "problem_description": "c++/modules: Keep tracking instantiations of static class variable templates [PR122625] (PR c++/122625): r16-4930-gfd5c057c2d01 ensured that we noted all class-scope variables. But I also added a clause to 'read_var_def' to skip all class-scope instantiations, under the mistaken belief that this would be handled in read_class_def. But as the testcase shows, read_class_def cannot (and should not) register instantiations of member variable templates, as when reading the class it... [Fix details: * module.cc (trees_in::read_var_def): Also track class-scope primary template specialisations.]"
+    },
+    {
+        "Commit": "fe2f86a960435a7c8c4e5134a0dfc64dd6062157",
+        "Fixed-by": "4f9f1269f4e929ee471b717b47c33d2d5a3db0d3",
+        "subsystem": "c++",
+        "problem_description": "c++/modules: Remove incorrect assertion [PR122015,PR122019] (PR c++/122015): This assertion, despite what I said in r16-4070, is not valid: we can reach here when deduping a VAR_DECL that didn't get a LANG_SPECIFIC in the current TU.  It's still correct to always use lang_cplusplus however as for anything else the decl would have been created with an appropriate LANG_SPECIFIC to start with. [Fix details: * module.cc (trees_in::install_entity): Remove incorrect assertion.]"
+    },
+    {
+        "Commit": "d3dd24acd74605488ebdb93c8b95da958053d43f",
+        "Fixed-by": "c0b21d1f45ac6a249974982c1a7f7515efb78747",
+        "subsystem": "c++",
+        "problem_description": "c++: fix count of z candidates for non-viable candidates, nesting [PR121966] (PR c++/121966): In r15-6116-gd3dd24acd74605 I updated print_z_candidates to show the number of candidates, and a number for each candidate. PR c++/121966 notes that the printed count is sometimes higher than what's actually printed: I missed the case where candidates in the list aren't printed due to not being viable. Fixed thusly. [Fix details: * call.cc (print_z_candidates): Copy the filtering logic on viable candidates from the printing loop to the counting loop, so that num_candidates matches the number of iterations of the latter loop.]"
+    },
+    {
+        "Commit": "c2e567a6edb563677107c40ce2ce67f78d294013",
+        "Fixed-by": "85409b9d6a29392d33f3fbac40c641eeda22062a",
+        "subsystem": "c++",
+        "problem_description": "c++/modules: Fix missed unwrapping of STAT_HACK in ADL [PR121893] (PR c++/121893): My r16-3559-gc2e567a6edb563 reworked ADL for modules, including a change to allow seeing module-linkage declarations if they only exist on the instantiation path.  This caused a crash however as I neglected to unwrap the stat hack wrapper when we were happy to see all declarations, allowing search_adl to add non-functions to the overload set. [Fix details: * name-lookup.cc (name_lookup::adl_namespace_fns): Unwrap the STAT_HACK also when on_inst_path.]"
+    },
+    {
+        "Commit": "4182cf11e1e3d2ebcf4f5c3dff157f844a635bf8",
+        "Fixed-by": "aa141f17fbab704e17e6c6cc046db91155b7bd21",
+        "subsystem": "target",
+        "problem_description": "aarch64: Fix aarch64_evpc_rev64_ext for testing_p case [PR127599] (PR target/127599): r17-3712-g4182cf11e1e3d2 added some code to expand a perm based on if we are in a loop or not.  The problem is in the testing case, the expanding stmt might not have a bb associated with it and that causes an ICE. This fixes the issue by moving the check for testing before the test of inside the loop. Pushed as obvious after bootstrapped and testing on aarch64-linux-gnu. [Fix details: * config/aarch64/aarch64.cc (aarch64_evpc_rev64_ext): Move the testing_p after the is_bb_in_loop test.]"
+    },
+    {
+        "Commit": "3b99fd4bdc7005333b0c760630f5db6ceeb81e5a",
+        "Fixed-by": "1fc2416ddc96a2fb1492642823f67e64488a153a",
+        "subsystem": "target",
+        "problem_description": "fix: riscv: Restore previous --param=riscv-autovec-mode behaviour [PR 127494] (PR target/127494): Fixed riscv regressions introduced in r17-4413-g3b99fd4bdc7005. Restores previous behaviour by only overriding autovec mode if it is one of the available autovec modes. [Fix details: * config/riscv/riscv-v.cc (autovectorize_vector_modes): Restore previous behaviour.]"
+    },
+    {
+        "Commit": "f2609a4c653a4993eec7ed9a2ad05caf936f0178",
+        "Fixed-by": "aca6b5d6eb67f452905fda689e39471e3f9a6fc4",
+        "subsystem": "target",
+        "problem_description": "x86-64: Check SSE4.1 for pinsrq/pextrq in TImode STV (PR target/127020): commit f2609a4c653a4993eec7ed9a2ad05caf936f0178 Author: Roger Sayle <roger@nextmovesoftware.com> Date:   Sat May 16 08:44:06 2026 +0100 x86_64: Handle hard registers in TImode STV with inter-unit moves. checks TARGET_AVX for vpinsrq and vpextrq.  But pinsrq and pextrq are added in SSE4_1.  Check TARGET_SSE4_1 instead of TARGET_AVX for pinsrq and pextrq. [Fix details: * config/i386/i386-features.cc (timode_scalar_chain::compute_convert_gain): Check TARGET_SSE4_1 instead of TARGET_AVX for pinsrq and pextrq.]"
+    },
+    {
+        "Commit": "00c22ba69d8e738a4789b30165ff9c925c508fc1",
+        "Fixed-by": "b41352c7aa2645de6c5751d447589c2ef8c4fa4d",
+        "subsystem": "target",
+        "problem_description": "aarch64: Fix -march=native when -mtune is used [PR124629] (PR target/124629): Handling of -march=native for recognised cores was broken by r13-2937-g00c22ba69d8e73, which added \"V\" to ARCH_IDENT values and filtered it out in some locations.  This causes a lookup by stringified ARCH_IDENT values to fail.  If no -mtune or -mcpu option is used, then we avoid this bug by upgrading -march=native to -mcpu=native. Fix this by removing the '+ 1' string... [Fix details: * config/aarch64/driver-aarch64.cc (AARCH64_ARCH): Don't skip first character of #ARCH_IDENT.] [Target commit function(s): aarch64_arches, all_cores]"
+    },
+    {
+        "Commit": "8a2d5bc28089b2660310b964ef75fb05eb387f88",
+        "Fixed-by": "8d0676db179aa31207bc4dd29e1c310823988f4b",
+        "subsystem": "target",
+        "problem_description": "s390: Fix ICE in usubc5 [PR126667] (PR target/126667): The following testcase ICEs on s390x-linux I believe since r15-6791 when usubc<mode>5 named pattern has been introduced. It intentionally uses general_operand predicate for operands[4], so that it can test it against const0_rtx and handle that differently, but otherwise it uses xor<mode>3 insn with operands[4] as first input, which has nonimmediate_operand.  So we emit... [Fix details: * config/s390/s390.md (usubc<mode>5): If operands[4] is an immediate operand other than const0_rtx, force it into reg before using it in xor<mode>3 insn.]"
+    },
+    {
+        "Commit": "b4c215b36d63e1c264d8c1bd5d34f9aef1bb8463",
+        "Fixed-by": "26058933d2a23140131b3980908554fc6f8b1f41",
+        "subsystem": "target",
+        "problem_description": "x86: Check register argument spill by callee (PR target/126320): commit b4c215b36d63e1c264d8c1bd5d34f9aef1bb8463 Author: H.J. Lu <hjl.tools@gmail.com> Date:   Sat Jun 28 06:27:25 2025 +0800 Adjust check for addressable misaligned stack argument ignores arguments passed on stack since caller is responsible to align the outgoing stack for arguments passed on stack.  However, callee may spill a register argument: (set (mem/c:V2DI (plus:DI... [Fix details: * config/i386/i386.cc (ix86_spill_register_argument_p): New function. (ix86_argument_passed_on_stack_p): Add a pattern argument.  Call ix86_spill_register_argument_p to check spill of register argument by callee. (ix86_update_stack_alignment): Pass pat to...]"
+    },
+    {
+        "Commit": "b6b9318ac9e72d6e3c9c400a98ce446846ed79d6",
+        "Fixed-by": "f50679ec5db3f4b33f793caa15344355bca7c45d",
+        "subsystem": "target",
+        "problem_description": "SH: Fix PR 67643 amendment of commit b6b9318ac9e72d6e (PR target/67643): * config/sh/sh.cc (fpscr_set_from_mem): Add missing argument to get_free_reg invocation."
+    },
+    {
+        "Commit": "5c55e923bcf191dbfdf65467b04e21c27adba1d6",
+        "Fixed-by": "d2e155986d0ec36b40fe5a9695e18ad7599f1850",
+        "subsystem": "target",
+        "problem_description": "s390: Fixup fix for *extzv_<mode>_{srl,sll}<clobbercc_or_nocc> (PR target/126054): Since r17-2057 the output template is a statement which means we have to annotate the mnemonic. [Fix details: * config/s390/s390.md: Annotate mnemonic for extzv_<mode>_{srl,sll}<clobbercc_or_nocc>.]"
+    },
+    {
+        "Commit": "f152cf1734f8087b982605ce93d4fb048283564e",
+        "Fixed-by": "667a1b5285c2d5d075a324a29323804f93d43add",
+        "subsystem": "target",
+        "problem_description": "aarch64: Fix wrong code for high-64-zero Advanced SIMD constants [PR125794] (PR target/125794): r17-1491-gf152cf1734f808 (PR113926) taught aarch64_simd_valid_imm to materialize a 128-bit Advanced SIMD MOV constant whose high 64 bits are zero with a 64-bit MOVI/FMOV, which zeroes the upper half of the register.  It records this with simd_immediate_info::width == 64 (output_width). However, when the low 64 bits are not themselves a valid Advanced SIMD (MOVI/MVNI/FMOV)... [Fix details: * config/aarch64/aarch64.cc (aarch64_simd_valid_imm): Do not fall through to the replicating SVE immediate forms for a 128-bit Advanced SIMD constant whose high 64 bits are zero (output_width != 0).]"
+    },
+    {
+        "Commit": "920eeb67a3537b024521f21f983be0e249faa5ea",
+        "Fixed-by": "8076bc965f8aebafcb18739492432a19ee62a17c",
+        "subsystem": "target",
+        "problem_description": "aarch64: use ZIP1 instead of UZP1 for concatenation [PR125550] (PR target/125550): This patch addresses the issue in PR125550, where two float16 values are being concatenated using UZP1, i.e., this code: svfloat16_t foo (float x0, float x1) { return svdupq_n_f16 (x0, x1, x0, x1, x0, x1, x0, x1); } is being compiled into: fcvt    h0, s0 fcvt    h1, s1 uzp1    v0.4h, v0.4h, v1.4h mov     z0.s, s0 ret causing the duplication of a 2-element vector ((float16)... [Fix details: * config/aarch64/aarch64-simd.md (*aarch64_combine_internal<mode>): Use zip1 instead of uzp1 to concatenate values residing in SIMD registers. (*aarch64_combine_internal_be<mode>): Likewise.] [Additional upstream fix for this commit: aarch64: fix combinez patterns for FP16 types [PR126983] (PR target/126983): The combinez patterns for scalar and partial vector operands added in r17-898-g920eeb67a3537b use the FMOV instruction indiscriminately, including for scalar FP16 modes in absence of the fp16 extension, causing assembly failure reported in PR126983.  Fix this by specializing the patterns for HF and BF modes and using the indexed INS instruction as fallback. This patch also... [Fix details: * config/aarch64/aarch64-simd.md (*aarch64_combinez<mode>): Split into VS32_I_SUB64_F_CONDFP16 and HFBF variants.  Change uxtw to uxt<extsize>. (*aarch64_combinez_be<mode>): Likewise. * config/aarch64/iterators.md (VSSUB64_F): Remove iterator....]]"
+    },
+    {
+        "Commit": "f511bf93f947199a9f9099fee87b7052e5515fb9",
+        "Fixed-by": "7b39d7b3b84d4d098b51bbdbd15e6ddea6bf99db",
+        "subsystem": "target",
+        "problem_description": "Correct x86: Call ix86_access_stack_p only for larger alignment (PR target/124165): commit f511bf93f947199a9f9099fee87b7052e5515fb9 Author: H.J. Lu <hjl.tools@gmail.com> Date:   Sun Mar 29 14:30:28 2026 -0700 x86: Call ix86_access_stack_p only for larger alignment has 2 issues: 1. It didn't exclude memory with SYMBOLIC_CONST when checking for stack access. 2. It replaced: HARD_REG_SET hard_stack_slot_access = stack_slot_access; ... bool... [Fix details: * config/i386/i386.cc (ix86_need_alignment_p_2): New function. Exclude memory with SYMBOLIC_CONST. (ix86_need_alignment_p_1): Call ix86_need_alignment_p_2. (ix86_find_max_used_stack_alignment): Restore hard_stack_slot_access handling.]"
+    },
+    {
+        "Commit": "238273fe06e3da6dd1d80b04217d53c76cf5fa41",
+        "Fixed-by": "f1065aba22dbf8cdf218cf60ccac310d758651e1",
+        "subsystem": "target",
+        "problem_description": "arm: Fix trapping arithmetic [PR123271] (PR target/123271): Patch r10-3995 accidentally defined insn patterns that overrode the default behaviour of overflow-trapping arithmetic; this broke the implementation of -ftrapv.  Fixed by renaming the internal patterns. For consistency I've renamed more than is strictly necessary. [Fix details: * config/arm/arm.md (subvsi3_intmin): Renamed to ... (sub_cmpVsi3_intmin): ... this. (subvsi3): Renamed to ... (sub_cmpVsi3): ... this. (subvsi3_imm1): Renamed to ... (sub_cmpVsi3_imm1): ... this. (usubvsi3_borrow): Renamed to ... (usub_cmpVsi3_borrow):...]"
+    },
+    {
+        "Commit": "febb0eac64c4a771c9f7260d4c28c5aca707c95e",
+        "Fixed-by": "1f9879e17466f5bcb583dd7bac8bae68b57ac31f",
+        "subsystem": "target",
+        "problem_description": "sparc: Don't require a sparc assembler with TLS [PR123926] (PR target/123926): Since r16-6798, it wasn't possible to build a sparc GCC without having a sparc assembler installed.  That shoudn't be the case since there are usecases for just compiling into assembly. The problem was sparc.h doing '#define TARGET_TLS HAVE_AS_TLS'. Building GCC failed when HAVE_AS_TLS wasn't defined which is the case when one doesn't have an assembler with TLS installed... [Fix details: * config/sparc/sparc.h (HAVE_AS_TLS): Default to 0.] [Target commit function(s): TARGET_ASM_OUTPUT_DWARF_DTPREL, TARGET_GNU_TLS, TARGET_SUN_TLS, TARGET_TLS]"
+    },
+    {
+        "Commit": "7a527754fdb61597b6a4c3289b63af3c86b2aa9d",
+        "Fixed-by": "b95f529df46e33c7ee7058b7cc51473e7a0d2f4c",
+        "subsystem": "target",
+        "problem_description": "i386: Fix up avx_vpermilp_parallel [PR124138] (PR target/124138): r16-3677 extended avx_vpermilp_parallel so that it handles also V8DImode (among others) and broke this testcase. For V8DFmode the bug existed there already since r0-127405 which extended avx_vpermilp_parallel to handle V8DFmode. For V16SImode/V16SFmode I think the code is correct, in that case it can for V4SImode/V4SFmode choose any permutation it wants and the V8S{I,F}mode... [Fix details: * config/i386/i386.cc (avx_vpermilp_parallel): Verify ipar[2] and ipar[3] aren't larger than 3.]"
+    },
+    {
+        "Commit": "2a84a753afcf376a5fc0339c5ce228c130000cd7",
+        "Fixed-by": "594f2cbf30f0a36cd7891ec915abf4de08630e49",
+        "subsystem": "target",
+        "problem_description": "ifcvt: cleanup if_info->cond usage in noce_try_cond_zero_arith (PR target/122769): Since r16-6332-g2a84a753afcf37, if_info->cond is not used indirectly any more for creating the conditional. So this patch stops doing the swap and fixes up so the case where if_info->rev_cond might be null. [Fix details: * ifcvt.cc (noce_try_cond_zero_arith): Don't swap if_info->cond but use it directly with if_info->rev_cond.] [Additional upstream fix for this commit: ifcvt: Allow non-comparisons against 0 in noce_try_cond_zero_arith (PR target/122769): Like r16-6332-g2a84a753afcf37 but instead of just allowing any comparisons against 0, this allows all comparisons. I mentioned this in https://gcc.gnu.org/pipermail/gcc-patches/2025-December/704463.html. [Fix details: * ifcvt.cc (noce_try_cond_zero_arith): Remove restriction on comparison against 0.]]"
+    },
+    {
+        "Commit": "ffdee87ac4cf576c59825a0a7a615ff212e51d96",
+        "Fixed-by": "f59cabadd0b678d744ba1f185ad215f561378a4e",
+        "subsystem": "target",
+        "problem_description": "LoongArch: Fix ICE caused by loongarch_split_reduction [PR122477]. (PR target/122477): In r16-4619, the scalar mode is not handled, which causes the compilation of test cases such as pr111414-1.c to fail in ICE. [Fix details: * config/loongarch/loongarch.cc (loongarch_split_reduction): Added handling of scalar mode.]"
+    },
+    {
+        "Commit": "73888cefe6da6531c590216c74ea5e04521897cb",
+        "Fixed-by": "d78bd76a49fb900db937d1bbabee7c5cb41ff4ba",
+        "subsystem": "target",
+        "problem_description": "c: Fix i386 target attribute regression [PR 122180] (PR target/122180): My patch (r16-4182-g73888cefe6da65) broke another target (i386), which this patch fixes. The issue was the target_version code was incorrectly being triggered on targets that do not support target_version semantics (i386). [Fix details: * c-decl.cc (pushdecl): Add TARGET_HAS_FMV_TARGET_ATTRIBUTE check.]"
+    },
+    {
+        "Commit": "afa74d37e8170d696f97424da7ab0f71883aac70",
+        "Fixed-by": "4c1d8818dee177b4f6c3adbf747873a0443d02b6",
+        "subsystem": "target",
+        "problem_description": "c: Fix regression related to DECL_NONLOCAL on aarch64 [PR121933] (PR target/121933): The recent patch r16-3747-gafa74d37e81 to detect the use of non-local context by nested functions caused regressions on aarch64, because DECL_NONLOCAL was set on labels.  Fix this by setting it only to the same types of decls as before. [Fix details: * c-typeck.cc (mark_decl_used): Set DECL_NONLOCAL only for VAR_DECL, FUNC_DECL, PARM_DECL.] [Additional upstream fix for this commit: c: Fix ICE after an error: typedef and old style prototypes for nested functions [PR123461] (PR c/123461): This started to ICE after r16-3747-gafa74d37e8170d which added a call to mark_decl_used. You can't call mark_decl_used with a typedef which is an error mark as you get an ICE. There is a check right after the newly added call for error mark, so let's move the call to inside that block instead. Bootstrapped and tested on x86_64-linux-gnu. [Fix details: * c-decl.cc (declspecs_add_type): Move mark_decl_used call after the check for error mark node.]]"
+    },
+    {
+        "Commit": "a76a032354ee48c0dcc5ff4842a9b319c3123685",
+        "Fixed-by": "b55277a4f8543f52c6d1664bb05e8eb90f46aaf3",
+        "subsystem": "target",
+        "problem_description": "bitint: Fix torture/bitint-14.c on bitint_extended targets [PR117599] (PR target/117599): This patch fixes regressions of the gcc.dg/torture/bitint-* tests caused by r16-3036-ga76a032354ee48 with --enable-checking=all. The errors are similar to the following: ../../gcc/testsuite/gcc.dg/torture/bitint-14.c:54:1: error: type mismatch in 'array_ref' <unnamed-signed:63> unsigned long _42 = VIEW_CONVERT_EXPR<unsigned long[10]>(r575[i_10])[8]; during GIMPLE pass:... [Fix details: * gimple-lower-bitint.cc (bitint_large_huge::limb_access): Move build_qualified_type calls into the if/else if/else bodies, for the last one set ltype to m_limb_type first, drop limb_type_a and use ltype instead.]"
+    },
+    {
+        "Commit": "d20b2ad845876eec0ee80a3933ad49f9f6c4ee30",
+        "Fixed-by": "cb508e54140687a50790059fac548d87515df6be",
+        "subsystem": "target",
+        "problem_description": "aarch64: PR target/121749: Use correct predicate for narrowing shift amounts (PR target/121749): With g:d20b2ad845876eec0ee80a3933ad49f9f6c4ee30 the narrowing shift instructions are now represented with standard RTL and more merging optimisations occur. This exposed a wrong predicate for the shift amount operand. The shift amount is the number of bits of the narrow destination, not the input sources. Correct this by using the vn_mode attribute when specifying the... [Fix details: * config/aarch64/aarch64-simd.md (aarch64_<shrn_op>shrn_n<mode>): Use aarch64_simd_shift_imm_offset_<vn_mode> instead of aarch64_simd_shift_imm_offset_<ve_mode> predicate. (aarch64_<shrn_op>shrn_n<mode> VQN define_expand): Likewise....] [Target commit function(s): V2XWIDE]"
+    },
+    {
+        "Commit": "1002a7ace111d746249fdea71af9b8e039cea0eb",
+        "Fixed-by": "89b2fa7a74ef1f7b8f0f8f1abc3bbc412d59302a",
+        "subsystem": "middle-end",
+        "problem_description": "lto.cc: OpenMP's offload_handle_link_vars - fix for global variables (2/2) [PR127273] (PR middle-end/127273): Commit r12-7776-g1002a7ace111d7 LTO: Fixes for renaming issues with offload/OpenMP [PR104285] moved the call to offload_handle_link_vars after the renaming of same-named static variables happened. However, it missed to remove the original call - such that the function is always called twice, walking the same node twice. In offload_handle_link_vars, the call to... [Fix details: * lto.cc (offload_handle_link_vars): Remove has-value-expr check; store link vars and processing them after walking the varpool. (lto_main): Remove duplicated offload_handle_link_vars call.]"
+    },
+    {
+        "Commit": "092e382942aeb24a949caa35512f8a4e613e234e",
+        "Fixed-by": "0621cf67366ffa2215cdd081b1ca1c3c577e8b70",
+        "subsystem": "middle-end",
+        "problem_description": "middle-end: Wrong code for a != b | (a|b) != 0. [PR126742] (PR middle-end/126742): Since r17-2886, GCC does a wrong optimize with: (a == b) & ((a|b) == 0) -> ((a|b) != 0) (a != b) | ((a|b) != 0) -> ((a|b) == 0) Should be: (a == b) & ((a|b) == 0) -> ((a|b) == 0) (a != b) | ((a|b) != 0) -> ((a|b) != 0) Regtest missed this because gcc.dg/int-bwise-opt-2.c only test: /* { dg-final { scan-tree-dump-times \"a == b\" 0 \"optimized\" } } */ /* { dg-final {... [Fix details: * match.pd: Fix wrong code.]"
+    },
+    {
+        "Commit": "8837b1d542fb685da3b36176a0bd82a46f472b80",
+        "Fixed-by": "2720a372bda550b8516a786562e0f5b705aede5b",
+        "subsystem": "middle-end",
+        "problem_description": "asan: Don't emit __asan_handle_no_return_call before __asan_report_* calls [PR126084] (PR middle-end/126084): Alex reported that since my r17-2388 fix we now emit an undesirable __asan_handle_no_return call before the __asan_report_{load,store}* calls added during bitintlower pass.  Normally (when large/huge _BitInt is not involved), those are added by the sanopt pass which runs after the asan pass and so aren't instrumented. The following patch avoids instrumenting those.... [Fix details: * asan.cc (maybe_instrument_call): Don't instrument BUILT_IN_ASAN_REPORT_{LOAD,STORE}{1,2,4,8,16,_N} builtins. (initialize_sanitizer_builtins): Use (*lang_hooks.types.type_for_mode) (ptr_mode, 0) instead of pointer_sized_int_mode for PTRMODE arguments....]"
+    },
+    {
+        "Commit": "cbc56384029c9224280b0a1018fb9502797f243d",
+        "Fixed-by": "10f654cd90ffd58f91bf1ee8a0af762040346ab4",
+        "subsystem": "middle-end",
+        "problem_description": "Replace the min size rtx with GEN_INT (min_size) (PR middle-end/125977): commit cbc56384029c9224280b0a1018fb9502797f243d Author: H.J. Lu <hjl.tools@gmail.com> Date:   Fri Jun 26 08:43:20 2026 +0800 determine_block_size: Set len_rtx to min size if min size == max size added +    gcc_assert (min_size != max_size +           || rtx_equal_p (ops[2].value, ops[6].value)); But the number of operands isn't fixed and may be less than 7.  Replace the min... [Fix details: * expr.cc (emit_block_move_via_pattern): Replace ops[6].value in assert with GEN_INT (min_size).]"
+    },
+    {
+        "Commit": "f6f33ca83cb6b84cc5d157103ac70c143011b176",
+        "Fixed-by": "7ec15f8a0b357e33a9c93ad25e4401dd75b7d466",
+        "subsystem": "middle-end",
+        "problem_description": "match: Disable `if (cond) (A | CST1) : (A & ~CST1)` pattern for non-GIMPLE [PR125588] (PR middle-end/125588): r17-265-gf6f33ca83cb6b8 added a new pattern that converts: cond ? (A | CST1) : (A & ~CST1) into `(A & ~CST1) | (cond * CST1)` but fold (partly via fold_binary_op_with_conditional_arg) will turn that back into `cond ? (A | CST1) : (A & ~CST1)` in some cases. In those cases we get an infinite loop and a stack overflow crash. This fixes the problem by enabling this pattern for... [Fix details: * match.pd (`if (cond) (A | CST1) : (A & ~CST1)`): Enable for GIMPLE only.]"
+    },
+    {
+        "Commit": "78db4753c9646a372512e6a951fced12f74de0bc",
+        "Fixed-by": "4a3ad71a20b62c79f8d82f902eeecc58eef21f3b",
+        "subsystem": "middle-end",
+        "problem_description": "middle-end/124877 - fix mis-apply of PROMOTE_PROTOTYPES (PR middle-end/124877): The following corrects how we apply PROMOTE_PROTOTYPES during RTL expansion.  The unsignedp field in args info is supposed to denote the signedness of the unpromoted value, but we've set it to the signedness of integer_type_node.  So delay adjusting the type until after we compute signedness of the formal argument. This was originally changed for GCC16 with... [Fix details: * calls.cc (initialize_argument_information): Compute signedness of the formal argument type before applying PROMOTE_PROTOTYPES promotion.  Also apply promotion to a smaller than int integer first member type of a transparent union. * target.def...]"
+    },
+    {
+        "Commit": "a9e48eca3a6eef2348c2827ed67b9cbb3f5f82ce",
+        "Fixed-by": "b40b4333470345d905a5a9cc01f82880f18080f7",
+        "subsystem": "middle-end",
+        "problem_description": "expand: Fix GET_MODE_SIZE/GET_MODE_BITSIZE typo [PR124435] (PR middle-end/124435): When splitting out store_field_updates_msb_p, r16-7265-ga9e48eca3a6eef accidentally replaced GET_MODE_BITSIZE with GET_MODE_SIZE. A matching rename of to_size to to_bitsize would have overflowed a line, so it seemed worth breaking the endian cases apart. [Fix details: * expr.cc (store_field_updates_msb_p): Use GET_MODE_BITSIZE instead of GET_MODE_SIZE.  Handle the two endiannesses separately.]"
+    },
+    {
+        "Commit": "a4716ece529dfd29d169ccc96979f7c747231f25",
+        "Fixed-by": "e787d5ace5cc315892868f3e5e2a2a16fd31bcc8",
+        "subsystem": "middle-end",
+        "problem_description": "middle-end/123573 - fix VEC_PERM folding more (PR middle-end/123573): The following fixes the fix from r16-6709-ga4716ece529dfd some more by making sure permute to one operand folding faces same element number vectors but also insert a VIEW_CONVERT_EXPR for the case one is VLA and one is VLS (when the VLA case is actually constant, like with -msve-vector-bits=128).  It also makes the assert that output and input element numbers match done in... [Fix details: * fold-const.cc (fold_vec_perm): Actually check, not assert, that input and output vector element numbers agree. * match.pd (vec_perm @0 @1 @2): Make sure element numbers are the same when folding to an input vector and wrap that inside a VIEW_CONVERT_EXPR.] [Target commit function(s): lower_vec_perm]"
+    },
+    {
+        "Commit": "bc62a2fbabad0402e96640b834d7c8a9f64c11db",
+        "Fixed-by": "9029f5436aa4badd17c63a5633346a620d265ef5",
+        "subsystem": "middle-end",
+        "problem_description": "vect-generic: Fix expand_vector_mult [PR123069] (PR middle-end/123069): The r16-5095 PR122065 change added build_int_cst call on vector types. That is never correct, it ICEs already on the TYPE_PRECISION used at the start of wide_int_to_tree_1. Fixed by using build_zero_cst instead. [Fix details: Andrew Pinski  <andrew.pinski@oss.qualcomm.com> * tree-vect-generic.cc (expand_vector_mult): Use build_zero_cst (vectype) instead of build_int_cst (vectype, 0).]"
+    },
+    {
+        "Commit": "e176456cfe5b1013bbfc24853265dfb13673011c",
+        "Fixed-by": "f4abe216199930adfa110059c3c8e642c585388b",
+        "subsystem": "middle-end",
+        "problem_description": "calls: Allow musttail calls to noreturn [PR121159] (PR middle-end/121159): In the PR119483 r15-9003 change we've allowed musttail calls to noreturn functions, after all the decision not to normally tail call noreturn functions is not because it is not possible to tail call those, but because it screws up backtraces.  As the following testcase shows, we've done that only for functions not declared [[noreturn]]/_Noreturn but later on discovered... [Fix details: * calls.cc (can_implement_as_sibling_call_p): Don't reject declared noreturn functions in musttail calls.]"
+    },
+    {
+        "Commit": "ec5349c37afe972ee79b777ee749630b1a0a007e",
+        "Fixed-by": "a48fbdd6a803429ccf2eda7c9ba8ecdd975f8e35",
+        "subsystem": "rtl-optimization",
+        "problem_description": "avoid-store-forwarding: Reject overlapping stores [PR124476] (PR rtl-optimization/124476): The redundant-store tracking introduced in ec5349c37af replaced a safe bitmap_bit_in_range_p check (which bailed on any overlap) with bitmap_all_bits_in_range_p (which only removed fully redundant stores). This broke \"last writer wins\" semantics for partially overlapping stores: when an earlier store's BFI was applied after the base store's value, it overwrote bytes that... [Fix details: * avoid-store-forwarding.cc (store_forwarding_analyzer::process_store_forwarding): Replace bitmap_all_bits_in_range_p with bitmap_any_bit_in_range_p and return false on partial overlap.  Remove redundant-store vectors and their associated removal, dump,...]"
+    },
+    {
+        "Commit": "594f2cbf30f0a36cd7891ec915abf4de08630e49",
+        "Fixed-by": "04159cca134b196d07bcbe7b71e8096ba1f3eda3",
+        "subsystem": "rtl-optimization",
+        "problem_description": "ifcvt: Fix rtl checking due to reversed_comparison_code returning UNKNOWN [PR124062] (PR rtl-optimization/124062): This was an oversight on my part (after r16-6435-g594f2cbf30f0a3) where I forgot that sometimes reversed_comparison_code will return UNKNOWN when the floating point comparison can't be reversed. This seems only to show up with RTL checking only; at least as far as I can tell because it is rejected later on but I could be wrong. Bootstrapped and tested on x86_64-linux-gnu. [Fix details: * ifcvt.cc (noce_try_cond_arith): Check the conditional code for UNKNOWN.] [Target commit function(s): noce_try_cond_zero_arith]"
+    },
+    {
+        "Commit": "19ba913517b5e2a001fa9c0f060a1ac74430c027",
+        "Fixed-by": "3ee0e36f81af4ca2355430c910ada014c66aab3a",
+        "subsystem": "rtl-optimization",
+        "problem_description": "combine: Fix up serious regression in try_combine [PR121773] (PR rtl-optimization/119291): Back in April last year I've changed try_combine's condition when trying to split two independent sets by moving one of them to i2.  Previously this was testing !modified_between_p (SET_DEST (setN), i2, i3) and I've changed it to SET_DEST (setN) != pc_rtx && !reg_used_between_p (SET_DEST (set1), i2, i3) on the assumption written in the r15-9131-g19ba913517b5e2a00 commit... [Fix details: * combine.cc (try_combine): Check that SET_DEST (setN) is neither modified_between_p nor reg_used_between_p instead of just not reg_used_between_p or pc_rtx.]"
+    },
+    {
+        "Commit": "a93f80feeef744649dc426a59a5860224d13e68d",
+        "Fixed-by": "528df313f6d941cde12c12bdeb20d6d24e05ba4b",
+        "subsystem": "rtl-optimization",
+        "problem_description": "rtl-optimization: Fix BB edge ordering [PR122675] (PR rtl-optimization/122675): Starting with r16-4438-ga93f80feeef744, the edge sorting order was switched to lowest execution frequency first.  But the \"bbro\" optimization pass chooses the first edge as a fallthrough.  Thus the most unlikely branches were optimized to fallthroughs. Fix by restoring the sorting order prior to r16-4438-ga93f80feeef744. Now the branches most likely to be executed are... [Fix details: * bb-reorder.cc (edge_order): Fix BB edge ordering to be descending.]"
+    },
+    {
+        "Commit": "965564eafb721f8000013a3112f1bba8d8fae32b",
+        "Fixed-by": "ef49f8e9480129433cc803625ae8c6877cf59453",
+        "subsystem": "rtl-optimization",
+        "problem_description": "simplify-rtx: Fix Distribute subregs over logic ops [PR121302] (PR rtl-optimization/121302): r16-2614-g965564eafb721f had a typo where it would assume byte==0 rather than use the byte (offset) that was passed. This fixes that typo and also fixes the comment since it is not just about lowerpart subregs but all non-paradoxical subregs. Pushed as obvious after bootstrap/test on x86_64-linux-gnu. [Fix details: * simplify-rtx.cc (simplify_context::simplify_subreg): Use byte instead of 0 when calling simplify_subreg.] [Additional upstream fix for this commit: simplify-rtx: Add `(subreg (not a))` simplification for word_mode [PR121308] (PR rtl-optimization/121308): Right now in simplify_subreg, there is code to try to simplify for word_mode with the binary bitwise operators. The unary bitwise operator is not handle, this causes an odd mix match and the new self testing code that was added with r16-2614-g965564eafb721f was not expecting. The self testing code was for testing the newly added code but since there was already code that... [Fix details: * v2: add `&& SCALAR_INT_MODE_P (innermode)` to the conditional. Bootstrapped and tested on x86_64-linux-gnu. * simplify-rtx.cc (simplify_context::simplify_subreg): Handle subreg of `not` with word_mode to make it symmetric with the other bitwise operators.] | simplify-rtx: Distribute some non-narrowing subregs [PR121306] (PR rtl-optimization/121306): In g:965564eafb721f8000013a3112f1bba8d8fae32b I'd added code to try distributing non-widening subregs through logic ops, in cases where that would eliminate a term of the logic op. For \"reasons\", this indirectly caused combine to generate: (set (zero_extract:SI (reg/v:SI 101 [ a ]) (const_int 8 [0x8]) (const_int 8 [0x8])) (not:SI (sign_extract:SI (reg:SI 107 [ b ])... [Fix details: * simplify-rtx.cc (simplify_context::simplify_subreg): Distribute non-narrowing integer-to-integer subregs through logic ops, in a similar way to the existing word_mode handling.]]"
+    },
+    {
+        "Commit": "d84fbc516ea57de7e88fce76ff6f342ee808c02e",
+        "Fixed-by": "dba5d112691a3e10b722468d94fffeda0fdbb818",
+        "subsystem": "rtl-optimization",
+        "problem_description": "simplify-rtl: Fix crash due to simplify_with_subreg_not [PR120059] (PR rtl-optimization/120059): r16-286-gd84fbc516ea57d added a call to simplify_gen_subreg but didn't check if the result of simplify_gen_subreg was non-null. simplify_gen_subreg can return NULL if the subreg would be not valid. In the case below we had a hard register for the SSE register xmm0 of mode SI and doing a subreg to QI mode but QImode is not a valid mode for the SSE register so... [Fix details: * simplify-rtx.cc (simplify_with_subreg_not): Check the result of simplify_gen_subreg.]"
+    },
+    {
+        "Commit": "99bfdb072e67fa3fe294d86b4b2a9f686f8d9705",
+        "Fixed-by": "bb9cee8928f7f4dfb94e7a8f232eda736b711450",
+        "subsystem": "rtl-optimization",
+        "problem_description": "loop-iv, riscv: Fix get_biv_step_1 for RISC-V [PR117506] (PR rtl-optimization/117506): The following test ICEs on RISC-V at least latently since r14-1622-g99bfdb072e67fa3fe294d86b4b2a9f686f8d9705 which added RISC-V specific case to get_biv_step_1 to recognize also ({zero,sign}_extend:DI (plus:SI op0 op1)) The reason for the ICE is that op1 in this case is CONST_POLY_INT which unlike the really expected VOIDmode CONST_INTs has its own mode and still satisfies... [Fix details: * loop-iv.cc (get_biv_step_1): For {ZERO,SIGN}_EXTEND of PLUS apply {ZERO,SIGN}_EXTEND to op1.]"
+    },
+    {
+        "Commit": "7876cde25cbd2f026a0ae488e5263e72f8e9bfa0",
+        "Fixed-by": "be966baa353dfcc20b76b5a5586ab2494bb0a735",
+        "subsystem": "rtl-optimization",
+        "problem_description": "simplify-rtx: Fix incorrect folding of shift and AND [PR117012] (PR rtl-optimization/117012): The optimization added in r15-1047-g7876cde25cbd2f is using the wrong operaiton to check for uniform constant vectors. The Author intended to check that all the lanes in the vector are the same and so used CONST_VECTOR_DUPLICATE_P.  However this only checks that the vector is created from a pattern duplication, but doesn't say how many pattern alternatives make up the... [Fix details: * simplify-rtx.cc (simplify_context::simplify_binary_operation_1): Use const_vec_duplicate_p instead of CONST_VECTOR_DUPLICATE_P.]"
+    },
+    {
+        "Commit": "f3943597388db4846386b6d5a18d33ebf80ea96c",
+        "Fixed-by": "787c7e0c01f091291edeb2471367119ca6f438e7",
+        "subsystem": "fortran",
+        "problem_description": "fortran: [PR126950] Load the span of a span addressed dummy on entry (PR fortran/126950): A TARGET assumed-shape dummy is addressed through the span of its descriptor since r17-3342.  Its bounds and data pointer are loaded into local variables on entry, but the span was reloaded from the descriptor at each element reference.  Inside an outlined region, such as an OpenMP target region, only those local variables are available; the descriptor is not mapped to the... [Fix details: * trans.h (struct lang_decl): Add span. (GFC_DECL_SPAN, GFC_DECL_GET_SPAN): New macros. * trans-decl.cc (gfc_build_dummy_array_decl): Create the variable holding the span of a span addressed dummy. * trans-array.cc (gfc_trans_dummy_array_bias): Load it...] [Additional upstream fix for this commit: fortran: [PR126964] Reduce the cost of a span addressed dummy (PR fortran/126964): r17-3342 made a TARGET assumed shape or assumed rank dummy be addressed through the span of its descriptor, so that a pointer to it stays valid when its elements are subobjects of larger ones.  That costs in two ways, and SPEC 465.tonto pays both. First, addressing every element as offset * span leaves the step of a data reference symbolic, so loop versioning cannot prove... [Fix details: * symbol.cc (gfc_is_span_addressed_dummy): Rename to... (gfc_dummy_requires_direct_arg): ... this and move the addressing out of the description. * trans.h (struct lang_decl): Add span_normalized. (GFC_DECL_SPAN_NORMALIZED): New macro....]]"
+    },
+    {
+        "Commit": "1cf8c5913bfe8016b8b2436cc17a7577be1b295f",
+        "Fixed-by": "75136eabafd2028a04d47720ea87548df47e2578",
+        "subsystem": "fortran",
+        "problem_description": "fortran: [PR126872] BIND(C) entities must keep default ELF visibility (PR fortran/125430): A binding label gives an entity external linkage, so PRIVATE hides only the Fortran name and must not lower the symbol's ELF visibility.  Three sites gave hidden visibility to PRIVATE module entities without exempting binding labels, so a BIND(C) procedure or variable in a module with a PRIVATE default was not exported from a shared library. The procedure case is a... [Fix details: * trans-decl.cc (gfc_finish_var_decl): Drop the unreachable hidden-visibility case in the BIND(C) block.  Do not give hidden visibility to a PRIVATE module variable with a binding label. (build_function_decl): Do not give hidden visibility to a PRIVATE...]"
+    },
+    {
+        "Commit": "790671b708400d1fc6bb1abbf1601f3616e8220d",
+        "Fixed-by": "038a334a1f5d28163393c15c842b4db729028a31",
+        "subsystem": "fortran",
+        "problem_description": "fortran: Fix minor memleak with GMP variables (PR fortran/94978): Commit r16-8564 introduced code that does not clear used GMP variables. Fix this. [Fix details: * frontend-passes.cc (inner_loop_may_be_skipped): Clear GMP variables.]"
+    },
+    {
+        "Commit": "18e49f19f5907de8d28cd33a8789946a3f5092ce",
+        "Fixed-by": "47bb24546297ef6812d69bc800ec005fc7e567e9",
+        "subsystem": "fortran",
+        "problem_description": "Fortran: checking of passed character length [PR125393] (PR fortran/125393): Commit r16-3462 enhanced checking of character length passed to a character dummy.  However, when the actual argument was an array element, its storage size was estimated from all elements up to the end of the array.  This could give a bogus warning when the dummy argument was of a scalar character type.  Fix check for this case to actually compare the character lengths of... [Fix details: * interface.cc (get_expr_storage_size): Additionally return character length. (gfc_compare_actual_formal): When the formal is a scalar character variable, use character lengths, not array storage size for check.]"
+    },
+    {
+        "Commit": "a9a1ed349974f03e9ba32dc21cce7e20cd7119ee",
+        "Fixed-by": "326fe37d6981c189fb0f2a5a4ab7f7a5b95ecf89",
+        "subsystem": "fortran",
+        "problem_description": "fortran: Diagnose invalid array initializer after parameter substitution [PR103367] (PR fortran/103367): Keep the trunk fallback from r16-8509, but turn it into a real constant-expression error instead of silently returning an empty constructor.  This avoids the ICE from PR103367 without regressing the more specific diagnostics discussed in the Bugzilla follow-up. [Fix details: * trans-array.cc (gfc_conv_array_initializer): Emit an error for invalid residual initializer expressions before returning a safe empty constructor.]"
+    },
+    {
+        "Commit": "0d0fbb0a01e4e77e274e0ff9b54506a495a7bdef",
+        "Fixed-by": "d8b00bf2e1514cd132a9febaa9849ab46cd316f5",
+        "subsystem": "fortran",
+        "problem_description": "fortran: Fix use-after-free in CLASS component error recovery [PR124482] (PR fortran/124482): The error recovery added in r16-8021 (PR106946) freed CLASS container symbols when removing invalid CLASS components from a derived type. However, gfc_build_class_symbol reuses existing containers when multiple components share the same class type and attributes.  Freeing the container for a failed component also invalidated it for previously committed components, causing a... [Fix details: * decl.cc (gfc_match_data_decl): Defer CLASS container cleanup until after all failed components are unlinked.  Check remaining component list before freeing a shared container.]"
+    },
+    {
+        "Commit": "689d4abc0b836aaf1c8ecd38091dde6b14373c60",
+        "Fixed-by": "e36fef054c03112a4cd20a6ff0a3b3533c41f2b5",
+        "subsystem": "libstdc++",
+        "problem_description": "libstdc++: Value-initialize _Hashtable_ebo_helper members [PR126949] (PR libstdc++/126949): The no_unique_address _Hashtable_ebo_helper members (that replaced base classes in r15-6273-g689d4abc0b836a), are initialized with {}. Since the _Hashtable_ebo_helper are aggregates, aggregate initialization is performed. In particular such initialization is ill-formed, if any aggregate member has explicit default constructor, as they cannot be initialized from {}. This... [Fix details: * include/bits/hashtable_policy.h (_Hash_code_base::_M_hash) (_Hashtable_base::_M_equal, _Hashtable_alloc::_M_alloc): Value initialized members in NSDMI. default construction with an hash, equality and allocator with explicit constructor.] [Target commit function(s): _Hash_code_base, _Hashtable_alloc, _Hashtable_base, _Hashtable_ebo_helper]"
+    },
+    {
+        "Commit": "98c37d3bacbb2f8bbbe56ed53a9547d3be01b66b",
+        "Fixed-by": "99266eead94c8aca7faa1e06d886c2f4abdbb1ed",
+        "subsystem": "libstdc++",
+        "problem_description": "libstdc++: Handle generators with non-zero min in uniform_int_distribution [PR118665] (PR libstdc++/118665): The commit r11-3757-g98c37d3bacbb2f that introduced Lemire's algorithm in uniform_int_distribution, assumed that any engine that generates range of size 2^32 or 2^64, returns a range starting from zero. While this is true for all standard providede engines, it may not be true for user provided range. In such case the produced output is no longer uniform: testDiscreteDist... [Fix details: * include/bits/uniform_int_dist.h (uniform_int_distribution::_S_nd): Substract __min (_Urbg::min()) from each generator invocation. Add testDiscreteDist for shifted (with non-zero min()) engine.] [Additional upstream fix for this commit: libstdc++: Prevent hanging of uniform_int_distribution for non-conforming engines [PR118665] (PR libstdc++/118665): Since r11-3757-g98c37d3bacbb2f the uniform_int_distribution uses Lemire's algorithm for engines outputting power of two range. As this algorithm (in-contrast to other) rejects low outputs from incoming generator, this change lead to hangs (due infinite loop) when distribution was mixed with non-uniform generator, that returns 0 constantly. Such usage has undefined behavior... [Fix details: * include/bits/uniform_int_dist.h (uniform_int_distribution::_S_nd): Alternate between rejecting from beginning/end of the range. New test. Updated expected values for test_2p55p1 that's depends on uniform_int_distribution.]]"
+    },
+    {
+        "Commit": "f7cde200320e0800e4fcc5cea399e9faef50f8d4",
+        "Fixed-by": "610134a51fa3d0bcd3e0980c6574557172dc88c0",
+        "subsystem": "libstdc++",
+        "problem_description": "libstdc++: Apply rule triggering at Zone line transition [PR124853] (PR libstdc++/124853): When seeding zone information from the application of the rules prior the transition, we should consider the rule triggering exactly at boundary, not only prior, i.e. call find_active_rule with info.begin. Due the rule_start - t < days(1) check (that is not removed yet), such transitions were effectively ignored. This addresses regressions introduced by... [Fix details: * src/c++20/tzdb.cc (time_zone::_M_get_sys_info): Find rules firing exactly at transition time. for Europe/Lisbon, and corrected test_negative.]"
+    },
+    {
+        "Commit": "7bed7d9276c11bef5a9a214e20c985af713f1532",
+        "Fixed-by": "86a93aaef14c1597f531a826f0004c6a86e9fdd4",
+        "subsystem": "libstdc++",
+        "problem_description": "libstdc++: Fix weight computation for piecewise_linear_distribution(nw, xmin, xmax, fw) constructor [PR125548] (PR libstdc++/125548): Compute kth weight using __fw(_M_int[k]) as required by standard, instead of __fw(_M_int[k] + __delta), i.e. __fw(_M_int[k + 1]). For __nw == 1, this was already corrected by r17-509-g7bed7d9276c11b. In both cases, previous behavior can be restored by defining _GLIBCXX_USE_OLD_PIECEWISE_DISTRIBUTIONS. [Fix details: * doc/html/manual/using_macros.html: (_GLIBCXX_USE_OLD_PIECEWISE_DISTRIBUTIONS): Mention PR125548 * doc/xml/manual/using.xml: Regenerate * include/bits/random.tcc (piecewise_linear_distribution::param_type::param_type(size_t, _RealType, ...)): Update...]"
+    },
+    {
+        "Commit": "106970adca69c9c577e6c75f4e69a08cd9ea2df0",
+        "Fixed-by": "68d3f1e2c20efe07f99de3720d1732c4b987ff22",
+        "subsystem": "c",
+        "problem_description": "c: fix wrong encoding for zero-sized arrays [PR125618] (PR c/125618): This reverts one change from 106970adca69c9c577e6c75f4e69a08cd9ea2df0 that replaced build_range_type with build_index_type.  In the function complete_array_type this breaks zero-sized arrays created from an empty initializer which there are represented using the C++ FE way [0, -1] causing issues on 32 bit architectures. After this partial revert this representation remains... [Fix details: * c-common.cc (complete_array_type): Change back to using build_range_type.]"
+    },
+    {
+        "Commit": "77b8221af8fc827a95b08a381bf5b2a43b3b2ba5",
+        "Fixed-by": "64be1fa670a04c81d48dfdaa074d8bf8f935d746",
+        "subsystem": "c",
+        "problem_description": "OpenMP: Fix omp_check_for_duplicate_variant [PR125377] (PR c/125377): Follow up to r16-5508-g77b8221af8fc82; seemingly, a testcase never got added - and the internal representation changed afther the code was written. At least the previous code ICE'd for the included testcase. [Fix details: * omp-general.cc (omp_check_for_duplicate_variant): Fix used tree for 'inform' part of the error message.]"
+    },
+    {
+        "Commit": "bedfca647a9e9c1adadd8924f3ee0ab4189424e0",
+        "Fixed-by": "86254629b636db579616befde49022f098af8148",
+        "subsystem": "c",
+        "problem_description": "c: fix uninitialized c_expr::m_decimal [PR106830] (PR c/106830): I added c_expr::m_decimal in r13-2386-gbedfca647a9e9c1a as part of the implementation of -Wxor-used-as-pow, but I missed various places where the field needed to be initialized. Fixed thusly. [Fix details: * c-warn.cc (check_for_xor_used_as_pow): Don't try checking values that don't fit in uhwi. * c-parser.cc (c_parser_initelt): Initialize m_decimal. (c_parser_cast_expression): Likewise. (c_parser_alignof_expression): Likewise....]"
+    },
+    {
+        "Commit": "ad3fb999a1b56893f0f6296a52fe2af550763fee",
+        "Fixed-by": "54d98b104420363d8109aee1bb275f4567c756f0",
+        "subsystem": "ipa",
+        "problem_description": "ipa-cp: Fix devirt bonus for targets that cannot be inlined (PR ipa/123412): PR 123412 has been filed because since commit r16-3990-gad3fb999a1b568 (Jan Hubicka: Improve ipa-cp devirtualization costing), there is accidentally zero devirtualization bonus for functions which cannot be inlined.  This has resulted in g++.dg/ipa/devirt-2.C failing since it has been pushed because the required function is not cloned even with --param max-devirt-targets=1.... [Fix details: * ipa-cp.cc (devirtualization_time_bonus): Do add the indirect edge frequency at least once even for targets which cannot be inlined.]"
+    },
+    {
+        "Commit": "a3ee90fd3dc5d5c98f63a16f9cdd788c5d5c3335",
+        "Fixed-by": "11e4b8bcc6694564670f2b93f3141fee2c86d5f8",
+        "subsystem": "ipa",
+        "problem_description": "ipa: Fix pritting of symtab_node type: Fix 'static_assert' [PR122512] (PR ipa/122512): Fix-up for commit r16-4914-ga3ee90fd3dc5d5c98f63a16f9cdd788c5d5c3335 \"ipa: Fix pritting of symtab_node type [PR122512]\": ../../source-gcc/gcc/symtab.cc:885:61: error: expected \u2018,\u2019 before \u2018)\u2019 token static_assert (ARRAY_SIZE(toplevel_type_names)==TOPLEVEL_MAX); ^ ../../source-gcc/gcc/symtab.cc:885:61: error: expected string-literal before \u2018)\u2019 token make[2]: ***... [Fix details: * symtab.cc: Fix 'static_assert'.]"
+    },
+    {
+        "Commit": "529c25ed6e0a06bc0cae21a80263450e49a11716",
+        "Fixed-by": "a3ee90fd3dc5d5c98f63a16f9cdd788c5d5c3335",
+        "subsystem": "ipa",
+        "problem_description": "ipa: Fix pritting of symtab_node type [PR122512] (PR ipa/122512): The problem here r16-4747-g529c25ed6e0a06 changed symtab_type to toplevel_type and then added 2 types at the begining but didn't update symtab_type_names. This obvious patch changes symtab_type_names to toplevel_type_names, adds a _MAX type to toplevel_type and a comment about keeping them in sync. Also adds an static assert to make sure if someone adds a toplevel_type that... [Fix details: * cgraph.h (enum toplevel_type): Add TOPLEVEL_MAX. Add comment about keeping toplevel_type_names in sync. * symtab.cc (symtab_type_names): Rename to ... (toplevel_type_names): Add new types and add an assert about the size....] [Additional upstream fix for this commit: cgraph: Move next/previous from symtab to toplevel_node [PR122955] (PR ipa/122955): Currently the GC marker functions don't support chain_next on non-toplevel tag structures (and does not error out either). So since r16-4747-g529c25ed6e0a06 if there are a lot of chained symtab_nodes (happens most likely with LTO), the GC marker function could cause a stack overflow because of the recusive nature of the marker. This fixes the problem by moving next/previous... [Fix details: * cgraph.h (toplevel_node): Add next and previous fields. Add chain_next and chain_prev to GTY. (symtab_node): Remove next and previous field. Remove chain_next and chain_prev from the GTY. (asm_node): Remove next field. (symtab_node::next_defined_symbol):...]] [Target commit function(s): GTY, finalize_toplevel_asm, lto_input_toplevel_asms, test]"
+    }
+]

@@ -59,11 +59,21 @@ pub fn sashiko_severity_guide() -> &'static str {
         .expect("sashiko/severity.md must exist in prompt bundle")
 }
 
+/// Returns the compiled-in content of `gcc/severity.md`.
+pub fn gcc_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "gcc/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("gcc/severity.md must exist in prompt bundle")
+}
+
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
         ProjectId::Linux => kernel_severity_guide(),
         ProjectId::Sashiko => sashiko_severity_guide(),
+        ProjectId::Gcc => gcc_severity_guide(),
     }
 }
 
@@ -130,6 +140,14 @@ mod tests {
         assert!(guide.contains("Sashiko is not an operating system kernel"));
         assert_eq!(severity_guide(ProjectId::Linux), kernel_severity_guide());
         assert_eq!(severity_guide(ProjectId::Sashiko), sashiko_severity_guide());
+        assert_eq!(severity_guide(ProjectId::Gcc), gcc_severity_guide());
+    }
+
+    #[test]
+    fn test_gcc_severity_guide_not_empty() {
+        let guide = gcc_severity_guide();
+        assert!(guide.contains("# Severity Levels"));
+        assert!(guide.contains("wrong-code"));
     }
 
     #[test]
@@ -208,6 +226,24 @@ mod tests {
             assert!(
                 found,
                 "guide {guide} referenced in sashiko/subsystem/subsystem.md not found in bundle under subsystem/ or patterns/"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gcc_prompt_bundle_integrity() {
+        let required_framing = [
+            "gcc/review-core.md",
+            "gcc/severity.md",
+            "gcc/false-positive-guide.md",
+            "gcc/inline-template.md",
+            "gcc/technical-patterns.md",
+            "gcc/subsystem/subsystem.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing GCC framing file in bundle: {path}"
             );
         }
     }

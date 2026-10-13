@@ -3673,7 +3673,7 @@ fn identify_subsystems(
             }
         }
 
-        // Fallback for known kernel lists if no mapping is provided
+        // Fallback for known mailing lists if no mapping is provided
         if !matched {
             let bare_email = sashiko::email_policy::extract_bare_email(&lower_email);
             if bare_email == "linux-kernel@vger.kernel.org" {
@@ -3681,9 +3681,11 @@ fn identify_subsystems(
             } else if bare_email == "netdev@vger.kernel.org" {
                 subsystems.push(("netdev".to_string(), bare_email));
             } else if let Some((name, domain)) = bare_email.split_once('@')
-                && sashiko::email_router::KNOWN_MAILING_LIST_DOMAINS
+                && (sashiko::email_router::KNOWN_MAILING_LIST_DOMAINS
                     .iter()
                     .any(|&d| d.eq_ignore_ascii_case(domain))
+                    || domain.eq_ignore_ascii_case("gcc.gnu.org")
+                    || domain.eq_ignore_ascii_case("sourceware.org"))
             {
                 subsystems.push((name.to_string(), bare_email));
             }

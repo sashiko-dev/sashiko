@@ -9,6 +9,7 @@ target/
 archives/
 third_party/linux/
 third_party/sashiko/
+third_party/gcc/
 benchmarks/smoke-repo/
 review_trees/
 sashiko.log

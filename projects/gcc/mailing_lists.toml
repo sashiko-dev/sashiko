@@ -1,0 +1,13 @@
+# Per-mailing-list configuration for GCC (--project gcc).
+
+[defaults]
+track = true
+embargo_hours = 0
+reply_to = []
+positive_review = "none"
+mute_all = true
+cc = []
+ignored_emails = []
+
+["gcc-patches@gcc.gnu.org"]
+nntp_group = "inbox.gcc.gcc-patches"

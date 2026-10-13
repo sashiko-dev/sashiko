@@ -1,10 +1,8 @@
 # Stable IPv4 Ingress
 #
-# The address is the one that used to serve bugrepo.sashiko.dev, which
-# sashiko.sashiko.dev already resolves to. A global address can back only one
-# forwarding rule, so the bugrepo Ingress has to be deleted before this one is
-# applied. There is no IPv6 counterpart because the only reserved IPv6 address
-# belongs to the main instance.
+# Both sashiko.sashiko.dev (port 8080) and gcc.sashiko.dev (port 8081) resolve
+# to lb-ipv4-bugrepo (136.110.177.184) and are routed by host header through
+# this shared Ingress in the sashiko-self namespace.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -12,10 +10,31 @@ metadata:
   namespace: sashiko-self
   annotations:
     kubernetes.io/ingress.global-static-ip-name: "lb-ipv4-bugrepo"
-    networking.gke.io/managed-certificates: "sashiko-self-cert"
+    networking.gke.io/managed-certificates: "sashiko-self-cert,sashiko-gcc-cert"
 spec:
   defaultBackend:
     service:
       name: sashiko-self-service
       port:
         number: 8080
+  rules:
+    - host: sashiko.sashiko.dev
+      http:
+        paths:
+          - path: /*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: sashiko-self-service
+                port:
+                  number: 8080
+    - host: gcc.sashiko.dev
+      http:
+        paths:
+          - path: /*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: sashiko-gcc-service
+                port:
+                  number: 8081
