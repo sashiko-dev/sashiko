@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
 use sashiko::auth::LocalToken;
+use sashiko::patch::parse_email;
 use sashiko::project::ProjectId;
 use sashiko::settings::Settings;
 use sashiko::utils::utf8_prefix;
@@ -844,16 +845,18 @@ async fn handle_submit(
 
     let payload = match submission_type {
         SubmitType::Mbox => {
-            let content = if target == "-" {
-                let mut buffer = String::new();
+            let raw_bytes = if target == "-" {
+                let mut buffer = Vec::new();
                 std::io::stdin()
-                    .read_to_string(&mut buffer)
+                    .read_to_end(&mut buffer)
                     .context("Failed to read from stdin")?;
                 buffer
             } else {
-                std::fs::read_to_string(&target)
+                std::fs::read(&target)
                     .with_context(|| format!("Failed to read file {:?}", target))?
             };
+
+            let content = prepare_mbox_payload(raw_bytes)?;
             SubmitRequest::Inject {
                 raw: content,
                 base_commit: baseline,
@@ -902,6 +905,73 @@ async fn handle_submit(
     }
 
     Ok(())
+}
+
+fn prepare_mbox_payload(raw_bytes: Vec<u8>) -> Result<String> {
+    if std::str::from_utf8(&raw_bytes).is_ok() {
+        return Ok(String::from_utf8(raw_bytes)?);
+    }
+
+    let messages = split_mbox(&raw_bytes);
+    let mut content = String::with_capacity(raw_bytes.len());
+
+    for msg in messages {
+        if let Ok(s) = std::str::from_utf8(msg) {
+            // Fast-path: whole mbox is valid UTF-8
+            content.push_str(s);
+        } else {
+            // Slow-path: Check each patch email is valid or not.
+            let (meta, _) = parse_email(msg)
+                .map_err(|e| anyhow::anyhow!("Failed to parse mbox message: {}", e))?;
+            if meta.is_patch_or_cover {
+                return Err(anyhow::anyhow!(
+                    "Cannot submit: patch \"{}\" contains invalid non-UTF-8 bytes. \
+                     Git cannot apply non-UTF-8 diffs. Please re-encode as UTF-8.",
+                    meta.subject
+                ));
+            } else {
+                // Replacement characters (U+FFFD) in reply emails are safe
+                // because they are only stored for review comments and
+                // never applied to git via git am.
+                content.push_str(&String::from_utf8_lossy(msg));
+            }
+        }
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+    }
+    Ok(content)
+}
+
+// Split the message in raw mbox without skipping mbox separator, i.e., "From".
+fn split_mbox(raw: &[u8]) -> Vec<&[u8]> {
+    let mut emails = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        if is_mbox_separator(line) && offset > start {
+            emails.push(&raw[start..offset]);
+            start = offset;
+        }
+        offset += line.len();
+    }
+
+    if offset > start {
+        emails.push(&raw[start..offset]);
+    }
+
+    emails
+}
+
+// Reference from mbox::is_mbox_separator() to have an aligned checking
+fn is_mbox_separator(line: &[u8]) -> bool {
+    if !line.starts_with(b"From ") {
+        return false;
+    }
+    // Mbox separator lines normally contain a timestamp. Requiring an
+    // HH:MM:SS-like value avoids splitting on ordinary body text.
+    line.iter().filter(|&&b| b == b':').count() >= 2
 }
 
 async fn handle_status(client: &Client, base_url: &str, format: OutputFormat) -> Result<()> {
@@ -2710,5 +2780,59 @@ mod tests {
                 ..
             } if input == "HEAD~1..HEAD"
         ));
+    }
+
+    #[test]
+    fn test_prepare_mbox_payload_with_non_utf8_reply_preserves_boundaries() {
+        let mbox_raw = b"From mboxrd@z Thu Jan  1 00:00:00 1970\n\
+Subject: [PATCH 1/2] Test first patch\n\
+Message-ID: <p1@example.com>\n\
+\n\
+diff --git a/f b/f\n\
+--- a/f\n\
++++ b/f\n\
+@@ -1 +1 @@\n\
+-a\n\
+++b\n\
+From mboxrd@z Thu Jan  1 00:00:00 1970\n\
+Subject: Re: [PATCH 1/2] Test first patch\n\
+Message-ID: <r1@example.com>\n\
+\n\
+Reviewed-by: TEST\xe7TEST <test@example.com>\n\
+From mboxrd@z Thu Jan  1 00:00:00 1970\n\
+Subject: [PATCH 2/2] Second patch\n\
+Message-ID: <p2@example.com>\n\
+\n\
+diff --git a/f2 b/f2\n\
+--- a/f2\n\
++++ b/f2\n\
+@@ -1 +1 @@\n\
+-x\n\
+++y\n";
+
+        let result = prepare_mbox_payload(mbox_raw.to_vec()).expect("should succeed");
+        // Verify it contains U+FFFD for the non-UTF-8 reply author
+        assert!(result.contains("TEST\u{FFFD}TEST"));
+
+        // Verify that the server's split_mbox sees all 3 distinct messages
+        let server_msgs = split_mbox(result.as_bytes());
+        assert_eq!(server_msgs.len(), 3);
+    }
+
+    #[test]
+    fn test_prepare_mbox_payload_rejects_non_utf8_patch() {
+        let mbox_raw = b"From mboxrd@z Thu Jan  1 00:00:00 1970\n\
+Subject: [PATCH] Patch with bad byte\n\
+Message-ID: <p1@example.com>\n\
+\n\
+diff --git a/f b/f\n\
+--- a/f\n\
++++ b/f\n\
+@@ -1 +1 @@\n\
+-bad\xe7\n\
+++good\n";
+
+        let err = prepare_mbox_payload(mbox_raw.to_vec()).unwrap_err();
+        assert!(err.to_string().contains("contains invalid non-UTF-8 bytes"));
     }
 }
