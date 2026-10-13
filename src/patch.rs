@@ -353,41 +353,40 @@ pub fn parse_subject_version(subject: &str) -> Option<u32> {
     None
 }
 
-pub fn get_subject_prefixes(subject: &str) -> Vec<String> {
+/// Returns bracketed subject tokens in order, including standard patch tags.
+pub(crate) fn subject_prefix_tokens(subject: &str) -> impl Iterator<Item = &str> {
     static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
     let re = RE_BRACKETS.get_or_init(|| Regex::new(r"\[(.*?)\]").unwrap());
 
-    let mut prefixes = Vec::new();
-
-    for cap in re.captures_iter(subject) {
-        if let Some(content) = cap.get(1) {
-            // Split by whitespace or non-word characters.
-            // "PATCH net-next 1/2" -> "PATCH", "net-next", "1/2"
-            // "PATCH,net-next,1/2" -> "PATCH", "net-next", "1/2"
-            let tokens: Vec<&str> = content
+    re.captures_iter(subject)
+        .filter_map(|cap| cap.get(1))
+        .flat_map(|content| {
+            content
                 .as_str()
                 .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '_')
-                .filter(|s| !s.is_empty())
-                .collect();
+        })
+        .filter(|token| !token.is_empty())
+}
 
-            for token in tokens {
-                let lower = token.to_lowercase();
-                // Ignore standard tags
-                if lower == "patch" || lower == "rfc" || lower == "resend" {
-                    continue;
-                }
-                // Ignore versions (v2, v10)
-                if lower.starts_with('v') && lower[1..].chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
-                // Ignore pure numbers (often part of 1/2 or just garbage)
-                if token.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
+pub fn get_subject_prefixes(subject: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
 
-                prefixes.push(token.to_string());
-            }
+    for token in subject_prefix_tokens(subject) {
+        let lower = token.to_lowercase();
+        // Ignore standard tags
+        if lower == "patch" || lower == "rfc" || lower == "resend" {
+            continue;
         }
+        // Ignore versions (v2, v10)
+        if lower.starts_with('v') && lower[1..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        // Ignore pure numbers (often part of 1/2 or just garbage)
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        prefixes.push(token.to_string());
     }
     prefixes.sort();
     prefixes.dedup();
@@ -862,6 +861,33 @@ Body";
         let (index, total) = parse_subject_index(subject);
         assert_eq!(index, 1);
         assert_eq!(total, 1); // Should be 1/1, NOT 508/512
+    }
+
+    #[test]
+    fn test_subject_prefix_tokens_preserve_order() {
+        let subject = "Re: [RESEND PATCH v2][STABLE V6.6-v6.1][net-next,bpf,net-next,1/2] \
+                       fix stable USB 3.0";
+        assert_eq!(
+            subject_prefix_tokens(subject).collect::<Vec<_>>(),
+            [
+                "RESEND",
+                "PATCH",
+                "v2",
+                "STABLE",
+                "V6.6-v6.1",
+                "net-next",
+                "bpf",
+                "net-next",
+                "1",
+                "2"
+            ]
+        );
+        assert_eq!(
+            get_subject_prefixes(subject),
+            ["STABLE", "V6.6-v6.1", "bpf", "net-next"]
+        );
+        assert!(subject_prefix_tokens("STABLE v6.6").next().is_none());
+        assert!(subject_prefix_tokens("[STABLE v6.6").next().is_none());
     }
 
     #[test]

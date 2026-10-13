@@ -379,18 +379,7 @@ impl BaselineRegistry {
         }
 
         // 1.5 Version Tag from Subject
-        if let Some(version) = extract_version_tag(subject) {
-            let base_version = version.strip_suffix(".y").unwrap_or(&version);
-            if version.ends_with(".y") || is_stable_series_prefix(subject, &version) {
-                candidates.push(BaselineResolution::RemoteTarget {
-                    url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
-                        .to_string(),
-                    name: "stable".to_string(),
-                    branch: Some(format!("linux-{}.y", base_version)),
-                });
-            }
-            candidates.push(BaselineResolution::LocalRef(format!("v{}", base_version)));
-        }
+        candidates.extend(subject_version_candidates(subject));
 
         // 2. Subsystem Heuristic
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
@@ -760,22 +749,69 @@ pub fn extract_version_tag(subject: &str) -> Option<String> {
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
 }
 
-fn is_stable_series_prefix(subject: &str, version: &str) -> bool {
-    let Some((major, minor)) = version.split_once('.') else {
-        return false;
-    };
-    if ![major, minor]
-        .iter()
-        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+fn subject_version_candidates(subject: &str) -> Vec<BaselineResolution> {
+    let version = extract_version_tag(subject);
+    let stable_versions = explicit_stable_versions(subject).or_else(|| {
+        let version = version.as_deref()?;
+        (version.ends_with(".y") || is_stable_series_prefix(subject, version))
+            .then(|| (version.strip_suffix(".y").unwrap_or(version), None))
+    });
+    let mut candidates = Vec::new();
+    if let Some((first, last)) = stable_versions {
+        for version in std::iter::once(first).chain(last) {
+            candidates.push(BaselineResolution::RemoteTarget {
+                url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git".to_string(),
+                name: "stable".to_string(),
+                branch: Some(format!("linux-{version}.y")),
+            });
+        }
+    }
+    if let Some(version) = version {
+        let version = version.strip_suffix(".y").unwrap_or(&version);
+        candidates.push(BaselineResolution::LocalRef(format!("v{version}")));
+    }
+    candidates
+}
+
+fn explicit_stable_versions(subject: &str) -> Option<(&str, Option<&str>)> {
+    if !crate::patch::subject_prefix_tokens(subject)
+        .any(|token| token.eq_ignore_ascii_case("stable"))
     {
-        return false;
+        return None;
     }
 
+    // Only the first complete token supplies hints, with at most two named
+    // endpoints. Expanding a numeric range would invent unrequested branches.
+    crate::patch::subject_prefix_tokens(subject).find_map(|token| {
+        if let Some((first, last)) = token.split_once('-') {
+            Some((
+                stable_series_version(first)?,
+                Some(stable_series_version(last)?),
+            ))
+        } else {
+            Some((stable_series_version(token)?, None))
+        }
+    })
+}
+
+fn stable_series_version(token: &str) -> Option<&str> {
+    let version = token.strip_prefix(['v', 'V']).unwrap_or(token);
+    let version = version
+        .strip_suffix(".y")
+        .or_else(|| version.strip_suffix(".Y"))
+        .unwrap_or(version);
+    let (major, minor) = version.split_once('.')?;
+    [major, minor]
+        .iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(version)
+}
+
+fn is_stable_series_prefix(subject: &str, version: &str) -> bool {
     // A bare X.Y prefix names a backport series, unlike an exact vX.Y tag
     // or a hardware/protocol version mentioned in the subject text.
-    crate::patch::get_subject_prefixes(subject)
-        .iter()
-        .any(|prefix| prefix == version)
+    stable_series_version(version) == Some(version)
+        && crate::patch::subject_prefix_tokens(subject).any(|prefix| prefix == version)
 }
 
 #[cfg(test)]
@@ -883,6 +919,18 @@ mod tests {
             ("[PATCH v5.10.y] net: fix", "5.10"),
             ("[PATCH 5.10.Y] net: fix", "5.10"),
             ("[PATCH 6.18 000/430] 6.18.3-rc1 review", "6.18"),
+            ("[STABLE v6.6 1/5] net: fix", "6.6"),
+            ("[STABLE v6.12 0/4] net: fixes", "6.12"),
+            ("[STABLE v6.18 1/4] net: fix", "6.18"),
+            ("[PATCH STABLE V6.6] net: fix", "6.6"),
+            ("[stable v6.6] net: fix", "6.6"),
+            ("[STABLE 6.6] net: fix", "6.6"),
+            ("[STABLE v6.6.Y] net: fix", "6.6"),
+            ("[RESEND PATCH v2][STABLE][v6.6] net: fix", "6.6"),
+            ("[PATCH,STABLE,v6.6,1/2] net: fix", "6.6"),
+            ("[v6.6][STABLE] net: fix", "6.6"),
+            ("[STABLE v6.6 v6.1] net: fix", "6.6"),
+            ("[STABLE v6.6-v6.6] net: fix", "6.6"),
         ] {
             for body in [None, Some(body)] {
                 let mut expected = Vec::new();
@@ -892,16 +940,93 @@ mod tests {
                     ));
                 }
                 expected.extend([
-                    BaselineResolution::RemoteTarget {
-                        url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
-                            .to_string(),
-                        name: "stable".to_string(),
-                        branch: Some(format!("linux-{version}.y")),
-                    },
+                    stable_branch(version),
                     BaselineResolution::LocalRef(format!("v{version}")),
                 ]);
                 expected.extend(fallback.clone());
 
+                assert_eq!(
+                    registry.resolve_candidates(&files, subject, body).await,
+                    expected,
+                    "{subject}, body: {body:?}"
+                );
+            }
+        }
+    }
+
+    fn stable_branch(version: &str) -> BaselineResolution {
+        BaselineResolution::RemoteTarget {
+            url: "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git".to_string(),
+            name: "stable".to_string(),
+            branch: Some(format!("linux-{version}.y")),
+        }
+    }
+
+    #[test]
+    fn test_stable_series_version_requires_complete_ascii_version() {
+        for token in ["6.6", "v6.6", "V6.6", "6.6.y", "v6.6.Y"] {
+            assert_eq!(stable_series_version(token), Some("6.6"), "{token}");
+        }
+        for token in [
+            "",
+            "6",
+            "6.",
+            ".6",
+            "v",
+            "v6",
+            "6.6.1",
+            "6.6-rc1",
+            "6.6-custom",
+            "6.6.y.y",
+            "vv6.6",
+            "6.６",
+            "６.6",
+            "-6.6",
+            "6.6_foo",
+        ] {
+            assert_eq!(stable_series_version(token), None, "{token}");
+        }
+        assert_eq!(
+            explicit_stable_versions("[STABLE v999999999999999999999999.1-v6.6]"),
+            Some(("999999999999999999999999.1", Some("6.6")))
+        );
+        assert_eq!(explicit_stable_versions("[STABLE v6.6.Y-invalid]"), None);
+        assert_eq!(explicit_stable_versions("[STABLE]"), None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stable_ranges() {
+        let registry = create_registry();
+        let files = vec!["net/core.c".to_string()];
+        let fallback = registry
+            .resolve_candidates(&files, "[PATCH] fix", None)
+            .await;
+        let body = "base-commit: 1234567890123456789012345678901234567890\n";
+
+        for (subject, first, last) in [
+            ("[STABLE v6.6-v6.1 1/2] net: fix", "6.6", "6.1"),
+            ("[STABLE v5.15-v5.10 0/2] net: fixes", "5.15", "5.10"),
+            ("[STABLE v6.1-v6.6] net: fix", "6.1", "6.6"),
+            ("[STABLE v6.1-v5.15] net: fix", "6.1", "5.15"),
+            ("[STABLE 6.6-6.1] net: fix", "6.6", "6.1"),
+            ("[STABLE v6.6-6.1] net: fix", "6.6", "6.1"),
+            ("[STABLE V6.6.Y-V6.1.Y] net: fix", "6.6", "6.1"),
+            ("[PATCH v2][stable][v6.6-v6.1] net: fix", "6.6", "6.1"),
+            ("[STABLE v6.6-v6.1 v5.15-v5.10] net: fix", "6.6", "6.1"),
+        ] {
+            for body in [None, Some(body)] {
+                let mut expected = Vec::new();
+                if body.is_some() {
+                    expected.push(BaselineResolution::Commit(
+                        CommitId::parse("1234567890123456789012345678901234567890").unwrap(),
+                    ));
+                }
+                expected.extend([
+                    stable_branch(first),
+                    stable_branch(last),
+                    BaselineResolution::LocalRef(format!("v{first}")),
+                ]);
+                expected.extend(fallback.clone());
                 assert_eq!(
                     registry.resolve_candidates(&files, subject, body).await,
                     expected,
@@ -931,6 +1056,26 @@ mod tests {
             ("[PATCH device-5.10] net: fix", "5.10"),
             ("[PATCH 5.10-custom] net: fix", "5.10"),
             ("[PATCH 5.10.1.2] net: fix", "5.10.1"),
+            ("[STABLE v6.6.10] net: fix", "6.6.10"),
+            ("[STABLE 6.6.10] net: fix", "6.6.10"),
+            ("[STABLE v6.6-rc1] net: fix", "6.6-rc1"),
+            ("[STABLE 6.6-rc1] net: fix", "6.6-rc1"),
+            ("[PATCH v6.6-v6.1] net: fix", "6.6"),
+            ("[PATCH v6.6] stable: fix", "6.6"),
+            ("[PATCH stable-next v6.6] net: fix", "6.6"),
+            ("[PATCH unstable v6.6] net: fix", "6.6"),
+            ("[STABLE] net: fix USB 3.0", "3.0"),
+            ("[STABLE device-v6.6] net: fix", "6.6"),
+            ("[STABLE v6.6-custom] net: fix", "6.6"),
+            ("[STABLE v6.6-] net: fix", "6.6"),
+            ("[STABLE -v6.6] net: fix", "6.6"),
+            ("[STABLE v6.6--v6.1] net: fix", "6.6"),
+            ("[STABLE v6.6-v6.1-v5.15] net: fix", "6.6"),
+            ("[STABLE v6.6-v6.1.10] net: fix", "6.6"),
+            ("[STABLE v6.6.10-v6.1] net: fix", "6.6.10"),
+            ("[STABLE v6.6-v6.1-rc1] net: fix", "6.6"),
+            ("[STABLE v6.6-rc1-v6.1] net: fix", "6.6-rc1"),
+            ("[STABLE v6.6-v6.1_custom] net: fix", "6.6"),
         ] {
             let mut expected = vec![BaselineResolution::LocalRef(format!("v{version}"))];
             expected.extend(fallback.clone());
