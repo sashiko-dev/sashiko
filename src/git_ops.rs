@@ -67,26 +67,40 @@ impl GitWorktree {
         commit_hash: &str,
         parent_dir: Option<&Path>,
     ) -> Result<Self> {
-        let temp_dir = if let Some(parent) = parent_dir {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
+        let parent_owned = parent_dir.map(|p| p.to_path_buf());
+        let temp_dir = tokio::task::spawn_blocking(move || -> Result<TempDir> {
+            if let Some(parent) = parent_owned {
+                if !parent.exists() {
+                    std::fs::create_dir_all(&parent)?;
+                }
+                Ok(tempfile::Builder::new()
+                    .prefix("sashiko-worktree-")
+                    .tempdir_in(parent)?)
+            } else {
+                Ok(TempDir::new()?)
             }
-            tempfile::Builder::new()
-                .prefix("sashiko-worktree-")
-                .tempdir_in(parent)?
-        } else {
-            TempDir::new()?
-        };
+        })
+        .await??;
         let path = temp_dir.path().to_path_buf();
+        // Wrap temp_dir in GitWorktree before the first await after creation so
+        // any error or cancellation during setup offloads TempDir cleanup (and
+        // worktree unregistration once registered) via Drop::drop.
+        let mut worktree = Self {
+            dir: Some(temp_dir),
+            path: path.clone(),
+            repo_path: repo_path.to_path_buf(),
+            is_managed: false,
+        };
 
         info!("Creating worktree at {:?}", path);
 
         // Split worktree creation into two phases:
         // 1) metadata update (under lock, fast)
         // 2) file checkout (no lock, parallelizable)
-        let output = {
+        let add_res = {
             let lock = get_worktree_lock();
             let _guard = lock.lock().await;
+            worktree.is_managed = true;
             crate::git_cmd::in_dir_async(repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("worktree")
@@ -96,35 +110,70 @@ impl GitWorktree {
                 .arg(&path)
                 .arg(commit_hash)
                 .output()
-                .await?
+                .await
+        };
+
+        let output = match add_res {
+            Ok(out) => out,
+            Err(e) => {
+                if let Err(cleanup_err) = worktree.remove().await {
+                    warn!(
+                        "Failed to clean up worktree {:?} after worktree add I/O error: {}",
+                        path, cleanup_err
+                    );
+                }
+                return Err(e.into());
+            }
         };
 
         if !output.status.success() {
-            return Err(anyhow!(
+            worktree.is_managed = false;
+            let err = anyhow!(
                 "Failed to create worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            );
+            if let Err(cleanup_err) = worktree.remove().await {
+                warn!(
+                    "Failed to clean up worktree {:?} after failed add: {}",
+                    path, cleanup_err
+                );
+            }
+            return Err(err);
         }
 
-        let output = crate::git_cmd::in_dir_async(&path)
+        let output = match crate::git_cmd::in_dir_async(&path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["reset", "--hard", commit_hash])
             .output()
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                if let Err(cleanup_err) = worktree.remove().await {
+                    warn!(
+                        "Failed to clean up worktree {:?} after reset I/O error: {}",
+                        path, cleanup_err
+                    );
+                }
+                return Err(e.into());
+            }
+        };
 
         if !output.status.success() {
-            return Err(anyhow!(
+            let err = anyhow!(
                 "Failed to populate worktree: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            );
+            if let Err(cleanup_err) = worktree.remove().await {
+                warn!(
+                    "Failed to clean up worktree {:?} after failed reset: {}",
+                    path, cleanup_err
+                );
+            }
+            return Err(err);
         }
 
-        Ok(Self {
-            dir: Some(temp_dir),
-            path,
-            repo_path: repo_path.to_path_buf(),
-            is_managed: true,
-        })
+        Ok(worktree)
     }
 
     pub async fn new_scratch_clone(
@@ -132,23 +181,35 @@ impl GitWorktree {
         commit_hash: &str,
         parent_dir: Option<&Path>,
     ) -> Result<Self> {
-        let temp_dir = if let Some(parent) = parent_dir {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
+        let parent_owned = parent_dir.map(|p| p.to_path_buf());
+        let temp_dir = tokio::task::spawn_blocking(move || -> Result<TempDir> {
+            if let Some(parent) = parent_owned {
+                if !parent.exists() {
+                    std::fs::create_dir_all(&parent)?;
+                }
+                Ok(tempfile::Builder::new()
+                    .prefix("sashiko-review-")
+                    .tempdir_in(parent)?)
+            } else {
+                Ok(tempfile::Builder::new()
+                    .prefix("sashiko-review-")
+                    .tempdir()?)
             }
-            tempfile::Builder::new()
-                .prefix("sashiko-review-")
-                .tempdir_in(parent)?
-        } else {
-            tempfile::Builder::new()
-                .prefix("sashiko-review-")
-                .tempdir()?
-        };
+        })
+        .await??;
         let path = temp_dir.path().to_path_buf();
+        // Wrap temp_dir in GitWorktree immediately so any error or cancellation
+        // during clone or checkout offloads TempDir removal via remove/Drop.
+        let worktree = Self {
+            dir: Some(temp_dir),
+            path: path.clone(),
+            repo_path: repo_path.to_path_buf(),
+            is_managed: false,
+        };
 
         info!("Creating scratch clone at {:?}", path);
 
-        let output = crate::git_cmd::detached_async()
+        let output = match crate::git_cmd::detached_async()
             .args(["-c", "safe.bareRepository=all"])
             .arg("clone")
             .arg("--shared")
@@ -156,34 +217,67 @@ impl GitWorktree {
             .arg(repo_path)
             .arg(&path)
             .output()
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                if let Err(cleanup_err) = worktree.remove().await {
+                    warn!(
+                        "Failed to clean up scratch clone {:?} after clone I/O error: {}",
+                        path, cleanup_err
+                    );
+                }
+                return Err(e.into());
+            }
+        };
 
         if !output.status.success() {
-            return Err(anyhow!(
+            let err = anyhow!(
                 "Failed to create scratch clone: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            );
+            if let Err(cleanup_err) = worktree.remove().await {
+                warn!(
+                    "Failed to clean up scratch clone {:?} after failed clone: {}",
+                    path, cleanup_err
+                );
+            }
+            return Err(err);
         }
 
-        let output = crate::git_cmd::in_dir_async(&path)
+        let output = match crate::git_cmd::in_dir_async(&path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["reset", "--hard", commit_hash])
             .output()
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                if let Err(cleanup_err) = worktree.remove().await {
+                    warn!(
+                        "Failed to clean up scratch clone {:?} after reset I/O error: {}",
+                        path, cleanup_err
+                    );
+                }
+                return Err(e.into());
+            }
+        };
 
         if !output.status.success() {
-            return Err(anyhow!(
+            let err = anyhow!(
                 "Failed to populate scratch clone: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            );
+            if let Err(cleanup_err) = worktree.remove().await {
+                warn!(
+                    "Failed to clean up scratch clone {:?} after failed reset: {}",
+                    path, cleanup_err
+                );
+            }
+            return Err(err);
         }
 
-        Ok(Self {
-            dir: Some(temp_dir),
-            path,
-            repo_path: repo_path.to_path_buf(),
-            is_managed: false,
-        })
+        Ok(worktree)
     }
 
     #[allow(dead_code)]
@@ -324,31 +418,49 @@ impl GitWorktree {
 
     #[allow(dead_code)]
     pub async fn remove(mut self) -> Result<()> {
-        if !self.is_managed {
-            return Ok(());
-        }
-        info!("Removing worktree at {:?}", self.path);
+        if self.is_managed {
+            info!("Removing worktree at {:?}", self.path);
 
-        let output = {
-            let lock = get_worktree_lock();
-            let _guard = lock.lock().await;
-            crate::git_cmd::in_dir_async(&self.repo_path)
-                .args(["-c", "safe.bareRepository=all"])
-                .arg("worktree")
-                .arg("remove")
-                .arg("-f")
-                .arg(&self.path)
-                .output()
-                .await?
-        };
+            let output = {
+                let lock = get_worktree_lock();
+                let _guard = lock.lock().await;
+                crate::git_cmd::in_dir_async(&self.repo_path)
+                    .args(["-c", "safe.bareRepository=all"])
+                    .arg("worktree")
+                    .arg("remove")
+                    .arg("-f")
+                    .arg(&self.path)
+                    .output()
+                    .await?
+            };
 
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Failed to remove worktree: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "Failed to remove worktree: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            self.is_managed = false;
         }
-        self.is_managed = false;
+        if let Some(dir) = self.dir.take() {
+            let path = self.path.clone();
+            match tokio::task::spawn_blocking(move || dir.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(Err(e)) => {
+                    warn!(
+                        "Failed to remove temporary worktree directory {:?}: {}",
+                        path, e
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Blocking task removing temporary worktree directory {:?} failed: {}",
+                        path, e
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -825,12 +937,41 @@ pub async fn check_disk_usage(path: &Path) -> Result<String> {
 }
 
 impl Drop for GitWorktree {
+    /// Runs when a worktree or scratch clone is dropped. If `remove()` was
+    /// not called on a managed worktree (`is_managed` is true), logs a
+    /// warning and leaves the `$GIT_DIR/worktrees` entry for
+    /// `prune_worktrees` at the next start, since `git worktree remove` is
+    /// async and cannot run here. Whenever `self.dir` is still `Some`
+    /// (either a managed worktree dropped without `remove()` or an
+    /// unmanaged `new_scratch_clone` whose `TempDir` owns a full checkout),
+    /// `dir.close()` is offloaded to `spawn_blocking` so `remove_dir_all`
+    /// never blocks an async worker thread and any filesystem cleanup error
+    /// is logged.
     fn drop(&mut self) {
         if self.is_managed {
             warn!(
                 "Dropping worktree at {:?}. Use explicit .remove() for clean git state.",
                 self.path
             );
+        }
+        if let Some(dir) = self.dir.take() {
+            let path = self.path.clone();
+            let close_dir = move || {
+                if let Err(e) = dir.close()
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(
+                        "Failed to remove temporary worktree directory {:?} on drop: {}",
+                        path, e
+                    );
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn_blocking(close_dir);
+                }
+                Err(_) => close_dir(),
+            }
         }
     }
 }

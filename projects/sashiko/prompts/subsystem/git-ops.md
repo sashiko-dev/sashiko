@@ -22,10 +22,29 @@ space.
     instance and a `sashiko` instance) *must never* share the same
     `review.worktree_dir`. Starting the second instance would delete active
     worktrees out from under running reviews in the first instance.
-- **Drop & Prune**: `GitWorktree` cleans up its directory on `Drop` when
-  `is_managed` is true, and `prune_worktrees` removes stale administrative
-  entries in `$GIT_DIR/worktrees`. Any early error return during worktree setup
-  must ensure the temporary directory and git worktree registration are cleaned up.
+- **Drop & Prune**: `GitWorktree` owns its directory through a
+  `tempfile::TempDir` (`dir: Option<TempDir>`), whose `Drop` runs
+  `remove_dir_all` on the directory. The on-disk worktree directory is
+  therefore reclaimed on every exit path, including an early `return`, a
+  panic that unwinds the task, or a dropped/cancelled Tokio future.
+  `impl Drop for GitWorktree` (and `GitWorktree::remove`) takes `self.dir`
+  for both managed worktrees and unmanaged `new_scratch_clone` instances and
+  offloads `dir.close()` to `spawn_blocking` when a runtime is available
+  (logging a warning on any non-`NotFound` `std::io::Error`), so the
+  recursive delete of a Linux-sized tree never blocks the async worker that
+  dropped the future; `Drop` cannot run the async `git worktree remove`, so
+  what a dropped managed worktree leaves behind is the administrative entry
+  under `$GIT_DIR/worktrees/<name>`, which `prune_worktrees` removes at
+  daemon startup. Do NOT report a "leaked
+  worktree directory on panic or cancellation" finding against callers of
+  `GitWorktree::new`/`new_scratch_clone` unless the diff removes or bypasses
+  the `TempDir` ownership (for example by calling `TempDir::keep` or
+  `disable_cleanup`, or by constructing the worktree with
+  `GitWorktree::from_path`). Explicit `.remove().await` calls on error paths
+  are preferred so the git registration is cleaned up eagerly, but their
+  absence on a panic/cancellation path is a stale `$GIT_DIR/worktrees` entry,
+  not a disk-space leak. Any early error return during worktree setup must
+  still ensure the git worktree registration is cleaned up.
 
 ## 2. Git Protocol Restrictions (`GIT_PROTOCOL_RESTRICTIONS`)
 
