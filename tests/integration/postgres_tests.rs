@@ -30,16 +30,44 @@ async fn postgres_daemon_storage_roundtrip() -> Result<()> {
     let db = Database::configured(&configured).await?;
     let result = std::panic::AssertUnwindSafe(async {
         exercise_daemon(&db).await?;
-        exercise_connection_recovery(&db, &configured.storage).await
+        exercise_connection_recovery(&db, &configured.storage).await?;
+        exercise_schema_isolation(&db, &configured.storage).await
     })
     .catch_unwind()
     .await;
-    db.execute_batch(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-        .await?;
+    db.execute_batch(&format!(
+        "DROP SCHEMA IF EXISTS \"{schema}_independent\" CASCADE;
+        DROP SCHEMA \"{schema}\" CASCADE"
+    ))
+    .await?;
     match result {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+async fn exercise_schema_isolation(db: &Database, settings: &StorageSettings) -> Result<()> {
+    let mut settings = settings.clone();
+    settings.postgres_schema.push_str("_independent");
+    let independent = Database::postgres(&settings).await?;
+    let tx = db.begin_transaction().await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        independent.conn.query("SELECT 1", ()),
+    )
+    .await
+    .context("a transaction blocked an independent schema")??;
+    tx.rollback().await?;
+    let guard = db.lock_bug_dedup().await?;
+    let independent_guard = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        independent.lock_bug_dedup(),
+    )
+    .await
+    .context("deduplication blocked an independent schema")??;
+    drop(independent_guard);
+    drop(guard);
+    Ok(())
 }
 
 async fn postgres_control(settings: &StorageSettings) -> Result<tokio_postgres::Client> {
@@ -320,6 +348,12 @@ async fn postgres_shared_catalog_between_instances() -> Result<()> {
         .ensure_project_stamp(sashiko::project::ProjectId::Sashiko)
         .await?;
     let mut second_settings = settings.clone();
+    let mut url = reqwest::Url::parse(second_settings.storage.postgres_url.as_deref().unwrap())?;
+    url.query_pairs_mut().append_pair(
+        "application_name",
+        &format!("{}_mirror", settings.storage.postgres_schema),
+    );
+    second_settings.storage.postgres_url = Some(url.into());
     second_settings.database.url = directory
         .path()
         .join("second.db")
@@ -482,7 +516,8 @@ async fn assert_shared_lock_exclusion(
     let guard = first.lock_bug_dedup().await?.context("held dedup guard")?;
     let pid = backend_pid(&guard).await?;
     let control = postgres_control(settings).await?;
-    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&pid];
+    let second_name = format!("{}_mirror", settings.postgres_schema);
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&pid, &second_name];
     let waiter = second.lock_bug_dedup();
     tokio::pin!(waiter);
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -497,7 +532,9 @@ async fn assert_shared_lock_exclusion(
                        SELECT 1 FROM pg_catalog.pg_locks held
                        JOIN pg_catalog.pg_locks waiting
                          USING (locktype,database,classid,objid,objsubid)
+                       JOIN pg_catalog.pg_stat_activity client ON client.pid=waiting.pid
                        WHERE held.pid=$1 AND held.locktype='advisory'
+                         AND client.application_name=$2
                          AND held.granted AND NOT waiting.granted)", &params,
                 ) => {
                     if row?.get::<_, bool>(0) {

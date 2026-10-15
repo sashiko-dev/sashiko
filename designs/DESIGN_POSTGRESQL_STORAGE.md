@@ -70,8 +70,8 @@ Canonical bug deduplication also takes a PostgreSQL session lock across
 the candidate check and final write. Keep a single database
 transaction for operations that currently depend on SQLite atomicity.
 
-The first implementation serializes reads and writes with a database-wide
-advisory lock. Explicit transactions use dedicated connections; ordinary
+The first implementation serializes reads and writes with an advisory lock for
+the configured schema. Explicit transactions use dedicated connections; ordinary
 sessions reconnect before a later operation after connection loss, without
 replaying failed writes. Transaction and deduplication sessions retain their
 connection identity and fail when that session is lost. Query results are

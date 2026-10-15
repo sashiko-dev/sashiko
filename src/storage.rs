@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 
-const WRITE_LOCK: i64 = 0x53415348494b4f;
+const WRITE_LOCK: i32 = 0x53415348;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -115,7 +115,10 @@ impl Connection {
                 .client
                 .lock()
                 .await
-                .query_one("SELECT pg_advisory_lock($1)", &[&(WRITE_LOCK + 1)])
+                .query_one(
+                    "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtext($1),$2)",
+                    &[&connection.config.schema, &(WRITE_LOCK + 1)],
+                )
                 .await?;
         }
         Ok(Some(conn))
@@ -150,8 +153,7 @@ impl Connection {
         let schema = format!("\"{}\"", config.schema);
         if !transaction {
             let tx = client.transaction().await?;
-            tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&WRITE_LOCK])
-                .await?;
+            pg_write_lock(&tx, &config.schema).await?;
             let exists: bool = tx
                 .query_one(
                     "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1)",
@@ -169,9 +171,7 @@ impl Connection {
             .await?;
         if transaction {
             client.batch_execute("BEGIN").await?;
-            client
-                .query_one("SELECT pg_advisory_xact_lock($1)", &[&WRITE_LOCK])
-                .await?;
+            pg_write_lock(&client, &config.schema).await?;
         }
         Ok(Self(Backend::Postgres(Arc::new(PgConnection {
             client: Mutex::new(client),
@@ -192,8 +192,7 @@ impl Connection {
                     pg_query(&*client, &sql, params).await?
                 } else {
                     let tx = client.transaction().await?;
-                    tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&WRITE_LOCK])
-                        .await?;
+                    pg_write_lock(&tx, &conn.config.schema).await?;
                     let values = pg_query(&tx, &sql, params).await?;
                     tx.commit().await?;
                     values
@@ -226,8 +225,7 @@ impl Connection {
                     pg_execute(&*client, &sql, params).await
                 } else {
                     let tx = client.transaction().await?;
-                    tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&WRITE_LOCK])
-                        .await?;
+                    pg_write_lock(&tx, &conn.config.schema).await?;
                     let count = pg_execute(&tx, &sql, params).await?;
                     tx.commit().await?;
                     Ok(count)
@@ -247,8 +245,7 @@ impl Connection {
                     client.batch_execute(sql).await?;
                 } else {
                     let tx = client.transaction().await?;
-                    tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&WRITE_LOCK])
-                        .await?;
+                    pg_write_lock(&tx, &conn.config.schema).await?;
                     tx.batch_execute(sql).await?;
                     tx.commit().await?;
                 }
@@ -484,6 +481,16 @@ async fn pg_query(
                 .map(Row::Postgres)
         })
         .collect()
+}
+
+async fn pg_write_lock(client: &impl tokio_postgres::GenericClient, schema: &str) -> Result<()> {
+    client
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext($1),$2)",
+            &[&schema, &WRITE_LOCK],
+        )
+        .await?;
+    Ok(())
 }
 
 async fn pg_execute(

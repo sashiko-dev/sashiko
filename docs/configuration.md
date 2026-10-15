@@ -107,9 +107,9 @@ enabled = true
 Set the PostgreSQL URL through deployment secrets in either configuration.
 An existing libSQL database is not automatically moved when selecting full
 PostgreSQL storage. Full mode creates an independent database schema.
-The initial backend serializes database operations with a database-wide
-advisory lock and uses dedicated sessions for explicit transactions. Select it
-with that execution model in mind when sizing a deployment.
+The initial backend serializes database operations with an advisory lock for
+the configured schema and uses dedicated sessions for explicit transactions.
+Select it with that execution model in mind when sizing a deployment.
 
 In shared catalog mode, each local database has a stable instance identity
 and a local bug mirror. Changes enter a durable outbox in the same transaction
