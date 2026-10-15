@@ -48,6 +48,64 @@ impl SharedCatalog {
 #[error("Shared bug catalog is unavailable")]
 struct SharedCatalogUnavailable;
 
+fn retryable_postgres_error(error: &tokio_postgres::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    error.is_closed()
+        || error.code().is_some_and(|code| {
+            code.code().starts_with("08")
+                || [
+                    SqlState::ADMIN_SHUTDOWN,
+                    SqlState::CRASH_SHUTDOWN,
+                    SqlState::CANNOT_CONNECT_NOW,
+                    SqlState::QUERY_CANCELED,
+                    SqlState::TOO_MANY_CONNECTIONS,
+                    SqlState::T_R_SERIALIZATION_FAILURE,
+                    SqlState::T_R_DEADLOCK_DETECTED,
+                ]
+                .contains(code)
+        })
+}
+
+fn catalog_error(error: anyhow::Error) -> anyhow::Error {
+    let retryable = error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<crate::storage::Error>() {
+            match error {
+                crate::storage::Error::Canceled => return true,
+                crate::storage::Error::Postgres(error) => return retryable_postgres_error(error),
+                _ => {}
+            }
+        }
+        if let Some(error) = cause.downcast_ref::<tokio_postgres::Error>()
+            && retryable_postgres_error(error)
+        {
+            return true;
+        }
+        if cause.is::<tokio::time::error::Elapsed>() {
+            return true;
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NetworkDown
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::HostUnreachable
+            )
+        })
+    });
+    if retryable {
+        error.context(SharedCatalogUnavailable)
+    } else {
+        error
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Record {
     bugid: String,
@@ -206,7 +264,7 @@ impl Database {
                 Ok::<_, anyhow::Error>(guard)
             }
             .await
-            .context(SharedCatalogUnavailable)
+            .map_err(catalog_error)
         } else {
             self.conn.dedup_lock().await
         }
@@ -1081,7 +1139,11 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_failure_defers_claim_without_spending_attempts() -> Result<()> {
-        let db = local_mirror().await?;
+        let mut db = local_mirror().await?;
+        Arc::get_mut(db.shared.as_mut().context("shared mode")?)
+            .context("exclusive test configuration")?
+            .settings
+            .postgres_url = Some("postgresql://test@127.0.0.1:1/unavailable".into());
         let bug: NewBug = serde_json::from_value(json!({
             "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()), "title": "catalog unavailable"
         }))?;
@@ -1113,6 +1175,32 @@ mod tests {
             .query("SELECT attempt_count FROM bugs WHERE id=?", [id])
             .await?;
         assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_configuration_errors_are_not_refunded_as_outages() -> Result<()> {
+        let db = local_mirror().await?;
+        let error = db
+            .lock_bug_dedup()
+            .await
+            .err()
+            .context("missing configuration")?;
+        assert!(!Database::is_shared_catalog_failure(&error));
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(Database::is_shared_catalog_failure(&catalog_error(
+                std::io::Error::from(kind).into()
+            )));
+        }
+        assert!(!Database::is_shared_catalog_failure(&catalog_error(
+            anyhow::anyhow!("Unsupported shared catalog format")
+        )));
+        assert!(!Database::is_shared_catalog_failure(&catalog_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound).into()
+        )));
         Ok(())
     }
 
