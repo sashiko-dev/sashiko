@@ -100,11 +100,14 @@ impl Connection {
     async fn connect_postgres(config: PgConfig, transaction: bool) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !config.schema.is_empty()
+                && config.schema.len() <= 63
+                && !config.schema.starts_with("pg_")
+                && config.schema != "information_schema"
                 && config
                     .schema
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-            "PostgreSQL schema must contain only letters, digits, and underscores"
+            "PostgreSQL schema must be a non-system name of 1 to 63 letters, digits, or underscores"
         );
         let mut options: tokio_postgres::Config = config.url.parse()?;
         options.connect_timeout(std::time::Duration::from_secs(10));

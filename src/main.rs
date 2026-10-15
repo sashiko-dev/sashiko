@@ -1152,6 +1152,20 @@ async fn run_daemon(
         None
     };
 
+    let shared_bug_sync_handle = if db.has_shared_bug_catalog() {
+        let shared_db = db.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                if let Err(error) = shared_db.sync_shared_bugs().await {
+                    warn!("Shared bug catalog synchronization will retry: {error:#}");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }))
+    } else {
+        None
+    };
+
     let bug_worker_handle = if settings.linux_bug.enabled {
         let provider =
             sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
@@ -1335,6 +1349,9 @@ async fn run_daemon(
         h.abort();
     }
     if let Some(h) = bug_worker_handle {
+        h.abort();
+    }
+    if let Some(h) = shared_bug_sync_handle {
         h.abort();
     }
     compressor_handle.abort();

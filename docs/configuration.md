@@ -16,7 +16,7 @@ Every command reads one file, the first of `--settings`, `$SASHIKO_CONFIG`,
 
 The daemon and `sashiko review` read the same shape, so one file serves both.
 `[database]`, `[server]`, and `[git]` are optional, since a local review has
-none of them; the daemon refuses to start without `[database] url`,
+none of them; the daemon requires a database URL for its selected storage mode,
 `[git] repository_path`, and `[review] worktree_dir`.
 
 For LLM provider-specific setup (API keys, auth, provider features), see
@@ -61,8 +61,65 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `url` | string | `"sashiko.db"` | Path to the SQLite database file. |
+| `url` | string | `"sashiko.db"` | Local libSQL file or remote libSQL URL. Used in `libsql` and `libsql_shared_bugs` modes. |
 | `token` | string | `""` | Database token (unused for SQLite). |
+
+### `[storage]`
+
+The default is `mode = "libsql"`. PostgreSQL can store the entire daemon
+database, or act as a shared bug catalog for instances that keep their reviews
+in libSQL. PostgreSQL requires TLS and a login that owns the configured schema
+so startup migrations can create tables, indexes, and triggers.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | string | `"libsql"` | `libsql`, `postgresql`, or `libsql_shared_bugs`. |
+| `postgres_url` | string | unset | PostgreSQL connection URL. Prefer the environment variable `SASHIKO__STORAGE__POSTGRES_URL` for credentials. |
+| `postgres_schema` | string | `"sashiko"` | Schema for this database or catalog. Use a separate schema for each full daemon project and each shared catalog. |
+| `postgres_ca_file` | path | unset | Additional trusted CA certificate in PEM format. |
+| `postgres_tls_require_only` | boolean | `false` | Require encryption while opting out of certificate and hostname validation. Intended for explicitly trusted lab deployments. |
+
+For all daemon data in PostgreSQL:
+
+```toml
+[storage]
+mode = "postgresql"
+postgres_schema = "sashiko"
+```
+
+For a shared bug catalog:
+
+```toml
+[database]
+url = "sashiko.db"
+
+[storage]
+mode = "libsql_shared_bugs"
+postgres_schema = "team_bugs"
+
+[linux_bug]
+enabled = true
+```
+
+Set the PostgreSQL URL through deployment secrets in either configuration.
+An existing libSQL database is not automatically moved when selecting full
+PostgreSQL storage. Full mode creates an independent database schema.
+
+In shared catalog mode, each local database has a stable instance identity
+and a local bug mirror. Changes enter a durable outbox in the same transaction
+as the bug update. A background task publishes and imports changes every five
+seconds; PostgreSQL outages leave changes queued and visible as **Sync pending**.
+Concurrent changes to different fields and new evidence are merged. If two
+instances change the same triage decision, the catalog decision is retained
+and a conflict event is recorded in the bug's audit history. The originating
+instance runs the bug's analysis; other instances can view and triage it.
+
+Public bug IDs identify shared records. Local patch and review IDs stay in
+their originating database. All instances sharing a catalog must trust the
+same subsystem attribution and permission policy. A shared catalog may hold
+multiple projects, with synchronization scoped by the instance's project.
+Use the API for catalog changes so audit history and synchronization remain
+consistent. Local CLI reviews do not submit bugs to the daemon automatically.
 
 ### `[mailing_lists]`
 

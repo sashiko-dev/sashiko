@@ -21,6 +21,8 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 #[cfg(feature = "server")]
 use libsql::Builder;
+#[cfg(feature = "server")]
+mod shared;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use serde_json::json;
@@ -181,6 +183,7 @@ async fn write_patch_if_unchanged(
 
 #[cfg(feature = "server")]
 pub struct Database {
+    shared: Option<Arc<shared::SharedCatalog>>,
     pub conn: crate::storage::Connection,
     tx_conn: crate::storage::Connection,
     tx_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -1361,7 +1364,12 @@ impl Database {
             StorageMode::Libsql => Self::new(&settings.database).await,
             StorageMode::Postgresql => Self::postgres(&settings.storage).await,
             StorageMode::LibsqlSharedBugs => {
-                anyhow::bail!("Shared PostgreSQL bug storage is not yet implemented")
+                let mut db = Self::new(&settings.database).await?;
+                db.shared = Some(Arc::new(shared::SharedCatalog {
+                    settings: settings.storage.clone(),
+                    lock: tokio::sync::Mutex::new(()),
+                }));
+                Ok(db)
             }
         }
     }
@@ -1394,8 +1402,17 @@ impl Database {
             bug_tool: "sashiko".into(),
             bug_model: None,
             bug_claim: None,
+            shared: None,
         })
     }
+    fn owned_bug_clause(&self) -> &'static str {
+        if self.shared.is_some() {
+            "AND NOT EXISTS (SELECT 1 FROM shared_bug_sync mirror WHERE mirror.bug_id=bugs.id AND mirror.origin != (SELECT value FROM meta WHERE key='shared_instance'))"
+        } else {
+            ""
+        }
+    }
+
     pub fn has_bug_actor(&self) -> bool {
         self.bug_actor != "system" || self.bug_tool != "sashiko"
     }
@@ -1423,6 +1440,7 @@ impl Database {
             bug_tool: tool.into(),
             bug_model: model,
             bug_claim: self.bug_claim.clone(),
+            shared: self.shared.clone(),
         }
     }
 
@@ -1437,6 +1455,7 @@ impl Database {
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
             bug_claim: self.bug_claim.clone(),
+            shared: self.shared.clone(),
         }
     }
 
@@ -1450,6 +1469,7 @@ impl Database {
             bug_actor: self.bug_actor.clone(),
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
+            shared: self.shared.clone(),
             bug_claim: Some(BugAnalysisClaim {
                 bug_id,
                 owner: owner.into(),
@@ -1877,6 +1897,7 @@ impl Database {
             bug_tool: "sashiko".into(),
             bug_model: None,
             bug_claim: None,
+            shared: None,
         })
     }
 
@@ -2082,6 +2103,9 @@ impl Database {
             tx.commit().await?;
         }
 
+        if self.shared.is_some() {
+            self.initialize_shared_catalog().await?;
+        }
         info!("Database schema is up to date at version 13.");
 
         Ok(())
@@ -2089,6 +2113,15 @@ impl Database {
 
     async fn migrate_postgres(&self) -> Result<()> {
         let tx = self.begin_transaction().await?;
+        let mut rows=tx.query("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='shared_bug_records'",()).await?;
+        anyhow::ensure!(
+            rows.next()
+                .await?
+                .context("missing schema check")?
+                .get::<i64>(0)?
+                == 0,
+            "Use a separate PostgreSQL schema for a full daemon database and a shared bug catalog"
+        );
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS sashiko_schema_migrations (
             scope TEXT NOT NULL, version BIGINT NOT NULL, applied_at BIGINT NOT NULL,
@@ -2159,8 +2192,8 @@ impl Database {
     /// Ensures the database is stamped for `project`, preventing two instances
     /// configured for different projects from sharing the same SQLite database.
     pub async fn ensure_project_stamp(&self, project: crate::project::ProjectId) -> Result<()> {
-        let mut rows = self
-            .conn
+        let tx = self.begin_transaction().await?;
+        let mut rows = tx
             .query("SELECT value FROM meta WHERE key = 'project'", ())
             .await?;
         if let Some(row) = rows.next().await? {
@@ -2172,14 +2205,18 @@ impl Database {
                     project
                 );
             }
+            drop(rows);
+            tx.commit().await?;
             return Ok(());
         }
 
-        self.execute(
+        tx.execute(
             "INSERT INTO meta (key, value) VALUES ('project', ?1)",
             libsql::params![project.as_str()],
         )
         .await?;
+        drop(rows);
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3653,7 +3690,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let id_opt = self
             .query_returning_i64(
-                "UPDATE bugs
+                &format!("UPDATE bugs
                     SET pipeline_state = 'running',
                         locked_by = ?1,
                         lease_expires_at = ?2,
@@ -3669,10 +3706,10 @@ impl Database {
                          AND (pipeline_state IN ('pending', 'failed')
                               OR (pipeline_state = 'running'
                                   AND (lease_expires_at IS NULL OR lease_expires_at < ?3)))
-                       ORDER BY created_at ASC
+                       {ownership} ORDER BY created_at ASC
                        LIMIT 1
                   )
-                  RETURNING id",
+                  RETURNING id", ownership=self.owned_bug_clause()),
                 libsql::params![
                     worker_id,
                     now + lease_ttl_seconds,
@@ -3742,7 +3779,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let count = self
             .execute(
-                "UPDATE bugs
+                &format!("UPDATE bugs
                     SET pipeline_state = 'abandoned',
                         locked_by = NULL,
                         lease_expires_at = NULL,
@@ -3753,7 +3790,7 @@ impl Database {
                   WHERE attempt_count >= ?2
                     AND (pipeline_state IN ('pending', 'failed')
                          OR (pipeline_state = 'running'
-                             AND (lease_expires_at IS NULL OR lease_expires_at < ?1)))",
+                             AND (lease_expires_at IS NULL OR lease_expires_at < ?1))) {ownership}", ownership=self.owned_bug_clause()),
                 libsql::params![now, max_attempts, self.bug_tool.as_str()],
             )
             .await?;
@@ -3784,7 +3821,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let count = self
             .execute(
-                "UPDATE bugs
+                &format!("UPDATE bugs
                     SET pipeline_state = 'pending',
                         locked_by = NULL,
                         lease_expires_at = NULL,
@@ -3793,7 +3830,7 @@ impl Database {
                         audit_tool = CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE pipeline_state = 'running'
-                    AND (lease_expires_at IS NULL OR lease_expires_at < ?1)",
+                    AND (lease_expires_at IS NULL OR lease_expires_at < ?1) {ownership}", ownership=self.owned_bug_clause()),
                 libsql::params![now, self.bug_tool.as_str()],
             )
             .await?;
@@ -4094,7 +4131,8 @@ impl Database {
         let ttl = lease_ttl_seconds.clamp(1, 86_400);
         let id_opt = self
             .query_returning_i64(
-                "UPDATE bugs
+                &format!(
+                    "UPDATE bugs
                     SET locked_by = ?1,
                         lease_expires_at = ?2,
                         updated_at = ?3
@@ -4107,10 +4145,12 @@ impl Database {
                          AND verified_on_sha != ''
                          AND verified_on_sha != ?4
                          AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
-                       ORDER BY updated_at ASC, id ASC
+                       {ownership} ORDER BY updated_at ASC, id ASC
                        LIMIT 1
                   )
                   RETURNING id",
+                    ownership = self.owned_bug_clause()
+                ),
                 libsql::params![
                     worker_id,
                     now.saturating_add(ttl),
@@ -4157,8 +4197,9 @@ impl Database {
                 AND verified_on_sha != ?1
                 AND (lease_expires_at IS NULL OR lease_expires_at <= ?2)
                 AND (?3 IS NULL OR updated_at > ?3 OR (updated_at = ?3 AND id > ?4))
-              ORDER BY updated_at ASC, id ASC
-              LIMIT ?5"
+              {ownership} ORDER BY updated_at ASC, id ASC
+              LIMIT ?5",
+            ownership = self.owned_bug_clause()
         );
         let mut rows = self
             .conn
@@ -4225,7 +4266,8 @@ impl Database {
         let ttl = lease_ttl_seconds.clamp(1, 86_400);
         let updated = self
             .execute(
-                "UPDATE bugs
+                &format!(
+                    "UPDATE bugs
                     SET locked_by = ?1,
                         lease_expires_at = ?2,
                         updated_at = ?3
@@ -4236,7 +4278,9 @@ impl Database {
                     AND verified_on_sha IS NOT NULL
                     AND verified_on_sha != ''
                     AND verified_on_sha != ?5
-                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)",
+                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3) {ownership}",
+                    ownership = self.owned_bug_clause()
+                ),
                 libsql::params![worker_id, now.saturating_add(ttl), now, bug_id, linus],
             )
             .await?;

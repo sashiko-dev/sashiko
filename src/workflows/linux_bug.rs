@@ -2453,7 +2453,7 @@ pub async fn process_issue_worker_for_project(
 
     let (seen_bug_ids, early_dup_outcome) = {
         let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
-        let _database_dedup_guard = db.conn.dedup_lock().await?;
+        let _database_dedup_guard = db.lock_bug_dedup().await?;
 
         let mut known_bugs = db.list_all_bugs_for_vector_search().await?;
         known_bugs.retain(|b| b.id != bug_row.id);
@@ -2461,6 +2461,7 @@ pub async fn process_issue_worker_for_project(
         let outcome = dedup_ctx
             .check_and_fold(&known_bugs, &mut full_history)
             .await?;
+        db.sync_shared_bugs().await?;
         (seen_ids, outcome)
     };
 
@@ -2550,7 +2551,7 @@ pub async fn process_issue_worker_for_project(
 
     let late_dup_outcome = {
         let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
-        let _database_dedup_guard = db.conn.dedup_lock().await?;
+        let _database_dedup_guard = db.lock_bug_dedup().await?;
 
         let mut newly_arrived_bugs = db.list_all_bugs_for_vector_search().await?;
         newly_arrived_bugs.retain(|b| b.id != bug_row.id && !seen_bug_ids.contains(&b.id));
@@ -2562,7 +2563,7 @@ pub async fn process_issue_worker_for_project(
             None
         };
 
-        if let Some(dup_outcome) = late_dup {
+        let outcome = if let Some(dup_outcome) = late_dup {
             Some(dup_outcome)
         } else {
             db.update_bug_outcome(
@@ -2589,7 +2590,9 @@ pub async fn process_issue_worker_for_project(
             )
             .await?;
             None
-        }
+        };
+        db.sync_shared_bugs().await?;
+        outcome
     };
 
     if let Some(dup_outcome) = late_dup_outcome {

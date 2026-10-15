@@ -187,3 +187,174 @@ async fn exercise_daemon(db: &Database) -> Result<()> {
     assert_ne!(db.get_bug(bug).await?.unwrap().title, "rolled back");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires SASHIKO_TEST_POSTGRES_URL_FILE pointing to a disposable PostgreSQL database"]
+async fn postgres_shared_catalog_between_instances() -> Result<()> {
+    let file = std::env::var("SASHIKO_TEST_POSTGRES_URL_FILE")?;
+    let directory = tempfile::tempdir()?;
+    let mut settings = sashiko::settings::Settings::new()?;
+    settings.storage.mode = sashiko::settings::StorageMode::LibsqlSharedBugs;
+    settings.storage.postgres_url = Some(std::fs::read_to_string(file)?.trim().to_string());
+    settings.storage.postgres_schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+    settings.storage.postgres_tls_require_only = true;
+    settings.database.url = directory
+        .path()
+        .join("first.db")
+        .to_string_lossy()
+        .to_string();
+    let first = Database::configured(&settings).await?;
+    first.migrate().await?;
+    first
+        .ensure_project_stamp(sashiko::project::ProjectId::Sashiko)
+        .await?;
+    let mut second_settings = settings.clone();
+    second_settings.database.url = directory
+        .path()
+        .join("second.db")
+        .to_string_lossy()
+        .to_string();
+    let second = Database::configured(&second_settings).await?;
+    second.migrate().await?;
+    second
+        .ensure_project_stamp(sashiko::project::ProjectId::Sashiko)
+        .await?;
+    let result = std::panic::AssertUnwindSafe(exercise_shared(&first, &second, &settings))
+        .catch_unwind()
+        .await;
+    let cleanup = Database::postgres(&settings.storage).await?;
+    cleanup
+        .execute_batch(&format!(
+            "DROP SCHEMA \"{}\" CASCADE",
+            settings.storage.postgres_schema
+        ))
+        .await?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn exercise_shared(
+    first: &Database,
+    second: &Database,
+    settings: &sashiko::settings::Settings,
+) -> Result<()> {
+    let local_only: NewBug = serde_json::from_value(
+        json!({"bugid":format!("sashiko-{}",uuid::Uuid::new_v4()),"title":"second instance","pipeline_state":"succeeded","lifecycle_status":"open"}),
+    )?;
+    second.create_bug(&local_only).await?;
+    let bug: NewBug = serde_json::from_value(
+        json!({"bugid":format!("sashiko-{}",uuid::Uuid::new_v4()),"title":"shared candidate"}),
+    )?;
+    let id = first
+        .create_bug_with_enrichment(
+            &bug,
+            Some(&NewBugEnrichment {
+                kind: "candidate".into(),
+                content: Some("original evidence".into()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    assert!(first.shared_bug_pending_ids().await?.contains(&id));
+    first.sync_shared_bugs().await?;
+    assert!(first.shared_bug_pending_ids().await?.is_empty());
+    second.sync_shared_bugs().await?;
+    let mirror = second
+        .get_bug_by_bugid(&bug.bugid)
+        .await?
+        .context("shared mirror")?;
+    assert_ne!(mirror.id, id);
+    assert!(
+        mirror
+            .enrichments
+            .iter()
+            .any(|e| e.content.as_deref() == Some("original evidence"))
+    );
+    assert!(
+        second
+            .claim_pending_bug("foreign-worker", 60, 3)
+            .await?
+            .is_none()
+    );
+    first
+        .set_bug_lifecycle_status(id, BugLifecycleStatus::Open)
+        .await?;
+    first.sync_shared_bugs().await?;
+    second.sync_shared_bugs().await?;
+    first
+        .set_bug_lifecycle_status(id, BugLifecycleStatus::Fixed)
+        .await?;
+    second
+        .set_bug_lifecycle_status(mirror.id, BugLifecycleStatus::Dismissed)
+        .await?;
+    first.sync_shared_bugs().await?;
+    second.sync_shared_bugs().await?;
+    let updated = second.get_bug_by_bugid(&bug.bugid).await?.unwrap();
+    assert_eq!(updated.lifecycle_status, BugLifecycleStatus::Fixed);
+    assert!(
+        updated
+            .enrichments
+            .iter()
+            .any(|e| e.kind == "sync_conflict")
+    );
+    first.sync_shared_bugs().await?;
+    let count = first.get_bug(id).await?.unwrap().enrichments.len();
+    first.sync_shared_bugs().await?;
+    assert_eq!(first.get_bug(id).await?.unwrap().enrichments.len(), count);
+    let duplicate: NewBug = serde_json::from_value(
+        json!({"bugid":format!("sashiko-{}",uuid::Uuid::new_v4()),"title":"duplicate report"}),
+    )?;
+    let duplicate_id = first.create_bug(&duplicate).await?;
+    first
+        .mark_bug_as_duplicate(sashiko::db::MarkDuplicateBugParams {
+            ephemeral_id: duplicate_id,
+            canonical_id: id,
+            reasoning: "same public bug",
+            ..Default::default()
+        })
+        .await?;
+    first.sync_shared_bugs().await?;
+    second.sync_shared_bugs().await?;
+    let imported_duplicate = second.get_bug_by_bugid(&duplicate.bugid).await?.unwrap();
+    assert_eq!(imported_duplicate.duplicate_of_id, Some(mirror.id));
+    let guard = first.lock_bug_dedup().await?;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            second.lock_bug_dedup()
+        )
+        .await
+        .is_err()
+    );
+    drop(guard);
+    let guard = second.lock_bug_dedup().await?;
+    drop(guard);
+    // A local bug write commits while the catalog is unreachable, then a new
+    // daemon handle publishes the durable outbox after connectivity is restored.
+    let mut offline = settings.clone();
+    offline.database.url = std::path::Path::new(&settings.database.url)
+        .with_file_name("offline.db")
+        .to_string_lossy()
+        .to_string();
+    offline.storage.postgres_url = Some("postgresql://localhost:1/unavailable".into());
+    let queued = Database::configured(&offline).await?;
+    queued.migrate().await?;
+    queued
+        .ensure_project_stamp(sashiko::project::ProjectId::Sashiko)
+        .await?;
+    let pending: NewBug = serde_json::from_value(
+        json!({"bugid":format!("sashiko-{}",uuid::Uuid::new_v4()),"title":"offline candidate"}),
+    )?;
+    queued.create_bug(&pending).await?;
+    assert!(queued.sync_shared_bugs().await.is_err());
+    drop(queued);
+    offline.storage = settings.storage.clone();
+    let resumed = Database::configured(&offline).await?;
+    resumed.migrate().await?;
+    resumed.sync_shared_bugs().await?;
+    second.sync_shared_bugs().await?;
+    assert!(second.get_bug_by_bugid(&pending.bugid).await?.is_some());
+    Ok(())
+}

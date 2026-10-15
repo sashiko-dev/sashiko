@@ -72,23 +72,28 @@ transaction for operations that currently depend on SQLite atomicity.
 
 ## Shared bugs mode
 
-PostgreSQL owns the canonical bug records, enrichments, subsystem attribution,
-vectors, and audit history. Each libSQL daemon keeps its reviews and patchsets.
-Cross-database references use public bug IDs, never local integer row IDs.
+PostgreSQL owns the shared catalog; each libSQL daemon keeps a local bug mirror
+alongside its reviews and patchsets. A stable instance UUID and public bug IDs
+identify synchronization records. Local row IDs never cross the catalog
+boundary. Discovery commit references remain part of the shared evidence.
 
-The local database records `review_id`, `bugid`, discovery flag, and a stable
-instance ID. PostgreSQL records the corresponding discovery provenance as
-external identifiers. Neither database declares a foreign key to the other.
-The UI resolves bug details through the PostgreSQL catalog. Repeated link
-writes are idempotent. A transactional local outbox retries the PostgreSQL
-write when either database is unavailable; the review remains available and
-the link shows pending synchronization until acknowledged. Central catalog
-updates must not silently erase local review associations.
+SQLite triggers maintain a coalescing outbox in the bug mutation's transaction.
+The synchronizer publishes a typed snapshot with stable event identities, then
+imports changes in bounded batches through a durable sequence cursor. PostgreSQL
+serializes catalog changes so sequence order follows commit order. The local
+base snapshot permits a three-way merge: independent edits and evidence combine,
+while concurrent triage or assignment conflicts retain the catalog decision and
+record a conflict event. A failed publication stays queued for retry.
 
-Bug permissions remain enforced by the Sashiko API. Operators must not expose
-the PostgreSQL connection string to browsers. A shared catalog may hold bugs
-from multiple projects, so queries and duplicate detection must retain the
-project scope encoded in public bug IDs and source metadata.
+A local mirror preserves its review links; imported records have no foreign keys
+to another instance's patches or reviews. Analysis remains with the originating
+instance. The shared deduplication lock imports the latest catalog before checking
+candidates and publishes the canonical result before releasing the lock. Bugs
+remain readable during an outage, and the UI shows pending synchronization.
+
+Bug permissions remain enforced by the Sashiko API. Catalog participants must
+share a trusted permission and subsystem attribution policy. Project-scoped
+catalog queries prevent accidental mixing of independent projects.
 
 ## Migration and rollout
 

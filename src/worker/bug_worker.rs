@@ -570,6 +570,13 @@ impl BugWorker {
         let mut fix_check_handle: Option<tokio::task::JoinHandle<usize>> = None;
 
         loop {
+            if self.db.has_shared_bug_catalog()
+                && let Err(error) = self.db.sync_shared_bugs().await
+            {
+                warn!("Waiting for the shared bug catalog before claiming analysis: {error:#}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
             if fix_check_handle.as_ref().is_some_and(|h| h.is_finished())
                 && let Some(handle) = fix_check_handle.take()
                 && let Err(e) = handle.await

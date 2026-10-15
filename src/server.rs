@@ -1444,6 +1444,14 @@ async fn get_bug(
     let principal = resolve_bug_read_principal(principal, &query)?;
     let (bug, access) = readable_bug_for_view(&state, &principal, &query).await?;
     let mut val = serde_json::to_value(&bug).unwrap_or(serde_json::json!({}));
+    val["sync_pending"] = serde_json::Value::Bool(
+        state
+            .db
+            .shared_bug_pending_ids()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .contains(&bug.id),
+    );
     val["slug"] = serde_json::Value::String(bug.bugid.clone());
     val["problem"] = serde_json::Value::String(bug.problem().to_string());
     val["severity"] = serde_json::to_value(bug.severity()).unwrap();
@@ -2445,8 +2453,14 @@ async fn list_bugs(
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let mut serialized_items = Vec::new();
+            let pending = state
+                .db
+                .shared_bug_pending_ids()
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             for bug in &items {
                 let mut val = serde_json::to_value(bug).unwrap_or(serde_json::json!({}));
+                val["sync_pending"] = serde_json::Value::Bool(pending.contains(&bug.id));
                 val["slug"] = serde_json::Value::String(bug.bugid.clone());
                 val["problem"] = serde_json::Value::String(bug.problem().to_string());
                 val["severity"] = serde_json::to_value(bug.severity()).unwrap();
