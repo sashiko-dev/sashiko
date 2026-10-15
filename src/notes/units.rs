@@ -70,8 +70,11 @@ pub fn assign_units(source: &dyn UnitSource, files: &[SourceFile]) -> UnitAssign
             continue;
         };
         owned.entry(primary.clone()).or_default().push(file.clone());
+        // A source may name one unit twice (two MAINTAINERS sections can
+        // share a title); each unit lists a shared file once.
+        let mut seen: HashSet<&str> = HashSet::from([primary.as_str()]);
         for other in others {
-            if other != primary {
+            if seen.insert(other.as_str()) {
                 shared
                     .entry(other.clone())
                     .or_default()
@@ -335,6 +338,26 @@ mod tests {
         let source = DirectoryUnits::new(&[".".to_string()], 1, ShallowFiles::PerModule);
         assert_eq!(source.owners("build.rs"), vec!["build"]);
         assert_eq!(normalize_root("././src/"), "src");
+    }
+
+    #[test]
+    fn test_duplicate_owner_names_share_a_file_once() {
+        struct Dup;
+        impl UnitSource for Dup {
+            fn owners(&self, path: &str) -> Vec<String> {
+                let names: &[&str] = if path == "a.c" {
+                    &["A", "B", "B", "A"]
+                } else {
+                    &["B"]
+                };
+                names.iter().map(|s| s.to_string()).collect()
+            }
+        }
+        let assignment = assign_units(&Dup, &[file("a.c", 1), file("b.c", 1)]);
+        let b = assignment.units.iter().find(|u| u.name == "B").unwrap();
+        assert_eq!(b.shared, vec!["a.c"]);
+        let a = assignment.units.iter().find(|u| u.name == "A").unwrap();
+        assert!(a.shared.is_empty());
     }
 
     #[test]
