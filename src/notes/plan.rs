@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::maintainers::MaintainersIndex;
@@ -121,31 +121,50 @@ pub async fn build_plan(
     unit_filter: &[String],
 ) -> Result<PlanReport> {
     let files = list_source_files(repo, sha, &profile.compiled_languages()).await?;
-    let source = unit_source(&profile.units, maintainers)?;
-    let assignment = assign_units(source.as_ref(), &files);
-    let units = select_units(assignment.units, unit_filter)?;
+
+    // Matching every file against the unit source and splitting units is
+    // CPU-bound (tens of thousands of files for a kernel tree), so it runs
+    // on the blocking pool.
+    let units_config = profile.units.clone();
+    let maintainers = maintainers.cloned();
+    let filter = unit_filter.to_vec();
+    let (units, unassigned) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let source = unit_source(&units_config, maintainers.as_ref())?;
+        let assignment = assign_units(source.as_ref(), &files);
+        Ok((
+            select_units(assignment.units, &filter)?,
+            assignment.unassigned,
+        ))
+    })
+    .await
+    .context("unit assignment panicked")??;
 
     let selected_files: Vec<_> = units.iter().flat_map(|u| u.files.clone()).collect();
     let entry_points = extract_entry_points(repo, sha, &selected_files).await?;
 
-    let mut entry_points_by_path: HashMap<&str, Vec<&EntryPoint>> = HashMap::new();
-    for entry in &entry_points {
-        entry_points_by_path
-            .entry(entry.path.as_str())
-            .or_default()
-            .push(entry);
-    }
-    let unit_plans: Vec<UnitPlan> = units
-        .iter()
-        .map(|unit| plan_unit(unit, profile.limits.component_lines, &entry_points_by_path))
-        .collect();
+    let component_lines = profile.limits.component_lines;
+    let unit_plans = tokio::task::spawn_blocking(move || {
+        let mut entry_points_by_path: HashMap<&str, Vec<&EntryPoint>> = HashMap::new();
+        for entry in &entry_points {
+            entry_points_by_path
+                .entry(entry.path.as_str())
+                .or_default()
+                .push(entry);
+        }
+        units
+            .iter()
+            .map(|unit| plan_unit(unit, component_lines, &entry_points_by_path))
+            .collect::<Vec<UnitPlan>>()
+    })
+    .await
+    .context("unit planning panicked")?;
     let totals = PlanTotals {
         units: unit_plans.len(),
         files: unit_plans.iter().map(|u| u.files).sum(),
         lines: unit_plans.iter().map(|u| u.lines).sum(),
         components: unit_plans.iter().map(|u| u.components.len()).sum(),
-        unassigned_files: assignment.unassigned.len(),
-        unassigned_lines: assignment.unassigned.iter().map(|f| f.lines).sum(),
+        unassigned_files: unassigned.len(),
+        unassigned_lines: unassigned.iter().map(|f| f.lines).sum(),
         estimated_input_tokens: unit_plans.iter().fold(TokenEstimate::default(), |acc, u| {
             acc.add(u.estimated_input_tokens)
         }),

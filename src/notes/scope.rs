@@ -61,26 +61,38 @@ pub async fn resolve_revision(repo: &Path, rev: &str) -> Result<String> {
 
 /// Lists the source files at commit `sha` that the profile's languages
 /// classify, with their line counts, sorted by path.
+///
+/// The git commands run asynchronously; parsing their output (megabytes for
+/// a kernel tree) and classifying every path runs on the blocking pool so
+/// it never stalls a Tokio worker thread.
 pub async fn list_source_files(
     repo: &Path,
     sha: &str,
     languages: &CompiledLanguages,
 ) -> Result<Vec<SourceFile>> {
-    let paths = list_tree_paths(repo, sha).await?;
-    let line_counts = count_lines(repo, sha).await?;
-    let mut files: Vec<SourceFile> = paths
-        .into_iter()
-        .filter_map(|path| {
-            let language = languages.classify(&path)?;
-            let lines = line_counts.get(&path).copied().unwrap_or(0);
-            Some(SourceFile {
-                path,
-                language,
-                lines,
-                test_lines: 0,
+    let tree = list_tree_output(repo, sha).await?;
+    let counts = count_lines_output(repo, sha).await?;
+    let sha_owned = sha.to_string();
+    let languages = languages.clone();
+    let mut files = tokio::task::spawn_blocking(move || -> Result<Vec<SourceFile>> {
+        let paths = parse_tree_paths(&tree)?;
+        let line_counts = parse_count_output(&counts, &sha_owned)?;
+        Ok(paths
+            .into_iter()
+            .filter_map(|path| {
+                let language = languages.classify(&path)?;
+                let lines = line_counts.get(&path).copied().unwrap_or(0);
+                Some(SourceFile {
+                    path,
+                    language,
+                    lines,
+                    test_lines: 0,
+                })
             })
-        })
-        .collect();
+            .collect())
+    })
+    .await
+    .context("source file classification panicked")??;
     if files.iter().any(|f| f.language == Language::Rust) {
         let boundaries = rust_test_boundaries(repo, sha).await?;
         for file in files.iter_mut().filter(|f| f.language == Language::Rust) {
@@ -95,7 +107,7 @@ pub async fn list_source_files(
     Ok(files)
 }
 
-async fn list_tree_paths(repo: &Path, sha: &str) -> Result<Vec<String>> {
+async fn list_tree_output(repo: &Path, sha: &str) -> Result<Vec<u8>> {
     let output = git_cmd::in_dir_async(repo)
         .args(["ls-tree", "-r", "--name-only", "-z", "--full-tree", sha])
         .output()
@@ -107,17 +119,22 @@ async fn list_tree_paths(repo: &Path, sha: &str) -> Result<Vec<String>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    output
-        .stdout
+    Ok(output.stdout)
+}
+
+/// Parses NUL-separated `git ls-tree -z --name-only` output.
+fn parse_tree_paths(stdout: &[u8]) -> Result<Vec<String>> {
+    stdout
         .split(|b| *b == 0)
         .filter(|p| !p.is_empty())
         .map(|p| String::from_utf8(p.to_vec()).context("repository contains a non-UTF-8 path"))
         .collect()
 }
 
-/// Counts lines of every text file at `sha` in one `git grep` pass. Binary
-/// files and empty files are absent from the result.
-async fn count_lines(repo: &Path, sha: &str) -> Result<HashMap<String, usize>> {
+/// Counts lines of every text file at `sha` in one `git grep` pass, returning
+/// the raw output for [`parse_count_output`]. Binary files and empty files
+/// are absent from it.
+async fn count_lines_output(repo: &Path, sha: &str) -> Result<Vec<u8>> {
     let output = git_cmd::in_dir_async(repo)
         .args(["grep", "--count", "-I", "--null", "-e", "", sha])
         .output()
@@ -130,7 +147,7 @@ async fn count_lines(repo: &Path, sha: &str) -> Result<HashMap<String, usize>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_count_output(&output.stdout, sha)
+    Ok(output.stdout)
 }
 
 /// Finds, per Rust file at `sha`, the first line of a top-level inline test

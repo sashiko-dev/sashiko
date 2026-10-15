@@ -210,7 +210,7 @@ pub fn resolve_profile_path(prompts_dir: &Path, override_path: Option<&Path>) ->
 }
 
 /// Language globs compiled for matching file paths.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledLanguages {
     globs: Vec<(Language, Vec<CompiledPattern>)>,
     skip: Vec<CompiledPattern>,
