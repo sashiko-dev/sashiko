@@ -71,7 +71,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    fn add(&mut self, outcome: &WorkflowOutcome) {
+    pub(crate) fn add(&mut self, outcome: &WorkflowOutcome) {
         self.tokens_in += u64::from(outcome.tokens_in);
         self.tokens_out += u64::from(outcome.tokens_out);
         self.tokens_cached += u64::from(outcome.tokens_cached);

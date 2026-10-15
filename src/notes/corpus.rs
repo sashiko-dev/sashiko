@@ -18,15 +18,24 @@
 //! change that introduced the bug is added when the profile can name it,
 //! so the analysis reads code rather than only the commit message.
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::{info, warn};
 
 use crate::git_cmd;
+use crate::notes::build::Usage;
 use crate::notes::history::{git_text, truncate_chars};
+use crate::workflow::{WorkflowEngine, WorkflowEnv};
+use crate::workflows::code_notes::LessonKind;
+use crate::workflows::notes_corpus::{
+    CORPUS_BATCH_SIZE, CORPUS_STAGE_NAMES, CaseAnalysis, CorpusState, corpus_stage, corpus_workflow,
+};
 
 /// Characters of a fix's message, its function-context diff, and each
 /// introducing change's diff given to the analysis.
@@ -35,6 +44,8 @@ const FIX_DIFF_CHARS: usize = 12_000;
 const INTRODUCED_DIFF_CHARS: usize = 4000;
 /// Introducing changes shown per fix.
 const MAX_INTRODUCED: usize = 2;
+/// Length of the commit IDs cases are shown and cited by.
+const FIX_ID_LEN: usize = 12;
 
 /// The change a fix names as having introduced its bug.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +219,178 @@ async fn resolve_commit(repo: &Path, id: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// One analyzed case as stored in a corpus file (one JSON object per
+/// line). The diff is not kept; it can be read again from the fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusRecord {
+    pub fix: String,
+    pub subject: String,
+    pub files: Vec<String>,
+    pub introduced: Vec<String>,
+    pub analysis: CaseAnalysis,
+}
+
+/// Settings of one corpus analysis run.
+#[derive(Debug, Clone)]
+pub struct CorpusConfig {
+    pub project: String,
+    pub out_file: PathBuf,
+    pub temperature: f32,
+    pub introducer: Option<Regex>,
+}
+
+/// What one corpus analysis run did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CorpusSummary {
+    pub already_done: usize,
+    pub analyzed: usize,
+    pub code_bugs: usize,
+    pub failed: usize,
+    pub usage: Usage,
+}
+
+/// Fixes already analyzed in `path`.
+pub fn read_done(path: &Path) -> Result<HashSet<String>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut done = HashSet::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A run killed mid-write leaves a torn last line; it is retried.
+        match serde_json::from_str::<CorpusRecord>(line) {
+            Ok(record) => {
+                done.insert(record.fix);
+            }
+            Err(err) => warn!(
+                "{}:{}: skipping unreadable record: {err}",
+                path.display(),
+                i + 1
+            ),
+        }
+    }
+    Ok(done)
+}
+
+/// Analyzes every fix in `fixes` not yet in the output file, appending
+/// each round's records so an interrupted run resumes where it stopped.
+/// Each case is attempted once per run; failed cases are retried by the
+/// next run.
+pub async fn analyze(
+    repo: &Path,
+    env: &WorkflowEnv<'_>,
+    fixes: &[String],
+    cfg: &CorpusConfig,
+) -> Result<CorpusSummary> {
+    let done = read_done(&cfg.out_file)?;
+    let todo: Vec<&String> = fixes.iter().filter(|f| !done.contains(*f)).collect();
+    let mut summary = CorpusSummary {
+        already_done: fixes.len() - todo.len(),
+        ..Default::default()
+    };
+    let per_round = CORPUS_BATCH_SIZE * CORPUS_STAGE_NAMES.len();
+    let rounds = todo.len().div_ceil(per_round);
+    for (round, chunk) in todo.chunks(per_round).enumerate() {
+        let contexts = futures::future::join_all(
+            chunk
+                .iter()
+                .map(|fix| case_context(repo, fix, cfg.introducer.as_ref())),
+        )
+        .await;
+        let mut cases = Vec::new();
+        for (fix, context) in chunk.iter().zip(contexts) {
+            match context {
+                Ok(case) => cases.push((fix_id(fix), case)),
+                Err(err) => {
+                    warn!("{fix}: cannot read the case: {err:#}");
+                    summary.failed += 1;
+                }
+            }
+        }
+        let stages = cases
+            .chunks(CORPUS_BATCH_SIZE)
+            .zip(CORPUS_STAGE_NAMES)
+            .map(|(batch, name)| corpus_stage(name, batch.to_vec(), cfg.temperature))
+            .collect();
+        let mut state = CorpusState {
+            project: cfg.project.clone(),
+            analyses: Vec::new(),
+        };
+        match WorkflowEngine::execute(&corpus_workflow(stages), env, &mut state, None).await {
+            Ok(outcome) => summary.usage.add(&outcome),
+            Err(err) => warn!("corpus round {} failed: {err:#}", round + 1),
+        }
+        let records = records_for(&cases, state.analyses);
+        summary.failed += cases.len() - records.len();
+        summary.analyzed += records.len();
+        summary.code_bugs += records
+            .iter()
+            .filter(|r| r.analysis.kind == LessonKind::CodeBug)
+            .count();
+        append_records(&cfg.out_file, &records)?;
+        info!(
+            "corpus round {}/{rounds}: {} analyzed, {} failed so far; {} tokens in",
+            round + 1,
+            summary.analyzed,
+            summary.failed,
+            summary.usage.tokens_in
+        );
+    }
+    Ok(summary)
+}
+
+fn fix_id(sha: &str) -> String {
+    sha.chars().take(FIX_ID_LEN).collect()
+}
+
+/// Joins analyses to their cases by ID; analyses for unknown IDs and
+/// cases without an analysis are dropped.
+fn records_for(cases: &[(String, CorpusCase)], analyses: Vec<CaseAnalysis>) -> Vec<CorpusRecord> {
+    let mut by_id: HashMap<String, CaseAnalysis> =
+        analyses.into_iter().map(|a| (a.fix.clone(), a)).collect();
+    cases
+        .iter()
+        .filter_map(|(id, case)| {
+            by_id.remove(id).map(|analysis| CorpusRecord {
+                fix: case.fix.clone(),
+                subject: case.subject.clone(),
+                files: case.files.clone(),
+                introduced: case.introduced.iter().map(|c| c.commit.clone()).collect(),
+                analysis,
+            })
+        })
+        .collect()
+}
+
+fn append_records(path: &Path, records: &[CorpusRecord]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    // A torn last line from an interrupted run must not swallow the
+    // first new record.
+    let torn = std::fs::read(path).is_ok_and(|bytes| bytes.last().is_some_and(|b| *b != b'\n'));
+    let mut text = if torn {
+        "\n".to_string()
+    } else {
+        String::new()
+    };
+    for record in records {
+        text.push_str(&serde_json::to_string(record)?);
+        text.push('\n');
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("failed to append to {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +452,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fixes, vec![fix]);
+    }
+
+    #[test]
+    fn test_records_join_by_id_and_resume() {
+        let case = |sha: &str| CorpusCase {
+            fix: sha.to_string(),
+            subject: format!("fix {sha}"),
+            message: String::new(),
+            diff: String::new(),
+            files: vec!["a.c".to_string()],
+            introduced: vec![],
+        };
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let cases = vec![(fix_id(&a), case(&a)), (fix_id(&b), case(&b))];
+        let analysis = |id: &str| CaseAnalysis {
+            fix: id.to_string(),
+            kind: LessonKind::NotCodeBug,
+            category: String::new(),
+            violated_rule: String::new(),
+            why_missed: String::new(),
+            knowledge_needed: String::new(),
+        };
+        let records = records_for(&cases, vec![analysis(&fix_id(&b)), analysis("zzzz")]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fix, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corpus.jsonl");
+        assert!(read_done(&path).unwrap().is_empty());
+        append_records(&path, &records).unwrap();
+        // A torn line from an interrupted run is skipped, not fatal.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"fix\": \"tor")
+            .unwrap();
+        assert_eq!(read_done(&path).unwrap(), HashSet::from([b.clone()]));
+        let mut again = records.clone();
+        again[0].fix = a.clone();
+        append_records(&path, &again).unwrap();
+        assert_eq!(read_done(&path).unwrap(), HashSet::from([a, b]));
     }
 
     #[test]
