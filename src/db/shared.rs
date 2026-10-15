@@ -1020,11 +1020,11 @@ impl Database {
         };
         tx.execute("UPDATE bugs SET title=?, lifecycle_status=?,duplicate_of_id=?,pipeline_state=?,
             assignee=?,assigned_at=?,severity_int=?,verified_on_sha=?,introducing_commit_sha=?,fixed_in_commit_sha=?,
-            created_at=?,updated_at=?,audit_author='system',audit_tool='shared_catalog',audit_model=NULL WHERE id=?",
+            reporter=?,reported_at=?,discovered_in_commit=?,source_ref=?,created_at=?,updated_at=?,audit_author='system',audit_tool='shared_catalog',audit_model=NULL WHERE id=?",
             libsql::params![record.title.as_str(),record.triage.status.as_str(),duplicate,record.analysis.state.as_str(),
             record.assignment.assignee.clone(),record.assignment.assigned_at,record.analysis.severity,
             record.analysis.verified.clone(),record.analysis.introduced.clone(),record.analysis.fixed.clone(),
-            record.created_at,record.updated_at,id]).await?;
+            record.reporter.as_str(),record.reported_at,record.discovered_in_commit.clone(),record.source_ref.clone(),record.created_at,record.updated_at,id]).await?;
         tx.execute("DELETE FROM bug_subsystems WHERE bug_id=?", [id])
             .await?;
         for (name, source) in &record.subsystems {
@@ -1045,13 +1045,19 @@ impl Database {
                 .await?;
             if let Some(row) = rows.next().await? {
                 let event_id: i64 = row.get(0)?;
-                tx.execute("UPDATE bug_enrichments SET content=?, data_json=?, logs=? WHERE id=? AND bug_id=?",libsql::params![
+                tx.execute("UPDATE bug_enrichments SET kind=?,tool=?,model=?,author=?,created_at=?,tokens_in=?,tokens_out=?,tokens_cached=?,content=?,data_json=?,logs=? WHERE id=? AND bug_id=?",libsql::params![
+                    event.kind.as_str(),event.tool.as_str(),event.model.clone(),event.author.clone(),event.created_at,
+                    event.tokens_in.map(|v|v as i64),event.tokens_out.map(|v|v as i64),event.tokens_cached.map(|v|v as i64),
                     event.content.as_deref().map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null),
                     event.data_json.as_ref().map(serde_json::to_string).transpose()?,
                     event.logs.as_deref().map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null),event_id,id]).await?;
             } else {
                 let event_id = db
-                    .insert_bug_enrichment(id, &event.new_enrichment())
+                    .insert_bug_enrichment_with_metadata(
+                        id,
+                        &event.new_enrichment(),
+                        EnrichmentMetadata::Preserve,
+                    )
                     .await?;
                 tx.execute(
                     "INSERT INTO shared_bug_events (enrichment_id,event_key) VALUES (?,?)",
@@ -1274,6 +1280,52 @@ mod tests {
             Some(right)
         );
         assert!(db.get_bug(right).await?.unwrap().duplicate_of_id.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imports_preserve_metadata_without_inheriting_the_receiving_actor() -> Result<()> {
+        let db = local_mirror().await?;
+        let source = local_report(&db, "original report").await?;
+        let instance = db.shared_meta("shared_instance").await?;
+        let (mut record, _, _) = db.shared_snapshot(source, &instance).await?;
+        record.bugid = format!("sashiko-{}", uuid::Uuid::new_v4());
+        record.origin = uuid::Uuid::new_v4().to_string();
+        record.reporter.clear();
+        record.reported_at = 0;
+        record.discovered_in_commit = Some("original-commit".into());
+        record.source_ref = Some("original-reference".into());
+        record.events = record
+            .events
+            .into_iter()
+            .map(|(key, mut event)| {
+                event.author = None;
+                event.model = None;
+                event.created_at = 0;
+                (key.replacen(&instance, &record.origin, 1), event)
+            })
+            .collect();
+        let receiver =
+            db.with_bug_actor("receiver", "receiver-tool", Some("receiver-model".into()));
+        for updated in [false, true] {
+            if updated {
+                record.reporter = "original-author".into();
+                record.reported_at = 123;
+                for event in record.events.values_mut() {
+                    event.author = Some("peer-author".into());
+                    event.model = Some("peer-model".into());
+                    event.created_at = 12;
+                    event.tokens_in = Some(42);
+                }
+            }
+            receiver.shared_accept(&record, None, &instance).await?;
+            let id = db.get_bug_by_bugid(&record.bugid).await?.unwrap().id;
+            let (actual, _, _) = db.shared_snapshot(id, &instance).await?;
+            assert_eq!(
+                serde_json::to_value(actual)?,
+                serde_json::to_value(&record)?
+            );
+        }
         Ok(())
     }
 

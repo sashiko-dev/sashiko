@@ -184,6 +184,12 @@ async fn write_patch_if_unchanged(
 }
 
 #[cfg(feature = "server")]
+enum EnrichmentMetadata {
+    ActorDefaults,
+    Preserve,
+}
+
+#[cfg(feature = "server")]
 pub struct Database {
     shared: Option<Arc<shared::SharedCatalog>>,
     pub conn: crate::storage::Connection,
@@ -2649,6 +2655,20 @@ impl Database {
         bug_id: i64,
         enrichment: &NewBugEnrichment,
     ) -> Result<i64> {
+        self.insert_bug_enrichment_with_metadata(
+            bug_id,
+            enrichment,
+            EnrichmentMetadata::ActorDefaults,
+        )
+        .await
+    }
+
+    async fn insert_bug_enrichment_with_metadata(
+        &self,
+        bug_id: i64,
+        enrichment: &NewBugEnrichment,
+        metadata: EnrichmentMetadata,
+    ) -> Result<i64> {
         let compressed_content = enrichment
             .content
             .as_ref()
@@ -2663,10 +2683,30 @@ impl Database {
             .data_json
             .as_ref()
             .and_then(|d| serde_json::to_string(d).ok());
-        let now = if enrichment.created_at > 0 {
-            enrichment.created_at
-        } else {
-            chrono::Utc::now().timestamp()
+        let (tool, model, author, now) = match metadata {
+            EnrichmentMetadata::ActorDefaults => (
+                if enrichment.tool.is_empty() {
+                    self.bug_tool.as_str()
+                } else {
+                    enrichment.tool.as_str()
+                },
+                enrichment.model.clone().or_else(|| self.bug_model.clone()),
+                enrichment
+                    .author
+                    .clone()
+                    .or_else(|| Some(self.bug_actor.clone())),
+                if enrichment.created_at > 0 {
+                    enrichment.created_at
+                } else {
+                    chrono::Utc::now().timestamp()
+                },
+            ),
+            EnrichmentMetadata::Preserve => (
+                enrichment.tool.as_str(),
+                enrichment.model.clone(),
+                enrichment.author.clone(),
+                enrichment.created_at,
+            ),
         };
 
         self.query_returning_i64(
@@ -2678,16 +2718,9 @@ impl Database {
             libsql::params![
                 bug_id,
                 enrichment.kind.as_str(),
-                if enrichment.tool.is_empty() {
-                    self.bug_tool.as_str()
-                } else {
-                    enrichment.tool.as_str()
-                },
-                enrichment.model.clone().or_else(|| self.bug_model.clone()),
-                enrichment
-                    .author
-                    .clone()
-                    .or_else(|| Some(self.bug_actor.clone())),
+                tool,
+                model,
+                author,
                 now,
                 compressed_content,
                 data_json_str,
