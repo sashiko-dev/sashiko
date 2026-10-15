@@ -5480,6 +5480,26 @@ impl Database {
         }))
     }
 
+    fn review_stats_sql(&self) -> String {
+        let index_hint = self.conn.sql(" INDEXED BY idx_ai_interactions_tokens", "");
+        format!(
+            "WITH last_reviews AS (
+            SELECT * FROM reviews ORDER BY id DESC LIMIT 1000
+        )
+        SELECT
+            r.provider,
+            r.model,
+            r.status,
+            count(*),
+            sum(COALESCE(ai.tokens_in, 0)),
+            sum(COALESCE(ai.tokens_out, 0)),
+            sum(COALESCE(ai.tokens_cached, 0))
+        FROM last_reviews r
+        LEFT JOIN ai_interactions ai{index_hint} ON r.interaction_id = ai.id
+        GROUP BY r.provider, r.model, r.status"
+        )
+    }
+
     pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
         let mut total_rows = self
             .conn
@@ -5507,22 +5527,7 @@ impl Database {
             0
         };
 
-        let sql = "WITH last_reviews AS (
-            SELECT * FROM reviews ORDER BY id DESC LIMIT 1000
-        )
-        SELECT
-            r.provider,
-            r.model,
-            r.status,
-            count(*),
-            sum(COALESCE(ai.tokens_in, 0)),
-            sum(COALESCE(ai.tokens_out, 0)),
-            sum(COALESCE(ai.tokens_cached, 0))
-        FROM last_reviews r
-        LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-        GROUP BY r.provider, r.model, r.status";
-
-        let mut rows = self.conn.query(sql, ()).await?;
+        let mut rows = self.conn.query(&self.review_stats_sql(), ()).await?;
         let mut stats = Vec::new();
         #[allow(clippy::similar_names)]
         while let Ok(Some(row)) = rows.next().await {
@@ -10957,6 +10962,31 @@ mod tests {
             .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::Unrestricted)
             .await?;
         assert_eq!(counts.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_statistics_keep_the_libsql_covering_index() -> Result<()> {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+        let mut rows = db
+            .conn
+            .query(&format!("EXPLAIN QUERY PLAN {}", db.review_stats_sql()), ())
+            .await?;
+        let mut covering_index = false;
+        while let Some(row) = rows.next().await? {
+            covering_index |= row
+                .get::<String>(3)?
+                .contains("COVERING INDEX idx_ai_interactions_tokens");
+        }
+        assert!(
+            covering_index,
+            "statistics must avoid reading interaction payloads"
+        );
         Ok(())
     }
 
