@@ -407,9 +407,6 @@ impl Reviewer {
             .await?;
 
         for review in reviews {
-            let Some(patch_id) = review.patch_id else {
-                continue;
-            };
             let ps_msg_id = patchset
                 .message_id
                 .as_deref()
@@ -418,7 +415,7 @@ impl Reviewer {
                 ctx,
                 patchset.id,
                 Some(review.id),
-                patch_id,
+                review.patch_id,
                 &review.patch_message_id,
                 ps_msg_id,
                 review.index,
@@ -465,12 +462,36 @@ impl Reviewer {
         let mut series_summary: Option<String> = None;
         let mut items = Vec::new();
 
+        if let Some(cover_review) = reviews
+            .iter()
+            .find(|r| r.patch_id.is_none() || r.index == 0)
+        {
+            if !cover_review.summary.trim().is_empty() {
+                series_summary = Some(cover_review.summary.clone());
+            }
+            let inline_review = Some(cover_review.inline_review.clone()).filter(|s| {
+                let t = s.trim();
+                !t.is_empty() && t != "No issues found."
+            });
+            items.push(crate::forge::PatchReviewSummaryItem {
+                part_index: 0,
+                total_parts,
+                commit_id: None,
+                subject: patchset
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| "Series / PR Review".to_string()),
+                inline_review,
+            });
+        }
+
         for (patch_id, idx, _diff, subj, _auth, _date, msg_id) in diffs {
             let matching_review = reviews
                 .iter()
                 .find(|r| r.patch_id == Some(*patch_id) || r.index == *idx);
             if *idx == 0 {
-                if let Some(r) = matching_review
+                if series_summary.is_none()
+                    && let Some(r) = matching_review
                     && !r.summary.trim().is_empty()
                 {
                     series_summary = Some(r.summary.clone());
@@ -507,15 +528,20 @@ impl Reviewer {
 
         let version =
             crate::forge::extract_mr_version_from_subject(patchset.subject.as_deref(), pr_number);
+        let commit_count = items.iter().filter(|p| p.part_index > 0).count();
         let body = crate::forge::compose_pr_review_comment(
             version,
-            items.len(),
+            commit_count,
             series_summary.as_deref(),
             &items,
             &target_url,
         );
 
-        let head_sha = items.last().and_then(|p| p.commit_id.as_deref());
+        let head_sha = items
+            .iter()
+            .rev()
+            .find(|p| p.part_index > 0)
+            .and_then(|p| p.commit_id.as_deref());
         let now = chrono::Utc::now().timestamp();
         let is_embargoed = patchset.embargo_until.is_some_and(|t| t > now);
         let status = ctx.settings.forge.post_mode.outbox_status(is_embargoed);
@@ -752,10 +778,77 @@ impl Reviewer {
                 })
                 .unwrap_or_default();
 
+            let has_separate_cover_msg = !patchset_msg_id.is_empty()
+                && (patchset.mr_url.is_some()
+                    || !diffs
+                        .iter()
+                        .any(|(_, _, _, _, _, _, m)| m == &patchset_msg_id));
+            let cover_letter = if has_separate_cover_msg {
+                match ctx.db.get_message_details_by_msgid(&patchset_msg_id).await {
+                    Ok(opt) => opt.map(|msg| {
+                        let date_str = msg
+                            .date
+                            .or(patchset.date)
+                            .and_then(|ts| {
+                                chrono::TimeZone::timestamp_opt(&chrono::Utc, ts, 0).single()
+                            })
+                            .map(|dt| dt.to_rfc2822())
+                            .unwrap_or_default();
+                        json!({
+                            "subject": msg.subject.or_else(|| patchset.subject.clone()),
+                            "author": msg.author.or_else(|| patchset.author.clone()),
+                            "date": msg.date.or(patchset.date),
+                            "date_string": date_str,
+                            "message_id": msg.message_id,
+                            "body": msg.body.unwrap_or_default(),
+                        })
+                    }),
+                    Err(e) => {
+                        error!(
+                            "Failed to fetch cover letter message details for patchset {} ({}): {}",
+                            patchset_id, patchset_msg_id, e
+                        );
+                        if let Err(rm_err) = worktree.remove().await {
+                            warn!(
+                                "Failed to remove worktree after patchset {} error: {}",
+                                patchset_id, rm_err
+                            );
+                        }
+                        Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let previous_version = match ctx
+                .db
+                .get_previous_version_review_context(patchset_id)
+                .await
+            {
+                Ok(prev) => prev,
+                Err(e) => {
+                    error!(
+                        "Failed to fetch previous version review context for patchset {}: {}",
+                        patchset_id, e
+                    );
+                    if let Err(rm_err) = worktree.remove().await {
+                        warn!(
+                            "Failed to remove worktree after patchset {} error: {}",
+                            patchset_id, rm_err
+                        );
+                    }
+                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    return;
+                }
+            };
+
             let input_payload = json!({
                 "id": patchset_id,
                 "message_id": patchset_msg_id,
                 "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
+                "cover_letter": cover_letter,
+                "previous_version": previous_version,
                 "patches": patches_json
             });
 
@@ -791,7 +884,7 @@ impl Reviewer {
             let only_regexes: Vec<_> = only_filters.iter().map(|f| compile_glob(f)).collect();
 
             struct ValidJob {
-                patch_id: i64,
+                patch_id: Option<i64>,
                 index: i64,
                 commit_sha: Option<String>,
                 diff: String,
@@ -864,11 +957,33 @@ impl Reviewer {
                 let commit_sha = patch_commits.get(index).cloned();
 
                 valid_jobs.push(ValidJob {
-                    patch_id: *patch_id,
+                    patch_id: Some(*patch_id),
                     index: *index,
                     commit_sha,
                     diff: diff.to_string(),
                 });
+            }
+
+            if !valid_jobs.is_empty()
+                && (cover_letter.is_some()
+                    || patchset.mr_url.is_some()
+                    || diffs.len() > 1
+                    || previous_version.is_some())
+            {
+                let series_tip_sha = diffs
+                    .iter()
+                    .map(|(_, idx, _, _, _, _, _)| *idx)
+                    .max()
+                    .and_then(|max_idx| patch_commits.get(&max_idx).cloned());
+                valid_jobs.insert(
+                    0,
+                    ValidJob {
+                        patch_id: None,
+                        index: 0,
+                        commit_sha: series_tip_sha,
+                        diff: String::new(),
+                    },
+                );
             }
 
             // Reverse so that pop() processes in the original order (index 1 first)
@@ -1676,7 +1791,7 @@ impl Reviewer {
         ctx: &ReviewContext,
         patchset_id: i64,
         review_id: Option<i64>,
-        patch_id: i64,
+        patch_id: Option<i64>,
         patch_msg_id: &str,
         patchset_msg_id: &str,
         index: i64,
@@ -1703,7 +1818,7 @@ impl Reviewer {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     warn!(
-                        "Failed to queue notifications for patch {}/{} (ID: {}) (attempt {}/{}): {}",
+                        "Failed to queue notifications for patch {}/{} (ID: {:?}) (attempt {}/{}): {}",
                         patchset_id,
                         index,
                         patch_id,
@@ -1721,7 +1836,7 @@ impl Reviewer {
         Err(last_err
             .unwrap_or_else(|| anyhow!("notification queueing failed"))
             .context(format!(
-                "Failed to queue notifications for patch {}/{} (ID: {})",
+                "Failed to queue notifications for patch {}/{} (ID: {:?})",
                 patchset_id, index, patch_id
             )))
     }
@@ -1730,7 +1845,7 @@ impl Reviewer {
     async fn process_patch_review(
         ctx: &ReviewContext,
         patchset_id: i64,
-        patch_id: i64,
+        patch_id: Option<i64>,
         index: i64,
         baseline_ref: &str,
         baseline_id: Option<i64>,
@@ -1742,18 +1857,18 @@ impl Reviewer {
         embargo_until: Option<i64>,
     ) -> Result<PatchResult> {
         info!(
-            "Reviewing patch {}/{} (ID: {})",
+            "Reviewing patch {}/{} (ID: {:?})",
             patchset_id, index, patch_id
         );
 
         let successful_count = ctx
             .db
-            .count_successful_reviews(patchset_id, Some(patch_id), baseline_id)
+            .count_successful_reviews(patchset_id, patch_id, baseline_id)
             .await?;
 
         if successful_count >= ctx.target_review_count {
             info!(
-                "Patch {}/{} (ID: {}) already has {} successful reviews with baseline {:?} (target: {}). Skipping.",
+                "Patch {}/{} (ID: {:?}) already has {} successful reviews with baseline {:?} (target: {}). Skipping.",
                 patchset_id,
                 index,
                 patch_id,
@@ -1775,15 +1890,25 @@ impl Reviewer {
                     .get_completed_reviews_for_release(patchset_id)
                     .await?
                     .into_iter()
-                    .rfind(|r| r.patch_id == Some(patch_id))
+                    .rfind(|r| r.patch_id == patch_id)
                 && review.has_inline_review
             {
-                let patch_msg_id = input_payload["patches"]
-                    .as_array()
-                    .and_then(|arr| arr.iter().find(|p| p["index"] == index))
-                    .and_then(|p| p["message_id"].as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&review.patch_message_id);
+                let patch_msg_id = if index == 0 {
+                    input_payload
+                        .get("cover_letter")
+                        .and_then(|c| c.get("message_id"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| input_payload.get("message_id").and_then(|v| v.as_str()))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&review.patch_message_id)
+                } else {
+                    input_payload["patches"]
+                        .as_array()
+                        .and_then(|arr| arr.iter().find(|p| p["index"] == index))
+                        .and_then(|p| p["message_id"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&review.patch_message_id)
+                };
                 let patchset_msg_id = input_payload["message_id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -1802,20 +1927,24 @@ impl Reviewer {
                 )
                 .await?;
             }
-            ctx.db.update_patch_status(patch_id, "Reviewed").await?;
+            if let Some(pid) = patch_id {
+                ctx.db.update_patch_status(pid, "Reviewed").await?;
+            }
             return Ok(PatchResult::Success);
         }
 
         if ctx
             .db
-            .has_failed_review(patchset_id, Some(patch_id), baseline_id)
+            .has_failed_review(patchset_id, patch_id, baseline_id)
             .await?
         {
             info!(
-                "Patch {}/{} (ID: {}) already has a failed review. Skipping to keep it visible.",
+                "Patch {}/{} (ID: {:?}) already has a failed review. Skipping to keep it visible.",
                 patchset_id, index, patch_id
             );
-            ctx.db.update_patch_status(patch_id, "Failed").await?;
+            if let Some(pid) = patch_id {
+                ctx.db.update_patch_status(pid, "Failed").await?;
+            }
             return Ok(PatchResult::ReviewFailed);
         }
 
@@ -1830,13 +1959,13 @@ impl Reviewer {
             })
         {
             info!(
-                "Skipping review for patch {}/{} (ID: {}) as it touches only ignored files.",
+                "Skipping review for patch {}/{} (ID: {:?}) as it touches only ignored files.",
                 patchset_id, index, patch_id
             );
 
             let review_id = if let Some(id) = ctx
                 .db
-                .claim_pending_review_id(patchset_id, Some(patch_id))
+                .claim_pending_review_id(patchset_id, patch_id)
                 .await?
             {
                 id
@@ -1844,7 +1973,7 @@ impl Reviewer {
                 ctx.db
                     .create_review(
                         patchset_id,
-                        Some(patch_id),
+                        patch_id,
                         &ctx.settings.ai.provider,
                         &ctx.settings.ai.model,
                         baseline_id,
@@ -1868,7 +1997,9 @@ impl Reviewer {
             // moved to a terminal status, so a database error leaves both the
             // review and the patch where a retry or rerun picks them up again.
             complete_res?;
-            ctx.db.update_patch_status(patch_id, "Skipped").await?;
+            if let Some(pid) = patch_id {
+                ctx.db.update_patch_status(pid, "Skipped").await?;
+            }
 
             return Ok(PatchResult::Success);
         }
@@ -1899,7 +2030,7 @@ impl Reviewer {
                     }
                     None => {
                         ctx.db
-                            .claim_pending_review_id(patchset_id, Some(patch_id))
+                            .claim_pending_review_id(patchset_id, patch_id)
                             .await?
                     }
                 };
@@ -1916,9 +2047,11 @@ impl Reviewer {
                     )
                     .await?;
                 }
-                ctx.db
-                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                    .await?;
+                if let Some(pid) = patch_id {
+                    ctx.db
+                        .update_patch_status(pid, ReviewStatus::Cancelled.as_str())
+                        .await?;
+                }
                 return Ok(PatchResult::Cancelled);
             }
 
@@ -1927,7 +2060,7 @@ impl Reviewer {
                 id
             } else if let Some(id) = ctx
                 .db
-                .claim_pending_review_id(patchset_id, Some(patch_id))
+                .claim_pending_review_id(patchset_id, patch_id)
                 .await?
             {
                 id
@@ -1936,7 +2069,7 @@ impl Reviewer {
                     .db
                     .create_review(
                         patchset_id,
-                        Some(patch_id),
+                        patch_id,
                         &ctx.settings.ai.provider,
                         &ctx.settings.ai.model,
                         baseline_id,
@@ -1990,9 +2123,11 @@ impl Reviewer {
                     None,
                 )
                 .await?;
-                ctx.db
-                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                    .await?;
+                if let Some(pid) = patch_id {
+                    ctx.db
+                        .update_patch_status(pid, ReviewStatus::Cancelled.as_str())
+                        .await?;
+                }
                 return Ok(PatchResult::Cancelled);
             }
 
@@ -2084,7 +2219,9 @@ impl Reviewer {
                             // moved to a terminal status, so a database error leaves both the
                             // review and the patch where a retry or rerun picks them up again.
                             complete_res?;
-                            ctx.db.update_patch_status(patch_id, "Failed").await?;
+                            if let Some(pid) = patch_id {
+                                ctx.db.update_patch_status(pid, "Failed").await?;
+                            }
                             return Ok(PatchResult::ReviewFailed);
                         } else if let Some(review_content) = json_output.get("review") {
                             if !review_content.is_null() {
@@ -2122,6 +2259,7 @@ impl Reviewer {
                                 }
 
                                 if ctx.settings.linux_bug.enabled
+                                    && let Some(pid) = patch_id
                                     && let Some(arr) =
                                         review_content.get("concerns").and_then(|f| f.as_array())
                                 {
@@ -2196,7 +2334,7 @@ impl Reviewer {
                                             source_files,
                                             commit_sha: commit_sha.clone(),
                                             patchset_id: Some(patchset_id),
-                                            patch_id: Some(patch_id),
+                                            patch_id: Some(pid),
                                             baseline_sha: Some(baseline_ref.to_string()),
                                             review_id: Some(review_id),
                                         };
@@ -2298,7 +2436,7 @@ impl Reviewer {
                                 .await
                                 {
                                     return Err(e.context(format!(
-                                        "Failed to save review completion for patch {}/{} (ID: {})",
+                                        "Failed to save review completion for patch {}/{} (ID: {:?})",
                                         patchset_id, index, patch_id
                                     )));
                                 }
@@ -2315,13 +2453,26 @@ impl Reviewer {
                                             until, patchset_id, index
                                         );
                                     } else {
-                                        let patch_msg_id = input_payload["patches"]
-                                            .as_array()
-                                            .and_then(|arr| {
-                                                arr.iter().find(|p| p["index"] == index)
-                                            })
-                                            .and_then(|p| p["message_id"].as_str())
-                                            .unwrap_or("");
+                                        let patch_msg_id = if index == 0 {
+                                            input_payload
+                                                .get("cover_letter")
+                                                .and_then(|c| c.get("message_id"))
+                                                .and_then(|v| v.as_str())
+                                                .or_else(|| {
+                                                    input_payload
+                                                        .get("message_id")
+                                                        .and_then(|v| v.as_str())
+                                                })
+                                                .unwrap_or("")
+                                        } else {
+                                            input_payload["patches"]
+                                                .as_array()
+                                                .and_then(|arr| {
+                                                    arr.iter().find(|p| p["index"] == index)
+                                                })
+                                                .and_then(|p| p["message_id"].as_str())
+                                                .unwrap_or("")
+                                        };
 
                                         let patchset_msg_id = input_payload["message_id"]
                                             .as_str()
@@ -2342,7 +2493,9 @@ impl Reviewer {
                                         .await?;
                                     }
                                 }
-                                ctx.db.update_patch_status(patch_id, "Reviewed").await?;
+                                if let Some(pid) = patch_id {
+                                    ctx.db.update_patch_status(pid, "Reviewed").await?;
+                                }
                                 return Ok(PatchResult::Success);
                             } else if ctx.settings.ai.no_ai {
                                 info!(
@@ -2367,7 +2520,9 @@ impl Reviewer {
                                 // moved to a terminal status, so a database error leaves both the
                                 // review and the patch where a retry or rerun picks them up again.
                                 complete_res?;
-                                ctx.db.update_patch_status(patch_id, "Skipped").await?;
+                                if let Some(pid) = patch_id {
+                                    ctx.db.update_patch_status(pid, "Skipped").await?;
+                                }
                                 return Ok(PatchResult::Success);
                             } else {
                                 if retries < max_retries {
@@ -2396,7 +2551,9 @@ impl Reviewer {
                                 // moved to a terminal status, so a database error leaves both the
                                 // review and the patch where a retry or rerun picks them up again.
                                 complete_res?;
-                                ctx.db.update_patch_status(patch_id, "Failed").await?;
+                                if let Some(pid) = patch_id {
+                                    ctx.db.update_patch_status(pid, "Failed").await?;
+                                }
                                 return Ok(PatchResult::ReviewFailed);
                             }
                         } else {
@@ -2429,7 +2586,9 @@ impl Reviewer {
                             // moved to a terminal status, so a database error leaves both the
                             // review and the patch where a retry or rerun picks them up again.
                             complete_res?;
-                            ctx.db.update_patch_status(patch_id, "Failed").await?;
+                            if let Some(pid) = patch_id {
+                                ctx.db.update_patch_status(pid, "Failed").await?;
+                            }
                             return Ok(PatchResult::ReviewFailed);
                         }
                     } else {
@@ -2463,7 +2622,9 @@ impl Reviewer {
                         // moved to a terminal status, so a database error leaves both the
                         // review and the patch where a retry or rerun picks them up again.
                         complete_res?;
-                        ctx.db.update_patch_status(patch_id, "Failed").await?;
+                        if let Some(pid) = patch_id {
+                            ctx.db.update_patch_status(pid, "Failed").await?;
+                        }
                         return Ok(PatchResult::ReviewFailed);
                     }
                 }
@@ -2487,9 +2648,11 @@ impl Reviewer {
                             None,
                         )
                         .await?;
-                        ctx.db
-                            .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                            .await?;
+                        if let Some(pid) = patch_id {
+                            ctx.db
+                                .update_patch_status(pid, ReviewStatus::Cancelled.as_str())
+                                .await?;
+                        }
                         return Ok(PatchResult::Cancelled);
                     }
                     error!("Review execution failed for {}: {}", patchset_id, e);
@@ -2519,7 +2682,9 @@ impl Reviewer {
                     // moved to a terminal status, so a database error leaves both the
                     // review and the patch where a retry or rerun picks them up again.
                     complete_res?;
-                    ctx.db.update_patch_status(patch_id, "Failed").await?;
+                    if let Some(pid) = patch_id {
+                        ctx.db.update_patch_status(pid, "Failed").await?;
+                    }
                     return Ok(PatchResult::ReviewFailed);
                 }
             }
@@ -3144,8 +3309,8 @@ impl Reviewer {
     async fn queue_notifications(
         ctx: &ReviewContext,
         patchset_id: i64,
-        _review_id: Option<i64>,
-        patch_id: i64,
+        review_id: Option<i64>,
+        patch_id: Option<i64>,
         patch_message_id: &str,
         patchset_message_id: &str,
         index: i64,
@@ -3181,6 +3346,38 @@ impl Reviewer {
         let patchset_msg_id = patchset_message_id;
         let patchset_msg_id_clean = patchset_msg_id.trim_matches(|c| c == '<' || c == '>');
 
+        if patch_id.is_none() {
+            // A series-level review (patch_id NULL) is always persisted in
+            // `reviews` and rendered in the Web UI and forge PR comment; email
+            // delivery is limited to replying on a real 0/N cover letter
+            // message. Forge-only patchsets carry synthetic @sashiko.local or
+            // commit-SHA message IDs, and a mailing-list series without a
+            // cover letter has no 0/N message to reply to: replying on 1/N
+            // with series-wide remarks would misplace them in the thread and
+            // duplicate the 1/N patch review email.
+            if msg_id_clean.is_empty()
+                || msg_id_clean.ends_with("@sashiko.local")
+                || (msg_id_clean.len() == 40 && msg_id_clean.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                info!(
+                    "Patchset {} series review has no email cover letter message; skipping email reply (results remain in the UI/forge)",
+                    patchset_id
+                );
+                return Ok(());
+            }
+            if ctx
+                .db
+                .patchset_has_patch_message_id(patchset_id, msg_id_clean)
+                .await?
+            {
+                info!(
+                    "Patchset {} series review root {} is a 1/N patch, not a 0/N cover letter; skipping email reply (results remain in the UI)",
+                    patchset_id, msg_id_clean
+                );
+                return Ok(());
+            }
+        }
+
         let msg_details = match ctx.db.get_message_details_by_msgid(msg_id).await? {
             Some(d) => d,
             None => return Ok(()),
@@ -3215,6 +3412,51 @@ impl Reviewer {
         let patch_author = msg_details.author.unwrap_or_default();
         let patch_subject = msg_details.subject.unwrap_or_default();
 
+        let insert_outbox = |status: &str,
+                             to_addrs: &str,
+                             cc_addrs: &str,
+                             subject: &str,
+                             in_reply_to: &str,
+                             refs_hdr: &str,
+                             body: &str| {
+            let db = &ctx.db;
+            let status = status.to_string();
+            let to_addrs = to_addrs.to_string();
+            let cc_addrs = cc_addrs.to_string();
+            let subject = subject.to_string();
+            let in_reply_to = in_reply_to.to_string();
+            let refs_hdr = refs_hdr.to_string();
+            let body = body.to_string();
+            async move {
+                if let Some(pid) = patch_id {
+                    db.insert_email_outbox(
+                        pid,
+                        &status,
+                        &to_addrs,
+                        &cc_addrs,
+                        &subject,
+                        &in_reply_to,
+                        &refs_hdr,
+                        &body,
+                    )
+                    .await
+                } else {
+                    db.insert_cover_email_outbox(
+                        patchset_id,
+                        review_id,
+                        &status,
+                        &to_addrs,
+                        &cc_addrs,
+                        &subject,
+                        &in_reply_to,
+                        &refs_hdr,
+                        &body,
+                    )
+                    .await
+                }
+            }
+        };
+
         let sashiko_bare = crate::email_policy::extract_bare_email(&sender_address);
         let author_bare = crate::email_policy::extract_bare_email(&patch_author);
         if EmailRouter::is_ignored_author(&policy, &patch_author)
@@ -3224,21 +3466,19 @@ impl Reviewer {
                     || patch_author.to_ascii_lowercase().contains(&sashiko_bare)))
         {
             info!(
-                "Bot loop guard muted notifications for patch {}/{} (ID: {}) from {}",
+                "Bot loop guard muted notifications for patch {}/{} (ID: {:?}) from {}",
                 patchset_id, index, patch_id, patch_author
             );
-            ctx.db
-                .insert_email_outbox(
-                    patch_id,
-                    "Muted",
-                    "[]",
-                    "[]",
-                    "Muted",
-                    msg_id_clean,
-                    &references_hdr,
-                    "Muted by bot loop guard",
-                )
-                .await?;
+            insert_outbox(
+                "Muted",
+                "[]",
+                "[]",
+                "Muted",
+                msg_id_clean,
+                &references_hdr,
+                "Muted by bot loop guard",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -3252,58 +3492,60 @@ impl Reviewer {
             domain, patchset_msg_id_clean, index
         );
 
-        let patchwork_policies =
-            crate::email_router::EmailRouter::resolve_patchwork(&policy, &to_list, &cc_list);
+        if patch_id.is_some() {
+            let patchwork_policies =
+                crate::email_router::EmailRouter::resolve_patchwork(&policy, &to_list, &cc_list);
 
-        let findings_slice = findings.map(|f| f.as_slice()).unwrap_or(&[]);
+            let findings_slice = findings.map(|f| f.as_slice()).unwrap_or(&[]);
 
-        for pw_policy in &patchwork_policies {
-            let check_result =
-                crate::patchwork::PatchworkCheckResult::from_policy(pw_policy, findings_slice);
+            for pw_policy in &patchwork_policies {
+                let check_result =
+                    crate::patchwork::PatchworkCheckResult::from_policy(pw_policy, findings_slice);
 
-            // API mode: insert into patchwork_outbox for retry-queued delivery
-            if let Some(api_url) = &pw_policy.api_url {
-                ctx.db
-                    .insert_patchwork_outbox(
+                // API mode: insert into patchwork_outbox for retry-queued delivery
+                if let Some(api_url) = &pw_policy.api_url {
+                    ctx.db
+                        .insert_patchwork_outbox(
+                            msg_id,
+                            api_url,
+                            &check_result.state,
+                            &check_result.description,
+                            &target_url,
+                            "sashiko",
+                        )
+                        .await?;
+                }
+
+                // Email mode: queue structured notification via email outbox
+                if let Some(email_addr) = &pw_policy.email {
+                    let (pw_subject, pw_body) = crate::patchwork::compose_patchwork_email(
                         msg_id,
-                        api_url,
                         &check_result.state,
                         &check_result.description,
                         &target_url,
-                        "sashiko",
-                    )
-                    .await?;
-            }
+                        &patch_subject,
+                    );
+                    let pw_email_status = match &ctx.settings.smtp {
+                        None => "Disabled",
+                        Some(s) if s.dry_run => "Dry-Run",
+                        _ => "Pending",
+                    };
+                    ctx.db
+                        .insert_patchwork_notification(
+                            pw_email_status,
+                            email_addr,
+                            &pw_subject,
+                            msg_id.trim_matches(|c| c == '<' || c == '>'),
+                            msg_id.trim_matches(|c| c == '<' || c == '>'),
+                            &pw_body,
+                        )
+                        .await?;
+                }
 
-            // Email mode: queue structured notification via email outbox
-            if let Some(email_addr) = &pw_policy.email {
-                let (pw_subject, pw_body) = crate::patchwork::compose_patchwork_email(
-                    msg_id,
-                    &check_result.state,
-                    &check_result.description,
-                    &target_url,
-                    &patch_subject,
-                );
-                let pw_email_status = match &ctx.settings.smtp {
-                    None => "Disabled",
-                    Some(s) if s.dry_run => "Dry-Run",
-                    _ => "Pending",
-                };
-                ctx.db
-                    .insert_patchwork_notification(
-                        pw_email_status,
-                        email_addr,
-                        &pw_subject,
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
-                        msg_id.trim_matches(|c| c == '<' || c == '>'),
-                        &pw_body,
-                    )
-                    .await?;
-            }
-
-            // Neither mode configured but patchwork enabled
-            if pw_policy.api_url.is_none() && pw_policy.email.is_none() {
-                tracing::warn!("Patchwork enabled but no api_url or email provided");
+                // Neither mode configured but patchwork enabled
+                if pw_policy.api_url.is_none() && pw_policy.email.is_none() {
+                    tracing::warn!("Patchwork enabled but no api_url or email provided");
+                }
             }
         }
 
@@ -3382,9 +3624,14 @@ impl Reviewer {
                         "Re: "
                     };
                     let final_subject = format!("{}{}", subject_prefix, patch_subject);
+                    let target_noun = if patch_id.is_some() {
+                        "this patch"
+                    } else {
+                        "this patch series"
+                    };
                     let final_body = format!(
-                        "{}\nSashiko has reviewed this patch and found no issues.\n\n-- \nSashiko AI review · {}\n",
-                        body_head, target_url
+                        "{}\nSashiko has reviewed {} and found no issues.\n\n-- \nSashiko AI review · {}\n",
+                        body_head, target_noun, target_url
                     );
 
                     let status = match &ctx.settings.smtp {
@@ -3393,39 +3640,35 @@ impl Reviewer {
                         _ => "Pending",
                     };
 
-                    ctx.db
-                        .insert_email_outbox(
-                            patch_id,
-                            status,
-                            &to_json,
-                            &cc_json,
-                            &final_subject,
-                            msg_id_clean,
-                            &references_hdr,
-                            &final_body,
-                        )
-                        .await?;
+                    insert_outbox(
+                        status,
+                        &to_json,
+                        &cc_json,
+                        &final_subject,
+                        msg_id_clean,
+                        &references_hdr,
+                        &final_body,
+                    )
+                    .await?;
                     sent_positive_review = true;
                 }
             }
 
             if !sent_positive_review {
                 info!(
-                    "No issues found for patch {}/{} (ID: {}), skipping email.",
+                    "No issues found for patch {}/{} (ID: {:?}), skipping email.",
                     patchset_id, index, patch_id
                 );
-                ctx.db
-                    .insert_email_outbox(
-                        patch_id,
-                        "Skipped",
-                        "[]",
-                        "[]",
-                        "Skipped",
-                        msg_id_clean,
-                        &references_hdr,
-                        "Skipped due to no findings",
-                    )
-                    .await?;
+                insert_outbox(
+                    "Skipped",
+                    "[]",
+                    "[]",
+                    "Skipped",
+                    msg_id_clean,
+                    &references_hdr,
+                    "Skipped due to no findings",
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -3433,21 +3676,19 @@ impl Reviewer {
         match action {
             EmailAction::Mute => {
                 info!(
-                    "Email policy muted email for patch {}/{} (ID: {})",
+                    "Email policy muted email for patch {}/{} (ID: {:?})",
                     patchset_id, index, patch_id
                 );
-                ctx.db
-                    .insert_email_outbox(
-                        patch_id,
-                        "Muted",
-                        "[]",
-                        "[]",
-                        "Muted",
-                        msg_id_clean,
-                        &references_hdr,
-                        "Muted by policy",
-                    )
-                    .await?;
+                insert_outbox(
+                    "Muted",
+                    "[]",
+                    "[]",
+                    "Muted",
+                    msg_id_clean,
+                    &references_hdr,
+                    "Muted by policy",
+                )
+                .await?;
             }
             EmailAction::Send { to, cc, .. } => {
                 let to_json = serde_json::to_string(&to)?;
@@ -3515,21 +3756,19 @@ impl Reviewer {
                     _ => "Pending",
                 };
 
-                ctx.db
-                    .insert_email_outbox(
-                        patch_id,
-                        status,
-                        &to_json,
-                        &cc_json,
-                        &final_subject,
-                        msg_id_clean,
-                        &references_hdr,
-                        &final_body,
-                    )
-                    .await?;
+                insert_outbox(
+                    status,
+                    &to_json,
+                    &cc_json,
+                    &final_subject,
+                    msg_id_clean,
+                    &references_hdr,
+                    &final_body,
+                )
+                .await?;
 
                 info!(
-                    "Queued email for patch {}/{} (ID: {})",
+                    "Queued email for patch {}/{} (ID: {:?})",
                     patchset_id, index, patch_id
                 );
             }
@@ -4641,7 +4880,7 @@ fi
         let result = Reviewer::process_patch_review(
             &ctx,
             ps_id,
-            p_id,
+            Some(p_id),
             1,
             "HEAD",
             None,
@@ -4682,7 +4921,7 @@ fi
         let result = Reviewer::process_patch_review(
             &ctx,
             ps_id,
-            p_id_2,
+            Some(p_id_2),
             2,
             "HEAD",
             None,
@@ -4718,7 +4957,7 @@ fi
         let _result = Reviewer::process_patch_review(
             &ctx,
             ps_id,
-            p_id_3,
+            Some(p_id_3),
             3,
             "HEAD",
             None,
@@ -4994,7 +5233,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             &ctx,
             ps_id,
             None,
-            p_id_1,
+            Some(p_id_1),
             "msg_id_p1",
             "msg_id_1",
             1, // index
@@ -5057,7 +5296,7 @@ inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchse
             &ctx,
             ps_id,
             None,
-            p_id_2,
+            Some(p_id_2),
             "msg_id_p2",
             "msg_id_1",
             2, // index
@@ -5112,7 +5351,7 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             &ctx,
             ps_id,
             None,
-            p_id_3,
+            Some(p_id_3),
             "msg_id_p3",
             "msg_id_1",
             3, // index
@@ -5196,7 +5435,7 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             &ctx,
             ps_id,
             Some(rev_id),
-            p_id_4,
+            Some(p_id_4),
             "msg_id_p4",
             "msg_id_1",
             4,
@@ -5301,7 +5540,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             &ctx,
             ps_id,
             None,
-            p_id_1,
+            Some(p_id_1),
             "msg_id_p1",
             "msg_id_1",
             1,
@@ -5347,7 +5586,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             &ctx,
             ps_id,
             None,
-            p_id_2,
+            Some(p_id_2),
             "msg_id_p2",
             "msg_id_1",
             2,
@@ -5465,7 +5704,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             &ctx,
             ps_id,
             None,
-            p_id_1,
+            Some(p_id_1),
             "msg_pos_1",
             "msg_pos_root",
             1,
@@ -5495,6 +5734,206 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert!(serde_json::from_str::<Vec<String>>(&cc_addrs)?.is_empty());
         assert!(body.contains("Sashiko has reviewed this patch and found no issues.\n"));
         assert!(!body.contains("It looks great!"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_notifications_cover_letter_and_no_cover_letter() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let policy_path = temp_dir.path().join("mailing_lists.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            mute_all = false
+            reply_to = ["author", "list", "recipients"]
+            "#,
+        )?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "localhost".to_string(),
+            port: 25,
+            username: None,
+            password: None,
+            sender_address: "bot@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db
+            .create_thread("cover_root@kernel.org", "[PATCH 0/2] series", 1000)
+            .await?;
+        db.create_message(
+            "cover_root@kernel.org",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH 0/2] series",
+            1000,
+            "*** BLURB HERE ***",
+            "linux-kernel@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_message(
+            "patch1@kernel.org",
+            thread_id,
+            Some("cover_root@kernel.org"),
+            "Author <author@example.com>",
+            "[PATCH 1/2] first",
+            1001,
+            "first patch",
+            "linux-kernel@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("cover_root@kernel.org"),
+                "cover_root@kernel.org",
+                "[PATCH 0/2] series",
+                "Author <author@example.com>",
+                1000,
+                2,
+                1,
+                "linux-kernel@vger.kernel.org",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, "patch1@kernel.org", 1, "diff")
+            .await?;
+        let cover_rev_id = db
+            .create_review(ps_id, None, "mock", "mock", None, None)
+            .await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(56)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(
+                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+            ),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+
+        let findings = vec![json!({
+            "problem": "Cover letter contains unfilled BLURB HERE template",
+            "severity": "Medium",
+            "preexisting": false
+        })];
+
+        Reviewer::queue_notifications(
+            &ctx,
+            ps_id,
+            Some(cover_rev_id),
+            None,
+            "cover_root@kernel.org",
+            "cover_root@kernel.org",
+            0,
+            "> *** BLURB HERE ***\n\nUnfilled b4 template.",
+            Some(&findings),
+            "Series summary",
+        )
+        .await?;
+
+        let details = db.get_patchset_details(ps_id, None, None).await?.unwrap();
+        assert_eq!(details["cover_email_status"], "Pending");
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT in_reply_to, body FROM email_outbox WHERE patchset_id = ? AND patch_id IS NULL",
+                libsql::params![ps_id],
+            )
+            .await?;
+        let row = rows.next().await?.expect("Expected cover email in outbox");
+        let in_reply_to: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        assert_eq!(in_reply_to, "cover_root@kernel.org");
+        assert!(body.contains("https://sashiko.dev/#/patchset/cover_root@kernel.org?part=0"));
+
+        // When patch_message_id belongs to a 1..N patch (no 0/N cover letter),
+        // queue_notifications with patch_id=None must NOT queue an email on 1/N.
+        let thread2 = db
+            .create_thread("only_patch1@kernel.org", "[PATCH 1/2] no cover", 2000)
+            .await?;
+        db.create_message(
+            "only_patch1@kernel.org",
+            thread2,
+            None,
+            "Author <author@example.com>",
+            "[PATCH 1/2] no cover",
+            2000,
+            "patch 1 body",
+            "linux-kernel@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps2 = db
+            .create_patchset(
+                thread2,
+                None,
+                "only_patch1@kernel.org",
+                "[PATCH 1/2] no cover",
+                "Author <author@example.com>",
+                2000,
+                2,
+                1,
+                "linux-kernel@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps2, "only_patch1@kernel.org", 1, "diff")
+            .await?;
+
+        Reviewer::queue_notifications(
+            &ctx,
+            ps2,
+            None,
+            None,
+            "only_patch1@kernel.org",
+            "only_patch1@kernel.org",
+            0,
+            "Missing cover letter on multi-patch series.",
+            Some(&findings),
+            "Series summary",
+        )
+        .await?;
+
+        let details2 = db.get_patchset_details(ps2, None, None).await?.unwrap();
+        assert!(details2["cover_email_status"].is_null());
 
         Ok(())
     }
@@ -5798,7 +6237,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         let res = Reviewer::process_patch_review(
             &ctx,
             ps_id,
-            patch_id,
+            Some(patch_id),
             1,
             "HEAD",
             None,

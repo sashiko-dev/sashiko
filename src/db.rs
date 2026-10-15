@@ -11245,6 +11245,27 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    pub async fn patchset_has_patch_message_id(
+        &self,
+        patchset_id: i64,
+        msgid: &str,
+    ) -> Result<bool> {
+        let candidates = Self::get_msgid_candidates(msgid);
+        for candidate in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patches WHERE patchset_id = ? AND message_id = ? LIMIT 1",
+                    libsql::params![patchset_id, candidate.as_str()],
+                )
+                .await?;
+            if rows.next().await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
