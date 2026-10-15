@@ -122,6 +122,20 @@ multiple projects, with synchronization scoped by the instance's project.
 Use the API for catalog changes so audit history and synchronization remain
 consistent. Local CLI reviews do not submit bugs to the daemon automatically.
 
+#### PostgreSQL integration tests
+
+CI runs both PostgreSQL scenarios against a disposable PostgreSQL 17 service
+with TLS. To run them locally, set `SASHIKO_TEST_POSTGRES_URL_FILE` to a private
+file containing the connection URL for a disposable database, then run:
+
+```bash
+cargo test --all-features --test integration_tests postgres_ -- --ignored
+```
+
+Stop other Sashiko processes before running tests. The tests create isolated
+schemas and remove them afterward. They allow self-signed test certificates
+while still requiring encryption.
+
 ### `[mailing_lists]`
 
 | Key | Type | Default | Description |
