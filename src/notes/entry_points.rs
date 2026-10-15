@@ -27,7 +27,7 @@ use regex::Regex;
 
 use crate::git_cmd;
 use crate::notes::profile::Language;
-use crate::notes::scope::SourceFile;
+use crate::notes::scope::{SourceFile, parse_grep_records};
 
 /// What kind of entry point a match is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
@@ -182,24 +182,10 @@ async fn grep_lines(repo: &Path, sha: &str, pattern: &str) -> Result<Vec<(String
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(parse_grep_lines(&output.stdout, sha))
-}
-
-/// Parses `git grep -n --null` output: `<sha>:<path>\0<line>\0<text>\n`.
-/// Malformed records are skipped; entry points are a best-effort map.
-fn parse_grep_lines(stdout: &[u8], sha: &str) -> Vec<(String, usize, String)> {
-    let prefix = format!("{sha}:");
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .filter_map(|record| {
-            let mut fields = record.splitn(3, '\0');
-            let name = fields.next()?;
-            let line = fields.next()?.parse().ok()?;
-            let text = fields.next()?;
-            let path = name.strip_prefix(&prefix).unwrap_or(name);
-            Some((path.to_string(), line, text.to_string()))
-        })
-        .collect()
+    Ok(parse_grep_records(&output.stdout, sha)
+        .into_iter()
+        .map(|r| (r.path, r.line, r.text))
+        .collect())
 }
 
 #[cfg(test)]
@@ -304,15 +290,6 @@ mod tests {
                 (EntryKind::TraitImpl, "Drop for Engine", "src/engine.rs", 2),
                 (EntryKind::Module, "engine", "src/lib.rs", 1),
             ]
-        );
-    }
-
-    #[test]
-    fn test_parse_grep_lines_skips_malformed() {
-        let out = b"abc:a.rs\x003\x00pub fn x() {}\nabc:b.rs\x00nan\x00pub fn y() {}\n";
-        assert_eq!(
-            parse_grep_lines(out, "abc"),
-            vec![("a.rs".to_string(), 3, "pub fn x() {}".to_string())]
         );
     }
 }

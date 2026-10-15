@@ -160,23 +160,59 @@ async fn rust_test_boundaries(repo: &Path, sha: &str) -> Result<HashMap<String, 
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let prefix = format!("{sha}:");
     let mut boundaries: HashMap<String, usize> = HashMap::new();
-    for record in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut fields = record.splitn(3, '\0');
-        let (Some(name), Some(line)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let Ok(line) = line.parse::<usize>() else {
-            continue;
-        };
-        let path = name.strip_prefix(&prefix).unwrap_or(name).to_string();
+    for record in parse_grep_records(&output.stdout, sha) {
         boundaries
-            .entry(path)
-            .and_modify(|first| *first = (*first).min(line))
-            .or_insert(line);
+            .entry(record.path)
+            .and_modify(|first| *first = (*first).min(record.line))
+            .or_insert(record.line);
     }
     Ok(boundaries)
+}
+
+/// One match from `git grep -n --null <sha>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrepRecord {
+    pub path: String,
+    pub line: usize,
+    pub text: String,
+}
+
+/// Parses `git grep -n --null` output, `<sha>:<path>\0<line>\0<text>\n` per
+/// match. Fields are read in sequence rather than by splitting on newlines,
+/// because a path may contain a newline while matched text (from a text
+/// file, `-I`) contains neither NUL nor newline. Records that do not parse
+/// are skipped: callers use the matches as best-effort hints.
+pub(crate) fn parse_grep_records(stdout: &[u8], sha: &str) -> Vec<GrepRecord> {
+    let prefix = format!("{sha}:");
+    let mut records = Vec::new();
+    let mut rest = stdout;
+    while !rest.is_empty() {
+        let Some(name_end) = rest.iter().position(|b| *b == 0) else {
+            break;
+        };
+        let name = &rest[..name_end];
+        rest = &rest[name_end + 1..];
+        let Some(line_end) = rest.iter().position(|b| *b == 0) else {
+            break;
+        };
+        let line = std::str::from_utf8(&rest[..line_end])
+            .ok()
+            .and_then(|l| l.parse::<usize>().ok());
+        rest = &rest[line_end + 1..];
+        let text_end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
+        let text = &rest[..text_end];
+        rest = rest.get(text_end + 1..).unwrap_or_default();
+        let (Ok(name), Some(line)) = (std::str::from_utf8(name), line) else {
+            continue;
+        };
+        records.push(GrepRecord {
+            path: name.strip_prefix(&prefix).unwrap_or(name).to_string(),
+            line,
+            text: String::from_utf8_lossy(text).into_owned(),
+        });
+    }
+    records
 }
 
 /// Parses `git grep --count --null` output: `<sha>:<path>\0<count>\n` per
@@ -312,6 +348,26 @@ mod tests {
         assert_eq!(
             resolve_revision(dir.path(), "HEAD").await.unwrap().len(),
             40
+        );
+    }
+
+    #[test]
+    fn test_parse_grep_records_handles_newlines_in_paths() {
+        let out = b"abc:src/bad\npath.rs\x003\x00pub fn x() {}\nabc:path.rs\x00nan\x00junk\nabc:b.rs\x007\x00fn y() {}\n";
+        assert_eq!(
+            parse_grep_records(out, "abc"),
+            vec![
+                GrepRecord {
+                    path: "src/bad\npath.rs".to_string(),
+                    line: 3,
+                    text: "pub fn x() {}".to_string(),
+                },
+                GrepRecord {
+                    path: "b.rs".to_string(),
+                    line: 7,
+                    text: "fn y() {}".to_string(),
+                },
+            ]
         );
     }
 
