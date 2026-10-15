@@ -40,6 +40,8 @@ use crate::workflow::{
 pub const MAX_FACTS_PER_STAGE: usize = 25;
 /// Longest fact statement, in characters.
 pub const MAX_STATEMENT_CHARS: usize = 350;
+/// Characters in the description of a patch that would break a fact.
+pub const MAX_VIOLATED_BY_CHARS: usize = 250;
 /// Most evidence entries per fact or verdict.
 pub const MAX_EVIDENCE_PER_ITEM: usize = 5;
 /// Widest line range one evidence entry may cite.
@@ -635,18 +637,22 @@ Past fixes, when listed, are bugs fixed earlier in this component for this topic
 
 Answer the questions by reading and tracing the code with the tools: follow callers and callees, lock acquisitions and releases, ownership transfers, error and cleanup paths, and every path that reaches the state in question. Then report what you established as facts.
 
-A good fact:
-- is ONE sentence of at most {{max_statement_chars}} characters that a reviewer can check a patch against, naming the concrete functions, types, fields, locks or files involved (name them; do not enumerate every member of a list);
-- states a rule whose violation would be a real bug (deadlock, race, leak, use after free, corruption, a silently wrong result, a broken compatibility promise), or a non-obvious contract;
-- holds on every path at this revision; if it holds only under a condition, the condition is part of the sentence;
-- is not generic advice ("inputs should be validated") and not a restatement of what a name already says.
+Report what a future patch to this component must preserve. A good fact:
+- is ONE sentence of at most {{max_statement_chars}} characters stating a rule a patch could break and a reviewer can check a diff against: an invariant, a locking or ordering rule, a lifetime rule, a contract that callers or implementers rely on, or a non-obvious pitfall. Name the concrete functions, types, fields, locks or files involved (name them; do not enumerate every member of a list);
+- has "violated_by": the shape of a patch that would break the rule, in at most {{max_violated_by_chars}} characters (for example "a new query that reads Bug::subsystems for authorization instead of calling authorizing_sections_for_bug"). If you cannot name a plausible patch that breaks it, it does not belong in the notes;
+- holds on every path at this revision; if it holds only under a condition, the condition is part of the sentence. "Always", "never", "only", "every" and "cannot" require that you checked every caller, path or variant (use git_grep);
+- states mechanics, not motives: add a purpose or consequence ("so that", "which prevents", "because") only when a comment, test or the traced code shows it;
+- is not a defect report: do not report missing limits, inefficiencies, panics or other weaknesses of the current code. When existing code follows a pattern that new code must follow too (chunking, a helper that must be called, a check that must come first), state that pattern as the rule;
+- is not a description of what the code plainly does, a list of constants (unless the exact value is the contract), or generic advice ("inputs should be validated").
+
+Comments and documentation that say "must", "never", "only", "do not" or "so that" often state the rules that matter most: find them, check that the code upholds them, and report them.
 
 Each fact needs evidence: the file path, a line range of at most {{max_evidence_lines}} lines, and a snippet copied verbatim from tool output (you may elide lines with "..."). Use "kind" from: Invariant, LockingRule, LifetimeRule, ApiContract, ErrorHandling, Concurrency, ExternalContract, Pitfall, Other. List the question IDs each fact answers in "questions", and the symbols it is about in "scope.symbols" (each symbol must appear in one of its snippets).
 
 When you investigated a plausible rule and found it does NOT hold, record it in "dismissed_hypotheses" with the reason and the code that disproves it. Record questions you could not settle in "open_questions". Report at most {{max_facts}} facts; a few strong facts are worth more than many weak ones, and an empty list is a valid answer when the topic has nothing worth stating.
 
 Return ONLY a JSON object:
-{"facts": [{"id": "F1", "kind": "LockingRule", "statement": "...", "scope": {"files": ["path"], "symbols": ["name"]}, "evidence": [{"path": "path", "start_line": 10, "end_line": 18, "snippet": "verbatim code"}], "questions": ["SYNC-2"], "from_history": []}], "dismissed_hypotheses": [{"statement": "...", "reason": "...", "evidence": []}], "open_questions": ["..."]}"##;
+{"facts": [{"id": "F1", "kind": "LockingRule", "statement": "...", "violated_by": "...", "scope": {"files": ["path"], "symbols": ["name"]}, "evidence": [{"path": "path", "start_line": 10, "end_line": 18, "snippet": "verbatim code"}], "questions": ["SYNC-2"], "from_history": []}], "dismissed_hypotheses": [{"statement": "...", "reason": "...", "evidence": []}], "open_questions": ["..."]}"##;
 
 /// One explore stage for `component` and `topic`.
 pub fn explore_stage(
@@ -698,6 +704,9 @@ pub fn explore_stage(
                     })
                     .with_var("max_statement_chars", |_: &NotesBuildState| {
                         MAX_STATEMENT_CHARS.to_string()
+                    })
+                    .with_var("max_violated_by_chars", |_: &NotesBuildState| {
+                        MAX_VIOLATED_BY_CHARS.to_string()
                     }),
             )
             .output_format(
@@ -797,6 +806,17 @@ pub fn validate_explore(
         if statement.chars().count() > MAX_STATEMENT_CHARS {
             return Err(format!(
                 "{owner} statement is longer than {MAX_STATEMENT_CHARS} characters; state one rule in one sentence"
+            ));
+        }
+        let violated_by = fact.violated_by.trim();
+        if violated_by.is_empty() {
+            return Err(format!(
+                "{owner} has no violated_by; describe a patch that would break the rule, or drop the fact if no plausible patch would"
+            ));
+        }
+        if violated_by.chars().count() > MAX_VIOLATED_BY_CHARS {
+            return Err(format!(
+                "{owner} violated_by is longer than {MAX_VIOLATED_BY_CHARS} characters"
             ));
         }
         validate_evidence_list(&owner, &fact.evidence, true)?;
@@ -956,7 +976,7 @@ Rules:
 - Start with "# {{unit}}", then one short paragraph saying what the unit does.
 - Then these headings, in this order, omitting any heading with no facts: "## Architecture & Data Flow", "## Synchronization", "## Object Lifetimes", "## API Contracts", "## Error Handling", "## External Contracts", "## Known Pitfalls", "## Other". The heading of each fact is given with it.
 - Each rule appears exactly ONCE in the whole note, under the single heading that fits it best. Facts from different topics often restate the same rule in different words: merge them into one bullet and cite all of them.
-- One bullet per rule, at most {{max_bullet_chars}} characters including its citation. Name the functions, types and locks involved, but do not list every argument or variable when the rule is clear without them. End every bullet with the IDs of the facts it comes from, like [F3] or [F3, F9].
+- One bullet per rule, at most {{max_bullet_chars}} characters including its citation. When the change that breaks a rule is not obvious from the rule, end the bullet with that change in a few words, from the facts' "violated_by" (for example "Broken by: awaiting while holding pool_lock."). Name the functions, types and locks involved, but do not list every argument or variable when the rule is clear without them. End every bullet with the IDs of the facts it comes from, like [F3] or [F3, F9].
 - Lead with what a reviewer could get wrong: rules whose violation would be a bug, implicit contracts, and pitfalls. Rules that merely describe what the code obviously does come last or are dropped.
 - State only what the facts state. Do not add claims, advice or examples of your own, and do not drop a fact's conditions.
 - No code blocks. Keep the note proportional to the unit: a small module needs only a few bullets. Never exceed {{max_bytes}} bytes; drop the least important rules first.
@@ -1162,6 +1182,7 @@ mod tests {
             id: id.to_string(),
             kind: FactKind::LockingRule,
             statement: "The pool lock is never held across an await.".to_string(),
+            violated_by: "a patch that awaits while holding pool_lock".to_string(),
             scope: FactScope {
                 files: vec![],
                 symbols: symbols.iter().map(|s| s.to_string()).collect(),
@@ -1275,6 +1296,14 @@ mod tests {
             validate_explore(&dup, &ids, &fixes)
                 .unwrap_err()
                 .contains("used twice")
+        );
+
+        let mut no_patch = good.clone();
+        no_patch.facts[0].violated_by = " ".to_string();
+        assert!(
+            validate_explore(&no_patch, &ids, &fixes)
+                .unwrap_err()
+                .contains("violated_by")
         );
 
         let mut from_fix = good.clone();

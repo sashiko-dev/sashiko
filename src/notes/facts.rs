@@ -74,6 +74,9 @@ pub struct Fact {
     pub id: String,
     pub kind: FactKind,
     pub statement: String,
+    /// The shape of a patch that would break the rule.
+    #[serde(default)]
+    pub violated_by: String,
     #[serde(default)]
     pub scope: FactScope,
     pub evidence: Vec<Evidence>,

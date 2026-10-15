@@ -602,6 +602,7 @@ struct SynthesisFact<'a> {
     id: &'a str,
     heading: &'static str,
     statement: &'a str,
+    violated_by: &'a str,
     symbols: &'a [String],
     from_history: &'a [String],
 }
@@ -613,6 +614,7 @@ fn synthesis_input(confirmed: &[&VerifiedFact]) -> (String, Vec<String>) {
             id: &v.fact.id,
             heading: v.fact.kind.heading(),
             statement: &v.fact.statement,
+            violated_by: &v.fact.violated_by,
             symbols: &v.fact.scope.symbols,
             from_history: &v.fact.from_history,
         })
@@ -760,6 +762,7 @@ mod tests {
                 id: id.to_string(),
                 kind: FactKind::Invariant,
                 statement: "s".to_string(),
+                violated_by: "p".to_string(),
                 scope: FactScope::default(),
                 evidence: vec![],
                 from_history: vec![],
