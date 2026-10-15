@@ -290,6 +290,12 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<(String, PathBuf)>) ->
         if name == ".git" {
             continue;
         }
+        // Code notes keep their verified facts in sidecar files for audit;
+        // reviews read only the notes, so the sidecars stay out of the
+        // binary.
+        if name.to_string_lossy().ends_with(".facts.json") {
+            continue;
+        }
 
         if path.is_dir() {
             collect_files(root, &path, files)?;
