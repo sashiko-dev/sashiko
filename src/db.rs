@@ -3211,6 +3211,7 @@ impl Database {
         // Interaction logs are deliberately not loaded with the family, so ask
         // the table which records carry one before assembling the events.
         let family_ids: Vec<i64> = family.iter().map(|b| b.id).collect();
+        let foreign_events = self.foreign_shared_events(&family_ids).await?;
         let mut logged_records = std::collections::HashSet::<i64>::new();
         if !family_ids.is_empty() {
             let mut rows = self
@@ -3272,12 +3273,15 @@ impl Database {
                     tools.insert(t.clone());
                 }
 
-                let patchset_id = record
+                // Raw inputs retain their original payload. Only references
+                // produced by this instance can link to its patch database.
+                let local_record = record.filter(|e| !foreign_events.contains(&e.id));
+                let patchset_id = local_record
                     .and_then(|e| e.data_json.as_ref())
                     .and_then(|d| d.get("patchset_id"))
                     .and_then(|v| v.as_i64())
                     .or(bug.discovered_in_patchset_id);
-                let patch_id = record
+                let patch_id = local_record
                     .and_then(|e| e.data_json.as_ref())
                     .and_then(|d| d.get("patch_id"))
                     .and_then(|v| v.as_i64())

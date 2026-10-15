@@ -74,8 +74,9 @@ transaction for operations that currently depend on SQLite atomicity.
 
 PostgreSQL owns the shared catalog; each libSQL daemon keeps a local bug mirror
 alongside its reviews and patchsets. A stable instance UUID and public bug IDs
-identify synchronization records. Local row IDs never cross the catalog
-boundary. Discovery commit references remain part of the shared evidence.
+identify synchronization records. Catalog relations use public bug IDs. Original evidence retains its raw
+payload, but imported discoveries never resolve producer-local patch or review
+IDs against the mirror database. Discovery commits remain shared evidence.
 
 SQLite triggers maintain a coalescing outbox in the bug mutation's transaction.
 The synchronizer publishes a typed snapshot with stable event identities, then

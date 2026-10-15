@@ -153,6 +153,24 @@ impl Database {
         Ok(ids)
     }
 
+    /// Producer-local IDs in foreign evidence cannot identify mirror reviews.
+    pub(super) async fn foreign_shared_events(&self, bug_ids: &[i64]) -> Result<BTreeSet<i64>> {
+        if self.shared.is_none() || bug_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let prefix = format!("{}:%", self.shared_meta("shared_instance").await?);
+        let mut rows = self.conn.query(
+            "SELECT e.id FROM bug_enrichments e JOIN shared_bug_events s ON s.enrichment_id=e.id
+             WHERE e.bug_id IN (SELECT value FROM json_each(?)) AND s.event_key NOT LIKE ?",
+            libsql::params![serde_json::to_string(bug_ids)?, prefix],
+        ).await?;
+        let mut foreign = BTreeSet::new();
+        while let Some(row) = rows.next().await? {
+            foreign.insert(row.get(0)?);
+        }
+        Ok(foreign)
+    }
+
     /// Publish local mutations and import catalog updates. Retries are idempotent.
     pub async fn sync_shared_bugs(&self) -> Result<()> {
         let Some(shared) = &self.shared else {
@@ -721,6 +739,66 @@ fn merge_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn imported_evidence_keeps_raw_input_without_foreign_review_links() -> Result<()> {
+        let mut db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.shared = Some(Arc::new(SharedCatalog {
+            settings: Default::default(),
+            lock: tokio::sync::Mutex::new(()),
+        }));
+        db.migrate().await?;
+        db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
+            .await?;
+        let instance = db.shared_meta("shared_instance").await?;
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()), "title": "local discovery"
+        }))?;
+        let payload = json!({"patchset_id": 123, "patch_id": 456, "review_id": 789, "reasoning": "original evidence"});
+        let id = db
+            .create_bug_with_enrichment(
+                &bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".into(),
+                    data_json: Some(payload.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let (mut record, _, _) = db.shared_snapshot(id, &instance).await?;
+        let local = db.get_bug(id).await?.context("local discovery")?;
+        let evidence = db.bug_evidence(&[local]).await?;
+        assert_eq!(evidence["discoveries"][0]["patchset_id"], 123);
+        assert_eq!(evidence["discoveries"][0]["patch_id"], 456);
+        record.bugid = format!("sashiko-{}", uuid::Uuid::new_v4());
+        record.origin = uuid::Uuid::new_v4().to_string();
+        record.events = record
+            .events
+            .into_iter()
+            .map(|(key, event)| (key.replacen(&instance, &record.origin, 1), event))
+            .collect();
+        db.shared_accept(&record, None, &instance).await?;
+        let imported = db
+            .get_bug_by_bugid(&record.bugid)
+            .await?
+            .context("imported discovery")?;
+        assert_eq!(
+            imported
+                .enrichments
+                .iter()
+                .find(|e| e.kind == "candidate")
+                .and_then(|e| e.data_json.as_ref()),
+            Some(&payload)
+        );
+        let evidence = db.bug_evidence(&[imported]).await?;
+        assert!(evidence["discoveries"][0]["patchset_id"].is_null());
+        assert!(evidence["discoveries"][0]["patch_id"].is_null());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn acknowledgement_keeps_merge_base_after_concurrent_local_edit() -> Result<()> {

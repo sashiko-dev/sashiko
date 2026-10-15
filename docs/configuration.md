@@ -114,8 +114,9 @@ instances change the same triage decision, the catalog decision is retained
 and a conflict event is recorded in the bug's audit history. The originating
 instance runs the bug's analysis; other instances can view and triage it.
 
-Public bug IDs identify shared records. Local patch and review IDs stay in
-their originating database. All instances sharing a catalog must trust the
+Public bug IDs identify shared records. Patch and review relations remain
+local. Original evidence can contain producer-local IDs; imported discoveries
+do not turn them into links in another database. All instances sharing a catalog must trust the
 same subsystem attribution and permission policy. A shared catalog may hold
 multiple projects, with synchronization scoped by the instance's project.
 Use the API for catalog changes so audit history and synchronization remain
