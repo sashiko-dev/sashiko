@@ -129,13 +129,27 @@ pub struct DirectoryUnits {
 impl DirectoryUnits {
     pub fn new(roots: &[String], depth: usize, shallow_files: ShallowFiles) -> Self {
         Self {
-            roots: roots
-                .iter()
-                .map(|r| r.trim().trim_matches('/').to_string())
-                .collect(),
+            roots: roots.iter().map(|r| normalize_root(r)).collect(),
             depth,
             shallow_files,
         }
+    }
+}
+
+/// Normalizes a configured directory root to a repository-relative prefix
+/// without leading `./` or surrounding slashes. The repository root (`.`,
+/// `./` or `/`) normalizes to the empty string. Profile validation rejects
+/// roots that are absolute or contain `..` before they reach this.
+pub fn normalize_root(root: &str) -> String {
+    let mut root = root.trim();
+    while let Some(rest) = root.strip_prefix("./") {
+        root = rest;
+    }
+    let root = root.trim_matches('/');
+    if root == "." {
+        String::new()
+    } else {
+        root.to_string()
     }
 }
 
@@ -147,29 +161,37 @@ impl UnitSource for DirectoryUnits {
     /// directory units never overlap.
     fn owners(&self, path: &str) -> Vec<String> {
         for root in &self.roots {
-            let Some(rel) = path
-                .strip_prefix(root.as_str())
-                .and_then(|r| r.strip_prefix('/'))
-            else {
+            let rel = if root.is_empty() {
+                Some(path)
+            } else {
+                path.strip_prefix(root.as_str())
+                    .and_then(|r| r.strip_prefix('/'))
+            };
+            let Some(rel) = rel else {
                 continue;
             };
             let dirs: Vec<&str> = rel.split('/').collect();
             // The last component is the file name.
             let dir_count = dirs.len().saturating_sub(1);
             let take = dir_count.min(self.depth);
-            let mut unit = root.clone();
-            for dir in &dirs[..take] {
-                unit.push('/');
-                unit.push_str(dir);
+            let mut parts: Vec<&str> = Vec::new();
+            if !root.is_empty() {
+                parts.push(root);
             }
+            parts.extend(&dirs[..take]);
             if take < self.depth && self.shallow_files == ShallowFiles::PerModule {
                 let file_name = dirs[dirs.len() - 1];
-                let stem = file_name
-                    .split_once('.')
-                    .map_or(file_name, |(stem, _)| stem);
-                unit.push('/');
-                unit.push_str(stem);
+                parts.push(
+                    file_name
+                        .split_once('.')
+                        .map_or(file_name, |(stem, _)| stem),
+                );
             }
+            let unit = if parts.is_empty() {
+                ".".to_string()
+            } else {
+                parts.join("/")
+            };
             return vec![unit];
         }
         Vec::new()
@@ -300,6 +322,19 @@ mod tests {
         assert_eq!(source.owners("src/git_ops.rs"), vec!["src/git_ops"]);
         assert_eq!(source.owners("src/git_ops/apply.rs"), vec!["src/git_ops"]);
         assert_eq!(source.owners("src/ai/cache/db.rs"), vec!["src/ai"]);
+    }
+
+    #[test]
+    fn test_directory_units_repository_root() {
+        for root in [".", "./", "/", ""] {
+            let source = DirectoryUnits::new(&[root.to_string()], 1, ShallowFiles::Together);
+            assert_eq!(source.owners("build.rs"), vec!["."], "root {root:?}");
+            assert_eq!(source.owners("src/main.rs"), vec!["src"], "root {root:?}");
+            assert_eq!(source.owners("src/ai/a.rs"), vec!["src"], "root {root:?}");
+        }
+        let source = DirectoryUnits::new(&[".".to_string()], 1, ShallowFiles::PerModule);
+        assert_eq!(source.owners("build.rs"), vec!["build"]);
+        assert_eq!(normalize_root("././src/"), "src");
     }
 
     #[test]

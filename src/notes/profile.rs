@@ -148,8 +148,20 @@ impl NotesProfile {
 
     fn validate(&self) -> Result<()> {
         if let UnitsConfig::Directories { roots, depth, .. } = &self.units {
-            if roots.is_empty() || roots.iter().any(|r| r.trim().is_empty()) {
-                bail!("units.roots must list at least one non-empty directory");
+            if roots.is_empty() {
+                bail!("units.roots must list at least one directory");
+            }
+            for root in roots {
+                let trimmed = root.trim();
+                if trimmed.starts_with('/') && !trimmed.trim_matches('/').is_empty() {
+                    bail!(
+                        "units.roots entry {root:?} is absolute; use a path relative to the \
+                         repository root (\".\" for the root itself)"
+                    );
+                }
+                if trimmed.split('/').any(|part| part == "..") {
+                    bail!("units.roots entry {root:?} must not contain \"..\"");
+                }
             }
             if !(1..=MAX_DIRECTORY_DEPTH).contains(depth) {
                 bail!("units.depth must be between 1 and {MAX_DIRECTORY_DEPTH}, got {depth}");
@@ -285,6 +297,14 @@ component_lines = 4000
             (
                 "[units]\nsource = \"directories\"\nroots = []\n[languages.globs]\nrust = [\"**.rs\"]\n",
                 "units.roots",
+            ),
+            (
+                "[units]\nsource = \"directories\"\nroots = [\"/usr/src\"]\n[languages.globs]\nrust = [\"**.rs\"]\n",
+                "absolute",
+            ),
+            (
+                "[units]\nsource = \"directories\"\nroots = [\"src/../x\"]\n[languages.globs]\nrust = [\"**.rs\"]\n",
+                "must not contain",
             ),
             (
                 "[units]\nsource = \"directories\"\nroots = [\"src\"]\ndepth = 9\n[languages.globs]\nrust = [\"**.rs\"]\n",
