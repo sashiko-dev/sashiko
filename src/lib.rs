@@ -48,6 +48,8 @@ pub mod patch;
 #[cfg(feature = "server")]
 pub mod patchwork;
 #[cfg(feature = "server")]
+pub mod postgres_storage;
+#[cfg(feature = "server")]
 pub mod prerequisites;
 pub mod project;
 pub mod prompt_bundle;
