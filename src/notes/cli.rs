@@ -23,15 +23,18 @@ use clap::Subcommand;
 use crate::git_cmd;
 use crate::maintainers::MaintainersIndex;
 use crate::notes::agenda::load_agenda;
+use crate::notes::agenda_derive;
 use crate::notes::build::{BuildConfig, build_unit};
 use crate::notes::corpus;
 use crate::notes::plan::{build_plan, render_text};
+use crate::notes::profile::Language;
 use crate::notes::profile::{NotesProfile, UnitsConfig, resolve_profile_path};
 use crate::notes::scope::resolve_revision;
 use crate::project::ProjectId;
 use crate::settings::Settings;
 use crate::toolbox::ToolBox;
 use crate::workflow::WorkflowEnv;
+use crate::workflows::notes_agenda::{ModuleSpec, ThemeScope};
 
 /// Default turn budget of one survey, explore or verify stage.
 const DEFAULT_STAGE_TURNS: usize = 30;
@@ -131,6 +134,78 @@ pub enum NotesCommand {
         #[arg(long)]
         profile: Option<PathBuf>,
     },
+
+    /// Derive the agenda from an analyzed corpus and write its modules
+    /// (universal, lang/<language>, domain/<project>) into <out>
+    Agenda {
+        /// Corpus directory written by sashiko notes corpus
+        #[arg(long)]
+        corpus: PathBuf,
+
+        /// Directory for the agenda modules, usually notes/agenda in the
+        /// project's prompt directory
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Most topics in the universal module
+        #[arg(long, default_value_t = 6)]
+        universal_topics: usize,
+
+        /// Most topics in each language module
+        #[arg(long, default_value_t = 2)]
+        language_topics: usize,
+
+        /// Most topics in the domain module
+        #[arg(long, default_value_t = 3)]
+        domain_topics: usize,
+
+        /// Notes profile (default: notes/profile.toml in the project's
+        /// prompt directory)
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+}
+
+/// The modules an agenda derivation writes: the universal one, one per
+/// language the profile names (other than Other), and the project's
+/// domain.
+fn agenda_modules(
+    project: ProjectId,
+    profile: &NotesProfile,
+    universal_topics: usize,
+    language_topics: usize,
+    domain_topics: usize,
+) -> Vec<ModuleSpec> {
+    let mut modules = vec![ModuleSpec {
+        module: "universal".to_string(),
+        scope: ThemeScope::Universal,
+        description: "Knowledge that applies to software of any kind.".to_string(),
+        max_topics: universal_topics,
+    }];
+    for language in profile.languages.globs.keys() {
+        let name = match language {
+            Language::Rust => "rust",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::Other => continue,
+        };
+        modules.push(ModuleSpec {
+            module: format!("lang/{name}"),
+            scope: ThemeScope::Language,
+            description: format!("Knowledge about code written in {language:?} and its runtime."),
+            max_topics: language_topics,
+        });
+    }
+    modules.push(ModuleSpec {
+        module: format!("domain/{}", project.as_str()),
+        scope: ThemeScope::Domain,
+        description: format!(
+            "Knowledge specific to the domain of {}.",
+            project.display_name()
+        ),
+        max_topics: domain_topics,
+    });
+    modules
 }
 
 /// Parses a shard given as "k/n" with k < n.
@@ -299,6 +374,39 @@ pub async fn run(
                 cfg.out_file.display()
             );
             let summary = corpus::analyze(repo, &env, &fixes, &cfg).await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            Ok(())
+        }
+        NotesCommand::Agenda {
+            corpus: corpus_dir,
+            out,
+            universal_topics,
+            language_topics,
+            domain_topics,
+            profile,
+        } => {
+            let settings = settings.context(
+                "notes agenda calls an LLM and needs a settings file (see sashiko init)",
+            )?;
+            let profile_path = resolve_profile_path(prompts_dir, profile.as_deref())?;
+            let profile = NotesProfile::load(&profile_path)?;
+            let (meta, records) = agenda_derive::read_corpus(corpus_dir)?;
+            let modules = agenda_modules(
+                project,
+                &profile,
+                *universal_topics,
+                *language_topics,
+                *domain_topics,
+            );
+            let env = llm_env(settings, repo, prompts_dir, &meta.revision).await?;
+            let cfg = agenda_derive::DeriveConfig {
+                project: project.display_name().to_string(),
+                temperature: settings.ai.temperature,
+                modules,
+                out_dir: out.clone(),
+                work_dir: corpus_dir.join("agenda-work"),
+            };
+            let summary = agenda_derive::derive_agenda(&env, &meta, &records, &cfg).await?;
             println!("{}", serde_json::to_string(&summary)?);
             Ok(())
         }

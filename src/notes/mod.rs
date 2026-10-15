@@ -17,6 +17,7 @@
 //! `designs/DESIGN_CODE_NOTES_ENGINE.md`.
 
 pub mod agenda;
+pub mod agenda_derive;
 pub mod build;
 pub mod cli;
 pub mod components;

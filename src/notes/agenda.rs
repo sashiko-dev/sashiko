@@ -108,7 +108,7 @@ fn is_safe_module_name(module: &str) -> bool {
 }
 
 /// Parses one agenda module into topics.
-fn parse_agenda_module(module: &str, text: &str) -> Result<Vec<Topic>> {
+pub(crate) fn parse_agenda_module(module: &str, text: &str) -> Result<Vec<Topic>> {
     let mut topics: Vec<Topic> = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim_end();
