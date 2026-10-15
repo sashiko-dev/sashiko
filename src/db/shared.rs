@@ -506,13 +506,9 @@ impl Database {
                 let version: i64 = row.get(0)?;
                 let dirty: i64 = row.get(1)?;
                 if dirty != 0 && expected != Some(version) {
-                    if expected.is_some() {
-                        tx.execute(
-                            "UPDATE shared_bug_sync SET base_json=? WHERE bug_id=?",
-                            libsql::params![serde_json::to_string(record)?, bug.id],
-                        )
-                        .await?;
-                    }
+                    // Keep the last accepted base until the current local
+                    // version is merged. Advancing it here would turn remote
+                    // changes into apparent local edits on the next retry.
                     tx.commit().await?;
                     return Ok(());
                 }
@@ -720,4 +716,74 @@ fn merge_value(
         });
     }
     remote.cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn acknowledgement_keeps_merge_base_after_concurrent_local_edit() -> Result<()> {
+        let mut db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.shared = Some(Arc::new(SharedCatalog {
+            settings: Default::default(),
+            lock: tokio::sync::Mutex::new(()),
+        }));
+        db.migrate().await?;
+        db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
+            .await?;
+        let instance = db.shared_meta("shared_instance").await?;
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()),
+            "title": "original title", "lifecycle_status": "open"
+        }))?;
+        let id = db.create_bug(&bug).await?;
+        let (base, _, version) = db.shared_snapshot(id, &instance).await?;
+        db.shared_accept(&base, Some(version), &instance).await?;
+        db.set_bug_lifecycle_status(id, BugLifecycleStatus::Dismissed)
+            .await?;
+        let (local, base, version) = db.shared_snapshot(id, &instance).await?;
+        let mut remote = base.clone().context("accepted catalog base")?;
+        remote.triage.status = BugLifecycleStatus::Fixed;
+        remote.title = "catalog title".into();
+        let merged = merge_record(base.as_ref(), &local, Some(&remote), version, &instance)?;
+
+        // Another local write commits while publication is awaiting its ack.
+        db.add_bug_enrichment(
+            id,
+            &NewBugEnrichment {
+                kind: "comment".into(),
+                content: Some("concurrent evidence".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        db.shared_accept(&merged, Some(version), &instance).await?;
+        let (pending, retry_base, retry_version) = db.shared_snapshot(id, &instance).await?;
+        assert!(db.shared_bug_pending_ids().await?.contains(&id));
+        assert!(retry_base == base);
+        let retry = merge_record(
+            retry_base.as_ref(),
+            &pending,
+            Some(&merged),
+            retry_version,
+            &instance,
+        )?;
+        assert_eq!(retry.triage.status, BugLifecycleStatus::Fixed);
+        assert_eq!(retry.title, "catalog title");
+        assert!(
+            retry
+                .events
+                .values()
+                .any(|e| e.content.as_deref() == Some("concurrent evidence"))
+        );
+        db.shared_accept(&retry, Some(retry_version), &instance)
+            .await?;
+        assert!(db.shared_bug_pending_ids().await?.is_empty());
+        Ok(())
+    }
 }
