@@ -118,6 +118,24 @@ async fn shared_duplicate_chain(
 }
 
 impl Record {
+    fn validate(&self, project: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.bugid.starts_with(&format!("{project}-")) && !self.origin.is_empty(),
+            "shared catalog project or origin mismatch"
+        );
+        anyhow::ensure!(
+            (self.triage.status == BugLifecycleStatus::Duplicate)
+                == self.triage.duplicate_of.is_some(),
+            "invalid shared bug triage for {}",
+            self.bugid
+        );
+        anyhow::ensure!(
+            self.triage.duplicate_of.as_ref() != Some(&self.bugid),
+            "shared bug cannot duplicate itself"
+        );
+        Ok(())
+    }
+
     fn add_conflict(&mut self, conflict: MergeConflict, version: i64, instance: &str) {
         let field = conflict.field;
         let key = format!("conflict:{instance}:{}:{version}:{field}", self.bugid);
@@ -243,10 +261,15 @@ impl Database {
         if self.shared.is_none() || scope.is_some_and(<[i64]>::is_empty) {
             return Ok(BTreeSet::new());
         }
-        let mut sql = "SELECT bug_id FROM shared_bug_sync WHERE dirty=1".to_string();
+        // Legacy reports from other projects remain local. Publishing them
+        // under this project's key would poison every peer's import cursor.
+        let mut sql = "SELECT s.bug_id FROM shared_bug_sync s JOIN bugs b ON b.id=s.bug_id
+            WHERE s.dirty=1 AND b.bugid GLOB
+                (SELECT value || '-*' FROM meta WHERE key='project')"
+            .to_string();
         let mut params = Vec::<libsql::Value>::new();
         if let Some(scope) = scope {
-            sql.push_str(" AND bug_id IN (SELECT value FROM json_each(?))");
+            sql.push_str(" AND s.bug_id IN (SELECT value FROM json_each(?))");
             params.push(serde_json::to_string(scope)?.into());
         }
         let mut rows = self.conn.query(&sql, params).await?;
@@ -371,6 +394,7 @@ impl Database {
                 .transpose()?;
             let mut merged =
                 merge_record(base.as_ref(), &local, prior.as_ref(), version, &instance)?;
+            merged.validate(&project)?;
             // Validate relations under the catalog write lock. Independent
             // local decisions can otherwise form a cross-instance cycle.
             match shared_duplicate_chain(&tx, &project, &merged).await? {
@@ -629,16 +653,7 @@ impl Database {
         instance: &str,
     ) -> Result<()> {
         let project = self.shared_meta("project").await?;
-        anyhow::ensure!(
-            record.bugid.starts_with(&format!("{project}-")) && !record.origin.is_empty(),
-            "shared catalog project or origin mismatch"
-        );
-        anyhow::ensure!(
-            (record.triage.status == BugLifecycleStatus::Duplicate)
-                == record.triage.duplicate_of.is_some(),
-            "invalid shared bug triage for {}",
-            record.bugid
-        );
+        record.validate(&project)?;
         let tx = self.begin_transaction().await?;
         let db = self.with_connection((*tx).clone());
         let existing = db.get_bug_by_bugid(&record.bugid).await?;
@@ -662,10 +677,6 @@ impl Database {
             }
         }
         let duplicate = if let Some(target) = &record.triage.duplicate_of {
-            anyhow::ensure!(
-                target != &record.bugid,
-                "shared bug cannot duplicate itself"
-            );
             Some(
                 db.get_bug_by_bugid(target)
                     .await?

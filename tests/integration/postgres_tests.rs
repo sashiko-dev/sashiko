@@ -369,9 +369,23 @@ async fn exercise_shared(
         )
         .await?;
     assert!(first.shared_bug_pending_ids().await?.contains(&id));
+    let legacy: NewBug = serde_json::from_value(json!({
+        "bugid": format!("linux-{}", uuid::Uuid::new_v4()),
+        "title": "legacy report from another project",
+        "pipeline_state": "succeeded", "lifecycle_status": "open"
+    }))?;
+    let legacy_id = first.create_bug(&legacy).await?;
+    assert!(
+        first
+            .shared_bug_pending_ids_for(&[legacy_id])
+            .await?
+            .is_empty()
+    );
     first.sync_shared_bugs().await?;
     assert!(first.shared_bug_pending_ids().await?.is_empty());
     second.sync_shared_bugs().await?;
+    assert!(first.get_bug(legacy_id).await?.is_some());
+    assert!(second.get_bug_by_bugid(&legacy.bugid).await?.is_none());
     let mirror = second
         .get_bug_by_bugid(&bug.bugid)
         .await?
