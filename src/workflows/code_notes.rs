@@ -887,10 +887,18 @@ For EVERY fact, read the code yourself with the tools and decide:
 - "refuted": the code contradicts the statement, or the statement overgeneralizes. Give the counter-evidence.
 - "unverifiable": you cannot establish it either way from the code.
 
-Do not give the statement the benefit of the doubt: confirming requires code that proves it, not the absence of counter-examples you happened to find. A fact whose "evidence_checks" show a failed check cited code that does not exist at the cited place; confirm it only if you find correct evidence yourself.
+Check every clause separately. A stated purpose or consequence ("so that", "which prevents", "because") needs a comment, test or traced code that shows it, and "always", "never", "only", "every" or "cannot" needs every caller, path or variant checked. If any clause is unsupported or overstated, the verdict is "refuted" and the reasoning names that clause.
+
+Do not give the statement the benefit of the doubt: confirming requires code that proves it, not the absence of counter-examples you happened to find.
+
+Also judge each fact's "review_value" for a reviewer of future patches:
+- "patch_rule": it states something a future patch must preserve, and its "violated_by" describes a plausible patch that would break it;
+- "existing_weakness": it criticizes the current code (a missing limit, an inefficiency, a panic path) rather than stating what to preserve;
+- "description": it restates what the code plainly does, or lists values whose exact amounts are not a contract;
+- "unknown": you cannot tell. A fact whose "evidence_checks" show a failed check cited code that does not exist at the cited place; confirm it only if you find correct evidence yourself.
 
 Return ONLY a JSON object with one verdict per fact:
-{"verdicts": [{"fact_id": "F1", "verdict": "confirmed", "reasoning": "...", "evidence": [{"path": "path", "start_line": 10, "end_line": 14, "snippet": "verbatim code"}]}]}"##;
+{"verdicts": [{"fact_id": "F1", "verdict": "confirmed", "review_value": "patch_rule", "reasoning": "...", "evidence": [{"path": "path", "start_line": 10, "end_line": 14, "snippet": "verbatim code"}]}]}"##;
 
 /// One verify stage for a batch of facts.
 pub fn verify_stage(
@@ -1147,7 +1155,7 @@ pub fn verdicts_by_id(verdicts: &[FactVerdict]) -> HashMap<&str, &FactVerdict> {
 mod tests {
     use super::*;
     use crate::notes::agenda::Question;
-    use crate::notes::facts::{FactKind, FactScope};
+    use crate::notes::facts::{FactKind, FactScope, ReviewValue};
 
     fn topic(id: &str, questions: &[&str]) -> Topic {
         Topic {
@@ -1424,12 +1432,14 @@ mod tests {
         let confirmed = FactVerdict {
             fact_id: "F1".to_string(),
             verdict: VerdictKind::Confirmed,
+            review_value: ReviewValue::PatchRule,
             reasoning: "seen".to_string(),
             evidence: fact("x", &[], "code").evidence,
         };
         let refuted = FactVerdict {
             fact_id: "F2".to_string(),
             verdict: VerdictKind::Refuted,
+            review_value: ReviewValue::Unknown,
             reasoning: "caller holds it".to_string(),
             evidence: vec![],
         };

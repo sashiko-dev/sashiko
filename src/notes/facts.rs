@@ -107,11 +107,28 @@ pub enum VerdictKind {
     Unverifiable,
 }
 
+/// What a fact is worth to a reviewer of future patches, as the verifier
+/// judges it. Only patch rules reach a note.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewValue {
+    /// Something a future patch must preserve.
+    PatchRule,
+    /// A criticism of the current code rather than a rule to preserve.
+    ExistingWeakness,
+    /// A restatement of what the code plainly does, or a list of values.
+    Description,
+    #[default]
+    Unknown,
+}
+
 /// A verdict with the verifier's reasoning and its own evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactVerdict {
     pub fact_id: String,
     pub verdict: VerdictKind,
+    #[serde(default)]
+    pub review_value: ReviewValue,
     pub reasoning: String,
     #[serde(default)]
     pub evidence: Vec<Evidence>,

@@ -29,7 +29,7 @@ use tracing::{info, warn};
 use crate::git_cmd;
 use crate::notes::agenda::Agenda;
 use crate::notes::evidence::RevisionFiles;
-use crate::notes::facts::{FactVerdict, VerdictKind, VerifiedFact};
+use crate::notes::facts::{FactVerdict, ReviewValue, VerdictKind, VerifiedFact};
 use crate::notes::history::{HistoryCase, unit_history};
 use crate::notes::output::{ManifestFile, ManifestUnit, UnitFacts, write_unit};
 use crate::notes::plan::UnitPlan;
@@ -92,6 +92,9 @@ pub struct UnitBuildSummary {
     pub confirmed: usize,
     pub refuted: usize,
     pub unverifiable: usize,
+    /// Confirmed facts kept out of the note because the verifier judged
+    /// them not to be patch rules.
+    pub not_patch_rules: usize,
     pub note_bytes: usize,
     /// The note was rendered deterministically because synthesis failed.
     pub synthesis_fallback: bool,
@@ -287,10 +290,8 @@ pub async fn build_unit(
             VerdictKind::Unverifiable => summary.unverifiable += 1,
         }
     }
-    let confirmed: Vec<&VerifiedFact> = verified
-        .iter()
-        .filter(|v| v.verdict.verdict == VerdictKind::Confirmed)
-        .collect();
+    let confirmed = noted_facts(&verified);
+    summary.not_patch_rules = summary.confirmed - confirmed.len();
 
     // 6. Synthesize the note.
     let note = match load_text(&work, "note.md", cfg.resume)? {
@@ -588,12 +589,23 @@ fn verified_facts(checked: &[CheckedFact], verdicts: &[FactVerdict]) -> Vec<Veri
                 || FactVerdict {
                     fact_id: c.fact.id.clone(),
                     verdict: VerdictKind::Unverifiable,
+                    review_value: ReviewValue::Unknown,
                     reasoning: "No verdict: the verify stage for this fact failed.".to_string(),
                     evidence: Vec::new(),
                 },
                 |v| (*v).clone(),
             ),
         })
+        .collect()
+}
+
+/// The facts a note is written from: confirmed, and judged to be rules a
+/// future patch must preserve.
+fn noted_facts(verified: &[VerifiedFact]) -> Vec<&VerifiedFact> {
+    verified
+        .iter()
+        .filter(|v| v.verdict.verdict == VerdictKind::Confirmed)
+        .filter(|v| v.verdict.review_value == ReviewValue::PatchRule)
         .collect()
 }
 
@@ -777,6 +789,7 @@ mod tests {
         let verdicts = vec![FactVerdict {
             fact_id: "F1".to_string(),
             verdict: VerdictKind::Confirmed,
+            review_value: ReviewValue::PatchRule,
             reasoning: "r".to_string(),
             evidence: vec![],
         }];
@@ -793,6 +806,7 @@ mod tests {
         let verdict = |snippet: &str| FactVerdict {
             fact_id: "F1".to_string(),
             verdict: VerdictKind::Confirmed,
+            review_value: ReviewValue::PatchRule,
             reasoning: "r".to_string(),
             evidence: vec![Evidence {
                 path: "a.rs".to_string(),
@@ -836,6 +850,7 @@ mod tests {
                 verdict: FactVerdict {
                     fact_id: fact.id.clone(),
                     verdict: VerdictKind::Confirmed,
+                    review_value: ReviewValue::PatchRule,
                     reasoning: "r".to_string(),
                     evidence: vec![],
                 },
@@ -850,6 +865,31 @@ mod tests {
         assert!(note.contains("- Hold A before B. [F1]"));
         let short = fallback_note("u", &survey, &refs, 40);
         assert!(short.len() <= 40);
+    }
+
+    #[test]
+    fn test_noted_facts_keep_confirmed_patch_rules() {
+        let checked = vec![checked("F1"), checked("F2"), checked("F3")];
+        let verdict = |id: &str, verdict: VerdictKind, review_value: ReviewValue| FactVerdict {
+            fact_id: id.to_string(),
+            verdict,
+            review_value,
+            reasoning: "r".to_string(),
+            evidence: vec![],
+        };
+        let verified = verified_facts(
+            &checked,
+            &[
+                verdict("F1", VerdictKind::Confirmed, ReviewValue::PatchRule),
+                verdict("F2", VerdictKind::Confirmed, ReviewValue::ExistingWeakness),
+                verdict("F3", VerdictKind::Refuted, ReviewValue::PatchRule),
+            ],
+        );
+        let noted: Vec<&str> = noted_facts(&verified)
+            .iter()
+            .map(|v| v.fact.id.as_str())
+            .collect();
+        assert_eq!(noted, vec!["F1"]);
     }
 
     #[test]
