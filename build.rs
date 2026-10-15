@@ -20,10 +20,13 @@ use std::path::{Path, PathBuf};
 #[path = "src/prompt_fingerprint.rs"]
 mod prompt_fingerprint;
 
+include!("src/prompt_namespaces.rs");
+
 fn main() {
     println!("cargo:rerun-if-changed=third_party/prompts");
     println!("cargo:rerun-if-changed=projects");
     println!("cargo:rerun-if-changed=src/prompt_fingerprint.rs");
+    println!("cargo:rerun-if-changed=src/prompt_namespaces.rs");
 
     track_git_changes();
 
@@ -61,6 +64,20 @@ fn main() {
             panic!(
                 "prompt {relative} exists in both third_party/prompts and projects; \
                  they share one bundle namespace, so one would silently shadow the other"
+            );
+        }
+    }
+    // Several projects/ directories can map to one namespace, so the
+    // first-party tree can collide with itself too. It is sorted by bundle
+    // path, which puts any duplicates next to each other.
+    for pair in first_party.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            panic!(
+                "prompt {} is provided by both {} and {}; they map to the same \
+                 bundle namespace, so one would silently shadow the other",
+                pair[0].0,
+                pair[0].1.display(),
+                pair[1].1.display()
             );
         }
     }
@@ -143,7 +160,8 @@ fn collect_root(root: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
-/// Every file under `projects/<project>/prompts/`, as (`<project>/<relative>`, source path).
+/// Every file under `projects/<project>/prompts/`, as (`<namespace>/<relative>`,
+/// source path), where the namespace comes from `PROJECT_PROMPT_NAMESPACES`.
 fn collect_projects_prompts(projects_dir: &Path) -> Vec<(String, PathBuf)> {
     let mut files = Vec::new();
     let entries = fs::read_dir(projects_dir).unwrap_or_else(|e| {
@@ -160,6 +178,10 @@ fn collect_projects_prompts(projects_dir: &Path) -> Vec<(String, PathBuf)> {
             continue;
         }
         let project_name = entry.file_name().to_string_lossy().into_owned();
+        let namespace = PROJECT_PROMPT_NAMESPACES
+            .iter()
+            .find(|(dir, _)| *dir == project_name)
+            .map_or(project_name.as_str(), |(_, namespace)| namespace);
         let prompts_dir = project_path.join("prompts");
         if !prompts_dir.is_dir() {
             continue;
@@ -169,7 +191,7 @@ fn collect_projects_prompts(projects_dir: &Path) -> Vec<(String, PathBuf)> {
             panic!("failed to read prompt root {}: {e}", prompts_dir.display())
         });
         for (rel, abs) in project_files {
-            files.push((format!("{project_name}/{rel}"), abs));
+            files.push((format!("{namespace}/{rel}"), abs));
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));

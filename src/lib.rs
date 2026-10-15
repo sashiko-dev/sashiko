@@ -54,6 +54,7 @@ pub mod patchwork;
 pub mod prerequisites;
 pub mod project;
 pub mod prompt_bundle;
+pub mod prompt_namespaces;
 #[cfg(feature = "server")]
 pub mod reviewer;
 #[cfg(feature = "server")]
