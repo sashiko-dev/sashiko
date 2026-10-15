@@ -37,7 +37,14 @@ pub enum CompiledPattern {
     /// Exact file path match `dir/file.c`.
     ExactFile { path: String, depth: usize },
     /// General glob pattern converted to regex (e.g. `*/net/*` or `arch/*/include/*`).
-    Glob { regex: Regex, depth: usize },
+    /// `anchor` is the literal directory prefix before the first wildcard
+    /// (`arch/` for `arch/*/include/*`, empty for `*/net/*`); every matching
+    /// path starts with it.
+    Glob {
+        regex: Regex,
+        depth: usize,
+        anchor: String,
+    },
 }
 
 impl CompiledPattern {
@@ -62,7 +69,13 @@ impl CompiledPattern {
         } else {
             let re_str = glob_to_regex(pattern);
             let regex = Regex::new(&re_str).unwrap_or_else(|_| Regex::new("a^").unwrap());
-            CompiledPattern::Glob { regex, depth }
+            let literal_end = pattern.find(['*', '?']).unwrap_or(pattern.len());
+            let anchor_end = pattern[..literal_end].rfind('/').map_or(0, |i| i + 1);
+            CompiledPattern::Glob {
+                regex,
+                depth,
+                anchor: pattern[..anchor_end].to_string(),
+            }
         }
     }
 
@@ -223,6 +236,138 @@ impl MaintainerSection {
         }
 
         best_depth
+    }
+}
+
+/// `(section index, pattern depth)` pairs sharing one lookup key.
+type SectionHits = Vec<(usize, usize)>;
+
+/// Answers [`MaintainersIndex::match_file`] for many paths at once.
+///
+/// `match_file` tests every pattern of every section, which is fine for the
+/// handful of files in a patch but takes minutes for a whole kernel tree
+/// (some 90,000 files against roughly 10,000 `F:` patterns). This matcher
+/// buckets patterns by the directory they are anchored to, so a file is only
+/// compared with patterns anchored at one of its ancestor directories. Its
+/// results are identical to `match_file`.
+pub struct FileMatcher<'a> {
+    sections: &'a [MaintainerSection],
+    exact: HashMap<&'a str, SectionHits>,
+    prefix_dirs: HashMap<&'a str, SectionHits>,
+    single_level: HashMap<&'a str, SectionHits>,
+    globs: HashMap<&'a str, Vec<(usize, &'a Regex, usize)>>,
+    with_regexes: Vec<usize>,
+}
+
+impl<'a> FileMatcher<'a> {
+    fn new(sections: &'a [MaintainerSection]) -> Self {
+        let mut matcher = Self {
+            sections,
+            exact: HashMap::new(),
+            prefix_dirs: HashMap::new(),
+            single_level: HashMap::new(),
+            globs: HashMap::new(),
+            with_regexes: Vec::new(),
+        };
+        for (idx, section) in sections.iter().enumerate() {
+            if !section.regexes.is_empty() {
+                matcher.with_regexes.push(idx);
+            }
+            for pattern in &section.files {
+                let depth = pattern.depth();
+                match pattern {
+                    CompiledPattern::ExactFile { path, .. } => {
+                        matcher.exact.entry(path).or_default().push((idx, depth));
+                    }
+                    CompiledPattern::PrefixDir { prefix, .. } => {
+                        matcher
+                            .prefix_dirs
+                            .entry(prefix)
+                            .or_default()
+                            .push((idx, depth));
+                    }
+                    CompiledPattern::DirSingleLevel { dir_prefix, .. } => {
+                        matcher
+                            .single_level
+                            .entry(dir_prefix)
+                            .or_default()
+                            .push((idx, depth));
+                    }
+                    CompiledPattern::Glob { regex, anchor, .. } => {
+                        matcher
+                            .globs
+                            .entry(anchor)
+                            .or_default()
+                            .push((idx, regex, depth));
+                    }
+                }
+            }
+        }
+        matcher
+    }
+
+    /// Matched section names for `file_path`, most specific first, exactly
+    /// as [`MaintainersIndex::match_file`] returns them.
+    pub fn match_file(&self, file_path: &str) -> Vec<String> {
+        let path = file_path.trim_start_matches("./");
+        let mut best: HashMap<usize, usize> = HashMap::new();
+        let mut record = |idx: usize, depth: usize| {
+            best.entry(idx)
+                .and_modify(|d| *d = (*d).max(depth))
+                .or_insert(depth);
+        };
+
+        for &(idx, depth) in self.exact.get(path).into_iter().flatten() {
+            record(idx, depth);
+        }
+        let parent_end = path.rfind('/').map_or(0, |i| i + 1);
+        for &(idx, depth) in self
+            .single_level
+            .get(&path[..parent_end])
+            .into_iter()
+            .flatten()
+        {
+            record(idx, depth);
+        }
+        // Every ancestor directory prefix ("a/", "a/b/", ...), plus the
+        // empty anchor of globs that start with a wildcard.
+        let ancestors = std::iter::once(0)
+            .chain(path.match_indices('/').map(|(i, _)| i + 1))
+            .map(|end| &path[..end]);
+        for prefix in ancestors {
+            for &(idx, depth) in self.prefix_dirs.get(prefix).into_iter().flatten() {
+                record(idx, depth);
+            }
+            for &(idx, regex, depth) in self.globs.get(prefix).into_iter().flatten() {
+                if regex.is_match(path) {
+                    record(idx, depth);
+                }
+            }
+        }
+
+        let excluded = |idx: usize| self.sections[idx].excludes.iter().any(|x| x.is_match(path));
+        best.retain(|idx, _| !excluded(*idx));
+        for &idx in &self.with_regexes {
+            if !best.contains_key(&idx)
+                && !excluded(idx)
+                && self.sections[idx]
+                    .regexes
+                    .iter()
+                    .any(|re| re.is_match(path))
+            {
+                best.insert(idx, 0);
+            }
+        }
+
+        let mut matches: Vec<(&MaintainerSection, usize)> = best
+            .into_iter()
+            .map(|(idx, depth)| (&self.sections[idx], depth))
+            .collect();
+        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name)));
+        matches
+            .into_iter()
+            .map(|(sec, _)| sec.name.clone())
+            .collect()
     }
 }
 
@@ -471,6 +616,11 @@ impl MaintainersIndex {
         Ok(Self::from_sections(sections))
     }
 
+    /// Builds a [`FileMatcher`] for matching many paths against this index.
+    pub fn file_matcher(&self) -> FileMatcher<'_> {
+        FileMatcher::new(&self.sections)
+    }
+
     /// Matches a single file path against all MAINTAINERS sections.
     /// Returns matched section names ordered by pattern specificity (deepest match first).
     pub fn match_file(&self, file_path: &str) -> Vec<String> {
@@ -616,6 +766,90 @@ pub fn sections_for_diff(diff: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_file_matcher_agrees_with_match_file() {
+        let maintainers = "\
+Maintainers List
+----------------
+
+ARM PORT
+M:\tA <a@example.com>
+F:\tarch/arm/
+F:\tarch/*/include/asm/io.h
+X:\tarch/arm/boot/dts/
+
+ARM DTS
+M:\tB <b@example.com>
+F:\tarch/arm/boot/dts/*
+F:\tarch/arm/boot/dts/**/*.dtsi
+
+NET
+M:\tC <c@example.com>
+F:\tnet/
+F:\tinclude/net/*
+F:\t*/net/*.h
+F:\t./drivers/net/Kconfig
+X:\tnet/sched/
+N:\tnetdev
+
+SCHED
+M:\tD <d@example.com>
+F:\tnet/sched/sch_?fq.c
+N:\t[^a-z]sched[^a-z]
+
+TOPLEVEL
+M:\tE <e@example.com>
+F:\tMakefile
+F:\t*.txt
+
+THE REST
+M:\tF <f@example.com>
+F:\t*
+F:\t*/
+";
+        let index = MaintainersIndex::from_reader(maintainers.as_bytes()).unwrap();
+        let matcher = index.file_matcher();
+        let paths = [
+            "arch/arm/kernel/setup.c",
+            "arch/arm/boot/dts/foo.dts",
+            "arch/arm/boot/dts/vendor/board.dtsi",
+            "arch/x86/include/asm/io.h",
+            "arch/x86/include/asm/io.c",
+            "net/core/dev.c",
+            "net/sched/sch_ffq.c",
+            "net/sched/sch_fq.c",
+            "net/sched/cls_api.c",
+            "include/net/sock.h",
+            "include/net/sub/x.h",
+            "drivers/net/Kconfig",
+            "./drivers/net/Kconfig",
+            "drivers/infiniband/net/netdev_x.h",
+            "tools/netdev/main.c",
+            "Makefile",
+            "README.txt",
+            "Documentation/x.txt",
+            "lib/sched/x.c",
+            "kernel/fork.c",
+        ];
+        for path in paths {
+            assert_eq!(
+                matcher.match_file(path),
+                index.match_file(path),
+                "matchers disagree for {path}"
+            );
+        }
+        assert!(
+            matcher
+                .match_file("net/sched/cls_api.c")
+                .contains(&"SCHED".to_string())
+        );
+        assert!(
+            !matcher
+                .match_file("net/sched/cls_api.c")
+                .contains(&"NET".to_string())
+        );
+    }
 
     const SAMPLE_MAINTAINERS: &str = r#"
 Maintainers List

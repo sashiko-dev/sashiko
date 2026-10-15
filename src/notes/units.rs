@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::maintainers::MaintainersIndex;
+use crate::maintainers::{FileMatcher, MaintainersIndex};
 use crate::notes::profile::{ShallowFiles, UnitsConfig};
 use crate::notes::scope::SourceFile;
 
@@ -180,7 +180,7 @@ impl UnitSource for DirectoryUnits {
 /// Catch-all sections (`F: *`) never own files: a file only they match is
 /// unassigned rather than explored as part of a tree-wide unit.
 pub struct MaintainersUnits<'a> {
-    index: &'a MaintainersIndex,
+    matcher: FileMatcher<'a>,
     catch_all: HashSet<String>,
 }
 
@@ -192,13 +192,16 @@ impl<'a> MaintainersUnits<'a> {
             .filter(|s| s.catch_all)
             .map(|s| s.name.clone())
             .collect();
-        Self { index, catch_all }
+        Self {
+            matcher: index.file_matcher(),
+            catch_all,
+        }
     }
 }
 
 impl UnitSource for MaintainersUnits<'_> {
     fn owners(&self, path: &str) -> Vec<String> {
-        self.index
+        self.matcher
             .match_file(path)
             .into_iter()
             .filter(|name| !self.catch_all.contains(name))
