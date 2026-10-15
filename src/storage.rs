@@ -33,6 +33,8 @@ pub enum Error {
     Postgres(#[from] tokio_postgres::Error),
     #[error("could not reconnect PostgreSQL session: {0}")]
     Reconnect(#[source] anyhow::Error),
+    #[error("PostgreSQL session was canceled")]
+    Canceled,
     #[error("invalid database value: {0}")]
     Value(String),
 }
@@ -48,9 +50,41 @@ pub struct PgConfig {
 
 struct PgConnection {
     client: Mutex<tokio_postgres::Client>,
+    driver: std::sync::Mutex<PgDriver>,
     config: PgConfig,
     session: PgSession,
     active: AtomicBool,
+    broken: AtomicBool,
+}
+
+struct PgDriver(tokio::task::JoinHandle<()>);
+
+impl Drop for PgDriver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct PgCall<'a> {
+    connection: &'a PgConnection,
+    complete: bool,
+}
+
+impl<'a> PgCall<'a> {
+    fn new(connection: &'a PgConnection) -> Self {
+        Self {
+            connection,
+            complete: false,
+        }
+    }
+}
+
+impl Drop for PgCall<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.connection.abort();
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,14 +95,35 @@ enum PgSession {
 }
 
 impl PgConnection {
+    fn driver(&self) -> std::sync::MutexGuard<'_, PgDriver> {
+        self.driver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn abort(&self) {
+        self.broken.store(true, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.driver().0.abort();
+    }
+
     async fn client(&self) -> Result<tokio::sync::MutexGuard<'_, tokio_postgres::Client>> {
         let mut client = self.client.lock().await;
-        if self.session == PgSession::Regular && client.is_closed() {
+        let broken = self.broken.load(Ordering::Acquire);
+        if self.session != PgSession::Regular && broken {
+            return Err(Error::Canceled);
+        }
+        if self.session == PgSession::Regular && (broken || client.is_closed()) {
             let replacement = Connection::connect_postgres(self.config.clone(), PgSession::Regular)
                 .await
                 .map_err(Error::Reconnect)?;
             if let Backend::Postgres(replacement) = replacement.0 {
-                std::mem::swap(&mut *client, &mut *replacement.client.lock().await);
+                let mut replacement_client = replacement.client.lock().await;
+                let mut driver = self.driver();
+                let mut replacement_driver = replacement.driver();
+                std::mem::swap(&mut *client, &mut *replacement_client);
+                std::mem::swap(&mut *driver, &mut *replacement_driver);
+                self.broken.store(false, Ordering::Release);
             }
         }
         Ok(client)
@@ -111,15 +166,15 @@ impl Connection {
         };
         let conn = Self::connect_postgres(connection.config.clone(), PgSession::DedupLock).await?;
         if let Backend::Postgres(connection) = &conn.0 {
-            connection
-                .client
-                .lock()
-                .await
+            let client = connection.client.lock().await;
+            let mut call = PgCall::new(connection);
+            client
                 .query_one(
                     "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtext($1),$2)",
                     &[&connection.config.schema, &(WRITE_LOCK + 1)],
                 )
                 .await?;
+            call.complete = true;
         }
         Ok(Some(conn))
     }
@@ -145,11 +200,11 @@ impl Connection {
                 config.tls.clone(),
             ))
             .await?;
-        tokio::spawn(async move {
+        let driver = PgDriver(tokio::spawn(async move {
             if let Err(error) = driver.await {
                 tracing::warn!("PostgreSQL connection ended: {error}");
             }
-        });
+        }));
         let schema = format!("\"{}\"", config.schema);
         if !transaction {
             let tx = client.transaction().await?;
@@ -175,9 +230,11 @@ impl Connection {
         }
         Ok(Self(Backend::Postgres(Arc::new(PgConnection {
             client: Mutex::new(client),
+            driver: std::sync::Mutex::new(driver),
             config,
             session,
             active: AtomicBool::new(transaction),
+            broken: AtomicBool::new(false),
         }))))
     }
 
@@ -188,6 +245,7 @@ impl Connection {
                 let params = positional(params)?;
                 let sql = placeholders(sql)?;
                 let mut client = conn.client().await?;
+                let mut call = PgCall::new(conn);
                 let values = if conn.session == PgSession::Transaction {
                     pg_query(&*client, &sql, params).await?
                 } else {
@@ -197,6 +255,7 @@ impl Connection {
                     tx.commit().await?;
                     values
                 };
+                call.complete = true;
                 Ok(Rows::Postgres(values.into()))
             }
         }
@@ -209,6 +268,7 @@ impl Connection {
                 let params = positional(params)?;
                 let sql = placeholders(sql)?;
                 let mut client = conn.client().await?;
+                let mut call = PgCall::new(conn);
                 let control = matches!(
                     sql.trim()
                         .trim_end_matches(';')
@@ -219,9 +279,10 @@ impl Connection {
                 if control {
                     client.batch_execute(&sql).await?;
                     conn.active.store(false, Ordering::Release);
+                    call.complete = true;
                     return Ok(0);
                 }
-                if conn.session == PgSession::Transaction {
+                let result = if conn.session == PgSession::Transaction {
                     pg_execute(&*client, &sql, params).await
                 } else {
                     let tx = client.transaction().await?;
@@ -229,7 +290,9 @@ impl Connection {
                     let count = pg_execute(&tx, &sql, params).await?;
                     tx.commit().await?;
                     Ok(count)
-                }
+                };
+                call.complete = result.is_ok();
+                result
             }
         }
     }
@@ -241,6 +304,7 @@ impl Connection {
             }
             Backend::Postgres(conn) => {
                 let mut client = conn.client().await?;
+                let mut call = PgCall::new(conn);
                 if conn.session == PgSession::Transaction {
                     client.batch_execute(sql).await?;
                 } else {
@@ -249,6 +313,7 @@ impl Connection {
                     tx.batch_execute(sql).await?;
                     tx.commit().await?;
                 }
+                call.complete = true;
             }
         }
         Ok(())
@@ -307,13 +372,10 @@ impl Drop for Transaction {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(native))).is_err() {
                 tracing::warn!("Suppressed libSQL rollback panic while closing a transaction");
             }
-        } else if !self.conn.is_autocommit() {
-            let conn = self.conn.clone();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                });
-            }
+        } else if !self.conn.is_autocommit()
+            && let Backend::Postgres(connection) = &self.conn.0
+        {
+            connection.abort();
         }
     }
 }

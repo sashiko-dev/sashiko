@@ -95,6 +95,19 @@ async fn backend_pid(conn: &sashiko::storage::Connection) -> Result<i32> {
 
 async fn exercise_connection_recovery(db: &Database, settings: &StorageSettings) -> Result<()> {
     let control = postgres_control(settings).await?;
+    let original = backend_pid(&db.conn).await?;
+    let tx = db.begin_transaction().await?;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            db.conn.query("SELECT 1", ()),
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    // Canceling a regular operation must discard its uncertain protocol state.
+    assert_ne!(backend_pid(&db.conn).await?, original);
     let prior = backend_pid(&db.conn).await?;
     control
         .query_one("SELECT pg_terminate_backend($1,5000)", &[&prior])
