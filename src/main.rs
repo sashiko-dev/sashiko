@@ -1154,12 +1154,15 @@ async fn run_daemon(
 
     let shared_bug_sync_handle = if db.has_shared_bug_catalog() {
         let shared_db = db.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                if let Err(error) = shared_db.sync_shared_bugs().await {
-                    warn!("Shared bug catalog synchronization will retry: {error:#}");
+        Some(spawn_supervised_worker("SharedBugCatalog", move || {
+            let shared_db = Arc::clone(&shared_db);
+            async move {
+                loop {
+                    if let Err(error) = shared_db.sync_shared_bugs().await {
+                        warn!("Shared bug catalog synchronization will retry: {error:#}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }))
     } else {

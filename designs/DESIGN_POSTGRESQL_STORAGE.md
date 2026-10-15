@@ -94,6 +94,14 @@ base snapshot permits a three-way merge: independent edits and evidence combine,
 while concurrent triage or assignment conflicts retain the catalog decision and
 record a conflict event. A failed publication stays queued for retry.
 
+Each synchronization pass handles at most 100 publications and 100 imports.
+Queue positions are durable and deferred reports move behind other pending
+work. Imports load one payload at a time, including when resolving duplicate
+targets. Canonical outcomes and their duplicate reports receive publication
+priority. Deduplication waits until committed catalog updates are imported.
+A five-minute coordination deadline cancels interrupted sessions, and the
+daemon supervisor restarts a failed background synchronization task.
+
 A local mirror preserves its review links; imported records have no foreign keys
 to another instance's patches or reviews. Analysis remains with the originating
 instance. The shared deduplication lock imports the latest catalog before checking

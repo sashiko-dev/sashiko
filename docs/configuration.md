@@ -115,6 +115,12 @@ In shared catalog mode, each local database has a stable instance identity
 and a local bug mirror. Changes enter a durable outbox in the same transaction
 as the bug update. A background task publishes and imports changes every five
 seconds; PostgreSQL outages leave changes queued and visible as **Sync pending**.
+Each pass publishes at most 100 queued reports and imports at most 100 records,
+loading one complete record at a time. Deferred publications move behind other
+queued reports. Canonical verdicts and their duplicate reports publish first;
+deduplication waits when committed catalog updates still need importing.
+Catalog coordination has a five-minute deadline, including mutex and advisory
+lock waits. The background task restarts through the daemon's worker supervisor.
 Lease renewals and housekeeping timestamps do not queue whole reports. Mirror
 migrations have their own version in metadata. Selecting `libsql` disables change
 tracking; re-enabling the shared catalog reconciles edits made while it was off.

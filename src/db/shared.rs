@@ -17,6 +17,20 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+const SYNC_BATCH: usize = 100;
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(300);
+const MIRROR_SCHEMA_VERSION: u32 = 2;
+
+/// Whether committed catalog updates are available for deduplication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedSyncStatus {
+    /// All changes through the captured catalog sequence have been imported.
+    Ready,
+    /// Another bounded pass must import remaining committed records.
+    Importing,
+}
 
 pub(super) struct SharedCatalog {
     pub settings: crate::settings::StorageSettings,
@@ -48,6 +62,39 @@ impl SharedCatalog {
 #[error("Shared bug catalog is unavailable")]
 struct SharedCatalogUnavailable;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Shared catalog has more records to import")]
+struct SharedCatalogNotReady;
+
+fn catalog_operation<T>(
+    timeout: Duration,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> impl std::future::Future<Output = Result<T>> {
+    let operation = Box::pin(operation);
+    async move {
+        let result = match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
+        result.map_err(catalog_error)
+    }
+}
+
+async fn next_queue_position(conn: &crate::storage::Connection) -> Result<i64> {
+    let mut rows = conn
+        .query(
+            "UPDATE meta SET value=CAST(value AS INTEGER)+1
+        WHERE key='shared_queue_sequence' RETURNING CAST(value AS INTEGER)",
+            (),
+        )
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .context("missing shared queue sequence")?
+        .get(0)?)
+}
+
 fn retryable_postgres_error(error: &tokio_postgres::Error) -> bool {
     use tokio_postgres::error::SqlState;
     error.is_closed()
@@ -67,6 +114,9 @@ fn retryable_postgres_error(error: &tokio_postgres::Error) -> bool {
 }
 
 fn catalog_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<SharedCatalogUnavailable>() {
+        return error;
+    }
     let retryable = error.chain().any(|cause| {
         if let Some(error) = cause.downcast_ref::<crate::storage::Error>() {
             match error {
@@ -80,7 +130,7 @@ fn catalog_error(error: anyhow::Error) -> anyhow::Error {
         {
             return true;
         }
-        if cause.is::<tokio::time::error::Elapsed>() {
+        if cause.is::<tokio::time::error::Elapsed>() || cause.is::<SharedCatalogNotReady>() {
             return true;
         }
         cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
@@ -170,6 +220,33 @@ enum DuplicateChain {
     Cycle,
 }
 
+enum CatalogTarget {
+    Missing,
+    Canonical,
+    Duplicate(String),
+}
+
+async fn catalog_target(
+    conn: &crate::storage::Connection,
+    project: &str,
+    bugid: &str,
+) -> Result<CatalogTarget> {
+    let mut rows = conn
+        .query(
+            "SELECT payload::jsonb #>> '{triage,duplicate_of}'
+        FROM shared_bug_records WHERE project=? AND bugid=?",
+            libsql::params![project, bugid],
+        )
+        .await?;
+    Ok(match rows.next().await? {
+        None => CatalogTarget::Missing,
+        Some(row) => match row.get::<Option<String>>(0)? {
+            None => CatalogTarget::Canonical,
+            Some(target) => CatalogTarget::Duplicate(target),
+        },
+    })
+}
+
 async fn shared_duplicate_chain(
     conn: &crate::storage::Connection,
     project: &str,
@@ -181,17 +258,11 @@ async fn shared_duplicate_chain(
         if !visited.insert(bugid.clone()) {
             return Ok(DuplicateChain::Cycle);
         }
-        let mut rows = conn
-            .query(
-                "SELECT payload::jsonb #>> '{triage,duplicate_of}'
-             FROM shared_bug_records WHERE project=? AND bugid=?",
-                libsql::params![project, bugid],
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(DuplicateChain::Unpublished);
+        target = match catalog_target(conn, project, &bugid).await? {
+            CatalogTarget::Missing => return Ok(DuplicateChain::Unpublished),
+            CatalogTarget::Canonical => None,
+            CatalogTarget::Duplicate(target) => Some(target),
         };
-        target = row.get(0)?;
     }
     Ok(DuplicateChain::Valid)
 }
@@ -257,14 +328,15 @@ impl Event {
 impl Database {
     pub async fn lock_bug_dedup(&self) -> Result<Option<crate::storage::Connection>> {
         if let Some(shared) = &self.shared {
-            async {
+            catalog_operation(CATALOG_TIMEOUT, async {
                 let remote = shared.remote().await?;
                 let guard = remote.conn.dedup_lock().await?;
-                self.sync_shared_bugs().await?;
-                Ok::<_, anyhow::Error>(guard)
-            }
+                if self.sync_shared_bugs().await? == SharedSyncStatus::Importing {
+                    return Err(SharedCatalogNotReady.into());
+                }
+                Ok(guard)
+            })
             .await
-            .map_err(catalog_error)
         } else {
             self.conn.dedup_lock().await
         }
@@ -276,7 +348,9 @@ impl Database {
 
     /// A committed outcome remains valid when publication must be retried.
     pub(crate) async fn publish_shared_bug_outcome(&self, bugid: &str) {
-        if let Err(error) = self.sync_shared_bugs().await {
+        if let Err(error) =
+            catalog_operation(CATALOG_TIMEOUT, self.sync_shared_bugs_inner(Some(bugid))).await
+        {
             tracing::warn!(
                 "Bug {bugid} outcome is committed; catalog publication remains pending: {error:#}"
             );
@@ -368,19 +442,28 @@ impl Database {
             (version, enabled)
         };
         anyhow::ensure!(
-            version <= 1,
+            version <= MIRROR_SCHEMA_VERSION,
             "Unsupported shared mirror schema version {version}"
         );
-        if version == 0 {
+        if version < 1 {
             tx.execute_batch(include_str!("../migrations/shared_catalog/001_mirror.sql"))
                 .await?;
+        }
+        if version < 2 {
+            tx.execute_batch(include_str!("../migrations/shared_catalog/002_queue.sql"))
+                .await?;
+        }
+        if version < MIRROR_SCHEMA_VERSION {
+            tx.execute_batch(include_str!("../migrations/shared_catalog/triggers.sql"))
+                .await?;
             tx.execute(
-                "INSERT INTO meta (key,value) VALUES ('shared_schema_version','1')
+                "INSERT INTO meta (key,value) VALUES ('shared_schema_version',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (),
+                [MIRROR_SCHEMA_VERSION.to_string()],
             )
             .await?;
         }
+        tx.execute("INSERT INTO meta (key,value) VALUES ('shared_queue_sequence','0') ON CONFLICT(key) DO NOTHING", ()).await?;
         tx.execute(
             "INSERT INTO meta (key,value) VALUES ('shared_instance',?) ON CONFLICT(key) DO NOTHING",
             [uuid::Uuid::new_v4().to_string()],
@@ -401,10 +484,11 @@ impl Database {
         let conflict = if was_enabled {
             "DO NOTHING"
         } else {
-            "DO UPDATE SET local_version=local_version+1,dirty=1"
+            "DO UPDATE SET local_version=local_version+1,dirty=1,queue_order=excluded.queue_order"
         };
-        tx.execute(&format!("INSERT INTO shared_bug_sync (bug_id, origin, local_version, dirty)
-            SELECT id, (SELECT value FROM meta WHERE key='shared_instance'), 1, 1 FROM bugs WHERE true
+        let position = next_queue_position(&tx).await?;
+        tx.execute(&format!("INSERT INTO shared_bug_sync (bug_id, origin, local_version, dirty,queue_order)
+            SELECT id, (SELECT value FROM meta WHERE key='shared_instance'), 1, 1, {position} FROM bugs WHERE true
             ON CONFLICT(bug_id) {conflict}"), ()).await?;
         tx.commit().await?;
         Ok(())
@@ -456,10 +540,15 @@ impl Database {
         Ok(foreign)
     }
 
-    /// Publish local mutations and import catalog updates. Retries are idempotent.
-    pub async fn sync_shared_bugs(&self) -> Result<()> {
+    /// Publish and import bounded batches. Pending local publications can remain
+    /// queued; the result describes whether committed catalog changes are imported.
+    pub async fn sync_shared_bugs(&self) -> Result<SharedSyncStatus> {
+        catalog_operation(CATALOG_TIMEOUT, self.sync_shared_bugs_inner(None)).await
+    }
+
+    async fn sync_shared_bugs_inner(&self, priority: Option<&str>) -> Result<SharedSyncStatus> {
         let Some(shared) = &self.shared else {
-            return Ok(());
+            return Ok(SharedSyncStatus::Ready);
         };
         let _guard = shared.lock.lock().await;
         let remote = shared.remote().await?;
@@ -490,73 +579,107 @@ impl Database {
         drop(rows);
         local.commit().await?;
 
-        for id in self.shared_bug_pending_ids().await?.into_iter() {
-            let (local, base, version) = self.shared_snapshot(id, &instance).await?;
-            let tx = remote.begin_transaction().await?;
-            let mut rows = tx
-                .query(
-                    "SELECT payload FROM shared_bug_records WHERE project=? AND bugid=?",
-                    libsql::params![project.as_str(), local.bugid.as_str()],
-                )
+        for id in self.shared_publication_ids(priority).await? {
+            self.shared_publish_record(remote, id, &project, &instance)
                 .await?;
-            let prior: Option<Record> = rows
-                .next()
-                .await?
-                .map(|r| r.get::<String>(0))
-                .transpose()?
-                .map(|s| serde_json::from_str(&s))
-                .transpose()?;
-            let mut merged =
-                merge_record(base.as_ref(), &local, prior.as_ref(), version, &instance)?;
-            merged.validate()?;
-            // Validate relations under the catalog write lock. Independent
-            // local decisions can otherwise form a cross-instance cycle.
-            match shared_duplicate_chain(&tx, &project, &merged).await? {
-                DuplicateChain::Valid => {}
-                DuplicateChain::Unpublished => {
-                    tx.rollback().await?;
-                    continue;
-                }
-                DuplicateChain::Cycle => {
-                    let prior = prior
-                        .as_ref()
-                        .context("shared duplicate cycle without a prior record")?;
-                    let conflict = MergeConflict {
-                        field: "triage".into(),
-                        local: Some(serde_json::to_value(&merged.triage)?),
-                        shared: Some(serde_json::to_value(&prior.triage)?),
-                    };
-                    merged.triage = prior.triage.clone();
-                    merged.analysis = prior.analysis.clone();
-                    merged.add_conflict(conflict, version, &instance);
-                }
-            }
-            if prior.as_ref() != Some(&merged) {
-                tx.execute(
-                    "INSERT INTO shared_bug_records (project,bugid,payload) VALUES (?,?,?)
-                    ON CONFLICT(project,bugid) DO UPDATE SET payload=excluded.payload,
-                    sequence=DEFAULT",
-                    libsql::params![
-                        project.as_str(),
-                        merged.bugid.as_str(),
-                        serde_json::to_string(&merged)?
-                    ],
-                )
-                .await?;
-            }
-            tx.commit().await?;
-            self.shared_import_targets(remote, &merged, &project, &instance)
-                .await?;
-            self.shared_accept(&merged, Some(version), &instance)
-                .await?;
+            self.shared_note_attempt(id).await?;
         }
+        let limit = if priority.is_some() { 0 } else { SYNC_BATCH };
+        let importing = self
+            .shared_import_batch(remote, &project, &instance, limit)
+            .await?;
+        Ok(if importing {
+            SharedSyncStatus::Importing
+        } else {
+            SharedSyncStatus::Ready
+        })
+    }
 
+    async fn shared_publish_record(
+        &self,
+        remote: &Database,
+        id: i64,
+        project: &str,
+        instance: &str,
+    ) -> Result<()> {
+        let (local, base, version) = self.shared_snapshot(id, instance).await?;
+        let tx = remote.begin_transaction().await?;
+        let mut rows = tx
+            .query(
+                "SELECT payload FROM shared_bug_records WHERE project=? AND bugid=?",
+                libsql::params![project, local.bugid.as_str()],
+            )
+            .await?;
+        let prior: Option<Record> = rows
+            .next()
+            .await?
+            .map(|r| r.get::<String>(0))
+            .transpose()?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?;
+        anyhow::ensure!(
+            prior
+                .as_ref()
+                .is_none_or(|prior| prior.bugid == local.bugid),
+            "catalog record identity mismatch"
+        );
+        let mut merged = merge_record(base.as_ref(), &local, prior.as_ref(), version, instance)?;
+        merged.validate()?;
+        // Validate relations under the catalog write lock. Independent
+        // local decisions can otherwise form a cross-instance cycle.
+        match shared_duplicate_chain(&tx, project, &merged).await? {
+            DuplicateChain::Valid => {}
+            DuplicateChain::Unpublished => {
+                tx.rollback().await?;
+                return Ok(());
+            }
+            DuplicateChain::Cycle => {
+                let prior = prior
+                    .as_ref()
+                    .context("shared duplicate cycle without a prior record")?;
+                let conflict = MergeConflict {
+                    field: "triage".into(),
+                    local: Some(serde_json::to_value(&merged.triage)?),
+                    shared: Some(serde_json::to_value(&prior.triage)?),
+                };
+                merged.triage = prior.triage.clone();
+                merged.analysis = prior.analysis.clone();
+                merged.add_conflict(conflict, version, instance);
+            }
+        }
+        if prior.as_ref() != Some(&merged) {
+            tx.execute(
+                "INSERT INTO shared_bug_records (project,bugid,payload) VALUES (?,?,?)
+                ON CONFLICT(project,bugid) DO UPDATE SET payload=excluded.payload,
+                sequence=DEFAULT",
+                libsql::params![
+                    project,
+                    merged.bugid.as_str(),
+                    serde_json::to_string(&merged)?
+                ],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        self.shared_import_targets(remote, &merged, project, instance)
+            .await?;
+        self.shared_accept(&merged, Some(version), instance).await?;
+        Ok(())
+    }
+
+    async fn shared_import_batch(
+        &self,
+        remote: &Database,
+        project: &str,
+        instance: &str,
+        limit: usize,
+    ) -> Result<bool> {
         let mut cursor: i64 = self.shared_meta("shared_cursor").await?.parse()?;
         let mut rows = remote
             .conn
             .query(
                 "SELECT coalesce(max(sequence),0) FROM shared_bug_records WHERE project=?",
-                [project.as_str()],
+                [project],
             )
             .await?;
         let high_water = rows
@@ -564,30 +687,77 @@ impl Database {
             .await?
             .context("missing catalog sequence")?
             .get::<i64>(0)?;
-        while cursor < high_water {
-            let mut rows=remote.conn.query("SELECT sequence,payload FROM shared_bug_records WHERE project=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT 200",libsql::params![project.as_str(),cursor,high_water]).await?;
-            let mut updates = Vec::new();
-            let mut last = cursor;
-            while let Some(row) = rows.next().await? {
-                last = row.get(0)?;
-                updates.push(serde_json::from_str::<Record>(&row.get::<String>(1)?)?);
-            }
-            if updates.is_empty() {
+        for _ in 0..limit {
+            if cursor >= high_water {
                 break;
             }
-            updates.sort_by_key(|r| r.triage.duplicate_of.is_some());
-            for record in updates {
-                self.shared_import_targets(remote, &record, &project, &instance)
+            let mut rows = remote.conn.query("SELECT sequence,payload,bugid FROM shared_bug_records WHERE project=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT 1", libsql::params![project,cursor,high_water]).await?;
+            if let Some(row) = rows.next().await? {
+                let next: i64 = row.get(0)?;
+                let record: Record = serde_json::from_str(&row.get::<String>(1)?)?;
+                anyhow::ensure!(
+                    record.bugid == row.get::<String>(2)?,
+                    "catalog record identity mismatch"
+                );
+                self.shared_import_targets(remote, &record, project, instance)
                     .await?;
-                self.shared_accept(&record, None, &instance).await?;
+                self.shared_accept(&record, None, instance).await?;
+                cursor = next;
+            } else {
+                // Rows can move beyond the captured high water during this pass.
+                cursor = high_water;
             }
             self.execute(
                 "UPDATE meta SET value=? WHERE key='shared_cursor'",
-                [last.to_string()],
+                [cursor.to_string()],
             )
             .await?;
-            cursor = last;
         }
+        Ok(cursor < high_water)
+    }
+
+    async fn shared_publication_ids(&self, priority: Option<&str>) -> Result<Vec<i64>> {
+        if let Some(bugid) = priority {
+            let mut rows = self
+                .conn
+                .query("SELECT id,duplicate_of_id FROM bugs WHERE bugid=?", [bugid])
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(Vec::new());
+            };
+            let id: i64 = row.get(0)?;
+            let mut ids: Vec<i64> = row.get::<Option<i64>>(1)?.into_iter().collect();
+            ids.push(id);
+            return Ok(ids);
+        }
+        let mut rows = self.conn.query("SELECT bug_id FROM shared_bug_sync WHERE dirty=1 ORDER BY queue_order,bug_id LIMIT ?", [SYNC_BATCH as i64]).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get(0)?);
+        }
+        Ok(ids)
+    }
+
+    async fn shared_note_attempt(&self, id: i64) -> Result<()> {
+        let tx = self.begin_transaction().await?;
+        let dirty = {
+            let mut rows = tx
+                .query(
+                    "SELECT 1 FROM shared_bug_sync WHERE bug_id=? AND dirty=1",
+                    [id],
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if dirty {
+            let position = next_queue_position(&tx).await?;
+            tx.execute(
+                "UPDATE shared_bug_sync SET queue_order=? WHERE bug_id=?",
+                libsql::params![position, id],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -609,6 +779,16 @@ impl Database {
             if self.get_bug_by_bugid(&bugid).await?.is_some() {
                 break;
             }
+            target = match catalog_target(&remote.conn, project, &bugid).await? {
+                CatalogTarget::Missing => {
+                    anyhow::bail!("shared canonical bug {bugid} is not published yet")
+                }
+                CatalogTarget::Canonical => None,
+                CatalogTarget::Duplicate(target) => Some(target),
+            };
+            missing.push(bugid);
+        }
+        for bugid in missing.into_iter().rev() {
             let mut rows = remote
                 .conn
                 .query(
@@ -621,10 +801,7 @@ impl Database {
                 .await?
                 .with_context(|| format!("shared canonical bug {bugid} is not published yet"))?;
             let record: Record = serde_json::from_str(&row.get::<String>(0)?)?;
-            target = record.triage.duplicate_of.clone();
-            missing.push(record);
-        }
-        for record in missing.into_iter().rev() {
+            anyhow::ensure!(record.bugid == bugid, "catalog record identity mismatch");
             self.shared_accept(&record, None, instance).await?;
         }
         Ok(())
@@ -801,6 +978,23 @@ impl Database {
         } else {
             None
         };
+        if let (Some(bug), Some(target)) = (&existing, duplicate) {
+            let cycle = {
+                let mut rows = tx.query("WITH RECURSIVE chain(id,duplicate_of_id) AS (
+                    SELECT id,duplicate_of_id FROM bugs WHERE id=?
+                    UNION SELECT b.id,b.duplicate_of_id FROM bugs b JOIN chain c ON b.id=c.duplicate_of_id
+                ) SELECT 1 FROM chain WHERE id=? LIMIT 1", libsql::params![target,bug.id]).await?;
+                rows.next().await?.is_some()
+            };
+            if cycle {
+                // Revisit the incoming relation after the conflicting local
+                // target is reconciled. Keep a valid local canonical meanwhile.
+                let position = next_queue_position(&tx).await?;
+                tx.execute("UPDATE shared_bug_sync SET dirty=1,local_version=local_version+1,queue_order=? WHERE bug_id=?", libsql::params![position,bug.id]).await?;
+                tx.commit().await?;
+                return Ok(());
+            }
+        }
         tx.execute("UPDATE meta SET value='1' WHERE key='shared_importing'", ())
             .await?;
         let id = if let Some(bug) = existing {
@@ -1004,6 +1198,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_batches_are_bounded_and_deferred_reports_do_not_starve_targets()
+    -> Result<()> {
+        let db = local_mirror().await?;
+        let mut ids = Vec::new();
+        for _ in 0..SYNC_BATCH + 5 {
+            ids.push(local_report(&db, "queued").await?);
+        }
+        let first = db.shared_publication_ids(None).await?;
+        assert_eq!(first.len(), SYNC_BATCH);
+        for id in first {
+            db.shared_note_attempt(id).await?;
+        }
+        let next = db.shared_publication_ids(None).await?;
+        assert_eq!(&next[..5], &ids[SYNC_BATCH..]);
+        let last = *ids.last().unwrap();
+        let bug = db.get_bug(last).await?.unwrap();
+        assert_eq!(
+            db.shared_publication_ids(Some(&bug.bugid)).await?,
+            vec![last]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_deadline_covers_waiting_for_the_local_sync_mutex() -> Result<()> {
+        let db = local_mirror().await?;
+        let guard = db.shared.as_ref().unwrap().lock.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            catalog_operation(Duration::from_millis(10), db.sync_shared_bugs_inner(None)),
+        )
+        .await?;
+        assert!(Database::is_shared_catalog_failure(
+            &result.err().context("deadline")?
+        ));
+        drop(guard);
+        assert!(db.shared.as_ref().unwrap().lock.try_lock().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_local_triage_cannot_form_a_cycle_during_import() -> Result<()> {
+        let db = local_mirror().await?;
+        let left = local_report(&db, "left").await?;
+        let right = local_report(&db, "right").await?;
+        acknowledge_local(&db, left).await?;
+        acknowledge_local(&db, right).await?;
+        let instance = db.shared_meta("shared_instance").await?;
+        let (mut incoming, _, _) = db.shared_snapshot(left, &instance).await?;
+        let (canonical_right, _, _) = db.shared_snapshot(right, &instance).await?;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: right,
+            canonical_id: left,
+            reasoning: "pending local decision",
+            ..Default::default()
+        })
+        .await?;
+        incoming.triage = Triage {
+            status: BugLifecycleStatus::Duplicate,
+            duplicate_of: Some(canonical_right.bugid.clone()),
+        };
+        incoming.analysis.state = BugPipelineState::Succeeded;
+        db.shared_accept(&incoming, None, &instance).await?;
+        assert!(db.get_bug(left).await?.unwrap().duplicate_of_id.is_none());
+        assert!(db.shared_bug_pending_ids().await?.contains(&left));
+        let (_, _, version) = db.shared_snapshot(right, &instance).await?;
+        db.shared_accept(&canonical_right, Some(version), &instance)
+            .await?;
+        let (_, _, version) = db.shared_snapshot(left, &instance).await?;
+        db.shared_accept(&incoming, Some(version), &instance)
+            .await?;
+        assert_eq!(
+            db.get_bug(left).await?.unwrap().duplicate_of_id,
+            Some(right)
+        );
+        assert!(db.get_bug(right).await?.unwrap().duplicate_of_id.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_migration_preserves_an_existing_version_one_mirror() -> Result<()> {
+        let mut db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+        let id = local_report(&db, "preexisting mirror").await?;
+        db.conn
+            .execute_batch(include_str!("../migrations/shared_catalog/001_mirror.sql"))
+            .await?;
+        let instance = uuid::Uuid::new_v4().to_string();
+        db.execute("INSERT INTO meta (key,value) VALUES ('shared_schema_version','1'),('shared_enabled','1'),('shared_instance',?)", [instance.as_str()]).await?;
+        db.execute(
+            "INSERT INTO shared_bug_sync (bug_id,origin,local_version,dirty) VALUES (?,?,1,1)",
+            libsql::params![id, instance.as_str()],
+        )
+        .await?;
+        db.shared = Some(Arc::new(SharedCatalog::new(Default::default())));
+        db.migrate().await?;
+        db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
+            .await?;
+        assert_eq!(
+            db.shared_meta("shared_schema_version").await?,
+            MIRROR_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(db.shared_meta("shared_instance").await?, instance);
+        assert_eq!(db.shared_publication_ids(None).await?, vec![id]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lease_and_housekeeping_updates_do_not_republish_reports() -> Result<()> {
         let db = local_mirror().await?;
         let id = local_report(&db, "bookkeeping").await?;
@@ -1044,7 +1350,10 @@ mod tests {
             db.get_bug(id).await?.unwrap().title,
             "edited in libSQL mode"
         );
-        assert_eq!(db.shared_meta("shared_schema_version").await?, "1");
+        assert_eq!(
+            db.shared_meta("shared_schema_version").await?,
+            MIRROR_SCHEMA_VERSION.to_string()
+        );
         db.execute(
             "UPDATE meta SET value='999' WHERE key='shared_schema_version'",
             (),

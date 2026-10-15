@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use serde_json::json;
 #[cfg(feature = "server")]
+pub use shared::SharedSyncStatus;
+#[cfg(feature = "server")]
 use std::str::FromStr;
 #[cfg(feature = "server")]
 use std::sync::Arc;

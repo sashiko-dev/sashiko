@@ -518,6 +518,30 @@ async fn exercise_shared(
     second.sync_shared_bugs().await?;
     assert!(second.get_bug_by_bugid(&pending.bugid).await?.is_some());
     exercise_shared_duplicate_races(first, second).await?;
+    exercise_bounded_shared_backlog(first, second).await?;
+    Ok(())
+}
+
+async fn exercise_bounded_shared_backlog(first: &Database, second: &Database) -> Result<()> {
+    let mut public_ids = Vec::new();
+    for _ in 0..105 {
+        public_ids.push(shared_report(first, "bounded initial backlog").await?.1);
+    }
+    first.sync_shared_bugs().await?;
+    assert_eq!(first.shared_bug_pending_ids().await?.len(), 5);
+    first.sync_shared_bugs().await?;
+    assert!(first.shared_bug_pending_ids().await?.is_empty());
+    assert_eq!(
+        second.sync_shared_bugs().await?,
+        sashiko::db::SharedSyncStatus::Importing
+    );
+    assert_eq!(
+        second.sync_shared_bugs().await?,
+        sashiko::db::SharedSyncStatus::Ready
+    );
+    for bugid in public_ids {
+        assert!(second.get_bug_by_bugid(&bugid).await?.is_some());
+    }
     Ok(())
 }
 
