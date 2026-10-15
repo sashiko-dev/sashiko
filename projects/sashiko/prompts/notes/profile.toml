@@ -29,3 +29,4 @@ fix_patterns = [
     "^fix(\\(.*\\))?:",
 ]
 max_cases = 60
+introducer_pattern = "^Fixes: ([0-9a-f]{8,})"

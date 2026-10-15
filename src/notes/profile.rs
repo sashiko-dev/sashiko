@@ -68,6 +68,9 @@ pub struct HistoryConfig {
     pub fix_patterns: Vec<String>,
     /// The most recent matching fixes classified per unit.
     pub max_cases: usize,
+    /// A regular expression, matched per line of a fix's message, whose
+    /// first capture group names the commit that introduced the bug.
+    pub introducer_pattern: Option<String>,
 }
 
 impl Default for HistoryConfig {
@@ -75,6 +78,7 @@ impl Default for HistoryConfig {
         Self {
             fix_patterns: Vec::new(),
             max_cases: DEFAULT_HISTORY_CASES,
+            introducer_pattern: None,
         }
     }
 }
@@ -168,6 +172,21 @@ impl Default for Limits {
     }
 }
 
+impl HistoryConfig {
+    /// The compiled introducer pattern, matching per line.
+    pub fn introducer(&self) -> Result<Option<regex::Regex>> {
+        let Some(pattern) = &self.introducer_pattern else {
+            return Ok(None);
+        };
+        let re = regex::Regex::new(&format!("(?m){pattern}"))
+            .with_context(|| format!("history.introducer_pattern {pattern:?} is invalid"))?;
+        if re.captures_len() < 2 {
+            bail!("history.introducer_pattern {pattern:?} needs a capture group for the commit ID");
+        }
+        Ok(Some(re))
+    }
+}
+
 impl NotesProfile {
     /// Parses and validates a profile from TOML text.
     pub fn from_toml_str(text: &str) -> Result<Self> {
@@ -223,6 +242,7 @@ impl NotesProfile {
         {
             bail!("history.fix_patterns must not contain empty patterns");
         }
+        self.history.introducer()?;
         Ok(())
     }
 
@@ -398,6 +418,10 @@ max_cases = 20
             (
                 "[units]\nsource = \"maintainers\"\n[languages.globs]\nrust = [\"**.rs\"]\n[history]\nfix_patterns = [\" \"]\n",
                 "history.fix_patterns",
+            ),
+            (
+                "[units]\nsource = \"maintainers\"\n[languages.globs]\nrust = [\"**.rs\"]\n[history]\nintroducer_pattern = \"^Fixes: [0-9a-f]+\"\n",
+                "capture group",
             ),
             (
                 "[units]\nsource = \"codeowners\"\n[languages.globs]\nrust = [\"**.rs\"]\n",

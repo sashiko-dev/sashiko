@@ -20,6 +20,7 @@ c = ["**.c", "**.h"]
 
 [history]
 fix_patterns = ["^Fixes: [0-9a-f]{8,}"]
+introducer_pattern = "^Fixes: ([0-9a-f]{8,})"
 max_cases = 60
 
 [limits]
