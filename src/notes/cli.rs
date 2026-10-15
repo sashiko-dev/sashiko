@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
+use futures::StreamExt;
 
 use crate::git_cmd;
 use crate::maintainers::MaintainersIndex;
@@ -66,9 +67,19 @@ pub enum NotesCommand {
     /// Build notes for units: survey, explore, verify, synthesize, and write
     /// them into a notes set
     Build {
-        /// Units to build (name or slug; repeatable, at least one)
-        #[arg(long = "unit", required = true)]
+        /// Units to build (name or slug; repeatable)
+        #[arg(long = "unit", required_unless_present = "select")]
         units: Vec<String>,
+
+        /// File selecting what to build, one "unit<TAB>component" per line
+        /// (component optional: the whole unit). Component names are only
+        /// unique within a unit, so large batch builds select by pair.
+        #[arg(long)]
+        select: Option<PathBuf>,
+
+        /// Units built concurrently
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
 
         /// Only explore these components of the selected units (name;
         /// repeatable). Default: every component.
@@ -208,6 +219,50 @@ fn agenda_modules(
     modules
 }
 
+/// What a selection file asks for: per unit, either the whole unit
+/// (None) or the named components.
+type Selection = std::collections::BTreeMap<String, Option<std::collections::BTreeSet<String>>>;
+
+/// Reads a selection file of "unit<TAB>component" lines; a line with only
+/// a unit selects the whole unit, and blank lines and lines starting with
+/// "#" are ignored.
+fn read_selection(path: &Path) -> Result<Selection> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    parse_selection(&text)
+}
+
+fn parse_selection(text: &str) -> Result<Selection> {
+    let mut selection = Selection::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (unit, component) = match line.split_once('\t') {
+            Some((unit, component)) => (unit.trim(), Some(component.trim())),
+            None => (line.trim(), None),
+        };
+        if unit.is_empty() {
+            bail!("selection line {} has no unit", i + 1);
+        }
+        let entry = selection
+            .entry(unit.to_string())
+            .or_insert_with(|| Some(Default::default()));
+        match (component, entry.as_mut()) {
+            (Some(c), Some(names)) if !c.is_empty() => {
+                names.insert(c.to_string());
+            }
+            // A whole-unit line wins over component lines.
+            _ => *entry = None,
+        }
+    }
+    if selection.is_empty() {
+        bail!("the selection selects nothing");
+    }
+    Ok(selection)
+}
+
 /// Parses a shard given as "k/n" with k < n.
 fn parse_shard(text: &str) -> Result<(usize, usize), String> {
     let (k, n) = text
@@ -261,6 +316,8 @@ pub async fn run(
         }
         NotesCommand::Build {
             units,
+            select,
+            jobs,
             components,
             rev,
             set,
@@ -282,7 +339,27 @@ pub async fn run(
                 UnitsConfig::Maintainers {} => Some(load_maintainers_at(repo, &sha).await?),
                 UnitsConfig::Directories { .. } => None,
             };
-            let mut report = build_plan(repo, &sha, &profile, maintainers.as_ref(), units).await?;
+            let selection = match select {
+                Some(path) => Some(read_selection(path)?),
+                None => None,
+            };
+            let mut wanted_units = units.clone();
+            if let Some(selection) = &selection {
+                wanted_units.extend(selection.keys().cloned());
+            }
+            let mut report =
+                build_plan(repo, &sha, &profile, maintainers.as_ref(), &wanted_units).await?;
+            if let Some(selection) = &selection {
+                for unit in &mut report.units {
+                    match selection.get(&unit.name) {
+                        // Units named with --unit are built whole.
+                        None => {}
+                        Some(None) => {}
+                        Some(Some(names)) => unit.components.retain(|c| names.contains(&c.name)),
+                    }
+                }
+                report.units.retain(|u| !u.components.is_empty());
+            }
             if !components.is_empty() {
                 for unit in &mut report.units {
                     unit.components.retain(|c| components.contains(&c.name));
@@ -315,8 +392,14 @@ pub async fn run(
             };
 
             let mut failures = Vec::new();
-            for unit in &report.units {
-                match build_unit(repo, &env, &agenda, unit, &cfg).await {
+            let mut builds = futures::stream::iter(report.units.iter())
+                .map(|unit| {
+                    let (env, agenda, cfg) = (&env, &agenda, &cfg);
+                    async move { (unit, build_unit(repo, env, agenda, unit, cfg).await) }
+                })
+                .buffer_unordered((*jobs).max(1));
+            while let Some((unit, result)) = builds.next().await {
+                match result {
                     Ok(summary) => println!("{}", serde_json::to_string(&summary)?),
                     Err(err) => {
                         eprintln!("{}: build failed: {err:#}", unit.name);
@@ -474,6 +557,18 @@ mod tests {
         assert!(parse_shard("8/8").is_err());
         assert!(parse_shard("1/0").is_err());
         assert!(parse_shard("x").is_err());
+    }
+
+    #[test]
+    fn test_parse_selection() {
+        let selection =
+            parse_selection("# comment\nNET\tnet/core\nNET\tnet/ipv4\n\nMM\nMM\tmm/slab\n")
+                .unwrap();
+        assert_eq!(selection.len(), 2);
+        let net = selection["NET"].as_ref().unwrap();
+        assert!(net.contains("net/core") && net.contains("net/ipv4"));
+        assert_eq!(selection["MM"], None);
+        assert!(parse_selection("# nothing\n").is_err());
     }
 
     #[test]
