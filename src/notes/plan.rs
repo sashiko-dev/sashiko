@@ -78,9 +78,17 @@ pub struct UnitPlan {
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentPlan {
     pub name: String,
-    pub files: Vec<String>,
+    pub files: Vec<PlannedFile>,
     pub lines: usize,
     pub entry_points: Vec<EntryPoint>,
+}
+
+/// One file of a planned component.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedFile {
+    pub path: String,
+    pub lines: usize,
+    pub test_lines: usize,
 }
 
 /// An uncalibrated input-token range.
@@ -207,10 +215,23 @@ fn plan_unit(
         .into_iter()
         .map(|component| {
             let lines = component.lines();
-            let files: Vec<String> = component.files.into_iter().map(|f| f.path).collect();
+            let files: Vec<PlannedFile> = component
+                .files
+                .into_iter()
+                .map(|f| PlannedFile {
+                    path: f.path,
+                    lines: f.lines,
+                    test_lines: f.test_lines,
+                })
+                .collect();
             let entry_points = files
                 .iter()
-                .flat_map(|f| entry_points_by_path.get(f.as_str()).into_iter().flatten())
+                .flat_map(|f| {
+                    entry_points_by_path
+                        .get(f.path.as_str())
+                        .into_iter()
+                        .flatten()
+                })
                 .map(|e| (*e).clone())
                 .collect();
             ComponentPlan {

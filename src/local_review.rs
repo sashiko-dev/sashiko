@@ -406,7 +406,7 @@ pub async fn run_worker(
 ///
 /// The limiters are skipped for a daemon-spawned worker, which reaches the
 /// model through a stdio provider and is throttled by the daemon instead.
-fn decorate_provider(
+pub(crate) fn decorate_provider(
     inner: std::sync::Arc<dyn crate::ai::AiProvider>,
     ai: &AiSettings,
     llm_semaphore: &Arc<Semaphore>,

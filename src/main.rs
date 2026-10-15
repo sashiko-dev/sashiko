@@ -517,7 +517,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Notes { command, prompts } => {
                 let repo = current_git_toplevel()?;
                 let prompts_dir = resolve_prompts_path(prompts.clone(), project)?;
-                sashiko::notes::cli::run(command, &repo, &prompts_dir).await?;
+                sashiko::notes::cli::run(
+                    command,
+                    project,
+                    &repo,
+                    &prompts_dir,
+                    settings_result.as_ref().ok(),
+                )
+                .await?;
                 return Ok(());
             }
             // What this arm passes down, and no more: --settings was read above,
