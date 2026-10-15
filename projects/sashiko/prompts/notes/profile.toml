@@ -20,3 +20,12 @@ modules = ["universal", "lang/rust"]
 component_lines = 15000
 unit_note_bytes = 16384
 review_notes_bytes = 49152
+
+[history]
+# Sashiko has few Fixes: trailers; most fixes say so in the subject.
+fix_patterns = [
+    "^Fixes: [0-9a-f]{8,}",
+    "^[^ :]+(\\(.*\\))?: (fix|avoid|prevent|correct)",
+    "^fix(\\(.*\\))?:",
+]
+max_cases = 60

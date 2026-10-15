@@ -18,6 +18,10 @@ skip = [
 rust = ["**.rs"]
 c = ["**.c", "**.h"]
 
+[history]
+fix_patterns = ["^Fixes: [0-9a-f]{8,}"]
+max_cases = 60
+
 [limits]
 component_lines = 15000
 unit_note_bytes = 16384

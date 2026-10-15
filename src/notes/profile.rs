@@ -51,6 +51,32 @@ pub struct NotesProfile {
     pub limits: Limits,
     #[serde(default)]
     pub agenda: AgendaConfig,
+    #[serde(default)]
+    pub history: HistoryConfig,
+}
+
+/// Default number of past fixes classified per unit.
+const DEFAULT_HISTORY_CASES: usize = 60;
+
+/// How a unit's past fixes are found. Projects without a fix convention
+/// leave `fix_patterns` empty, and builds skip the history step.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryConfig {
+    /// Extended regular expressions matched against commit messages
+    /// (`git log -E --grep`, any line, `^` anchors a line).
+    pub fix_patterns: Vec<String>,
+    /// The most recent matching fixes classified per unit.
+    pub max_cases: usize,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            fix_patterns: Vec::new(),
+            max_cases: DEFAULT_HISTORY_CASES,
+        }
+    }
 }
 
 /// Which agenda modules (`notes/agenda/<module>.md`) a build works through.
@@ -189,6 +215,14 @@ impl NotesProfile {
         if self.limits.component_lines == 0 {
             bail!("limits.component_lines must be positive");
         }
+        if self
+            .history
+            .fix_patterns
+            .iter()
+            .any(|p| p.trim().is_empty())
+        {
+            bail!("history.fix_patterns must not contain empty patterns");
+        }
         Ok(())
     }
 
@@ -278,6 +312,10 @@ component_lines = 4000
 
 [agenda]
 modules = ["universal", "lang/rust"]
+
+[history]
+fix_patterns = ["^Fixes: [0-9a-f]{8,}"]
+max_cases = 20
 "#;
 
     #[test]
@@ -294,6 +332,8 @@ modules = ["universal", "lang/rust"]
         assert_eq!(profile.limits.component_lines, 4000);
         assert_eq!(profile.limits.unit_note_bytes, DEFAULT_UNIT_NOTE_BYTES);
         assert_eq!(profile.agenda.modules, vec!["universal", "lang/rust"]);
+        assert_eq!(profile.history.fix_patterns, vec!["^Fixes: [0-9a-f]{8,}"]);
+        assert_eq!(profile.history.max_cases, 20);
     }
 
     #[test]
@@ -304,6 +344,24 @@ modules = ["universal", "lang/rust"]
         .unwrap();
         assert_eq!(profile.units, UnitsConfig::Maintainers {});
         assert_eq!(profile.limits, Limits::default());
+        assert_eq!(profile.history, HistoryConfig::default());
+    }
+
+    #[test]
+    fn test_shipped_profiles_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for project in ["sashiko", "linux"] {
+            let path = root
+                .join("projects")
+                .join(project)
+                .join("prompts")
+                .join(PROFILE_RELPATH);
+            let profile = NotesProfile::load(&path).unwrap();
+            assert!(
+                !profile.history.fix_patterns.is_empty(),
+                "{project} profile has no fix patterns"
+            );
+        }
     }
 
     #[test]
@@ -336,6 +394,10 @@ modules = ["universal", "lang/rust"]
             (
                 "[units]\nsource = \"maintainers\"\n[languages.globs]\nrust = [\"**.rs\"]\n[limits]\ncomponent_lines = 0\n",
                 "component_lines",
+            ),
+            (
+                "[units]\nsource = \"maintainers\"\n[languages.globs]\nrust = [\"**.rs\"]\n[history]\nfix_patterns = [\" \"]\n",
+                "history.fix_patterns",
             ),
             (
                 "[units]\nsource = \"codeowners\"\n[languages.globs]\nrust = [\"**.rs\"]\n",
