@@ -3894,9 +3894,122 @@
                 return reviews.map((r, i) => renderReviewCard(r, i === reviews.length - 1 ? emailHtml : '')).join('');
             };
 
+            const computeReviewSummaryStatus = (reviews, patch = null) => {
+                if (patch && (patch.status === 'error' || patch.status === 'failed')) {
+                    return `<span class="text-error-bold">Apply Failed</span>`;
+                }
+                if (patch && patch.status === 'Skipped') {
+                    return '<span style="color:var(--text-dim)">Skipped</span>';
+                }
+                if (!reviews || reviews.length === 0) {
+                    return '<span style="color:var(--text-dim)">No reviews</span>';
+                }
+                let maxCounts = { low: 0, medium: 0, high: 0, critical: 0 };
+                let hasSuccessful = false;
+                let hasSkipped = false;
+                let hasInProgress = false;
+                let skippedReason = '';
+                let errors = [];
+                let validRunCount = 0;
+
+                reviews.forEach(r => {
+                    if (r.status !== 'Failed To Apply') {
+                        validRunCount++;
+                    }
+                    if (r.status === 'Reviewed') {
+                        hasSuccessful = true;
+                        try {
+                            if (r.output) {
+                                const out = typeof r.output === 'string' ? JSON.parse(r.output) : r.output;
+                                if (out && out.findings && Array.isArray(out.findings)) {
+                                    let current = { low: 0, medium: 0, high: 0, critical: 0 };
+                                    out.findings.forEach(f => {
+                                        if (f.preexisting) return;
+                                        const s = String(f.severity || '').toLowerCase();
+                                        if (s === 'critical') current.critical++;
+                                        else if (s === 'high') current.high++;
+                                        else if (s === 'medium') current.medium++;
+                                        else current.low++;
+                                    });
+                                    maxCounts.critical = Math.max(maxCounts.critical, current.critical);
+                                    maxCounts.high = Math.max(maxCounts.high, current.high);
+                                    maxCounts.medium = Math.max(maxCounts.medium, current.medium);
+                                    maxCounts.low = Math.max(maxCounts.low, current.low);
+                                }
+                            }
+                        } catch (e) {}
+                    } else if (r.status === 'Skipped') {
+                        hasSkipped = true;
+                        skippedReason = r.result || 'Skipped';
+                    } else if (r.status && (r.status.toLowerCase().includes('failed') || r.status.toLowerCase().includes('error'))) {
+                        errors.push(r.status);
+                    } else if (r.status === 'Pending' || r.status === 'In Review') {
+                        hasInProgress = true;
+                    }
+                });
+
+                if (hasSuccessful) {
+                    let s = renderFindingsBadges(maxCounts, 'Reviewed');
+                    if (validRunCount > 1) {
+                        s += ` <span style="color:var(--text-dim); font-size:0.85em; font-style:italic;">(max of ${validRunCount} runs)</span>`;
+                    }
+                    return s;
+                }
+                if (errors.length > 0) {
+                    return `<span class="text-error-bold">${escapeHtml(errors[0])}</span>`;
+                }
+                if (hasSkipped && !hasInProgress) {
+                    return `<span style="color:var(--text-dim)" title="${escapeHtml(skippedReason)}">Skipped</span>`;
+                }
+                return '<span style="color:var(--text-dim)">In progress...</span>';
+            };
+
             const generalReviews = reviewsByPatch.get(null) || [];
             if (generalReviews.length > 0) {
-                reviewsHtml += `<h3>General Reviews</h3>${renderReviewList(generalReviews)}`;
+                const hasCoverMsg = data.message_id
+                    && !/^[0-9a-f]{40}$/.test(data.message_id)
+                    && !data.message_id.includes('@sashiko.local')
+                    && !(Array.isArray(data.patches) && data.patches.some(p => p.message_id === data.message_id));
+                let coverHeader = hasCoverMsg
+                    ? `Cover Letter / Series Review: <a href="#/message/${encodeURIComponent(data.message_id)}">${escapeHtml(data.subject || '(no subject)')}</a>`
+                    : `Cover Letter / Series Review: ${escapeHtml(data.subject || '(no subject)')}`;
+                const encodedPatchsetId = encodeURIComponent(state.patchsetId).replace(/'/g, '%27');
+                const coverLink = window.location.origin + window.location.pathname + `#/patchset/${encodedPatchsetId}?part=0`;
+                coverHeader += `<a href="${escapeHtml(coverLink)}" class="permalink-icon" onclick="copyToClipboard(this.href); return false;" title="Copy permalink to cover letter review">
+                    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
+                </a>`;
+
+                let coverEmailHtml = '';
+                if (hasCoverMsg || data.cover_email_status) {
+                    let toAddrs = data.cover_email_to || '';
+                    let ccAddrs = data.cover_email_cc || '';
+                    let eStatus = data.cover_email_status;
+                    if (!data.smtp_enabled) {
+                        eStatus = 'Disabled (SMTP not configured)';
+                    } else if (data.dry_run) {
+                        eStatus = eStatus ? `Dry-run (${eStatus})` : 'Dry-run (Not sent)';
+                    } else {
+                        eStatus = eStatus || 'None';
+                    }
+                    try { if (toAddrs.startsWith('[')) toAddrs = JSON.parse(toAddrs).join(', '); } catch(e) {}
+                    try { if (ccAddrs.startsWith('[')) ccAddrs = JSON.parse(ccAddrs).join(', '); } catch(e) {}
+                    coverEmailHtml = `
+                        <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; word-break: break-all;">
+                            <strong>To:</strong> ${escapeHtml(toAddrs || 'None')} &nbsp;&nbsp; 
+                            <strong>Cc:</strong> ${escapeHtml(ccAddrs || 'None')} &nbsp;&nbsp; 
+                            <strong>Status:</strong> ${escapeHtml(eStatus)}
+                        </div>
+                    `;
+                }
+
+                reviewsHtml += `
+                    <div id="patch-cover" data-part="0" style="margin-top:12px;">
+                        <h3 style="display:flex; justify-content:space-between;">
+                            <span>${coverHeader}</span>
+                        </h3>
+                        ${renderReviewList(generalReviews, coverEmailHtml)}
+                    </div>
+                `;
             }
 
             const sortedPatchIds = Array.from(reviewsByPatch.keys())
@@ -3907,9 +4020,15 @@
                     return (pa?.part_index || 0) - (pb?.part_index || 0);
                 });
 
+            const showSummaryTable = sortedPatchIds.length > 1 || generalReviews.length > 0;
             let summaryHtml = '';
-            if (sortedPatchIds.length > 1) {
+            if (showSummaryTable) {
                 summaryHtml = '<table style="margin-bottom: 20px;"><thead><tr><th>Patch</th><th>Potential Regressions</th></tr></thead><tbody>';
+                if (generalReviews.length > 0) {
+                    const coverStatus = computeReviewSummaryStatus(generalReviews);
+                    const coverSubject = escapeHtml(data.subject || '(no subject)');
+                    summaryHtml += `<tr onclick="document.getElementById('patch-cover').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>Series / Cover Letter</strong>: ${coverSubject}</td><td>${coverStatus}</td></tr>`;
+                }
             }
 
             sortedPatchIds.forEach((pid, index) => {
@@ -3918,8 +4037,9 @@
                 let header = patch
                     ? `Patch ${patch.part_index}: <a href="#/message/${encodeURIComponent(patch.message_id)}">${escapeHtml(patch.subject || '(no subject)')}</a>`
                     : `Patch ID ${pid}`;
-                const patchLink = window.location.origin + window.location.pathname + `#/patchset/${encodeURIComponent(state.patchsetId)}?${patch ? 'part=' + patch.part_index : 'patch=' + pid}`;
-                header += `<a href="${patchLink}" class="permalink-icon" onclick="copyToClipboard('${patchLink}'); return false;" title="Copy permalink to this patch">
+                const encodedPatchsetId = encodeURIComponent(state.patchsetId).replace(/'/g, '%27');
+                const patchLink = window.location.origin + window.location.pathname + `#/patchset/${encodedPatchsetId}?${patch ? 'part=' + encodeURIComponent(patch.part_index) : 'patch=' + encodeURIComponent(pid)}`;
+                header += `<a href="${escapeHtml(patchLink)}" class="permalink-icon" onclick="copyToClipboard(this.href); return false;" title="Copy permalink to this patch">
                     <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
                 </a>`;
                 let patchLineageBadge = '';
@@ -3995,84 +4115,15 @@
                     </div>
                 `;
 
-                if (sortedPatchIds.length > 1) {
-                    let summaryStatus = '';
-
-                    if (patch && (patch.status === 'error' || patch.status === 'failed')) {
-                        summaryStatus = `<span class="text-error-bold">Apply Failed</span>`;
-                    } else if (patch && patch.status === 'Skipped') {
-                        summaryStatus = '<span style="color:var(--text-dim)">Skipped</span>';
-                    } else if (!reviews || reviews.length === 0) {
-                        summaryStatus = '<span style="color:var(--text-dim)">No reviews</span>';
-                    } else {                         // Aggregate "MAX" across all reviews for this patch
-                        let maxCounts = { low: 0, medium: 0, high: 0, critical: 0 };
-                        let hasSuccessful = false;
-                        let hasSkipped = false;
-                        let hasInProgress = false;
-                        let skippedReason = '';
-                        let errors = [];
-
-                        let validRunCount = 0;
-                        reviews.forEach(r => {
-                           if (r.status !== 'Failed To Apply') {
-                               validRunCount++;
-                           }
-
-                           if (r.status === 'Reviewed') {
-                               hasSuccessful = true;
-                               try {
-                                   if (r.output) {
-                                       const out = typeof r.output === 'string' ? JSON.parse(r.output) : r.output;
-                                       if (out && out.findings && Array.isArray(out.findings)) {
-                                           let current = { low: 0, medium: 0, high: 0, critical: 0 };
-                                           out.findings.forEach(f => {
-                                               if (f.preexisting) return; // Skip preexisting findings for summary counts
-                                               const s = String(f.severity || '').toLowerCase();
-                                               if (s === 'critical') current.critical++;
-                                               else if (s === 'high') current.high++;
-                                               else if (s === 'medium') current.medium++;
-                                               else current.low++;
-                                           });
-
-                                           // Max aggregation
-                                           maxCounts.critical = Math.max(maxCounts.critical, current.critical);
-                                           maxCounts.high = Math.max(maxCounts.high, current.high);
-                                           maxCounts.medium = Math.max(maxCounts.medium, current.medium);
-                                           maxCounts.low = Math.max(maxCounts.low, current.low);
-                                       }
-                                   }
-                               } catch (e) {}
-                           } else if (r.status === 'Skipped') {
-                               hasSkipped = true;
-                               skippedReason = r.result || 'Skipped';
-                           } else if (r.status && (r.status.toLowerCase().includes('failed') || r.status.toLowerCase().includes('error'))) {
-                               errors.push(r.status);
-                           } else if (r.status === 'Pending' || r.status === 'In Review') {
-                               hasInProgress = true;
-                           }
-                        });
-
-                        if (hasSuccessful) {
-                           summaryStatus = renderFindingsBadges(maxCounts, 'Reviewed');
-                           if (validRunCount > 1) {
-                               summaryStatus += ` <span style="color:var(--text-dim); font-size:0.85em; font-style:italic;">(max of ${validRunCount} runs)</span>`;
-                           }
-                        } else if (errors.length > 0) {
-                           summaryStatus = `<span class="text-error-bold">${escapeHtml(errors[0])}</span>`;
-                        } else if (hasSkipped && !hasInProgress) {
-                           // Only skipped
-                            summaryStatus = `<span style="color:var(--text-dim)" title="${escapeHtml(skippedReason)}">Skipped</span>`;
-                        } else {
-                            summaryStatus = '<span style="color:var(--text-dim)">In progress...</span>';
-                        }
-                    }
+                if (showSummaryTable) {
+                    const summaryStatus = computeReviewSummaryStatus(reviews, patch);
                     const patchLabel = patch ? `Patch ${patch.part_index}` : `Patch ${pid}`;
                     const patchSubject = patch ? escapeHtml(patch.subject || '(no subject)') : '';
                     summaryHtml += `<tr onclick="document.getElementById('patch-${pid}').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>${patchLabel}</strong>: ${patchSubject}${patchLineageBadge}</td><td>${summaryStatus}</td></tr>`;
                 }
             });
 
-            if (sortedPatchIds.length > 1) {
+            if (showSummaryTable) {
                 summaryHtml += '</tbody></table>';
             }
 

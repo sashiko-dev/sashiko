@@ -118,6 +118,8 @@ pub struct DefaultListPolicy {
     #[serde(default)]
     pub mute_all: bool,
     #[serde(default)]
+    pub cover_review_email: bool,
+    #[serde(default)]
     pub cc: Vec<String>,
     #[serde(default)]
     pub ignored_emails: Vec<String>,
@@ -134,6 +136,7 @@ impl Default for DefaultListPolicy {
             reply_to: Vec::new(),
             positive_review: PositiveReviewPolicy::None,
             mute_all: false,
+            cover_review_email: false,
             cc: Vec::new(),
             ignored_emails: Vec::new(),
             patchwork: PatchworkPolicy::default(),
@@ -150,6 +153,7 @@ pub struct MailingListPolicy {
     pub reply_to: Option<Vec<ReplyTarget>>,
     pub positive_review: Option<PositiveReviewPolicy>,
     pub mute_all: Option<bool>,
+    pub cover_review_email: Option<bool>,
     #[serde(default)]
     pub cc: Vec<String>,
     #[serde(default)]

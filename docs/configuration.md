@@ -299,6 +299,7 @@ pass.
 | `email_policy_path` | string | `"projects/linux/mailing_lists.toml"` | Path to the per-project mailing list and email delivery policy file (`projects/<project>/mailing_lists.toml`). |
 | `max_total_tokens` | integer | `10000000` | Maximum cumulative uncached tokens (input + output, including thinking tokens) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `1000000` | Maximum cumulative output tokens (including thinking tokens) per review. Set to 0 to disable. |
+| `series_review_enabled` | bool | `true` | Enable series-level (`0/N` cover letter and pull request description) reviews. |
 | `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
 
 ### `[linux_bug]`
@@ -358,6 +359,7 @@ Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashik
 | `defaults.reply_to` | list | `[]` | Recipient targets when findings are present: `"author"`, `"list"`, `"recipients"`. |
 | `defaults.positive_review` | string | `"none"` | Who receives a review email when 0 issues are found: `"none"`, `"author"`, or `"all"`. |
 | `defaults.mute_all` | bool | `false` | Suppress all email sending for this scope. |
+| `defaults.cover_review_email` | bool | `false` | Whether to send email replies on `0/N` cover letters when series-level findings are reported (results always appear in the Web UI). |
 | `defaults.cc` | list | `[]` | Static CC addresses always included on review emails. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses to mute entirely. |
 
@@ -372,6 +374,7 @@ Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.
 | `reply_to` | list | `defaults.reply_to` | Recipient targets for this list (`"author"`, `"list"`, `"recipients"`). |
 | `positive_review` | string | `defaults.positive_review` | Positive review delivery mode (`"none"`, `"author"`, `"all"`). |
 | `mute_all` | bool | `defaults.mute_all` | Suppress all email sending for patches matching this list. |
+| `cover_review_email` | bool | `defaults.cover_review_email` | Whether to send email replies on `0/N` cover letters when series-level findings are reported. |
 | `cc` | list | `[]` | Additional static CC addresses for this list (merged with `defaults.cc`). |
 | `ignored_emails` | list | `[]` | Additional author addresses to mute for this list. |
 | `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this mailing list. |
