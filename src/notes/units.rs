@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::maintainers::MaintainersIndex;
-use crate::notes::profile::UnitsConfig;
+use crate::notes::profile::{ShallowFiles, UnitsConfig};
 use crate::notes::scope::SourceFile;
 
 /// Answers which units own a file.
@@ -123,25 +123,28 @@ fn unique_slug(name: &str, used: &mut HashSet<String>) -> String {
 pub struct DirectoryUnits {
     roots: Vec<String>,
     depth: usize,
+    shallow_files: ShallowFiles,
 }
 
 impl DirectoryUnits {
-    pub fn new(roots: &[String], depth: usize) -> Self {
+    pub fn new(roots: &[String], depth: usize, shallow_files: ShallowFiles) -> Self {
         Self {
             roots: roots
                 .iter()
                 .map(|r| r.trim().trim_matches('/').to_string())
                 .collect(),
             depth,
+            shallow_files,
         }
     }
 }
 
 impl UnitSource for DirectoryUnits {
     /// A file `depth` or more directories below a root belongs to the
-    /// directory at that depth; a shallower file belongs to its own
-    /// directory. The first matching root wins, so directory units never
-    /// overlap.
+    /// directory at that depth. A shallower file belongs to its own
+    /// directory, or with `ShallowFiles::PerModule` to a unit named after
+    /// the file without its extension. The first matching root wins, so
+    /// directory units never overlap.
     fn owners(&self, path: &str) -> Vec<String> {
         for root in &self.roots {
             let Some(rel) = path
@@ -158,6 +161,14 @@ impl UnitSource for DirectoryUnits {
             for dir in &dirs[..take] {
                 unit.push('/');
                 unit.push_str(dir);
+            }
+            if take < self.depth && self.shallow_files == ShallowFiles::PerModule {
+                let file_name = dirs[dirs.len() - 1];
+                let stem = file_name
+                    .split_once('.')
+                    .map_or(file_name, |(stem, _)| stem);
+                unit.push('/');
+                unit.push_str(stem);
             }
             return vec![unit];
         }
@@ -202,9 +213,11 @@ pub fn unit_source<'a>(
     maintainers: Option<&'a MaintainersIndex>,
 ) -> anyhow::Result<Box<dyn UnitSource + 'a>> {
     match config {
-        UnitsConfig::Directories { roots, depth } => {
-            Ok(Box::new(DirectoryUnits::new(roots, *depth)))
-        }
+        UnitsConfig::Directories {
+            roots,
+            depth,
+            shallow_files,
+        } => Ok(Box::new(DirectoryUnits::new(roots, *depth, *shallow_files))),
         UnitsConfig::Maintainers {} => {
             let index = maintainers.ok_or_else(|| {
                 anyhow::anyhow!("the maintainers unit source needs a MAINTAINERS file")
@@ -243,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_directory_units_depth_one() {
-        let source = DirectoryUnits::new(&["src/".to_string()], 1);
+        let source = DirectoryUnits::new(&["src/".to_string()], 1, ShallowFiles::Together);
         let files = [
             file("src/main.rs", 10),
             file("src/ai/gemini.rs", 20),
@@ -267,12 +280,23 @@ mod tests {
 
     #[test]
     fn test_directory_units_depth_two() {
-        let source = DirectoryUnits::new(&["src".to_string()], 2);
+        let source = DirectoryUnits::new(&["src".to_string()], 2, ShallowFiles::Together);
         assert_eq!(source.owners("src/lib.rs"), vec!["src"]);
         assert_eq!(source.owners("src/ai/gemini.rs"), vec!["src/ai"]);
         assert_eq!(source.owners("src/ai/cache/db.rs"), vec!["src/ai/cache"]);
         assert_eq!(source.owners("src/ai/cache/x/y.rs"), vec!["src/ai/cache"]);
         assert!(source.owners("srcx/lib.rs").is_empty());
+    }
+
+    #[test]
+    fn test_directory_units_per_module() {
+        let source = DirectoryUnits::new(&["src".to_string()], 1, ShallowFiles::PerModule);
+        assert_eq!(source.owners("src/db.rs"), vec!["src/db"]);
+        assert_eq!(source.owners("src/main.rs"), vec!["src/main"]);
+        // A module file joins the directory unit of the same name.
+        assert_eq!(source.owners("src/git_ops.rs"), vec!["src/git_ops"]);
+        assert_eq!(source.owners("src/git_ops/apply.rs"), vec!["src/git_ops"]);
+        assert_eq!(source.owners("src/ai/cache/db.rs"), vec!["src/ai"]);
     }
 
     #[test]
@@ -335,6 +359,7 @@ F:\t*/
         let dirs = UnitsConfig::Directories {
             roots: vec!["src".to_string()],
             depth: 1,
+            shallow_files: ShallowFiles::Together,
         };
         assert_eq!(
             unit_source(&dirs, None).unwrap().owners("src/a.rs"),

@@ -62,6 +62,8 @@ pub enum UnitsConfig {
         roots: Vec<String>,
         #[serde(default = "default_directory_depth")]
         depth: usize,
+        #[serde(default)]
+        shallow_files: ShallowFiles,
     },
     /// Sections of the project's `MAINTAINERS` file.
     Maintainers {},
@@ -69,6 +71,21 @@ pub enum UnitsConfig {
 
 fn default_directory_depth() -> usize {
     1
+}
+
+/// What happens to files shallower than the unit depth (for depth 1, the
+/// files directly inside a root).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShallowFiles {
+    /// They form one unit named after their directory.
+    #[default]
+    Together,
+    /// Each is its own unit named after the file without its extension, so
+    /// a module file (`src/db.rs`) joins the directory unit of the same
+    /// name (`src/db/`) when one exists. Suits languages where each file is
+    /// a module, such as Rust.
+    PerModule,
 }
 
 /// Source languages the engine has entry-point extraction for. Files of any
@@ -130,7 +147,7 @@ impl NotesProfile {
     }
 
     fn validate(&self) -> Result<()> {
-        if let UnitsConfig::Directories { roots, depth } = &self.units {
+        if let UnitsConfig::Directories { roots, depth, .. } = &self.units {
             if roots.is_empty() || roots.iter().any(|r| r.trim().is_empty()) {
                 bail!("units.roots must list at least one non-empty directory");
             }
@@ -224,6 +241,7 @@ mod tests {
 source = "directories"
 roots = ["src"]
 depth = 1
+shallow_files = "together"
 
 [languages]
 skip = ["src/migrations/"]
@@ -243,7 +261,8 @@ component_lines = 4000
             profile.units,
             UnitsConfig::Directories {
                 roots: vec!["src".to_string()],
-                depth: 1
+                depth: 1,
+                shallow_files: ShallowFiles::Together,
             }
         );
         assert_eq!(profile.limits.component_lines, 4000);
