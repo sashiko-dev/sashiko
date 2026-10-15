@@ -28,12 +28,32 @@ Move SQL execution, query rows, and transactions behind a backend-neutral
 interface owned by `src/db/`. The interface must support typed parameters,
 nullable values, returned rows, and explicit transaction ownership. Keep
 SQLite-specific SQL in the libSQL implementation and use native PostgreSQL
-queries in the PostgreSQL implementation. A string substitution layer for
-placeholder syntax is insufficient: the schemas also differ in identity
-columns, triggers, JSON functions, conflict clauses, and transaction behavior.
+queries in the PostgreSQL implementation. The execution boundary translates
+the application's closed query vocabulary with a SQL lexer: positional
+parameters, case-insensitive LIKE, string aggregation, and native PostgreSQL
+date and JSON helper functions. Values stay bound through the PostgreSQL wire
+protocol. Native migrations separately handle identity columns, bytea payloads,
+audit and projection triggers, and transaction behavior.
 
-Callers outside `src/db/` must use database methods rather than a public
-libSQL connection. Keep the no-default-features local review build independent
+Full PostgreSQL configuration:
+
+```toml
+[storage]
+mode = "postgresql"
+postgres_url = "postgresql://sashiko:password@database.example/sashiko"
+postgres_schema = "sashiko"
+# postgres_ca_file = "/etc/sashiko/postgres-ca.pem"
+```
+
+TLS is required, with certificate and hostname verification by default.
+`postgres_tls_require_only = true` explicitly opts into encryption without
+certificate verification for environments using an untrusted certificate.
+Connection URLs are secret and should come from deployment secret storage
+through `SASHIKO__STORAGE__POSTGRES_URL`, using the existing settings loader's
+environment convention. PostgreSQL schemas isolate independent deployments.
+
+Callers use the backend-neutral connection rather than a public libSQL
+connection. Keep the no-default-features local review build independent
 of both daemon database drivers.
 
 ## Full PostgreSQL mode
@@ -44,7 +64,10 @@ backend-specific, versioned migrations. PostgreSQL schema versioning must be
 transactional and protected against concurrent daemon startups. Translate
 SQLite triggers and JSON projections into PostgreSQL triggers or explicit
 transactional writes, with tests proving equivalent behavior. Use PostgreSQL
-row locking for worker claims and outbox leases. Keep a single database
+an advisory transaction lock for worker claims and outbox leases, preserving
+the existing single-writer transaction contract across daemon instances.
+Canonical bug deduplication also takes a PostgreSQL session lock across
+the candidate check and final write. Keep a single database
 transaction for operations that currently depend on SQLite atomicity.
 
 ## Shared bugs mode

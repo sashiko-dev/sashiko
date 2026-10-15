@@ -7,6 +7,11 @@ use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
 pub async fn run_compressor(db: Arc<Database>) {
+    if db.conn.is_postgres() {
+        // PostgreSQL payloads are stored as bytea and compressed when written.
+        std::future::pending::<()>().await;
+        return;
+    }
     info!("Starting background data compressor");
     loop {
         let batch_size = 50;

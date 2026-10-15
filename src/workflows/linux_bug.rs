@@ -2453,6 +2453,7 @@ pub async fn process_issue_worker_for_project(
 
     let (seen_bug_ids, early_dup_outcome) = {
         let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
+        let _database_dedup_guard = db.conn.dedup_lock().await?;
 
         let mut known_bugs = db.list_all_bugs_for_vector_search().await?;
         known_bugs.retain(|b| b.id != bug_row.id);
@@ -2549,6 +2550,7 @@ pub async fn process_issue_worker_for_project(
 
     let late_dup_outcome = {
         let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
+        let _database_dedup_guard = db.conn.dedup_lock().await?;
 
         let mut newly_arrived_bugs = db.list_all_bugs_for_vector_search().await?;
         newly_arrived_bugs.retain(|b| b.id != bug_row.id && !seen_bug_ids.contains(&b.id));

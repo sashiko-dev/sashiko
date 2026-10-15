@@ -142,13 +142,49 @@ pub enum StorageMode {
     LibsqlSharedBugs,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StorageSettings {
     #[serde(default)]
     pub mode: StorageMode,
     #[serde(default)]
     pub postgres_url: Option<String>,
+    #[serde(default = "default_postgres_schema")]
+    pub postgres_schema: String,
+    #[serde(default)]
+    pub postgres_ca_file: Option<PathBuf>,
+    /// Explicitly allow an encrypted connection without certificate validation.
+    #[serde(default)]
+    pub postgres_tls_require_only: bool,
+}
+
+fn default_postgres_schema() -> String {
+    "sashiko".to_string()
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            mode: StorageMode::Libsql,
+            postgres_url: None,
+            postgres_schema: default_postgres_schema(),
+            postgres_ca_file: None,
+            postgres_tls_require_only: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for StorageSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageSettings")
+            .field("mode", &self.mode)
+            .field(
+                "postgres_url",
+                &self.postgres_url.as_ref().map(|_| "[redacted]"),
+            )
+            .field("postgres_schema", &self.postgres_schema)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An empty url, which is no database at all.
@@ -1300,6 +1336,9 @@ impl Settings {
     /// A remote database names no directory, so the token falls back to the
     /// working directory, which is where the configuration was read from.
     pub fn local_token_path(&self) -> PathBuf {
+        if self.storage.mode == StorageMode::Postgresql {
+            return Path::new(".").join(LOCAL_TOKEN_FILE_NAME);
+        }
         let url = self.database.url.trim();
         let dir = if url.contains("://") {
             Path::new("")
