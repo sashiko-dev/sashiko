@@ -201,6 +201,7 @@ pub async fn run(
                 temperature: settings.ai.temperature,
                 model: settings.ai.model.clone(),
                 note_bytes: profile.limits.unit_note_bytes,
+                history: profile.history.clone(),
             };
 
             let mut failures = Vec::new();

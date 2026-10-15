@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Drives a notes build for one unit (design section 7): survey, explore,
-//! evidence check, verify, synthesize, write. Each step runs as its own
-//! workflow and saves its result in the unit's work directory, so an
-//! interrupted build resumes from the last finished step, and every LLM
+//! Drives a notes build for one unit (design section 7): survey, history,
+//! explore, evidence check, verify, synthesize, write. Each step runs as
+//! its own workflow and saves its result in the unit's work directory, so
+//! an interrupted build resumes from the last finished step, and every LLM
 //! interaction is kept there for audit.
 
 use std::collections::BTreeSet;
@@ -30,15 +30,21 @@ use crate::git_cmd;
 use crate::notes::agenda::Agenda;
 use crate::notes::evidence::RevisionFiles;
 use crate::notes::facts::{FactVerdict, VerdictKind, VerifiedFact};
+use crate::notes::history::{HistoryCase, unit_history};
 use crate::notes::output::{ManifestFile, ManifestUnit, UnitFacts, write_unit};
 use crate::notes::plan::UnitPlan;
+use crate::notes::profile::HistoryConfig;
 use crate::workflow::{Workflow, WorkflowEngine, WorkflowEnv, WorkflowOutcome};
 use crate::workflows::code_notes::{
     Applicability, CheckedFact, ComponentInput, EXPLORE_STAGE_NAMES, ExploreRecord, FileInput,
-    NotesBuildState, SurveyOutput, VERIFY_BATCH_SIZE, VERIFY_STAGE_NAMES, explore_stage,
-    parallel_workflow, renumber_facts, single_stage_workflow, survey_stage, synthesize_stage,
-    verdicts_by_id, verify_stage,
+    HISTORY_BATCH_SIZE, HISTORY_STAGE_NAMES, HISTORY_TOPIC_ID, HistoryInput, HistoryLesson,
+    LessonKind, NotesBuildState, PlacedLesson, SurveyOutput, VERIFY_BATCH_SIZE, VERIFY_STAGE_NAMES,
+    explore_stage, history_stage, history_topic, lessons_for, parallel_workflow, renumber_facts,
+    single_stage_workflow, survey_stage, synthesize_stage, verdicts_by_id, verify_stage,
 };
+
+/// Length of the commit IDs past fixes are shown and cited by.
+const FIX_ID_LEN: usize = 12;
 
 /// Settings shared by every unit of one build.
 #[derive(Debug, Clone)]
@@ -53,6 +59,7 @@ pub struct BuildConfig {
     pub temperature: f32,
     pub model: String,
     pub note_bytes: usize,
+    pub history: HistoryConfig,
 }
 
 /// Token use of one step or a whole unit.
@@ -76,6 +83,9 @@ impl Usage {
 pub struct UnitBuildSummary {
     pub unit: String,
     pub slug: String,
+    /// Past fixes classified, and those read as code bugs.
+    pub history_cases: usize,
+    pub history_lessons: usize,
     pub explore_stages: usize,
     pub facts_proposed: usize,
     pub evidence_failures: usize,
@@ -138,7 +148,20 @@ pub async fn build_unit(
     };
     state.survey = Some(survey.clone());
 
-    // 2. Explore every component for every topic that may apply.
+    // 2. Read the unit's past fixes into lessons for the explorers.
+    let lessons: Vec<PlacedLesson> = match load_step(&work, "history", cfg.resume)? {
+        Some(saved) => saved,
+        None => {
+            let lessons =
+                classify_history(repo, env, &mut state, unit, cfg, &work, &mut summary).await?;
+            save_step(&work, "history", &lessons)?;
+            lessons
+        }
+    };
+    summary.history_lessons = lessons.len();
+
+    // 3. Explore every component for every topic that may apply, plus the
+    //    history topic where past fixes fit no agenda topic.
     let explored: Vec<ExploreRecord> = match load_step(&work, "explore", cfg.resume)? {
         Some(saved) => saved,
         None => {
@@ -158,6 +181,9 @@ pub async fn build_unit(
                         stages.push((component.clone(), topic.clone(), component_survey.clone()));
                     }
                 }
+                if !lessons_for(&lessons, &component.name, HISTORY_TOPIC_ID).is_empty() {
+                    stages.push((component.clone(), history_topic(), component_survey.clone()));
+                }
             }
             for (round, chunk) in stages.chunks(EXPLORE_STAGE_NAMES.len()).enumerate() {
                 let built = chunk
@@ -169,6 +195,10 @@ pub async fn build_unit(
                             component.clone(),
                             topic.clone(),
                             survey.clone(),
+                            lessons_for(&lessons, &component.name, &topic.id)
+                                .into_iter()
+                                .cloned()
+                                .collect(),
                             cfg.max_turns,
                             cfg.temperature,
                         )
@@ -193,7 +223,7 @@ pub async fn build_unit(
     };
     state.explored = explored;
 
-    // 3. Unit-wide IDs and the deterministic evidence check.
+    // 4. Unit-wide IDs and the deterministic evidence check.
     let checked: Vec<CheckedFact> = match load_step(&work, "checked", cfg.resume)? {
         Some(saved) => saved,
         None => {
@@ -221,7 +251,7 @@ pub async fn build_unit(
         .filter(|f| !f.evidence_checks.iter().any(|c| c.is_ok()))
         .count();
 
-    // 4. Independent verification, then the same deterministic check on
+    // 5. Independent verification, then the same deterministic check on
     //    the verifier's own evidence.
     let verdicts: Vec<FactVerdict> = match load_step(&work, "verdicts", cfg.resume)? {
         Some(saved) => saved,
@@ -262,7 +292,7 @@ pub async fn build_unit(
         .filter(|v| v.verdict.verdict == VerdictKind::Confirmed)
         .collect();
 
-    // 5. Synthesize the note.
+    // 6. Synthesize the note.
     let note = match load_text(&work, "note.md", cfg.resume)? {
         Some(saved) => saved,
         None => {
@@ -314,7 +344,7 @@ pub async fn build_unit(
     };
     summary.note_bytes = note.len();
 
-    // 6. Write the unit into the set.
+    // 7. Write the unit into the set.
     let symbols: BTreeSet<String> = confirmed
         .iter()
         .flat_map(|v| v.fact.scope.symbols.iter().cloned())
@@ -367,6 +397,100 @@ pub async fn build_unit(
         summary.usage.tokens_in
     );
     Ok(summary)
+}
+
+/// Mines the unit's past fixes and classifies them in parallel batches.
+/// Returns the code-bug lessons placed on the components their fixes
+/// touched, newest first.
+async fn classify_history(
+    repo: &Path,
+    env: &WorkflowEnv<'_>,
+    state: &mut NotesBuildState,
+    unit: &UnitPlan,
+    cfg: &BuildConfig,
+    work: &Path,
+    summary: &mut UnitBuildSummary,
+) -> Result<Vec<PlacedLesson>> {
+    let files: Vec<String> = unit
+        .components
+        .iter()
+        .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
+        .collect();
+    let cases = unit_history(
+        repo,
+        &cfg.revision,
+        &files,
+        &cfg.history.fix_patterns,
+        cfg.history.max_cases,
+    )
+    .await?;
+    summary.history_cases = cases.len();
+    if cases.is_empty() {
+        return Ok(Vec::new());
+    }
+    save_step(work, "history-cases", &cases)?;
+    let inputs: Vec<HistoryInput> = cases
+        .iter()
+        .map(|c| HistoryInput {
+            id: fix_id(&c.fix),
+            subject: c.subject.clone(),
+            message: c.message.clone(),
+            diff: c.diff.clone(),
+        })
+        .collect();
+    let per_round = HISTORY_BATCH_SIZE * HISTORY_STAGE_NAMES.len();
+    for (round, chunk) in inputs.chunks(per_round).enumerate() {
+        let built = chunk
+            .chunks(HISTORY_BATCH_SIZE)
+            .zip(HISTORY_STAGE_NAMES)
+            .map(|(batch, name)| history_stage(name, batch.to_vec(), cfg.temperature))
+            .collect();
+        let workflow = parallel_workflow("notes_history", built);
+        let step = format!("history-round-{}", round + 1);
+        run_step(&workflow, env, state, work, &step, &mut summary.usage).await?;
+    }
+    Ok(place_lessons(&cases, &state.lessons, unit))
+}
+
+fn fix_id(sha: &str) -> String {
+    sha.chars().take(FIX_ID_LEN).collect()
+}
+
+/// Code-bug lessons in the cases' order (newest first), each on the
+/// components holding a file its fix touched, or on every component when
+/// none does.
+fn place_lessons(
+    cases: &[HistoryCase],
+    lessons: &[HistoryLesson],
+    unit: &UnitPlan,
+) -> Vec<PlacedLesson> {
+    let mut placed = Vec::new();
+    for case in cases {
+        let id = fix_id(&case.fix);
+        let Some(lesson) = lessons
+            .iter()
+            .find(|l| l.fix == id && l.kind == LessonKind::CodeBug)
+        else {
+            continue;
+        };
+        let mut components: Vec<String> = unit
+            .components
+            .iter()
+            .filter(|c| c.files.iter().any(|f| case.files.contains(&f.path)))
+            .map(|c| c.name.clone())
+            .collect();
+        if components.is_empty() {
+            components = unit.components.iter().map(|c| c.name.clone()).collect();
+        }
+        placed.push(PlacedLesson {
+            fix: id,
+            subject: case.subject.clone(),
+            topic: lesson.topic.clone(),
+            violated_rule: lesson.violated_rule.trim().to_string(),
+            components,
+        });
+    }
+    placed
 }
 
 fn component_inputs(unit: &UnitPlan) -> Vec<ComponentInput> {
@@ -723,6 +847,64 @@ mod tests {
         assert!(note.contains("- Hold A before B. [F1]"));
         let short = fallback_note("u", &survey, &refs, 40);
         assert!(short.len() <= 40);
+    }
+
+    #[test]
+    fn test_place_lessons_by_touched_files() {
+        use crate::notes::plan::{ComponentPlan, PlannedFile, TokenEstimate};
+        let component = |name: &str, path: &str| ComponentPlan {
+            name: name.to_string(),
+            files: vec![PlannedFile {
+                path: path.to_string(),
+                lines: 10,
+                test_lines: 0,
+            }],
+            lines: 10,
+            entry_points: vec![],
+        };
+        let unit = UnitPlan {
+            name: "net".to_string(),
+            slug: "net".to_string(),
+            files: 2,
+            lines: 20,
+            shared_files: 0,
+            components: vec![component("a", "net/a.c"), component("b", "net/b.c")],
+            estimated_input_tokens: TokenEstimate::default(),
+        };
+        let case = |sha: &str, files: &[&str]| HistoryCase {
+            fix: sha.to_string(),
+            time: 0,
+            subject: format!("fix {sha}"),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            message: String::new(),
+            diff: String::new(),
+        };
+        let lesson = |sha: &str, kind: LessonKind| HistoryLesson {
+            fix: fix_id(sha),
+            kind,
+            topic: "SYNC".to_string(),
+            violated_rule: " rule ".to_string(),
+        };
+        let newer = "1".repeat(40);
+        let older = "2".repeat(40);
+        let docs = "3".repeat(40);
+        let cases = vec![
+            case(&newer, &["net/b.c"]),
+            case(&docs, &["net/a.c"]),
+            case(&older, &[]),
+        ];
+        // Lessons arrive in any order; placement follows the cases.
+        let lessons = vec![
+            lesson(&older, LessonKind::CodeBug),
+            lesson(&docs, LessonKind::NotCodeBug),
+            lesson(&newer, LessonKind::CodeBug),
+        ];
+        let placed = place_lessons(&cases, &lessons, &unit);
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[0].fix, "1".repeat(FIX_ID_LEN));
+        assert_eq!(placed[0].components, vec!["b"]);
+        assert_eq!(placed[0].violated_rule, "rule");
+        assert_eq!(placed[1].components, vec!["a", "b"]);
     }
 
     #[test]

@@ -217,6 +217,7 @@ pub struct NotesBuildState {
     pub components: Vec<ComponentInput>,
     pub topics: Vec<Topic>,
     pub survey: Option<SurveyOutput>,
+    pub lessons: Vec<HistoryLesson>,
     pub explored: Vec<ExploreRecord>,
     pub verdicts: Vec<FactVerdict>,
     pub note: Option<String>,
@@ -376,6 +377,239 @@ fn sorted<'a>(set: &HashSet<&'a str>) -> Vec<&'a str> {
 }
 
 // ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+
+/// Historic fixes classified by one history stage.
+pub const HISTORY_BATCH_SIZE: usize = 15;
+/// Lessons from past fixes given to one explore stage, newest first.
+pub const MAX_LESSONS_PER_STAGE: usize = 8;
+/// Topic ID for lessons that fit no agenda topic; components with such
+/// lessons get an extra explore stage for them.
+pub const HISTORY_TOPIC_ID: &str = "HIST";
+
+pub const HISTORY_STAGE_NAMES: [&str; 8] = [
+    "history-1",
+    "history-2",
+    "history-3",
+    "history-4",
+    "history-5",
+    "history-6",
+    "history-7",
+    "history-8",
+];
+
+/// Whether a past fix repaired a defect in the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LessonKind {
+    /// The fix repaired a code defect and restored a rule.
+    CodeBug,
+    /// Documentation, build, test-only, cosmetic or revert-only changes,
+    /// or a fix whose rule cannot be told from the change.
+    NotCodeBug,
+}
+
+/// The classifier's reading of one past fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryLesson {
+    /// The fix ID exactly as given.
+    pub fix: String,
+    pub kind: LessonKind,
+    /// An agenda topic ID, or HISTORY_TOPIC_ID when none fits.
+    #[serde(default)]
+    pub topic: String,
+    /// The rule the buggy code broke and the fix restored.
+    #[serde(default)]
+    pub violated_rule: String,
+}
+
+/// History stage output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryOutput {
+    pub lessons: Vec<HistoryLesson>,
+}
+
+/// One past fix as the history stage sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryInput {
+    /// Short commit ID, unique within the unit's history.
+    pub id: String,
+    pub subject: String,
+    pub message: String,
+    pub diff: String,
+}
+
+const HISTORY_INSTRUCTION: &str = r##"Read these past fixes of unit "{{unit}}" and extract the rule each one restored. The rules will steer a deep exploration of the current code, so they must be precise and checkable.
+
+<agenda_topics>
+{{topics}}
+</agenda_topics>
+
+<past_fixes>
+{{cases}}
+</past_fixes>
+
+For EVERY fix decide:
+- "kind": "code_bug" when the fix repaired a defect in the code; "not_code_bug" for documentation, build, test-only, cosmetic or revert-only changes, or when the change does not show what was wrong.
+- For a code bug, "violated_rule": ONE sentence of at most {{max_statement_chars}} characters stating the rule the buggy code broke and the fix restored, generalized just enough to apply to other code in this unit (name the functions, types, locks or fields involved; never just "the bug was fixed"). It must follow from the message and diff shown, not from guesses.
+- For a code bug, "topic": the agenda topic ID the rule belongs to, or "{{history_topic}}" when no topic fits.
+
+Return ONLY a JSON object with one lesson per fix, using the fix IDs exactly as given:
+{"lessons": [{"fix": "0123456789ab", "kind": "code_bug", "topic": "SYNC", "violated_rule": "..."}, {"fix": "ba9876543210", "kind": "not_code_bug", "topic": "", "violated_rule": ""}]}"##;
+
+fn render_cases(cases: &[HistoryInput]) -> String {
+    cases
+        .iter()
+        .map(|c| {
+            format!(
+                "<fix id=\"{}\">\n<subject>{}</subject>\n<message>\n{}\n</message>\n<diff>\n{}\n</diff>\n</fix>",
+                c.id, c.subject, c.message, c.diff
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One history stage classifying a batch of past fixes. It needs no tools:
+/// the message and diff carry what it decides from.
+pub fn history_stage(
+    name: &'static str,
+    cases: Vec<HistoryInput>,
+    temperature: f32,
+) -> Box<dyn ExecutableStage<NotesBuildState>> {
+    let ids: Vec<String> = cases.iter().map(|c| c.id.clone()).collect();
+    let rendered = render_cases(&cases);
+    Box::new(
+        Stage::builder(name)
+            .system_prompt(system_prompt())
+            .user_prompt(
+                PromptTemplate::new(HISTORY_INSTRUCTION)
+                    .with_var("unit", |s: &NotesBuildState| s.unit.clone())
+                    .with_var("topics", |s: &NotesBuildState| render_topics(&s.topics))
+                    .with_var("cases", move |_: &NotesBuildState| rendered.clone())
+                    .with_var("history_topic", |_: &NotesBuildState| {
+                        HISTORY_TOPIC_ID.to_string()
+                    })
+                    .with_var("max_statement_chars", |_: &NotesBuildState| {
+                        MAX_STATEMENT_CHARS.to_string()
+                    }),
+            )
+            .output_format(
+                OutputFormat::json()
+                    .with_validator(move |out: &HistoryOutput, state: &NotesBuildState| {
+                        validate_lessons(out, &ids, &state.topics)
+                    })
+                    .with_feedback_formatter(|err| {
+                        format!("Your lessons were rejected: {err}\nFix exactly that and return the full JSON object again.")
+                    }),
+            )
+            .policy(StagePolicy {
+                max_validation_attempts: SYNTH_VALIDATION_ATTEMPTS,
+                ..policy(SYNTH_VALIDATION_ATTEMPTS, temperature, ToolScope::None)
+            })
+            .reduce(|state: &mut NotesBuildState, out: HistoryOutput| {
+                state.lessons.extend(out.lessons);
+            })
+            .build(),
+    )
+}
+
+/// One lesson per fix in the batch; code bugs name a known topic and state
+/// a bounded rule.
+pub fn validate_lessons(
+    out: &HistoryOutput,
+    ids: &[String],
+    topics: &[Topic],
+) -> Result<(), String> {
+    let expected: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut topic_ids: HashSet<&str> = topics.iter().map(|t| t.id.as_str()).collect();
+    topic_ids.insert(HISTORY_TOPIC_ID);
+    let mut seen = HashSet::new();
+    for lesson in &out.lessons {
+        if !expected.contains(lesson.fix.as_str()) {
+            return Err(format!(
+                "lesson for unknown fix {:?}; the fixes are {ids:?}",
+                lesson.fix
+            ));
+        }
+        if !seen.insert(lesson.fix.as_str()) {
+            return Err(format!("fix {} has two lessons", lesson.fix));
+        }
+        if lesson.kind == LessonKind::NotCodeBug {
+            continue;
+        }
+        if !topic_ids.contains(lesson.topic.as_str()) {
+            return Err(format!(
+                "fix {} names topic {:?}; use one of {:?}",
+                lesson.fix,
+                lesson.topic,
+                sorted(&topic_ids)
+            ));
+        }
+        let rule = lesson.violated_rule.trim();
+        if rule.is_empty() {
+            return Err(format!(
+                "fix {} is a code bug without a violated_rule",
+                lesson.fix
+            ));
+        }
+        if rule.chars().count() > MAX_STATEMENT_CHARS {
+            return Err(format!(
+                "fix {} violated_rule is longer than {MAX_STATEMENT_CHARS} characters; state one rule in one sentence",
+                lesson.fix
+            ));
+        }
+    }
+    let missing: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !seen.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("fixes {missing:?} have no lesson"));
+    }
+    Ok(())
+}
+
+/// A lesson placed on the components whose files its fix touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacedLesson {
+    pub fix: String,
+    pub subject: String,
+    pub topic: String,
+    pub violated_rule: String,
+    pub components: Vec<String>,
+}
+
+/// The topic every component with lessons outside the agenda explores.
+pub fn history_topic() -> Topic {
+    Topic {
+        id: HISTORY_TOPIC_ID.to_string(),
+        title: "Rules restored by past fixes".to_string(),
+        module: "history".to_string(),
+        questions: vec![crate::notes::agenda::Question {
+            id: format!("{HISTORY_TOPIC_ID}-1"),
+            text: "Does each rule a past fix restored still govern the current code, where else does the same rule apply, and is it upheld there?".to_string(),
+        }],
+    }
+}
+
+/// Lessons for one explore stage: those placed on `component` under
+/// `topic`, newest first (the input order), at most MAX_LESSONS_PER_STAGE.
+pub fn lessons_for<'a>(
+    lessons: &'a [PlacedLesson],
+    component: &str,
+    topic: &str,
+) -> Vec<&'a PlacedLesson> {
+    lessons
+        .iter()
+        .filter(|l| l.topic == topic && l.components.iter().any(|c| c == component))
+        .take(MAX_LESSONS_PER_STAGE)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Explore
 // ---------------------------------------------------------------------------
 
@@ -393,6 +627,12 @@ const EXPLORE_INSTRUCTION: &str = r##"Explore component "{{component}}" of unit 
 {{questions}}
 </questions>
 
+<past_fixes>
+{{past_fixes}}
+</past_fixes>
+
+Past fixes, when listed, are bugs fixed earlier in this component for this topic, with the rule each fix restored as read from the fix. Use them as leads: check whether each rule still governs the current code, where else the same rule applies, and whether it is upheld there. A rule from a past fix becomes a fact only when the current code proves it; when a fact states or generalizes a past fix's rule, list that fix's ID in "from_history".
+
 Answer the questions by reading and tracing the code with the tools: follow callers and callees, lock acquisitions and releases, ownership transfers, error and cleanup paths, and every path that reaches the state in question. Then report what you established as facts.
 
 A good fact:
@@ -406,7 +646,7 @@ Each fact needs evidence: the file path, a line range of at most {{max_evidence_
 When you investigated a plausible rule and found it does NOT hold, record it in "dismissed_hypotheses" with the reason and the code that disproves it. Record questions you could not settle in "open_questions". Report at most {{max_facts}} facts; a few strong facts are worth more than many weak ones, and an empty list is a valid answer when the topic has nothing worth stating.
 
 Return ONLY a JSON object:
-{"facts": [{"id": "F1", "kind": "LockingRule", "statement": "...", "scope": {"files": ["path"], "symbols": ["name"]}, "evidence": [{"path": "path", "start_line": 10, "end_line": 18, "snippet": "verbatim code"}], "questions": ["SYNC-2"]}], "dismissed_hypotheses": [{"statement": "...", "reason": "...", "evidence": []}], "open_questions": ["..."]}"##;
+{"facts": [{"id": "F1", "kind": "LockingRule", "statement": "...", "scope": {"files": ["path"], "symbols": ["name"]}, "evidence": [{"path": "path", "start_line": 10, "end_line": 18, "snippet": "verbatim code"}], "questions": ["SYNC-2"], "from_history": []}], "dismissed_hypotheses": [{"statement": "...", "reason": "...", "evidence": []}], "open_questions": ["..."]}"##;
 
 /// One explore stage for `component` and `topic`.
 pub fn explore_stage(
@@ -414,10 +654,13 @@ pub fn explore_stage(
     component: ComponentInput,
     topic: Topic,
     survey: Option<ComponentSurvey>,
+    lessons: Vec<PlacedLesson>,
     max_turns: usize,
     temperature: f32,
 ) -> Box<dyn ExecutableStage<NotesBuildState>> {
     let question_ids: HashSet<String> = topic.questions.iter().map(|q| q.id.clone()).collect();
+    let fix_ids: HashSet<String> = lessons.iter().map(|l| l.fix.clone()).collect();
+    let past_fixes = render_lessons(&lessons);
     let component_name = component.name.clone();
     let topic_id = topic.id.clone();
     let component_json = serde_json::to_string_pretty(&component).unwrap_or_default();
@@ -446,6 +689,7 @@ pub fn explore_stage(
                     })
                     .with_var("survey", move |_: &NotesBuildState| survey_json.clone())
                     .with_var("questions", move |_: &NotesBuildState| questions.clone())
+                    .with_var("past_fixes", move |_: &NotesBuildState| past_fixes.clone())
                     .with_var("max_evidence_lines", |_: &NotesBuildState| {
                         MAX_EVIDENCE_LINES.to_string()
                     })
@@ -459,7 +703,7 @@ pub fn explore_stage(
             .output_format(
                 OutputFormat::json()
                     .with_validator(move |out: &ExploreOutput, _: &NotesBuildState| {
-                        validate_explore(out, &question_ids)
+                        validate_explore(out, &question_ids, &fix_ids)
                     })
                     .with_feedback_formatter(|err| {
                         format!("Your facts were rejected: {err}\nFix exactly that and return the full JSON object again.")
@@ -475,6 +719,17 @@ pub fn explore_stage(
             })
             .build(),
     )
+}
+
+fn render_lessons(lessons: &[PlacedLesson]) -> String {
+    if lessons.is_empty() {
+        return "(none)".to_string();
+    }
+    lessons
+        .iter()
+        .map(|l| format!("- {} \"{}\": {}", l.fix, l.subject, l.violated_rule))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn validate_evidence_list(
@@ -518,7 +773,11 @@ fn validate_evidence_list(
 
 /// Explore output rules: bounded size, evidence on every fact, question IDs
 /// from the topic, and scope symbols that appear in the evidence.
-pub fn validate_explore(out: &ExploreOutput, question_ids: &HashSet<String>) -> Result<(), String> {
+pub fn validate_explore(
+    out: &ExploreOutput,
+    question_ids: &HashSet<String>,
+    fix_ids: &HashSet<String>,
+) -> Result<(), String> {
     if out.facts.len() > MAX_FACTS_PER_STAGE {
         return Err(format!(
             "{} facts reported; at most {MAX_FACTS_PER_STAGE} are allowed, keep the strongest",
@@ -547,6 +806,18 @@ pub fn validate_explore(out: &ExploreOutput, question_ids: &HashSet<String>) -> 
                     "{owner} answers unknown question {q:?}; this topic's questions are {:?}",
                     {
                         let mut v: Vec<&String> = question_ids.iter().collect();
+                        v.sort();
+                        v
+                    }
+                ));
+            }
+        }
+        for fix in &fact.from_history {
+            if !fix_ids.contains(fix) {
+                return Err(format!(
+                    "{owner} lists {fix:?} in from_history, but it is not one of the past fixes given ({:?})",
+                    {
+                        let mut v: Vec<&String> = fix_ids.iter().collect();
                         v.sort();
                         v
                     }
@@ -958,17 +1229,18 @@ mod tests {
     #[test]
     fn test_validate_explore() {
         let ids: HashSet<String> = ["SYNC-1".to_string()].into();
+        let fixes: HashSet<String> = ["0123456789ab".to_string()].into();
         let good = ExploreOutput {
             facts: vec![fact("F1", &["pool_lock"], "let g = pool_lock.lock();")],
             dismissed_hypotheses: vec![],
             open_questions: vec![],
         };
-        assert!(validate_explore(&good, &ids).is_ok());
+        assert!(validate_explore(&good, &ids, &fixes).is_ok());
 
         let mut bad_symbol = good.clone();
         bad_symbol.facts[0].scope.symbols = vec!["other".to_string()];
         assert!(
-            validate_explore(&bad_symbol, &ids)
+            validate_explore(&bad_symbol, &ids, &fixes)
                 .unwrap_err()
                 .contains("scope.symbols")
         );
@@ -976,7 +1248,7 @@ mod tests {
         let mut no_evidence = good.clone();
         no_evidence.facts[0].evidence.clear();
         assert!(
-            validate_explore(&no_evidence, &ids)
+            validate_explore(&no_evidence, &ids, &fixes)
                 .unwrap_err()
                 .contains("no evidence")
         );
@@ -984,7 +1256,7 @@ mod tests {
         let mut wide = good.clone();
         wide.facts[0].evidence[0].end_line = 500;
         assert!(
-            validate_explore(&wide, &ids)
+            validate_explore(&wide, &ids, &fixes)
                 .unwrap_err()
                 .contains("spans more")
         );
@@ -992,7 +1264,7 @@ mod tests {
         let mut wrong_q = good.clone();
         wrong_q.facts[0].questions = vec!["LIFE-1".to_string()];
         assert!(
-            validate_explore(&wrong_q, &ids)
+            validate_explore(&wrong_q, &ids, &fixes)
                 .unwrap_err()
                 .contains("unknown question")
         );
@@ -1000,9 +1272,19 @@ mod tests {
         let mut dup = good.clone();
         dup.facts.push(dup.facts[0].clone());
         assert!(
-            validate_explore(&dup, &ids)
+            validate_explore(&dup, &ids, &fixes)
                 .unwrap_err()
                 .contains("used twice")
+        );
+
+        let mut from_fix = good.clone();
+        from_fix.facts[0].from_history = vec!["0123456789ab".to_string()];
+        assert!(validate_explore(&from_fix, &ids, &fixes).is_ok());
+        from_fix.facts[0].from_history = vec!["ffffffffffff".to_string()];
+        assert!(
+            validate_explore(&from_fix, &ids, &fixes)
+                .unwrap_err()
+                .contains("from_history")
         );
 
         let empty = ExploreOutput {
@@ -1010,7 +1292,101 @@ mod tests {
             dismissed_hypotheses: vec![],
             open_questions: vec![],
         };
-        assert!(validate_explore(&empty, &ids).is_ok());
+        assert!(validate_explore(&empty, &ids, &fixes).is_ok());
+    }
+
+    #[test]
+    fn test_validate_lessons() {
+        let ids = vec!["aaaaaaaaaaaa".to_string(), "bbbbbbbbbbbb".to_string()];
+        let topics = vec![topic("SYNC", &["SYNC-1"])];
+        let lesson = |fix: &str, kind: LessonKind, topic: &str, rule: &str| HistoryLesson {
+            fix: fix.to_string(),
+            kind,
+            topic: topic.to_string(),
+            violated_rule: rule.to_string(),
+        };
+        let ok = HistoryOutput {
+            lessons: vec![
+                lesson(
+                    "aaaaaaaaaaaa",
+                    LessonKind::CodeBug,
+                    "SYNC",
+                    "Hold tx_lock across the read and the write.",
+                ),
+                lesson("bbbbbbbbbbbb", LessonKind::NotCodeBug, "", ""),
+            ],
+        };
+        assert!(validate_lessons(&ok, &ids, &topics).is_ok());
+
+        let mut other_topic = ok.clone();
+        other_topic.lessons[0].topic = HISTORY_TOPIC_ID.to_string();
+        assert!(validate_lessons(&other_topic, &ids, &topics).is_ok());
+
+        let mut bad_topic = ok.clone();
+        bad_topic.lessons[0].topic = "LIFE".to_string();
+        assert!(
+            validate_lessons(&bad_topic, &ids, &topics)
+                .unwrap_err()
+                .contains("topic")
+        );
+
+        let mut no_rule = ok.clone();
+        no_rule.lessons[0].violated_rule = " ".to_string();
+        assert!(
+            validate_lessons(&no_rule, &ids, &topics)
+                .unwrap_err()
+                .contains("violated_rule")
+        );
+
+        let mut long_rule = ok.clone();
+        long_rule.lessons[0].violated_rule = "x".repeat(MAX_STATEMENT_CHARS + 1);
+        assert!(
+            validate_lessons(&long_rule, &ids, &topics)
+                .unwrap_err()
+                .contains("longer")
+        );
+
+        let mut missing = ok.clone();
+        missing.lessons.pop();
+        assert!(
+            validate_lessons(&missing, &ids, &topics)
+                .unwrap_err()
+                .contains("no lesson")
+        );
+
+        let mut unknown = ok.clone();
+        unknown.lessons[1].fix = "cccccccccccc".to_string();
+        assert!(
+            validate_lessons(&unknown, &ids, &topics)
+                .unwrap_err()
+                .contains("unknown fix")
+        );
+    }
+
+    #[test]
+    fn test_lessons_for_filters_and_caps() {
+        let placed: Vec<PlacedLesson> = (0..MAX_LESSONS_PER_STAGE + 3)
+            .map(|i| PlacedLesson {
+                fix: format!("{i:012}"),
+                subject: "s".to_string(),
+                topic: if i == 0 {
+                    "LIFE".to_string()
+                } else {
+                    "SYNC".to_string()
+                },
+                violated_rule: "r".to_string(),
+                components: vec![if i == 1 {
+                    "b".to_string()
+                } else {
+                    "a".to_string()
+                }],
+            })
+            .collect();
+        let got = lessons_for(&placed, "a", "SYNC");
+        assert_eq!(got.len(), MAX_LESSONS_PER_STAGE);
+        assert_eq!(got[0].fix, format!("{:012}", 2));
+        assert!(lessons_for(&placed, "a", "LIFE").len() == 1);
+        assert!(lessons_for(&placed, "c", "SYNC").is_empty());
     }
 
     #[test]
