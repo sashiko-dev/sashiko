@@ -23,7 +23,7 @@
 //! the files the patch touches, and their notes are inlined up to a byte
 //! budget.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -134,6 +134,7 @@ pub struct SelectedNote {
 pub fn select_notes(
     set: &NotesSet,
     touched_files: &[String],
+    focus: Option<&HashSet<String>>,
     max_bytes: usize,
 ) -> Vec<SelectedNote> {
     let mut covered: HashMap<&str, &str> = HashMap::new();
@@ -166,6 +167,13 @@ pub fn select_notes(
             continue;
         };
         let text = strip_citations(&text);
+        let text = match focus {
+            None => text,
+            Some(identifiers) => match focus_note(&text, identifiers) {
+                Some(focused) => focused,
+                None => continue,
+            },
+        };
         if used + text.len() > max_bytes {
             continue;
         }
@@ -201,6 +209,90 @@ fn nearest_unit<'a>(covered: &HashMap<&'a str, &'a str>, file: &str) -> Option<&
         }
     }
     None
+}
+
+/// Words too common in code to tie a note rule to a patch.
+const COMMON_WORDS: &[&str] = &[
+    "const", "static", "struct", "return", "unsigned", "signed", "sizeof", "while", "break",
+    "continue", "switch", "default", "inline", "extern", "union", "typedef", "volatile", "false",
+    "true", "NULL", "void", "char", "short", "long", "self", "Self", "impl", "match", "where",
+    "async", "await", "error", "value", "index", "count", "flags", "data", "size", "len", "ret",
+    "err", "the", "and",
+];
+
+static IDENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex"));
+static CODE_SPAN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"`([^`]+)`").expect("valid regex"));
+
+/// An identifier specific enough to tie a rule to a patch: not a common
+/// word, and either containing an underscore or at least five long.
+fn is_specific(word: &str) -> bool {
+    (word.contains('_') || word.len() >= 5) && !COMMON_WORDS.contains(&word)
+}
+
+/// The specific identifiers a diff touches: those on its added and removed
+/// lines and in its hunk headers (which name the enclosing function).
+pub fn diff_identifiers(diff: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for line in diff.lines() {
+        let text = if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        } else if let Some(rest) = line.strip_prefix("@@") {
+            rest.split_once("@@").map_or("", |(_, context)| context)
+        } else if let Some(rest) = line.strip_prefix(['+', '-']) {
+            rest
+        } else {
+            continue;
+        };
+        for m in IDENT.find_iter(text) {
+            if is_specific(m.as_str()) {
+                out.insert(m.as_str().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The part of a note relevant to a patch: its title and introduction,
+/// and the rules (bullets) whose code spans name one of `identifiers`,
+/// under their headings. None when no rule matches.
+pub fn focus_note(note: &str, identifiers: &HashSet<String>) -> Option<String> {
+    let mut out = String::new();
+    let mut heading: Option<&str> = None;
+    let mut matched = 0usize;
+    let mut in_preamble = true;
+    for line in note.lines() {
+        if line.starts_with("## ") {
+            in_preamble = false;
+            heading = Some(line);
+            continue;
+        }
+        if in_preamble {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if !line.starts_with("- ") {
+            continue;
+        }
+        let relevant = CODE_SPAN.captures_iter(line).any(|span| {
+            IDENT
+                .find_iter(&span[1])
+                .any(|word| is_specific(word.as_str()) && identifiers.contains(word.as_str()))
+        });
+        if relevant {
+            if let Some(h) = heading.take() {
+                out.push('\n');
+                out.push_str(h);
+                out.push('\n');
+            }
+            out.push_str(line);
+            out.push('\n');
+            matched += 1;
+        }
+    }
+    (matched > 0).then_some(out)
 }
 
 static CITATION: LazyLock<Regex> =
@@ -335,6 +427,26 @@ mod tests {
     }
 
     #[test]
+    fn test_focus_note_keeps_rules_naming_touched_identifiers() {
+        let diff = "diff --git a/fs/locks.c b/fs/locks.c\n--- a/fs/locks.c\n+++ b/fs/locks.c\n@@ -10,3 +10,4 @@ static void locks_move_blocks(struct file_lock *new)\n-\tspin_lock(&ctx->flc_lock);\n+\tif (ret)\n";
+        let ids = diff_identifiers(diff);
+        assert!(
+            ids.contains("locks_move_blocks")
+                && ids.contains("spin_lock")
+                && ids.contains("flc_lock")
+        );
+        assert!(!ids.contains("static") && !ids.contains("ret") && !ids.contains("ctx"));
+
+        let note = "# FILE LOCKING\n\nImplements locks.\n\n## Synchronization\n- `locks_move_blocks()` runs under `ctx->flc_lock`.\n- `posix_lock_inode()` holds `blocked_lock_lock`.\n\n## Other\n- Unrelated `ctx` rule.\n";
+        let focused = focus_note(note, &ids).unwrap();
+        assert_eq!(
+            focused,
+            "# FILE LOCKING\n\nImplements locks.\n\n\n## Synchronization\n- `locks_move_blocks()` runs under `ctx->flc_lock`.\n"
+        );
+        assert!(focus_note(note, &HashSet::from(["other_fn".to_string()])).is_none());
+    }
+
+    #[test]
     fn test_select_notes_by_touched_files_and_budget() {
         let prompts = tempfile::tempdir().unwrap();
         write_set(
@@ -366,7 +478,7 @@ mod tests {
             "mm/slab.c".to_string(),
             "drivers/x.c".to_string(),
         ];
-        let notes = select_notes(set, &touched, 200);
+        let notes = select_notes(set, &touched, None, 200);
         let units: Vec<&str> = notes.iter().map(|n| n.unit.as_str()).collect();
         // net covers two touched files (one by directory), mm one; big does
         // not fit the budget.
@@ -377,6 +489,6 @@ mod tests {
         assert!(block.contains("<code_notes set=\"s\" revision=\"r\">"));
         assert!(block.contains("<unit_note unit=\"mm\">"));
         assert!(render_block(set, &[]).is_empty());
-        assert!(select_notes(set, &["docs/x.rst".to_string()], 1000).is_empty());
+        assert!(select_notes(set, &["docs/x.rst".to_string()], None, 1000).is_empty());
     }
 }

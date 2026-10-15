@@ -300,6 +300,7 @@ pass.
 | `max_total_tokens` | integer | `10000000` | Maximum cumulative uncached tokens (input + output, including thinking tokens) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `use_code_notes` | bool | `false` | Load code notes (`notes/<set>/` in the project's prompt directory, built with `sashiko notes build`) into reviews. |
 | `code_notes_bytes` | integer | `49152` | Byte budget of the code notes inlined into one review. |
+| `code_notes_scope` | string | `"unit"` | `"unit"` inlines the whole note of every unit the patch touches; `"touched"` keeps only the rules that name an identifier the patch's diff touches. |
 | `max_total_output_tokens` | integer | `1000000` | Maximum cumulative output tokens (including thinking tokens) per review. Set to 0 to disable. |
 | `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
 

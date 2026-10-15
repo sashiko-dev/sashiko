@@ -596,6 +596,7 @@ async fn review_single_patch(
                     .review
                     .use_code_notes
                     .then_some(settings.review.code_notes_bytes),
+                code_notes_scope: settings.review.code_notes_scope,
             },
         );
 

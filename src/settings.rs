@@ -974,6 +974,9 @@ pub struct ReviewSettings {
     /// Byte budget of the code notes inlined into one review.
     #[serde(default = "default_code_notes_bytes")]
     pub code_notes_bytes: usize,
+    /// How much of each selected unit note a review gets.
+    #[serde(default)]
+    pub code_notes_scope: CodeNotesScope,
     /// Maximum cumulative output tokens (including thinking tokens) across all turns in a
     /// single review. Set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
@@ -1001,6 +1004,18 @@ impl ReviewSettings {
         }
         Some(self.effort.unwrap_or(EffortMode::Mid))
     }
+}
+
+/// How much of a unit note a review gets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeNotesScope {
+    /// The whole note of every unit the patch touches.
+    #[default]
+    Unit,
+    /// Only the rules that name an identifier the patch's diff touches,
+    /// with the note's title and introduction.
+    Touched,
 }
 
 fn default_code_notes_bytes() -> usize {

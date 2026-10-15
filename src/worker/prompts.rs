@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::ai::{AiErrorClass, AiMessage, AiProvider, ClassifyAiError};
+use crate::settings::CodeNotesScope;
 use crate::toolbox::ToolBox;
 use anyhow::Result;
 
@@ -97,6 +98,7 @@ async fn select_code_notes(
     baseline: &str,
     diff: &str,
     max_bytes: usize,
+    scope: CodeNotesScope,
 ) -> String {
     let sets = crate::notes::select::load_sets(prompts_dir);
     if sets.is_empty() {
@@ -111,7 +113,11 @@ async fn select_code_notes(
         }
     };
     let files = crate::baseline::extract_files_from_diff(diff);
-    let notes = crate::notes::select::select_notes(set, &files, max_bytes);
+    let identifiers = match scope {
+        CodeNotesScope::Unit => None,
+        CodeNotesScope::Touched => Some(crate::notes::select::diff_identifiers(diff)),
+    };
+    let notes = crate::notes::select::select_notes(set, &files, identifiers.as_ref(), max_bytes);
     tracing::info!(
         "code notes: set {} with {} unit note(s) for {} touched file(s)",
         set.manifest.set,
@@ -137,6 +143,8 @@ pub struct WorkerConfig {
     /// Byte budget of code notes to load into the review; `None` disables
     /// code notes.
     pub code_notes_bytes: Option<usize>,
+    /// How much of each selected unit note the review gets.
+    pub code_notes_scope: CodeNotesScope,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +229,7 @@ pub struct Worker {
     report_preexisting: bool,
     effort: Option<crate::ai::EffortMode>,
     code_notes_bytes: Option<usize>,
+    code_notes_scope: CodeNotesScope,
 }
 
 impl Worker {
@@ -247,6 +256,7 @@ impl Worker {
             report_preexisting: config.report_preexisting,
             effort: config.effort,
             code_notes_bytes: config.code_notes_bytes,
+            code_notes_scope: config.code_notes_scope,
         }
     }
 
@@ -385,6 +395,7 @@ impl Worker {
                     &baseline_sha,
                     &target_commit_diff_only,
                     max_bytes,
+                    self.code_notes_scope,
                 )
                 .await
             }
@@ -1100,6 +1111,7 @@ mod tests {
             report_preexisting: false,
             effort: None,
             code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1212,6 +1224,7 @@ mod tests {
             report_preexisting: false,
             effort: None,
             code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1251,6 +1264,7 @@ mod tests {
             report_preexisting: false,
             effort: None,
             code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1294,6 +1308,7 @@ mod tests {
             report_preexisting: false,
             effort: None,
             code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1398,6 +1413,7 @@ mod tests {
             report_preexisting: false,
             effort: None,
             code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1584,6 +1600,7 @@ mod tests {
                 report_preexisting: false,
                 effort: None,
                 code_notes_bytes: None,
+                code_notes_scope: Default::default(),
             };
             let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1686,6 +1703,7 @@ mod tests {
                 report_preexisting: false,
                 effort: None,
                 code_notes_bytes: None,
+                code_notes_scope: Default::default(),
             },
         );
         let out_default = worker_default
@@ -1719,6 +1737,7 @@ mod tests {
                 report_preexisting: true,
                 effort: None,
                 code_notes_bytes: None,
+                code_notes_scope: Default::default(),
             },
         );
         let out_preexisting = worker_preexisting
