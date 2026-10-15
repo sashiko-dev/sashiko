@@ -83,7 +83,7 @@ libsql = { version = "0.9.29", optional = true }
 mail-parser = "0.11.3"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json", "query"] }
-rustix = { version = "1.1.4", features = ["termios"] }
+rustix = { version = "1.1.4", features = ["pty", "termios"] }
 rustls-native-certs = { version = "0.8.4", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
