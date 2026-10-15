@@ -139,13 +139,25 @@ impl Database {
 
     /// Pending publications remain durable until PostgreSQL acknowledges them.
     pub async fn shared_bug_pending_ids(&self) -> Result<BTreeSet<i64>> {
-        if self.shared.is_none() {
+        self.shared_pending_ids(None).await
+    }
+
+    /// Look up pending state only for the bugs included in an API response.
+    pub async fn shared_bug_pending_ids_for(&self, bug_ids: &[i64]) -> Result<BTreeSet<i64>> {
+        self.shared_pending_ids(Some(bug_ids)).await
+    }
+
+    async fn shared_pending_ids(&self, scope: Option<&[i64]>) -> Result<BTreeSet<i64>> {
+        if self.shared.is_none() || scope.is_some_and(<[i64]>::is_empty) {
             return Ok(BTreeSet::new());
         }
-        let mut rows = self
-            .conn
-            .query("SELECT bug_id FROM shared_bug_sync WHERE dirty=1", ())
-            .await?;
+        let mut sql = "SELECT bug_id FROM shared_bug_sync WHERE dirty=1".to_string();
+        let mut params = Vec::<libsql::Value>::new();
+        if let Some(scope) = scope {
+            sql.push_str(" AND bug_id IN (SELECT value FROM json_each(?))");
+            params.push(serde_json::to_string(scope)?.into());
+        }
+        let mut rows = self.conn.query(&sql, params).await?;
         let mut ids = BTreeSet::new();
         while let Some(row) = rows.next().await? {
             ids.insert(row.get(0)?);
@@ -740,8 +752,7 @@ fn merge_value(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn imported_evidence_keeps_raw_input_without_foreign_review_links() -> Result<()> {
+    async fn local_mirror() -> Result<Database> {
         let mut db = Database::new(&crate::settings::DatabaseSettings {
             url: ":memory:".into(),
             token: String::new(),
@@ -754,6 +765,31 @@ mod tests {
         db.migrate().await?;
         db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
             .await?;
+        Ok(db)
+    }
+
+    #[tokio::test]
+    async fn pending_state_is_limited_to_requested_bugs() -> Result<()> {
+        let db = local_mirror().await?;
+        let mut ids = Vec::new();
+        for title in ["requested", "unrelated"] {
+            let bug: NewBug = serde_json::from_value(json!({
+                "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()), "title": title
+            }))?;
+            ids.push(db.create_bug(&bug).await?);
+        }
+        assert_eq!(db.shared_bug_pending_ids().await?.len(), 2);
+        assert_eq!(
+            db.shared_bug_pending_ids_for(&[ids[0], -1]).await?,
+            BTreeSet::from([ids[0]])
+        );
+        assert!(db.shared_bug_pending_ids_for(&[]).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imported_evidence_keeps_raw_input_without_foreign_review_links() -> Result<()> {
+        let db = local_mirror().await?;
         let instance = db.shared_meta("shared_instance").await?;
         let bug: NewBug = serde_json::from_value(json!({
             "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()), "title": "local discovery"

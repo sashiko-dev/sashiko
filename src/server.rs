@@ -1466,7 +1466,7 @@ async fn get_bug(
     val["sync_pending"] = serde_json::Value::Bool(
         state
             .db
-            .shared_bug_pending_ids()
+            .shared_bug_pending_ids_for(&[bug.id])
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .contains(&bug.id),
@@ -2481,7 +2481,7 @@ async fn list_bugs(
             let mut serialized_items = Vec::new();
             let pending = state
                 .db
-                .shared_bug_pending_ids()
+                .shared_bug_pending_ids_for(&ids)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             for bug in &items {
