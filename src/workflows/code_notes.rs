@@ -52,7 +52,10 @@ pub const MAX_EVIDENCE_LINES: usize = 80;
 pub const VERIFY_BATCH_SIZE: usize = 8;
 /// Attempts the synthesize stage gets to satisfy the note rules before the
 /// driver falls back to a deterministic note.
-pub const SYNTH_VALIDATION_ATTEMPTS: usize = 5;
+pub const SYNTH_VALIDATION_ATTEMPTS: usize = 7;
+/// Bytes of a typical note bullet, for telling synthesis how many bullets
+/// its budget holds.
+const TYPICAL_BULLET_BYTES: usize = 320;
 /// Attempts an explore stage gets to satisfy the fact rules; a failed
 /// stage loses its whole exploration, so it gets more than the default.
 pub const EXPLORE_VALIDATION_ATTEMPTS: usize = 5;
@@ -1182,7 +1185,7 @@ Rules:
 - One bullet per rule, at most {{max_bullet_chars}} characters including its citation. When the change that breaks a rule is not obvious from the rule, end the bullet with that change in a few words, from the facts' "violated_by" (for example "Broken by: awaiting while holding pool_lock."). Name the functions, types and locks involved, but do not list every argument or variable when the rule is clear without them. End every bullet with the IDs of the facts it comes from, like [F3] or [F3, F9].
 - Lead with what a reviewer could get wrong: rules whose violation would be a bug, implicit contracts, and pitfalls. Rules that merely describe what the code obviously does come last or are dropped.
 - State only what the facts state. Do not add claims, advice or examples of your own, and do not drop a fact's conditions.
-- No code blocks. Keep the note proportional to the unit: a small module needs only a few bullets. Never exceed {{max_bytes}} bytes; drop the least important rules first.
+- No code blocks. Keep the note proportional to the unit: a small module needs only a few bullets. Never exceed {{max_bytes}} bytes, which holds about {{max_bullets}} bullets: with more facts than that, merge related rules and drop the least important ones first, and plan the cut before writing rather than trimming afterwards.
 
 Return ONLY the markdown note."###;
 
@@ -1209,6 +1212,9 @@ pub fn synthesize_stage(
                 .with_var("summaries", move |_: &NotesBuildState| summaries.clone())
                 .with_var("facts", move |_: &NotesBuildState| facts_json.clone())
                 .with_var("max_bytes", move |_: &NotesBuildState| max_bytes.to_string())
+                .with_var("max_bullets", move |_: &NotesBuildState| {
+                    (max_bytes / TYPICAL_BULLET_BYTES).max(1).to_string()
+                })
                 .with_var("max_bullet_chars", |_: &NotesBuildState| {
                     MAX_BULLET_CHARS.to_string()
                 }),
@@ -1262,8 +1268,10 @@ pub fn validate_note(
     }
     if note.len() > max_bytes {
         return Err(format!(
-            "the note is {} bytes; the limit is {max_bytes}. Drop the least important rules",
-            note.len()
+            "the note is {} bytes; the limit is {max_bytes}. Cut at least {} bytes ({}%) by dropping the least important rules and merging related ones",
+            note.len(),
+            note.len() - max_bytes,
+            ((note.len() - max_bytes) * 100).div_ceil(note.len())
         ));
     }
     if note.contains("```") {
