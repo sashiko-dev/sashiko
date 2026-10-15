@@ -24,6 +24,7 @@ use crate::git_cmd;
 use crate::maintainers::MaintainersIndex;
 use crate::notes::agenda::load_agenda;
 use crate::notes::build::{BuildConfig, build_unit};
+use crate::notes::corpus;
 use crate::notes::plan::{build_plan, render_text};
 use crate::notes::profile::{NotesProfile, UnitsConfig, resolve_profile_path};
 use crate::notes::scope::resolve_revision;
@@ -96,6 +97,59 @@ pub enum NotesCommand {
         #[arg(long, default_value_t = DEFAULT_STAGE_TURNS)]
         max_turns: usize,
     },
+
+    /// Analyze the project's fixes from their code (the corpus the agenda
+    /// is derived from), appending to <out>/corpus-<k>-of-<n>.jsonl
+    Corpus {
+        /// Only fixes reachable from this revision are read (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        rev: String,
+
+        /// Directory for the corpus files
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Only the newest this many fixes
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// A deterministic sample of this many of those fixes, for
+        /// calibration runs
+        #[arg(long)]
+        sample: Option<usize>,
+
+        /// Seed of the sample
+        #[arg(long, default_value = "sashiko")]
+        seed: String,
+
+        /// The share of the fixes this process analyzes, as k/n
+        #[arg(long, default_value = "0/1", value_parser = parse_shard)]
+        shard: (usize, usize),
+
+        /// Notes profile (default: notes/profile.toml in the project's
+        /// prompt directory)
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+}
+
+/// Parses a shard given as "k/n" with k < n.
+fn parse_shard(text: &str) -> Result<(usize, usize), String> {
+    let (k, n) = text
+        .split_once('/')
+        .ok_or_else(|| format!("expected k/n, got {text:?}"))?;
+    let k: usize = k
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad shard index {k:?}"))?;
+    let n: usize = n
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad shard count {n:?}"))?;
+    if n == 0 || k >= n {
+        return Err(format!("shard {k}/{n} needs 0 <= k < n"));
+    }
+    Ok((k, n))
 }
 
 /// Runs a `sashiko notes` command in the repository `repo`, reading the
@@ -164,26 +218,7 @@ pub async fn run(
                 }
             }
 
-            let provider = crate::ai::create_provider_cached(&settings.ai, None).await?;
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(
-                settings.review.concurrency.max(1),
-            ));
-            let quota = Arc::new(crate::ai::quota::QuotaManager::new());
-            let provider = crate::local_review::decorate_provider(
-                provider,
-                &settings.ai,
-                &semaphore,
-                &quota,
-                &None,
-            );
-            let mut tools = ToolBox::new(repo.to_path_buf(), Some(prompts_dir.to_path_buf()));
-            tools.set_virtual_head(sha.clone());
-            let env = WorkflowEnv {
-                provider,
-                tools: Arc::new(tools),
-                base_dir: prompts_dir,
-                context_tag: None,
-            };
+            let env = llm_env(settings, repo, prompts_dir, &sha).await?;
             let cfg = BuildConfig {
                 project: project.display_name().to_string(),
                 set_id: set.clone(),
@@ -219,7 +254,72 @@ pub async fn run(
             }
             Ok(())
         }
+        NotesCommand::Corpus {
+            rev,
+            out,
+            limit,
+            sample,
+            seed,
+            shard,
+            profile,
+        } => {
+            let settings = settings.context(
+                "notes corpus calls an LLM and needs a settings file (see sashiko init)",
+            )?;
+            let profile_path = resolve_profile_path(prompts_dir, profile.as_deref())?;
+            let profile = NotesProfile::load(&profile_path)?;
+            let sha = resolve_revision(repo, rev).await?;
+            let mut fixes =
+                corpus::list_fixes(repo, &sha, &profile.history.fix_patterns, *limit).await?;
+            if let Some(size) = sample {
+                fixes = corpus::sample(&fixes, *size, seed);
+            }
+            let (index, count) = *shard;
+            let fixes = corpus::shard(&fixes, index, count);
+            std::fs::create_dir_all(out)
+                .with_context(|| format!("failed to create {}", out.display()))?;
+            let env = llm_env(settings, repo, prompts_dir, &sha).await?;
+            let cfg = corpus::CorpusConfig {
+                project: project.display_name().to_string(),
+                out_file: out.join(format!("corpus-{index}-of-{count}.jsonl")),
+                temperature: settings.ai.temperature,
+                introducer: profile.history.introducer()?,
+            };
+            eprintln!(
+                "analyzing {} fixes reachable from {sha} into {}",
+                fixes.len(),
+                cfg.out_file.display()
+            );
+            let summary = corpus::analyze(repo, &env, &fixes, &cfg).await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            Ok(())
+        }
     }
+}
+
+/// The LLM environment of a notes command: the configured provider with
+/// the review pipeline's decorations, and git tools pinned to `sha`.
+async fn llm_env<'a>(
+    settings: &Settings,
+    repo: &Path,
+    prompts_dir: &'a Path,
+    sha: &str,
+) -> Result<WorkflowEnv<'a>> {
+    let provider = crate::ai::create_provider_cached(&settings.ai, None).await?;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        settings.review.concurrency.max(1),
+    ));
+    let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+    let provider =
+        crate::local_review::decorate_provider(provider, &settings.ai, &semaphore, &quota, &None);
+    let mut tools = ToolBox::new(repo.to_path_buf(), Some(prompts_dir.to_path_buf()));
+    tools.set_virtual_head(sha.to_string());
+    Ok(WorkflowEnv {
+        provider,
+        tools: Arc::new(tools),
+        base_dir: prompts_dir,
+        context_tag: None,
+    })
 }
 
 /// A set ID becomes a directory name: letters, digits, dots, dashes and
@@ -245,4 +345,25 @@ async fn load_maintainers_at(repo: &Path, sha: &str) -> Result<MaintainersIndex>
         anyhow::bail!("no MAINTAINERS file at {sha}");
     }
     MaintainersIndex::from_reader(output.stdout.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_shard() {
+        assert_eq!(parse_shard("0/1"), Ok((0, 1)));
+        assert_eq!(parse_shard("3/8"), Ok((3, 8)));
+        assert!(parse_shard("8/8").is_err());
+        assert!(parse_shard("1/0").is_err());
+        assert!(parse_shard("x").is_err());
+    }
+
+    #[test]
+    fn test_is_safe_set_id() {
+        assert!(is_safe_set_id("6.18"));
+        assert!(!is_safe_set_id(".."));
+        assert!(!is_safe_set_id("a/b"));
+    }
 }
