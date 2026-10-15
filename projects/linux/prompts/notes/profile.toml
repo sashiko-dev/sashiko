@@ -1,0 +1,24 @@
+# Code notes profile for the Linux kernel.
+# See designs/DESIGN_CODE_NOTES_ENGINE.md, section 3.
+
+[units]
+source = "maintainers"
+
+[languages]
+# Documentation, tests and samples are readable on demand but do not drive
+# scoping.
+skip = [
+    "Documentation/",
+    "tools/testing/",
+    "samples/",
+    "LICENSES/",
+]
+
+[languages.globs]
+rust = ["**.rs"]
+c = ["**.c", "**.h"]
+
+[limits]
+component_lines = 15000
+unit_note_bytes = 16384
+review_notes_bytes = 49152
