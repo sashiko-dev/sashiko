@@ -53,6 +53,9 @@ pub const VERIFY_BATCH_SIZE: usize = 8;
 /// Attempts the synthesize stage gets to satisfy the note rules before the
 /// driver falls back to a deterministic note.
 pub const SYNTH_VALIDATION_ATTEMPTS: usize = 5;
+/// Attempts an explore stage gets to satisfy the fact rules; a failed
+/// stage loses its whole exploration, so it gets more than the default.
+pub const EXPLORE_VALIDATION_ATTEMPTS: usize = 5;
 /// Longest note bullet, in characters, citation included.
 pub const MAX_BULLET_CHARS: usize = 600;
 
@@ -740,8 +743,12 @@ pub fn explore_stage(
                         format!("Your facts were rejected: {err}\nFix exactly that and return the full JSON object again.")
                     }),
             )
-            .policy(policy(max_turns, temperature, ToolScope::All))
-            .reduce(move |state: &mut NotesBuildState, out: ExploreOutput| {
+            .policy(StagePolicy {
+                max_validation_attempts: EXPLORE_VALIDATION_ATTEMPTS,
+                ..policy(max_turns, temperature, ToolScope::All)
+            })
+            .reduce(move |state: &mut NotesBuildState, mut out: ExploreOutput| {
+                out.facts.iter_mut().for_each(ground_symbols);
                 state.explored.push(ExploreRecord {
                     component: component_name.clone(),
                     topic: topic_id.clone(),
@@ -815,104 +822,113 @@ pub fn validate_explore(
             out.facts.len()
         ));
     }
+    // Every problem is reported at once, so one retry can fix them all.
+    let mut problems = Vec::new();
     let mut ids = HashSet::new();
     for fact in &out.facts {
-        let owner = format!("fact {}", fact.id);
         if !ids.insert(fact.id.as_str()) {
-            return Err(format!("fact ID {} is used twice", fact.id));
+            problems.push(format!("fact ID {} is used twice", fact.id));
         }
-        let statement = fact.statement.trim();
-        if statement.is_empty() {
-            return Err(format!("{owner} has an empty statement"));
-        }
-        if statement.chars().count() > MAX_STATEMENT_CHARS {
-            return Err(format!(
-                "{owner} statement is longer than {MAX_STATEMENT_CHARS} characters; state one rule in one sentence"
-            ));
-        }
-        let violated_by = fact.violated_by.trim();
-        if violated_by.is_empty() {
-            return Err(format!(
-                "{owner} has no violated_by; describe a patch that would break the rule, or drop the fact if no plausible patch would"
-            ));
-        }
-        if violated_by.chars().count() > MAX_VIOLATED_BY_CHARS {
-            return Err(format!(
-                "{owner} violated_by is longer than {MAX_VIOLATED_BY_CHARS} characters"
-            ));
-        }
-        match &fact.basis {
-            None => {
-                return Err(format!(
-                    "{owner} has no basis; give the comment, test, past fix or failure that shows the rule matters, or drop the fact"
-                ));
-            }
-            Some(basis) if basis.detail.trim().is_empty() => {
-                return Err(format!("{owner} basis has an empty detail"));
-            }
-            Some(basis) if basis.detail.chars().count() > MAX_VIOLATED_BY_CHARS => {
-                return Err(format!(
-                    "{owner} basis detail is longer than {MAX_VIOLATED_BY_CHARS} characters"
-                ));
-            }
-            Some(basis) if basis.kind == BasisKind::PastFix && fact.from_history.is_empty() => {
-                return Err(format!(
-                    "{owner} has basis past_fix but lists no past fix in from_history"
-                ));
-            }
-            Some(_) => {}
-        }
-        validate_evidence_list(&owner, &fact.evidence, true)?;
-        for q in &fact.questions {
-            if !question_ids.contains(q) {
-                return Err(format!(
-                    "{owner} answers unknown question {q:?}; this topic's questions are {:?}",
-                    {
-                        let mut v: Vec<&String> = question_ids.iter().collect();
-                        v.sort();
-                        v
-                    }
-                ));
-            }
-        }
-        for fix in &fact.from_history {
-            if !fix_ids.contains(fix) {
-                return Err(format!(
-                    "{owner} lists {fix:?} in from_history, but it is not one of the past fixes given ({:?})",
-                    {
-                        let mut v: Vec<&String> = fix_ids.iter().collect();
-                        v.sort();
-                        v
-                    }
-                ));
-            }
-        }
-        for symbol in &fact.scope.symbols {
-            if !fact
-                .evidence
-                .iter()
-                .any(|e| e.snippet.contains(symbol.as_str()))
-            {
-                return Err(format!(
-                    "{owner} lists symbol {symbol:?} in scope.symbols, but none of its snippets contains it; cite code that shows it or drop the symbol"
-                ));
-            }
+        if let Err(problem) = check_fact(fact, question_ids, fix_ids) {
+            problems.push(problem);
         }
     }
     for (i, d) in out.dismissed_hypotheses.iter().enumerate() {
+        let owner = format!("dismissed hypothesis {}", i + 1);
         if d.statement.trim().is_empty() || d.reason.trim().is_empty() {
+            problems.push(format!("{owner} needs both a statement and a reason"));
+        } else if let Err(problem) = validate_evidence_list(&owner, &d.evidence, false) {
+            problems.push(problem);
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} problem(s):\n- {}",
+            problems.len(),
+            problems.join("\n- ")
+        ))
+    }
+}
+
+/// The first problem with one fact, if any.
+fn check_fact(
+    fact: &Fact,
+    question_ids: &HashSet<String>,
+    fix_ids: &HashSet<String>,
+) -> Result<(), String> {
+    let owner = format!("fact {}", fact.id);
+    let statement = fact.statement.trim();
+    if statement.is_empty() {
+        return Err(format!("{owner} has an empty statement"));
+    }
+    if statement.chars().count() > MAX_STATEMENT_CHARS {
+        return Err(format!(
+            "{owner} statement is longer than {MAX_STATEMENT_CHARS} characters; state one rule in one sentence"
+        ));
+    }
+    let violated_by = fact.violated_by.trim();
+    if violated_by.is_empty() {
+        return Err(format!(
+            "{owner} has no violated_by; describe a patch that would break the rule, or drop the fact if no plausible patch would"
+        ));
+    }
+    if violated_by.chars().count() > MAX_VIOLATED_BY_CHARS {
+        return Err(format!(
+            "{owner} violated_by is longer than {MAX_VIOLATED_BY_CHARS} characters"
+        ));
+    }
+    match &fact.basis {
+        None => {
             return Err(format!(
-                "dismissed hypothesis {} needs both a statement and a reason",
-                i + 1
+                "{owner} has no basis; give the comment, test, past fix or failure that shows the rule matters, or drop the fact"
             ));
         }
-        validate_evidence_list(
-            &format!("dismissed hypothesis {}", i + 1),
-            &d.evidence,
-            false,
-        )?;
+        Some(basis) if basis.detail.trim().is_empty() => {
+            return Err(format!("{owner} basis has an empty detail"));
+        }
+        Some(basis) if basis.detail.chars().count() > MAX_VIOLATED_BY_CHARS => {
+            return Err(format!(
+                "{owner} basis detail is longer than {MAX_VIOLATED_BY_CHARS} characters"
+            ));
+        }
+        Some(basis) if basis.kind == BasisKind::PastFix && fact.from_history.is_empty() => {
+            return Err(format!(
+                "{owner} has basis past_fix but lists no past fix in from_history"
+            ));
+        }
+        Some(_) => {}
+    }
+    validate_evidence_list(&owner, &fact.evidence, true)?;
+    for q in &fact.questions {
+        if !question_ids.contains(q) {
+            let mut known: Vec<&String> = question_ids.iter().collect();
+            known.sort();
+            return Err(format!(
+                "{owner} answers unknown question {q:?}; this topic's questions are {known:?}"
+            ));
+        }
+    }
+    for fix in &fact.from_history {
+        if !fix_ids.contains(fix) {
+            let mut known: Vec<&String> = fix_ids.iter().collect();
+            known.sort();
+            return Err(format!(
+                "{owner} lists {fix:?} in from_history, but it is not one of the past fixes given ({known:?})"
+            ));
+        }
     }
     Ok(())
+}
+
+/// Drops scope symbols that none of a fact's snippets shows, so a fact's
+/// scope stays grounded without rejecting the whole stage over it.
+pub fn ground_symbols(fact: &mut Fact) {
+    let evidence = &fact.evidence;
+    fact.scope
+        .symbols
+        .retain(|symbol| evidence.iter().any(|e| e.snippet.contains(symbol.as_str())));
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,11 +1473,20 @@ mod tests {
         assert!(validate_explore(&good, &ids, &fixes).is_ok());
 
         let mut bad_symbol = good.clone();
-        bad_symbol.facts[0].scope.symbols = vec!["other".to_string()];
+        bad_symbol.facts[0].scope.symbols = vec!["other".to_string(), "pool_lock".to_string()];
+        assert!(validate_explore(&bad_symbol, &ids, &fixes).is_ok());
+        ground_symbols(&mut bad_symbol.facts[0]);
+        assert_eq!(bad_symbol.facts[0].scope.symbols, vec!["pool_lock"]);
+
+        // Every problem is reported at once.
+        let mut two = good.clone();
+        two.facts.push(fact("F2", &[], "x"));
+        two.facts[0].violated_by.clear();
+        two.facts[1].evidence.clear();
+        let err = validate_explore(&two, &ids, &fixes).unwrap_err();
+        assert!(err.starts_with("2 problem(s)"), "{err}");
         assert!(
-            validate_explore(&bad_symbol, &ids, &fixes)
-                .unwrap_err()
-                .contains("scope.symbols")
+            err.contains("fact F1 has no violated_by") && err.contains("fact F2 has no evidence")
         );
 
         let mut no_evidence = good.clone();
