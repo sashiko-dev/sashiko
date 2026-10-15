@@ -20,6 +20,7 @@ pub mod agenda;
 pub mod cli;
 pub mod components;
 pub mod entry_points;
+pub mod evidence;
 pub mod facts;
 pub mod plan;
 pub mod profile;
