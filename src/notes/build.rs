@@ -39,8 +39,9 @@ use crate::workflows::code_notes::{
     Applicability, CheckedFact, ComponentInput, EXPLORE_STAGE_NAMES, ExploreRecord, FileInput,
     HISTORY_BATCH_SIZE, HISTORY_STAGE_NAMES, HISTORY_TOPIC_ID, HistoryInput, HistoryLesson,
     LessonKind, NotesBuildState, PlacedLesson, SurveyOutput, VERIFY_BATCH_SIZE, VERIFY_STAGE_NAMES,
-    explore_stage, history_stage, history_topic, lessons_for, parallel_workflow, renumber_facts,
-    single_stage_workflow, survey_stage, synthesize_stage, verdicts_by_id, verify_stage,
+    explore_stage, history_stage, history_topic, lessons_for, neutralize_directives,
+    parallel_workflow, renumber_facts, single_stage_workflow, survey_stage, synthesize_stage,
+    verdicts_by_id, verify_stage,
 };
 
 /// Length of the commit IDs past fixes are shown and cited by.
@@ -338,7 +339,7 @@ pub async fn build_unit(
                     }
                 }
             };
-            let note = format!("{}\n", note.trim_end());
+            let note = format!("{}\n", neutralize_directives(note.trim_end()));
             std::fs::write(work.join("note.md"), &note)?;
             note
         }

@@ -52,7 +52,7 @@ pub const VERIFY_BATCH_SIZE: usize = 8;
 /// driver falls back to a deterministic note.
 pub const SYNTH_VALIDATION_ATTEMPTS: usize = 5;
 /// Longest note bullet, in characters, citation included.
-pub const MAX_BULLET_CHARS: usize = 500;
+pub const MAX_BULLET_CHARS: usize = 600;
 
 /// Static stage names for fan-out; the engine names stages with
 /// `&'static str`. A build with more stages runs them in several rounds.
@@ -1032,6 +1032,14 @@ pub fn synthesize_stage(
         .build()
 }
 
+/// Breaks up prompt-template syntax in a note. Notes reach review prompts
+/// as variable values, which are not expanded, but a unit about a prompt
+/// engine legitimately names its directives, and a note must stay inert
+/// wherever it is pasted.
+pub fn neutralize_directives(text: &str) -> String {
+    text.replace("{{", "{ {").replace("@include", "@ include")
+}
+
 /// Removes a fence some models wrap around a whole markdown answer.
 pub fn strip_code_fence(text: &str) -> String {
     let trimmed = text.trim();
@@ -1063,10 +1071,8 @@ pub fn validate_note(
             note.len()
         ));
     }
-    for directive in ["@include", "{{", "```"] {
-        if note.contains(directive) {
-            return Err(format!("the note must not contain {directive:?}"));
-        }
+    if note.contains("```") {
+        return Err("the note must not contain code blocks".to_string());
     }
     for line in note.lines() {
         if line.starts_with("- ") && line.chars().count() > MAX_BULLET_CHARS {
@@ -1495,14 +1501,19 @@ mod tests {
                 .unwrap_err()
                 .contains("cites")
         );
-        assert!(validate_note(&format!("{note}@include(\"x\")"), "src/db", &known, 1000).is_err());
+        assert!(validate_note(&format!("{note}@include(\"x\")"), "src/db", &known, 1000).is_ok());
+        assert!(validate_note(&format!("{note}```\nx\n```"), "src/db", &known, 1000).is_err());
+        assert_eq!(
+            neutralize_directives("use {{var}} and @include(\"a\")"),
+            "use { {var}} and @ include(\"a\")"
+        );
         let repeated = "# src/db\n\n- Rule one. [F1]\n\n## Other\n- Rule one again. [F1, F2]\n";
         assert!(
             validate_note(repeated, "src/db", &known, 1000)
                 .unwrap_err()
                 .contains("more than one bullet")
         );
-        let long = format!("# src/db\n\n- {} [F1]\n", "x".repeat(500));
+        let long = format!("# src/db\n\n- {} [F1]\n", "x".repeat(MAX_BULLET_CHARS));
         assert!(
             validate_note(&long, "src/db", &known, 2000)
                 .unwrap_err()
