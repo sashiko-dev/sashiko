@@ -109,10 +109,18 @@ In shared catalog mode, each local database has a stable instance identity
 and a local bug mirror. Changes enter a durable outbox in the same transaction
 as the bug update. A background task publishes and imports changes every five
 seconds; PostgreSQL outages leave changes queued and visible as **Sync pending**.
+Analysis waits for the catalog before making shared deduplication decisions.
+An outage during that check requeues the analysis without consuming an attempt.
+If an outcome is already committed locally, publication retries from the outbox
+while its review links and successful state are retained.
 Concurrent changes to different fields and new evidence are merged. If two
 instances change the same triage decision, the catalog decision is retained
 and a conflict event is recorded in the bug's audit history. The originating
 instance runs the bug's analysis; other instances can view and triage it.
+Connected deduplication decisions are serialized. A connection loss between a
+local outcome and its publication can still produce separate reports of the
+same defect; public bug IDs make publication retries idempotent, and triage can
+merge those reports.
 
 Public bug IDs identify shared records. Patch and review relations remain
 local. Original evidence can contain producer-local IDs; imported discoveries

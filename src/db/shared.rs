@@ -23,6 +23,10 @@ pub(super) struct SharedCatalog {
     pub lock: tokio::sync::Mutex<()>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Shared bug catalog is unavailable")]
+struct SharedCatalogUnavailable;
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 struct Record {
     bugid: String,
@@ -156,13 +160,47 @@ impl Event {
 impl Database {
     pub async fn lock_bug_dedup(&self) -> Result<Option<crate::storage::Connection>> {
         if let Some(shared) = &self.shared {
-            let remote = Self::postgres(&shared.settings).await?;
-            let guard = remote.conn.dedup_lock().await?;
-            self.sync_shared_bugs().await?;
-            Ok(guard)
+            async {
+                let remote = Self::postgres(&shared.settings).await?;
+                let guard = remote.conn.dedup_lock().await?;
+                self.sync_shared_bugs().await?;
+                Ok::<_, anyhow::Error>(guard)
+            }
+            .await
+            .context(SharedCatalogUnavailable)
         } else {
             self.conn.dedup_lock().await
         }
+    }
+
+    pub(crate) fn is_shared_catalog_failure(error: &anyhow::Error) -> bool {
+        error.is::<SharedCatalogUnavailable>()
+    }
+
+    /// A committed outcome remains valid when publication must be retried.
+    pub(crate) async fn publish_shared_bug_outcome(&self, bugid: &str) {
+        if let Err(error) = self.sync_shared_bugs().await {
+            tracing::warn!(
+                "Bug {bugid} outcome is committed; catalog publication remains pending: {error:#}"
+            );
+        }
+    }
+
+    /// Return a claimed analysis to the queue without charging a catalog outage.
+    pub(crate) async fn defer_bug_analysis_for_catalog(&self, id: i64, error: &str) -> Result<()> {
+        let tx = self.begin_bug_write(id).await?;
+        tx.execute(
+            "UPDATE bugs SET
+             attempt_count=CASE WHEN pipeline_state='running' AND attempt_count>0
+                                THEN attempt_count-1 ELSE attempt_count END,
+             pipeline_state=CASE WHEN pipeline_state='running' THEN 'pending' ELSE pipeline_state END,
+             locked_by=NULL,lease_expires_at=NULL,last_error=?,updated_at=?,
+             audit_author=?,audit_tool=?,audit_model=? WHERE id=?",
+            libsql::params![error,chrono::Utc::now().timestamp(),self.bug_actor.as_str(),
+                self.bug_tool.as_str(),self.bug_model.clone(),id],
+        ).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub fn has_shared_bug_catalog(&self) -> bool {
@@ -847,6 +885,75 @@ mod tests {
             BTreeSet::from([ids[0]])
         );
         assert!(db.shared_bug_pending_ids_for(&[]).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_failure_defers_claim_without_spending_attempts() -> Result<()> {
+        let db = local_mirror().await?;
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()), "title": "catalog unavailable"
+        }))?;
+        let id = db.create_bug(&bug).await?;
+        db.claim_pending_bug("owner", 300, 3)
+            .await?
+            .context("claim")?;
+        let owner = db.with_bug_claim(id, "owner");
+        let error = owner
+            .lock_bug_dedup()
+            .await
+            .err()
+            .context("catalog must be unavailable")?;
+        assert!(Database::is_shared_catalog_failure(&error));
+        assert!(
+            db.with_bug_claim(id, "stale")
+                .defer_bug_analysis_for_catalog(id, "outage")
+                .await
+                .is_err()
+        );
+        owner.defer_bug_analysis_for_catalog(id, "outage").await?;
+        assert_eq!(
+            db.get_bug(id).await?.unwrap().pipeline_state,
+            BugPipelineState::Pending
+        );
+        assert!(!db.renew_bug_lease(id, "owner", 300).await?);
+        let mut rows = db
+            .conn
+            .query("SELECT attempt_count FROM bugs WHERE id=?", [id])
+            .await?;
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_outcome_publication_keeps_success_and_releases_claim() -> Result<()> {
+        let db = local_mirror().await?;
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()), "title": "committed outcome"
+        }))?;
+        let id = db.create_bug(&bug).await?;
+        db.claim_pending_bug("owner", 300, 3)
+            .await?
+            .context("claim")?;
+        let owner = db.with_bug_claim(id, "owner");
+        owner
+            .update_bug_outcome(
+                id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Open,
+                    inline_review: "saved report",
+                    ..Default::default()
+                },
+            )
+            .await?;
+        owner.publish_shared_bug_outcome(&bug.bugid).await;
+        owner.release_bug_lease(id).await?;
+        let saved = db.get_bug(id).await?.unwrap();
+        assert_eq!(saved.pipeline_state, BugPipelineState::Succeeded);
+        assert_eq!(saved.lifecycle_status, BugLifecycleStatus::Open);
+        assert_eq!(saved.inline_review(), "saved report");
+        assert!(db.shared_bug_pending_ids_for(&[id]).await?.contains(&id));
+        assert!(!db.renew_bug_lease(id, "owner", 300).await?);
         Ok(())
     }
 

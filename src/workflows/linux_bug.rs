@@ -2461,7 +2461,9 @@ pub async fn process_issue_worker_for_project(
         let outcome = dedup_ctx
             .check_and_fold(&known_bugs, &mut full_history)
             .await?;
-        db.sync_shared_bugs().await?;
+        if outcome.is_some() {
+            db.publish_shared_bug_outcome(&bug_row.bugid).await;
+        }
         (seen_ids, outcome)
     };
 
@@ -2591,7 +2593,7 @@ pub async fn process_issue_worker_for_project(
             .await?;
             None
         };
-        db.sync_shared_bugs().await?;
+        db.publish_shared_bug_outcome(&bug_row.bugid).await;
         outcome
     };
 

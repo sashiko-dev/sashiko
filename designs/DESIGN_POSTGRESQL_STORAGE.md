@@ -89,8 +89,14 @@ record a conflict event. A failed publication stays queued for retry.
 A local mirror preserves its review links; imported records have no foreign keys
 to another instance's patches or reviews. Analysis remains with the originating
 instance. The shared deduplication lock imports the latest catalog before checking
-candidates and publishes the canonical result before releasing the lock. Bugs
-remain readable during an outage, and the UI shows pending synchronization.
+candidates and attempts to publish the canonical result before releasing the
+lock. Catalog failures before a decision defer analysis without consuming an
+attempt. Committed outcomes and their review links remain valid when publication
+needs an outbox retry. Connected decisions are serialized; a session loss or
+crash between the local commit and publication can still admit another report
+of the same defect. Public UUIDs prevent a publication retry from creating a
+second copy of the same report. Bugs remain readable during an outage, and the
+UI shows pending synchronization.
 
 Bug permissions remain enforced by the Sashiko API. Catalog participants must
 share a trusted permission and subsystem attribution policy. Project-scoped
