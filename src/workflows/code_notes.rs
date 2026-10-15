@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::notes::agenda::Topic;
 use crate::notes::evidence::EvidenceCheck;
-use crate::notes::facts::{DismissedHypothesis, Evidence, Fact, FactVerdict, VerdictKind};
+use crate::notes::facts::{
+    BasisKind, DismissedHypothesis, Evidence, Fact, FactVerdict, VerdictKind,
+};
 use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, Stage, StagePolicy, ToolScope,
     Workflow,
@@ -633,6 +635,7 @@ const EXPLORE_INSTRUCTION: &str = r##"Explore component "{{component}}" of unit 
 {{past_fixes}}
 </past_fixes>
 
+
 Past fixes, when listed, are bugs fixed earlier in this component for this topic, with the rule each fix restored as read from the fix. Use them as leads: check whether each rule still governs the current code, where else the same rule applies, and whether it is upheld there. A rule from a past fix becomes a fact only when the current code proves it; when a fact states or generalizes a past fix's rule, list that fix's ID in "from_history".
 
 Answer the questions by reading and tracing the code with the tools: follow callers and callees, lock acquisitions and releases, ownership transfers, error and cleanup paths, and every path that reaches the state in question. Then report what you established as facts.
@@ -643,6 +646,9 @@ Report what a future patch to this component must preserve. A good fact:
 - holds on every path at this revision; if it holds only under a condition, the condition is part of the sentence. "Always", "never", "only", "every" and "cannot" require that you checked every caller, path or variant (use git_grep);
 - states mechanics, not motives: add a purpose or consequence ("so that", "which prevents", "because") only when a comment, test or the traced code shows it;
 - is not a defect report: do not report missing limits, inefficiencies, panics or other weaknesses of the current code. When existing code follows a pattern that new code must follow too (chunking, a helper that must be called, a check that must come first), state that pattern as the rule;
+- has a "basis" showing the rule matters: "comment" (a comment or doc states it), "test" (a test pins it), "past_fix" (a past fix restored it) or "failure_mode" (breaking it causes a concrete failure: a panic, deadlock, race, leak, corruption, a wrong result or a broken external contract), with a one-sentence "detail". Behavior nothing depends on, constants and incidental ordering are not rules;
+- states ONE rule: split a fact whose parts concern different symbols or would be broken by different patches;
+- is not enforced by the compiler or type system: if a violating patch would not build, drop the fact;
 - is not a description of what the code plainly does, a list of constants (unless the exact value is the contract), or generic advice ("inputs should be validated").
 
 Comments and documentation that say "must", "never", "only", "do not" or "so that" often state the rules that matter most: find them, check that the code upholds them, and report them.
@@ -652,7 +658,7 @@ Each fact needs evidence: the file path, a line range of at most {{max_evidence_
 When you investigated a plausible rule and found it does NOT hold, record it in "dismissed_hypotheses" with the reason and the code that disproves it. Record questions you could not settle in "open_questions". Report at most {{max_facts}} facts; a few strong facts are worth more than many weak ones, and an empty list is a valid answer when the topic has nothing worth stating.
 
 Return ONLY a JSON object:
-{"facts": [{"id": "F1", "kind": "LockingRule", "statement": "...", "violated_by": "...", "scope": {"files": ["path"], "symbols": ["name"]}, "evidence": [{"path": "path", "start_line": 10, "end_line": 18, "snippet": "verbatim code"}], "questions": ["SYNC-2"], "from_history": []}], "dismissed_hypotheses": [{"statement": "...", "reason": "...", "evidence": []}], "open_questions": ["..."]}"##;
+{"facts": [{"id": "F1", "kind": "LockingRule", "statement": "...", "violated_by": "...", "basis": {"kind": "comment", "detail": "..."}, "scope": {"files": ["path"], "symbols": ["name"]}, "evidence": [{"path": "path", "start_line": 10, "end_line": 18, "snippet": "verbatim code"}], "questions": ["SYNC-2"], "from_history": []}], "dismissed_hypotheses": [{"statement": "...", "reason": "...", "evidence": []}], "open_questions": ["..."]}"##;
 
 /// One explore stage for `component` and `topic`.
 pub fn explore_stage(
@@ -819,6 +825,27 @@ pub fn validate_explore(
                 "{owner} violated_by is longer than {MAX_VIOLATED_BY_CHARS} characters"
             ));
         }
+        match &fact.basis {
+            None => {
+                return Err(format!(
+                    "{owner} has no basis; give the comment, test, past fix or failure that shows the rule matters, or drop the fact"
+                ));
+            }
+            Some(basis) if basis.detail.trim().is_empty() => {
+                return Err(format!("{owner} basis has an empty detail"));
+            }
+            Some(basis) if basis.detail.chars().count() > MAX_VIOLATED_BY_CHARS => {
+                return Err(format!(
+                    "{owner} basis detail is longer than {MAX_VIOLATED_BY_CHARS} characters"
+                ));
+            }
+            Some(basis) if basis.kind == BasisKind::PastFix && fact.from_history.is_empty() => {
+                return Err(format!(
+                    "{owner} has basis past_fix but lists no past fix in from_history"
+                ));
+            }
+            Some(_) => {}
+        }
         validate_evidence_list(&owner, &fact.evidence, true)?;
         for q in &fact.questions {
             if !question_ids.contains(q) {
@@ -886,6 +913,8 @@ For EVERY fact, read the code yourself with the tools and decide:
 - "confirmed": the code proves the statement exactly as written, on every path it claims to cover. Check the claim's scope: words like "always", "never", "only" and "every" require checking all callers and paths (use git_grep). Give your own evidence: file, line range and a verbatim snippet.
 - "refuted": the code contradicts the statement, or the statement overgeneralizes. Give the counter-evidence.
 - "unverifiable": you cannot establish it either way from the code.
+
+Check the fact's "basis" too: a cited comment or test must exist and say what is claimed, and a claimed failure must really follow from a patch like "violated_by". A fact whose basis does not hold, or that only restates behavior nothing depends on, is "refuted". When a fact says "every", "all paths" or names several call sites, list the matching call sites and check each one.
 
 Check every clause separately. A stated purpose or consequence ("so that", "which prevents", "because") needs a comment, test or traced code that shows it, and "always", "never", "only", "every" or "cannot" needs every caller, path or variant checked. If any clause is unsupported or overstated, the verdict is "refuted" and the reasoning names that clause.
 
@@ -1161,7 +1190,7 @@ pub fn verdicts_by_id(verdicts: &[FactVerdict]) -> HashMap<&str, &FactVerdict> {
 mod tests {
     use super::*;
     use crate::notes::agenda::Question;
-    use crate::notes::facts::{FactKind, FactScope, ReviewValue};
+    use crate::notes::facts::{FactBasis, FactKind, FactScope, ReviewValue};
 
     fn topic(id: &str, questions: &[&str]) -> Topic {
         Topic {
@@ -1197,6 +1226,10 @@ mod tests {
             kind: FactKind::LockingRule,
             statement: "The pool lock is never held across an await.".to_string(),
             violated_by: "a patch that awaits while holding pool_lock".to_string(),
+            basis: Some(FactBasis {
+                kind: BasisKind::FailureMode,
+                detail: "Awaiting with the guard held deadlocks the pool.".to_string(),
+            }),
             scope: FactScope {
                 files: vec![],
                 symbols: symbols.iter().map(|s| s.to_string()).collect(),
@@ -1310,6 +1343,23 @@ mod tests {
             validate_explore(&dup, &ids, &fixes)
                 .unwrap_err()
                 .contains("used twice")
+        );
+
+        let mut no_basis = good.clone();
+        no_basis.facts[0].basis = None;
+        assert!(
+            validate_explore(&no_basis, &ids, &fixes)
+                .unwrap_err()
+                .contains("no basis")
+        );
+        let mut past_fix = good.clone();
+        if let Some(basis) = past_fix.facts[0].basis.as_mut() {
+            basis.kind = BasisKind::PastFix;
+        }
+        assert!(
+            validate_explore(&past_fix, &ids, &fixes)
+                .unwrap_err()
+                .contains("from_history")
         );
 
         let mut no_patch = good.clone();

@@ -59,6 +59,27 @@ pub struct Evidence {
     pub snippet: String,
 }
 
+/// What shows that a rule matters, so observed behavior nothing depends
+/// on is not mistaken for a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BasisKind {
+    /// A comment or doc states the rule.
+    Comment,
+    /// A test pins the behavior.
+    Test,
+    /// A past fix restored the rule.
+    PastFix,
+    /// Breaking the rule causes a concrete failure.
+    FailureMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactBasis {
+    pub kind: BasisKind,
+    pub detail: String,
+}
+
 /// Files and symbols a fact is about.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactScope {
@@ -77,6 +98,9 @@ pub struct Fact {
     /// The shape of a patch that would break the rule.
     #[serde(default)]
     pub violated_by: String,
+    /// What shows the rule matters.
+    #[serde(default)]
+    pub basis: Option<FactBasis>,
     #[serde(default)]
     pub scope: FactScope,
     pub evidence: Vec<Evidence>,

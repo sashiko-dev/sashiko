@@ -776,6 +776,7 @@ mod tests {
                 kind: FactKind::Invariant,
                 statement: "s".to_string(),
                 violated_by: "p".to_string(),
+                basis: None,
                 scope: FactScope::default(),
                 evidence: vec![],
                 from_history: vec![],
