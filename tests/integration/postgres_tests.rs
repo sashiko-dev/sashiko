@@ -16,7 +16,12 @@ async fn postgres_daemon_storage_roundtrip() -> Result<()> {
         postgres_tls_require_only: true,
         ..Default::default()
     };
-    let db = Database::postgres(&settings).await?;
+    let mut configured = sashiko::settings::Settings::new()?;
+    configured.storage = settings;
+    configured.storage.mode = sashiko::settings::StorageMode::Postgresql;
+    // A configured PostgreSQL client must ignore the legacy libSQL URL.
+    configured.database.url = ":memory:".into();
+    let db = Database::configured(&configured).await?;
     let result = std::panic::AssertUnwindSafe(exercise_daemon(&db))
         .catch_unwind()
         .await;

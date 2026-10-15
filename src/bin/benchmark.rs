@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     // Initialize settings and DB
     let settings = Settings::new().context("Failed to load settings")?;
     let db = Arc::new(
-        Database::new(&settings.database)
+        Database::configured(&settings)
             .await
             .context("Failed to connect to database")?,
     );
