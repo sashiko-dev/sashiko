@@ -426,13 +426,13 @@ async fn exercise_shared(
         first
             .shared_bug_pending_ids_for(&[legacy_id])
             .await?
-            .is_empty()
+            .contains(&legacy_id)
     );
     first.sync_shared_bugs().await?;
     assert!(first.shared_bug_pending_ids().await?.is_empty());
     second.sync_shared_bugs().await?;
     assert!(first.get_bug(legacy_id).await?.is_some());
-    assert!(second.get_bug_by_bugid(&legacy.bugid).await?.is_none());
+    assert!(second.get_bug_by_bugid(&legacy.bugid).await?.is_some());
     let mirror = second
         .get_bug_by_bugid(&bug.bugid)
         .await?

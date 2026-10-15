@@ -136,8 +136,8 @@ local. Original evidence can contain producer-local IDs; imported discoveries
 do not turn them into links in another database. All instances sharing a catalog must trust the
 same subsystem attribution and permission policy. A shared catalog may hold
 multiple projects, with synchronization scoped by the instance's project.
-Existing reports with another project's public ID prefix remain local and do
-not block synchronization of the configured project.
+The database project stamp defines catalog membership. Legacy public bug IDs
+retain their original prefix and synchronize without renaming reports.
 Use the API for catalog changes so audit history and synchronization remain
 consistent. Local CLI reviews do not submit bugs to the daemon automatically.
 

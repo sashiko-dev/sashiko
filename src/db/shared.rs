@@ -197,10 +197,10 @@ async fn shared_duplicate_chain(
 }
 
 impl Record {
-    fn validate(&self, project: &str) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            self.bugid.starts_with(&format!("{project}-")) && !self.origin.is_empty(),
-            "shared catalog project or origin mismatch"
+            !self.bugid.is_empty() && !self.origin.is_empty(),
+            "shared catalog bug identity or origin is missing"
         );
         anyhow::ensure!(
             (self.triage.status == BugLifecycleStatus::Duplicate)
@@ -424,12 +424,7 @@ impl Database {
         if self.shared.is_none() || scope.is_some_and(<[i64]>::is_empty) {
             return Ok(BTreeSet::new());
         }
-        // Legacy reports from other projects remain local. Publishing them
-        // under this project's key would poison every peer's import cursor.
-        let mut sql = "SELECT s.bug_id FROM shared_bug_sync s JOIN bugs b ON b.id=s.bug_id
-            WHERE s.dirty=1 AND b.bugid GLOB
-                (SELECT value || '-*' FROM meta WHERE key='project')"
-            .to_string();
+        let mut sql = "SELECT s.bug_id FROM shared_bug_sync s WHERE s.dirty=1".to_string();
         let mut params = Vec::<libsql::Value>::new();
         if let Some(scope) = scope {
             sql.push_str(" AND s.bug_id IN (SELECT value FROM json_each(?))");
@@ -513,7 +508,7 @@ impl Database {
                 .transpose()?;
             let mut merged =
                 merge_record(base.as_ref(), &local, prior.as_ref(), version, &instance)?;
-            merged.validate(&project)?;
+            merged.validate()?;
             // Validate relations under the catalog write lock. Independent
             // local decisions can otherwise form a cross-instance cycle.
             match shared_duplicate_chain(&tx, &project, &merged).await? {
@@ -771,8 +766,7 @@ impl Database {
         expected: Option<i64>,
         instance: &str,
     ) -> Result<()> {
-        let project = self.shared_meta("project").await?;
-        record.validate(&project)?;
+        record.validate()?;
         let tx = self.begin_transaction().await?;
         let db = self.with_connection((*tx).clone());
         let existing = db.get_bug_by_bugid(&record.bugid).await?;
