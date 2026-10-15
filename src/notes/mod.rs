@@ -28,6 +28,7 @@ pub mod history;
 pub mod output;
 pub mod plan;
 pub mod profile;
+pub mod rule_comments;
 pub mod scope;
 pub mod select;
 pub mod units;

@@ -142,6 +142,10 @@ pub struct ComponentInput {
     pub files: Vec<FileInput>,
     /// Entry points as "kind name (path:line)".
     pub entry_points: Vec<String>,
+    /// Comments stating rules, as "path:line: text"; shown to explorers
+    /// in their own block rather than in the component JSON.
+    #[serde(skip)]
+    pub rule_comments: Vec<String>,
 }
 
 /// How an agenda topic relates to a component.
@@ -635,6 +639,9 @@ const EXPLORE_INSTRUCTION: &str = r##"Explore component "{{component}}" of unit 
 {{past_fixes}}
 </past_fixes>
 
+<rule_comments>
+{{rule_comments}}
+</rule_comments>
 
 Past fixes, when listed, are bugs fixed earlier in this component for this topic, with the rule each fix restored as read from the fix. Use them as leads: check whether each rule still governs the current code, where else the same rule applies, and whether it is upheld there. A rule from a past fix becomes a fact only when the current code proves it; when a fact states or generalizes a past fix's rule, list that fix's ID in "from_history".
 
@@ -651,7 +658,7 @@ Report what a future patch to this component must preserve. A good fact:
 - is not enforced by the compiler or type system: if a violating patch would not build, drop the fact;
 - is not a description of what the code plainly does, a list of constants (unless the exact value is the contract), or generic advice ("inputs should be validated").
 
-Comments and documentation that say "must", "never", "only", "do not" or "so that" often state the rules that matter most: find them, check that the code upholds them, and report them.
+Comments and documentation that say "must", "never", "only", "do not" or "so that" often state the rules that matter most. Those found in this component are listed under rule_comments (possibly truncated): read the ones that bear on this topic in context, check that the code upholds them, and report them.
 
 Each fact needs evidence: the file path, a line range of at most {{max_evidence_lines}} lines, and a snippet copied verbatim from tool output (you may elide lines with "..."). Use "kind" from: Invariant, LockingRule, LifetimeRule, ApiContract, ErrorHandling, Concurrency, ExternalContract, Pitfall, Other. List the question IDs each fact answers in "questions", and the symbols it is about in "scope.symbols" (each symbol must appear in one of its snippets).
 
@@ -673,6 +680,11 @@ pub fn explore_stage(
     let question_ids: HashSet<String> = topic.questions.iter().map(|q| q.id.clone()).collect();
     let fix_ids: HashSet<String> = lessons.iter().map(|l| l.fix.clone()).collect();
     let past_fixes = render_lessons(&lessons);
+    let rule_comments = if component.rule_comments.is_empty() {
+        "(none found)".to_string()
+    } else {
+        component.rule_comments.join("\n")
+    };
     let component_name = component.name.clone();
     let topic_id = topic.id.clone();
     let component_json = serde_json::to_string_pretty(&component).unwrap_or_default();
@@ -702,6 +714,9 @@ pub fn explore_stage(
                     .with_var("survey", move |_: &NotesBuildState| survey_json.clone())
                     .with_var("questions", move |_: &NotesBuildState| questions.clone())
                     .with_var("past_fixes", move |_: &NotesBuildState| past_fixes.clone())
+                    .with_var("rule_comments", move |_: &NotesBuildState| {
+                        rule_comments.clone()
+                    })
                     .with_var("max_evidence_lines", |_: &NotesBuildState| {
                         MAX_EVIDENCE_LINES.to_string()
                     })
@@ -1214,6 +1229,7 @@ mod tests {
                 name: "src/db".to_string(),
                 files: vec![],
                 entry_points: vec![],
+                rule_comments: vec![],
             }],
             topics: vec![topic("SYNC", &["SYNC-1"]), topic("LIFE", &["LIFE-1"])],
             ..Default::default()

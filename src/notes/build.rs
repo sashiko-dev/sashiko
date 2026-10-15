@@ -34,6 +34,7 @@ use crate::notes::history::{HistoryCase, unit_history};
 use crate::notes::output::{ManifestFile, ManifestUnit, UnitFacts, write_unit};
 use crate::notes::plan::UnitPlan;
 use crate::notes::profile::HistoryConfig;
+use crate::notes::rule_comments::rule_comments;
 use crate::workflow::{Workflow, WorkflowEngine, WorkflowEnv, WorkflowOutcome};
 use crate::workflows::code_notes::{
     Applicability, CheckedFact, ComponentInput, EXPLORE_STAGE_NAMES, ExploreRecord, FileInput,
@@ -43,6 +44,9 @@ use crate::workflows::code_notes::{
     parallel_workflow, renumber_facts, single_stage_workflow, survey_stage, synthesize_stage,
     verdicts_by_id, verify_stage,
 };
+
+/// Rule comments shown to the explorers of one component.
+const MAX_RULE_COMMENTS: usize = 80;
 
 /// Length of the commit IDs past fixes are shown and cited by.
 const FIX_ID_LEN: usize = 12;
@@ -165,7 +169,13 @@ pub async fn build_unit(
     summary.history_lessons = lessons.len();
 
     // 3. Explore every component for every topic that may apply, plus the
-    //    history topic where past fixes fit no agenda topic.
+    //    history topic where past fixes fit no agenda topic. Explorers get
+    //    the component's rule comments up front.
+    for component in &mut state.components {
+        let files: Vec<String> = component.files.iter().map(|f| f.path.clone()).collect();
+        component.rule_comments =
+            rule_comments(repo, &cfg.revision, &files, MAX_RULE_COMMENTS).await?;
+    }
     let explored: Vec<ExploreRecord> = match load_step(&work, "explore", cfg.resume)? {
         Some(saved) => saved,
         None => {
@@ -514,6 +524,7 @@ fn component_inputs(unit: &UnitPlan) -> Vec<ComponentInput> {
                 .iter()
                 .map(|e| format!("{:?} {} ({}:{})", e.kind, e.name, e.path, e.line))
                 .collect(),
+            rule_comments: Vec::new(),
         })
         .collect()
 }
