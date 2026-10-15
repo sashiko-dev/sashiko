@@ -21,6 +21,27 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) struct SharedCatalog {
     pub settings: crate::settings::StorageSettings,
     pub lock: tokio::sync::Mutex<()>,
+    remote: tokio::sync::OnceCell<Database>,
+}
+
+impl SharedCatalog {
+    pub(super) fn new(settings: crate::settings::StorageSettings) -> Self {
+        Self {
+            settings,
+            lock: tokio::sync::Mutex::new(()),
+            remote: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn remote(&self) -> Result<&Database> {
+        self.remote
+            .get_or_try_init(|| async {
+                let remote = Database::postgres(&self.settings).await?;
+                remote.initialize_remote_catalog().await?;
+                Ok::<_, anyhow::Error>(remote)
+            })
+            .await
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -179,7 +200,7 @@ impl Database {
     pub async fn lock_bug_dedup(&self) -> Result<Option<crate::storage::Connection>> {
         if let Some(shared) = &self.shared {
             async {
-                let remote = Self::postgres(&shared.settings).await?;
+                let remote = shared.remote().await?;
                 let guard = remote.conn.dedup_lock().await?;
                 self.sync_shared_bugs().await?;
                 Ok::<_, anyhow::Error>(guard)
@@ -223,6 +244,52 @@ impl Database {
 
     pub fn has_shared_bug_catalog(&self) -> bool {
         self.shared.is_some()
+    }
+
+    async fn initialize_remote_catalog(&self) -> Result<()> {
+        let tx = self.begin_transaction().await?;
+        let mut rows=tx.query("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='reviews'",()).await?;
+        anyhow::ensure!(
+            rows.next()
+                .await?
+                .context("missing schema check")?
+                .get::<i64>(0)?
+                == 0,
+            "Use a separate PostgreSQL schema for a shared bug catalog and a full daemon database"
+        );
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS shared_catalog_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)").await?;
+        tx.execute(
+            "INSERT INTO shared_catalog_meta VALUES ('identity',?) ON CONFLICT(key) DO NOTHING",
+            [uuid::Uuid::new_v4().to_string()],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO shared_catalog_meta VALUES ('format','1') ON CONFLICT(key) DO NOTHING",
+            (),
+        )
+        .await?;
+        let mut format = tx
+            .query(
+                "SELECT value FROM shared_catalog_meta WHERE key='format'",
+                (),
+            )
+            .await?;
+        anyhow::ensure!(
+            format
+                .next()
+                .await?
+                .context("missing catalog format")?
+                .get::<String>(0)?
+                == "1",
+            "Unsupported shared catalog format"
+        );
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS shared_bug_records (
+            project TEXT NOT NULL, bugid TEXT NOT NULL,
+            sequence BIGINT GENERATED ALWAYS AS IDENTITY,
+            payload TEXT NOT NULL, PRIMARY KEY(project,bugid));
+            CREATE INDEX IF NOT EXISTS shared_bug_records_sequence ON shared_bug_records(project,sequence)").await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub(super) async fn initialize_shared_catalog(&self) -> Result<()> {
@@ -342,62 +409,18 @@ impl Database {
             return Ok(());
         };
         let _guard = shared.lock.lock().await;
-        let remote = Self::postgres(&shared.settings).await?;
+        let remote = shared.remote().await?;
         let project = self.shared_meta("project").await?;
         let instance = self.shared_meta("shared_instance").await?;
-        let tx = remote.begin_transaction().await?;
-        let mut rows=tx.query("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='reviews'",()).await?;
+        let mut rows = remote.conn.query(
+            "SELECT i.value,f.value FROM shared_catalog_meta i JOIN shared_catalog_meta f ON f.key='format' WHERE i.key='identity'", (),
+        ).await?;
+        let row = rows.next().await?.context("missing catalog metadata")?;
+        let identity: String = row.get(0)?;
         anyhow::ensure!(
-            rows.next()
-                .await?
-                .context("missing schema check")?
-                .get::<i64>(0)?
-                == 0,
-            "Use a separate PostgreSQL schema for a shared bug catalog and a full daemon database"
-        );
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS shared_catalog_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)").await?;
-        tx.execute(
-            "INSERT INTO shared_catalog_meta VALUES ('identity',?) ON CONFLICT(key) DO NOTHING",
-            [uuid::Uuid::new_v4().to_string()],
-        )
-        .await?;
-        tx.execute(
-            "INSERT INTO shared_catalog_meta VALUES ('format','1') ON CONFLICT(key) DO NOTHING",
-            (),
-        )
-        .await?;
-        let mut format = tx
-            .query(
-                "SELECT value FROM shared_catalog_meta WHERE key='format'",
-                (),
-            )
-            .await?;
-        anyhow::ensure!(
-            format
-                .next()
-                .await?
-                .context("missing catalog format")?
-                .get::<String>(0)?
-                == "1",
+            row.get::<String>(1)? == "1",
             "Unsupported shared catalog format"
         );
-        let mut rows = tx
-            .query(
-                "SELECT value FROM shared_catalog_meta WHERE key='identity'",
-                (),
-            )
-            .await?;
-        let identity = rows
-            .next()
-            .await?
-            .context("missing catalog identity")?
-            .get::<String>(0)?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS shared_bug_records (
-            project TEXT NOT NULL, bugid TEXT NOT NULL,
-            sequence BIGINT GENERATED ALWAYS AS IDENTITY,
-            payload TEXT NOT NULL, PRIMARY KEY(project,bugid));
-            CREATE INDEX IF NOT EXISTS shared_bug_records_sequence ON shared_bug_records(project,sequence)").await?;
-        tx.commit().await?;
         let local = self.begin_transaction().await?;
         local.execute("INSERT INTO meta (key,value) VALUES ('shared_catalog_id',?) ON CONFLICT(key) DO NOTHING",[identity.as_str()]).await?;
         let mut rows = local
@@ -469,7 +492,7 @@ impl Database {
                 .await?;
             }
             tx.commit().await?;
-            self.shared_import_targets(&remote, &merged, &project, &instance)
+            self.shared_import_targets(remote, &merged, &project, &instance)
                 .await?;
             self.shared_accept(&merged, Some(version), &instance)
                 .await?;
@@ -501,7 +524,7 @@ impl Database {
             }
             updates.sort_by_key(|r| r.triage.duplicate_of.is_some());
             for record in updates {
-                self.shared_import_targets(&remote, &record, &project, &instance)
+                self.shared_import_targets(remote, &record, &project, &instance)
                     .await?;
                 self.shared_accept(&record, None, &instance).await?;
             }
@@ -908,10 +931,7 @@ mod tests {
             token: String::new(),
         })
         .await?;
-        db.shared = Some(Arc::new(SharedCatalog {
-            settings: Default::default(),
-            lock: tokio::sync::Mutex::new(()),
-        }));
+        db.shared = Some(Arc::new(SharedCatalog::new(Default::default())));
         db.migrate().await?;
         db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
             .await?;
@@ -1184,10 +1204,7 @@ mod tests {
             token: String::new(),
         })
         .await?;
-        db.shared = Some(Arc::new(SharedCatalog {
-            settings: Default::default(),
-            lock: tokio::sync::Mutex::new(()),
-        }));
+        db.shared = Some(Arc::new(SharedCatalog::new(Default::default())));
         db.migrate().await?;
         db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
             .await?;

@@ -1365,10 +1365,9 @@ impl Database {
             StorageMode::Postgresql => Self::postgres(&settings.storage).await,
             StorageMode::LibsqlSharedBugs => {
                 let mut db = Self::new(&settings.database).await?;
-                db.shared = Some(Arc::new(shared::SharedCatalog {
-                    settings: settings.storage.clone(),
-                    lock: tokio::sync::Mutex::new(()),
-                }));
+                db.shared = Some(Arc::new(shared::SharedCatalog::new(
+                    settings.storage.clone(),
+                )));
                 Ok(db)
             }
         }
@@ -1376,21 +1375,28 @@ impl Database {
 
     /// Open PostgreSQL in the configured schema.
     pub async fn postgres(settings: &crate::settings::StorageSettings) -> Result<Self> {
-        let mut tls = native_tls::TlsConnector::builder();
-        if let Some(path) = &settings.postgres_ca_file {
-            tls.add_root_certificate(native_tls::Certificate::from_pem(&std::fs::read(path)?)?);
-        }
-        if settings.postgres_tls_require_only {
-            tls.danger_accept_invalid_certs(true);
-            tls.danger_accept_invalid_hostnames(true);
-        }
+        let url = settings
+            .postgres_url
+            .clone()
+            .context("missing PostgreSQL URL")?;
+        let ca_file = settings.postgres_ca_file.clone();
+        let require_only = settings.postgres_tls_require_only;
+        let tls = tokio::task::spawn_blocking(move || -> Result<native_tls::TlsConnector> {
+            let mut tls = native_tls::TlsConnector::builder();
+            if let Some(path) = ca_file {
+                tls.add_root_certificate(native_tls::Certificate::from_pem(&std::fs::read(path)?)?);
+            }
+            if require_only {
+                tls.danger_accept_invalid_certs(true);
+                tls.danger_accept_invalid_hostnames(true);
+            }
+            Ok(tls.build()?)
+        })
+        .await??;
         let conn = crate::storage::Connection::postgres(crate::storage::PgConfig {
-            url: settings
-                .postgres_url
-                .clone()
-                .context("missing PostgreSQL URL")?,
+            url,
             schema: settings.postgres_schema.clone(),
-            tls: tls.build()?,
+            tls,
         })
         .await?;
         Ok(Self {
