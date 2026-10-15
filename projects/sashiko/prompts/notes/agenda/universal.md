@@ -33,7 +33,7 @@ evidence; a question that does not apply is marked as such, never padded.
 - ERR-1: How are errors signaled and propagated, and where are they deliberately swallowed, downgraded or retried?
 - ERR-2: On each failure path, what must be rolled back or released so the system returns to a consistent state?
 - ERR-3: Which failures are expected in normal operation and which are fatal, and how does the code tell them apart?
-- ERR-4: Where can a failure become silent, producing a plausible but wrong result instead of an error?
+- ERR-4: Where must a failure surface as an error rather than a plausible default or partial result, and what guarantees it does?
 
 ## API: Contracts and Boundaries
 
@@ -44,5 +44,5 @@ evidence; a question that does not apply is marked as such, never padded.
 
 ## BOUND: Resource Bounds and Scaling
 
-- BOUND-1: Which operations scale with input size, history length or fan-out, and what bounds each?
-- BOUND-2: Where can caches, queues, buffers, retries or recursion grow without limit?
+- BOUND-1: Which operations scale with input size, history length or fan-out, and which caps, chunking, pagination or timeouts bound them that new code paths must keep?
+- BOUND-2: Which caches, queues, buffers, retries or recursion are bounded, by what, and which helper or pattern must new code use to stay bounded?
