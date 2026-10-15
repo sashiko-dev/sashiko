@@ -70,6 +70,9 @@ The default is `mode = "libsql"`. PostgreSQL can store the entire daemon
 database, or act as a shared bug catalog for instances that keep their reviews
 in libSQL. PostgreSQL requires TLS and a login that owns the configured schema
 so startup migrations can create tables, indexes, and triggers.
+An administrator can create the schema in advance and assign it to the
+application login. An existing schema does not require database-level `CREATE`
+permission; automatic creation of a missing schema does.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -104,6 +107,9 @@ enabled = true
 Set the PostgreSQL URL through deployment secrets in either configuration.
 An existing libSQL database is not automatically moved when selecting full
 PostgreSQL storage. Full mode creates an independent database schema.
+The initial backend serializes database operations with a database-wide
+advisory lock and uses dedicated sessions for explicit transactions. Select it
+with that execution model in mind when sizing a deployment.
 
 In shared catalog mode, each local database has a stable instance identity
 and a local bug mirror. Changes enter a durable outbox in the same transaction

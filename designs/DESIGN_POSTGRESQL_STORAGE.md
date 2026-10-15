@@ -64,11 +64,19 @@ backend-specific, versioned migrations. PostgreSQL schema versioning must be
 transactional and protected against concurrent daemon startups. Translate
 SQLite triggers and JSON projections into PostgreSQL triggers or explicit
 transactional writes, with tests proving equivalent behavior. Use PostgreSQL
-an advisory transaction lock for worker claims and outbox leases, preserving
+advisory transaction locks for worker claims and outbox leases, preserving
 the existing single-writer transaction contract across daemon instances.
 Canonical bug deduplication also takes a PostgreSQL session lock across
 the candidate check and final write. Keep a single database
 transaction for operations that currently depend on SQLite atomicity.
+
+The first implementation serializes reads and writes with a database-wide
+advisory lock. Explicit transactions use dedicated connections; ordinary
+sessions reconnect before a later operation after connection loss, without
+replaying failed writes. Transaction and deduplication sessions retain their
+connection identity and fail when that session is lost. Query results are
+buffered, and catalog updates transfer whole bug snapshots. Pooling, concurrent
+read scaling and incremental evidence transfer remain future improvements.
 
 ## Shared bugs mode
 
