@@ -50,6 +50,8 @@ pub struct LinuxPatchReviewState {
     pub manual_stages: Option<Vec<String>>,
     /// Caller-supplied instructions appended to the shared system prompt.
     pub custom_prompt: Option<String>,
+    /// Rendered `<code_notes>` block for the system prompt, or empty.
+    pub code_notes: String,
     /// Stages selected by dynamic planning (or overridden by manual_stages).
     pub planned_stages: Vec<String>,
     /// Optional reasoning effort mode (`Mid`, `High`, or `Dynamic`).
@@ -157,7 +159,7 @@ If tool output is truncated ('truncated': true), page only if directly relevant 
 <global_review_guidelines>
 The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.
 @includes
-</global_review_guidelines>
+</global_review_guidelines>{{{{code_notes}}}}
 
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
@@ -170,6 +172,7 @@ Target Commit:
     ))
     .with_var("target_commit_sha", |s: &LinuxPatchReviewState| s.target_commit_sha.clone())
     .with_var("baseline_sha", |s: &LinuxPatchReviewState| s.baseline_sha.clone())
+    .with_var("code_notes", |s: &LinuxPatchReviewState| s.code_notes.clone())
     .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
     .with_var("target_commit_diff_only", |s: &LinuxPatchReviewState| s.target_commit_diff_only.clone())
     .with_var("prefetched_block", |s: &LinuxPatchReviewState| {

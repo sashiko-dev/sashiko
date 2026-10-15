@@ -66,7 +66,7 @@ If tool output is truncated ('truncated': true), page only if directly relevant 
 <global_review_guidelines>
 The following documents contain the official Sashiko architecture rules, component invariants, and cross-cutting Rust/async guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.
 @includes
-</global_review_guidelines>
+</global_review_guidelines>{{{{code_notes}}}}
 
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
@@ -83,6 +83,7 @@ Target Commit:
     .with_var("baseline_sha", |s: &SashikoPatchReviewState| {
         s.baseline_sha.clone()
     })
+    .with_var("code_notes", |s: &SashikoPatchReviewState| s.code_notes.clone())
     .with_var("target_commit_diff", |s: &SashikoPatchReviewState| {
         s.target_commit_diff.clone()
     })

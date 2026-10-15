@@ -968,6 +968,12 @@ pub struct ReviewSettings {
     /// they cost ~10x less and don't reflect runaway model behaviour. Set to 0 to disable.
     #[serde(default = "default_max_total_tokens")]
     pub max_total_tokens: usize,
+    /// Load code notes (`notes/<set>/` in the prompt directory) into reviews.
+    #[serde(default)]
+    pub use_code_notes: bool,
+    /// Byte budget of the code notes inlined into one review.
+    #[serde(default = "default_code_notes_bytes")]
+    pub code_notes_bytes: usize,
     /// Maximum cumulative output tokens (including thinking tokens) across all turns in a
     /// single review. Set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
@@ -995,6 +1001,10 @@ impl ReviewSettings {
         }
         Some(self.effort.unwrap_or(EffortMode::Mid))
     }
+}
+
+fn default_code_notes_bytes() -> usize {
+    48 * 1024
 }
 
 fn default_max_total_tokens() -> usize {

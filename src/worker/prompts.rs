@@ -88,6 +88,39 @@ pub struct ReviewInput {
     pub patches: Vec<PatchInput>,
 }
 
+/// Selects the code notes for a review and renders their prompt block.
+/// Notes are an aid, not a requirement: any failure is logged and the
+/// review proceeds without them.
+async fn select_code_notes(
+    repo: &std::path::Path,
+    prompts_dir: &std::path::Path,
+    baseline: &str,
+    diff: &str,
+    max_bytes: usize,
+) -> String {
+    let sets = crate::notes::select::load_sets(prompts_dir);
+    if sets.is_empty() {
+        return String::new();
+    }
+    let set = match crate::notes::select::choose_set(repo, &sets, baseline).await {
+        Ok(Some(set)) => set,
+        Ok(None) => return String::new(),
+        Err(err) => {
+            tracing::warn!("code notes skipped: {err:#}");
+            return String::new();
+        }
+    };
+    let files = crate::baseline::extract_files_from_diff(diff);
+    let notes = crate::notes::select::select_notes(set, &files, max_bytes);
+    tracing::info!(
+        "code notes: set {} with {} unit note(s) for {} touched file(s)",
+        set.manifest.set,
+        notes.len(),
+        files.len()
+    );
+    crate::notes::select::render_block(set, &notes)
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub project: ProjectId,
@@ -101,6 +134,9 @@ pub struct WorkerConfig {
     pub skip_report: bool,
     pub report_preexisting: bool,
     pub effort: Option<crate::ai::EffortMode>,
+    /// Byte budget of code notes to load into the review; `None` disables
+    /// code notes.
+    pub code_notes_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +220,7 @@ pub struct Worker {
     skip_report: bool,
     report_preexisting: bool,
     effort: Option<crate::ai::EffortMode>,
+    code_notes_bytes: Option<usize>,
 }
 
 impl Worker {
@@ -209,6 +246,7 @@ impl Worker {
             skip_report: config.skip_report,
             report_preexisting: config.report_preexisting,
             effort: config.effort,
+            code_notes_bytes: config.code_notes_bytes,
         }
     }
 
@@ -339,6 +377,20 @@ impl Worker {
             ),
         };
 
+        let code_notes = match self.code_notes_bytes {
+            Some(max_bytes) => {
+                select_code_notes(
+                    worktree_path,
+                    &self.prompts.base_dir,
+                    &baseline_sha,
+                    &target_commit_diff_only,
+                    max_bytes,
+                )
+                .await
+            }
+            None => String::new(),
+        };
+
         let mut state = LinuxPatchReviewState {
             ps_id,
             p_id,
@@ -353,6 +405,7 @@ impl Worker {
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
+            code_notes,
             planned_stages: Vec::new(),
             effort: self.effort,
             planned_efforts: std::collections::BTreeMap::new(),
@@ -1046,6 +1099,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1157,6 +1211,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1195,6 +1250,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1237,6 +1293,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1340,6 +1397,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1525,6 +1583,7 @@ mod tests {
                 skip_report: true,
                 report_preexisting: false,
                 effort: None,
+                code_notes_bytes: None,
             };
             let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1626,6 +1685,7 @@ mod tests {
                 skip_report: false,
                 report_preexisting: false,
                 effort: None,
+                code_notes_bytes: None,
             },
         );
         let out_default = worker_default
@@ -1658,6 +1718,7 @@ mod tests {
                 skip_report: false,
                 report_preexisting: true,
                 effort: None,
+                code_notes_bytes: None,
             },
         );
         let out_preexisting = worker_preexisting
