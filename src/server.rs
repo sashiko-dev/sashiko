@@ -1367,12 +1367,16 @@ fn referenced_duplicate_ids(bug: &crate::db::Bug) -> Vec<i64> {
 fn redact_inaccessible_duplicate_enrichments(
     bug: &mut crate::db::Bug,
     readable_targets: &std::collections::HashSet<i64>,
+    foreign_events: &std::collections::BTreeSet<i64>,
 ) {
     let refs = referenced_duplicate_ids(bug);
-    if refs.iter().all(|id| readable_targets.contains(id)) {
-        return;
-    }
+    let inaccessible = refs.iter().any(|id| !readable_targets.contains(id));
     for enrichment in &mut bug.enrichments {
+        // Foreign historical IDs cannot establish access to their original
+        // targets, even if they collide with readable local rows.
+        if !inaccessible && !foreign_events.contains(&enrichment.id) {
+            continue;
+        }
         if enrichment.kind == "audit"
             && enrichment
                 .data_json
@@ -1386,6 +1390,21 @@ fn redact_inaccessible_duplicate_enrichments(
             enrichment.data_json = None;
         }
     }
+}
+
+async fn foreign_events_for_bug_view(
+    state: &AppState,
+    principal: &Principal,
+    bug_ids: &[i64],
+) -> Result<std::collections::BTreeSet<i64>, StatusCode> {
+    if principal.has_global_bug_visibility() {
+        return Ok(Default::default());
+    }
+    state
+        .db
+        .foreign_shared_events(bug_ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Loads the bug for one of the raw transcript endpoints.
@@ -1487,8 +1506,14 @@ async fn get_bug(
     let mut readable_family = readable_by_principal.clone();
     readable_family.insert(bug.id);
     family.retain(|member| readable_family.contains(&member.id));
+    let foreign_events = foreign_events_for_bug_view(
+        &state,
+        &principal,
+        &family.iter().map(|member| member.id).collect::<Vec<_>>(),
+    )
+    .await?;
     for member in &mut family {
-        redact_inaccessible_duplicate_enrichments(member, &readable_by_principal);
+        redact_inaccessible_duplicate_enrichments(member, &readable_by_principal, &foreign_events);
     }
     let mut evidence = state
         .db
@@ -1633,7 +1658,8 @@ async fn get_bug_enrichments(
     }
     let refs = referenced_duplicate_ids(&bug);
     let readable_refs = readable_bug_ids(&state, &principal, &refs).await?;
-    redact_inaccessible_duplicate_enrichments(&mut bug, &readable_refs);
+    let foreign_events = foreign_events_for_bug_view(&state, &principal, &[bug.id]).await?;
+    redact_inaccessible_duplicate_enrichments(&mut bug, &readable_refs, &foreign_events);
     Ok(Json(
         serde_json::to_value(&bug.enrichments).unwrap_or_default(),
     ))
@@ -4743,14 +4769,13 @@ mod tests {
 
     #[tokio::test]
     async fn bug_evidence_excludes_inaccessible_family_members() {
-        let db = Arc::new(
-            Database::new(&crate::settings::DatabaseSettings {
-                url: ":memory:".into(),
-                token: String::new(),
-            })
-            .await
-            .unwrap(),
-        );
+        let mut configured: crate::settings::Settings =
+            toml::from_str("[ai]\nprovider='mock'\nmodel='test'\n[review]\nconcurrency=1\n")
+                .unwrap();
+        configured.database.url = ":memory:".into();
+        configured.storage.mode = crate::settings::StorageMode::LibsqlSharedBugs;
+        configured.storage.postgres_url = Some("postgresql://localhost/unused".into());
+        let db = Arc::new(Database::configured(&configured).await.unwrap());
         db.migrate().await.unwrap();
         let mut ids = Vec::new();
         for (name, section) in [
@@ -5017,6 +5042,59 @@ mod tests {
                     item["data_json"],
                     serde_json::json!({ "field": "duplicate_of_id" })
                 );
+            }
+        }
+
+        // The producer's historical target collides with a readable local
+        // target. That coincidence must not authorize foreign reasoning.
+        state
+            .db
+            .execute(
+                "INSERT INTO shared_bug_events (enrichment_id,event_key)
+             SELECT id,'foreign:' || id FROM bug_enrichments
+             WHERE bug_id=? AND kind IN ('audit','deduplication')",
+                [ids[2]],
+            )
+            .await
+            .unwrap();
+        for email in ["a@example.org", "operator@example.org"] {
+            let principal = Principal::resolve(email, &acl, Some(&index));
+            let query = BugQuery {
+                id: Some(ids[2]),
+                bugid: None,
+                slug: None,
+            };
+            let Json(body) = get_bug(Ok(principal.clone()), State(state.clone()), Query(query))
+                .await
+                .unwrap();
+            let Json(enrichments) = get_bug_enrichments(
+                principal,
+                State(state.clone()),
+                Query(BugQuery {
+                    id: Some(ids[2]),
+                    bugid: None,
+                    slug: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let globally_visible = email == "operator@example.org";
+            for value in [&body["evidence"], &enrichments] {
+                assert_eq!(
+                    value.to_string().contains("same defect as canonical"),
+                    globally_visible
+                );
+            }
+            if !globally_visible {
+                for event in enrichments.as_array().unwrap() {
+                    if event["kind"] == "audit" && event["data_json"]["field"] == "duplicate_of_id"
+                    {
+                        assert_eq!(
+                            event["data_json"],
+                            serde_json::json!({"field":"duplicate_of_id"})
+                        );
+                    }
+                }
             }
         }
     }

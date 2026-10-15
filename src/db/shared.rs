@@ -154,7 +154,7 @@ impl Database {
     }
 
     /// Producer-local IDs in foreign evidence cannot identify mirror reviews.
-    pub(super) async fn foreign_shared_events(&self, bug_ids: &[i64]) -> Result<BTreeSet<i64>> {
+    pub(crate) async fn foreign_shared_events(&self, bug_ids: &[i64]) -> Result<BTreeSet<i64>> {
         if self.shared.is_none() || bug_ids.is_empty() {
             return Ok(BTreeSet::new());
         }
