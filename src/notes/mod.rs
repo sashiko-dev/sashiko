@@ -27,4 +27,5 @@ pub mod output;
 pub mod plan;
 pub mod profile;
 pub mod scope;
+pub mod select;
 pub mod units;
