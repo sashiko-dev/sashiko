@@ -17,8 +17,8 @@ Use an explicit database mode rather than inferring a backend from a URL:
 | `postgresql` | PostgreSQL | PostgreSQL | no |
 | `libsql_shared_bugs` | libSQL | PostgreSQL | no |
 
-`[database]` keeps its existing `url` and `token` for libSQL. Add a
-`postgres_url` value for the PostgreSQL connection. Require it in either
+`[database]` keeps its existing `url` and `token` for libSQL. Add `[storage]`
+with `mode` and `postgres_url` for the PostgreSQL connection. Require it in either
 PostgreSQL mode. Reject a PostgreSQL URL passed as the libSQL URL, and reject
 mixed mode without a local or remote libSQL URL. Do not log credentials.
 

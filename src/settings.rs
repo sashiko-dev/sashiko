@@ -132,6 +132,25 @@ pub struct DatabaseSettings {
     pub token: String,
 }
 
+/// Selects where the daemon stores its primary data and bug catalog.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMode {
+    #[default]
+    Libsql,
+    Postgresql,
+    LibsqlSharedBugs,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSettings {
+    #[serde(default)]
+    pub mode: StorageMode,
+    #[serde(default)]
+    pub postgres_url: Option<String>,
+}
+
 /// An empty url, which is no database at all.
 ///
 /// The section is optional because a local review has none and never asks. The
@@ -988,6 +1007,8 @@ pub struct Settings {
     #[serde(default)]
     pub database: DatabaseSettings,
     #[serde(default)]
+    pub storage: StorageSettings,
+    #[serde(default)]
     pub nntp: NntpSettings,
     pub smtp: Option<SmtpSettings>,
     #[serde(default)]
@@ -1065,12 +1086,36 @@ impl Settings {
     /// and an empty one reaching a connection attempt or a git command produces
     /// an error far from its cause.
     pub fn validate_for_daemon(&self) -> Result<(), String> {
-        if self.database.url.trim().is_empty() {
+        if self.database.url.starts_with("postgres://")
+            || self.database.url.starts_with("postgresql://")
+        {
+            return Err(
+                "[database] url is for libSQL; set PostgreSQL in [storage] postgres_url"
+                    .to_string(),
+            );
+        }
+        if self.storage.mode != StorageMode::Postgresql && self.database.url.trim().is_empty() {
             return Err(
                 "[database] url must be set: the daemon keeps every patchset, review and \
                  finding there"
                     .to_string(),
             );
+        }
+        if self.storage.mode != StorageMode::Libsql
+            && self
+                .storage
+                .postgres_url
+                .as_deref()
+                .is_none_or(|url| url.trim().is_empty())
+        {
+            return Err("[storage] postgres_url must be set in PostgreSQL modes".to_string());
+        }
+        if self.storage.mode != StorageMode::Libsql
+            && self.storage.postgres_url.as_deref().is_some_and(|url| {
+                !url.starts_with("postgres://") && !url.starts_with("postgresql://")
+            })
+        {
+            return Err("[storage] postgres_url must be a PostgreSQL URL".to_string());
         }
         if self.git.repository_path.trim().is_empty() {
             return Err(
@@ -1391,6 +1436,56 @@ mod tests {
             format!(
                 "{base}worktree_dir = \"review_trees\"\n\
                  \n[database]\nurl = \"sashiko.db\"\n\n[git]\nrepository_path = \"linux\"\n"
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert!(settings.validate_for_daemon().is_ok());
+    }
+
+    #[test]
+    fn test_storage_modes_preserve_libsql_default_and_require_their_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let base = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\
+                    [review]\nconcurrency = 8\nworktree_dir = \"review_trees\"\n\
+                    [git]\nrepository_path = \"linux\"\n";
+
+        std::fs::write(&path, format!("{base}[database]\nurl = \"sashiko.db\"\n")).unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert_eq!(settings.storage.mode, StorageMode::Libsql);
+        assert!(settings.validate_for_daemon().is_ok());
+
+        std::fs::write(
+            &path,
+            format!(
+                "{base}[storage]\nmode = \"postgresql\"\n\
+                 postgres_url = \"postgresql://localhost/sashiko\"\n"
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert_eq!(settings.storage.mode, StorageMode::Postgresql);
+        assert!(settings.validate_for_daemon().is_ok());
+
+        std::fs::write(
+            &path,
+            format!(
+                "{base}[storage]\nmode = \"libsql_shared_bugs\"\n\
+                 postgres_url = \"postgresql://localhost/sashiko\"\n"
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(&path)).unwrap();
+        assert_eq!(settings.storage.mode, StorageMode::LibsqlSharedBugs);
+        assert!(settings.validate_for_daemon().is_err());
+
+        std::fs::write(
+            &path,
+            format!(
+                "{base}[database]\nurl = \"sashiko.db\"\n\
+                 [storage]\nmode = \"libsql_shared_bugs\"\n\
+                 postgres_url = \"postgresql://localhost/sashiko\"\n"
             ),
         )
         .unwrap();

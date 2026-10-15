@@ -540,6 +540,10 @@ async fn run_daemon(
         return Err(reason.into());
     }
 
+    if settings.storage.mode != sashiko::settings::StorageMode::Libsql {
+        return Err(anyhow::anyhow!("PostgreSQL storage mode is not yet implemented").into());
+    }
+
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
