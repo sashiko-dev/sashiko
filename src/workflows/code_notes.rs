@@ -1292,13 +1292,18 @@ pub fn validate_note(
     if note.contains("```") {
         return Err("the note must not contain code blocks".to_string());
     }
-    for line in note.lines() {
-        if line.starts_with("- ") && line.chars().count() > MAX_BULLET_CHARS {
-            let start: String = line.chars().take(60).collect();
-            return Err(format!(
-                "the bullet starting {start:?} is longer than {MAX_BULLET_CHARS} characters; shorten it"
-            ));
-        }
+    // Every long bullet is named at once, so one retry can fix them all.
+    let long: Vec<String> = note
+        .lines()
+        .filter(|line| line.starts_with("- ") && line.chars().count() > MAX_BULLET_CHARS)
+        .map(|line| format!("{:?}", line.chars().take(60).collect::<String>()))
+        .collect();
+    if !long.is_empty() {
+        return Err(format!(
+            "{} bullet(s) are longer than {MAX_BULLET_CHARS} characters; shorten or split each: the bullets starting {}",
+            long.len(),
+            long.join(", ")
+        ));
     }
     let mut cited_ids: Vec<&str> = Vec::new();
     for caps in FACT_REF.captures_iter(&note) {
