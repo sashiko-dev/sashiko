@@ -40,9 +40,9 @@ use crate::workflows::code_notes::{
     Applicability, CheckedFact, ComponentInput, EXPLORE_STAGE_NAMES, ExploreRecord, FileInput,
     HISTORY_BATCH_SIZE, HISTORY_STAGE_NAMES, HISTORY_TOPIC_ID, HistoryInput, HistoryLesson,
     LessonKind, NotesBuildState, PlacedLesson, SurveyOutput, VERIFY_BATCH_SIZE, VERIFY_STAGE_NAMES,
-    explore_stage, history_stage, history_topic, lessons_for, neutralize_directives,
-    parallel_workflow, renumber_facts, single_stage_workflow, survey_stage, synthesize_stage,
-    verdicts_by_id, verify_stage,
+    dedup_stage, explore_stage, history_stage, history_topic, keep_representatives, lessons_for,
+    neutralize_directives, parallel_workflow, renumber_facts, single_stage_workflow, survey_stage,
+    synthesize_stage, verdicts_by_id, verify_stage,
 };
 
 /// Rule comments shown to the explorers of one component.
@@ -94,6 +94,8 @@ pub struct UnitBuildSummary {
     pub explore_stages: usize,
     pub facts_proposed: usize,
     pub evidence_failures: usize,
+    /// Facts dropped as restatements of another fact's rule.
+    pub duplicates: usize,
     pub confirmed: usize,
     pub refuted: usize,
     pub unverifiable: usize,
@@ -264,6 +266,37 @@ pub async fn build_unit(
         .iter()
         .filter(|f| !f.evidence_checks.iter().any(|c| c.is_ok()))
         .count();
+
+    // Facts from different topics often restate one rule; verify each
+    // rule once. A failed dedup keeps every fact.
+    let groups: Vec<Vec<String>> = match load_step(&work, "dedup", cfg.resume)? {
+        Some(saved) => saved,
+        None if checked.len() < 2 => Vec::new(),
+        None => {
+            let workflow =
+                single_stage_workflow("notes_dedup", dedup_stage(&checked, cfg.temperature));
+            let groups = match run_step(
+                &workflow,
+                env,
+                &mut state,
+                &work,
+                "dedup",
+                &mut summary.usage,
+            )
+            .await
+            {
+                Ok(()) => state.dedup.take().map(|d| d.groups).unwrap_or_default(),
+                Err(err) => {
+                    warn!("{}: dedup failed, verifying every fact: {err:#}", unit.name);
+                    Vec::new()
+                }
+            };
+            save_step(&work, "dedup", &groups)?;
+            groups
+        }
+    };
+    let checked = keep_representatives(checked, &groups);
+    summary.duplicates = summary.facts_proposed - checked.len();
 
     // 5. Independent verification, then the same deterministic check on
     //    the verifier's own evidence.

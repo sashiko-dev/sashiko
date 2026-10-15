@@ -227,6 +227,7 @@ pub struct NotesBuildState {
     pub survey: Option<SurveyOutput>,
     pub lessons: Vec<HistoryLesson>,
     pub explored: Vec<ExploreRecord>,
+    pub dedup: Option<DedupOutput>,
     pub verdicts: Vec<FactVerdict>,
     pub note: Option<String>,
 }
@@ -915,6 +916,140 @@ pub fn validate_explore(
 }
 
 // ---------------------------------------------------------------------------
+// Deduplicate
+// ---------------------------------------------------------------------------
+
+/// Dedup stage output: groups of fact IDs stating the same rule, the most
+/// precise statement first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupOutput {
+    pub groups: Vec<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct DedupFact<'a> {
+    id: &'a str,
+    statement: &'a str,
+    violated_by: &'a str,
+    symbols: &'a [String],
+}
+
+const DEDUP_INSTRUCTION: &str = r##"These facts about unit "{{unit}}" were proposed independently for different topics, so several may state the same rule in different words.
+
+<facts>
+{{facts}}
+</facts>
+
+Group the facts that state the same rule, meaning the same patch would break them. Facts about the same symbols that state different rules stay in separate groups. Within each group, put first the fact that states the rule most precisely and completely. Every fact ID must appear in exactly one group; a fact with no duplicate is a group of one.
+
+Return ONLY a JSON object:
+{"groups": [["F3", "F7"], ["F1"]]}"##;
+
+/// The dedup stage over `checked` facts. It needs no tools.
+pub fn dedup_stage(
+    checked: &[CheckedFact],
+    temperature: f32,
+) -> Stage<NotesBuildState, DedupOutput> {
+    let ids: Vec<String> = checked.iter().map(|c| c.fact.id.clone()).collect();
+    let facts: Vec<DedupFact> = checked
+        .iter()
+        .map(|c| DedupFact {
+            id: &c.fact.id,
+            statement: &c.fact.statement,
+            violated_by: &c.fact.violated_by,
+            symbols: &c.fact.scope.symbols,
+        })
+        .collect();
+    let facts_json = serde_json::to_string_pretty(&facts).unwrap_or_default();
+    Stage::builder("dedup")
+        .system_prompt(system_prompt())
+        .user_prompt(
+            PromptTemplate::new(DEDUP_INSTRUCTION)
+                .with_var("unit", |s: &NotesBuildState| s.unit.clone())
+                .with_var("facts", move |_: &NotesBuildState| facts_json.clone()),
+        )
+        .output_format(
+            OutputFormat::json()
+                .with_validator(move |out: &DedupOutput, _: &NotesBuildState| {
+                    validate_groups(out, &ids)
+                })
+                .with_feedback_formatter(|err| {
+                    format!("Your groups were rejected: {err}\nFix exactly that and return the full JSON object again.")
+                }),
+        )
+        .policy(StagePolicy {
+            max_validation_attempts: SYNTH_VALIDATION_ATTEMPTS,
+            ..policy(SYNTH_VALIDATION_ATTEMPTS, temperature, ToolScope::None)
+        })
+        .reduce(|state: &mut NotesBuildState, out: DedupOutput| state.dedup = Some(out))
+        .build()
+}
+
+/// Every fact ID in exactly one non-empty group.
+pub fn validate_groups(out: &DedupOutput, ids: &[String]) -> Result<(), String> {
+    let expected: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    for group in &out.groups {
+        if group.is_empty() {
+            return Err("a group is empty".to_string());
+        }
+        for id in group {
+            if !expected.contains(id.as_str()) {
+                return Err(format!("unknown fact {id:?}; the facts are {ids:?}"));
+            }
+            if !seen.insert(id.as_str()) {
+                return Err(format!("fact {id} appears in more than one group"));
+            }
+        }
+    }
+    let missing: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !seen.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("facts {missing:?} are in no group"));
+    }
+    Ok(())
+}
+
+/// Keeps the first fact of each group, in the original order, with the
+/// past fixes of its whole group.
+pub fn keep_representatives(checked: Vec<CheckedFact>, groups: &[Vec<String>]) -> Vec<CheckedFact> {
+    let mut group_of: HashMap<&str, &[String]> = HashMap::new();
+    for group in groups {
+        for id in group {
+            group_of.insert(id.as_str(), group.as_slice());
+        }
+    }
+    let mut fixes: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &checked {
+        if let Some(group) = group_of.get(c.fact.id.as_str()) {
+            let entry = fixes.entry(group[0].clone()).or_default();
+            for fix in &c.fact.from_history {
+                if !entry.contains(fix) {
+                    entry.push(fix.clone());
+                }
+            }
+        }
+    }
+    checked
+        .into_iter()
+        .filter(|c| {
+            group_of
+                .get(c.fact.id.as_str())
+                .is_none_or(|group| group[0] == c.fact.id)
+        })
+        .map(|mut c| {
+            if let Some(all) = fixes.remove(&c.fact.id) {
+                c.fact.from_history = all;
+            }
+            c
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Verify
 // ---------------------------------------------------------------------------
 
@@ -1402,6 +1537,61 @@ mod tests {
             open_questions: vec![],
         };
         assert!(validate_explore(&empty, &ids, &fixes).is_ok());
+    }
+
+    #[test]
+    fn test_dedup_groups_and_representatives() {
+        let ids = vec!["F1".to_string(), "F2".to_string(), "F3".to_string()];
+        let groups = DedupOutput {
+            groups: vec![
+                vec!["F2".to_string(), "F1".to_string()],
+                vec!["F3".to_string()],
+            ],
+        };
+        assert!(validate_groups(&groups, &ids).is_ok());
+        let missing = DedupOutput {
+            groups: vec![vec!["F2".to_string()]],
+        };
+        assert!(
+            validate_groups(&missing, &ids)
+                .unwrap_err()
+                .contains("no group")
+        );
+        let twice = DedupOutput {
+            groups: vec![vec![
+                "F1".to_string(),
+                "F2".to_string(),
+                "F3".to_string(),
+                "F1".to_string(),
+            ]],
+        };
+        assert!(
+            validate_groups(&twice, &ids)
+                .unwrap_err()
+                .contains("more than one")
+        );
+
+        let checked = |id: &str, fixes: &[&str]| {
+            let mut f = fact(id, &[], "x");
+            f.from_history = fixes.iter().map(|s| s.to_string()).collect();
+            CheckedFact {
+                component: "c".to_string(),
+                topic: "SYNC".to_string(),
+                fact: f,
+                evidence_checks: vec![],
+            }
+        };
+        let kept = keep_representatives(
+            vec![
+                checked("F1", &["aaa"]),
+                checked("F2", &[]),
+                checked("F3", &[]),
+            ],
+            &groups.groups,
+        );
+        let kept_ids: Vec<&str> = kept.iter().map(|c| c.fact.id.as_str()).collect();
+        assert_eq!(kept_ids, vec!["F2", "F3"]);
+        assert_eq!(kept[0].fact.from_history, vec!["aaa"]);
     }
 
     #[test]
