@@ -18,7 +18,7 @@
 //! an interrupted build resumes from the last finished step, and every LLM
 //! interaction is kept there for audit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -26,8 +26,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
+use crate::ai::AiRole;
 use crate::git_cmd;
 use crate::notes::agenda::Agenda;
+use crate::notes::agenda::Topic;
 use crate::notes::evidence::RevisionFiles;
 use crate::notes::facts::{FactVerdict, ReviewValue, VerdictKind, VerifiedFact};
 use crate::notes::history::{HistoryCase, unit_history};
@@ -35,14 +37,16 @@ use crate::notes::output::{ManifestFile, ManifestUnit, UnitFacts, write_unit};
 use crate::notes::plan::UnitPlan;
 use crate::notes::profile::HistoryConfig;
 use crate::notes::rule_comments::rule_comments;
+use crate::workflow::output::parse_json_from_text;
 use crate::workflow::{Workflow, WorkflowEngine, WorkflowEnv, WorkflowOutcome};
 use crate::workflows::code_notes::{
-    Applicability, CheckedFact, ComponentInput, EXPLORE_STAGE_NAMES, ExploreRecord, FileInput,
-    HISTORY_BATCH_SIZE, HISTORY_STAGE_NAMES, HISTORY_TOPIC_ID, HistoryInput, HistoryLesson,
-    LessonKind, NotesBuildState, PlacedLesson, SurveyOutput, VERIFY_BATCH_SIZE, VERIFY_STAGE_NAMES,
-    dedup_stage, explore_stage, history_stage, history_topic, keep_representatives, lessons_for,
-    neutralize_directives, parallel_workflow, renumber_facts, single_stage_workflow, survey_stage,
-    synthesize_stage, verdicts_by_id, verify_stage,
+    Applicability, CheckedFact, ComponentInput, EXPLORE_STAGE_NAMES, ExploreOutput, ExploreRecord,
+    FileInput, HISTORY_BATCH_SIZE, HISTORY_STAGE_NAMES, HISTORY_TOPIC_ID, HistoryInput,
+    HistoryLesson, LessonKind, MAX_FACTS_PER_STAGE, NotesBuildState, PlacedLesson, SurveyOutput,
+    VERIFY_BATCH_SIZE, VERIFY_STAGE_NAMES, check_fact, dedup_stage, explore_stage, ground_symbols,
+    history_stage, history_topic, keep_representatives, lessons_for, neutralize_directives,
+    parallel_workflow, renumber_facts, single_stage_workflow, survey_stage, synthesize_stage,
+    verdicts_by_id, verify_stage,
 };
 
 /// Rule comments shown to the explorers of one component.
@@ -92,6 +96,8 @@ pub struct UnitBuildSummary {
     pub history_cases: usize,
     pub history_lessons: usize,
     pub explore_stages: usize,
+    /// Explore stages that failed validation but kept their valid facts.
+    pub explore_salvaged: usize,
     pub facts_proposed: usize,
     pub evidence_failures: usize,
     /// Facts dropped as restatements of another fact's rule.
@@ -222,7 +228,29 @@ pub async fn build_unit(
                     .collect();
                 let workflow = parallel_workflow("notes_explore", built);
                 let step = format!("explore-round-{}", round + 1);
-                run_step(&workflow, env, &mut state, &work, &step, &mut summary.usage).await?;
+                let outcome =
+                    run_step(&workflow, env, &mut state, &work, &step, &mut summary.usage).await?;
+                // A stage that ran out of validation attempts still wrote
+                // facts; keep the ones that pass the rules on their own.
+                for ((component, topic, _), name) in chunk.iter().zip(EXPLORE_STAGE_NAMES) {
+                    let explored = state
+                        .explored
+                        .iter()
+                        .any(|r| r.component == component.name && r.topic == topic.id);
+                    if explored {
+                        continue;
+                    }
+                    let fix_ids = lessons_for(&lessons, &component.name, &topic.id)
+                        .into_iter()
+                        .map(|l| l.fix.clone())
+                        .collect();
+                    if let Some(record) =
+                        salvage_explore(&outcome, name, component, topic, &fix_ids)
+                    {
+                        summary.explore_salvaged += 1;
+                        state.explored.push(record);
+                    }
+                }
             }
             summary.explore_stages = stages.len();
             if state.explored.len() < stages.len() {
@@ -285,7 +313,7 @@ pub async fn build_unit(
             )
             .await
             {
-                Ok(()) => state.dedup.take().map(|d| d.groups).unwrap_or_default(),
+                Ok(_) => state.dedup.take().map(|d| d.groups).unwrap_or_default(),
                 Err(err) => {
                     warn!("{}: dedup failed, verifying every fact: {err:#}", unit.name);
                     Vec::new()
@@ -368,7 +396,7 @@ pub async fn build_unit(
                 )
                 .await
                 {
-                    Ok(()) => state
+                    Ok(_) => state
                         .note
                         .clone()
                         .context("the synthesize stage produced no note")?,
@@ -562,7 +590,45 @@ fn component_inputs(unit: &UnitPlan) -> Vec<ComponentInput> {
         .collect()
 }
 
-/// Runs one step's workflow and keeps its full LLM history for audit.
+/// The facts of a failed explore stage's last answer that pass the fact
+/// rules on their own, or None when nothing usable is left.
+fn salvage_explore(
+    outcome: &WorkflowOutcome,
+    stage: &str,
+    component: &ComponentInput,
+    topic: &Topic,
+    fix_ids: &HashSet<String>,
+) -> Option<ExploreRecord> {
+    let run = outcome.stage_runs.iter().find(|r| r.name == stage)?;
+    let messages = outcome.history.get(run.history_start..run.history_end)?;
+    let text = messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == AiRole::Assistant)
+        .find_map(|m| m.content.as_deref().filter(|c| !c.trim().is_empty()))?;
+    let mut output: ExploreOutput = parse_json_from_text(text).ok()?;
+    let question_ids: HashSet<String> = topic.questions.iter().map(|q| q.id.clone()).collect();
+    let mut ids = HashSet::new();
+    output
+        .facts
+        .retain(|f| check_fact(f, &question_ids, fix_ids).is_ok() && ids.insert(f.id.clone()));
+    output.facts.truncate(MAX_FACTS_PER_STAGE);
+    if output.facts.is_empty() {
+        return None;
+    }
+    output.facts.iter_mut().for_each(ground_symbols);
+    output
+        .dismissed_hypotheses
+        .retain(|d| !d.statement.trim().is_empty() && !d.reason.trim().is_empty());
+    Some(ExploreRecord {
+        component: component.name.clone(),
+        topic: topic.id.clone(),
+        output,
+    })
+}
+
+/// Runs one step's workflow, keeps its full LLM history for audit, and
+/// returns its outcome.
 async fn run_step(
     workflow: &Workflow<NotesBuildState>,
     env: &WorkflowEnv<'_>,
@@ -570,7 +636,7 @@ async fn run_step(
     work: &Path,
     step: &str,
     usage: &mut Usage,
-) -> Result<()> {
+) -> Result<WorkflowOutcome> {
     info!("{}: running {step}", state.unit);
     let result = WorkflowEngine::execute(workflow, env, state, None).await;
     let outcome = match result {
@@ -585,7 +651,7 @@ async fn run_step(
     usage.add(&outcome);
     save_step(work, &format!("{step}.history"), &outcome.history)?;
     save_step(work, &format!("{step}.stages"), &outcome.stage_runs)?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Confirmed verdicts whose own evidence all fails the deterministic check
@@ -936,6 +1002,73 @@ mod tests {
             .map(|v| v.fact.id.as_str())
             .collect();
         assert_eq!(noted, vec!["F1"]);
+    }
+
+    #[test]
+    fn test_salvage_explore_keeps_valid_facts() {
+        use crate::ai::AiMessage;
+        use crate::notes::agenda::Question;
+        use crate::workflow::StageRunRecord;
+        let fact = |id: &str, violated_by: &str| {
+            serde_json::json!({
+                "id": id, "kind": "Invariant", "statement": "s", "violated_by": violated_by,
+                "basis": {"kind": "comment", "detail": "d"},
+                "scope": {"files": [], "symbols": ["ghost"]},
+                "evidence": [{"path": "a.c", "start_line": 1, "end_line": 2, "snippet": "x"}],
+                "questions": ["SYNC-1"]
+            })
+        };
+        let answer = serde_json::json!({"facts": [fact("F1", "p"), fact("F2", "")]});
+        let message = |role: AiRole, content: &str| AiMessage {
+            role,
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let outcome = WorkflowOutcome {
+            history: vec![
+                message(AiRole::User, "explore"),
+                message(AiRole::Assistant, &answer.to_string()),
+                message(AiRole::User, "rejected"),
+            ],
+            stage_runs: vec![StageRunRecord {
+                name: "explore-2".to_string(),
+                skipped: false,
+                turns: 2,
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+                prompts_read: vec![],
+                history_start: 0,
+                history_end: 3,
+            }],
+            ..Default::default()
+        };
+        let component = ComponentInput {
+            name: "c".to_string(),
+            files: vec![],
+            entry_points: vec![],
+            rule_comments: vec![],
+        };
+        let topic = Topic {
+            id: "SYNC".to_string(),
+            title: "sync".to_string(),
+            module: "universal".to_string(),
+            questions: vec![Question {
+                id: "SYNC-1".to_string(),
+                text: "q".to_string(),
+            }],
+        };
+        let record =
+            salvage_explore(&outcome, "explore-2", &component, &topic, &HashSet::new()).unwrap();
+        assert_eq!(record.output.facts.len(), 1);
+        assert_eq!(record.output.facts[0].id, "F1");
+        assert!(record.output.facts[0].scope.symbols.is_empty());
+        assert!(
+            salvage_explore(&outcome, "explore-1", &component, &topic, &HashSet::new()).is_none()
+        );
     }
 
     #[test]

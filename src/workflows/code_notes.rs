@@ -853,7 +853,7 @@ pub fn validate_explore(
 }
 
 /// The first problem with one fact, if any.
-fn check_fact(
+pub fn check_fact(
     fact: &Fact,
     question_ids: &HashSet<String>,
     fix_ids: &HashSet<String>,
