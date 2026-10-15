@@ -30,7 +30,11 @@ use crate::notes::profile::{CompiledLanguages, Language};
 pub struct SourceFile {
     pub path: String,
     pub language: Language,
+    /// Lines of production code: the whole file, except that a trailing
+    /// inline test module (Rust `#[cfg(test)]`) is counted in `test_lines`
+    /// instead.
     pub lines: usize,
+    pub test_lines: usize,
 }
 
 /// Resolves `rev` to a full commit SHA. A revision starting with `-` is
@@ -73,9 +77,20 @@ pub async fn list_source_files(
                 path,
                 language,
                 lines,
+                test_lines: 0,
             })
         })
         .collect();
+    if files.iter().any(|f| f.language == Language::Rust) {
+        let boundaries = rust_test_boundaries(repo, sha).await?;
+        for file in files.iter_mut().filter(|f| f.language == Language::Rust) {
+            if let Some(first_test_line) = boundaries.get(&file.path) {
+                let production = first_test_line.saturating_sub(1).min(file.lines);
+                file.test_lines = file.lines - production;
+                file.lines = production;
+            }
+        }
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
@@ -116,6 +131,52 @@ async fn count_lines(repo: &Path, sha: &str) -> Result<HashMap<String, usize>> {
         );
     }
     parse_count_output(&output.stdout, sha)
+}
+
+/// Finds, per Rust file at `sha`, the first line of a top-level inline test
+/// module (`#[cfg(test)]` or `#[cfg(all(test, ...))]` at column 0). By
+/// convention such modules close the file, so everything from that line on
+/// is test code.
+async fn rust_test_boundaries(repo: &Path, sha: &str) -> Result<HashMap<String, usize>> {
+    let output = git_cmd::in_dir_async(repo)
+        .args([
+            "grep",
+            "-n",
+            "-I",
+            "--null",
+            "-E",
+            "-e",
+            r"^#\[cfg\((all\()?test[,)]",
+            sha,
+            "--",
+            "*.rs",
+        ])
+        .output()
+        .await
+        .context("failed to run git grep")?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!(
+            "git grep for Rust test modules failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let prefix = format!("{sha}:");
+    let mut boundaries: HashMap<String, usize> = HashMap::new();
+    for record in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = record.splitn(3, '\0');
+        let (Some(name), Some(line)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(line) = line.parse::<usize>() else {
+            continue;
+        };
+        let path = name.strip_prefix(&prefix).unwrap_or(name).to_string();
+        boundaries
+            .entry(path)
+            .and_modify(|first| *first = (*first).min(line))
+            .or_insert(line);
+    }
+    Ok(boundaries)
 }
 
 /// Parses `git grep --count --null` output: `<sha>:<path>\0<count>\n` per
@@ -199,6 +260,14 @@ mod tests {
             dir.path(),
             &[
                 ("src/main.rs", "fn main() {}\n\n// end\n"),
+                (
+                    "src/lib.rs",
+                    "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n",
+                ),
+                (
+                    "src/db.rs",
+                    "pub fn g() {}\n\n#[cfg(all(test, feature = \"server\"))]\nmod tests {}\n",
+                ),
                 ("src/gen/table.rs", "// generated\n"),
                 ("lib/util.c", "int x;\n"),
                 ("lib/empty.h", ""),
@@ -213,16 +282,18 @@ mod tests {
         let files = list_source_files(dir.path(), &sha, &languages())
             .await
             .unwrap();
-        let summary: Vec<(&str, Language, usize)> = files
+        let summary: Vec<(&str, Language, usize, usize)> = files
             .iter()
-            .map(|f| (f.path.as_str(), f.language, f.lines))
+            .map(|f| (f.path.as_str(), f.language, f.lines, f.test_lines))
             .collect();
         assert_eq!(
             summary,
             vec![
-                ("lib/empty.h", Language::C, 0),
-                ("lib/util.c", Language::C, 1),
-                ("src/main.rs", Language::Rust, 3),
+                ("lib/empty.h", Language::C, 0, 0),
+                ("lib/util.c", Language::C, 1, 0),
+                ("src/db.rs", Language::Rust, 2, 2),
+                ("src/lib.rs", Language::Rust, 1, 4),
+                ("src/main.rs", Language::Rust, 3, 0),
             ]
         );
     }

@@ -224,6 +224,7 @@ mod tests {
             path: path.to_string(),
             language: Language::Rust,
             lines,
+            test_lines: 0,
         }
     }
 

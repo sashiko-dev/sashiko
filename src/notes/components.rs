@@ -179,6 +179,7 @@ mod tests {
                     path: path.to_string(),
                     language: Language::Rust,
                     lines: *lines,
+                    test_lines: 0,
                 })
                 .collect(),
             shared: Vec::new(),
