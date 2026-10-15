@@ -22,15 +22,95 @@ async fn postgres_daemon_storage_roundtrip() -> Result<()> {
     // A configured PostgreSQL client must ignore the legacy libSQL URL.
     configured.database.url = ":memory:".into();
     let db = Database::configured(&configured).await?;
-    let result = std::panic::AssertUnwindSafe(exercise_daemon(&db))
-        .catch_unwind()
-        .await;
+    let result = std::panic::AssertUnwindSafe(async {
+        exercise_daemon(&db).await?;
+        exercise_connection_recovery(&db, &configured.storage).await
+    })
+    .catch_unwind()
+    .await;
     db.execute_batch(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
         .await?;
     match result {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+async fn postgres_control(settings: &StorageSettings) -> Result<tokio_postgres::Client> {
+    let mut config: tokio_postgres::Config = settings.postgres_url.as_ref().unwrap().parse()?;
+    config.ssl_mode(tokio_postgres::config::SslMode::Require);
+    let tls = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()?;
+    let (client, driver) = config
+        .connect(postgres_native_tls::MakeTlsConnector::new(tls))
+        .await?;
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    Ok(client)
+}
+
+async fn backend_pid(conn: &sashiko::storage::Connection) -> Result<i32> {
+    let mut rows = conn.query("SELECT pg_backend_pid()", ()).await?;
+    Ok(i32::try_from(
+        rows.next().await?.context("backend PID")?.get::<i64>(0)?,
+    )?)
+}
+
+async fn exercise_connection_recovery(db: &Database, settings: &StorageSettings) -> Result<()> {
+    let control = postgres_control(settings).await?;
+    let prior = backend_pid(&db.conn).await?;
+    control
+        .query_one("SELECT pg_terminate_backend($1,5000)", &[&prior])
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(current) = backend_pid(&db.conn).await {
+                assert_ne!(current, prior);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("regular PostgreSQL session did not recover")?;
+
+    // Dedicated transactions must fail after losing their session. Reopening
+    // here would execute a write outside the original transaction.
+    let tx = db.begin_transaction().await?;
+    let pid = backend_pid(&tx).await?;
+    control
+        .query_one("SELECT pg_terminate_backend($1,5000)", &[&pid])
+        .await?;
+    assert!(
+        tx.execute("UPDATE bugs SET title='uncommitted reconnect write'", ())
+            .await
+            .is_err()
+    );
+    drop(tx);
+    let (bugs, _) = db.list_bugs(ListBugsParams::default()).await?;
+    assert!(
+        bugs.iter()
+            .all(|bug| bug.title != "uncommitted reconnect write")
+    );
+
+    // A lost lock session must also stay failed rather than silently replacing
+    // the connection with one that does not own the advisory lock.
+    let guard = db
+        .lock_bug_dedup()
+        .await?
+        .context("PostgreSQL dedup guard")?;
+    let pid = backend_pid(&guard).await?;
+    control
+        .query_one("SELECT pg_terminate_backend($1,5000)", &[&pid])
+        .await?;
+    assert!(backend_pid(&guard).await.is_err());
+    drop(guard);
+    let guard = db.lock_bug_dedup().await?;
+    drop(guard);
+    Ok(())
 }
 
 async fn exercise_daemon(db: &Database) -> Result<()> {

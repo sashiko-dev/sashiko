@@ -31,6 +31,8 @@ pub enum Error {
     Libsql(#[from] libsql::Error),
     #[error("PostgreSQL operation failed: {0}")]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("could not reconnect PostgreSQL session: {0}")]
+    Reconnect(#[source] anyhow::Error),
     #[error("invalid database value: {0}")]
     Value(String),
 }
@@ -47,8 +49,30 @@ pub struct PgConfig {
 struct PgConnection {
     client: Mutex<tokio_postgres::Client>,
     config: PgConfig,
-    transaction: bool,
+    session: PgSession,
     active: AtomicBool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PgSession {
+    Regular,
+    Transaction,
+    DedupLock,
+}
+
+impl PgConnection {
+    async fn client(&self) -> Result<tokio::sync::MutexGuard<'_, tokio_postgres::Client>> {
+        let mut client = self.client.lock().await;
+        if self.session == PgSession::Regular && client.is_closed() {
+            let replacement = Connection::connect_postgres(self.config.clone(), PgSession::Regular)
+                .await
+                .map_err(Error::Reconnect)?;
+            if let Backend::Postgres(replacement) = replacement.0 {
+                std::mem::swap(&mut *client, &mut *replacement.client.lock().await);
+            }
+        }
+        Ok(client)
+    }
 }
 
 #[derive(Clone)]
@@ -76,7 +100,7 @@ impl Connection {
     }
 
     pub async fn postgres(config: PgConfig) -> anyhow::Result<Self> {
-        Self::connect_postgres(config, false).await
+        Self::connect_postgres(config, PgSession::Regular).await
     }
 
     /// Hold a PostgreSQL session lock while canonical bug decisions are made.
@@ -85,7 +109,7 @@ impl Connection {
         let Backend::Postgres(connection) = &self.0 else {
             return Ok(None);
         };
-        let conn = Self::connect_postgres(connection.config.clone(), false).await?;
+        let conn = Self::connect_postgres(connection.config.clone(), PgSession::DedupLock).await?;
         if let Backend::Postgres(connection) = &conn.0 {
             connection
                 .client
@@ -97,7 +121,8 @@ impl Connection {
         Ok(Some(conn))
     }
 
-    async fn connect_postgres(config: PgConfig, transaction: bool) -> anyhow::Result<Self> {
+    async fn connect_postgres(config: PgConfig, session: PgSession) -> anyhow::Result<Self> {
+        let transaction = session == PgSession::Transaction;
         anyhow::ensure!(
             !config.schema.is_empty()
                 && config.schema.len() <= 63
@@ -127,8 +152,16 @@ impl Connection {
             let tx = client.transaction().await?;
             tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&WRITE_LOCK])
                 .await?;
-            tx.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
-                .await?;
+            let exists: bool = tx
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1)",
+                    &[&config.schema],
+                )
+                .await?
+                .get(0);
+            if !exists {
+                tx.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
+            }
             tx.commit().await?;
         }
         client
@@ -143,7 +176,7 @@ impl Connection {
         Ok(Self(Backend::Postgres(Arc::new(PgConnection {
             client: Mutex::new(client),
             config,
-            transaction,
+            session,
             active: AtomicBool::new(transaction),
         }))))
     }
@@ -154,8 +187,8 @@ impl Connection {
             Backend::Postgres(conn) => {
                 let params = positional(params)?;
                 let sql = placeholders(sql)?;
-                let mut client = conn.client.lock().await;
-                let values = if conn.transaction {
+                let mut client = conn.client().await?;
+                let values = if conn.session == PgSession::Transaction {
                     pg_query(&*client, &sql, params).await?
                 } else {
                     let tx = client.transaction().await?;
@@ -176,7 +209,7 @@ impl Connection {
             Backend::Postgres(conn) => {
                 let params = positional(params)?;
                 let sql = placeholders(sql)?;
-                let mut client = conn.client.lock().await;
+                let mut client = conn.client().await?;
                 let control = matches!(
                     sql.trim()
                         .trim_end_matches(';')
@@ -189,7 +222,7 @@ impl Connection {
                     conn.active.store(false, Ordering::Release);
                     return Ok(0);
                 }
-                if conn.transaction {
+                if conn.session == PgSession::Transaction {
                     pg_execute(&*client, &sql, params).await
                 } else {
                     let tx = client.transaction().await?;
@@ -209,8 +242,8 @@ impl Connection {
                 conn.execute_batch(sql).await?;
             }
             Backend::Postgres(conn) => {
-                let mut client = conn.client.lock().await;
-                if conn.transaction {
+                let mut client = conn.client().await?;
+                if conn.session == PgSession::Transaction {
                     client.batch_execute(sql).await?;
                 } else {
                     let tx = client.transaction().await?;
@@ -238,7 +271,7 @@ impl Connection {
                 })
             }
             Backend::Postgres(conn) => Ok(Transaction {
-                conn: Self::connect_postgres(conn.config.clone(), true).await?,
+                conn: Self::connect_postgres(conn.config.clone(), PgSession::Transaction).await?,
                 native: None,
             }),
         }
