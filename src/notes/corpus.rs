@@ -219,6 +219,54 @@ async fn resolve_commit(repo: &Path, id: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Name of the file recording which corpus a directory holds.
+const META_FILE: &str = "corpus-meta.json";
+
+/// Which fixes a corpus directory holds. Every shard of one corpus must
+/// agree, so shards of different corpora never mix in one directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusMeta {
+    pub revision: String,
+    pub fix_patterns: Vec<String>,
+    pub limit: Option<usize>,
+    pub sample: Option<usize>,
+    pub seed: String,
+}
+
+impl CorpusMeta {
+    /// The metadata in `dir`, if any.
+    pub fn load(dir: &Path) -> Result<Option<Self>> {
+        let path = dir.join(META_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&text).with_context(|| {
+            format!("failed to parse {}", path.display())
+        })?))
+    }
+
+    /// Records this corpus in `dir`, or checks that `dir` already holds
+    /// the same one.
+    pub fn claim(&self, dir: &Path) -> Result<()> {
+        if let Some(existing) = Self::load(dir)? {
+            if &existing != self {
+                bail!(
+                    "{} holds another corpus ({existing:?}); use a different --out",
+                    dir.display()
+                );
+            }
+            return Ok(());
+        }
+        let tmp = dir.join(format!("{META_FILE}.{}", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, dir.join(META_FILE))
+            .with_context(|| format!("failed to record the corpus in {}", dir.display()))
+    }
+}
+
 /// One analyzed case as stored in a corpus file (one JSON object per
 /// line). The diff is not kept; it can be read again from the fix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +543,27 @@ mod tests {
         again[0].fix = a.clone();
         append_records(&path, &again).unwrap();
         assert_eq!(read_done(&path).unwrap(), HashSet::from([a, b]));
+    }
+
+    #[test]
+    fn test_corpus_meta_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = CorpusMeta {
+            revision: "abc".to_string(),
+            fix_patterns: vec!["^Fixes: ".to_string()],
+            limit: Some(10),
+            sample: None,
+            seed: "s".to_string(),
+        };
+        assert!(CorpusMeta::load(dir.path()).unwrap().is_none());
+        meta.claim(dir.path()).unwrap();
+        meta.claim(dir.path()).unwrap();
+        assert_eq!(CorpusMeta::load(dir.path()).unwrap(), Some(meta.clone()));
+        let other = CorpusMeta {
+            revision: "def".to_string(),
+            ..meta
+        };
+        assert!(format!("{:#}", other.claim(dir.path()).unwrap_err()).contains("another corpus"));
     }
 
     #[test]

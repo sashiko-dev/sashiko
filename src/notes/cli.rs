@@ -278,6 +278,14 @@ pub async fn run(
             let fixes = corpus::shard(&fixes, index, count);
             std::fs::create_dir_all(out)
                 .with_context(|| format!("failed to create {}", out.display()))?;
+            corpus::CorpusMeta {
+                revision: sha.clone(),
+                fix_patterns: profile.history.fix_patterns.clone(),
+                limit: *limit,
+                sample: *sample,
+                seed: seed.clone(),
+            }
+            .claim(out)?;
             let env = llm_env(settings, repo, prompts_dir, &sha).await?;
             let cfg = corpus::CorpusConfig {
                 project: project.display_name().to_string(),
