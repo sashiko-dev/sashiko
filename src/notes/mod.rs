@@ -19,3 +19,4 @@
 pub mod profile;
 pub mod scope;
 pub mod units;
+pub mod components;
