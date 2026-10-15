@@ -5,6 +5,9 @@ DECLARE
     previous JSONB;
     current_value JSONB;
     payload JSONB;
+    summary TEXT;
+    before_text TEXT;
+    after_text TEXT;
 BEGIN
     IF TG_OP = 'INSERT' THEN
         INSERT INTO bug_enrichments
@@ -18,11 +21,26 @@ BEGIN
             current_value := to_jsonb(NEW) -> field_name;
             IF previous IS DISTINCT FROM current_value THEN
                 payload := jsonb_build_object('field', field_name, 'old', previous, 'new', current_value);
+                before_text := coalesce(previous #>> '{}', 'null');
+                after_text := coalesce(current_value #>> '{}', 'null');
+                summary := CASE field_name
+                    WHEN 'lifecycle_status' THEN
+                        'Status changed from "' || before_text || '" to "' || after_text || '"'
+                    WHEN 'assignee' THEN CASE
+                        WHEN NEW.assignee IS NULL THEN 'Unassigned from ' || OLD.assignee
+                        WHEN OLD.assignee IS NULL THEN 'Assigned to ' || NEW.assignee
+                        ELSE 'Reassigned from ' || OLD.assignee || ' to ' || NEW.assignee
+                    END
+                    ELSE 'Field "' || field_name || '" changed from "'
+                        || CASE WHEN field_name = 'title' THEN left(before_text, 50) ELSE before_text END
+                        || '" to "'
+                        || CASE WHEN field_name = 'title' THEN left(after_text, 50) ELSE after_text END || '"'
+                END;
                 INSERT INTO bug_enrichments
                     (bug_id, kind, tool, model, author, created_at, content, data_json)
                 VALUES (NEW.id, 'audit', NEW.audit_tool, NEW.audit_model,
                     NEW.audit_author, extract(epoch from now())::bigint,
-                    convert_to('Field "' || field_name || '" changed', 'UTF8'), payload::text);
+                    convert_to(summary, 'UTF8'), payload::text);
             END IF;
         END LOOP;
     END IF;
@@ -38,6 +56,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
     parent bugs%ROWTYPE;
     payload JSONB;
+    summary TEXT;
 BEGIN
     IF TG_OP = 'UPDATE' AND OLD.source = NEW.source THEN
         RETURN NEW;
@@ -45,15 +64,18 @@ BEGIN
     SELECT * INTO parent FROM bugs WHERE id = NEW.bug_id;
     IF TG_OP = 'INSERT' THEN
         payload := jsonb_build_object('action', 'subsystem_added', 'subsystem', NEW.subsystem);
+        summary := 'Subsystem "' || NEW.subsystem || '" added';
     ELSE
         payload := jsonb_build_object('action', 'subsystem_reattributed',
             'subsystem', NEW.subsystem, 'old', OLD.source, 'new', NEW.source);
+        summary := 'Subsystem "' || NEW.subsystem || '" reattributed from '
+            || OLD.source || ' to ' || NEW.source;
     END IF;
     INSERT INTO bug_enrichments
         (bug_id, kind, tool, model, author, created_at, content, data_json)
     VALUES (NEW.bug_id, 'audit', parent.audit_tool, parent.audit_model,
         parent.audit_author, extract(epoch from now())::bigint,
-        convert_to('Subsystem "' || NEW.subsystem || '" updated', 'UTF8'), payload::text);
+        convert_to(summary, 'UTF8'), payload::text);
     RETURN NEW;
 END
 $$;

@@ -3626,7 +3626,7 @@ impl Database {
         tx.execute(
             "UPDATE bugs
                     SET assignee = ?1,
-                        assigned_at = CASE WHEN ?1 IS NULL THEN NULL ELSE ?2 END,
+                        assigned_at = CASE WHEN CAST(?1 AS TEXT) IS NULL THEN NULL ELSE CAST(?2 AS BIGINT) END,
                         updated_at = ?2,
                         audit_author = ?3,
                         audit_tool = ?4,

@@ -263,6 +263,31 @@ async fn exercise_daemon(db: &Database) -> Result<()> {
     assert!(db.list_bugs_for_review(review).await?[0].1);
     db.set_bug_lifecycle_status(bug, BugLifecycleStatus::Open)
         .await?;
+    db.update_bug_title(bug, "storage: confirmed transaction")
+        .await?;
+    for assignee in [Some("alice"), Some("bob"), None] {
+        assert!(
+            db.assign_bug(bug, assignee, None, None)
+                .await
+                .with_context(|| format!("assign PostgreSQL bug to {assignee:?}"))?
+        );
+    }
+    let history = db.get_bug_enrichments(bug).await?;
+    for expected in [
+        "Status changed from \"new\" to \"open\"",
+        "Field \"title\" changed from \"storage: candidate transaction\" to \"storage: confirmed transaction\"",
+        "Assigned to alice",
+        "Reassigned from alice to bob",
+        "Unassigned from bob",
+        "Subsystem \"ÄTHERNET DRIVER\" added",
+    ] {
+        assert!(
+            history
+                .iter()
+                .any(|event| event.kind == "audit" && event.content.as_deref() == Some(expected)),
+            "missing audit summary: {expected}"
+        );
+    }
     db.add_bug_enrichment(
         bug,
         &NewBugEnrichment {
@@ -298,6 +323,15 @@ async fn exercise_daemon(db: &Database) -> Result<()> {
             ..Default::default()
         })
         .await?
+    );
+    let expected = format!("Field \"duplicate_of_id\" changed from \"null\" to \"{bug}\"");
+    assert!(
+        db.get_bug_enrichments(duplicate_id)
+            .await?
+            .iter()
+            .any(|event| {
+                event.kind == "audit" && event.content.as_deref() == Some(expected.as_str())
+            })
     );
     let (bugs, total) = db
         .list_bugs(ListBugsParams {
