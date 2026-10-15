@@ -17,3 +17,4 @@
 //! `designs/DESIGN_CODE_NOTES_ENGINE.md`.
 
 pub mod profile;
+pub mod scope;
