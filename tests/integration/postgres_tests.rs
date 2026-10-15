@@ -84,7 +84,8 @@ async fn exercise_daemon(db: &Database) -> Result<()> {
         "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()),
         "title": "storage: candidate transaction",
         "discovered_in_patchset_id": patchset,
-        "discovered_in_patch_id": patch
+        "discovered_in_patch_id": patch,
+        "subsystems": [{"name": "ÄTHERNET DRIVER", "source": "maintainers_section"}]
     }))?;
     let bug = db
         .create_bug_with_enrichment(
@@ -101,6 +102,25 @@ async fn exercise_daemon(db: &Database) -> Result<()> {
     let loaded = db.get_bug(bug).await?.context("stored bug")?;
     assert_eq!(loaded.bugid, new_bug.bugid);
     assert!(loaded.enrichments.iter().any(|e| e.kind == "candidate" && e.content.as_deref() == Some(&"evidence".repeat(500))));
+    for (scope, expected) in [("ÄTHERNET driver", 1), ("äTHERNET driver", 0)] {
+        let scope = vec![scope.to_string()];
+        let (_, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: sashiko::db::BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total, expected);
+        assert_eq!(
+            db.get_subsystems_bug_counts(
+                Some(BugLifecycleStatus::New),
+                sashiko::db::BugVisibility::Sections(&scope)
+            )
+            .await?
+            .len(),
+            expected
+        );
+    }
     let claim = db
         .claim_pending_bug("postgres-test", 60, 3)
         .await?

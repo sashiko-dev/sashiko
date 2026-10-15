@@ -4591,6 +4591,18 @@ impl Database {
         Ok(())
     }
 
+    fn maintainer_section_fold_sql(&self) -> &'static str {
+        // Authorization and SQLite NOCASE fold ASCII only. Preserve distinct
+        // section names that differ in non-ASCII characters on both backends.
+        self.conn.sql(
+            "lower(subsystem)",
+            concat!(
+                "translate(subsystem, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', ",
+                "'abcdefghijklmnopqrstuvwxyz')"
+            ),
+        )
+    }
+
     pub async fn list_bugs(&self, params: ListBugsParams<'_>) -> Result<(Vec<Bug>, usize)> {
         let limit_val = params.limit.unwrap_or(50) as i64;
         let page_val = params.page.unwrap_or(1) as i64;
@@ -4612,17 +4624,18 @@ impl Database {
                 return Ok((Vec::new(), 0));
             }
             let placeholders = vec!["?"; titles.len()].join(", ");
+            let fold = self.maintainer_section_fold_sql();
             conditions.push(
                 format!(
                     "id IN (SELECT bug_id FROM bug_subsystems
-                            WHERE source = '{}' AND lower(subsystem) IN ({}))",
+                            WHERE source = '{}' AND {fold} IN ({}))",
                     SubsystemSource::MaintainersSection.as_str(),
                     placeholders
                 )
                 .into(),
             );
             for title in titles {
-                query_params.push(libsql::Value::Text(title.to_lowercase()));
+                query_params.push(libsql::Value::Text(title.to_ascii_lowercase()));
             }
         }
 
@@ -4880,12 +4893,13 @@ impl Database {
                     return Ok(Vec::new());
                 }
                 let placeholders = vec!["?"; titles.len()].join(", ");
+                let fold = self.maintainer_section_fold_sql();
                 for title in &titles {
-                    params.push(libsql::Value::Text(title.to_lowercase()));
+                    params.push(libsql::Value::Text(title.to_ascii_lowercase()));
                 }
                 format!(
                     " AND b.id IN (SELECT bug_id FROM bug_subsystems
-                                   WHERE source = '{}' AND lower(subsystem) IN ({}))",
+                                   WHERE source = '{}' AND {fold} IN ({}))",
                     SubsystemSource::MaintainersSection.as_str(),
                     placeholders
                 )
@@ -10943,6 +10957,40 @@ mod tests {
             .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::Unrestricted)
             .await?;
         assert_eq!(counts.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_scope_preserves_non_ascii_section_names() -> Result<()> {
+        let db = setup_db().await;
+        let title = "ÄTHERNET DRIVER";
+        let mut bug: NewBug = serde_json::from_value(json!({
+            "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()),
+            "title": "Unicode section visibility"
+        }))?;
+        bug.subsystems = vec![AttributedSubsystem::from_maintainers(title)];
+        let id = db.create_bug(&bug).await?;
+        for (scope, expected) in [("ÄTHERNET driver", 1), ("äTHERNET driver", 0)] {
+            let scope = vec![scope.to_string()];
+            let (items, total) = db
+                .list_bugs(ListBugsParams {
+                    visibility: BugVisibility::Sections(&scope),
+                    ..Default::default()
+                })
+                .await?;
+            assert_eq!(total, expected);
+            assert!(items.iter().all(|bug| bug.id == id));
+            let counts = db
+                .get_subsystems_bug_counts(
+                    Some(BugLifecycleStatus::New),
+                    BugVisibility::Sections(&scope),
+                )
+                .await?;
+            assert_eq!(counts.len(), expected);
+            if expected != 0 {
+                assert_eq!(counts, vec![(title.to_string(), 1)]);
+            }
+        }
         Ok(())
     }
 
