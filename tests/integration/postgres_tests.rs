@@ -381,5 +381,94 @@ async fn exercise_shared(
     resumed.sync_shared_bugs().await?;
     second.sync_shared_bugs().await?;
     assert!(second.get_bug_by_bugid(&pending.bugid).await?.is_some());
+    exercise_shared_duplicate_races(first, second).await?;
+    Ok(())
+}
+
+async fn shared_report(db: &Database, title: &str) -> Result<(i64, String)> {
+    let bugid = format!("sashiko-{}", uuid::Uuid::new_v4());
+    let bug: NewBug = serde_json::from_value(json!({
+        "bugid": bugid, "title": title,
+        "pipeline_state": "succeeded", "lifecycle_status": "open"
+    }))?;
+    Ok((db.create_bug(&bug).await?, bugid))
+}
+
+async fn exercise_shared_duplicate_races(first: &Database, second: &Database) -> Result<()> {
+    let (source, source_public) = shared_report(first, "acknowledgement source").await?;
+    first.sync_shared_bugs().await?;
+    second.sync_shared_bugs().await?;
+    let source_mirror = second.get_bug_by_bugid(&source_public).await?.unwrap();
+    let (target, target_public) = shared_report(second, "new remote target").await?;
+    second.sync_shared_bugs().await?;
+    second
+        .mark_bug_as_duplicate(sashiko::db::MarkDuplicateBugParams {
+            ephemeral_id: source_mirror.id,
+            canonical_id: target,
+            reasoning: "new shared target",
+            ..Default::default()
+        })
+        .await?;
+    second.sync_shared_bugs().await?;
+    first
+        .add_bug_enrichment(
+            source,
+            &NewBugEnrichment {
+                kind: "comment".into(),
+                content: Some("concurrent source comment".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    // Publishing the dirty source merges a target this mirror has not pulled.
+    first.sync_shared_bugs().await?;
+    let imported_target = first.get_bug_by_bugid(&target_public).await?.unwrap();
+    let loaded = first.get_bug(source).await?.unwrap();
+    assert_eq!(loaded.duplicate_of_id, Some(imported_target.id));
+    assert!(
+        loaded
+            .enrichments
+            .iter()
+            .any(|e| e.content.as_deref() == Some("concurrent source comment"))
+    );
+
+    let (left, left_public) = shared_report(first, "left concurrent decision").await?;
+    let (right, right_public) = shared_report(first, "right concurrent decision").await?;
+    first.sync_shared_bugs().await?;
+    second.sync_shared_bugs().await?;
+    let mirror_left = second.get_bug_by_bugid(&left_public).await?.unwrap();
+    let mirror_right = second.get_bug_by_bugid(&right_public).await?.unwrap();
+    first
+        .mark_bug_as_duplicate(sashiko::db::MarkDuplicateBugParams {
+            ephemeral_id: left,
+            canonical_id: right,
+            reasoning: "first decision",
+            ..Default::default()
+        })
+        .await?;
+    second
+        .mark_bug_as_duplicate(sashiko::db::MarkDuplicateBugParams {
+            ephemeral_id: mirror_right.id,
+            canonical_id: mirror_left.id,
+            reasoning: "reciprocal decision",
+            ..Default::default()
+        })
+        .await?;
+    first.sync_shared_bugs().await?;
+    second.sync_shared_bugs().await?;
+    first.sync_shared_bugs().await?;
+    for db in [first, second] {
+        let left = db.get_bug_by_bugid(&left_public).await?.unwrap();
+        let right = db.get_bug_by_bugid(&right_public).await?.unwrap();
+        assert_eq!(left.duplicate_of_id, Some(right.id));
+        assert_eq!(right.lifecycle_status, BugLifecycleStatus::Open);
+        assert!(right.duplicate_of_id.is_none());
+        assert!(
+            right
+                .enrichments
+                .iter()
+                .any(|event| event.kind == "sync_conflict")
+        );
+    }
     Ok(())
 }

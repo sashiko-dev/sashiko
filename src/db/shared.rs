@@ -81,6 +81,60 @@ struct MergeConflict {
     shared: Option<serde_json::Value>,
 }
 
+enum DuplicateChain {
+    Valid,
+    Unpublished,
+    Cycle,
+}
+
+async fn shared_duplicate_chain(
+    conn: &crate::storage::Connection,
+    project: &str,
+    record: &Record,
+) -> Result<DuplicateChain> {
+    let mut target = record.triage.duplicate_of.clone();
+    let mut visited = BTreeSet::from([record.bugid.clone()]);
+    while let Some(bugid) = target {
+        if !visited.insert(bugid.clone()) {
+            return Ok(DuplicateChain::Cycle);
+        }
+        let mut rows = conn
+            .query(
+                "SELECT payload::jsonb #>> '{triage,duplicate_of}'
+             FROM shared_bug_records WHERE project=? AND bugid=?",
+                libsql::params![project, bugid],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(DuplicateChain::Unpublished);
+        };
+        target = row.get(0)?;
+    }
+    Ok(DuplicateChain::Valid)
+}
+
+impl Record {
+    fn add_conflict(&mut self, conflict: MergeConflict, version: i64, instance: &str) {
+        let field = conflict.field;
+        let key = format!("conflict:{instance}:{}:{version}:{field}", self.bugid);
+        self.events.entry(key).or_insert_with(|| Event {
+            kind: "sync_conflict".into(),
+            tool: "shared_catalog".into(),
+            model: None,
+            author: Some("system".into()),
+            created_at: chrono::Utc::now().timestamp(),
+            content: Some(format!(
+                "Concurrent changes to {field}; kept the shared catalog value"
+            )),
+            data_json: Some(json!({"field":field,"local_version":version,"proposed":conflict.local,"kept":conflict.shared})),
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
+            logs: None,
+        });
+    }
+}
+
 impl Event {
     fn new_enrichment(&self) -> NewBugEnrichment {
         NewBugEnrichment {
@@ -277,7 +331,30 @@ impl Database {
                 .transpose()?
                 .map(|s| serde_json::from_str(&s))
                 .transpose()?;
-            let merged = merge_record(base.as_ref(), &local, prior.as_ref(), version, &instance)?;
+            let mut merged =
+                merge_record(base.as_ref(), &local, prior.as_ref(), version, &instance)?;
+            // Validate relations under the catalog write lock. Independent
+            // local decisions can otherwise form a cross-instance cycle.
+            match shared_duplicate_chain(&tx, &project, &merged).await? {
+                DuplicateChain::Valid => {}
+                DuplicateChain::Unpublished => {
+                    tx.rollback().await?;
+                    continue;
+                }
+                DuplicateChain::Cycle => {
+                    let prior = prior
+                        .as_ref()
+                        .context("shared duplicate cycle without a prior record")?;
+                    let conflict = MergeConflict {
+                        field: "triage".into(),
+                        local: Some(serde_json::to_value(&merged.triage)?),
+                        shared: Some(serde_json::to_value(&prior.triage)?),
+                    };
+                    merged.triage = prior.triage.clone();
+                    merged.analysis = prior.analysis.clone();
+                    merged.add_conflict(conflict, version, &instance);
+                }
+            }
             if prior.as_ref() != Some(&merged) {
                 tx.execute(
                     "INSERT INTO shared_bug_records (project,bugid,payload) VALUES (?,?,?)
@@ -292,6 +369,8 @@ impl Database {
                 .await?;
             }
             tx.commit().await?;
+            self.shared_import_targets(&remote, &merged, &project, &instance)
+                .await?;
             self.shared_accept(&merged, Some(version), &instance)
                 .await?;
         }
@@ -675,23 +754,7 @@ fn merge_record(
     result.created_at = local.created_at.min(remote.created_at);
     result.updated_at = local.updated_at.max(remote.updated_at);
     for conflict in conflicts {
-        let field = conflict.field;
-        let key = format!("conflict:{instance}:{}:{version}:{field}", local.bugid);
-        result.events.entry(key).or_insert_with(|| Event {
-            kind: "sync_conflict".into(),
-            tool: "shared_catalog".into(),
-            model: None,
-            author: Some("system".into()),
-            created_at: chrono::Utc::now().timestamp(),
-            content: Some(format!(
-                "Concurrent changes to {field}; kept the shared catalog value"
-            )),
-            data_json: Some(json!({"field":field,"local_version":version,"proposed":conflict.local,"kept":conflict.shared})),
-            tokens_in: None,
-            tokens_out: None,
-            tokens_cached: None,
-            logs: None,
-        });
+        result.add_conflict(conflict, version, instance);
     }
     Ok(result)
 }
