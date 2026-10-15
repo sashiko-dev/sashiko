@@ -2105,6 +2105,20 @@ impl Database {
 
         if self.shared.is_some() {
             self.initialize_shared_catalog().await?;
+        } else {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shared_bug_sync'",
+                    (),
+                )
+                .await?;
+            let installed = rows.next().await?.is_some();
+            drop(rows);
+            if installed {
+                self.execute("UPDATE meta SET value='0' WHERE key='shared_enabled'", ())
+                    .await?;
+            }
         }
         info!("Database schema is up to date at version 13.");
 

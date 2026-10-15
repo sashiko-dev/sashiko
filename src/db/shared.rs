@@ -227,8 +227,35 @@ impl Database {
 
     pub(super) async fn initialize_shared_catalog(&self) -> Result<()> {
         let tx = self.begin_transaction().await?;
-        tx.execute_batch(include_str!("../migrations/014_shared_bug_mirror.sql"))
+        let (version, was_enabled) = {
+            let mut rows = tx.query(
+                "SELECT key,value FROM meta WHERE key IN ('shared_schema_version','shared_enabled')", (),
+            ).await?;
+            let mut version = 0u32;
+            let mut enabled = false;
+            while let Some(row) = rows.next().await? {
+                match row.get::<String>(0)?.as_str() {
+                    "shared_schema_version" => version = row.get::<String>(1)?.parse()?,
+                    "shared_enabled" => enabled = row.get::<String>(1)? == "1",
+                    _ => {}
+                }
+            }
+            (version, enabled)
+        };
+        anyhow::ensure!(
+            version <= 1,
+            "Unsupported shared mirror schema version {version}"
+        );
+        if version == 0 {
+            tx.execute_batch(include_str!("../migrations/shared_catalog/001_mirror.sql"))
+                .await?;
+            tx.execute(
+                "INSERT INTO meta (key,value) VALUES ('shared_schema_version','1')
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (),
+            )
             .await?;
+        }
         tx.execute(
             "INSERT INTO meta (key,value) VALUES ('shared_instance',?) ON CONFLICT(key) DO NOTHING",
             [uuid::Uuid::new_v4().to_string()],
@@ -240,9 +267,20 @@ impl Database {
             (),
         )
         .await?;
-        tx.execute("INSERT INTO shared_bug_sync (bug_id, origin, local_version, dirty)
+        tx.execute(
+            "INSERT INTO meta (key,value) VALUES ('shared_enabled','1')
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (),
+        )
+        .await?;
+        let conflict = if was_enabled {
+            "DO NOTHING"
+        } else {
+            "DO UPDATE SET local_version=local_version+1,dirty=1"
+        };
+        tx.execute(&format!("INSERT INTO shared_bug_sync (bug_id, origin, local_version, dirty)
             SELECT id, (SELECT value FROM meta WHERE key='shared_instance'), 1, 1 FROM bugs WHERE true
-            ON CONFLICT(bug_id) DO NOTHING", ()).await?;
+            ON CONFLICT(bug_id) {conflict}"), ()).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -878,6 +916,128 @@ mod tests {
         db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
             .await?;
         Ok(db)
+    }
+
+    async fn local_report(db: &Database, title: &str) -> Result<i64> {
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()), "title": title
+        }))?;
+        db.create_bug(&bug).await
+    }
+
+    async fn acknowledge_local(db: &Database, id: i64) -> Result<()> {
+        let instance = db.shared_meta("shared_instance").await?;
+        let (record, _, version) = db.shared_snapshot(id, &instance).await?;
+        db.shared_accept(&record, Some(version), &instance).await
+    }
+
+    #[tokio::test]
+    async fn lease_and_housekeeping_updates_do_not_republish_reports() -> Result<()> {
+        let db = local_mirror().await?;
+        let id = local_report(&db, "bookkeeping").await?;
+        db.claim_pending_bug("owner", 300, 3)
+            .await?
+            .context("claim")?;
+        acknowledge_local(&db, id).await?;
+        assert!(db.shared_bug_pending_ids().await?.is_empty());
+        assert!(db.renew_bug_lease(id, "owner", 300).await?);
+        assert!(db.shared_bug_pending_ids().await?.is_empty());
+        db.execute("UPDATE bugs SET lifecycle_status='open',pipeline_state='succeeded',locked_by=NULL,lease_expires_at=NULL WHERE id=?", [id]).await?;
+        acknowledge_local(&db, id).await?;
+        assert_eq!(db.touch_open_bugs_fix_check_batch(&[id]).await?, 1);
+        assert!(db.shared_bug_pending_ids().await?.is_empty());
+        db.update_bug_title(id, "meaningful edit").await?;
+        assert!(db.shared_bug_pending_ids().await?.contains(&id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabling_and_reenabling_catalog_tracking_preserves_local_edits() -> Result<()> {
+        let mut db = local_mirror().await?;
+        let id = local_report(&db, "before disable").await?;
+        acknowledge_local(&db, id).await?;
+        let shared = db.shared.take().context("shared mode")?;
+        db.migrate().await?;
+        db.update_bug_title(id, "edited in libSQL mode").await?;
+        let mut rows = db
+            .conn
+            .query("SELECT dirty FROM shared_bug_sync WHERE bug_id=?", [id])
+            .await?;
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
+        drop(rows);
+        db.shared = Some(shared);
+        db.migrate().await?;
+        assert!(db.shared_bug_pending_ids().await?.contains(&id));
+        assert_eq!(
+            db.get_bug(id).await?.unwrap().title,
+            "edited in libSQL mode"
+        );
+        assert_eq!(db.shared_meta("shared_schema_version").await?, "1");
+        db.execute(
+            "UPDATE meta SET value='999' WHERE key='shared_schema_version'",
+            (),
+        )
+        .await?;
+        assert!(db.migrate().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fix_checks_and_lease_recovery_skip_foreign_mirrors() -> Result<()> {
+        let db = local_mirror().await?;
+        let own = local_report(&db, "origin-owned analysis").await?;
+        db.execute("UPDATE bugs SET lifecycle_status='open',pipeline_state='succeeded',verified_on_sha='old' WHERE id=?", [own]).await?;
+        let instance = db.shared_meta("shared_instance").await?;
+        let (mut remote, _, _) = db.shared_snapshot(own, &instance).await?;
+        remote.bugid = format!("sashiko-{}", uuid::Uuid::new_v4());
+        remote.origin = uuid::Uuid::new_v4().to_string();
+        remote.events.clear();
+        db.shared_accept(&remote, None, &instance).await?;
+        let foreign = db
+            .get_bug_by_bugid(&remote.bugid)
+            .await?
+            .context("foreign mirror")?
+            .id;
+        let candidates = db.list_open_bugs_for_fix_check("new", None, 50).await?;
+        assert_eq!(
+            candidates.iter().map(|bug| bug.id).collect::<Vec<_>>(),
+            vec![own]
+        );
+        assert!(
+            db.claim_specific_open_bug_for_fix_check(foreign, "new", "owner", 300)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            db.claim_open_bug_for_fix_check("new", "owner", 300)
+                .await?
+                .context("owned fix check")?
+                .id,
+            own
+        );
+        assert!(
+            db.claim_open_bug_for_fix_check("new", "owner", 300)
+                .await?
+                .is_none()
+        );
+        for id in [own, foreign] {
+            db.execute("UPDATE bugs SET pipeline_state='running',attempt_count=3,locked_by=NULL,lease_expires_at=NULL WHERE id=?", [id]).await?;
+        }
+        assert_eq!(db.recover_stale_running_bugs().await?, 1);
+        assert_eq!(
+            db.get_bug(foreign).await?.unwrap().pipeline_state,
+            BugPipelineState::Running
+        );
+        assert_eq!(db.abandon_exhausted_bugs(3).await?, 1);
+        assert_eq!(
+            db.get_bug(own).await?.unwrap().pipeline_state,
+            BugPipelineState::Abandoned
+        );
+        assert_eq!(
+            db.get_bug(foreign).await?.unwrap().pipeline_state,
+            BugPipelineState::Running
+        );
+        Ok(())
     }
 
     #[tokio::test]

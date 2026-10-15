@@ -115,6 +115,9 @@ In shared catalog mode, each local database has a stable instance identity
 and a local bug mirror. Changes enter a durable outbox in the same transaction
 as the bug update. A background task publishes and imports changes every five
 seconds; PostgreSQL outages leave changes queued and visible as **Sync pending**.
+Lease renewals and housekeeping timestamps do not queue whole reports. Mirror
+migrations have their own version in metadata. Selecting `libsql` disables change
+tracking; re-enabling the shared catalog reconciles edits made while it was off.
 Analysis waits for the catalog before making shared deduplication decisions.
 An outage during that check requeues the analysis without consuming an attempt.
 If an outcome is already committed locally, publication retries from the outbox
