@@ -17,6 +17,7 @@
 //! `designs/DESIGN_CODE_NOTES_ENGINE.md`.
 
 pub mod components;
+pub mod entry_points;
 pub mod profile;
 pub mod scope;
 pub mod units;
