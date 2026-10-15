@@ -128,7 +128,7 @@ pub async fn unit_history(
     Ok(cases)
 }
 
-async fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
     let output = git_cmd::in_dir_async(repo)
         .args(args)
         .output()
@@ -144,7 +144,7 @@ async fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
