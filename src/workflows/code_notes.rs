@@ -53,6 +53,16 @@ pub const VERIFY_BATCH_SIZE: usize = 8;
 /// Attempts the synthesize stage gets to satisfy the note rules before the
 /// driver falls back to a deterministic note.
 pub const SYNTH_VALIDATION_ATTEMPTS: usize = 7;
+/// The size synthesis is asked to stay under: a margin below the hard
+/// budget, so a note that overshoots its target a little is accepted
+/// instead of failing after a run of near misses.
+pub fn target_bytes(max_bytes: usize) -> usize {
+    max_bytes * TARGET_PERCENT / 100
+}
+
+/// Share of the hard budget synthesis is asked to stay under.
+const TARGET_PERCENT: usize = 85;
+
 /// Bytes of a typical note bullet, for telling synthesis how many bullets
 /// its budget holds.
 const TYPICAL_BULLET_BYTES: usize = 320;
@@ -1211,9 +1221,13 @@ pub fn synthesize_stage(
                 .with_var("revision", |s: &NotesBuildState| s.revision.clone())
                 .with_var("summaries", move |_: &NotesBuildState| summaries.clone())
                 .with_var("facts", move |_: &NotesBuildState| facts_json.clone())
-                .with_var("max_bytes", move |_: &NotesBuildState| max_bytes.to_string())
+                .with_var("max_bytes", move |_: &NotesBuildState| {
+                    target_bytes(max_bytes).to_string()
+                })
                 .with_var("max_bullets", move |_: &NotesBuildState| {
-                    (max_bytes / TYPICAL_BULLET_BYTES).max(1).to_string()
+                    (target_bytes(max_bytes) / TYPICAL_BULLET_BYTES)
+                        .max(1)
+                        .to_string()
                 })
                 .with_var("max_bullet_chars", |_: &NotesBuildState| {
                     MAX_BULLET_CHARS.to_string()
@@ -1267,11 +1281,12 @@ pub fn validate_note(
         ));
     }
     if note.len() > max_bytes {
+        let target = target_bytes(max_bytes);
         return Err(format!(
-            "the note is {} bytes; the limit is {max_bytes}. Cut at least {} bytes ({}%) by dropping the least important rules and merging related ones",
+            "the note is {} bytes; keep it under {target}. Cut at least {} bytes ({}%) by dropping the least important rules and merging related ones",
             note.len(),
-            note.len() - max_bytes,
-            ((note.len() - max_bytes) * 100).div_ceil(note.len())
+            note.len() - target,
+            ((note.len() - target) * 100).div_ceil(note.len())
         ));
     }
     if note.contains("```") {
@@ -1773,7 +1788,7 @@ mod tests {
         assert!(
             validate_note(note, "src/db", &known, 10)
                 .unwrap_err()
-                .contains("limit")
+                .contains("keep it under 8")
         );
         assert!(
             validate_note("# other\n[F1]", "src/db", &known, 1000)
