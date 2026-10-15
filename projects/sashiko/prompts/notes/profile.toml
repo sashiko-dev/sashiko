@@ -12,6 +12,10 @@ shallow_files = "per_module"
 rust = ["src/**.rs"]
 other = ["src/migrations/**.sql"]
 
+[agenda]
+# Hand-written, project-agnostic starting agenda for the Sashiko pilot.
+modules = ["universal", "lang/rust"]
+
 [limits]
 component_lines = 15000
 unit_note_bytes = 16384

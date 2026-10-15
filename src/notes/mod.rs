@@ -16,6 +16,7 @@
 //! about it, and writes notes for the review pipeline. See
 //! `designs/DESIGN_CODE_NOTES_ENGINE.md`.
 
+pub mod agenda;
 pub mod cli;
 pub mod components;
 pub mod entry_points;

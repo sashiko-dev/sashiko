@@ -49,6 +49,17 @@ pub struct NotesProfile {
     pub languages: LanguagesConfig,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub agenda: AgendaConfig,
+}
+
+/// Which agenda modules (`notes/agenda/<module>.md`) a build works through.
+/// Planning needs none; building requires at least one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgendaConfig {
+    #[serde(default)]
+    pub modules: Vec<String>,
 }
 
 /// How a project's files are divided into ownership units.
@@ -264,6 +275,9 @@ other = ["src/**.sql"]
 
 [limits]
 component_lines = 4000
+
+[agenda]
+modules = ["universal", "lang/rust"]
 "#;
 
     #[test]
@@ -279,6 +293,7 @@ component_lines = 4000
         );
         assert_eq!(profile.limits.component_lines, 4000);
         assert_eq!(profile.limits.unit_note_bytes, DEFAULT_UNIT_NOTE_BYTES);
+        assert_eq!(profile.agenda.modules, vec!["universal", "lang/rust"]);
     }
 
     #[test]
