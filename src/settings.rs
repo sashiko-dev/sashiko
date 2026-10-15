@@ -987,6 +987,10 @@ pub struct ReviewSettings {
     /// ignored otherwise.
     #[serde(default)]
     pub effort: Option<EffortMode>,
+    /// Whether series-level cover letter (`0/N`) and pull request description
+    /// reviews are enabled. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub series_review_enabled: bool,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
 }

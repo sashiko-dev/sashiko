@@ -17,6 +17,10 @@ positive_review = "none"
 # If true, completely mutes (suppresses) outbound emails for this scope.
 mute_all = false
 
+# Whether to send email replies on 0/N cover letters when series-level
+# findings are reported (default: false; results always appear in the Web UI).
+cover_review_email = false
+
 # Static email addresses that always receive a copy (CC'd).
 cc = []
 

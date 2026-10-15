@@ -1106,9 +1106,12 @@ async fn run_worker_in_worktree(
             // commit-range reviews (`options.current_tree`) have no 0/N email cover
             // letter in git history and review commits 1..N directly unless `--patch 0`
             // is explicitly requested.
-            if (cover_letter.is_some()
-                || previous_version.is_some()
-                || (!options.current_tree && patches.len() > 1))
+            if settings.review.series_review_enabled
+                && (cover_letter.is_some()
+                    || previous_version.is_some()
+                    || (!options.current_tree
+                        && patches.len() > 1
+                        && !patches.iter().all(|p| p.commit_id.is_some())))
                 && !patches.iter().any(|p| p.index == 0)
             {
                 all.push(synthesize_cover_patch());

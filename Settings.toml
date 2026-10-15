@@ -244,6 +244,7 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+# series_review_enabled = true  # Run 0/N cover letter and PR description reviews
 # effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"
 
 [linux_bug]

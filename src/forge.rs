@@ -631,20 +631,24 @@ pub fn compose_pr_review_comment(
     }
 
     for patch in patches_with_findings {
-        let short_sha = patch
-            .commit_id
-            .as_deref()
-            .filter(|s| s.len() >= 8)
-            .map(|s| &s[..8]);
-        let title_line = match short_sha {
-            Some(sha) => format!(
-                "#### Commit {}/{} — `{}` {}\n\n",
-                patch.part_index, patch.total_parts, sha, patch.subject
-            ),
-            None => format!(
-                "#### Commit {}/{} — {}\n\n",
-                patch.part_index, patch.total_parts, patch.subject
-            ),
+        let title_line = if patch.part_index == 0 {
+            "#### Series / PR Review\n\n".to_string()
+        } else {
+            let short_sha = patch
+                .commit_id
+                .as_deref()
+                .filter(|s| s.len() >= 8)
+                .map(|s| crate::utils::utf8_prefix(s, 8));
+            match short_sha {
+                Some(sha) => format!(
+                    "#### Commit {}/{} — `{}` {}\n\n",
+                    patch.part_index, patch.total_parts, sha, patch.subject
+                ),
+                None => format!(
+                    "#### Commit {}/{} — {}\n\n",
+                    patch.part_index, patch.total_parts, patch.subject
+                ),
+            }
         };
         out.push_str(&title_line);
 
@@ -1622,6 +1626,39 @@ mod tests {
                 "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-v3)"
             )
         );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_with_series_review_finding() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 0,
+                total_parts: 2,
+                commit_id: None,
+                subject: "Series / PR Review".to_string(),
+                inline_review: Some(
+                    "Severity: MEDIUM\nPR description claims a metrics endpoint is added, but no endpoint is registered.".to_string(),
+                ),
+            },
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 2,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "clean commit".to_string(),
+                inline_review: Some("No issues found.".to_string()),
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(2),
+            1,
+            Some("Series summary text."),
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/mr-502-v2",
+        );
+        assert!(body.starts_with("### Sashiko review — v2\n\n"));
+        assert!(!body.contains("No issues found"));
+        assert!(body.contains("#### Series / PR Review\n\nSeverity: MEDIUM\nPR description claims a metrics endpoint is added"));
+        assert!(!body.contains("clean commit"));
     }
 
     #[test]

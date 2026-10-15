@@ -855,6 +855,123 @@ async fn run_daemon(
     let parser_handle = tokio::spawn(async move {
         info!("Parser Dispatcher started");
         while let Some(event) = raw_rx.recv().await {
+            // Forward pre-parsed events inline without spawning a separate task
+            // so multi-patch git-fetch series (0/N cover followed by 1..=N) are
+            // delivered to parsed_rx in strict FIFO order.
+            match event {
+                Event::IngestionFailed {
+                    article_id,
+                    error,
+                    source,
+                } => {
+                    if let Err(e) = parsed_tx
+                        .send(ParsedArticle {
+                            group: "error".to_string(),
+                            article_id,
+                            source,
+                            metadata: None,
+                            patch: None,
+                            baseline: None,
+                            failed_error: Some(error),
+                            skip_filters: None,
+                            only_filters: None,
+                            mr_url: None,
+                            mr_title: None,
+                            mr_number: None,
+                            receipt: None,
+                        })
+                        .await
+                    {
+                        error!("Failed to forward IngestionFailed event: {}", e);
+                    }
+                    continue;
+                }
+                Event::PatchSubmitted {
+                    group,
+                    article_id,
+                    message_id,
+                    subject,
+                    author,
+                    message,
+                    diff,
+                    base_commit,
+                    timestamp,
+                    index,
+                    total,
+                    mr_url,
+                    mr_title,
+                    mr_number,
+                } => {
+                    let root_msg_id = format!("{}@sashiko.local", article_id);
+
+                    // For single commits where message_id is the root itself or 0/N
+                    // cover events, in_reply_to is None; range patches (message_id != root_msg_id)
+                    // reply to root_msg_id even when total == 1.
+                    let in_reply_to = if (total == 1 && message_id == root_msg_id) || index == 0 {
+                        None
+                    } else {
+                        Some(root_msg_id.clone())
+                    };
+
+                    let metadata = sashiko::patch::PatchsetMetadata {
+                        message_id: message_id.clone(),
+                        subject,
+                        author,
+                        date: timestamp,
+                        received_date: None,
+                        in_reply_to,
+                        references: vec![root_msg_id.clone()],
+                        index,
+                        total,
+                        to: "submitted".to_string(),
+                        cc: "".to_string(),
+                        is_patch_or_cover: true,
+                        version: None,
+                        body: message.clone(),
+                    };
+
+                    let patch = if index == 0 {
+                        None
+                    } else {
+                        Some(sashiko::patch::Patch {
+                            message_id,
+                            body: message,
+                            diff,
+                            part_index: index,
+                        })
+                    };
+
+                    let source = if group.starts_with("git-import") {
+                        MessageSource::GitImport
+                    } else {
+                        MessageSource::GitFetch
+                    };
+
+                    if let Err(e) = parsed_tx
+                        .send(ParsedArticle {
+                            group,
+                            article_id,
+                            source,
+                            metadata: Some(metadata),
+                            patch,
+                            baseline: base_commit,
+                            failed_error: None,
+                            skip_filters: None,
+                            only_filters: None,
+                            mr_url,
+                            mr_title,
+                            mr_number,
+                            receipt: None,
+                        })
+                        .await
+                    {
+                        error!("Failed to send pre-parsed article: {}", e);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -867,108 +984,8 @@ async fn run_daemon(
                 let _permit = permit; // Hold permit until task completion
 
                 match event {
-                    Event::IngestionFailed {
-                        article_id,
-                        error,
-                        source,
-                    } => {
-                        if let Err(e) = tx
-                            .send(ParsedArticle {
-                                group: "error".to_string(),
-                                article_id,
-                                source,
-                                metadata: None,
-                                patch: None,
-                                baseline: None,
-                                failed_error: Some(error),
-                                skip_filters: None,
-                                only_filters: None,
-                                mr_url: None,
-                                mr_title: None,
-                                mr_number: None,
-                                receipt: None,
-                            })
-                            .await
-                        {
-                            error!("Failed to forward IngestionFailed event: {}", e);
-                        }
-                    }
-                    Event::PatchSubmitted {
-                        group,
-                        article_id,
-                        message_id,
-                        subject,
-                        author,
-                        message,
-                        diff,
-                        base_commit,
-                        timestamp,
-                        index,
-                        total,
-                        mr_url,
-                        mr_title,
-                        mr_number,
-                    } => {
-                        let root_msg_id = format!("{}@sashiko.local", article_id);
-
-                        // For single patches, we don't want a synthetic parent (the patch is the root)
-                        let in_reply_to = if total == 1 {
-                            None
-                        } else {
-                            Some(root_msg_id.clone())
-                        };
-
-                        // Pre-parsed patch handling
-                        let metadata = sashiko::patch::PatchsetMetadata {
-                            message_id: message_id.clone(),
-                            subject,
-                            author,
-                            date: timestamp,
-                            received_date: None,
-                            in_reply_to,
-                            references: vec![root_msg_id.clone()],
-                            index,
-                            total,
-                            to: "submitted".to_string(),
-                            cc: "".to_string(),
-                            is_patch_or_cover: true,
-                            version: None,
-                            body: message.clone(),
-                        };
-
-                        let patch = Some(sashiko::patch::Patch {
-                            message_id,
-                            body: message,
-                            diff,
-                            part_index: index,
-                        });
-
-                        let source = if group.starts_with("git-import") {
-                            MessageSource::GitImport
-                        } else {
-                            MessageSource::GitFetch
-                        };
-
-                        if let Err(e) = tx
-                            .send(ParsedArticle {
-                                group,
-                                article_id,
-                                source,
-                                metadata: Some(metadata),
-                                patch,
-                                baseline: base_commit,
-                                failed_error: None,
-                                skip_filters: None,
-                                only_filters: None,
-                                mr_url,
-                                mr_title,
-                                mr_number,
-                                receipt: None,
-                            })
-                            .await
-                        {
-                            error!("Failed to send pre-parsed article: {}", e);
-                        }
+                    Event::IngestionFailed { .. } | Event::PatchSubmitted { .. } => {
+                        unreachable!("handled inline before spawning parser task");
                     }
                     Event::RawMboxSubmitted {
                         raw,
@@ -3539,9 +3556,21 @@ async fn process_parsed_article(
     };
 
     let is_git_hash = article_id.len() == 40 && article_id.chars().all(|c| c.is_ascii_hexdigit());
+    let preserved_cover_body = if group == "git-fetch" && metadata.index == 0 {
+        worker_db
+            .get_message_body(&metadata.message_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|b| !b.trim().is_empty())
+    } else {
+        None
+    };
     // Only optimize storage (skip body) if it's a bulk git import where we have the archives
     let (body_to_store, git_hash_opt) = if is_git_hash && group.starts_with("git-import") {
         ("", Some(article_id.as_str()))
+    } else if let Some(ref existing) = preserved_cover_body {
+        (existing.as_str(), None)
     } else {
         (metadata.body.as_str(), None)
     };
@@ -3811,6 +3840,13 @@ async fn process_parsed_article(
             .await
         {
             Ok(Some(patchset_id)) => {
+                if let Some(cid) = sashiko::patch::parse_b4_change_id(&metadata.body)
+                    && let Err(e) = worker_db
+                        .set_patchset_change_id_if_unset(patchset_id, &cid)
+                        .await
+                {
+                    warn!("Failed to set change_id on patchset {}: {}", patchset_id, e);
+                }
                 if mr_url.is_some() || mr_title.is_some() || mr_number.is_some() {
                     let slug = if let (Some(url), Some(num)) = (&mr_url, mr_number) {
                         sashiko::forge::extract_repo_name_from_mr_url(url)
