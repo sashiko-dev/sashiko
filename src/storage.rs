@@ -704,4 +704,64 @@ mod tests {
         );
         assert!(placeholders("SELECT ?0").is_err());
     }
+
+    #[test]
+    fn query_vocabulary_preserves_quoted_names_and_nested_comments() {
+        assert_eq!(
+            placeholders("SELECT strftime('%s','now'), datetime(?, 'unixepoch'), group_concat(name, ','), json_each(?), json_set(data, '$.x', ?), json_extract(data, '$.x') WHERE title NOT LIKE ?").unwrap(),
+            "SELECT sashiko_strftime('%s','now'), sashiko_datetime($1, 'unixepoch'), string_agg(name, ','), sashiko_json_ids($2), sashiko_json_set(data, '$.x', $3), sashiko_json_flag(data, '$.x') WHERE title NOT ILIKE $4"
+        );
+        assert_eq!(
+            placeholders("SELECT \"like\", 'datetime ''?''', ?1 /* outer ? /* json_set */ ? */ -- json_each ?\n").unwrap(),
+            "SELECT \"like\", 'datetime ''?''', $1 /* outer ? /* json_set */ ? */ -- json_each ?\n"
+        );
+    }
+
+    fn decode_numeric(weight: i16, negative: bool, scale: i16, digits: &[i16]) -> Value {
+        let header = [
+            i16::try_from(digits.len()).unwrap(),
+            weight,
+            if negative { 0x4000 } else { 0 },
+            scale,
+        ];
+        let bytes: Vec<_> = header
+            .iter()
+            .chain(digits)
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        Numeric::from_sql(&Type::NUMERIC, &bytes).unwrap().0
+    }
+
+    #[test]
+    fn numeric_wire_values_preserve_integer_limits_signs_and_fractions() {
+        assert_eq!(decode_numeric(0, false, 0, &[]), Value::Integer(0));
+        assert_eq!(
+            decode_numeric(1, true, 0, &[42, 1]),
+            Value::Integer(-420001)
+        );
+        assert_eq!(
+            decode_numeric(4, false, 0, &[922, 3372, 368, 5477, 5807]),
+            Value::Integer(i64::MAX)
+        );
+        assert_eq!(
+            decode_numeric(4, true, 0, &[922, 3372, 368, 5477, 5808]),
+            Value::Integer(i64::MIN)
+        );
+        for (weight, digits, expected) in [(0, vec![12, 3456], 12.3456), (-1, vec![1], 0.0001)] {
+            let Value::Real(actual) = decode_numeric(weight, false, 4, &digits) else {
+                panic!("expected a fractional value")
+            };
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        for words in [
+            vec![0],
+            vec![2, 0, 0, 0, 1],
+            vec![1, 0, 0, 0, 10000],
+            vec![0, 0, -16384, 0],
+            vec![5, 4, 0, 0, 922, 3372, 368, 5477, 5808],
+        ] {
+            let bytes: Vec<_> = words.into_iter().flat_map(i16::to_be_bytes).collect();
+            assert!(Numeric::from_sql(&Type::NUMERIC, &bytes).is_err());
+        }
+    }
 }

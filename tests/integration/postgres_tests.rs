@@ -4,6 +4,12 @@ use sashiko::db::{BugLifecycleStatus, Database, ListBugsParams, NewBug, NewBugEn
 use sashiko::settings::StorageSettings;
 use serde_json::json;
 
+fn test_settings() -> Result<sashiko::settings::Settings> {
+    Ok(toml::from_str(
+        "[ai]\nprovider='mock'\nmodel='test'\n[review]\nconcurrency=1\n",
+    )?)
+}
+
 #[tokio::test]
 #[ignore = "requires SASHIKO_TEST_POSTGRES_URL_FILE pointing to a disposable PostgreSQL database"]
 async fn postgres_daemon_storage_roundtrip() -> Result<()> {
@@ -16,7 +22,7 @@ async fn postgres_daemon_storage_roundtrip() -> Result<()> {
         postgres_tls_require_only: true,
         ..Default::default()
     };
-    let mut configured = sashiko::settings::Settings::new()?;
+    let mut configured = test_settings()?;
     configured.storage = settings;
     configured.storage.mode = sashiko::settings::StorageMode::Postgresql;
     // A configured PostgreSQL client must ignore the legacy libSQL URL.
@@ -298,7 +304,7 @@ async fn exercise_daemon(db: &Database) -> Result<()> {
 async fn postgres_shared_catalog_between_instances() -> Result<()> {
     let file = std::env::var("SASHIKO_TEST_POSTGRES_URL_FILE")?;
     let directory = tempfile::tempdir()?;
-    let mut settings = sashiko::settings::Settings::new()?;
+    let mut settings = test_settings()?;
     settings.storage.mode = sashiko::settings::StorageMode::LibsqlSharedBugs;
     settings.storage.postgres_url = Some(std::fs::read_to_string(file)?.trim().to_string());
     settings.storage.postgres_schema = format!("test_{}", uuid::Uuid::new_v4().simple());
@@ -424,18 +430,7 @@ async fn exercise_shared(
     second.sync_shared_bugs().await?;
     let imported_duplicate = second.get_bug_by_bugid(&duplicate.bugid).await?.unwrap();
     assert_eq!(imported_duplicate.duplicate_of_id, Some(mirror.id));
-    let guard = first.lock_bug_dedup().await?;
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            second.lock_bug_dedup()
-        )
-        .await
-        .is_err()
-    );
-    drop(guard);
-    let guard = second.lock_bug_dedup().await?;
-    drop(guard);
+    assert_shared_lock_exclusion(first, second, &settings.storage).await?;
     // A local bug write commits while the catalog is unreachable, then a new
     // daemon handle publishes the durable outbox after connectivity is restored.
     let mut offline = settings.clone();
@@ -462,6 +457,50 @@ async fn exercise_shared(
     second.sync_shared_bugs().await?;
     assert!(second.get_bug_by_bugid(&pending.bugid).await?.is_some());
     exercise_shared_duplicate_races(first, second).await?;
+    Ok(())
+}
+
+async fn assert_shared_lock_exclusion(
+    first: &Database,
+    second: &Database,
+    settings: &StorageSettings,
+) -> Result<()> {
+    let guard = first.lock_bug_dedup().await?.context("held dedup guard")?;
+    let pid = backend_pid(&guard).await?;
+    let control = postgres_control(settings).await?;
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&pid];
+    let waiter = second.lock_bug_dedup();
+    tokio::pin!(waiter);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                acquired = &mut waiter => {
+                    acquired?;
+                    anyhow::bail!("second dedup guard acquired before the first was released");
+                }
+                row = control.query_one(
+                    "SELECT EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_locks held
+                       JOIN pg_catalog.pg_locks waiting
+                         USING (locktype,database,classid,objid,objsubid)
+                       WHERE held.pid=$1 AND held.locktype='advisory'
+                         AND held.granted AND NOT waiting.granted)", &params,
+                ) => {
+                    if row?.get::<_, bool>(0) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("second connection never entered the server lock wait")??;
+    drop(guard);
+    let guard = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+        .await
+        .context("second dedup guard did not acquire after release")??;
+    drop(guard);
     Ok(())
 }
 
