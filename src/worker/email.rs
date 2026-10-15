@@ -184,8 +184,10 @@ fn build_email_message(
         builder = builder
             .header(AutoSubmitted("auto-generated".to_string()))
             .header(ListId(format!("<{}.{}>", label, from.email.domain())));
-    } else if email_row.kind == crate::db::EmailKind::ReviewNotification
-        && let Some(reply_to) = &settings.reply_to
+    } else if matches!(
+        email_row.kind,
+        crate::db::EmailKind::ReviewNotification | crate::db::EmailKind::ReviewReply
+    ) && let Some(reply_to) = &settings.reply_to
     {
         match reply_to.parse() {
             Ok(addr) => builder = builder.reply_to(addr),
@@ -448,6 +450,11 @@ mod tests {
         assert!(!review.contains("Auto-Submitted"));
         assert!(!review.contains("List-Id"));
         assert!(review.contains("Reply-To: reviews@lists.example.org\r\n"));
+
+        let cover_reply = format(crate::db::EmailKind::ReviewReply);
+        assert!(!cover_reply.contains("Auto-Submitted"));
+        assert!(!cover_reply.contains("List-Id"));
+        assert!(cover_reply.contains("Reply-To: reviews@lists.example.org\r\n"));
 
         let unrecognized = format(crate::db::EmailKind::Unrecognized);
         assert!(!unrecognized.contains("List-Id"));
