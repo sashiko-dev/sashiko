@@ -1,0 +1,18 @@
+# Code notes profile for Sashiko itself.
+# See designs/DESIGN_CODE_NOTES_ENGINE.md, section 3.
+
+[units]
+source = "directories"
+roots = ["src"]
+depth = 1
+# Each top-level file is a module of its own (src/db.rs is unit src/db).
+shallow_files = "per_module"
+
+[languages.globs]
+rust = ["src/**.rs"]
+other = ["src/migrations/**.sql"]
+
+[limits]
+component_lines = 15000
+unit_note_bytes = 16384
+review_notes_bytes = 49152

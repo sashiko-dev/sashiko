@@ -117,6 +117,18 @@ enum Commands {
         prompts: bool,
     },
 
+    /// Build and inspect code notes (deep, verified notes about the
+    /// project's source that reviews load)
+    Notes {
+        #[command(subcommand)]
+        command: sashiko::notes::cli::NotesCommand,
+
+        /// Prompt directory holding the project's notes profile (default:
+        /// the installed prompt bundle)
+        #[arg(long, global = true)]
+        prompts: Option<PathBuf>,
+    },
+
     /// Review a local commit or commit range without starting the daemon
     Review {
         /// Git commit or range, for example HEAD or HEAD~3..HEAD
@@ -389,6 +401,8 @@ fn cli_overrides(cli: &Cli) -> Overrides {
         // Reads no settings, so the top-level flags typed before it mean
         // nothing to it.
         Some(Commands::Init { .. }) => Overrides::default(),
+        // Planning reads no settings either.
+        Some(Commands::Notes { .. }) => Overrides::default(),
     }
 }
 
@@ -427,7 +441,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Settings log_level
     // 4. Worker command defaults to "info" (worker logs progress on stderr)
     // 5. Fallback to "warn" (if settings failed)
-    let is_review = matches!(cli.command, Some(Commands::Review { .. }));
+    let is_review = matches!(
+        cli.command,
+        Some(Commands::Review { .. } | Commands::Notes { .. })
+    );
     let is_worker = matches!(cli.command, Some(Commands::Worker { .. }));
     let log_level = if cli.debug {
         "info"
@@ -495,6 +512,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prompts,
             } => {
                 handle_init_command(path.clone(), *force, *print, *prompts)?;
+                return Ok(());
+            }
+            Commands::Notes { command, prompts } => {
+                let repo = current_git_toplevel()?;
+                let prompts_dir = resolve_prompts_path(prompts.clone(), project)?;
+                sashiko::notes::cli::run(command, &repo, &prompts_dir).await?;
                 return Ok(());
             }
             // What this arm passes down, and no more: --settings was read above,
