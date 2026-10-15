@@ -39,14 +39,24 @@ const ELISIONS: &[&str] = &["...", "…", "// ...", "/* ... */"];
 pub enum EvidenceCheck {
     Ok,
     MissingFile,
-    BadRange { file_lines: usize },
-    SnippetMismatch { first_unmatched_line: String },
+    BadRange {
+        file_lines: usize,
+    },
+    SnippetMismatch {
+        first_unmatched_line: String,
+    },
     EmptySnippet,
+    /// The snippet is verbatim code of the file, but at these lines rather
+    /// than the cited ones.
+    Relocated {
+        start_line: usize,
+        end_line: usize,
+    },
 }
 
 impl EvidenceCheck {
     pub fn is_ok(&self) -> bool {
-        matches!(self, EvidenceCheck::Ok)
+        matches!(self, EvidenceCheck::Ok | EvidenceCheck::Relocated { .. })
     }
 
     /// One-line explanation for the verifier and the logs.
@@ -63,6 +73,10 @@ impl EvidenceCheck {
                 "snippet does not appear near the cited lines; first unmatched line: {first_unmatched_line:?}"
             ),
             EvidenceCheck::EmptySnippet => "snippet is empty".to_string(),
+            EvidenceCheck::Relocated {
+                start_line,
+                end_line,
+            } => format!("snippet found at lines {start_line}-{end_line}, not at the cited lines"),
         }
     }
 }
@@ -83,11 +97,12 @@ impl<'a> RevisionFiles<'a> {
         }
     }
 
-    /// The lines of `path` at the revision, or `None` if it does not exist.
+    /// The normalized lines of `path` at the revision, or `None` if it
+    /// does not exist.
     async fn lines(&mut self, path: &str) -> Result<Option<&Vec<String>>> {
         if !self.cache.contains_key(path) {
             let content = read_at_revision(self.repo, self.sha, path).await?;
-            let lines = content.map(|text| text.lines().map(str::to_string).collect());
+            let lines = content.map(|text| text.lines().map(normalize).collect());
             self.cache.insert(path.to_string(), lines);
         }
         Ok(self.cache.get(path).and_then(Option::as_ref))
@@ -117,11 +132,20 @@ impl<'a> RevisionFiles<'a> {
         }
         let window_start = start.saturating_sub(1 + LINE_TOLERANCE);
         let window_end = end.saturating_add(LINE_TOLERANCE).min(lines.len());
-        let window: Vec<String> = lines[window_start..window_end]
-            .iter()
-            .map(|l| normalize(l))
-            .collect();
-        Ok(match_in_order(&wanted, &window))
+        let check = match_in_order(&wanted, &lines[window_start..window_end]);
+        if check.is_ok() {
+            return Ok(check);
+        }
+        // Explorers often copy code verbatim but misremember where it is.
+        // Verbatim code elsewhere in the file still backs the claim.
+        Ok(
+            relocate(&wanted, lines, start).map_or(check, |(start_line, end_line)| {
+                EvidenceCheck::Relocated {
+                    start_line,
+                    end_line,
+                }
+            }),
+        )
     }
 }
 
@@ -140,6 +164,47 @@ fn match_in_order(wanted: &[String], window: &[String]) -> EvidenceCheck {
         }
     }
     EvidenceCheck::Ok
+}
+
+/// The 1-based line range of the compact in-order match of `wanted` in
+/// `lines` that starts closest to `cited_start`. A match may span at most
+/// twice the snippet's length plus a little, so scattered common lines do
+/// not count as a match.
+fn relocate(wanted: &[String], lines: &[String], cited_start: usize) -> Option<(usize, usize)> {
+    let first = wanted.first()?;
+    let max_span = wanted.len() * 2 + 10;
+    let mut best: Option<(usize, usize)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains(first.as_str()) {
+            continue;
+        }
+        let limit = (i + max_span).min(lines.len());
+        let mut pos = i + 1;
+        let mut matched = true;
+        for want in &wanted[1..] {
+            match lines[pos..limit]
+                .iter()
+                .position(|l| l.contains(want.as_str()))
+            {
+                Some(offset) => pos += offset + 1,
+                None => {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            continue;
+        }
+        let candidate = (i + 1, pos);
+        let closer = best.is_none_or(|(start, _)| {
+            candidate.0.abs_diff(cited_start) < start.abs_diff(cited_start)
+        });
+        if closer {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
 /// Collapses runs of whitespace and trims the line.
@@ -179,12 +244,19 @@ mod tests {
     #[tokio::test]
     async fn test_check_evidence_against_revision() {
         let dir = tempfile::tempdir().unwrap();
+        let long: String = (0..20)
+            .map(|i| format!("// line {i}\n"))
+            .collect::<String>()
+            + "fn twenty() {\n    20\n}\n";
         let sha = test_repo::commit_files(
             dir.path(),
-            &[(
-                "src/cache.rs",
-                "use std::sync::Mutex;\n\npub fn get(m: &Mutex<u8>) -> u8 {\n    let guard = m.lock().unwrap();\n    *guard\n}\n",
-            )],
+            &[
+                (
+                    "src/cache.rs",
+                    "use std::sync::Mutex;\n\npub fn get(m: &Mutex<u8>) -> u8 {\n    let guard = m.lock().unwrap();\n    *guard\n}\n",
+                ),
+                ("src/long.rs", &long),
+            ],
         );
         let mut files = RevisionFiles::new(dir.path(), &sha);
 
@@ -210,6 +282,23 @@ mod tests {
             files.check(&invented).await.unwrap(),
             EvidenceCheck::SnippetMismatch { .. }
         ));
+
+        // Verbatim code far from the cited lines is found where it is.
+        let far = ev("src/long.rs", 1, 2, "fn twenty() {\n    20\n}");
+        assert_eq!(
+            files.check(&far).await.unwrap(),
+            EvidenceCheck::Relocated {
+                start_line: 21,
+                end_line: 23
+            }
+        );
+        assert!(
+            EvidenceCheck::Relocated {
+                start_line: 5,
+                end_line: 6
+            }
+            .is_ok()
+        );
 
         // Lines in the wrong order do not match.
         let reordered = ev(
