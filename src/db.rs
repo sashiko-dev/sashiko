@@ -189,6 +189,7 @@ pub struct Database {
     bug_tool: String,
     bug_model: Option<String>,
     bug_claim: Option<BugAnalysisClaim>,
+    patchset_claim: Option<PatchsetReviewClaim>,
 }
 
 /// Guards an open transaction on the transaction `libsql::Connection` so
@@ -278,6 +279,15 @@ struct BugAnalysisClaim {
     owner: String,
 }
 
+/// Ownership of one patchset review attempt, fencing out stale writes if a
+/// concurrent `rerun_patchset` or `cancel_patchset` supersedes the worker.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy)]
+struct PatchsetReviewClaim {
+    patchset_id: i64,
+    generation: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Subsystem {
     pub id: i64,
@@ -346,6 +356,7 @@ pub struct ReleaseReview {
     pub patch_id: Option<i64>,
     pub patch_message_id: String,
     pub index: i64,
+    pub has_inline_review: bool,
     pub inline_review: String,
     pub summary: String,
     pub findings: Vec<serde_json::Value>,
@@ -1421,6 +1432,7 @@ impl Database {
             bug_tool: tool.into(),
             bug_model: model,
             bug_claim: self.bug_claim.clone(),
+            patchset_claim: self.patchset_claim,
         }
     }
 
@@ -1435,6 +1447,7 @@ impl Database {
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
             bug_claim: self.bug_claim.clone(),
+            patchset_claim: self.patchset_claim,
         }
     }
 
@@ -1452,7 +1465,118 @@ impl Database {
                 bug_id,
                 owner: owner.into(),
             }),
+            patchset_claim: self.patchset_claim,
         }
+    }
+
+    /// Binds patchset and review writes to the exact generation that claimed
+    /// this patchset for review.
+    pub fn with_patchset_claim(&self, patchset_id: i64, generation: i64) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            tx_conn: self.tx_conn.clone(),
+            tx_lock: self.tx_lock.clone(),
+            in_transaction: self.in_transaction,
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+            bug_claim: self.bug_claim.clone(),
+            patchset_claim: Some(PatchsetReviewClaim {
+                patchset_id,
+                generation,
+            }),
+        }
+    }
+
+    pub fn has_patchset_claim(&self) -> bool {
+        self.patchset_claim.is_some()
+    }
+
+    fn claim_params(&self) -> (Option<i64>, Option<i64>) {
+        match self.patchset_claim {
+            Some(c) => (Some(c.patchset_id), Some(c.generation)),
+            None => (None, None),
+        }
+    }
+
+    /// Returns whether `patchset_id` is still actively owned by this handle
+    /// (for claimed worker handles, `patchsets.status = 'In Review'` and
+    /// `meta('patchset_active_gen:<id>')` matches the claim generation; for
+    /// unscoped handles, the patchset exists and is not `'Cancelled'`).
+    pub async fn is_patchset_claim_active(&self, patchset_id: i64) -> Result<bool> {
+        if let Some(claim) = self.patchset_claim {
+            if claim.patchset_id != patchset_id {
+                return Ok(false);
+            }
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets ps
+                     JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
+                     WHERE ps.id = ?
+                       AND ps.status = 'In Review'
+                       AND CAST(m.value AS INTEGER) = ?",
+                    libsql::params![claim.patchset_id, claim.generation],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        } else {
+            Ok(!matches!(
+                self.get_patchset_status(patchset_id).await?.as_deref(),
+                None | Some("Cancelled")
+            ))
+        }
+    }
+
+    /// Checks whether outbox writes remain permitted for this handle (including
+    /// immediately after the owning worker transitions `patchsets.status` from
+    /// `'In Review'` to `'Reviewed'`, before `release_patchset_claim` runs).
+    async fn is_patchset_claim_active_for_outbox(
+        &self,
+        expected_patchset_id: Option<i64>,
+    ) -> Result<bool> {
+        if let Some(claim) = self.patchset_claim {
+            if expected_patchset_id.is_some_and(|pid| pid != claim.patchset_id) {
+                return Ok(false);
+            }
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets ps
+                     JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
+                     WHERE ps.id = ?
+                       AND ps.status IN ('In Review', 'Reviewed')
+                       AND CAST(m.value AS INTEGER) = ?",
+                    libsql::params![claim.patchset_id, claim.generation],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Releases the active generation marker in `meta` if it still belongs to
+    /// this worker claim and the patchset has already exited `'In Review'`, so
+    /// completed patchsets leave no residual `meta` rows while a failed terminal
+    /// status write never strips the active marker from a still-`'In Review'`
+    /// patchset.
+    pub async fn release_patchset_claim(&self) -> Result<()> {
+        if let Some(claim) = self.patchset_claim {
+            self.execute(
+                "DELETE FROM meta
+                  WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)
+                    AND CAST(value AS INTEGER) = ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = ?
+                           AND ps.status = 'In Review'
+                    )",
+                libsql::params![claim.patchset_id, claim.generation, claim.patchset_id],
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Executes a write statement on the serialized write connection.
@@ -1878,6 +2002,7 @@ impl Database {
             bug_tool: "sashiko".into(),
             bug_model: None,
             bug_claim: None,
+            patchset_claim: None,
         })
     }
 
@@ -2156,6 +2281,24 @@ impl Database {
             }
         }
 
+        let has_patchwork_outbox = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'patchwork_outbox'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if has_patchwork_outbox {
+            self.execute(
+                "CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_patch_msg_id ON patchwork_outbox(patch_msg_id)",
+                (),
+            )
+            .await?;
+        }
+
         info!("Database schema is up to date at version 15.");
 
         Ok(())
@@ -2294,6 +2437,127 @@ impl Database {
         }
     }
 
+    async fn claim_pending_review_id_in_tx(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let id_opt = self
+            .query_returning_i64(
+                "UPDATE reviews
+                    SET status = 'In Review', interaction_id = NULL
+                  WHERE id = (
+                      SELECT id FROM reviews
+                       WHERE patchset_id = ?
+                         AND patch_id IS ?
+                         AND status = 'Pending'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM patchsets ps
+                              WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                         )
+                       ORDER BY id ASC
+                       LIMIT 1
+                  )
+                  RETURNING id",
+                libsql::params![patchset_id, patch_id],
+            )
+            .await?;
+        if let Some(id) = id_opt {
+            self.clear_aborted_review_artifacts_in_tx(id).await?;
+        }
+        Ok(id_opt)
+    }
+
+    /// Atomically claims a `Pending` review row for `(patchset_id, patch_id)`
+    /// (including interrupted `In Review` rows reset to `Pending` on startup
+    /// by `reset_reviewing_status`) by transitioning its status to `'In Review'`,
+    /// clearing any partial artifacts from prior aborted attempts, and
+    /// returning its ID.
+    pub async fn claim_pending_review_id(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if self.patchset_claim.is_some() && !tx_db.is_patchset_claim_active(patchset_id).await? {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let id_opt = tx_db
+            .claim_pending_review_id_in_tx(patchset_id, patch_id)
+            .await?;
+        tx.commit().await?;
+        Ok(id_opt)
+    }
+
+    /// Atomically claims an existing `Pending` review row for
+    /// `(patchset_id, patch_id)` (transitioning it to `'In Review'`, refreshing
+    /// its execution metadata, and clearing any partial artifacts) or inserts a
+    /// new review row directly in `'In Review'` status inside the same immediate
+    /// transaction.
+    pub async fn claim_or_create_in_review(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+    ) -> Result<i64> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active(patchset_id).await? {
+            bail!(
+                "patchset {} no longer exists or was cancelled/superseded",
+                patchset_id
+            );
+        }
+        let id = if let Some(id) = tx_db
+            .claim_pending_review_id_in_tx(patchset_id, patch_id)
+            .await?
+        {
+            tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET provider = ?, model = ?, baseline_id = ?, prompts_hash = ?
+                      WHERE id = ?",
+                    libsql::params![provider, model, baseline_id, prompts_hash, id],
+                )
+                .await?;
+            id
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            tx_db
+                .query_returning_i64(
+                    "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
+                     VALUES (
+                         MAX(
+                             COALESCE((SELECT MAX(id) FROM reviews), 0),
+                             COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'reviews_max_id'), 0)
+                         ) + 1,
+                         ?, ?, 'In Review', ?, ?, ?, ?, ?
+                     )
+                     RETURNING id",
+                    libsql::params![
+                        patchset_id,
+                        patch_id,
+                        now,
+                        provider,
+                        model,
+                        baseline_id,
+                        prompts_hash
+                    ],
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Failed to get review ID"))?
+        };
+        tx.commit().await?;
+        Ok(id)
+    }
+
     pub async fn create_review(
         &self,
         patchset_id: i64,
@@ -2304,8 +2568,15 @@ impl Database {
         prompts_hash: Option<&str>,
     ) -> Result<i64> {
         self.query_returning_i64(
-            "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
-             VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
+             VALUES (
+                 MAX(
+                     COALESCE((SELECT MAX(id) FROM reviews), 0),
+                     COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'reviews_max_id'), 0)
+                 ) + 1,
+                 ?, ?, 'Pending', ?, ?, ?, ?, ?
+             )
+             RETURNING id",
             libsql::params![
                 patchset_id,
                 patch_id,
@@ -2377,21 +2648,89 @@ impl Database {
         status: &str,
         logs: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let cancel_guard = "(? = 'Cancelled' AND EXISTS (
+                SELECT 1 FROM patchsets ps
+                 WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+            ))
+            OR (? != 'Cancelled'
+                AND COALESCE(status, '') != 'Cancelled'
+                AND NOT EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                )
+                AND (? IS NULL OR (
+                    reviews.patchset_id = ?
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps_claim
+                        JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                        WHERE ps_claim.id = reviews.patchset_id
+                          AND ps_claim.status = 'In Review'
+                          AND CAST(m_claim.value AS INTEGER) = ?
+                    )
+                )))";
         if let Some(l) = logs {
             let compressed_logs = crate::compression::compress_string_async(l).await;
             self.execute(
-                "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                libsql::params![status, compressed_logs, review_id],
+                &format!(
+                    "UPDATE reviews SET status = ?, logs = ? WHERE id = ? AND ({cancel_guard})"
+                ),
+                libsql::params![
+                    status,
+                    compressed_logs,
+                    review_id,
+                    status,
+                    status,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen
+                ],
             )
             .await?;
         } else {
             self.execute(
-                "UPDATE reviews SET status = ? WHERE id = ?",
-                libsql::params![status, review_id],
+                &format!("UPDATE reviews SET status = ? WHERE id = ? AND ({cancel_guard})"),
+                libsql::params![
+                    status,
+                    review_id,
+                    status,
+                    status,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen
+                ],
             )
             .await?;
         }
         Ok(())
+    }
+
+    pub async fn mark_review_in_review_if_active(&self, review_id: i64) -> Result<bool> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let updated = self
+            .execute(
+                "UPDATE reviews
+                    SET status = 'In Review'
+                  WHERE id = ?
+                    AND COALESCE(status, '') != 'Cancelled'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )
+                    AND (? IS NULL OR (
+                        reviews.patchset_id = ?
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps_claim
+                            JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                            WHERE ps_claim.id = reviews.patchset_id
+                              AND ps_claim.status = 'In Review'
+                              AND CAST(m_claim.value AS INTEGER) = ?
+                        )
+                    ))",
+                libsql::params![review_id, claim_ps_id, claim_ps_id, claim_gen],
+            )
+            .await?;
+        Ok(updated > 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2405,22 +2744,56 @@ impl Database {
         inline_review: Option<&str>,
         logs: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         let compressed_inline_review =
             crate::compression::compress_opt_string_async(inline_review).await;
         let compressed_logs = crate::compression::compress_opt_string_async(logs).await;
-        self.execute(
-            "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-            libsql::params![
-                status,
-                result,
-                summary,
-                interaction_id,
-                compressed_inline_review,
-                compressed_logs,
-                review_id
-            ],
-        )
-        .await?;
+        let updated = self
+            .execute(
+                "UPDATE reviews
+                    SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?
+                  WHERE id = ?
+                    AND (
+                        (? = 'Cancelled' AND EXISTS (
+                            SELECT 1 FROM patchsets ps
+                             WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                        ))
+                        OR (? != 'Cancelled'
+                            AND COALESCE(status, '') != 'Cancelled'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM patchsets ps
+                                 WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                            )
+                            AND (? IS NULL OR (
+                                reviews.patchset_id = ?
+                                AND EXISTS (
+                                    SELECT 1 FROM patchsets ps_claim
+                                    JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                                    WHERE ps_claim.id = reviews.patchset_id
+                                      AND ps_claim.status = 'In Review'
+                                      AND CAST(m_claim.value AS INTEGER) = ?
+                                )
+                            )))
+                    )",
+                libsql::params![
+                    status,
+                    result,
+                    summary,
+                    interaction_id,
+                    compressed_inline_review,
+                    compressed_logs,
+                    review_id,
+                    status,
+                    status,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen
+                ],
+            )
+            .await?;
+        if updated == 0 {
+            bail!("review {} no longer exists or was superseded", review_id);
+        }
         Ok(())
     }
 
@@ -2451,9 +2824,27 @@ impl Database {
     }
 
     pub async fn create_tool_usage(&self, usage: ToolUsage) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
             "INSERT INTO tool_usages (review_id, provider, model, tool_name, arguments, output_length, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             FROM reviews
+             WHERE id = ?1
+               AND COALESCE(status, '') != 'Cancelled'
+               AND NOT EXISTS (
+                   SELECT 1 FROM patchsets ps
+                    WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+               )
+               AND (?8 IS NULL OR (
+                   reviews.patchset_id = ?8
+                   AND EXISTS (
+                       SELECT 1 FROM patchsets ps_claim
+                       JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                       WHERE ps_claim.id = reviews.patchset_id
+                         AND ps_claim.status = 'In Review'
+                         AND CAST(m_claim.value AS INTEGER) = ?9
+                   )
+               ))",
             libsql::params![
                 usage.review_id,
                 usage.provider,
@@ -2461,7 +2852,9 @@ impl Database {
                 usage.tool_name,
                 usage.arguments,
                 usage.output_length,
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64,
+                claim_ps_id,
+                claim_gen
             ],
         ).await?;
         Ok(())
@@ -2489,24 +2882,53 @@ impl Database {
     }
 
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         let val = finding.preexisting.map(|b| if b { 1 } else { 0 });
         let locations_val = finding
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
-        self.execute(
-            "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            libsql::params![
-                finding.review_id,
-                finding.severity as i32,
-                finding.severity_explanation,
-                finding.problem,
-                val,
-                locations_val,
-            ],
-        )
-        .await?;
+        let inserted = self
+            .execute(
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
+                 SELECT ?, ?, ?, ?, ?, ?
+                 FROM reviews
+                 WHERE id = ?
+                   AND COALESCE(status, '') != 'Cancelled'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patchsets ps
+                        WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                   )
+                   AND (? IS NULL OR (
+                       reviews.patchset_id = ?
+                       AND EXISTS (
+                           SELECT 1 FROM patchsets ps_claim
+                           JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                           WHERE ps_claim.id = reviews.patchset_id
+                             AND ps_claim.status = 'In Review'
+                             AND CAST(m_claim.value AS INTEGER) = ?
+                       )
+                   ))",
+                libsql::params![
+                    finding.review_id,
+                    finding.severity as i32,
+                    finding.severity_explanation,
+                    finding.problem,
+                    val,
+                    locations_val,
+                    finding.review_id,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen,
+                ],
+            )
+            .await?;
+        if inserted == 0 {
+            bail!(
+                "review {} no longer exists for finding insertion",
+                finding.review_id
+            );
+        }
         Ok(())
     }
 
@@ -4985,13 +5407,32 @@ impl Database {
         bug_id: i64,
         is_newly_discovered: bool,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
             "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
-                 VALUES (?1, ?2, ?3)
+                 SELECT id, ?2, ?3 FROM reviews
+                  WHERE id = ?1
+                    AND COALESCE(status, '') != 'Cancelled'
+                    AND (?4 IS NULL OR (
+                        reviews.patchset_id = ?4
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps_claim
+                            JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                            WHERE ps_claim.id = reviews.patchset_id
+                              AND ps_claim.status = 'In Review'
+                              AND CAST(m_claim.value AS INTEGER) = ?5
+                        )
+                    ))
                  ON CONFLICT(review_id, bug_id) DO UPDATE
                     SET is_newly_discovered =
                         MAX(is_newly_discovered, excluded.is_newly_discovered)",
-            libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
+            libsql::params![
+                review_id,
+                bug_id,
+                if is_newly_discovered { 1 } else { 0 },
+                claim_ps_id,
+                claim_gen
+            ],
         )
         .await?;
         Ok(())
@@ -9979,55 +10420,107 @@ impl Database {
         &self,
         patchset_id: i64,
     ) -> Result<Vec<ReleaseReview>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT r.id, r.patch_id, r.inline_review, r.summary,
-                        COALESCE(m.message_id, ps.cover_letter_message_id, ''),
-                        COALESCE(p.part_index, 0)
-             FROM reviews r
-             JOIN patchsets ps ON ps.id = r.patchset_id
-             LEFT JOIN patches p ON r.patch_id = p.id
-             LEFT JOIN messages m ON m.message_id = COALESCE(p.message_id, ps.cover_letter_message_id)
-             WHERE r.patchset_id = ? AND r.status = 'Reviewed'
-             ORDER BY COALESCE(p.part_index, 0) ASC, r.id ASC",
-                libsql::params![patchset_id],
-            )
-            .await?;
+        self.query_completed_reviews_for_release(patchset_id, None)
+            .await
+    }
 
-        let mut temp_reviews = Vec::new();
+    pub async fn get_latest_completed_review_for_patch(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+    ) -> Result<Option<ReleaseReview>> {
+        Ok(self
+            .query_completed_reviews_for_release(patchset_id, Some(patch_id))
+            .await?
+            .pop())
+    }
+
+    async fn query_completed_reviews_for_release(
+        &self,
+        patchset_id: i64,
+        patch_id_filter: Option<Option<i64>>,
+    ) -> Result<Vec<ReleaseReview>> {
+        let mut rows = match patch_id_filter {
+            Some(patch_id) => {
+                self.conn
+                    .query(
+                        "SELECT r.id, r.patch_id, r.inline_review, r.summary,
+                                COALESCE(m.message_id, ps.cover_letter_message_id, ''),
+                                COALESCE(p.part_index, 0)
+                     FROM reviews r
+                     JOIN patchsets ps ON ps.id = r.patchset_id
+                     LEFT JOIN patches p ON r.patch_id = p.id
+                     LEFT JOIN messages m ON m.message_id = COALESCE(p.message_id, ps.cover_letter_message_id)
+                     WHERE r.patchset_id = ? AND r.patch_id IS ? AND r.status = 'Reviewed'
+                     ORDER BY r.id DESC
+                     LIMIT 1",
+                        libsql::params![patchset_id, patch_id],
+                    )
+                    .await?
+            }
+            None => {
+                self.conn
+                    .query(
+                        "SELECT r.id, r.patch_id, r.inline_review, r.summary,
+                                COALESCE(m.message_id, ps.cover_letter_message_id, ''),
+                                COALESCE(p.part_index, 0)
+                     FROM reviews r
+                     JOIN patchsets ps ON ps.id = r.patchset_id
+                     LEFT JOIN patches p ON r.patch_id = p.id
+                     LEFT JOIN messages m ON m.message_id = COALESCE(p.message_id, ps.cover_letter_message_id)
+                     WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                     ORDER BY COALESCE(p.part_index, 0) ASC, r.id ASC",
+                        libsql::params![patchset_id],
+                    )
+                    .await?
+            }
+        };
+
+        let mut reviews = Vec::new();
         while let Some(row) = rows.next().await? {
             let review_id: i64 = row.get(0)?;
             let patch_id: Option<i64> = row.get(1)?;
-            let inline_review: String = crate::compression::get_compressed_string_opt(&row, 2)
-                .unwrap_or(None)
-                .unwrap_or_default();
-            let summary: String = crate::compression::get_compressed_string_opt(&row, 3)
-                .unwrap_or(None)
-                .unwrap_or_default();
+            let inline_review_opt = crate::compression::get_compressed_string_opt(&row, 2)?;
+            let has_inline_review = inline_review_opt.is_some();
+            let inline_review: String = inline_review_opt.unwrap_or_default();
+            let summary: String =
+                crate::compression::get_compressed_string_opt(&row, 3)?.unwrap_or_default();
             let patch_message_id: String = row.get(4).unwrap_or_default();
             let index: i64 = row.get(5).unwrap_or_default();
-            temp_reviews.push((
-                review_id,
+            reviews.push(ReleaseReview {
+                id: review_id,
                 patch_id,
-                inline_review,
-                summary,
                 patch_message_id,
                 index,
-            ));
+                has_inline_review,
+                inline_review,
+                summary,
+                findings: Vec::new(),
+            });
         }
 
-        let mut reviews = Vec::new();
-        for (review_id, patch_id, inline_review, summary, patch_message_id, index) in temp_reviews {
-            // Fetch findings for this review
-            let mut findings_rows = self.conn.query(
-                "SELECT severity, problem, severity_explanation, preexisting, locations FROM findings WHERE review_id = ?",
-                libsql::params![review_id],
-            ).await?;
+        if reviews.is_empty() {
+            return Ok(reviews);
+        }
 
-            let mut findings = Vec::new();
+        const FINDINGS_CHUNK_SIZE: usize = 200;
+        let mut findings_by_review: std::collections::HashMap<i64, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        for chunk in reviews.chunks(FINDINGS_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT review_id, severity, problem, severity_explanation, preexisting, locations
+                   FROM findings
+                  WHERE review_id IN ({})
+                  ORDER BY id ASC",
+                placeholders
+            );
+            let params: Vec<libsql::Value> =
+                chunk.iter().map(|r| libsql::Value::Integer(r.id)).collect();
+            let mut findings_rows = self.conn.query(&sql, params).await?;
             while let Some(f_row) = findings_rows.next().await? {
-                let severity_int: i64 = f_row.get(0).unwrap_or(1);
+                let review_id: i64 = f_row.get(0)?;
+                let severity_int: i64 = f_row.get(1).unwrap_or(1);
                 let severity = match severity_int {
                     4 => "Critical",
                     3 => "High",
@@ -10035,67 +10528,187 @@ impl Database {
                     _ => "Low",
                 }
                 .to_string();
-                let problem: String = f_row.get(1).unwrap_or_default();
-                let severity_explanation: Option<String> = f_row.get(2).ok();
-                let int: Option<i64> = f_row.get(3).ok();
+                let problem: String = f_row.get(2).unwrap_or_default();
+                let severity_explanation: Option<String> = f_row.get(3).ok();
+                let int: Option<i64> = f_row.get(4).ok();
                 let preexisting = int.map(|val| val != 0);
-                let locations_str: Option<String> = f_row.get(4).ok();
+                let locations_str: Option<String> = f_row.get(5).ok();
                 let locations =
                     locations_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
-                findings.push(json!({
-                    "severity": severity,
-                    "problem": problem,
-                    "severity_explanation": severity_explanation,
-                    "preexisting": preexisting,
-                    "locations": locations,
-                }));
+                findings_by_review
+                    .entry(review_id)
+                    .or_default()
+                    .push(json!({
+                        "severity": severity,
+                        "problem": problem,
+                        "severity_explanation": severity_explanation,
+                        "preexisting": preexisting,
+                        "locations": locations,
+                    }));
             }
+        }
 
-            reviews.push(ReleaseReview {
-                id: review_id,
-                patch_id,
-                patch_message_id,
-                index,
-                inline_review,
-                summary,
-                findings,
-            });
+        for review in &mut reviews {
+            if let Some(findings) = findings_by_review.remove(&review.id) {
+                review.findings = findings;
+            }
         }
         Ok(reviews)
     }
 
-    pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
+    pub async fn complete_patchset_review_status(&self, id: i64, status: &str) -> Result<bool> {
         if status == ReviewStatus::Cancelled.as_str() {
-            self.execute(
-                "UPDATE patchsets SET status = ? WHERE id = ?",
-                libsql::params![status, id],
-            )
-            .await?;
-        } else {
-            self.execute(
-                "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
-                libsql::params![status, id],
-            )
-            .await?;
+            let updated = self
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ?",
+                    libsql::params![status, id],
+                )
+                .await?;
+            return Ok(updated > 0);
         }
+        if let Some(claim) = self.patchset_claim {
+            if claim.patchset_id != id {
+                return Ok(false);
+            }
+            let updated = self
+                .execute(
+                    "UPDATE patchsets
+                        SET status = ?
+                      WHERE id = ?
+                        AND status = 'In Review'
+                        AND EXISTS (
+                            SELECT 1 FROM meta m
+                             WHERE m.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
+                               AND CAST(m.value AS INTEGER) = ?
+                        )",
+                    libsql::params![status, id, claim.generation],
+                )
+                .await?;
+            Ok(updated > 0)
+        } else {
+            let updated = self
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
+                    libsql::params![status, id],
+                )
+                .await?;
+            Ok(updated > 0)
+        }
+    }
+
+    pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
+        let _ = self.complete_patchset_review_status(id, status).await?;
         Ok(())
     }
 
-    pub async fn claim_patchset_for_review(&self, id: i64) -> Result<bool> {
-        let count = self
+    async fn allocate_patchset_review_gen_in_tx(&self, id: i64) -> Result<i64> {
+        let generation = self
+            .query_returning_i64(
+                "INSERT INTO meta (key, value) VALUES ('patchset_gen_seq', '1')
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = CAST(CAST(meta.value AS INTEGER) + 1 AS TEXT)
+                 RETURNING CAST(value AS INTEGER)",
+                (),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Failed to allocate patchset review generation"))?;
+        self.execute(
+            "INSERT INTO meta (key, value)
+             VALUES ('patchset_active_gen:' || CAST(? AS TEXT), CAST(? AS TEXT))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![id, generation],
+        )
+        .await?;
+        Ok(generation)
+    }
+
+    /// Atomically claims a `Pending` patchset for review (`status = 'In Review'`)
+    /// and allocates a monotonic claim generation token in `meta` so any stale
+    /// worker superseded by a later `rerun_patchset` or `cancel_patchset` is
+    /// fenced out of all database writes.
+    pub async fn claim_patchset_for_review_with_gen(&self, id: i64) -> Result<Option<i64>> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let count = tx_db
             .execute(
                 "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND status = 'Pending'",
                 libsql::params![id],
             )
             .await?;
-        Ok(count > 0)
+        if count == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let generation = tx_db.allocate_patchset_review_gen_in_tx(id).await?;
+        tx.commit().await?;
+        Ok(Some(generation))
+    }
+
+    /// Transitions a non-cancelled patchset into `'In Review'` and allocates a
+    /// claim generation token for direct callers of `review_patchset_task`.
+    pub async fn enter_patchset_review_with_gen(&self, id: i64) -> Result<Option<i64>> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let count = tx_db
+            .execute(
+                "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND COALESCE(status, '') != 'Cancelled'",
+                libsql::params![id],
+            )
+            .await?;
+        if count == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let generation = tx_db.allocate_patchset_review_gen_in_tx(id).await?;
+        tx.commit().await?;
+        Ok(Some(generation))
+    }
+
+    pub async fn claim_patchset_for_review(&self, id: i64) -> Result<bool> {
+        Ok(self.claim_patchset_for_review_with_gen(id).await?.is_some())
     }
 
     pub async fn update_patch_status(&self, patch_id: i64, status: &str) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
-            "UPDATE patches SET status = ? WHERE id = ?",
-            libsql::params![status, patch_id],
+            "UPDATE patches
+                SET status = ?
+              WHERE id = ?
+                AND (
+                    (? = 'Cancelled'
+                        AND COALESCE(status, '') NOT IN ('Reviewed', 'Skipped', 'Failed')
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps
+                             WHERE ps.id = patches.patchset_id AND ps.status = 'Cancelled'
+                        ))
+                    OR (? != 'Cancelled'
+                        AND (? = 'Pending' OR COALESCE(status, '') != 'Cancelled')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM patchsets ps
+                             WHERE ps.id = patches.patchset_id AND ps.status = 'Cancelled'
+                        )
+                        AND (? IS NULL OR (
+                            patches.patchset_id = ?
+                            AND EXISTS (
+                                SELECT 1 FROM patchsets ps_claim
+                                JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                                WHERE ps_claim.id = patches.patchset_id
+                                  AND ps_claim.status = 'In Review'
+                                  AND CAST(m_claim.value AS INTEGER) = ?
+                            )
+                        )))
+                )",
+            libsql::params![
+                status,
+                patch_id,
+                status,
+                status,
+                status,
+                claim_ps_id,
+                claim_ps_id,
+                claim_gen
+            ],
         )
         .await?;
         Ok(())
@@ -10152,11 +10765,22 @@ impl Database {
         } else {
             "('Fetching', 'Pending', 'Incomplete')"
         };
-        // Atomically transition patchsets.status to 'Cancelled' first so any
-        // concurrent worker calling update_patchset_status (which guards with
-        // status != 'Cancelled') is immediately blocked from marking the
-        // patchset as 'Reviewed'.
-        let count = self
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
+        // Atomically transition patchsets.status to 'Cancelled' inside an
+        // immediate transaction so concurrent workers calling
+        // update_patchset_status, create_tool_usage, create_finding, or
+        // link_review_to_bug cannot interleave between child artifact cleanup
+        // and marking review/patch rows Cancelled.
+        let count = tx_db
             .execute(
                 &format!(
                     "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN {}",
@@ -10166,21 +10790,64 @@ impl Database {
             )
             .await?;
         if count == 0 {
+            if let Some(tx) = tx_guard {
+                tx.commit().await?;
+            }
             return Ok(false);
         }
 
-        self.execute(
-                "UPDATE reviews SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review')",
+        tx_db
+            .execute(
+                "DELETE FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
                 libsql::params![id],
             )
             .await?;
-        self.execute(
-                "UPDATE patches SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review', 'Reviewing')",
+
+        for table in ["tool_usages", "findings", "bug_reviews"] {
+            tx_db
+                .execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE review_id IN (
+                            SELECT id FROM reviews
+                             WHERE patchset_id = ? AND status IN ('Pending', 'In Review')
+                        )"
+                    ),
+                    libsql::params![id],
+                )
+                .await?;
+        }
+        tx_db
+            .execute(
+                "UPDATE reviews
+                    SET status = 'Cancelled', interaction_id = NULL
+                  WHERE patchset_id = ? AND status IN ('Pending', 'In Review')",
                 libsql::params![id],
             )
             .await?;
-        self.cancel_outbox_for_patchset(id, "Cancelled because patchset was cancelled")
+        tx_db
+            .execute(
+                "UPDATE patches
+                    SET status = 'Cancelled'
+                  WHERE patchset_id = ?
+                    AND (
+                        status IS NULL
+                        OR status IN ('Pending', 'In Review', 'Reviewing')
+                        OR (status = 'applied' AND NOT EXISTS (
+                            SELECT 1 FROM reviews r
+                             WHERE r.patchset_id = patches.patchset_id
+                               AND r.patch_id = patches.id
+                               AND r.status = 'Reviewed'
+                        ))
+                    )",
+                libsql::params![id],
+            )
             .await?;
+        tx_db
+            .cancel_outbox_for_patchset(id, "Cancelled because patchset was cancelled")
+            .await?;
+        if let Some(tx) = tx_guard {
+            tx.commit().await?;
+        }
         Ok(true)
     }
 
@@ -11705,63 +12372,434 @@ impl Database {
     }
 
     pub async fn rerun_patchset(&self, id: i64) -> Result<()> {
-        // 1. Get current status of the patchset
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT status FROM patchsets WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
 
-        let current_status = if let Some(row) = rows.next().await? {
-            row.get::<Option<String>>(0)?
-        } else {
-            None
+        // 1. Get current status of the patchset under the write lock
+        let current_status = {
+            let mut rows = tx_db
+                .conn
+                .query(
+                    "SELECT status FROM patchsets WHERE id = ?",
+                    libsql::params![id],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                row.get::<Option<String>>(0)?
+            } else {
+                None
+            }
         };
 
         let should_increment = current_status.as_deref() == Some("Reviewed");
 
-        // 2. Reset patchset status to Pending
-        self.execute(
-            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
-            libsql::params![id],
-        )
-        .await?;
+        // 2. Reset patchset, active claim generation, and non-terminal/failed patch statuses to Pending
+        tx_db
+            .execute(
+                "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        tx_db
+            .execute(
+                "DELETE FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+                libsql::params![id],
+            )
+            .await?;
+        tx_db
+            .execute(
+                "UPDATE patches
+                    SET status = 'Pending', apply_error = NULL
+                  WHERE patchset_id = ?
+                    AND (status IN ('Failed', 'Cancelled', 'In Review', 'error')
+                         OR (status = 'applied' AND NOT EXISTS (
+                             SELECT 1 FROM reviews r
+                              WHERE r.patchset_id = ? AND r.patch_id = patches.id AND r.status = 'Reviewed'
+                         )))",
+                libsql::params![id, id],
+            )
+            .await?;
 
         // 3. Increment target_review_count only if it was previously Reviewed
         if should_increment {
-            self.execute(
+            tx_db
+                .execute(
                     "UPDATE patchsets SET target_review_count = COALESCE(target_review_count, 1) + 1 WHERE id = ?",
                     libsql::params![id],
                 )
                 .await?;
         }
 
-        // 4. Delete associated tool usages and findings for failed reviews that block retrying
+        // 4. Delete associated tool usages, findings, bug links, and unsent
+        // outbox entries for infra-failed attempts (interaction_id IS NULL,
+        // which are the only Failed rows matched by has_failed_review()) and
+        // interrupted/cancelled ('In Review', 'Cancelled') attempts before
+        // deleting those review rows in step 5. Standalone ai_interactions rows
+        // have no foreign key to reviews and remain in the ledger for cumulative
+        // token accounting.
+        let review_filter = "((status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL) OR status IN ('In Review', 'Cancelled'))";
+
+        tx_db
+            .execute(
+                &format!(
+                    "DELETE FROM tool_usages WHERE review_id IN (
+                        SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                    )"
+                ),
+                libsql::params![id],
+            )
+            .await?;
+
+        tx_db
+            .execute(
+                &format!(
+                    "DELETE FROM findings WHERE review_id IN (
+                        SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                    )"
+                ),
+                libsql::params![id],
+            )
+            .await?;
+
+        tx_db
+            .execute(
+                &format!(
+                    "DELETE FROM bug_reviews WHERE review_id IN (
+                        SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                    )"
+                ),
+                libsql::params![id],
+            )
+            .await?;
+
+        tx_db
+            .execute(
+                &format!(
+                    "DELETE FROM email_outbox
+                      WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                        AND patch_id IN (
+                            SELECT id FROM patches WHERE patchset_id = ?
+                        )
+                        AND (
+                            patch_id IN (
+                                SELECT patch_id FROM reviews
+                                 WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
+                            )
+                            OR status = 'Cancelled'
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM reviews r_ok
+                             WHERE r_ok.patchset_id = ? AND r_ok.patch_id = email_outbox.patch_id AND r_ok.status = 'Reviewed'
+                        )"
+                ),
+                libsql::params![id, id, id],
+            )
+            .await?;
+
+        tx_db
+            .execute(
+                &format!(
+                    "DELETE FROM email_outbox
+                      WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                        AND patch_id IS NULL
+                        AND patchset_id = ?
+                        AND (
+                            EXISTS (
+                                SELECT 1 FROM reviews
+                                 WHERE patchset_id = ? AND patch_id IS NULL AND {review_filter}
+                            )
+                            OR status = 'Cancelled'
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM reviews r_ok
+                             WHERE r_ok.patchset_id = ? AND r_ok.patch_id IS NULL AND r_ok.status = 'Reviewed'
+                        )"
+                ),
+                libsql::params![id, id, id],
+            )
+            .await?;
+
+        tx_db
+            .execute(
+                &format!(
+                    "DELETE FROM patchwork_outbox
+                      WHERE status IN ('Pending', 'Cancelled')
+                        AND patch_msg_id IN (
+                            SELECT p.message_id FROM patches p
+                            WHERE p.patchset_id = ?
+                              AND (
+                                  p.id IN (
+                                      SELECT patch_id FROM reviews
+                                       WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
+                                  )
+                                  OR patchwork_outbox.status = 'Cancelled'
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM reviews r_ok
+                                   WHERE r_ok.patch_id = p.id AND r_ok.status = 'Reviewed'
+                              )
+                        )"
+                ),
+                libsql::params![id, id],
+            )
+            .await?;
+
+        // 5. Record the high-water review ID before deleting failed,
+        // cancelled, or interrupted ('In Review') review rows so SQLite never
+        // recycles the deleted rowid on the next INSERT INTO reviews.
+        tx_db
+            .execute(
+                "INSERT INTO meta (key, value)
+                 VALUES (
+                     'reviews_max_id',
+                     CAST((SELECT COALESCE(MAX(id), 0) FROM reviews) AS TEXT)
+                 )
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = CAST(
+                         MAX(CAST(meta.value AS INTEGER), CAST(excluded.value AS INTEGER))
+                         AS TEXT
+                     )",
+                (),
+            )
+            .await?;
+        tx_db
+            .execute(
+                &format!("DELETE FROM reviews WHERE patchset_id = ? AND {review_filter}"),
+                libsql::params![id],
+            )
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Clears any partial tool usages, findings, bug links, unsent outbox rows,
+    /// and interaction reference attached to a review row inside an immediate
+    /// transaction before an in-process retry or claimed Pending row reuses it.
+    pub async fn clear_aborted_review_artifacts(&self, review_id: i64) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        tx_db
+            .clear_aborted_review_artifacts_in_tx(review_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically clears partial artifacts for `review_id` and transitions it
+    /// to `'Cancelled'` while the parent patchset remains `'Cancelled'` (or
+    /// no-ops if a concurrent rerun already reset the patchset or deleted the
+    /// row).
+    pub async fn cancel_aborted_review(&self, review_id: i64, reason: &str) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let id_opt = tx_db
+            .query_returning_i64(
+                "SELECT id FROM reviews
+                  WHERE id = ?
+                    AND status IN ('Pending', 'In Review', 'Cancelled')
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )",
+                libsql::params![review_id],
+            )
+            .await?;
+        if id_opt.is_some() {
+            tx_db
+                .delete_aborted_review_children_in_tx(review_id)
+                .await?;
+            tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET status = 'Cancelled',
+                            result_description = ?,
+                            interaction_id = NULL
+                      WHERE id = ?
+                        AND status IN ('Pending', 'In Review', 'Cancelled')",
+                    libsql::params![reason, review_id],
+                )
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically cancels any `'Pending'` or orphaned `'In Review'` review row
+    /// for `(patchset_id, patch_id)` and clears its partial artifacts inside a
+    /// single immediate transaction while the parent patchset remains
+    /// `'Cancelled'`.
+    pub async fn cancel_pending_review_for_patch(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+        reason: &str,
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let id_opt = tx_db
+            .query_returning_i64(
+                "SELECT id FROM reviews
+                  WHERE patchset_id = ?
+                    AND patch_id IS ?
+                    AND status IN ('Pending', 'In Review')
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )
+                  ORDER BY id ASC LIMIT 1",
+                libsql::params![patchset_id, patch_id],
+            )
+            .await?;
+        if let Some(review_id) = id_opt {
+            tx_db
+                .delete_aborted_review_children_in_tx(review_id)
+                .await?;
+            tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET status = 'Cancelled',
+                            result_description = ?,
+                            interaction_id = NULL
+                      WHERE id = ?",
+                    libsql::params![reason, review_id],
+                )
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_aborted_review_children_in_tx(&self, review_id: i64) -> Result<()> {
         self.execute(
-                "DELETE FROM tool_usages WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
+            "DELETE FROM tool_usages WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM findings WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM bug_reviews WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM email_outbox
+              WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                AND patch_id IN (SELECT patch_id FROM reviews WHERE id = ? AND patch_id IS NOT NULL)
+                AND NOT EXISTS (
+                    SELECT 1 FROM reviews r_ok
+                     WHERE r_ok.patch_id = email_outbox.patch_id AND r_ok.status = 'Reviewed'
                 )",
-                libsql::params![id],
-            )
-            .await?;
-
+            libsql::params![review_id],
+        )
+        .await?;
         self.execute(
-                "DELETE FROM findings WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
+            "DELETE FROM email_outbox
+              WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                AND patch_id IS NULL
+                AND patchset_id IN (SELECT patchset_id FROM reviews WHERE id = ? AND patch_id IS NULL)
+                AND NOT EXISTS (
+                    SELECT 1 FROM reviews r_ok
+                     WHERE r_ok.patchset_id = email_outbox.patchset_id AND r_ok.patch_id IS NULL AND r_ok.status = 'Reviewed'
                 )",
-                libsql::params![id],
-            )
-            .await?;
-
-        // 5. Delete failed reviews that block retrying (infra failures)
+            libsql::params![review_id],
+        )
+        .await?;
         self.execute(
-                "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
-                libsql::params![id],
+            "DELETE FROM patchwork_outbox
+              WHERE status IN ('Pending', 'Cancelled')
+                AND patch_msg_id IN (
+                    SELECT p.message_id FROM patches p
+                    JOIN reviews r ON r.patch_id = p.id
+                    WHERE r.id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reviews r_ok
+                           WHERE r_ok.patch_id = p.id AND r_ok.status = 'Reviewed'
+                      )
+                )",
+            libsql::params![review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_aborted_review_artifacts_in_tx(&self, review_id: i64) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let active = self
+            .query_returning_i64(
+                "UPDATE reviews
+                    SET status = 'In Review', interaction_id = NULL
+                  WHERE id = ?
+                    AND COALESCE(status, '') != 'Cancelled'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )
+                    AND (? IS NULL OR (
+                        reviews.patchset_id = ?
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps_claim
+                            JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                            WHERE ps_claim.id = reviews.patchset_id
+                              AND ps_claim.status = 'In Review'
+                              AND CAST(m_claim.value AS INTEGER) = ?
+                        )
+                    ))
+                  RETURNING id",
+                libsql::params![review_id, claim_ps_id, claim_ps_id, claim_gen],
             )
             .await?;
+        if active.is_none() {
+            bail!("review {} no longer exists or was superseded", review_id);
+        }
+        self.delete_aborted_review_children_in_tx(review_id).await?;
 
+        Ok(())
+    }
+
+    /// Transitions any still-`'In Review'` review rows for `patchset_id` to
+    /// `'Failed'` and clears their partial artifacts inside an immediate
+    /// transaction when the owning review task terminates abnormally or errors
+    /// out while its claim generation is still active.
+    pub async fn fail_orphaned_in_review_rows(&self, patchset_id: i64, reason: &str) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active(patchset_id).await? {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let mut review_ids = Vec::new();
+        {
+            let mut rows = tx_db
+                .conn
+                .query(
+                    "SELECT id FROM reviews WHERE patchset_id = ? AND status = 'In Review'",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                review_ids.push(row.get::<i64>(0)?);
+            }
+        }
+        for rev_id in review_ids {
+            tx_db.delete_aborted_review_children_in_tx(rev_id).await?;
+            tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET status = 'Failed',
+                            result_description = ?,
+                            interaction_id = NULL
+                      WHERE id = ?
+                        AND status = 'In Review'",
+                    libsql::params![reason, rev_id],
+                )
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -12027,16 +13065,32 @@ impl Database {
         logs: Option<&str>,
         provider: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         let compressed_logs = crate::compression::compress_opt_string_async(logs).await;
         self.execute(
-            "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
+            "UPDATE patchsets
+                SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ?
+              WHERE id = ?
+                AND COALESCE(status, '') != 'Cancelled'
+                AND (? IS NULL OR (
+                    patchsets.id = ?
+                    AND patchsets.status = 'In Review'
+                    AND EXISTS (
+                        SELECT 1 FROM meta m_claim
+                         WHERE m_claim.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
+                           AND CAST(m_claim.value AS INTEGER) = ?
+                    )
+                ))",
             libsql::params![
                 baseline_id,
                 model_name,
                 prompts_hash,
                 compressed_logs,
                 provider,
-                id
+                id,
+                claim_ps_id,
+                claim_ps_id,
+                claim_gen
             ],
         )
         .await?;
@@ -12050,17 +13104,47 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
-            "UPDATE patches SET status = ?, apply_error = ? WHERE patchset_id = ? AND part_index = ?",
-            libsql::params![status, error, patchset_id, part_index],
-        ).await?;
+            "UPDATE patches
+                SET status = ?, apply_error = ?
+              WHERE patchset_id = ?
+                AND part_index = ?
+                AND (status IS NULL OR status IN ('Pending', 'In Review', 'Reviewing', 'applied', 'error'))
+                AND NOT EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = patches.patchset_id AND ps.status = 'Cancelled'
+                )
+                AND (? IS NULL OR (
+                    patches.patchset_id = ?
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps_claim
+                        JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                        WHERE ps_claim.id = patches.patchset_id
+                          AND ps_claim.status = 'In Review'
+                          AND CAST(m_claim.value AS INTEGER) = ?
+                    )
+                ))",
+            libsql::params![
+                status,
+                error,
+                patchset_id,
+                part_index,
+                claim_ps_id,
+                claim_ps_id,
+                claim_gen
+            ],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn reset_reviewing_status(&self) -> Result<u64> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
         let status_pending = ReviewStatus::Pending.as_str();
-        // Reset Patchsets
-        let count_ps = self
+        // Reset Patchsets and invalidate any prior active claim generations
+        let count_ps = tx_db
             .execute(
                 format!(
                     "UPDATE patchsets SET status = '{}' WHERE status IN ('In Review', 'Reviewing')",
@@ -12070,9 +13154,15 @@ impl Database {
                 (),
             )
             .await?;
+        tx_db
+            .execute(
+                "DELETE FROM meta WHERE key LIKE 'patchset_active_gen:%'",
+                (),
+            )
+            .await?;
 
         // Reset Reviews
-        let count_rev = self
+        let count_rev = tx_db
             .execute(
                 format!(
                     "UPDATE reviews SET status = '{}' WHERE status = 'In Review'",
@@ -12083,6 +13173,7 @@ impl Database {
             )
             .await?;
 
+        tx.commit().await?;
         Ok(count_ps + count_rev)
     }
 
@@ -12119,24 +13210,80 @@ impl Database {
         references_hdr: &str,
         body: &str,
     ) -> Result<()> {
-        // Prevent duplicate emails for the same patch
+        // Prevent duplicate emails for the same patch; if an unsent row from an
+        // aborted attempt exists, refresh its payload with the latest review.
         let tx = self.begin_immediate_transaction().await?;
-        let mut rows = tx
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active_for_outbox(None).await? {
+            return Ok(());
+        }
+        let mut ps_rows = tx
             .query(
-                "SELECT 1 FROM email_outbox WHERE patch_id = ?",
+                "SELECT ps.status FROM patches p JOIN patchsets ps ON ps.id = p.patchset_id WHERE p.id = ?",
                 libsql::params![patch_id],
             )
             .await?;
+        if let Some(ps_row) = ps_rows.next().await?
+            && ps_row.get::<Option<String>>(0)?.as_deref() == Some("Cancelled")
+        {
+            return Ok(());
+        }
+        drop(ps_rows);
+        let existing = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status FROM email_outbox WHERE patch_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![patch_id],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let existing_status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                Some((id, existing_status))
+            } else {
+                None
+            }
+        };
 
-        if rows.next().await?.is_some() {
-            drop(rows);
+        if let Some((existing_id, existing_status)) = existing {
+            if matches!(
+                existing_status.as_str(),
+                "Pending"
+                    | "Embargoed"
+                    | "Skipped"
+                    | "Muted"
+                    | "Disabled"
+                    | "Dry-Run"
+                    | "Cancelled"
+            ) {
+                tx.execute(
+                    "UPDATE email_outbox
+                        SET status = ?, to_addresses = ?, cc_addresses = ?,
+                            subject = ?, in_reply_to = ?, references_hdr = ?, body = ?,
+                            error_log = NULL
+                      WHERE id = ?",
+                    libsql::params![
+                        status,
+                        to_addresses,
+                        cc_addresses,
+                        subject,
+                        in_reply_to,
+                        references_hdr,
+                        body,
+                        existing_id,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(());
+            }
             tracing::info!(
-                "Email outbox entry already exists for patch_id {}, skipping to prevent duplicates.",
-                patch_id
+                "Email outbox entry already exists for patch_id {} (status {}), skipping to prevent duplicates.",
+                patch_id,
+                existing_status
             );
             return Ok(());
         }
-        drop(rows);
 
         let created_at = chrono::Utc::now().timestamp();
         tx.execute(
@@ -12173,23 +13320,83 @@ impl Database {
         body: &str,
     ) -> Result<()> {
         let tx = self.begin_immediate_transaction().await?;
-        let mut rows = tx
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db
+            .is_patchset_claim_active_for_outbox(Some(patchset_id))
+            .await?
+        {
+            return Ok(());
+        }
+        let mut ps_rows = tx
             .query(
-                "SELECT 1 FROM email_outbox
-                 WHERE patchset_id = ? AND patch_id IS NULL AND kind = ?",
-                libsql::params![patchset_id, EmailKind::ReviewReply.as_str()],
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
             )
             .await?;
+        if let Some(ps_row) = ps_rows.next().await?
+            && ps_row.get::<Option<String>>(0)?.as_deref() == Some("Cancelled")
+        {
+            return Ok(());
+        }
+        drop(ps_rows);
+        let existing = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status FROM email_outbox
+                     WHERE patchset_id = ? AND patch_id IS NULL AND kind = ?
+                     ORDER BY id DESC LIMIT 1",
+                    libsql::params![patchset_id, EmailKind::ReviewReply.as_str()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let existing_status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                Some((id, existing_status))
+            } else {
+                None
+            }
+        };
 
-        if rows.next().await?.is_some() {
-            drop(rows);
+        if let Some((existing_id, existing_status)) = existing {
+            if matches!(
+                existing_status.as_str(),
+                "Pending"
+                    | "Embargoed"
+                    | "Skipped"
+                    | "Muted"
+                    | "Disabled"
+                    | "Dry-Run"
+                    | "Cancelled"
+            ) {
+                tx.execute(
+                    "UPDATE email_outbox
+                        SET review_id = ?, status = ?, to_addresses = ?, cc_addresses = ?,
+                            subject = ?, in_reply_to = ?, references_hdr = ?, body = ?,
+                            error_log = NULL
+                      WHERE id = ?",
+                    libsql::params![
+                        review_id,
+                        status,
+                        to_addresses,
+                        cc_addresses,
+                        subject,
+                        in_reply_to,
+                        references_hdr,
+                        body,
+                        existing_id,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(());
+            }
             tracing::info!(
-                "Cover letter email outbox entry already exists for patchset_id {}, skipping to prevent duplicates.",
-                patchset_id
+                "Cover letter email outbox entry already exists for patchset_id {} (status {}), skipping to prevent duplicates.",
+                patchset_id,
+                existing_status
             );
             return Ok(());
         }
-        drop(rows);
 
         let created_at = chrono::Utc::now().timestamp();
         tx.execute(
@@ -12360,33 +13567,78 @@ impl Database {
         target_url: &str,
         context: &str,
     ) -> Result<()> {
-        let mut rows = self
-            .conn
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active_for_outbox(None).await? {
+            return Ok(());
+        }
+        let mut ps_rows = tx
             .query(
-                "SELECT 1 FROM patchwork_outbox
-                 WHERE patch_msg_id = ? AND api_url = ? AND context = ?",
-                libsql::params![patch_msg_id, api_url, context],
+                "SELECT 1 FROM patches p
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.message_id = ? AND ps.status = 'Cancelled'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patches p2
+                       JOIN patchsets ps2 ON ps2.id = p2.patchset_id
+                       WHERE p2.message_id = ? AND COALESCE(ps2.status, '') != 'Cancelled'
+                   )
+                 LIMIT 1",
+                libsql::params![patch_msg_id, patch_msg_id],
             )
             .await?;
-        if rows.next().await?.is_some() {
+        if ps_rows.next().await?.is_some() {
+            return Ok(());
+        }
+        drop(ps_rows);
+        let existing = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status FROM patchwork_outbox
+                     WHERE patch_msg_id = ? AND api_url = ? AND context = ?
+                     ORDER BY id DESC LIMIT 1",
+                    libsql::params![patch_msg_id, api_url, context],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let existing_status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                Some((id, existing_status))
+            } else {
+                None
+            }
+        };
+
+        if let Some((existing_id, existing_status)) = existing {
+            if matches!(existing_status.as_str(), "Pending" | "Cancelled") {
+                tx.execute(
+                    "UPDATE patchwork_outbox
+                        SET status = 'Pending', check_state = ?, description = ?, target_url = ?,
+                            retry_count = 0, next_retry_at = NULL, locked_at = NULL, error_log = NULL
+                      WHERE id = ?",
+                    libsql::params![check_state, description, target_url, existing_id],
+                )
+                .await?;
+                tx.commit().await?;
+            }
             return Ok(());
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.execute(
-                "INSERT INTO patchwork_outbox (patch_msg_id, api_url, check_state, description, target_url, context, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    patch_msg_id,
-                    api_url,
-                    check_state,
-                    description,
-                    target_url,
-                    context,
-                    created_at,
-                ],
-            )
-            .await?;
+        tx.execute(
+            "INSERT INTO patchwork_outbox (patch_msg_id, api_url, check_state, description, target_url, context, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                patch_msg_id,
+                api_url,
+                check_state,
+                description,
+                target_url,
+                context,
+                created_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -12516,6 +13768,16 @@ impl Database {
         target_url: &str,
         status: &str,
     ) -> Result<()> {
+        if !self
+            .is_patchset_claim_active_for_outbox(Some(patchset_id))
+            .await?
+        {
+            info!(
+                "Skipping forge outbox insertion for superseded worker on patchset {}",
+                patchset_id
+            );
+            return Ok(());
+        }
         if self.get_patchset_status(patchset_id).await?.as_deref()
             == Some(ReviewStatus::Cancelled.as_str())
         {
@@ -27661,5 +28923,937 @@ mod tests {
                 "unexpected uncompressed text row > 1024 bytes in {table}.{col}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_rerun_patchset_cleans_in_review_artifacts_and_resets_to_pending() -> Result<()> {
+        let db = setup_db().await;
+        let tid = db
+            .create_thread("in_review_cleanup@kernel.org", "[PATCH] test", 1000)
+            .await?;
+        db.create_message(
+            "in_review_cleanup@kernel.org",
+            tid,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] test",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                None,
+                "in_review_cleanup@kernel.org",
+                "[PATCH] test",
+                "Author <a@b.c>",
+                1000,
+                1,
+                1,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "in_review_cleanup@kernel.org", 1, "diff")
+            .await?;
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.create_ai_interaction(AiInteractionParams {
+            id: "inter-aborted-1",
+            parent_id: None,
+            workflow_id: None,
+            provider: "gemini",
+            model: "pro",
+            input: "in",
+            output: "out",
+            tokens_in: 10,
+            tokens_out: 20,
+            tokens_cached: 0,
+        })
+        .await?;
+        db.update_review_status(review_id, "In Review", Some("inter-aborted-1"))
+            .await?;
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::High,
+            severity_explanation: Some("partial finding before DB completion error".to_string()),
+            problem: "partial finding".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.create_tool_usage(ToolUsage {
+            review_id,
+            provider: "gemini".to_string(),
+            model: "pro".to_string(),
+            tool_name: "git_diff".to_string(),
+            arguments: Some("{}".to_string()),
+            output_length: 12,
+        })
+        .await?;
+        let bug_id = db
+            .create_bug(&NewBug {
+                bugid: "linux-aborted-rerun-1".to_string(),
+                title: "Partial bug candidate".to_string(),
+                lifecycle_status: BugLifecycleStatus::New,
+                pipeline_state: BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
+                discovered_in_patchset_id: Some(ps_id),
+                discovered_in_patch_id: Some(patch_id),
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![],
+            })
+            .await?;
+        db.link_review_to_bug(review_id, bug_id, true).await?;
+        db.insert_email_outbox(
+            patch_id,
+            "Pending",
+            "to@b.c",
+            "",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "stale outbox body",
+        )
+        .await?;
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "warning",
+            "stale patchwork check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+
+        db.rerun_patchset(ps_id).await?;
+
+        let reused_id = db.get_pending_review_id(ps_id, Some(patch_id)).await?;
+        assert_eq!(reused_id, None);
+
+        let mut eo_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let eo_count: i64 = eo_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(eo_count, 0);
+
+        let mut pw_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchwork_outbox WHERE patch_msg_id = ?",
+                libsql::params!["in_review_cleanup@kernel.org"],
+            )
+            .await?;
+        let pw_count: i64 = pw_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(pw_count, 0);
+
+        let mut br_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM bug_reviews WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let br_count: i64 = br_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(br_count, 0);
+
+        let mut f_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let f_count: i64 = f_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(
+            f_count, 0,
+            "rerun_patchset must delete partial findings from In Review rows"
+        );
+
+        let mut t_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM tool_usages WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let t_count: i64 = t_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(t_count, 0);
+
+        let mut rev_rows = db
+            .conn
+            .query(
+                "SELECT 1 FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        assert!(rev_rows.next().await?.is_none());
+
+        assert!(
+            db.complete_review(
+                review_id,
+                "Reviewed",
+                "late completion from old worker",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert!(db.clear_aborted_review_artifacts(review_id).await.is_err());
+
+        // Also verify clear_aborted_review_artifacts on a claimed Pending row
+        let retry_rev_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.create_finding(Finding {
+            review_id: retry_rev_id,
+            severity: Severity::Medium,
+            severity_explanation: Some("aborted finding".to_string()),
+            problem: "aborted".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.create_tool_usage(ToolUsage {
+            review_id: retry_rev_id,
+            provider: "gemini".to_string(),
+            model: "pro".to_string(),
+            tool_name: "git_diff".to_string(),
+            arguments: Some("{}".to_string()),
+            output_length: 8,
+        })
+        .await?;
+        db.link_review_to_bug(retry_rev_id, bug_id, true).await?;
+        db.insert_email_outbox(
+            patch_id,
+            "Pending",
+            "to@b.c",
+            "",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "aborted body",
+        )
+        .await?;
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "warning",
+            "aborted patchwork check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+
+        let claimed = db.claim_pending_review_id(ps_id, Some(patch_id)).await?;
+        assert_eq!(claimed, Some(retry_rev_id));
+
+        for table in ["findings", "tool_usages", "bug_reviews"] {
+            let mut rows = db
+                .conn
+                .query(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE review_id = ?"),
+                    libsql::params![retry_rev_id],
+                )
+                .await?;
+            let count: i64 = rows.next().await?.unwrap().get(0)?;
+            assert_eq!(count, 0, "expected {table} to be cleared");
+        }
+        let mut eo2 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        assert_eq!(eo2.next().await?.unwrap().get::<i64>(0)?, 0);
+        let mut pw2 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchwork_outbox WHERE patch_msg_id = ?",
+                libsql::params!["in_review_cleanup@kernel.org"],
+            )
+            .await?;
+        assert_eq!(pw2.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        // While retry_rev_id is actively 'In Review', claim_or_create_in_review
+        // must NOT reclaim a live 'In Review' row (which would allow two workers
+        // to share a review ID); once a daemon restarts and reset_reviewing_status()
+        // transitions retry_rev_id back to 'Pending', claim_or_create_in_review
+        // reclaims it and clears any orphaned findings.
+        db.create_finding(Finding {
+            review_id: retry_rev_id,
+            severity: Severity::Low,
+            severity_explanation: Some("orphaned finding".to_string()),
+            problem: "orphaned".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.reset_reviewing_status().await?;
+        let reclaimed_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert_eq!(reclaimed_id, retry_rev_id);
+        let mut orphaned_f_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM findings WHERE review_id = ?",
+                libsql::params![retry_rev_id],
+            )
+            .await?;
+        assert_eq!(orphaned_f_rows.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        // Once the active review reaches a terminal status, a subsequent
+        // claim_or_create_in_review inserts a fresh row directly in 'In Review'.
+        db.complete_review(
+            retry_rev_id,
+            "Reviewed",
+            "completed",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let fresh_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert_ne!(fresh_id, retry_rev_id);
+
+        // Verify that unsent outbox rows ('Skipped', 'Dry-Run', 'Pending') are
+        // refreshed in place when a subsequent review run queues notifications.
+        db.insert_email_outbox(
+            patch_id,
+            "Skipped",
+            "to@b.c",
+            "",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "clean body",
+        )
+        .await?;
+        db.insert_email_outbox(
+            patch_id,
+            "Pending",
+            "to@b.c",
+            "cc@b.c",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "finding body",
+        )
+        .await?;
+        let mut eo_refresh = db
+            .conn
+            .query(
+                "SELECT status, body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let eo_row = eo_refresh.next().await?.unwrap();
+        assert_eq!(eo_row.get::<String>(0)?, "Pending");
+        assert_eq!(eo_row.get::<String>(1)?, "finding body");
+        assert!(eo_refresh.next().await?.is_none());
+
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "success",
+            "clean check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "warning",
+            "finding check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+        let mut pw_refresh = db
+            .conn
+            .query(
+                "SELECT check_state, description FROM patchwork_outbox WHERE patch_msg_id = ?",
+                libsql::params!["in_review_cleanup@kernel.org"],
+            )
+            .await?;
+        let pw_row = pw_refresh.next().await?.unwrap();
+        assert_eq!(pw_row.get::<String>(0)?, "warning");
+        assert_eq!(pw_row.get::<String>(1)?, "finding check");
+        assert!(pw_refresh.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_cancelled_worker_cannot_poison_concurrent_rerun() -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("late_cancel_rerun@kernel.org", "[PATCH] test", 1000)
+            .await?;
+        db.create_message(
+            "late_cancel_rerun@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] test late cancel vs rerun",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("late_cancel_rerun@kernel.org"),
+                "late_cancel_rerun@kernel.org",
+                "[PATCH] test late cancel vs rerun",
+                "Author <a@b.c>",
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(
+                ps_id,
+                "late_cancel_rerun@kernel.org",
+                1,
+                "diff --git a/x.c b/x.c",
+            )
+            .await?;
+
+        assert!(db.claim_patchset_for_review(ps_id).await?);
+        let first_rev_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.create_finding(Finding {
+            review_id: first_rev_id,
+            severity: Severity::Medium,
+            severity_explanation: Some("first attempt partial finding".to_string()),
+            problem: "partial".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+
+        // Operator cancels the in-flight patchset, then immediately triggers a rerun
+        // before the old worker finishes unwinding.
+        assert!(db.cancel_patchset(ps_id, true).await?);
+
+        // An in-flight worker racing against cancellation on the ignore_files or
+        // normal review path cannot claim/insert a new 'In Review' row or mark an
+        // existing row 'Skipped' / 'Reviewed' once patchsets.status is 'Cancelled'.
+        let claim_err = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await
+            .expect_err("claim_or_create_in_review must reject cancelled patchset");
+        assert!(
+            claim_err.to_string().contains("no longer exists"),
+            "unexpected claim error: {claim_err}"
+        );
+        let complete_err = db
+            .complete_review(
+                first_rev_id,
+                "Skipped",
+                "Skipped: touches only ignored files",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("complete_review must reject non-Cancelled write on cancelled patchset");
+        assert!(
+            complete_err.to_string().contains("no longer exists"),
+            "unexpected complete error: {complete_err}"
+        );
+
+        // An in-flight worker racing between get_patchset_status and its first AI
+        // request cannot revert the cancelled review back to 'In Review' or insert
+        // orphaned tool_usages rows.
+        db.update_review_status(first_rev_id, "In Review", None)
+            .await?;
+        assert!(!db.mark_review_in_review_if_active(first_rev_id).await?);
+        db.create_tool_usage(ToolUsage {
+            review_id: first_rev_id,
+            provider: "gemini".to_string(),
+            model: "pro".to_string(),
+            tool_name: "ai_request".to_string(),
+            arguments: None,
+            output_length: 42,
+        })
+        .await?;
+        let mut tu_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM tool_usages WHERE review_id = ?",
+                libsql::params![first_rev_id],
+            )
+            .await?;
+        assert_eq!(tu_rows.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        db.rerun_patchset(ps_id).await?;
+
+        // Rerun worker claims the patchset and creates/claims a new review row.
+        assert!(db.claim_patchset_for_review(ps_id).await?);
+        let pending_rev_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert!(
+            pending_rev_id > first_rev_id,
+            "rerun must allocate a strictly newer review ID ({pending_rev_id} <= {first_rev_id})"
+        );
+
+        // Late unwinding worker from the cancelled attempt now runs its cleanup calls.
+        db.cancel_aborted_review(
+            first_rev_id,
+            "Cancelled because patchset was superseded or cancelled",
+        )
+        .await?;
+        db.cancel_pending_review_for_patch(
+            ps_id,
+            Some(patch_id),
+            "Cancelled because patchset was superseded or cancelled",
+        )
+        .await?;
+        db.update_patch_status(patch_id, "Cancelled").await?;
+
+        // Neither the patch status nor the newly created Pending review row may be
+        // poisoned back to 'Cancelled'.
+        let mut p_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let p_status: String = p_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(p_status, "Pending");
+
+        let mut r_rows = db
+            .conn
+            .query(
+                "SELECT status FROM reviews WHERE id = ?",
+                libsql::params![pending_rev_id],
+            )
+            .await?;
+        let r_status: String = r_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(r_status, "Pending");
+
+        // Rerun worker can now claim pending_rev_id and transition patch_id to 'Reviewed'.
+        let claimed_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert_eq!(claimed_id, pending_rev_id);
+        db.update_patch_status(patch_id, "Reviewed").await?;
+
+        let mut p_rows2 = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let p_status2: String = p_rows2.next().await?.unwrap().get(0)?;
+        assert_eq!(p_status2, "Reviewed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_review_claim_generation_fences_superseded_worker_on_rerun() -> Result<()>
+    {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("gen_fence_rerun@kernel.org", "[PATCH] gen fence", 1000)
+            .await?;
+        db.create_message(
+            "gen_fence_rerun@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] gen fence",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("gen_fence_rerun@kernel.org"),
+                "gen_fence_rerun@kernel.org",
+                "[PATCH] gen fence",
+                "Author <a@b.c>",
+                1000,
+                1,
+                1,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(
+                ps_id,
+                "gen_fence_rerun@kernel.org",
+                1,
+                "diff --git a/g.c b/g.c",
+            )
+            .await?;
+
+        // Worker 1 claims patchset under generation 1.
+        let gen1 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        let worker1_db = db.with_patchset_claim(ps_id, gen1);
+        assert!(worker1_db.is_patchset_claim_active(ps_id).await?);
+
+        let rev1_id = worker1_db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert!(worker1_db.mark_review_in_review_if_active(rev1_id).await?);
+
+        // Operator calls rerun_patchset directly on the In Review patchset (without cancel_patchset),
+        // and Worker 2 immediately claims the patchset under generation 2.
+        db.rerun_patchset(ps_id).await?;
+        assert!(!worker1_db.is_patchset_claim_active(ps_id).await?);
+
+        let gen2 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        assert!(gen2 > gen1);
+        let worker2_db = db.with_patchset_claim(ps_id, gen2);
+        assert!(worker2_db.is_patchset_claim_active(ps_id).await?);
+        // Even though patchsets.status is back to 'In Review', Worker 1 remains fenced out!
+        assert!(!worker1_db.is_patchset_claim_active(ps_id).await?);
+
+        let rev2_id = worker2_db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert!(rev2_id > rev1_id);
+
+        // Every write attempted by superseded Worker 1 (even targeting rev2_id or ps_id) must fail or no-op.
+        assert!(!worker1_db.mark_review_in_review_if_active(rev1_id).await?);
+        assert!(!worker1_db.mark_review_in_review_if_active(rev2_id).await?);
+        assert!(
+            worker1_db
+                .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            worker1_db
+                .clear_aborted_review_artifacts(rev2_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            worker1_db
+                .create_finding(Finding {
+                    review_id: rev2_id,
+                    severity: Severity::High,
+                    severity_explanation: Some("stale worker".to_string()),
+                    problem: "stale".to_string(),
+                    preexisting: Some(false),
+                    locations: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            worker1_db
+                .complete_review(rev2_id, "Failed", "stale fail", None, None, None, None)
+                .await
+                .is_err()
+        );
+        worker1_db
+            .update_patch_application_status(ps_id, 1, "error", Some("stale git am"))
+            .await?;
+        worker1_db.update_patch_status(patch_id, "Failed").await?;
+        assert!(
+            !worker1_db
+                .complete_patchset_review_status(ps_id, "Failed")
+                .await?
+        );
+        worker1_db
+            .fail_orphaned_in_review_rows(ps_id, "stale panic")
+            .await?;
+        worker1_db.release_patchset_claim().await?;
+
+        // Worker 2's active claim, review row, and patch status are completely untouched.
+        assert!(worker2_db.is_patchset_claim_active(ps_id).await?);
+        assert!(worker2_db.mark_review_in_review_if_active(rev2_id).await?);
+        worker2_db
+            .complete_review(rev2_id, "Reviewed", "clean", Some("ok"), None, None, None)
+            .await?;
+        worker2_db.update_patch_status(patch_id, "Reviewed").await?;
+        assert!(
+            worker2_db
+                .complete_patchset_review_status(ps_id, "Reviewed")
+                .await?
+        );
+        worker2_db.release_patchset_claim().await?;
+
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Reviewed")
+        );
+        let mut meta_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+                libsql::params![ps_id],
+            )
+            .await?;
+        assert_eq!(meta_rows.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancel_patchset_cancels_applied_unreviewed_patches_and_blocks_late_apply_status()
+    -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("cancel_applied@kernel.org", "[PATCH 0/2] cancel", 1000)
+            .await?;
+        db.create_message(
+            "cancel_applied_1@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH 1/2] cancel 1",
+            1000,
+            "body1",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_message(
+            "cancel_applied_2@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH 2/2] cancel 2",
+            1001,
+            "body2",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "cancel_applied_1@kernel.org",
+                "[PATCH 1/2] cancel 1",
+                "Author <a@b.c>",
+                1000,
+                2,
+                2,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let p1 = db
+            .create_patch(
+                ps_id,
+                "cancel_applied_1@kernel.org",
+                1,
+                "diff --git a/a.c b/a.c",
+            )
+            .await?;
+        let p2 = db
+            .create_patch(
+                ps_id,
+                "cancel_applied_2@kernel.org",
+                2,
+                "diff --git a/b.c b/b.c",
+            )
+            .await?;
+
+        let gen1 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        let worker_db = db.with_patchset_claim(ps_id, gen1);
+
+        // Patch 1 already has a completed 'Reviewed' review (with status = 'applied' or 'Reviewed'),
+        // while Patch 2 was marked 'applied' during git am and is still mid-review ('In Review').
+        let r1 = worker_db
+            .claim_or_create_in_review(ps_id, Some(p1), "gemini", "pro", None, None)
+            .await?;
+        worker_db
+            .update_patch_application_status(ps_id, 1, "applied", None)
+            .await?;
+        worker_db
+            .complete_review(r1, "Reviewed", "ok", None, None, None, None)
+            .await?;
+        worker_db.update_patch_status(p1, "Reviewed").await?;
+
+        let _r2 = worker_db
+            .claim_or_create_in_review(ps_id, Some(p2), "gemini", "pro", None, None)
+            .await?;
+        worker_db
+            .update_patch_application_status(ps_id, 2, "applied", None)
+            .await?;
+
+        // Force-cancel the in-flight patchset.
+        assert!(db.cancel_patchset(ps_id, true).await?);
+
+        // Late update_patch_application_status calls (both claimed and unscoped) must not
+        // overwrite either the Reviewed patch 1 or the Cancelled patch 2 back to 'applied'.
+        worker_db
+            .update_patch_application_status(ps_id, 1, "applied", None)
+            .await?;
+        worker_db
+            .update_patch_application_status(ps_id, 2, "applied", None)
+            .await?;
+        db.update_patch_application_status(ps_id, 1, "applied", None)
+            .await?;
+        db.update_patch_application_status(ps_id, 2, "applied", None)
+            .await?;
+
+        let mut p1_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![p1],
+            )
+            .await?;
+        assert_eq!(p1_rows.next().await?.unwrap().get::<String>(0)?, "Reviewed");
+
+        let mut p2_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![p2],
+            )
+            .await?;
+        assert_eq!(
+            p2_rows.next().await?.unwrap().get::<String>(0)?,
+            "Cancelled"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_release_patchset_claim_preserves_marker_until_terminal_status() -> Result<()> {
+        let db = setup_db().await;
+        let t_id = db
+            .create_thread("msg_release_guard", "Release Guard", 1000)
+            .await?;
+        let ps_id = db
+            .create_patchset(
+                t_id,
+                None,
+                "msg_release_guard",
+                "Release Guard",
+                "Author <a@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+
+        let generation = db
+            .enter_patchset_review_with_gen(ps_id)
+            .await?
+            .expect("expected active generation");
+        let worker_db = db.with_patchset_claim(ps_id, generation);
+        assert!(worker_db.is_patchset_claim_active(ps_id).await?);
+
+        // Releasing while patchsets.status is still 'In Review' must keep the
+        // active generation marker intact so a failed terminal status write
+        // never leaves an unfenced 'In Review' patchset row behind.
+        worker_db.release_patchset_claim().await?;
+        assert!(worker_db.is_patchset_claim_active(ps_id).await?);
+
+        // Once the patchset exits 'In Review', release_patchset_claim cleans up
+        // the meta marker row.
+        assert!(
+            worker_db
+                .complete_patchset_review_status(ps_id, "Failed")
+                .await?
+        );
+        worker_db.release_patchset_claim().await?;
+        let mut meta_rows = db
+            .conn
+            .query(
+                "SELECT 1 FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+                libsql::params![ps_id],
+            )
+            .await?;
+        assert!(meta_rows.next().await?.is_none());
+
+        Ok(())
     }
 }

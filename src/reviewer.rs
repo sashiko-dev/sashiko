@@ -268,12 +268,18 @@ impl Reviewer {
             let target_review_count = patchset.target_review_count.unwrap_or(1) as usize;
 
             // Atomically claim only if still Pending (avoids reopening a patchset
-            // that was cancelled while waiting for a semaphore permit)
-            match self.db.claim_patchset_for_review(patchset.id).await {
-                Ok(true) => {
+            // that was cancelled while waiting for a semaphore permit) and bind a
+            // monotonic claim generation so any superseded worker is fenced out.
+            let generation = match self
+                .db
+                .claim_patchset_for_review_with_gen(patchset.id)
+                .await
+            {
+                Ok(Some(generation)) => {
                     claimed_count += 1;
+                    generation
                 }
-                Ok(false) => {
+                Ok(None) => {
                     info!(
                         "Skipping patchset {} as it is no longer Pending (likely cancelled)",
                         patchset.id
@@ -287,13 +293,14 @@ impl Reviewer {
                     );
                     continue;
                 }
-            }
+            };
             patchset.status = Some(ReviewStatus::InReview.as_str().to_string());
 
+            let claimed_db = Arc::new(self.db.with_patchset_claim(patchset.id, generation));
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
                 llm_semaphore: self.llm_semaphore.clone(),
-                db: self.db.clone(),
+                db: claimed_db.clone(),
                 settings: self.settings.clone(),
                 baseline_registry: self.baseline_registry.clone(),
                 quota_manager: self.quota_manager.clone(),
@@ -304,7 +311,7 @@ impl Reviewer {
 
             let patchset_id = patchset.id;
             Self::spawn_supervised_patchset_review(
-                self.db.clone(),
+                claimed_db,
                 permit,
                 patchset_id,
                 Self::review_patchset_task(context, patchset),
@@ -315,16 +322,34 @@ impl Reviewer {
     }
 
     async fn mark_patchset_failed_unless_cancelled(db: &Database, patchset_id: i64) {
-        let current_status = db.get_patchset_status(patchset_id).await.ok().flatten();
-        if current_status.as_deref() != Some(ReviewStatus::Cancelled.as_str())
-            && let Err(db_err) = db
-                .update_patchset_status(patchset_id, ReviewStatus::Failed.as_str())
-                .await
+        if let Err(e) = Self::fail_orphaned_in_review_rows_with_retry(
+            db,
+            patchset_id,
+            "Review task terminated abnormally",
+        )
+        .await
         {
-            error!(
-                "Failed to mark patchset {} as Failed: {}",
-                patchset_id, db_err
+            warn!(
+                "Failed to fail orphaned In Review rows for patchset {}: {}",
+                patchset_id, e
             );
+        }
+        match Self::complete_patchset_review_status_with_retry(
+            db,
+            patchset_id,
+            ReviewStatus::Failed.as_str(),
+        )
+        .await
+        {
+            Ok(_) => {
+                let _ = db.release_patchset_claim().await;
+            }
+            Err(db_err) => {
+                error!(
+                    "Failed to mark patchset {} as Failed: {}",
+                    patchset_id, db_err
+                );
+            }
         }
     }
 
@@ -560,35 +585,67 @@ impl Reviewer {
             .await
     }
 
-    async fn review_patchset_task(ctx: ReviewContext, patchset: PatchsetRow) {
+    async fn review_patchset_task(mut ctx: ReviewContext, patchset: PatchsetRow) {
         let patchset_id = patchset.id;
-        if ctx
-            .db
-            .get_patchset_status(patchset_id)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some(ReviewStatus::Cancelled.as_str())
-        {
-            info!(
-                "Patchset {} was cancelled before review started, skipping",
-                patchset_id
-            );
-            return;
-        }
-        info!("Starting review for patchset {}", patchset_id);
+        if ctx.db.has_patchset_claim() {
+            match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
+                Ok(true) => {
+                    info!("Starting review for patchset {}", patchset_id);
+                }
+                Ok(false) => {
+                    info!(
+                        "Patchset {} was cancelled or superseded before review started, skipping",
+                        patchset_id
+                    );
+                    let _ = ctx.db.release_patchset_claim().await;
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to verify active claim before starting review for patchset {}: {}",
+                        patchset_id, e
+                    );
+                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    return;
+                }
+            }
+        } else {
+            if ctx
+                .db
+                .get_patchset_status(patchset_id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(ReviewStatus::Cancelled.as_str())
+            {
+                info!(
+                    "Patchset {} was cancelled before review started, skipping",
+                    patchset_id
+                );
+                return;
+            }
+            info!("Starting review for patchset {}", patchset_id);
 
-        if let Err(e) = ctx
-            .db
-            .update_patchset_status(patchset_id, ReviewStatus::InReview.as_str())
-            .await
-        {
-            error!(
-                "Failed to update status to In Review for {}: {}",
-                patchset_id, e
-            );
-            return;
+            match ctx.db.enter_patchset_review_with_gen(patchset_id).await {
+                Ok(Some(generation)) => {
+                    ctx.db = Arc::new(ctx.db.with_patchset_claim(patchset_id, generation));
+                }
+                Ok(None) => {
+                    info!(
+                        "Patchset {} was cancelled before entering In Review, skipping",
+                        patchset_id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to update status to In Review for {}: {}",
+                        patchset_id, e
+                    );
+                    return;
+                }
+            }
         }
 
         let diffs = match ctx.db.get_patch_diffs(patchset_id).await {
@@ -700,26 +757,36 @@ impl Reviewer {
 
         // Save findings to patchset
         if let Some((baseline_id, worktree, review_baseline)) = found_baseline {
-            if ctx
-                .db
-                .get_patchset_status(patchset_id)
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(ReviewStatus::Cancelled.as_str())
-            {
-                info!(
-                    "Patchset {} was cancelled during baseline preparation, aborting",
-                    patchset_id
-                );
-                if let Err(e) = worktree.remove().await {
-                    warn!(
-                        "Failed to remove worktree after patchset {} cancellation: {}",
+            match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(
+                        "Patchset {} was cancelled or superseded during baseline preparation, aborting",
+                        patchset_id
+                    );
+                    if let Err(e) = worktree.remove().await {
+                        warn!(
+                            "Failed to remove worktree after patchset {} cancellation: {}",
+                            patchset_id, e
+                        );
+                    }
+                    let _ = ctx.db.release_patchset_claim().await;
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to verify active claim after baseline preparation for patchset {}: {}",
                         patchset_id, e
                     );
+                    if let Err(rm_err) = worktree.remove().await {
+                        warn!(
+                            "Failed to remove worktree after patchset {} error: {}",
+                            patchset_id, rm_err
+                        );
+                    }
+                    Self::mark_patchset_failed_unless_cancelled(&ctx.db, patchset_id).await;
+                    return;
                 }
-                return;
             }
 
             if let Err(e) = ctx
@@ -901,6 +968,7 @@ impl Reviewer {
             valid_jobs.reverse();
             let total_valid = valid_jobs.len();
             let valid_jobs_queue = Arc::new(tokio::sync::Mutex::new(valid_jobs));
+            let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut handles = Vec::new();
             let baseline_ref_str = review_baseline;
 
@@ -909,6 +977,7 @@ impl Reviewer {
                 let worktree_path = worktree.path.clone();
                 while let Ok(permit) = ctx.semaphore.clone().try_acquire_owned() {
                     let queue = valid_jobs_queue.clone();
+                    let aborted_clone = aborted.clone();
                     let ctx_clone = ctx.clone();
                     let input_payload_clone = input_payload.clone();
                     let prompts_hash_clone = prompts_hash.map(|s| s.to_string());
@@ -920,48 +989,69 @@ impl Reviewer {
                     let handle = tokio::spawn(async move {
                         let mut failed = 0;
                         loop {
-                            if ctx_clone
-                                .db
-                                .get_patchset_status(patchset_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .as_deref()
-                                == Some(ReviewStatus::Cancelled.as_str())
-                            {
-                                queue.lock().await.clear();
-                                break;
-                            }
-                            let job = {
+                            let Some(job) = ({
                                 let mut q = queue.lock().await;
                                 q.pop()
-                            };
-                            if let Some(job) = job {
-                                match Self::process_patch_review(
-                                    &ctx_clone,
-                                    patchset_id,
-                                    job.patch_id,
-                                    job.index,
-                                    &baseline_ref_clone,
-                                    Some(baseline_id_clone),
-                                    &input_payload_clone,
-                                    job.commit_sha,
-                                    prompts_hash_clone.as_deref(),
-                                    Some(&worktree_path_clone), // Reuse the single worktree!
-                                    &job.diff,
-                                    embargo_until_clone,
-                                )
-                                .await
-                                {
-                                    Ok(PatchResult::Success) => {}
-                                    Ok(PatchResult::Cancelled) => {
-                                        queue.lock().await.clear();
-                                        break;
-                                    }
-                                    _ => failed += 1,
-                                }
-                            } else {
+                            }) else {
                                 break;
+                            };
+                            match Self::check_patchset_claim_active_with_retry(
+                                &ctx_clone.db,
+                                patchset_id,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    aborted_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    queue.lock().await.clear();
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to verify active claim before reviewing patch {}/{}: {}",
+                                        patchset_id, job.index, e
+                                    );
+                                    let remaining = {
+                                        let mut q = queue.lock().await;
+                                        let n = q.len();
+                                        q.clear();
+                                        n
+                                    };
+                                    failed += 1 + remaining;
+                                    break;
+                                }
+                            }
+                            match Self::process_patch_review(
+                                &ctx_clone,
+                                patchset_id,
+                                job.patch_id,
+                                job.index,
+                                &baseline_ref_clone,
+                                Some(baseline_id_clone),
+                                &input_payload_clone,
+                                job.commit_sha,
+                                prompts_hash_clone.as_deref(),
+                                Some(&worktree_path_clone), // Reuse the single worktree!
+                                &job.diff,
+                                embargo_until_clone,
+                            )
+                            .await
+                            {
+                                Ok(PatchResult::Success) => {}
+                                Ok(PatchResult::Cancelled) => {
+                                    aborted_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    queue.lock().await.clear();
+                                    break;
+                                }
+                                Ok(PatchResult::ReviewFailed) => failed += 1,
+                                Err(e) => {
+                                    error!(
+                                        "Failed to process review for patch {}/{}: {}",
+                                        patchset_id, job.index, e
+                                    );
+                                    failed += 1;
+                                }
                             }
                         }
                         drop(permit);
@@ -983,48 +1073,64 @@ impl Reviewer {
             // Main worker loop uses the existing worktree
             let mut main_failed = 0;
             loop {
-                if ctx
-                    .db
-                    .get_patchset_status(patchset_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some(ReviewStatus::Cancelled.as_str())
-                {
-                    valid_jobs_queue.lock().await.clear();
-                    break;
-                }
-                let job = {
+                let Some(job) = ({
                     let mut q = valid_jobs_queue.lock().await;
                     q.pop()
-                };
-                if let Some(job) = job {
-                    match Self::process_patch_review(
-                        &ctx,
-                        patchset_id,
-                        job.patch_id,
-                        job.index,
-                        &baseline_ref_str,
-                        Some(baseline_id),
-                        &input_payload,
-                        job.commit_sha,
-                        prompts_hash,
-                        Some(&worktree.path),
-                        &job.diff,
-                        patchset.embargo_until,
-                    )
-                    .await
-                    {
-                        Ok(PatchResult::Success) => {}
-                        Ok(PatchResult::Cancelled) => {
-                            valid_jobs_queue.lock().await.clear();
-                            break;
-                        }
-                        _ => main_failed += 1,
-                    }
-                } else {
+                }) else {
                     break;
+                };
+                match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        valid_jobs_queue.lock().await.clear();
+                        break;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to verify active claim before reviewing patch {}/{}: {}",
+                            patchset_id, job.index, e
+                        );
+                        let remaining = {
+                            let mut q = valid_jobs_queue.lock().await;
+                            let n = q.len();
+                            q.clear();
+                            n
+                        };
+                        main_failed += 1 + remaining;
+                        break;
+                    }
+                }
+                match Self::process_patch_review(
+                    &ctx,
+                    patchset_id,
+                    job.patch_id,
+                    job.index,
+                    &baseline_ref_str,
+                    Some(baseline_id),
+                    &input_payload,
+                    job.commit_sha,
+                    prompts_hash,
+                    Some(&worktree.path),
+                    &job.diff,
+                    patchset.embargo_until,
+                )
+                .await
+                {
+                    Ok(PatchResult::Success) => {}
+                    Ok(PatchResult::Cancelled) => {
+                        aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        valid_jobs_queue.lock().await.clear();
+                        break;
+                    }
+                    Ok(PatchResult::ReviewFailed) => main_failed += 1,
+                    Err(e) => {
+                        error!(
+                            "Failed to process review for patch {}/{}: {}",
+                            patchset_id, job.index, e
+                        );
+                        main_failed += 1;
+                    }
                 }
             }
             failed_patches += main_failed;
@@ -1051,44 +1157,72 @@ impl Reviewer {
                 );
             }
 
-            let current_status = ctx.db.get_patchset_status(patchset_id).await.ok().flatten();
-            if current_status.as_deref() == Some(ReviewStatus::Cancelled.as_str()) {
+            if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                let current_status = ctx.db.get_patchset_status(patchset_id).await.ok().flatten();
                 info!(
-                    "Patchset {} was cancelled during review, preserving status",
-                    patchset_id
+                    "Patchset {} was cancelled or superseded during review (status={:?}), preserving status",
+                    patchset_id, current_status
                 );
             } else {
-                let final_status = if review_success {
-                    ReviewStatus::Reviewed.as_str().to_string()
-                } else {
-                    ReviewStatus::Failed.as_str().to_string()
-                };
-
-                if let Err(e) = ctx
-                    .db
-                    .update_patchset_status(patchset_id, &final_status)
+                if !review_success
+                    && let Err(e) = Self::fail_orphaned_in_review_rows_with_retry(
+                        &ctx.db,
+                        patchset_id,
+                        "Review failed before completion",
+                    )
                     .await
                 {
                     warn!(
-                        "Failed to update patchset {} status to {}: {}",
-                        patchset_id, final_status, e
+                        "Failed to clean up orphaned In Review rows for patchset {}: {}",
+                        patchset_id, e
                     );
                 }
 
-                if review_success {
-                    if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await {
-                        error!(
-                            "Failed to queue forge PR comment for patchset {}: {}",
-                            patchset_id, e
+                let final_status = if review_success {
+                    ReviewStatus::Reviewed.as_str()
+                } else {
+                    ReviewStatus::Failed.as_str()
+                };
+
+                match Self::complete_patchset_review_status_with_retry(
+                    &ctx.db,
+                    patchset_id,
+                    final_status,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        if review_success {
+                            if let Err(e) =
+                                Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await
+                            {
+                                error!(
+                                    "Failed to queue forge PR comment for patchset {}: {}",
+                                    patchset_id, e
+                                );
+                            }
+
+                            if patchset.embargo_until.is_some()
+                                && let Err(e) =
+                                    Self::release_patchset_results(&ctx, &patchset).await
+                            {
+                                error!(
+                                    "Failed to release clean patchset {} immediately: {}",
+                                    patchset_id, e
+                                );
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        info!(
+                            "Patchset {} was cancelled or superseded before final status transition, skipping post-review actions",
+                            patchset_id,
                         );
                     }
-
-                    if patchset.embargo_until.is_some()
-                        && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
-                    {
-                        error!(
-                            "Failed to release clean patchset {} immediately: {}",
-                            patchset_id, e
+                    Err(e) => {
+                        warn!(
+                            "Failed to update patchset {} status to {}: {}",
+                            patchset_id, final_status, e
                         );
                     }
                 }
@@ -1096,7 +1230,7 @@ impl Reviewer {
         } else {
             // No baseline found
             warn!("No working baseline found for patchset {}", patchset_id);
-            let _ = ctx
+            if let Err(e) = ctx
                 .db
                 .update_patchset_baseline_info(
                     patchset_id,
@@ -1106,13 +1240,38 @@ impl Reviewer {
                     Some(logs.as_str()),
                     Some(ctx.settings.ai.provider.as_str()),
                 )
-                .await;
+                .await
+            {
+                warn!(
+                    "Failed to record missing baseline info for patchset {}: {}",
+                    patchset_id, e
+                );
+            }
 
-            let _ = ctx
-                .db
-                .update_patchset_status(patchset_id, ReviewStatus::FailedToApply.as_str())
-                .await;
+            match Self::complete_patchset_review_status_with_retry(
+                &ctx.db,
+                patchset_id,
+                ReviewStatus::FailedToApply.as_str(),
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(
+                        "Patchset {} was cancelled or superseded during baseline search, preserving status",
+                        patchset_id
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to mark patchset {} as FailedToApply: {}",
+                        patchset_id, e
+                    );
+                }
+            }
         }
+
+        let _ = ctx.db.release_patchset_claim().await;
 
         if let Some(stats) = ctx.provider.cache_stats() {
             let total_hits = stats.hits_this_session + stats.hits_prev_session;
@@ -1623,6 +1782,224 @@ impl Reviewer {
         (None, HashMap::new(), logs_json)
     }
 
+    /// How many times a review completion or notification write is attempted
+    /// before the failure is reported, and how long the first pause is; each
+    /// later pause is a multiple of it.
+    const DB_WRITE_ATTEMPTS: u32 = 3;
+    const DB_WRITE_RETRY_PAUSE: Duration = Duration::from_millis(250);
+
+    fn is_deleted_review_error(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.to_string().contains("no longer exists"))
+    }
+
+    async fn check_patchset_claim_active_with_retry(
+        db: &Database,
+        patchset_id: i64,
+    ) -> Result<bool> {
+        let mut last_err = None;
+        for attempt in 1..=Self::DB_WRITE_ATTEMPTS {
+            match db.is_patchset_claim_active(patchset_id).await {
+                Ok(active) => return Ok(active),
+                Err(e) => {
+                    warn!(
+                        "Failed to check active claim for patchset {} (attempt {}/{}): {}",
+                        patchset_id,
+                        attempt,
+                        Self::DB_WRITE_ATTEMPTS,
+                        e
+                    );
+                    last_err = Some(e);
+                    if attempt < Self::DB_WRITE_ATTEMPTS {
+                        tokio::time::sleep(Self::DB_WRITE_RETRY_PAUSE * attempt).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            anyhow!(
+                "patchset {} claim liveness check failed after retries",
+                patchset_id
+            )
+        }))
+    }
+
+    async fn fail_orphaned_in_review_rows_with_retry(
+        db: &Database,
+        patchset_id: i64,
+        reason: &str,
+    ) -> Result<()> {
+        let mut last_err = None;
+        for attempt in 1..=Self::DB_WRITE_ATTEMPTS {
+            match db.fail_orphaned_in_review_rows(patchset_id, reason).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        "Failed to fail orphaned In Review rows for patchset {} (attempt {}/{}): {}",
+                        patchset_id,
+                        attempt,
+                        Self::DB_WRITE_ATTEMPTS,
+                        e
+                    );
+                    last_err = Some(e);
+                    if attempt < Self::DB_WRITE_ATTEMPTS {
+                        tokio::time::sleep(Self::DB_WRITE_RETRY_PAUSE * attempt).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            anyhow!(
+                "failing orphaned In Review rows for patchset {} failed",
+                patchset_id
+            )
+        }))
+    }
+
+    async fn complete_patchset_review_status_with_retry(
+        db: &Database,
+        patchset_id: i64,
+        status: &str,
+    ) -> Result<bool> {
+        let mut last_err = None;
+        for attempt in 1..=Self::DB_WRITE_ATTEMPTS {
+            match db
+                .complete_patchset_review_status(patchset_id, status)
+                .await
+            {
+                Ok(updated) => return Ok(updated),
+                Err(e) => {
+                    warn!(
+                        "Failed to complete patchset {} status as {} (attempt {}/{}): {}",
+                        patchset_id,
+                        status,
+                        attempt,
+                        Self::DB_WRITE_ATTEMPTS,
+                        e
+                    );
+                    last_err = Some(e);
+                    if attempt < Self::DB_WRITE_ATTEMPTS {
+                        tokio::time::sleep(Self::DB_WRITE_RETRY_PAUSE * attempt).await;
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("patchset {} completion as {} failed", patchset_id, status)))
+    }
+
+    /// Writes a review's final status, retrying a few times in place.
+    ///
+    /// The shared SQLite connection can be briefly locked by another writer.
+    /// Repeating this write is cheap; repeating the model run that produced
+    /// the result is not, and would also duplicate the findings already
+    /// attached to the review row. A failure that outlives the retries is
+    /// returned to the caller, which leaves the review and the patch where a
+    /// rerun picks them up rather than parking the patch on a terminal status.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_review_with_retry(
+        ctx: &ReviewContext,
+        review_id: i64,
+        status: &str,
+        result: &str,
+        summary: Option<&str>,
+        interaction_id: Option<&str>,
+        inline_review: Option<&str>,
+        logs: Option<&str>,
+    ) -> Result<()> {
+        let mut last_err = None;
+        for attempt in 1..=Self::DB_WRITE_ATTEMPTS {
+            match ctx
+                .db
+                .complete_review(
+                    review_id,
+                    status,
+                    result,
+                    summary,
+                    interaction_id,
+                    inline_review,
+                    logs,
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if Self::is_deleted_review_error(&e) {
+                        return Err(e);
+                    }
+                    warn!(
+                        "Failed to complete review {} as {} (attempt {}/{}): {}",
+                        review_id,
+                        status,
+                        attempt,
+                        Self::DB_WRITE_ATTEMPTS,
+                        e
+                    );
+                    last_err = Some(e);
+                    if attempt < Self::DB_WRITE_ATTEMPTS {
+                        tokio::time::sleep(Self::DB_WRITE_RETRY_PAUSE * attempt).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("review {} completion failed", review_id)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn queue_notifications_with_retry(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        review_id: Option<i64>,
+        patch_id: i64,
+        patch_msg_id: &str,
+        patchset_msg_id: &str,
+        index: i64,
+        inline_review: &str,
+        findings: Option<&Vec<Value>>,
+        summary: &str,
+    ) -> Result<()> {
+        let mut last_err = None;
+        for attempt in 1..=Self::DB_WRITE_ATTEMPTS {
+            match Self::queue_notifications(
+                ctx,
+                patchset_id,
+                review_id,
+                patch_id,
+                patch_msg_id,
+                patchset_msg_id,
+                index,
+                inline_review,
+                findings,
+                summary,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        "Failed to queue notifications for patch {}/{} (ID: {}) (attempt {}/{}): {}",
+                        patchset_id,
+                        index,
+                        patch_id,
+                        attempt,
+                        Self::DB_WRITE_ATTEMPTS,
+                        e
+                    );
+                    last_err = Some(e);
+                    if attempt < Self::DB_WRITE_ATTEMPTS {
+                        tokio::time::sleep(Self::DB_WRITE_RETRY_PAUSE * attempt).await;
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("notification queueing failed"))
+            .context(format!(
+                "Failed to queue notifications for patch {}/{} (ID: {})",
+                patchset_id, index, patch_id
+            )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn process_patch_review(
         ctx: &ReviewContext,
@@ -1658,6 +2035,46 @@ impl Reviewer {
                 baseline_id,
                 ctx.target_review_count
             );
+            // A previous attempt may have completed the review and then failed
+            // while queueing notifications or recording the patch status;
+            // finish both idempotently so the outbox entries and patch status
+            // cannot stay missing behind a finished review.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if embargo_until.filter(|&u| u > now).is_none()
+                && let Some(review) = ctx
+                    .db
+                    .get_latest_completed_review_for_patch(patchset_id, Some(patch_id))
+                    .await?
+                && review.has_inline_review
+            {
+                let patch_msg_id = input_payload["patches"]
+                    .as_array()
+                    .and_then(|arr| arr.iter().find(|p| p["index"] == index))
+                    .and_then(|p| p["message_id"].as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&review.patch_message_id);
+                let patchset_msg_id = input_payload["message_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(patch_msg_id);
+                Self::queue_notifications_with_retry(
+                    ctx,
+                    patchset_id,
+                    Some(review.id),
+                    patch_id,
+                    patch_msg_id,
+                    patchset_msg_id,
+                    index,
+                    &review.inline_review,
+                    Some(&review.findings),
+                    &review.summary,
+                )
+                .await?;
+            }
+            ctx.db.update_patch_status(patch_id, "Reviewed").await?;
             return Ok(PatchResult::Success);
         }
 
@@ -1670,7 +2087,7 @@ impl Reviewer {
                 "Patch {}/{} (ID: {}) already has a failed review. Skipping to keep it visible.",
                 patchset_id, index, patch_id
             );
-            let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+            ctx.db.update_patch_status(patch_id, "Failed").await?;
             return Ok(PatchResult::ReviewFailed);
         }
 
@@ -1689,37 +2106,54 @@ impl Reviewer {
                 patchset_id, index, patch_id
             );
 
-            let review_id = if let Some(id) = ctx
+            let review_id = match ctx
                 .db
-                .get_pending_review_id(patchset_id, Some(patch_id))
-                .await?
+                .claim_or_create_in_review(
+                    patchset_id,
+                    Some(patch_id),
+                    &ctx.settings.ai.provider,
+                    &ctx.settings.ai.model,
+                    baseline_id,
+                    prompts_hash,
+                )
+                .await
             {
-                id
-            } else {
-                ctx.db
-                    .create_review(
-                        patchset_id,
-                        Some(patch_id),
-                        &ctx.settings.ai.provider,
-                        &ctx.settings.ai.model,
-                        baseline_id,
-                        prompts_hash,
-                    )
-                    .await?
+                Ok(id) => id,
+                Err(e) if Self::is_deleted_review_error(&e) => {
+                    info!(
+                        "Patchset {} was cancelled before skipping patch {}/{}, aborting worker",
+                        patchset_id, patchset_id, index
+                    );
+                    return Ok(PatchResult::Cancelled);
+                }
+                Err(e) => return Err(e),
             };
 
-            let _ = ctx
-                .db
-                .complete_review(
-                    review_id,
-                    ReviewStatus::Skipped.as_str(),
-                    "Skipped: touches only ignored files",
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+            if let Err(e) = Self::complete_review_with_retry(
+                ctx,
+                review_id,
+                ReviewStatus::Skipped.as_str(),
+                "Skipped: touches only ignored files",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                if Self::is_deleted_review_error(&e) {
+                    info!(
+                        "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
+                        review_id, patchset_id, index
+                    );
+                    return Ok(PatchResult::Cancelled);
+                }
+                // Propagate a failed review completion before the patch row is
+                // moved to a terminal status, so a database error leaves both the
+                // review and the patch where a retry or rerun picks them up again.
+                return Err(e);
+            }
+            ctx.db.update_patch_status(patch_id, "Skipped").await?;
 
             return Ok(PatchResult::Success);
         }
@@ -1727,56 +2161,79 @@ impl Reviewer {
         let mut retries = 0;
         let max_retries = ctx.settings.review.max_retries;
 
-        let mut existing_pending_review_id = ctx
-            .db
-            .get_pending_review_id(patchset_id, Some(patch_id))
-            .await?;
+        let mut existing_pending_review_id: Option<i64> = None;
 
         loop {
-            if ctx
-                .db
-                .get_patchset_status(patchset_id)
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(ReviewStatus::Cancelled.as_str())
-            {
-                info!(
-                    "Patchset {} was cancelled before reviewing patch {}/{}",
-                    patchset_id, patchset_id, index
-                );
-                if let Some(rid) = existing_pending_review_id.take()
-                    && let Err(e) = ctx
+            match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(
+                        "Patchset {} was cancelled or superseded before reviewing patch {}/{}",
+                        patchset_id, patchset_id, index
+                    );
+                    let cancel_reason = "Cancelled because patchset was superseded or cancelled";
+                    let cancel_res = match existing_pending_review_id.take() {
+                        Some(id) => ctx.db.cancel_aborted_review(id, cancel_reason).await,
+                        None => {
+                            ctx.db
+                                .cancel_pending_review_for_patch(
+                                    patchset_id,
+                                    Some(patch_id),
+                                    cancel_reason,
+                                )
+                                .await
+                        }
+                    };
+                    if let Err(e) = cancel_res {
+                        warn!(
+                            "Failed to cancel pending/aborted review for patchset {} patch {}: {}",
+                            patchset_id, index, e
+                        );
+                    }
+                    if let Err(e) = ctx
                         .db
-                        .complete_review(
-                            rid,
-                            ReviewStatus::Cancelled.as_str(),
-                            "Cancelled because patchset was superseded or cancelled",
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
+                        .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
                         .await
-                {
-                    warn!("Failed to mark review {} as Cancelled: {}", rid, e);
+                    {
+                        warn!(
+                            "Failed to mark patch {} as Cancelled for patchset {}: {}",
+                            patch_id, patchset_id, e
+                        );
+                    }
+                    return Ok(PatchResult::Cancelled);
                 }
-                if let Err(e) = ctx
-                    .db
-                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                    .await
-                {
-                    warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "failed to verify active patchset claim before reviewing patch {}/{}",
+                        patchset_id, index
+                    )));
                 }
-                return Ok(PatchResult::Cancelled);
             }
 
+            // In-process retries reuse existing_pending_review_id and clear
+            // partial artifacts via clear_aborted_review_artifacts. Abnormal
+            // task termination fails orphaned 'In Review' rows via
+            // Database::fail_orphaned_in_review_rows, while
+            // Database::reset_reviewing_status resets interrupted 'In Review'
+            // rows to 'Pending' on daemon startup so claim_or_create_in_review
+            // can reclaim them without ever sharing an active review ID across
+            // two concurrent workers.
             let review_id = if let Some(id) = existing_pending_review_id.take() {
+                if let Err(e) = ctx.db.clear_aborted_review_artifacts(id).await {
+                    if Self::is_deleted_review_error(&e) {
+                        info!(
+                            "Review {} for patch {}/{} was deleted by a concurrent rerun, aborting superseded worker",
+                            id, patchset_id, index
+                        );
+                        return Ok(PatchResult::Cancelled);
+                    }
+                    return Err(e);
+                }
                 id
             } else {
-                ctx.db
-                    .create_review(
+                match ctx
+                    .db
+                    .claim_or_create_in_review(
                         patchset_id,
                         Some(patch_id),
                         &ctx.settings.ai.provider,
@@ -1784,19 +2241,19 @@ impl Reviewer {
                         baseline_id,
                         prompts_hash,
                     )
-                    .await?
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) if Self::is_deleted_review_error(&e) => {
+                        info!(
+                            "Patchset {} was cancelled before claiming review for patch {}/{}, aborting worker",
+                            patchset_id, patchset_id, index
+                        );
+                        return Ok(PatchResult::Cancelled);
+                    }
+                    Err(e) => return Err(e),
+                }
             };
-
-            if let Err(e) = ctx
-                .db
-                .update_review_status(review_id, ReviewStatus::InReview.as_str(), None)
-                .await
-            {
-                warn!(
-                    "Failed to update review {} status to In Review: {}",
-                    review_id, e
-                );
-            }
 
             let result = run_review_tool(
                 patchset_id,
@@ -1815,42 +2272,44 @@ impl Reviewer {
             )
             .await;
 
-            if ctx
-                .db
-                .get_patchset_status(patchset_id)
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(ReviewStatus::Cancelled.as_str())
-            {
-                info!(
-                    "Patchset {} was cancelled while reviewing patch {}/{}",
-                    patchset_id, patchset_id, index
-                );
-                if let Err(e) = ctx
-                    .db
-                    .complete_review(
-                        review_id,
-                        ReviewStatus::Cancelled.as_str(),
-                        "Cancelled because patchset was superseded or cancelled",
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    warn!("Failed to mark review {} as Cancelled: {}", review_id, e);
+            match Self::check_patchset_claim_active_with_retry(&ctx.db, patchset_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(
+                        "Patchset {} was cancelled or superseded while reviewing patch {}/{}",
+                        patchset_id, patchset_id, index
+                    );
+                    if let Err(e) = ctx
+                        .db
+                        .cancel_aborted_review(
+                            review_id,
+                            "Cancelled because patchset was superseded or cancelled",
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Failed to cancel aborted review {} for patchset {} patch {}: {}",
+                            review_id, patchset_id, index, e
+                        );
+                    }
+                    if let Err(e) = ctx
+                        .db
+                        .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
+                        .await
+                    {
+                        warn!(
+                            "Failed to mark patch {} as Cancelled for patchset {}: {}",
+                            patch_id, patchset_id, e
+                        );
+                    }
+                    return Ok(PatchResult::Cancelled);
                 }
-                if let Err(e) = ctx
-                    .db
-                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                    .await
-                {
-                    warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
+                Err(e) => {
+                    warn!(
+                        "Failed to verify active patchset claim after reviewing patch {}/{} (proceeding with fenced DB writes): {}",
+                        patchset_id, index, e
+                    );
                 }
-                return Ok(PatchResult::Cancelled);
             }
 
             match result {
@@ -1882,7 +2341,7 @@ impl Reviewer {
                             String::new()
                         };
 
-                        let _ = ctx
+                        match ctx
                             .db
                             .create_ai_interaction(AiInteractionParams {
                                 id: &i_id,
@@ -1897,8 +2356,14 @@ impl Reviewer {
                                 tokens_cached: json_output["tokens_cached"].as_u64().unwrap_or(0)
                                     as u32,
                             })
-                            .await;
-                        Some(i_id)
+                            .await
+                        {
+                            Ok(()) => Some(i_id),
+                            Err(e) => {
+                                warn!("Failed to record AI interaction {}: {}", i_id, e);
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
@@ -1909,26 +2374,34 @@ impl Reviewer {
                                 "Review tool returned error for ps={} idx={}: {}",
                                 patchset_id, index, error_msg
                             );
-                            let _ = ctx
-                                .db
-                                .complete_review(
-                                    review_id,
-                                    ReviewStatus::Failed.as_str(),
-                                    error_msg,
-                                    None,
-                                    interaction_id.as_deref(),
-                                    None,
-                                    logs_str.as_deref(),
-                                )
-                                .await;
-
                             if retries < max_retries {
                                 retries += 1;
+                                // Keep the review row In Review and hand it to the next
+                                // attempt so an intermediate retry never writes a Failed row
+                                // that would poison has_failed_review() on crash recovery.
+                                existing_pending_review_id = Some(review_id);
                                 continue;
-                            } else {
-                                let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                                return Ok(PatchResult::ReviewFailed);
                             }
+                            let complete_res = Self::complete_review_with_retry(
+                                ctx,
+                                review_id,
+                                ReviewStatus::Failed.as_str(),
+                                error_msg,
+                                None,
+                                interaction_id.as_deref(),
+                                None,
+                                logs_str.as_deref(),
+                            )
+                            .await;
+                            if let Err(ref e) = complete_res {
+                                error!("Failed to complete review {}: {}", review_id, e);
+                            }
+                            // Propagate a failed review completion before the patch row is
+                            // moved to a terminal status, so a database error leaves both the
+                            // review and the patch where a retry or rerun picks them up again.
+                            complete_res?;
+                            ctx.db.update_patch_status(patch_id, "Failed").await?;
+                            return Ok(PatchResult::ReviewFailed);
                         } else if let Some(review_content) = json_output.get("review") {
                             if !review_content.is_null() {
                                 if let Some(findings_arr) =
@@ -2119,23 +2592,31 @@ impl Reviewer {
 
                                 let inline_review = json_output["inline_review"].as_str();
 
-                                let mut db_success = true;
-
-                                if let Err(e) = ctx
-                                    .db
-                                    .complete_review(
-                                        review_id,
-                                        ReviewStatus::Reviewed.as_str(),
-                                        result_desc,
-                                        Some(&summary),
-                                        interaction_id.as_deref(),
-                                        inline_review,
-                                        logs_str.as_deref(),
-                                    )
-                                    .await
+                                // Persist the Reviewed status before queueing
+                                // notifications so an email or Patchwork worker
+                                // can never deliver findings for an uncompleted
+                                // review whose artifacts might later be cleared
+                                // on retry. If notification queueing or the
+                                // patch status update fails afterwards, a rerun
+                                // enters the count_successful_reviews() recovery
+                                // path above and finishes both without re-running
+                                // the model.
+                                if let Err(e) = Self::complete_review_with_retry(
+                                    ctx,
+                                    review_id,
+                                    ReviewStatus::Reviewed.as_str(),
+                                    result_desc,
+                                    Some(&summary),
+                                    interaction_id.as_deref(),
+                                    inline_review,
+                                    logs_str.as_deref(),
+                                )
+                                .await
                                 {
-                                    error!("Failed to save review completion: {}", e);
-                                    db_success = false;
+                                    return Err(e.context(format!(
+                                        "Failed to save review completion for patch {}/{} (ID: {})",
+                                        patchset_id, index, patch_id
+                                    )));
                                 }
 
                                 let now = std::time::SystemTime::now()
@@ -2143,129 +2624,111 @@ impl Reviewer {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
 
-                                if db_success {
-                                    let inline_opt = inline_review;
-                                    if let Some(inline) = inline_opt {
-                                        let mut skip_notify = false;
-                                        if let Some(until) = embargo_until.filter(|&u| u > now) {
-                                            info!(
-                                                "Review completed but embargoed until {} for patch {}/{}",
-                                                until, patchset_id, index
-                                            );
-                                            skip_notify = true;
-                                        }
+                                if let Some(inline) = inline_review {
+                                    if let Some(until) = embargo_until.filter(|&u| u > now) {
+                                        info!(
+                                            "Review completed but embargoed until {} for patch {}/{}",
+                                            until, patchset_id, index
+                                        );
+                                    } else {
+                                        let patch_msg_id = input_payload["patches"]
+                                            .as_array()
+                                            .and_then(|arr| {
+                                                arr.iter().find(|p| p["index"] == index)
+                                            })
+                                            .and_then(|p| p["message_id"].as_str())
+                                            .unwrap_or("");
 
-                                        if !skip_notify {
-                                            let patch_msg_id = input_payload["patches"]
-                                                .as_array()
-                                                .and_then(|arr| {
-                                                    arr.iter().find(|p| p["index"] == index)
-                                                })
-                                                .and_then(|p| p["message_id"].as_str())
-                                                .unwrap_or("");
+                                        let patchset_msg_id = input_payload["message_id"]
+                                            .as_str()
+                                            .unwrap_or(patch_msg_id);
 
-                                            let patchset_msg_id = input_payload["message_id"]
-                                                .as_str()
-                                                .unwrap_or(patch_msg_id);
-
-                                            if let Err(e) = Self::queue_notifications(
-                                                ctx,
-                                                patchset_id,
-                                                Some(review_id),
-                                                patch_id,
-                                                patch_msg_id,
-                                                patchset_msg_id,
-                                                index,
-                                                inline,
-                                                review_content["findings"].as_array(),
-                                                &summary,
-                                            )
-                                            .await
-                                            {
-                                                error!(
-                                                    "Failed to queue email for patch {}/{} (ID: {}): {}",
-                                                    patchset_id, index, patch_id, e
-                                                );
-                                            }
-                                        }
+                                        Self::queue_notifications_with_retry(
+                                            ctx,
+                                            patchset_id,
+                                            Some(review_id),
+                                            patch_id,
+                                            patch_msg_id,
+                                            patchset_msg_id,
+                                            index,
+                                            inline,
+                                            review_content["findings"].as_array(),
+                                            &summary,
+                                        )
+                                        .await?;
                                     }
                                 }
-                                if !db_success {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                                    return Ok(PatchResult::ReviewFailed);
-                                }
-                                // Failing the patchset over a notification
-                                // would strand it: get_pending_patchsets()
-                                // selects only Pending rows.
-                                let _ = ctx.db.update_patch_status(patch_id, "Reviewed").await;
+                                ctx.db.update_patch_status(patch_id, "Reviewed").await?;
                                 return Ok(PatchResult::Success);
                             } else if ctx.settings.ai.no_ai {
                                 info!(
                                     "Review skipped as requested for ps={} idx={}",
                                     patchset_id, index
                                 );
-                                let _ = ctx
-                                    .db
-                                    .complete_review(
-                                        review_id,
-                                        ReviewStatus::Skipped.as_str(),
-                                        "Skipped AI review via --no-ai",
-                                        None,
-                                        interaction_id.as_deref(),
-                                        None,
-                                        logs_str.as_deref(),
-                                    )
-                                    .await;
-                                let _ = ctx.db.update_patch_status(patch_id, "Skipped").await;
-                                return Ok(PatchResult::Success);
-                            } else {
-                                let _ = ctx
-                                    .db
-                                    .complete_review(
-                                        review_id,
-                                        ReviewStatus::Failed.as_str(),
-                                        "AI returned null response",
-                                        None,
-                                        interaction_id.as_deref(),
-                                        None,
-                                        logs_str.as_deref(),
-                                    )
-                                    .await;
-                                if retries < max_retries {
-                                    retries += 1;
-                                    continue;
-                                } else {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                                    return Ok(PatchResult::ReviewFailed);
-                                }
-                            }
-                        } else {
-                            let error_msg = json_output["error"]
-                                .as_str()
-                                .unwrap_or("Missing review content");
-                            let _ = ctx
-                                .db
-                                .complete_review(
+                                let complete_res = Self::complete_review_with_retry(
+                                    ctx,
                                     review_id,
-                                    ReviewStatus::Failed.as_str(),
-                                    error_msg,
+                                    ReviewStatus::Skipped.as_str(),
+                                    "Skipped AI review via --no-ai",
                                     None,
                                     interaction_id.as_deref(),
                                     None,
                                     logs_str.as_deref(),
                                 )
                                 .await;
-                            let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                            return Ok(PatchResult::ReviewFailed);
-                        }
-                    } else {
-                        // Tool failed to process or missing patches array
-                        let error_msg = json_output["error"]
-                            .as_str()
-                            .unwrap_or("Tool failed to return patch status");
-                        let _ = ctx
-                            .db
-                            .complete_review(
+                                if let Err(ref e) = complete_res {
+                                    error!("Failed to complete review {}: {}", review_id, e);
+                                }
+                                // Propagate a failed review completion before the patch row is
+                                // moved to a terminal status, so a database error leaves both the
+                                // review and the patch where a retry or rerun picks them up again.
+                                complete_res?;
+                                ctx.db.update_patch_status(patch_id, "Skipped").await?;
+                                return Ok(PatchResult::Success);
+                            } else {
+                                if retries < max_retries {
+                                    retries += 1;
+                                    // Keep the review row In Review and hand it to the next
+                                    // attempt so an intermediate retry never writes a Failed row
+                                    // that would poison has_failed_review() on crash recovery.
+                                    existing_pending_review_id = Some(review_id);
+                                    continue;
+                                }
+                                let complete_res = Self::complete_review_with_retry(
+                                    ctx,
+                                    review_id,
+                                    ReviewStatus::Failed.as_str(),
+                                    "AI returned null response",
+                                    None,
+                                    interaction_id.as_deref(),
+                                    None,
+                                    logs_str.as_deref(),
+                                )
+                                .await;
+                                if let Err(ref e) = complete_res {
+                                    error!("Failed to complete review {}: {}", review_id, e);
+                                }
+                                // Propagate a failed review completion before the patch row is
+                                // moved to a terminal status, so a database error leaves both the
+                                // review and the patch where a retry or rerun picks them up again.
+                                complete_res?;
+                                ctx.db.update_patch_status(patch_id, "Failed").await?;
+                                return Ok(PatchResult::ReviewFailed);
+                            }
+                        } else {
+                            let error_msg = json_output["error"]
+                                .as_str()
+                                .unwrap_or("Missing review content");
+                            if retries < max_retries {
+                                retries += 1;
+                                // Keep the review row In Review and hand it to the next
+                                // attempt so an intermediate retry never writes a Failed row
+                                // that would poison has_failed_review() on crash recovery.
+                                existing_pending_review_id = Some(review_id);
+                                continue;
+                            }
+                            let complete_res = Self::complete_review_with_retry(
+                                ctx,
                                 review_id,
                                 ReviewStatus::Failed.as_str(),
                                 error_msg,
@@ -2275,11 +2738,48 @@ impl Reviewer {
                                 logs_str.as_deref(),
                             )
                             .await;
+                            if let Err(ref e) = complete_res {
+                                error!("Failed to complete review {}: {}", review_id, e);
+                            }
+                            // Propagate a failed review completion before the patch row is
+                            // moved to a terminal status, so a database error leaves both the
+                            // review and the patch where a retry or rerun picks them up again.
+                            complete_res?;
+                            ctx.db.update_patch_status(patch_id, "Failed").await?;
+                            return Ok(PatchResult::ReviewFailed);
+                        }
+                    } else {
+                        // Tool failed to process or missing patches array
+                        let error_msg = json_output["error"]
+                            .as_str()
+                            .unwrap_or("Tool failed to return patch status");
                         if retries < max_retries {
                             retries += 1;
+                            // Keep the review row In Review and hand it to the next
+                            // attempt so an intermediate retry never writes a Failed row
+                            // that would poison has_failed_review() on crash recovery.
+                            existing_pending_review_id = Some(review_id);
                             continue;
                         }
-                        let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                        let complete_res = Self::complete_review_with_retry(
+                            ctx,
+                            review_id,
+                            ReviewStatus::Failed.as_str(),
+                            error_msg,
+                            None,
+                            interaction_id.as_deref(),
+                            None,
+                            logs_str.as_deref(),
+                        )
+                        .await;
+                        if let Err(ref e) = complete_res {
+                            error!("Failed to complete review {}: {}", review_id, e);
+                        }
+                        // Propagate a failed review completion before the patch row is
+                        // moved to a terminal status, so a database error leaves both the
+                        // review and the patch where a retry or rerun picks them up again.
+                        complete_res?;
+                        ctx.db.update_patch_status(patch_id, "Failed").await?;
                         return Ok(PatchResult::ReviewFailed);
                     }
                 }
@@ -2291,27 +2791,28 @@ impl Reviewer {
                             "Review cancelled for patchset {} patch {}",
                             patchset_id, index
                         );
-                        if let Err(err) = ctx
+                        if let Err(e) = ctx
                             .db
-                            .complete_review(
+                            .cancel_aborted_review(
                                 review_id,
-                                ReviewStatus::Cancelled.as_str(),
                                 "Cancelled because patchset was superseded or cancelled",
-                                None,
-                                None,
-                                None,
-                                None,
                             )
                             .await
                         {
-                            warn!("Failed to mark review {} as Cancelled: {}", review_id, err);
+                            warn!(
+                                "Failed to cancel aborted review {} for patchset {} patch {}: {}",
+                                review_id, patchset_id, index, e
+                            );
                         }
-                        if let Err(err) = ctx
+                        if let Err(e) = ctx
                             .db
                             .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
                             .await
                         {
-                            warn!("Failed to mark patch {} as Cancelled: {}", patch_id, err);
+                            warn!(
+                                "Failed to mark patch {} as Cancelled for patchset {}: {}",
+                                patch_id, patchset_id, e
+                            );
                         }
                         return Ok(PatchResult::Cancelled);
                     }
@@ -2319,23 +2820,33 @@ impl Reviewer {
                         .downcast_ref::<ReviewError>()
                         .is_some_and(|re| matches!(re, ReviewError::BudgetExceeded(_)));
                     error!("Review execution failed for {}: {}", patchset_id, e);
-                    let _ = ctx
-                        .db
-                        .complete_review(
-                            review_id,
-                            ReviewStatus::Failed.as_str(),
-                            &format!("Tool error: {}", e),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
                     if !budget_exceeded && retries < max_retries {
                         retries += 1;
+                        // Keep the review row In Review and hand it to the next
+                        // attempt so an intermediate retry never writes a Failed row
+                        // that would poison has_failed_review() on crash recovery.
+                        existing_pending_review_id = Some(review_id);
                         continue;
                     }
-                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                    let complete_res = Self::complete_review_with_retry(
+                        ctx,
+                        review_id,
+                        ReviewStatus::Failed.as_str(),
+                        &format!("Tool error: {}", e),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                    if let Err(ref err) = complete_res {
+                        error!("Failed to complete review {}: {}", review_id, err);
+                    }
+                    // Propagate a failed review completion before the patch row is
+                    // moved to a terminal status, so a database error leaves both the
+                    // review and the patch where a retry or rerun picks them up again.
+                    complete_res?;
+                    ctx.db.update_patch_status(patch_id, "Failed").await?;
                     return Ok(PatchResult::ReviewFailed);
                 }
             }
@@ -2597,7 +3108,7 @@ async fn run_review_tool_with_cmd_and_overrides(
 
     let stdin_writer = Arc::new(tokio::sync::Mutex::new(stdin));
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::Instant as TokioInstant;
     use tokio::time::{timeout, timeout_at};
@@ -2636,7 +3147,6 @@ async fn run_review_tool_with_cmd_and_overrides(
             let mut lines = reader.lines();
             let mut final_result: Option<Value> = None;
 
-            let ai_started = Arc::new(AtomicBool::new(false));
             let total_tokens_used = Arc::new(AtomicUsize::new(0));
             let total_output_tokens_used = Arc::new(AtomicUsize::new(0));
 
@@ -2656,11 +3166,9 @@ async fn run_review_tool_with_cmd_and_overrides(
                         return Err(err);
                     }
                     _ = cancel_interval.tick() => {
-                        if let Ok(Some(status)) = db.get_patchset_status(patchset_id).await
-                            && status == ReviewStatus::Cancelled.as_str()
-                        {
+                        if !db.is_patchset_claim_active(patchset_id).await.unwrap_or(true) {
                             info!(
-                                "Patchset {} was cancelled during active review; aborting worker",
+                                "Patchset {} was cancelled or superseded during active review; aborting worker",
                                 patchset_id
                             );
                             return Err(ReviewError::Cancelled.into());
@@ -2690,25 +3198,29 @@ async fn run_review_tool_with_cmd_and_overrides(
                             if let Some(type_str) = json_msg.get("type").and_then(|v| v.as_str()) {
                                 match type_str {
                                     "ai_request" | "ai_request_with_cache" => {
-                                        if let Ok(Some(status)) = db.get_patchset_status(patchset_id).await
-                                            && status == ReviewStatus::Cancelled.as_str()
-                                        {
+                                        if !db.is_patchset_claim_active(patchset_id).await.unwrap_or(true) {
                                             info!(
-                                                "Patchset {} was cancelled before AI request; aborting worker",
+                                                "Patchset {} was cancelled or superseded before AI request; aborting worker",
                                                 patchset_id
                                             );
                                             return Err(ReviewError::Cancelled.into());
                                         }
 
-                                        if !ai_started.load(Ordering::SeqCst) {
-                                            let _ = db
-                                                .update_review_status(
-                                                    review_id,
-                                                    ReviewStatus::InReview.as_str(),
-                                                    None,
-                                                )
-                                                .await;
-                                            ai_started.store(true, Ordering::SeqCst);
+                                        match db.mark_review_in_review_if_active(review_id).await {
+                                            Ok(true) => {}
+                                            Ok(false) => {
+                                                info!(
+                                                    "Review {} for patchset {} was cancelled or deleted before AI request; aborting worker",
+                                                    review_id, patchset_id
+                                                );
+                                                return Err(ReviewError::Cancelled.into());
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to confirm In Review status for review {}: {}",
+                                                    review_id, e
+                                                );
+                                            }
                                         }
 
                                         let tx_id = json_msg.get("tx_id").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2958,6 +3470,18 @@ async fn run_review_tool_with_cmd_and_overrides(
 
     match interaction_result {
         Ok(json) => {
+            if !db
+                .mark_review_in_review_if_active(review_id)
+                .await
+                .unwrap_or(true)
+            {
+                info!(
+                    "Review {} for patchset {} was cancelled or superseded before persisting patch application status; aborting worker",
+                    review_id, patchset_id
+                );
+                return Err(ReviewError::Cancelled.into());
+            }
+
             // Update DB with patch statuses if final_result available
             if let Some(patches) = json["patches"].as_array() {
                 for p in patches {
@@ -4578,7 +5102,9 @@ fi
         )
         .await;
 
-        // Even if it fails to run tool, it shouldn't be "Skipped".
+        // Even if it fails to run tool across retries, it must reuse the single
+        // review row rather than stranding extra Failed rows per retry, and
+        // must not mark the review "Skipped".
         let mut rows = db
             .conn
             .query(
@@ -4586,22 +5112,16 @@ fi
                 libsql::params![p_id_3],
             )
             .await?;
-        // Review might be created (Pending/InReview) or not if process failed early (but create_review is called early in loop)
-        // Wait, loop calls create_review at start of loop.
-        // If run_review_tool fails (which it will), we get ReviewFailed.
-
-        if let Ok(Some(row)) = rows.next().await {
-            let status: String = row.get(0)?;
-            assert_ne!(status, "Skipped");
-        } else {
-            // It might fail before creating review?
-            // create_review is inside the loop.
-            // If run_review_tool fails to spawn (binary not found), it returns Err.
-            // process_patch_review handles Err by logging and retrying.
-            // If retries exhausted, it returns ReviewFailed.
-            // But it DOES create a review entry in each iteration.
-            // So we should find at least one review.
-        }
+        let row = rows
+            .next()
+            .await?
+            .expect("Expected a single review row for p_id_3");
+        let status: String = row.get(0)?;
+        assert_eq!(status, "Failed");
+        assert!(
+            rows.next().await?.is_none(),
+            "Retries must reuse the same review row instead of stranding extra Failed rows"
+        );
 
         Ok(())
     }
@@ -5547,6 +6067,318 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             db.get_patchset_status(ps_id).await?.as_deref(),
             Some(ReviewStatus::Failed.as_str())
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_process_patch_review_recovers_missing_notifications_for_completed_review()
+    -> Result<()> {
+        let temp_dir = tempdir()?;
+        let policy_path = temp_dir.path().join("mailing_lists.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            mute_all = false
+            reply_to = ["author"]
+            "#,
+        )?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            transport: crate::settings::MailTransport::Smtp,
+            server: Some("localhost".to_string()),
+            port: Some(25),
+            username: None,
+            password: None,
+            sendmail_path: None,
+            sender_address: "bot@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db
+            .create_thread("msg_recover_root", "Subject", 1000)
+            .await?;
+        db.create_message(
+            "msg_recover_p1",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH] recover notification",
+            1000,
+            "Body\n---\ndiff --git a/foo.c b/foo.c\n",
+            "netdev@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_recover_root",
+                "[PATCH] recover notification",
+                "Author <author@example.com>",
+                1000,
+                1,
+                1,
+                "netdev@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_recover_p1", 1, "diff --git a/foo.c b/foo.c\n")
+            .await?;
+
+        // Simulate a review that completed in the DB before notification queueing
+        // or patch status update succeeded.
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "mock", "mock", None, None)
+            .await?;
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::High,
+            severity_explanation: Some("use-after-free".to_string()),
+            problem: "UAF on error path".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.complete_review(
+            review_id,
+            ReviewStatus::Reviewed.as_str(),
+            "Review completed successfully.",
+            Some("Found 1 issue"),
+            None,
+            Some("Inline review body for UAF"),
+            None,
+        )
+        .await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(FailingProvider),
+            worker_overrides: WorkerSubprocessOverrides::default(),
+        };
+
+        let payload = json!({
+            "message_id": "msg_recover_root",
+            "patches": [{
+                "index": 1,
+                "message_id": "msg_recover_p1",
+            }]
+        });
+
+        let res = Reviewer::process_patch_review(
+            &ctx,
+            ps_id,
+            patch_id,
+            1,
+            "HEAD",
+            None,
+            &payload,
+            None,
+            None,
+            None,
+            "diff --git a/foo.c b/foo.c\n",
+            None,
+        )
+        .await?;
+        assert!(matches!(res, PatchResult::Success));
+
+        let mut eo_rows = db
+            .conn
+            .query(
+                "SELECT status, body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let eo_row = eo_rows
+            .next()
+            .await?
+            .expect("Expected recovered email outbox entry");
+        let eo_status: String = eo_row.get(0)?;
+        let eo_body: String = eo_row.get(1)?;
+        assert_eq!(eo_status, "Pending");
+        assert!(eo_body.contains("Inline review body for UAF"));
+
+        let mut p_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let patch_status: String = p_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(patch_status, "Reviewed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_process_patch_review_propagates_claim_db_error_instead_of_cancelling()
+    -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db
+            .create_thread("msg_claim_err_root", "Claim DB Error", 1000)
+            .await?;
+        db.create_message(
+            "msg_claim_err_p1",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH] claim db error",
+            1000,
+            "Body\n---\ndiff --git a/foo.c b/foo.c\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_claim_err_root",
+                "[PATCH] claim db error",
+                "Author <author@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_claim_err_p1", 1, "diff --git a/foo.c b/foo.c\n")
+            .await?;
+
+        let generation = db
+            .enter_patchset_review_with_gen(ps_id)
+            .await?
+            .expect("expected active claim generation");
+        let claimed_db = Arc::new(db.with_patchset_claim(ps_id, generation));
+        let orphan_rev_id = claimed_db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "mock", "mock", None, None)
+            .await?;
+
+        // Force is_patchset_claim_active to fail with a SQLite read error.
+        db.conn
+            .execute("ALTER TABLE meta RENAME TO meta_broken", ())
+            .await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: claimed_db.clone(),
+            settings,
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(FailingProvider),
+            worker_overrides: WorkerSubprocessOverrides::default(),
+        };
+
+        let payload = json!({
+            "message_id": "msg_claim_err_root",
+            "patches": [{
+                "index": 1,
+                "message_id": "msg_claim_err_p1",
+            }]
+        });
+
+        let res = Reviewer::process_patch_review(
+            &ctx,
+            ps_id,
+            patch_id,
+            1,
+            "HEAD",
+            None,
+            &payload,
+            None,
+            None,
+            None,
+            "diff --git a/foo.c b/foo.c\n",
+            None,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "DB read error on claim check must return Err, not Ok(PatchResult::Cancelled)"
+        );
+
+        let mut p_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let patch_status: Option<String> = p_rows.next().await?.unwrap().get(0)?;
+        assert_ne!(patch_status.as_deref(), Some("Cancelled"));
+
+        // Restore meta table and verify mark_patchset_failed_unless_cancelled
+        // fails orphaned In Review rows, marks the patchset Failed, and removes
+        // the active generation marker.
+        db.conn
+            .execute("ALTER TABLE meta_broken RENAME TO meta", ())
+            .await?;
+        Reviewer::mark_patchset_failed_unless_cancelled(&claimed_db, ps_id).await;
+
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some(ReviewStatus::Failed.as_str())
+        );
+        let mut rev_rows = db
+            .conn
+            .query(
+                "SELECT status FROM reviews WHERE id = ?",
+                libsql::params![orphan_rev_id],
+            )
+            .await?;
+        assert_eq!(rev_rows.next().await?.unwrap().get::<String>(0)?, "Failed");
+        let mut meta_rows = db
+            .conn
+            .query(
+                "SELECT 1 FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+                libsql::params![ps_id],
+            )
+            .await?;
+        assert!(meta_rows.next().await?.is_none());
 
         Ok(())
     }
