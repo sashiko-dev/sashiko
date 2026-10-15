@@ -124,6 +124,10 @@ lock waits. The background task restarts through the daemon's worker supervisor.
 Lease renewals and housekeeping timestamps do not queue whole reports. Mirror
 migrations have their own version in metadata. Selecting `libsql` disables change
 tracking; re-enabling the shared catalog reconciles edits made while it was off.
+That reconciliation conservatively queues every local report, including foreign
+mirrors, because disabled tracking cannot identify which reports changed. The
+normal publication limit still applies, and unchanged snapshots are remote
+no-ops. Pending local publications do not block analysis once imports are current.
 Analysis waits for the catalog before making shared deduplication decisions.
 An outage during that check requeues the analysis without consuming an attempt.
 If an outcome is already committed locally, publication retries from the outbox
@@ -136,6 +140,13 @@ Connected deduplication decisions are serialized. A connection loss between a
 local outcome and its publication can still produce separate reports of the
 same defect; public bug IDs make publication retries idempotent, and triage can
 merge those reports.
+
+Catalog participants must use compatible catalog formats. Invalid records,
+identity mismatches and unsupported formats stop synchronization and shared
+analysis until an operator corrects the data or deployment. The importer does
+not skip records or advance its cursor past a failed import: doing so could hide
+an existing canonical bug from deduplication. Transient failures retry; these
+permanent errors require correction and are reported in the daemon logs.
 
 Public bug IDs identify shared records. Patch and review relations remain
 local. Original evidence can contain producer-local IDs; imported discoveries

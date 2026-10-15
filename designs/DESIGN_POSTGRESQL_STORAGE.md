@@ -114,6 +114,15 @@ of the same defect. Public UUIDs prevent a publication retry from creating a
 second copy of the same report. Bugs remain readable during an outage, and the
 UI shows pending synchronization.
 
+Deduplication fails closed on malformed catalog records or incompatible formats.
+Skipping a failed import could conceal a canonical bug, so the cursor advances
+only after accepting the record. Compatible writers validate records before
+publication; future incompatible writers must increment the catalog format.
+Operators must correct persistent data or deployment errors before analysis can
+resume. Re-enabling disabled change tracking conservatively queues all reports
+for bounded reconciliation, including unchanged and foreign mirrors. Publication
+backlog alone does not block analysis once committed imports are current.
+
 Bug permissions remain enforced by the Sashiko API. Catalog participants must
 share a trusted permission and subsystem attribution policy. Project-scoped
 catalog queries prevent accidental mixing of independent projects.

@@ -96,21 +96,22 @@ async fn next_queue_position(conn: &crate::storage::Connection) -> Result<i64> {
 }
 
 fn retryable_postgres_error(error: &tokio_postgres::Error) -> bool {
+    error.is_closed() || error.code().is_some_and(retryable_sqlstate)
+}
+
+fn retryable_sqlstate(code: &tokio_postgres::error::SqlState) -> bool {
     use tokio_postgres::error::SqlState;
-    error.is_closed()
-        || error.code().is_some_and(|code| {
-            code.code().starts_with("08")
-                || [
-                    SqlState::ADMIN_SHUTDOWN,
-                    SqlState::CRASH_SHUTDOWN,
-                    SqlState::CANNOT_CONNECT_NOW,
-                    SqlState::QUERY_CANCELED,
-                    SqlState::TOO_MANY_CONNECTIONS,
-                    SqlState::T_R_SERIALIZATION_FAILURE,
-                    SqlState::T_R_DEADLOCK_DETECTED,
-                ]
-                .contains(code)
-        })
+    code.code().starts_with("08")
+        || [
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::CRASH_SHUTDOWN,
+            SqlState::CANNOT_CONNECT_NOW,
+            SqlState::QUERY_CANCELED,
+            SqlState::TOO_MANY_CONNECTIONS,
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+        ]
+        .contains(code)
 }
 
 fn catalog_error(error: anyhow::Error) -> anyhow::Error {
@@ -1557,6 +1558,36 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::NotFound).into()
         )));
         Ok(())
+    }
+
+    #[test]
+    fn catalog_cancellation_and_pending_imports_allow_deferral() {
+        let errors: [anyhow::Error; 2] = [
+            crate::storage::Error::Canceled.into(),
+            SharedCatalogNotReady.into(),
+        ];
+        for error in errors {
+            let error = catalog_error(error.context("catalog coordination"));
+            assert!(Database::is_shared_catalog_failure(&error));
+            assert!(Database::is_shared_catalog_failure(&catalog_error(error)));
+        }
+    }
+
+    #[test]
+    fn postgres_retry_policy_distinguishes_interruptions_from_invalid_writes() {
+        use tokio_postgres::error::SqlState;
+        // Network loss, shutdown, cancellation, saturation and transaction
+        // conflicts can succeed when retried without changing stored data.
+        for code in [
+            "08006", "57P01", "57P02", "57P03", "57014", "53300", "40001", "40P01",
+        ] {
+            assert!(retryable_sqlstate(&SqlState::from_code(code)), "{code}");
+        }
+        // Authentication, privileges, schema and constraint errors need a
+        // configuration or data correction and must retain failure accounting.
+        for code in ["28P01", "42501", "42P01", "23505", "23514", "22023"] {
+            assert!(!retryable_sqlstate(&SqlState::from_code(code)), "{code}");
+        }
     }
 
     #[tokio::test]

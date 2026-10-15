@@ -565,10 +565,18 @@ async fn exercise_bounded_shared_backlog(first: &Database, second: &Database) ->
     assert_eq!(first.shared_bug_pending_ids().await?.len(), 5);
     first.sync_shared_bugs().await?;
     assert!(first.shared_bug_pending_ids().await?.is_empty());
-    assert_eq!(
-        second.sync_shared_bugs().await?,
-        sashiko::db::SharedSyncStatus::Importing
-    );
+    let error = second
+        .lock_bug_dedup()
+        .await
+        .err()
+        .context("deduplication must wait for the remaining imports")?;
+    assert_eq!(error.to_string(), "Shared bug catalog is unavailable");
+    assert!(format!("{error:#}").contains("Shared catalog has more records to import"));
+    let guard = second
+        .lock_bug_dedup()
+        .await?
+        .context("deduplication guard after importing the remaining records")?;
+    drop(guard);
     assert_eq!(
         second.sync_shared_bugs().await?,
         sashiko::db::SharedSyncStatus::Ready
