@@ -55,6 +55,7 @@ pub mod project;
 pub mod prompt_bundle;
 #[cfg(feature = "server")]
 pub mod reviewer;
+pub mod scan;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod settings;
