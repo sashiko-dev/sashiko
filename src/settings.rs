@@ -969,7 +969,10 @@ pub struct ReviewSettings {
     #[serde(default = "default_max_total_tokens")]
     pub max_total_tokens: usize,
     /// Load code notes (`notes/<set>/` in the prompt directory) into reviews.
-    #[serde(default)]
+    /// On by default: code notes replaced the hand-written subsystem guides,
+    /// so a review without them has no knowledge about the code beyond what
+    /// it reads itself.
+    #[serde(default = "default_true")]
     pub use_code_notes: bool,
     /// Byte budget of the code notes inlined into one review.
     #[serde(default = "default_code_notes_bytes")]
@@ -2050,6 +2053,13 @@ mod tests {
         let omitted: AclSettings = serde_json::from_str("{}").unwrap();
         assert!(omitted.admins.is_empty());
         assert!(!omitted.is_admin(""));
+    }
+
+    #[test]
+    fn test_code_notes_load_by_default() {
+        let settings = Settings::new().unwrap();
+        assert!(settings.review.use_code_notes);
+        assert_eq!(settings.review.code_notes_scope, CodeNotesScope::Unit);
     }
 
     #[test]
