@@ -185,7 +185,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
     // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
     if !symbols.is_empty() {
         let regex_pattern = format!(
-            "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
+            "^((struct|enum|union)[[:space:]]+({0})([^[:alnum:]_]|$)|#define[[:space:]]+({0})([^[:alnum:]_]|$)|([[:alpha:]_][[:alnum:]_[:space:]*]+[[:space:]]+)?({0})[[:space:]]*\\()",
             symbols.join("|")
         );
 
@@ -201,7 +201,7 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
             .arg("-z")
             .arg("-n")
             .arg("-I")
-            .arg("-P")
+            .arg("-E")
             .arg("-e")
             .arg(&regex_pattern)
             .arg(&snapshot.sha)

@@ -191,7 +191,6 @@ impl GitWorktree {
         info!("Applying patch in {:?}", self.path);
 
         let mut child = crate::git_cmd::in_dir_async(&self.path)
-            .env("LC_ALL", "C")
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
             .env("GIT_COMMITTER_NAME", "Sashiko Bot")
