@@ -105,7 +105,8 @@ the code behaves a certain way, you MUST verify against the actual implementatio
 
 ### 3.2. Subsystem & Hardware Invariants (MANDATORY)
 **Before flagging missing input/bounds validation or error-pointer checks, verify if the subsystem's invariants render the issue impossible:**
-- **Subsystem Pre-Validation Engine & Tooling Guarantees:** Does the subsystem or the language/compiler tooling ecosystem (e.g., BPF's verifier, Rust's compiler safety constraints, Sparse annotations, lockdep, or device tree schemas) statically or dynamically guarantee that the safety invariant is enforced? If so, do not suggest redundant manual checks.
+- **Subsystem Pre-Validation Engine & Tooling Guarantees:** Does the subsystem or the language/compiler tooling ecosystem (e.g., BPF's verifier, Rust's compiler safety constraints, Sparse annotations, lockdep, or device tree schemas) statically or dynamically guarantee that the safety invariant is enforced? If so, do not suggest redundant manual checks. However, when dismissing an out-of-bounds or parsing bug based on an upstream helper or validator (such as `*_size_ok` or a pre-decode check), you MUST read that validator's implementation and verify that every flag or branch condition (such as default-mapping flags or post-decode empty outputs) guarantees the consumer's access.
+- **Hardware vs. Software Array Bounds:** Never dismiss a missing bounds check on a fixed-capacity kernel software array or fragment list (such as `skb_shinfo(skb)->frags[MAX_SKB_FRAGS]` in `skb_add_rx_frag()`) inside a descriptor or packet loop by assuming hardware initialization registers or MTU settings cap the iteration count.
 - **Architecture & Context Constraints:** Is the flagged issue (e.g., unaligned memory access or 32-bit register layout corruption) only physically possible on hardware architectures that are irrelevant to or unsupported by the target subsystem or driver?
 - **Intentional Error Pointers:** Do not flag callee functions for returning standard kernel error pointers (e.g., `ERR_PTR(-ENOENT)` or `ERR_PTR(-ENOMEM)`) instead of NULL. Returning an `ERR_PTR` is a standard, deliberate design pattern in the Linux kernel to propagate specific failure codes. (However, always verify that the *callers* of such functions properly validate the returned value using `IS_ERR()` or `IS_ERR_OR_NULL()`).
 - **Hardware Quirks:** Is the flagged sequence (e.g., writing to registers in a seemingly "wrong" order or after sleep) explicitly required by the hardware specification?
@@ -215,9 +216,9 @@ produced one, check it against the code again rather than copying it.
 
 ### 9. Performance Tradeoffs
 **Not a regression if**:
-- Lower performance was an intentional tradeoff
+- Lower performance was an intentional tradeoff explicitly documented in the commit message or code comments
 - Commit message explains the performance impact
-- Simplicity/maintainability was prioritized
+- Simplicity/maintainability was explicitly prioritized by the author in the commit message or comments (never invent an unstated "simplicity tradeoff" to excuse operating on unmodified ranges/entries when the code tracks modified sub-ranges, or to excuse narrowing an existing Kconfig/UAPI feature)
 - It's optimizing for a different use case
 
 ### 9.1 Documented API Guarantees
