@@ -1029,7 +1029,7 @@ pub fn extra_prompt_paths_for_items(
         if p.contains('/')
             || matches!(
                 p.as_str(),
-                "callstack.md" | "technical-patterns.md" | "prompt-injection.md"
+                "callstack.md" | "technical-patterns.md" | "locking.md" | "prompt-injection.md"
             )
         {
             push_path(PathBuf::from(&p));
@@ -1782,7 +1782,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "locking",
         short: "Locking & Sync",
         instruction: STAGE_LOCKING_INSTRUCTION,
-        guides: &["subsystem/locking.md"],
+        guides: &["locking.md"],
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
@@ -2676,14 +2676,7 @@ mod tests {
         assert!(!is_stage_exclusive_guide("mm-vma.md"));
         assert!(!is_stage_exclusive_guide("subsystem.md"));
 
-        // Matched on the file name, since that is what the pre-screen returns,
-        // while the table holds the path a stage includes it by.
-        assert!(
-            ANALYSIS_STAGES
-                .iter()
-                .any(|d| d.guides.contains(&"subsystem/locking.md"))
-        );
-        assert!(!is_stage_exclusive_guide("subsystem/locking.md"));
+        assert!(ANALYSIS_STAGES.iter().any(|d| d.guides.contains(&"locking.md")));
     }
 
     #[test]
@@ -3802,7 +3795,7 @@ mod tests {
             prompts,
             vec![
                 "networking.md".to_string(),
-                "subsystem/locking.md".to_string(),
+                "locking.md".to_string(),
                 "patterns/BPF-001.md".to_string(),
             ]
         );
@@ -3847,22 +3840,22 @@ mod tests {
         assert_eq!(state.all_concerns[0]["prompts"], json!(prompts));
 
         // Extra prompt paths for verification exclude networking.md (already in selected_guides)
-        // and include subsystem/locking.md, patterns/BPF-001.md, callstack.md, technical-patterns.md.
+        // and include locking.md, patterns/BPF-001.md, callstack.md, technical-patterns.md.
         let extra_paths = extra_prompt_paths_for_state(&state, analysis_stage_by_name);
         assert_eq!(
             extra_paths,
             vec![
-                PathBuf::from("subsystem/locking.md"),
+                PathBuf::from("locking.md"),
                 PathBuf::from("patterns/BPF-001.md"),
                 PathBuf::from("callstack.md"),
                 PathBuf::from("technical-patterns.md"),
             ]
         );
 
-        // Verification stage user prompt log includes @subsystem/locking.md, @patterns/BPF-001.md, etc.
+        // Verification stage user prompt log includes @locking.md, @patterns/BPF-001.md, etc.
         let ver_stage = verification_stage(20, 0.0);
         let rendered_ver_log = ver_stage.user_prompt.render_for_log(&state);
-        assert!(rendered_ver_log.contains("@subsystem/locking.md"));
+        assert!(rendered_ver_log.contains("@locking.md"));
         assert!(rendered_ver_log.contains("@patterns/BPF-001.md"));
         assert!(rendered_ver_log.contains("@callstack.md"));
         assert!(rendered_ver_log.contains("@technical-patterns.md"));
@@ -3897,7 +3890,7 @@ mod tests {
             state.hard_cases[0]["prompts"],
             json!([
                 "networking.md",
-                "subsystem/locking.md",
+                "locking.md",
                 "patterns/BPF-001.md",
                 "callstack.md",
                 "technical-patterns.md"
@@ -3939,7 +3932,7 @@ mod tests {
             state.findings[0]["prompts"],
             json!([
                 "networking.md",
-                "subsystem/locking.md",
+                "locking.md",
                 "patterns/BPF-001.md",
                 "callstack.md",
                 "technical-patterns.md"
@@ -3968,7 +3961,7 @@ mod tests {
             &mut state.all_dismissed_concerns,
             &[json!({"description": "dismissed one", "reasoning": "d1", "locations": []})],
             "locking",
-            &["subsystem/locking.md".to_string()],
+            &["locking.md".to_string()],
         );
 
         assert_eq!(state.all_concerns[0]["id"], "C1");

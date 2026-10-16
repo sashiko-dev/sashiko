@@ -201,9 +201,9 @@ complete caller analysis.
   - Output: list of pointers you found for the same memory
 - step resource.4: Verify resources are properly initialized, locked, and freed
 - step resource.4b: For any suspected race, including a use-after-free where the other side is asynchronous work, an RCU callback or a workqueue item:
-  - Load `subsystem/locking.md` if not already loaded, and follow its tracing method
+  - Load `locking.md` if not already loaded, and follow its tracing method
   - For a suspected use-after-free, complete "Step 5: Check Object Lifetime", including the reference budget, before reporting
-  - Output: "subsystem/locking.md loaded: [ y / n ]", plus the `budget:` line for a suspected use-after-free
+  - Output: "locking.md loaded: [ y / n ]", plus the `budget:` line for a suspected use-after-free
 - step resource.5: Continue into Task 5B, even if you think you've found enough details to complete the analysis
 - Output: Category NUMBER [ list of resources checked: line of code where each resource was assigned ]
 

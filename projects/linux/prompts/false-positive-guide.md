@@ -208,7 +208,7 @@ the dismissal is invalid. Report the race.
 ### 8.2. Race reference budget (MANDATORY)
 For any suspected use-after-free where the other side is asynchronous work, an
 RCU callback or a workqueue item, apply "Step 5: Check Object Lifetime" in
-`subsystem/locking.md`, loading it if it is not already loaded.
+`locking.md`, loading it if it is not already loaded.
 
 Required output: the `budget:` line defined there. If analysis already
 produced one, check it against the code again rather than copying it.
