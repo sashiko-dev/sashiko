@@ -23,7 +23,6 @@ mod prompt_fingerprint;
 include!("src/prompt_namespaces.rs");
 
 fn main() {
-    println!("cargo:rerun-if-changed=third_party/prompts");
     println!("cargo:rerun-if-changed=projects");
     println!("cargo:rerun-if-changed=src/prompt_fingerprint.rs");
     println!("cargo:rerun-if-changed=src/prompt_namespaces.rs");
@@ -48,25 +47,12 @@ fn main() {
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let vendored_dir = manifest_dir.join("third_party/prompts");
     let projects_dir = manifest_dir.join("projects");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let generated = out_dir.join("prompts_generated.rs");
 
-    // Both trees flatten into one bundle namespace, so a project directory
-    // appearing in both would have one copy silently win depending on
-    // collection order. Collect them separately to name the offender.
-    let vendored = collect_root(&vendored_dir);
     let first_party = collect_projects_prompts(&projects_dir);
 
-    for (relative, _) in &first_party {
-        if vendored.iter().any(|(other, _)| other == relative) {
-            panic!(
-                "prompt {relative} exists in both third_party/prompts and projects; \
-                 they share one bundle namespace, so one would silently shadow the other"
-            );
-        }
-    }
     // Several projects/ directories can map to one namespace, so the
     // first-party tree can collide with itself too. It is sorted by bundle
     // path, which puts any duplicates next to each other.
@@ -82,23 +68,13 @@ fn main() {
         }
     }
 
-    let mut files = vendored;
-    files.extend(first_party.iter().cloned());
-    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let files = first_party;
 
     // The bundle is installed into a directory named after its revision, and
     // an existing directory marked complete is used as it is. So the revision
     // must change whenever any bundled file does, or an edited prompt never
-    // reaches an installed copy. The vendored tree's REVISION names the
-    // review-prompts snapshot it came from, but local changes to that tree
-    // land without touching it, so it serves only as a readable prefix.
-    // Fingerprinting every file, vendored and first-party, is what makes an
-    // edit produce a new directory, and keeps two builds with different
-    // prompts from sharing one.
-    let vendored_revision = fs::read_to_string(vendored_dir.join("REVISION"))
-        .unwrap_or_else(|_| "unknown".to_string())
-        .trim()
-        .to_string();
+    // reaches an installed copy: it is a fingerprint of every bundled file,
+    // which also keeps two builds with different prompts from sharing one.
     let contents: Vec<(&str, Vec<u8>)> = files
         .iter()
         .map(|(relative, absolute)| {
@@ -112,7 +88,7 @@ fn main() {
             .iter()
             .map(|(relative, content)| (*relative, content.as_slice())),
     );
-    let revision = format!("{vendored_revision}-{fingerprint:016x}");
+    let revision = format!("prompts-{fingerprint:016x}");
 
     let mut generated_bytes = Vec::new();
     writeln!(
@@ -144,20 +120,6 @@ fn main() {
     if should_write {
         fs::write(&generated, &generated_bytes).unwrap();
     }
-}
-
-/// Every file under a prompt root, as (bundle path, source path).
-fn collect_root(root: &Path) -> Vec<(String, PathBuf)> {
-    let mut files = Vec::new();
-    collect_files(root, root, &mut files).unwrap_or_else(|e| {
-        panic!(
-            "failed to read prompt root {}: {e}. If this is the vendored tree, \
-             the submodule may not be checked out",
-            root.display()
-        )
-    });
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
 }
 
 /// Every file under `projects/<project>/prompts/`, as (`<namespace>/<relative>`,

@@ -169,11 +169,11 @@ modify test cases in the `benchmarks/` directory: `benchmarks/*.json` are static
 ground-truth datasets of known positive kernel bugs (`BenchmarkEntry` in
 `src/benchmark.rs`) and do not support negative/false-positive test cases or
 per-commit test additions. For targeted false-positive refinements in
-`third_party/prompts/`, local re-review results on the affected Linux
+`projects/linux/prompts/`, local re-review results on the affected Linux
 patches/series reported in the commit message are sufficient validation. Only
 flag missing validation (as **High** severity) when a change that can
 meaningfully affect overall Linux AI patch-review or initial bug-discovery
-quality across the board (`third_party/prompts/`, `linux_patch_review.rs`,
+quality across the board (`projects/linux/prompts/`, `linux_patch_review.rs`,
 `linux_bug.rs`, generic workflow graph, model parameters, or shared
 verification/deduplication logic) provides neither benchmark results nor targeted
 patch re-review validation in its commit message.

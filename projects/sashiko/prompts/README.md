@@ -3,10 +3,9 @@
 First-party review prompts for Sashiko reviewing its own changes, used by the
 `sashiko` project profile (`--project sashiko`).
 
-These are distinct from `third_party/prompts/`, which is a vendored upstream
-tree covering the Linux kernel, systemd and iproute. Both are compiled into the
-prompt bundle by `build.rs` and extracted side by side, so a directory name must
-not appear in both; the build fails if one does.
+These are distinct from `projects/linux/prompts/`, the Linux review's prompts.
+Both are compiled into the prompt bundle by `build.rs`, each under its own
+namespace (`sashiko/` and `kernel/`).
 
 ## Layout
 

@@ -440,7 +440,7 @@ mod tests {
 
         // Ensure we have a dummy prompt file to read
         // The real review-prompts might not be populated in test env, check first
-        // Or assume technical-patterns.md exists as per repo structure.
+        // Or assume severity.md exists as per repo structure.
         // But tests might run in clean env. Let's create a dummy one if we can or check existence.
         // Since we are running in the actual repo, review-prompts should exist.
 
@@ -452,7 +452,7 @@ mod tests {
             assert!(result.get("content").is_some());
         } else {
             // If file doesn't exist (e.g. CI), skip assertion on content but check tool availability
-            println!("Skipping read_prompt content check: technical-patterns.md not found");
+            println!("Skipping read_prompt content check: severity.md not found");
         }
 
         // Test disabled tool

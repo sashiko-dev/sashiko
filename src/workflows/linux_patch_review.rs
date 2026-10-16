@@ -1035,7 +1035,7 @@ pub fn extra_prompt_paths_for_items(
         if p.contains('/')
             || matches!(
                 p.as_str(),
-                "callstack.md" | "technical-patterns.md" | "locking.md" | "prompt-injection.md"
+                "callstack.md" | "locking.md" | "prompt-injection.md"
             )
         {
             push_path(PathBuf::from(&p));
@@ -1720,7 +1720,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "execution-flow",
         short: "Execution Flow",
         instruction: STAGE_EXECUTION_FLOW_INSTRUCTION,
-        guides: &["callstack.md", "technical-patterns.md"],
+        guides: &["callstack.md"],
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
@@ -2625,7 +2625,6 @@ mod tests {
         // Claimed by a stage, so the pre-screen must not also broadcast them.
         assert!(is_stage_exclusive_guide("locking.md"));
         assert!(is_stage_exclusive_guide("callstack.md"));
-        assert!(is_stage_exclusive_guide("technical-patterns.md"));
 
         // Not claimed by any stage: the pre-screen's to offer.
         assert!(!is_stage_exclusive_guide("mm-vma.md"));
@@ -3807,7 +3806,7 @@ mod tests {
         assert_eq!(state.all_concerns[0]["prompts"], json!(prompts));
 
         // Extra prompt paths for verification exclude networking.md (already in selected_guides)
-        // and include locking.md, patterns/BPF-001.md, callstack.md, technical-patterns.md.
+        // and include locking.md, patterns/BPF-001.md and callstack.md.
         let extra_paths = extra_prompt_paths_for_state(&state, analysis_stage_by_name);
         assert_eq!(
             extra_paths,
@@ -3815,7 +3814,6 @@ mod tests {
                 PathBuf::from("locking.md"),
                 PathBuf::from("patterns/BPF-001.md"),
                 PathBuf::from("callstack.md"),
-                PathBuf::from("technical-patterns.md"),
             ]
         );
 
@@ -3825,7 +3823,6 @@ mod tests {
         assert!(rendered_ver_log.contains("@locking.md"));
         assert!(rendered_ver_log.contains("@patterns/BPF-001.md"));
         assert!(rendered_ver_log.contains("@callstack.md"));
-        assert!(rendered_ver_log.contains("@technical-patterns.md"));
 
         let mut ver_out = VerificationOutput {
             findings: vec![],
@@ -3859,8 +3856,7 @@ mod tests {
                 "networking.md",
                 "locking.md",
                 "patterns/BPF-001.md",
-                "callstack.md",
-                "technical-patterns.md"
+                "callstack.md"
             ])
         );
 
@@ -3901,8 +3897,7 @@ mod tests {
                 "networking.md",
                 "locking.md",
                 "patterns/BPF-001.md",
-                "callstack.md",
-                "technical-patterns.md"
+                "callstack.md"
             ])
         );
         let _ = &mut ver_out;

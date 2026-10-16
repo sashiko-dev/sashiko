@@ -407,8 +407,8 @@ Two properties fall out, and both are load-bearing:
    an `Included` segment. `test_a_variable_value_cannot_place_a_file` asserts
    exactly this: a diff carrying both directives renders them literally, and
    the real guide is still placed exactly once.
-2. **An included file's content is never scanned for `{{var}}`.** A vendored
-   guide under `third_party/prompts/kernel/` that happens to contain
+2. **An included file's content is never scanned for `{{var}}`.** A prompt
+   file under `projects/linux/prompts/` that happens to contain
    `{{target_commit_diff}}` does not get the diff spliced into it.
 
 This came from `2baf858f4e03`, which also fixed the functional half: before

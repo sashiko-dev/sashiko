@@ -59,7 +59,7 @@ impl Default for WorkerOptions {
         Self {
             project: crate::project::ProjectId::Linux,
             baseline: None,
-            prompts: PathBuf::from("third_party/prompts/kernel"),
+            prompts: PathBuf::from("projects/linux/prompts"),
             review_patch_index: None,
             review_commit: None,
             reuse_worktree: None,
@@ -89,7 +89,7 @@ impl Default for ReviewOptions {
         Self {
             project: crate::project::ProjectId::Linux,
             baseline: None,
-            prompts: PathBuf::from("third_party/prompts/kernel"),
+            prompts: PathBuf::from("projects/linux/prompts"),
             custom_prompt: None,
             agent: false,
             report_preexisting: false,

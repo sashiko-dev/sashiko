@@ -35,7 +35,7 @@ make check-pr
 - `yamllint` when YAML configuration or workflow files are touched.
 - `cargo fmt`, `cargo clippy` across feature profiles (`server`, `--no-default-features`, and `--features cache`), and `cargo test --all-features` when Rust source or Cargo files are touched.
 
-If you are modifying Linux kernel review prompts (`third_party/prompts/`) or review workflows, also validate your changes against the benchmark suite (see the [Benchmarking Guide](docs/benchmarking.md)).
+If you are modifying Linux kernel review prompts (`projects/linux/prompts/`) or review workflows, also validate your changes against the benchmark suite (see the [Benchmarking Guide](docs/benchmarking.md)).
 
 ## Sashiko-for-Sashiko Review Workflow
 

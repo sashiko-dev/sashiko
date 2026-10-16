@@ -7,7 +7,7 @@ analysis traverses the full callstack — both up and down — to identify
 side effects, unintended consequences, and regressions that would be invisible
 when examining modified functions in isolation.
 
-See technical-patterns.md "NULL Pointer Dereference" section for guidance.
+See pointer-guards.md for how to decide whether a NULL pointer is guarded.
 
 Note: foo->ptr dereferences foo BUT NOT ptr
 
@@ -212,8 +212,7 @@ complete caller analysis.
 **CRITICAL**: This task catches use-after-free bugs in RCU-protected data structures.
 
 - step rcu.1: For any `call_rcu()`, `synchronize_rcu()`, or `kfree_rcu()` in the diff:
-  - Load `subsystem/rcu.md` if not already loaded
-  - Output: "subsystem/rcu.md loaded: [ y / n ]"
+  - Check the code notes for the RCU rules of the structures involved, and the RCU section of `locking.md`
 - step rcu.2: Identify what data structures the object is part of (rhashtable, hlist, list, rb-tree, etc.)
   - Output: "Object in data structures: [ list ]"
 - step rcu.3: Verify removal from ALL lookup structures happens BEFORE call_rcu()

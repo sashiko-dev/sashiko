@@ -103,7 +103,7 @@ affect overall Linux AI patch-review or initial bug-discovery quality across the
 board — such as global Linux patch-review or initial bug-discovery stage
 instructions (`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph
 structure, model parameters, shared verification/deduplication logic, or broad
-Linux prompt changes (`third_party/prompts/`) — must include validation evidence
+Linux prompt changes (`projects/linux/prompts/`) — must include validation evidence
 in the commit message (either benchmark suite evaluation results or, for targeted
 false-positive prompt refinements, local re-review results on the affected Linux
 patches/series). Note that the JSON files in `benchmarks/` are static

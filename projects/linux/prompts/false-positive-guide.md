@@ -245,10 +245,9 @@ redzone padding up to the cache alignment.
   allocation is only guaranteed `UART_XMIT_SIZE` alignment, while `foo()`
   masks the low `PAGE_SHIFT` bits of the address."
 
-See "kmalloc Alignment Guarantees" in `subsystem/mm-alloc.md` for the full
-rules, and "Suitability of kmalloc Memory" for the constraints on kmalloc
-memory that are real (`struct page` requirements, silently-ignored
-`__GFP_DMA32`).
+Check the allocator code (and its code notes) for the full alignment
+rules and for the constraints on kmalloc memory that are real (`struct
+page` requirements, silently-ignored `__GFP_DMA32`).
 
 ### 9.2. Practical Severity vs. Theoretical Pathology
 **Do not waste developer time with theoretical, non-impactful bugs:**
@@ -286,7 +285,6 @@ to them before reading them
 ### 13. Implicit Guard Conditions
 
 **Before reporting NULL dereference**:
-- Review technical-patterns.md "NULL Pointer Dereference" section
 - Load and fully analyze pointer-guards.md for EVERY NULL pointer
 
 ### 14. Patch series false positive removal
@@ -374,7 +372,7 @@ Do not skip steps. Do not claim completion without producing the output.
 
 Before reporting ANY regression, verify:
 
-0. For NULL pointer dereferences, review technical-patterns.md and load pointer-guards.md
+0. For NULL pointer dereferences, load pointer-guards.md
    - Output: "reviewed" or "not applicable - not a NULL dereference issue"
 1. **Can I prove this path executes?**
    - Find calling code that reaches here

@@ -66,7 +66,7 @@ As with any LLM-based tool, Sashiko's output is probabilistic and may vary acros
 
 ### Multi-Stage Review Pipeline
 
-Sashiko evaluates patches through specialized parallel analysis stages followed by sequential consolidation stages, combined with per-subsystem prompts initially developed by Chris Mason ([review-prompts](https://github.com/masoncl/review-prompts)).
+Sashiko evaluates patches through specialized parallel analysis stages followed by sequential consolidation stages, combined with code notes generated and verified from the kernel source, maintainer notes on each subsystem's preferences and policies, and review procedures that descend from Chris Mason's [review-prompts](https://github.com/masoncl/review-prompts).
 
 **Analysis stages** (run in parallel; `goal`, `implementation`, and `execution-flow` always run, while the planning stage selects the rest unless overridden via `--stages`):
 

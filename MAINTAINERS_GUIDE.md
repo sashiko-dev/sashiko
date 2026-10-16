@@ -19,12 +19,9 @@ To request tracking for a new lore or NNTP mailing list, you can either:
 
 ## Adding Subsystem-Specific Prompts
 
-If you'd like to customize the review criteria or focus areas for your subsystem, you can provide subsystem-specific prompts. There are two ways to do this:
+Sashiko learns how your subsystem's code works by reading and verifying the source itself (its code notes), so there is no need to describe the code. What it cannot learn from the code is what you and your community expect: coding preferences, patch and process policies, conventions and review priorities. To record those, submit a pull request adding or editing a maintainer note under [`projects/linux/prompts/maintainers/`](projects/linux/prompts/maintainers/): one markdown file per subsystem, with front matter naming the paths and symbols it covers (see the existing notes and `projects/linux/prompts/README.md`).
 
-1.  **Submit a Pull Request to this Repository:** Add your prompt markdown file directly into the [`third_party/prompts/kernel/subsystem/`](third_party/prompts/kernel/subsystem/) directory.
-2.  **Submit a Pull Request to Chris Mason's Repository:** Contribute your prompts upstream to [Chris Mason's repository](https://github.com/masoncl/review-prompts), which is periodically synced into Sashiko.
-
-> **Note:** Please keep your prompts small and focused. Avoid adding trivial facts or generic programming advice, as this only wastes the AI's context window and can degrade review quality.
+> **Note:** Please keep maintainer notes small and focused on preferences and policies. Facts about the code belong in the code, not in a note.
 
 ## How Sashiko Detects the Baseline for Your Patch
 
