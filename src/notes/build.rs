@@ -139,9 +139,52 @@ pub async fn build_unit(
         ..Default::default()
     };
 
+    // A resumed build may name components the saved steps do not cover;
+    // those are surveyed and explored, and every later step reruns over the
+    // whole unit, reusing the verdicts of facts already verified.
+    let mut extended = false;
+
     // 1. Survey.
-    let survey: SurveyOutput = match load_step(&work, "survey", cfg.resume)? {
-        Some(saved) => saved,
+    let survey: SurveyOutput = match load_step::<SurveyOutput>(&work, "survey", cfg.resume)? {
+        Some(mut saved) => {
+            let missing: Vec<ComponentInput> = state
+                .components
+                .iter()
+                .filter(|c| !saved.components.iter().any(|s| s.name == c.name))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                info!(
+                    "{}: surveying {} component(s) new to the saved build",
+                    unit.name,
+                    missing.len()
+                );
+                let mut partial = NotesBuildState {
+                    components: missing,
+                    ..state.clone()
+                };
+                let workflow = single_stage_workflow(
+                    "notes_survey",
+                    survey_stage(cfg.max_turns, cfg.temperature),
+                );
+                run_step(
+                    &workflow,
+                    env,
+                    &mut partial,
+                    &work,
+                    "survey-extend",
+                    &mut summary.usage,
+                )
+                .await?;
+                let added = partial
+                    .survey
+                    .context("the survey stage produced no survey")?;
+                saved.components.extend(added.components);
+                save_step(&work, "survey", &saved)?;
+                extended = true;
+            }
+            saved
+        }
         None => {
             let workflow =
                 single_stage_workflow("notes_survey", survey_stage(cfg.max_turns, cfg.temperature));
@@ -184,11 +227,28 @@ pub async fn build_unit(
         component.rule_comments =
             rule_comments(repo, &cfg.revision, &files, MAX_RULE_COMMENTS).await?;
     }
-    let explored: Vec<ExploreRecord> = match load_step(&work, "explore", cfg.resume)? {
-        Some(saved) => saved,
-        None => {
+    let saved_explore: Option<Vec<ExploreRecord>> = load_step(&work, "explore", cfg.resume)?;
+    let explored: Vec<ExploreRecord> = match saved_explore {
+        Some(saved)
+            if state
+                .components
+                .iter()
+                .all(|c| saved.iter().any(|r| r.component == c.name)) =>
+        {
+            saved
+        }
+        saved => {
+            if saved.is_some() {
+                extended = true;
+            }
+            let previous = saved.unwrap_or_default();
+            state.explored = previous.clone();
             let mut stages = Vec::new();
-            for component in &state.components {
+            for component in state
+                .components
+                .iter()
+                .filter(|c| !previous.iter().any(|r| r.component == c.name))
+            {
                 let component_survey = survey
                     .components
                     .iter()
@@ -253,11 +313,12 @@ pub async fn build_unit(
                 }
             }
             summary.explore_stages = stages.len();
-            if state.explored.len() < stages.len() {
+            let produced = state.explored.len() - previous.len();
+            if produced < stages.len() {
                 warn!(
                     "{}: {} of {} explore stages failed",
                     unit.name,
-                    stages.len() - state.explored.len(),
+                    stages.len() - produced,
                     stages.len()
                 );
             }
@@ -268,7 +329,8 @@ pub async fn build_unit(
     state.explored = explored;
 
     // 4. Unit-wide IDs and the deterministic evidence check.
-    let checked: Vec<CheckedFact> = match load_step(&work, "checked", cfg.resume)? {
+    let saved_checked: Option<Vec<CheckedFact>> = load_step(&work, "checked", cfg.resume)?;
+    let checked: Vec<CheckedFact> = match saved_checked.filter(|_| !extended) {
         Some(saved) => saved,
         None => {
             let mut files = RevisionFiles::new(repo, &cfg.revision);
@@ -297,7 +359,8 @@ pub async fn build_unit(
 
     // Facts from different topics often restate one rule; verify each
     // rule once. A failed dedup keeps every fact.
-    let groups: Vec<Vec<String>> = match load_step(&work, "dedup", cfg.resume)? {
+    let saved_groups: Option<Vec<Vec<String>>> = load_step(&work, "dedup", cfg.resume)?;
+    let groups: Vec<Vec<String>> = match saved_groups.filter(|_| !extended) {
         Some(saved) => saved,
         None if checked.len() < 2 => Vec::new(),
         None => {
@@ -328,10 +391,18 @@ pub async fn build_unit(
 
     // 5. Independent verification, then the same deterministic check on
     //    the verifier's own evidence.
-    let verdicts: Vec<FactVerdict> = match load_step(&work, "verdicts", cfg.resume)? {
-        Some(saved) => saved,
-        None => {
-            let batches: Vec<Vec<CheckedFact>> = checked
+    let saved_verdicts: Option<Vec<FactVerdict>> = load_step(&work, "verdicts", cfg.resume)?;
+    let verdicts: Vec<FactVerdict> = match saved_verdicts {
+        Some(saved) if !extended => saved,
+        saved => {
+            // An extended build verifies only the facts without a verdict.
+            let previous = saved.unwrap_or_default();
+            let pending: Vec<CheckedFact> = checked
+                .iter()
+                .filter(|c| !previous.iter().any(|v| v.fact_id == c.fact.id))
+                .cloned()
+                .collect();
+            let batches: Vec<Vec<CheckedFact>> = pending
                 .chunks(VERIFY_BATCH_SIZE)
                 .map(<[_]>::to_vec)
                 .collect();
@@ -347,7 +418,8 @@ pub async fn build_unit(
                 let step = format!("verify-round-{}", round + 1);
                 run_step(&workflow, env, &mut state, &work, &step, &mut summary.usage).await?;
             }
-            let verdicts = check_verifier_evidence(repo, &cfg.revision, &state.verdicts).await?;
+            let mut verdicts = previous;
+            verdicts.extend(check_verifier_evidence(repo, &cfg.revision, &state.verdicts).await?);
             save_step(&work, "verdicts", &verdicts)?;
             verdicts
         }
@@ -366,7 +438,8 @@ pub async fn build_unit(
     summary.not_patch_rules = summary.confirmed - confirmed.len();
 
     // 6. Synthesize the note.
-    let note = match load_text(&work, "note.md", cfg.resume)? {
+    let saved_note = load_text(&work, "note.md", cfg.resume)?;
+    let note = match saved_note.filter(|_| !extended) {
         Some(saved) => saved,
         None => {
             let note = if confirmed.is_empty() {
