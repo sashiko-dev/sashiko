@@ -43,8 +43,9 @@ pub struct LinuxPatchReviewState {
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
 
-    /// Subsystem guide markdown files selected during the pre-screen and
-    /// shared with every stage.
+    /// Guide files shared with every stage. Linux reviews no longer select
+    /// guides (maintainer notes and code notes replaced the pre-screen), so
+    /// this stays empty for them; the provenance code keeps reading it.
     pub selected_guides: Vec<String>,
     /// Optional manual stages filter (e.g. `--stages goal,locking`).
     pub manual_stages: Option<Vec<String>>,
@@ -52,6 +53,8 @@ pub struct LinuxPatchReviewState {
     pub custom_prompt: Option<String>,
     /// Rendered `<code_notes>` block for the system prompt, or empty.
     pub code_notes: String,
+    /// Rendered `<maintainer_notes>` block for the system prompt, or empty.
+    pub maintainer_notes: String,
     /// Stages selected by dynamic planning (or overridden by manual_stages).
     pub planned_stages: Vec<String>,
     /// Optional reasoning effort mode (`Mid`, `High`, or `Dynamic`).
@@ -159,7 +162,7 @@ If tool output is truncated ('truncated': true), page only if directly relevant 
 <global_review_guidelines>
 The following documents contain the official technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.
 @includes
-</global_review_guidelines>{{{{code_notes}}}}
+</global_review_guidelines>{{{{maintainer_notes}}}}{{{{code_notes}}}}
 
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
@@ -173,6 +176,9 @@ Target Commit:
     .with_var("target_commit_sha", |s: &LinuxPatchReviewState| s.target_commit_sha.clone())
     .with_var("baseline_sha", |s: &LinuxPatchReviewState| s.baseline_sha.clone())
     .with_var("code_notes", |s: &LinuxPatchReviewState| s.code_notes.clone())
+    .with_var("maintainer_notes", |s: &LinuxPatchReviewState| {
+        s.maintainer_notes.clone()
+    })
     .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
     .with_var("target_commit_diff_only", |s: &LinuxPatchReviewState| s.target_commit_diff_only.clone())
     .with_var("prefetched_block", |s: &LinuxPatchReviewState| {
@@ -1443,56 +1449,6 @@ pub fn enrich_post_verification_output(
 // Stage Definitions
 // ---------------------------------------------------------------------------
 
-pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
-    prescreen_stage_with_effort(0.0, None)
-}
-
-pub fn prescreen_stage_with_effort(
-    temperature: f32,
-    effort: Option<crate::ai::EffortMode>,
-) -> Stage<LinuxPatchReviewState, PrescreenOutput> {
-    Stage::builder("pre-screen")
-        .system_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
-            "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking-core.md\", \"locking.md\"]}\n```",
-        ))
-        .user_prompt(
-            PromptTemplate::<LinuxPatchReviewState>::new(
-                "<subsystem_guide_index>\n@include(\"subsystem/subsystem.md\")\n</subsystem_guide_index>\n\n<patch>\n{{target_commit_diff}}\n</patch>",
-            )
-            .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
-            .include_file("subsystem/subsystem.md"),
-        )
-        .output_format(OutputFormat::json_with_schema(json!({
-            "type": "object",
-            "properties": {
-                "selected_prompts": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                }
-            },
-            "required": ["selected_prompts"]
-        })))
-        .policy(StagePolicy {
-            tools: ToolScope::None,
-            max_turns: 1,
-            temperature,
-            reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
-            ..Default::default()
-        })
-        .skip_if(|s| s.manual_stages.is_some())
-        .reduce(|state, out: PrescreenOutput| {
-            let prompts: Vec<String> = out
-                .selected_prompts
-                .into_iter()
-                .map(|name| crate::workflows::guard::normalize_guide_name(&name).to_string())
-                .filter(|name| !is_stage_exclusive_guide(name))
-                .filter(|name| crate::workflows::guard::sanitize_guide_name(name))
-                .collect();
-            state.selected_guides = prompts;
-        })
-        .build()
-}
-
 pub fn build_stage_efforts_schema(stages: &[AnalysisStage]) -> Value {
     let mut props = serde_json::Map::new();
     let mut required = Vec::new();
@@ -2571,7 +2527,6 @@ pub fn build_linux_patch_review_workflow_with_effort(
     effort: Option<crate::ai::EffortMode>,
 ) -> Workflow<LinuxPatchReviewState> {
     Workflow::builder("linux_patch_review")
-        .stage(prescreen_stage_with_effort(temperature, effort))
         .dynamic_parallel(
             planning_stage_with_effort(temperature, effort),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
@@ -2676,7 +2631,11 @@ mod tests {
         assert!(!is_stage_exclusive_guide("mm-vma.md"));
         assert!(!is_stage_exclusive_guide("subsystem.md"));
 
-        assert!(ANALYSIS_STAGES.iter().any(|d| d.guides.contains(&"locking.md")));
+        assert!(
+            ANALYSIS_STAGES
+                .iter()
+                .any(|d| d.guides.contains(&"locking.md"))
+        );
     }
 
     #[test]
@@ -2695,7 +2654,6 @@ mod tests {
             assert!(is_known_stage(stage.name()), "{} not known", stage.name());
             assert_eq!(stage_short_label(stage.name()), Some("Post-Verification"));
         }
-        assert!(is_known_stage(prescreen_stage().name()));
         assert!(is_known_stage(planning_stage().name()));
     }
 
@@ -2912,10 +2870,6 @@ mod tests {
         assert_eq!(
             mid_stage.policy.reasoning_effort,
             Some(crate::ai::ReasoningEffort::Medium)
-        );
-        assert_eq!(
-            prescreen_stage_with_effort(1.0, None).policy.temperature,
-            1.0
         );
         assert_eq!(
             planning_stage_with_effort(1.0, None).policy.temperature,
@@ -3443,7 +3397,20 @@ mod tests {
     fn test_build_workflow_graph_structure() {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
-        assert_eq!(workflow.steps.len(), 6);
+        assert_eq!(workflow.steps.len(), 5);
+    }
+
+    #[test]
+    fn test_maintainer_notes_render_before_code_notes() {
+        let rendered = linux_system_prompt(true).render_for_log(&LinuxPatchReviewState {
+            maintainer_notes: "\n\n<maintainer_notes>M</maintainer_notes>".to_string(),
+            code_notes: "\n\n<code_notes>C</code_notes>".to_string(),
+            ..Default::default()
+        });
+        let m = rendered.find("<maintainer_notes>M").unwrap();
+        let c = rendered.find("<code_notes>C").unwrap();
+        let guidelines = rendered.find("</global_review_guidelines>").unwrap();
+        assert!(guidelines < m && m < c);
     }
 
     #[tokio::test]
@@ -3490,7 +3457,7 @@ mod tests {
         }
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let prompts_dir = std::path::Path::new("third_party/prompts/kernel");
+        let prompts_dir = std::path::Path::new("projects/linux/prompts");
 
         let provider = std::sync::Arc::new(RecordingProvider {
             temperatures: std::sync::Mutex::new(Vec::new()),
@@ -3513,11 +3480,11 @@ mod tests {
             .unwrap();
 
         let recorded = provider.temperatures.lock().unwrap().clone();
-        // pre-screen + planning + 3 core analysis stages (goal, implementation, execution-flow)
-        assert_eq!(recorded.len(), 5);
+        // planning + 3 core analysis stages (goal, implementation, execution-flow)
+        assert_eq!(recorded.len(), 4);
         assert!(
             recorded.iter().all(|&t| t == Some(1.0)),
-            "expected all stages including pre-screen and planning to receive temperature 1.0, got {recorded:?}"
+            "expected all stages including planning to receive temperature 1.0, got {recorded:?}"
         );
     }
 

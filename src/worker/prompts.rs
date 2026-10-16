@@ -127,6 +127,31 @@ async fn select_code_notes(
     crate::notes::select::render_block(set, &notes)
 }
 
+/// Selects the maintainer notes that apply to a patch, by the files and
+/// identifiers its diff touches, and renders their prompt block.
+fn select_maintainer_notes(prompts_dir: &std::path::Path, diff: &str) -> String {
+    use crate::notes::maintainer_notes::{
+        diff_identifiers_all, load_maintainer_notes, render_maintainer_notes,
+    };
+    let notes = load_maintainer_notes(prompts_dir);
+    if notes.is_empty() {
+        return String::new();
+    }
+    let files = crate::baseline::extract_files_from_diff(diff);
+    let identifiers = diff_identifiers_all(diff);
+    let selected: Vec<_> = notes
+        .iter()
+        .filter(|note| note.applies(&files, &identifiers))
+        .collect();
+    tracing::info!(
+        "maintainer notes: {} of {} apply: {:?}",
+        selected.len(),
+        notes.len(),
+        selected.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+    );
+    render_maintainer_notes(&selected)
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub project: ProjectId,
@@ -401,6 +426,8 @@ impl Worker {
             }
             None => String::new(),
         };
+        let maintainer_notes =
+            select_maintainer_notes(&self.prompts.base_dir, &target_commit_diff_only);
 
         let mut state = LinuxPatchReviewState {
             ps_id,
@@ -417,6 +444,7 @@ impl Worker {
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
             code_notes,
+            maintainer_notes,
             planned_stages: Vec::new(),
             effort: self.effort,
             planned_efforts: std::collections::BTreeMap::new(),
