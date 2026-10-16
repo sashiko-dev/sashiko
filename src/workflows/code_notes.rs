@@ -71,6 +71,10 @@ const TYPICAL_BULLET_BYTES: usize = 320;
 pub const EXPLORE_VALIDATION_ATTEMPTS: usize = 5;
 /// Longest note bullet, in characters, citation included.
 pub const MAX_BULLET_CHARS: usize = 600;
+/// Longest bullet the validator accepts. Synthesis is asked for
+/// MAX_BULLET_CHARS; merged rules sometimes run longer, and failing a whole
+/// note over that throws away the synthesis for the fallback note.
+pub const HARD_MAX_BULLET_CHARS: usize = 1000;
 
 /// Static stage names for fan-out; the engine names stages with
 /// `&'static str`. A build with more stages runs them in several rounds.
@@ -1295,12 +1299,12 @@ pub fn validate_note(
     // Every long bullet is named at once, so one retry can fix them all.
     let long: Vec<String> = note
         .lines()
-        .filter(|line| line.starts_with("- ") && line.chars().count() > MAX_BULLET_CHARS)
+        .filter(|line| line.starts_with("- ") && line.chars().count() > HARD_MAX_BULLET_CHARS)
         .map(|line| format!("{:?}", line.chars().take(60).collect::<String>()))
         .collect();
     if !long.is_empty() {
         return Err(format!(
-            "{} bullet(s) are longer than {MAX_BULLET_CHARS} characters; shorten or split each: the bullets starting {}",
+            "{} bullet(s) are longer than {HARD_MAX_BULLET_CHARS} characters; shorten or split each to at most {MAX_BULLET_CHARS}: the bullets starting {}",
             long.len(),
             long.join(", ")
         ));
@@ -1822,7 +1826,7 @@ mod tests {
                 .unwrap_err()
                 .contains("more than one bullet")
         );
-        let long = format!("# src/db\n\n- {} [F1]\n", "x".repeat(MAX_BULLET_CHARS));
+        let long = format!("# src/db\n\n- {} [F1]\n", "x".repeat(HARD_MAX_BULLET_CHARS));
         assert!(
             validate_note(&long, "src/db", &known, 2000)
                 .unwrap_err()
