@@ -214,12 +214,12 @@ pub fn select_notes(
     out
 }
 
-/// Picks up to MAX_SYMBOL_UNITS more unit notes for the specific
-/// identifiers a patch uses (see diff_identifiers), skipping units already
-/// chosen. A unit scores one point per identifier its facts are about that
-/// at most MAX_UNITS_PER_SYMBOL units share; each chosen note keeps only
-/// the rules that name one of the identifiers, within what is left of
-/// `max_bytes`.
+/// Picks up to MAX_SYMBOL_UNITS more unit notes for the cross-unit API
+/// symbols a patch uses (see diff_identifiers), skipping units already
+/// chosen. A unit scores one point per rare API symbol in its manifest that
+/// appears as a subject of one of its note rules; each chosen note keeps
+/// only the rules whose subject names one of that unit's matched symbols,
+/// within what is left of `max_bytes`.
 pub fn select_symbol_notes(
     set: &NotesSet,
     identifiers: &HashSet<String>,
@@ -227,43 +227,65 @@ pub fn select_symbol_notes(
     max_bytes: usize,
 ) -> Vec<SelectedNote> {
     let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut note_freq: HashMap<String, usize> = HashMap::new();
+    let mut unit_texts: HashMap<&str, String> = HashMap::new();
     for (slug, unit) in &set.manifest.units {
         for symbol in &unit.symbols {
-            if identifiers.contains(symbol) {
+            if identifiers.contains(symbol) && is_cross_unit_symbol(symbol) {
                 owners
                     .entry(symbol.as_str())
                     .or_default()
                     .push(slug.as_str());
             }
         }
+        if let Ok(raw) = std::fs::read_to_string(set.dir.join(&unit.note)) {
+            let text = strip_citations(&raw);
+            for sym in note_api_symbols(&text) {
+                *note_freq.entry(sym).or_default() += 1;
+            }
+            unit_texts.insert(slug.as_str(), text);
+        }
     }
-    let mut score: BTreeMap<&str, usize> = BTreeMap::new();
-    for slugs in owners.values() {
-        if slugs.len() <= MAX_UNITS_PER_SYMBOL {
-            for slug in slugs {
-                *score.entry(slug).or_default() += 1;
+
+    let mut matched_by_unit: BTreeMap<&str, HashSet<String>> = BTreeMap::new();
+    for (sym, slugs) in &owners {
+        if slugs.len() <= MAX_UNITS_PER_SYMBOL
+            && note_freq.get(*sym).copied().unwrap_or(0) <= MAX_UNITS_PER_SYMBOL
+        {
+            for &slug in slugs {
+                matched_by_unit
+                    .entry(slug)
+                    .or_default()
+                    .insert((*sym).to_string());
             }
         }
     }
-    let mut ranked: Vec<(&str, usize)> = score.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
 
-    let mut used: usize = chosen.iter().map(|n| n.text.len()).sum();
-    let mut out = Vec::new();
-    for (slug, _) in ranked {
-        if out.len() == MAX_SYMBOL_UNITS {
-            break;
-        }
+    let mut candidates: Vec<(&str, usize, String)> = Vec::new();
+    for (slug, matched) in matched_by_unit {
         let Some(unit) = set.manifest.units.get(slug) else {
             continue;
         };
         if chosen.iter().any(|n| n.unit == unit.name) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(set.dir.join(&unit.note)) else {
+        let Some(raw_text) = unit_texts.get(slug) else {
             continue;
         };
-        let Some(text) = focus_note(&strip_citations(&text), identifiers) else {
+        let Some((focused, hit_count)) = focus_symbol_note(raw_text, &matched) else {
+            continue;
+        };
+        candidates.push((slug, hit_count, focused));
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+
+    let mut used: usize = chosen.iter().map(|n| n.text.len()).sum();
+    let mut out = Vec::new();
+    for (slug, _, text) in candidates {
+        if out.len() == MAX_SYMBOL_UNITS {
+            break;
+        }
+        let Some(unit) = set.manifest.units.get(slug) else {
             continue;
         };
         if used + text.len() > max_bytes {
@@ -306,22 +328,227 @@ fn nearest_unit<'a>(covered: &HashMap<&'a str, &'a str>, file: &str) -> Option<&
 
 /// Words too common in code to tie a note rule to a patch.
 const COMMON_WORDS: &[&str] = &[
-    "const", "static", "struct", "return", "unsigned", "signed", "sizeof", "while", "break",
-    "continue", "switch", "default", "inline", "extern", "union", "typedef", "volatile", "false",
-    "true", "NULL", "void", "char", "short", "long", "self", "Self", "impl", "match", "where",
-    "async", "await", "error", "value", "index", "count", "flags", "data", "size", "len", "ret",
-    "err", "the", "and",
+    "const",
+    "static",
+    "struct",
+    "return",
+    "unsigned",
+    "signed",
+    "sizeof",
+    "while",
+    "break",
+    "continue",
+    "switch",
+    "default",
+    "inline",
+    "extern",
+    "union",
+    "typedef",
+    "volatile",
+    "false",
+    "true",
+    "NULL",
+    "void",
+    "char",
+    "short",
+    "long",
+    "self",
+    "Self",
+    "impl",
+    "match",
+    "where",
+    "async",
+    "await",
+    "error",
+    "value",
+    "index",
+    "count",
+    "flags",
+    "data",
+    "size",
+    "len",
+    "ret",
+    "err",
+    "the",
+    "and",
+    "THIS_MODULE",
+    "EXPORT_SYMBOL",
+    "EXPORT_SYMBOL_GPL",
 ];
 
 static IDENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex"));
 static CODE_SPAN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"`([^`]+)`").expect("valid regex"));
+static CLAUSE_SEP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r";\s+|,\s+(?:whereas|while)\s+").expect("valid regex"));
 
 /// An identifier specific enough to tie a rule to a patch: not a common
 /// word, and either containing an underscore or at least five long.
 fn is_specific(word: &str) -> bool {
     (word.contains('_') || word.len() >= 5) && !COMMON_WORDS.contains(&word)
+}
+
+/// A multi-part identifier specific enough to tie a patch to a foreign unit:
+/// either underscore-separated (`len >= 6`, at least two segments) or
+/// multi-hump CamelCase (`len >= 5`, at least two uppercase and two lowercase
+/// ASCII letters), and not in `COMMON_WORDS`.
+fn is_cross_unit_symbol(word: &str) -> bool {
+    if COMMON_WORDS.contains(&word) {
+        return false;
+    }
+    if word.contains('_') {
+        let parts = word.split('_').filter(|s| !s.is_empty()).count();
+        return word.len() >= 6 && parts >= 2;
+    }
+    let up = word.bytes().filter(|b| b.is_ascii_uppercase()).count();
+    let lo = word.bytes().filter(|b| b.is_ascii_lowercase()).count();
+    word.len() >= 5 && up >= 2 && lo >= 2
+}
+
+/// Extracts cross-unit API symbols (function/macro calls, `_t` typedefs,
+/// `UPPER_CASE` constants, `CamelCase` types, or `::` paths) from a code span.
+/// Bare lowercase variable or field names (`ring_size`, `a->b`) are ignored.
+fn api_span_symbols(span: &str) -> Vec<String> {
+    let mut s = span.trim();
+    while let Some(rest) = s
+        .strip_prefix("const ")
+        .or_else(|| s.strip_prefix("struct "))
+        .or_else(|| s.strip_prefix("enum "))
+        .or_else(|| s.strip_prefix("union "))
+    {
+        s = rest.trim();
+    }
+    let has_call = s.contains('(');
+    let head = s
+        .split_once('(')
+        .map_or(s, |(h, _)| h)
+        .trim()
+        .trim_end_matches('*');
+    if head.contains(['.', '=', ' ', '/', '<', '>', '[']) || head.contains("->") {
+        return Vec::new();
+    }
+    if head.contains("::") {
+        return head
+            .split("::")
+            .filter(|p| is_cross_unit_symbol(p))
+            .map(str::to_string)
+            .collect();
+    }
+    let is_ident = !head.is_empty() && head.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !is_ident || !is_cross_unit_symbol(head) {
+        return Vec::new();
+    }
+    let all_lower = head
+        .bytes()
+        .filter(|b| b.is_ascii_alphabetic())
+        .all(|b| b.is_ascii_lowercase());
+    if all_lower && !has_call && !head.ends_with("_t") {
+        return Vec::new();
+    }
+    vec![head.to_string()]
+}
+
+/// Collects all unique API symbols appearing in bullet code spans of `note`.
+fn note_api_symbols(note: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for line in note.lines() {
+        if !line.starts_with("- ") {
+            continue;
+        }
+        for cap in CODE_SPAN.captures_iter(line) {
+            out.extend(api_span_symbols(&cap[1]));
+        }
+    }
+    out
+}
+
+/// Extracts the leading subject code spans of a clause (skipping file/function
+/// location clauses starting with `In `, `Within `, or `On `).
+fn clause_subject_spans(clause: &str) -> Vec<&str> {
+    let rest = clause.trim();
+    for loc_prefix in ["In ", "in ", "Within ", "within ", "On ", "on "] {
+        if rest.starts_with(loc_prefix) {
+            return Vec::new();
+        }
+    }
+    let Some(first_tick) = rest.find('`') else {
+        return Vec::new();
+    };
+    if first_tick > 25 || rest[..first_tick].contains([':', ';', '.', ',', '(']) {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut cursor = &rest[first_tick..];
+    while let Some(after_open) = cursor.trim_start().strip_prefix('`') {
+        let Some(end) = after_open.find('`') else {
+            break;
+        };
+        spans.push(&after_open[..end]);
+        let after = &after_open[end + 1..];
+        let sep = [", or ", ", and ", ", ", " and ", " or ", " / "]
+            .into_iter()
+            .find_map(|s| after.strip_prefix(s));
+        match sep {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    spans
+}
+
+/// Extracts the subject API symbols that a bullet rule is directly about.
+fn bullet_subject_symbols(line: &str) -> HashSet<String> {
+    let rest = line.strip_prefix("- ").unwrap_or(line).trim();
+    if rest.starts_with("In `") || rest.starts_with("Within `") {
+        return HashSet::new();
+    }
+    let mut out = HashSet::new();
+    for clause in CLAUSE_SEP.split(rest) {
+        for span in clause_subject_spans(clause) {
+            out.extend(api_span_symbols(span));
+        }
+    }
+    out
+}
+
+/// Keeps the preamble and only the bullets whose subject API symbols intersect
+/// `matched_symbols`, returning the focused text and number of matched symbols.
+fn focus_symbol_note(note: &str, matched_symbols: &HashSet<String>) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut heading: Option<&str> = None;
+    let mut hit_symbols: HashSet<String> = HashSet::new();
+    let mut in_preamble = true;
+    for line in note.lines() {
+        if line.starts_with("## ") {
+            in_preamble = false;
+            heading = Some(line);
+            continue;
+        }
+        if in_preamble {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if !line.starts_with("- ") {
+            continue;
+        }
+        let hits: Vec<String> = bullet_subject_symbols(line)
+            .into_iter()
+            .filter(|s| matched_symbols.contains(s))
+            .collect();
+        if !hits.is_empty() {
+            if let Some(h) = heading.take() {
+                out.push('\n');
+                out.push_str(h);
+                out.push('\n');
+            }
+            out.push_str(line);
+            out.push('\n');
+            hit_symbols.extend(hits);
+        }
+    }
+    (!hit_symbols.is_empty()).then_some((out, hit_symbols.len()))
 }
 
 /// The specific identifiers a diff touches: those on its added and removed
@@ -666,5 +893,78 @@ mod tests {
         shared.manifest.units.insert("fourth".to_string(), fourth);
         let ids = HashSet::from(["common_helper".to_string()]);
         assert!(select_symbol_notes(&shared, &ids, &[], 10_000).is_empty());
+    }
+
+    #[test]
+    fn test_select_symbol_notes_ignores_generic_words_and_non_subject_mentions() {
+        let prompts = tempfile::tempdir().unwrap();
+        let note = |name: &str, rules: &str| format!("# {name}\n\nIntro.\n\n## Rules\n{rules}");
+        write_set(
+            prompts.path(),
+            "s",
+            "r",
+            &[
+                (
+                    "rust",
+                    "rust",
+                    &["rust/kernel/lib.rs"],
+                    &note(
+                        "rust",
+                        "- `UserSliceReader::read_raw()` validates `write` and `pointer`.\n- `ListLinks` requires `remove`.\n",
+                    ),
+                ),
+                (
+                    "driver",
+                    "driver",
+                    &["drivers/foo/bar.c"],
+                    &note(
+                        "driver",
+                        "- In `drivers/foo/bar.c`, `bar_probe()` calls `sysfs_emit()` on `ring_size`.\n- `bar_init()` sets `ctx->spin_lock`.\n",
+                    ),
+                ),
+                (
+                    "sysfs",
+                    "sysfs",
+                    &["fs/sysfs/file.c"],
+                    &note(
+                        "sysfs",
+                        "-Once `kobject_init()` or `sysfs_emit()` runs, `pointer` is valid.\n- `other_sysfs_fn()` touches `write`.\n".replacen("-Once", "- Once", 1).as_str(),
+                    ),
+                ),
+            ],
+        );
+        let mut set = load_sets(prompts.path()).remove(0);
+        for (slug, syms) in [
+            (
+                "rust",
+                &["write", "pointer", "remove", "UserSliceReader"][..],
+            ),
+            ("driver", &["sysfs_emit", "ring_size", "spin_lock"][..]),
+            ("sysfs", &["sysfs_emit", "kobject_init"][..]),
+        ] {
+            set.manifest.units.get_mut(slug).unwrap().symbols =
+                syms.iter().map(|s| s.to_string()).collect();
+        }
+
+        // Single-word identifiers (write, pointer, remove) and bare field/variable
+        // names (ring_size, spin_lock) must not pull in unrelated units; only
+        // sysfs (whose bullet has sysfs_emit() as its subject) is selected, and
+        // its unrelated bullet mentioning write is excluded.
+        let ids: HashSet<String> = [
+            "write",
+            "pointer",
+            "remove",
+            "ring_size",
+            "spin_lock",
+            "sysfs_emit",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let extra = select_symbol_notes(&set, &ids, &[], 10_000);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].unit, "sysfs");
+        assert!(extra[0].text.contains("sysfs_emit()"));
+        assert!(!extra[0].text.contains("other_sysfs_fn"));
     }
 }
