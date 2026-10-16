@@ -22,6 +22,7 @@ use serde_json::Value;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
@@ -128,6 +129,37 @@ fn parse_epoch_urls(list_id: &str, manifest: &Value) -> Result<Vec<(i32, String)
     Ok(epochs)
 }
 
+/// Builds the shallow bare clone of a public-inbox epoch.
+///
+/// The URL comes from a remote manifest, so the transport is pinned to
+/// the protocols every other network-facing git call allows; left to
+/// git's defaults, helper schemes such as ext:: run a command.
+fn bootstrap_clone_command(url: &str, path: &std::path::Path, n: usize) -> Command {
+    let mut cmd = crate::git_cmd::detached_async();
+    cmd.args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+        .arg("clone")
+        .arg("--bare")
+        .arg(format!("--depth={}", n))
+        .arg(url)
+        .arg(path);
+    cmd
+}
+
+/// Builds the shallow fetch of every head of an existing epoch clone.
+///
+/// The origin URL is stored repository configuration, so the same
+/// protocol pinning as the clone applies.
+fn bootstrap_fetch_command(path: &std::path::Path, n: usize) -> Command {
+    let mut cmd = crate::git_cmd::in_dir_async(path);
+    cmd.args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+        .arg("-c")
+        .arg("safe.bareRepository=all")
+        .arg("fetch")
+        .arg(format!("--depth={}", n))
+        .arg("origin")
+        .arg("+refs/heads/*:refs/heads/*"); // Fetch all heads
+    cmd
+}
 pub struct Ingestor {
     settings: Settings,
     db: Arc<Database>,
@@ -378,14 +410,7 @@ impl Ingestor {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let output = crate::git_cmd::detached_async()
-                .arg("clone")
-                .arg("--bare")
-                .arg(format!("--depth={}", n))
-                .arg(url)
-                .arg(path)
-                .output()
-                .await?;
+            let output = bootstrap_clone_command(url, path, n).output().await?;
 
             if !output.status.success() {
                 return Err(anyhow!(
@@ -436,15 +461,7 @@ impl Ingestor {
             }
 
             info!("Fetching latest changes in {:?} with depth {}", path, n);
-            let output = crate::git_cmd::in_dir_async(path)
-                .arg("-c")
-                .arg("safe.bareRepository=all")
-                .arg("fetch")
-                .arg(format!("--depth={}", n))
-                .arg("origin")
-                .arg("+refs/heads/*:refs/heads/*") // Fetch all heads
-                .output()
-                .await?;
+            let output = bootstrap_fetch_command(path, n).output().await?;
 
             if !output.status.success() {
                 // Warn but continue, maybe we are offline
@@ -1544,6 +1561,74 @@ index bbc440c93e08..1123ef3ccf90 100644
         assert!(
             !err.contains("secret_tok_123"),
             "leaked token in error: {err}"
+        );
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The protocol pinning must precede the subcommand: git only reads
+    /// -c options placed before it.
+    fn assert_protocol_restricted(args: &[String], subcommand: &str) {
+        let restrictions = crate::git_ops::GIT_PROTOCOL_RESTRICTIONS;
+        let pinned = args
+            .windows(restrictions.len())
+            .position(|window| window == restrictions);
+        let command = args.iter().position(|arg| arg == subcommand);
+        assert!(
+            matches!((pinned, command), (Some(p), Some(c)) if p < c),
+            "{subcommand} is not protocol restricted: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_clone_command_restricts_protocols() {
+        let path = std::path::Path::new("/nonexistent/archive.git");
+        let args = args_of(&bootstrap_clone_command(
+            "https://example.com/list/0",
+            path,
+            7,
+        ));
+        assert_protocol_restricted(&args, "clone");
+        assert!(args.iter().any(|arg| arg == "--depth=7"), "{args:?}");
+    }
+
+    #[test]
+    fn test_bootstrap_fetch_command_restricts_protocols() {
+        let path = std::path::Path::new("/nonexistent/archive.git");
+        let args = args_of(&bootstrap_fetch_command(path, 7));
+        assert_protocol_restricted(&args, "fetch");
+        assert!(args.iter().any(|arg| arg == "--depth=7"), "{args:?}");
+    }
+
+    /// Without the restriction git looks for a git-remote-nohelper
+    /// executable and reports that the helper aborted; with it, git
+    /// refuses the transport before running anything.
+    #[tokio::test]
+    async fn test_bootstrap_repo_clone_refuses_helper_transport() {
+        let mut settings = Settings::new().unwrap();
+        settings.database.url = ":memory:".into();
+        let db = Arc::new(Database::new(&settings.database).await.unwrap());
+        db.migrate().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let ingestor = Ingestor::new(settings, db, sender, None, true);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().join("archive.git");
+
+        let err = ingestor
+            .bootstrap_repo("nohelper::unused", &repo_path, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("transport 'nohelper' not allowed"),
+            "expected git to refuse the helper transport, got: {err}"
         );
     }
 }
