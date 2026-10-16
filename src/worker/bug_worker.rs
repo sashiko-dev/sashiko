@@ -570,6 +570,23 @@ impl BugWorker {
         let mut fix_check_handle: Option<tokio::task::JoinHandle<usize>> = None;
 
         loop {
+            if self.db.has_shared_bug_catalog() {
+                match self.db.sync_shared_bugs().await {
+                    Ok(crate::db::SharedSyncStatus::Ready) => {}
+                    Ok(crate::db::SharedSyncStatus::Importing) => {
+                        info!("Importing shared catalog updates before claiming analysis");
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Waiting for the shared bug catalog before claiming analysis: {error:#}"
+                        );
+                        sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+            }
             if fix_check_handle.as_ref().is_some_and(|h| h.is_finished())
                 && let Some(handle) = fix_check_handle.take()
                 && let Err(e) = handle.await
@@ -710,8 +727,13 @@ impl BugWorker {
                             }
                             Err(e) => {
                                 error!("Failed to process bug {}: {}", bug.id, e);
-                                let error_msg = format!("Error during async processing: {}", e);
-                                if let Err(e) = db.fail_bug_analysis(bug.id, &error_msg).await {
+                                let error_msg = format!("Error during async processing: {e:#}");
+                                let settled = if Database::is_shared_catalog_failure(&e) {
+                                    db.defer_bug_analysis_for_catalog(bug.id, &error_msg).await
+                                } else {
+                                    db.fail_bug_analysis(bug.id, &error_msg).await
+                                };
+                                if let Err(e) = settled {
                                     warn!(
                                         "Could not settle failed analysis of bug {}: {}",
                                         bug.id, e

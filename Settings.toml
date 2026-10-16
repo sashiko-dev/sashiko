@@ -33,6 +33,13 @@ enabled = false
 url = "sashiko.db"
 token = ""
 
+# PostgreSQL is optional. The default mode remains libsql.
+# [storage]
+# mode = "postgresql" # Or "libsql_shared_bugs" to share only the bug catalog.
+# Set SASHIKO__STORAGE__POSTGRES_URL through deployment secrets.
+# postgres_schema = "sashiko"
+# postgres_ca_file = "/etc/sashiko/postgres-ca.pem"
+
 [mailing_lists]
 # Tracked mailing lists are configured in projects/<project>/mailing_lists.toml
 # by default. Set `track` here (or via SASHIKO__MAILING_LISTS__TRACK) to override.

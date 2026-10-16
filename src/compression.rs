@@ -17,26 +17,35 @@ pub fn compress_string_if_needed(input: &str) -> Value {
     Value::Text(input.to_string())
 }
 
-pub fn get_compressed_string(row: &libsql::Row, index: i32) -> Result<String, libsql::Error> {
+pub fn get_compressed_string(
+    row: &crate::storage::Row,
+    index: i32,
+) -> crate::storage::Result<String> {
     let val: Value = row.get(index)?;
     match val {
         Value::Text(s) => Ok(s),
-        Value::Blob(b) => decompress_gzip(&b)
-            .map(Ok)
-            .unwrap_or_else(|| String::from_utf8(b).map_err(|_| libsql::Error::InvalidColumnType)),
+        Value::Blob(b) => decompress_gzip(&b).map(Ok).unwrap_or_else(|| {
+            String::from_utf8(b)
+                .map_err(|_| crate::storage::Error::Value("invalid compressed value".into()))
+        }),
         Value::Null => Ok(String::new()),
-        _ => Err(libsql::Error::InvalidColumnType),
+        _ => Err(crate::storage::Error::Value(
+            "invalid compressed value".into(),
+        )),
     }
 }
 
-pub fn decompress_string_value(value: &Value) -> Result<String, libsql::Error> {
+pub fn decompress_string_value(value: &Value) -> crate::storage::Result<String> {
     match value {
         Value::Text(s) => Ok(s.clone()),
         Value::Blob(b) => decompress_gzip(b).map(Ok).unwrap_or_else(|| {
-            String::from_utf8(b.clone()).map_err(|_| libsql::Error::InvalidColumnType)
+            String::from_utf8(b.clone())
+                .map_err(|_| crate::storage::Error::Value("invalid compressed value".into()))
         }),
         Value::Null => Ok(String::new()),
-        _ => Err(libsql::Error::InvalidColumnType),
+        _ => Err(crate::storage::Error::Value(
+            "invalid compressed value".into(),
+        )),
     }
 }
 
@@ -50,9 +59,9 @@ fn decompress_gzip(bytes: &[u8]) -> Option<String> {
 }
 
 pub fn get_compressed_string_opt(
-    row: &libsql::Row,
+    row: &crate::storage::Row,
     index: i32,
-) -> Result<Option<String>, libsql::Error> {
+) -> crate::storage::Result<Option<String>> {
     let val: Value = row.get(index)?;
     match val {
         Value::Null => Ok(None),
@@ -69,8 +78,10 @@ pub fn get_compressed_string_opt(
             }
             String::from_utf8(b)
                 .map(Some)
-                .map_err(|_| libsql::Error::InvalidColumnType)
+                .map_err(|_| crate::storage::Error::Value("invalid compressed value".into()))
         }
-        _ => Err(libsql::Error::InvalidColumnType),
+        _ => Err(crate::storage::Error::Value(
+            "invalid compressed value".into(),
+        )),
     }
 }

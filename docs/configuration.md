@@ -16,7 +16,7 @@ Every command reads one file, the first of `--settings`, `$SASHIKO_CONFIG`,
 
 The daemon and `sashiko review` read the same shape, so one file serves both.
 `[database]`, `[server]`, and `[git]` are optional, since a local review has
-none of them; the daemon refuses to start without `[database] url`,
+none of them; the daemon requires a database URL for its selected storage mode,
 `[git] repository_path`, and `[review] worktree_dir`.
 
 For LLM provider-specific setup (API keys, auth, provider features), see
@@ -61,8 +61,116 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `url` | string | `"sashiko.db"` | Path to the SQLite database file. |
+| `url` | string | `"sashiko.db"` | Local libSQL file or remote libSQL URL. Used in `libsql` and `libsql_shared_bugs` modes. |
 | `token` | string | `""` | Database token (unused for SQLite). |
+
+### `[storage]`
+
+The default is `mode = "libsql"`. PostgreSQL can store the entire daemon
+database, or act as a shared bug catalog for instances that keep their reviews
+in libSQL. PostgreSQL requires TLS and a login that owns the configured schema
+so startup migrations can create tables, indexes, and triggers.
+An administrator can create the schema in advance and assign it to the
+application login. An existing schema does not require database-level `CREATE`
+permission; automatic creation of a missing schema does.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | string | `"libsql"` | `libsql`, `postgresql`, or `libsql_shared_bugs`. |
+| `postgres_url` | string | unset | PostgreSQL connection URL. Prefer the environment variable `SASHIKO__STORAGE__POSTGRES_URL` for credentials. |
+| `postgres_schema` | string | `"sashiko"` | Schema for this database or catalog. Use a separate schema for each full daemon project and each shared catalog. |
+| `postgres_ca_file` | path | unset | Additional trusted CA certificate in PEM format. |
+| `postgres_tls_require_only` | boolean | `false` | Require encryption while opting out of certificate and hostname validation. Intended for explicitly trusted lab deployments. |
+
+For all daemon data in PostgreSQL:
+
+```toml
+[storage]
+mode = "postgresql"
+postgres_schema = "sashiko"
+```
+
+For a shared bug catalog:
+
+```toml
+[database]
+url = "sashiko.db"
+
+[storage]
+mode = "libsql_shared_bugs"
+postgres_schema = "team_bugs"
+
+[linux_bug]
+enabled = true
+```
+
+Set the PostgreSQL URL through deployment secrets in either configuration.
+An existing libSQL database is not automatically moved when selecting full
+PostgreSQL storage. Full mode creates an independent database schema.
+The initial backend serializes database operations with an advisory lock for
+the configured schema and uses dedicated sessions for explicit transactions.
+Select it with that execution model in mind when sizing a deployment.
+
+In shared catalog mode, each local database has a stable instance identity
+and a local bug mirror. Changes enter a durable outbox in the same transaction
+as the bug update. A background task publishes and imports changes every five
+seconds; PostgreSQL outages leave changes queued and visible as **Sync pending**.
+Each pass publishes at most 100 queued reports and imports at most 100 records,
+loading one complete record at a time. Deferred publications move behind other
+queued reports. Canonical verdicts and their duplicate reports publish first;
+deduplication waits when committed catalog updates still need importing.
+Catalog coordination has a five-minute deadline, including mutex and advisory
+lock waits. The background task restarts through the daemon's worker supervisor.
+Lease renewals and housekeeping timestamps do not queue whole reports. Mirror
+migrations have their own version in metadata. Selecting `libsql` disables change
+tracking; re-enabling the shared catalog reconciles edits made while it was off.
+That reconciliation conservatively queues every local report, including foreign
+mirrors, because disabled tracking cannot identify which reports changed. The
+normal publication limit still applies, and unchanged snapshots are remote
+no-ops. Pending local publications do not block analysis once imports are current.
+Analysis waits for the catalog before making shared deduplication decisions.
+An outage during that check requeues the analysis without consuming an attempt.
+If an outcome is already committed locally, publication retries from the outbox
+while its review links and successful state are retained.
+Concurrent changes to different fields and new evidence are merged. If two
+instances change the same triage decision, the catalog decision is retained
+and a conflict event is recorded in the bug's audit history. The originating
+instance runs the bug's analysis; other instances can view and triage it.
+Connected deduplication decisions are serialized. A connection loss between a
+local outcome and its publication can still produce separate reports of the
+same defect; public bug IDs make publication retries idempotent, and triage can
+merge those reports.
+
+Catalog participants must use compatible catalog formats. Invalid records,
+identity mismatches and unsupported formats stop synchronization and shared
+analysis until an operator corrects the data or deployment. The importer does
+not skip records or advance its cursor past a failed import: doing so could hide
+an existing canonical bug from deduplication. Transient failures retry; these
+permanent errors require correction and are reported in the daemon logs.
+
+Public bug IDs identify shared records. Patch and review relations remain
+local. Original evidence can contain producer-local IDs; imported discoveries
+do not turn them into links in another database. All instances sharing a catalog must trust the
+same subsystem attribution and permission policy. A shared catalog may hold
+multiple projects, with synchronization scoped by the instance's project.
+The database project stamp defines catalog membership. Legacy public bug IDs
+retain their original prefix and synchronize without renaming reports.
+Use the API for catalog changes so audit history and synchronization remain
+consistent. Local CLI reviews do not submit bugs to the daemon automatically.
+
+#### PostgreSQL integration tests
+
+CI runs both PostgreSQL scenarios against a disposable PostgreSQL 17 service
+with TLS. To run them locally, set `SASHIKO_TEST_POSTGRES_URL_FILE` to a private
+file containing the connection URL for a disposable database, then run:
+
+```bash
+cargo test --all-features --test integration_tests postgres_ -- --ignored
+```
+
+Stop other Sashiko processes before running tests. The tests create isolated
+schemas and remove them afterward. They allow self-signed test certificates
+while still requiring encryption.
 
 ### `[mailing_lists]`
 

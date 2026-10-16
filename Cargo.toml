@@ -46,6 +46,9 @@ default = ["server"]
 server = [
     "cache",
     "dep:libsql",
+    "dep:tokio-postgres",
+    "dep:postgres-native-tls",
+    "dep:native-tls",
     "dep:flate2",
     "dep:axum",
     "dep:tower-http",
@@ -80,10 +83,13 @@ flate2 = { version = "1.1.9", optional = true }
 futures = "0.3.31"
 lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
 libsql = { version = "0.9.29", optional = true }
+native-tls = { version = "0.2.14", optional = true }
+postgres-native-tls = { version = "0.5.3", optional = true }
+tokio-postgres = { version = "0.7.18", optional = true }
 mail-parser = "0.11.3"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json", "query"] }
-rustix = { version = "1.1.4", features = ["termios"] }
+rustix = { version = "1.1.4", features = ["pty", "termios"] }
 rustls-native-certs = { version = "0.8.4", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

@@ -17,6 +17,20 @@ jobs:
   check:
     name: Check & Test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: sashiko
+          POSTGRES_DB: sashiko_test
+          POSTGRES_PASSWORD: ci-postgres-fixture
+        ports:
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U sashiko -d sashiko_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -55,6 +69,40 @@ jobs:
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Native TLS Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev openssl
+
+      - name: Configure PostgreSQL Test TLS
+        env:
+          PG_CONTAINER_ID: ${{ job.services.postgres.id }}
+          PG_PORT: ${{ job.services.postgres.ports[5432] }}
+        run: |
+          openssl req -new -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj /CN=localhost \
+            -keyout "$RUNNER_TEMP/postgres.key" \
+            -out "$RUNNER_TEMP/postgres.crt"
+          docker cp "$RUNNER_TEMP/postgres.key" \
+            "$PG_CONTAINER_ID:/var/lib/postgresql/server.key"
+          docker cp "$RUNNER_TEMP/postgres.crt" \
+            "$PG_CONTAINER_ID:/var/lib/postgresql/server.crt"
+          docker exec "$PG_CONTAINER_ID" chown postgres:postgres \
+            /var/lib/postgresql/server.key /var/lib/postgresql/server.crt
+          docker exec "$PG_CONTAINER_ID" chmod 600 \
+            /var/lib/postgresql/server.key
+          docker exec -i "$PG_CONTAINER_ID" \
+            psql -v ON_ERROR_STOP=1 -U sashiko -d sashiko_test <<'SQL'
+          ALTER SYSTEM SET ssl_cert_file='/var/lib/postgresql/server.crt';
+          ALTER SYSTEM SET ssl_key_file='/var/lib/postgresql/server.key';
+          ALTER SYSTEM SET ssl=on;
+          SELECT pg_reload_conf();
+          SQL
+          umask 077
+          ci_pg_url_base='postgresql://sashiko:ci-postgres-fixture@127.0.0.1'
+          printf '%s:%s/sashiko_test\n' "$ci_pg_url_base" "$PG_PORT" \
+            > "$RUNNER_TEMP/postgres-url"
+
       - name: Check Formatting
         run: cargo fmt --all -- --check
 
@@ -69,3 +117,10 @@ jobs:
 
       - name: Run Tests
         run: make test
+
+      - name: Run PostgreSQL Integration Tests
+        env:
+          SASHIKO_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/postgres-url
+        run: >-
+          cargo test --all-features --test integration_tests
+          postgres_ -- --ignored

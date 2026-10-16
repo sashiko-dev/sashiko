@@ -3490,7 +3490,7 @@
                             <td title="${escapeHtml(discoveriesTitle)}">${discoveriesCount}</td>
                             <td style="line-height:1.2;"><div>${dateStr}</div>${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}</td>
                             <td title="${escapeHtml(p.assignee || 'Unassigned')}">${p.assignee ? escapeHtml(p.assignee.split('@')[0]) : '<span class="text-muted-sm">Unassigned</span>'}</td>
-                            <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span></td>
+                            <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span>${p.sync_pending ? '<div class="text-muted-sm">Sync pending</div>' : ''}</td>
                         `;
                     } else {
                         const { dateStr, timeStr } = formatDateParts(p.date);
@@ -4786,7 +4786,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const auditEvents = [];
 
             for (const e of activity) {
-                if (e.kind === 'audit' || e.kind === 'deduplication') {
+                if (e.kind === 'audit' || e.kind === 'deduplication' || e.kind === 'sync_conflict') {
                     auditEvents.push(e);
                 } else if (e.kind === 'comment') {
                     comments.push(e);
@@ -4882,6 +4882,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             `;
 
             const actionButtonsHtml = `
+                ${data.sync_pending ? '<span class="text-muted-sm">Sync pending</span>' : ''}
                 ${commentBtnHtml}
                 ${assignBtnHtml}
                 ${statusBtnHtml}

@@ -14,6 +14,8 @@ mod integration {
     mod merge_bug_prefixes;
     #[cfg(feature = "server")]
     mod merge_should_happen;
+    #[cfg(feature = "server")]
+    mod postgres_tests;
     mod prefetch_e2e_test;
     #[cfg(feature = "server")]
     mod quilt_merge_test;

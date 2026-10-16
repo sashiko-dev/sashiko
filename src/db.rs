@@ -21,9 +21,13 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 #[cfg(feature = "server")]
 use libsql::Builder;
+#[cfg(feature = "server")]
+mod shared;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "server")]
 use serde_json::json;
+#[cfg(feature = "server")]
+pub use shared::SharedSyncStatus;
 #[cfg(feature = "server")]
 use std::str::FromStr;
 #[cfg(feature = "server")]
@@ -40,13 +44,13 @@ const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
           AND received_parts >= total_parts))";
 
 #[cfg(feature = "server")]
-fn get_required_text(row: &libsql::Row, index: i32) -> Result<String> {
+fn get_required_text(row: &crate::storage::Row, index: i32) -> Result<String> {
     get_optional_text(row, index)?
         .ok_or_else(|| anyhow::anyhow!("database column {index} is unexpectedly NULL"))
 }
 
 #[cfg(feature = "server")]
-fn get_optional_text(row: &libsql::Row, index: i32) -> Result<Option<String>> {
+fn get_optional_text(row: &crate::storage::Row, index: i32) -> Result<Option<String>> {
     match row.get::<libsql::Value>(index)? {
         libsql::Value::Null => Ok(None),
         libsql::Value::Text(value) => Ok(Some(value)),
@@ -55,7 +59,7 @@ fn get_optional_text(row: &libsql::Row, index: i32) -> Result<Option<String>> {
 }
 
 #[cfg(feature = "server")]
-fn get_optional_integer(row: &libsql::Row, index: i32) -> Result<Option<i64>> {
+fn get_optional_integer(row: &crate::storage::Row, index: i32) -> Result<Option<i64>> {
     match row.get::<libsql::Value>(index)? {
         libsql::Value::Null => Ok(None),
         libsql::Value::Integer(value) => Ok(Some(value)),
@@ -80,7 +84,7 @@ enum PatchWriteOutcome {
 
 #[cfg(feature = "server")]
 async fn get_stored_patch_state(
-    conn: &libsql::Connection,
+    conn: &crate::storage::Connection,
     patchset_id: i64,
     message_id: &str,
 ) -> Result<Option<StoredPatchState>> {
@@ -129,7 +133,7 @@ async fn select_git_patch_id(
 
 #[cfg(feature = "server")]
 async fn write_patch_if_unchanged(
-    conn: &libsql::Connection,
+    conn: &crate::storage::Connection,
     old_patch: Option<StoredPatchState>,
     patchset_id: i64,
     message_id: &str,
@@ -146,7 +150,7 @@ async fn write_patch_if_unchanged(
         conn.query(
             "UPDATE patches SET part_index = ?, diff = ?, git_patch_id = ?
              WHERE patchset_id = ? AND message_id = ?
-               AND diff IS ? AND git_patch_id IS ?
+               AND diff IS NOT DISTINCT FROM ? AND git_patch_id IS NOT DISTINCT FROM ?
              RETURNING id",
             libsql::params![
                 part_index,
@@ -180,9 +184,16 @@ async fn write_patch_if_unchanged(
 }
 
 #[cfg(feature = "server")]
+enum EnrichmentMetadata {
+    ActorDefaults,
+    Preserve,
+}
+
+#[cfg(feature = "server")]
 pub struct Database {
-    pub conn: libsql::Connection,
-    tx_conn: libsql::Connection,
+    shared: Option<Arc<shared::SharedCatalog>>,
+    pub conn: crate::storage::Connection,
+    tx_conn: crate::storage::Connection,
     tx_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     in_transaction: bool,
     bug_actor: String,
@@ -191,18 +202,17 @@ pub struct Database {
     bug_claim: Option<BugAnalysisClaim>,
 }
 
-/// Guards an open transaction on the transaction `libsql::Connection` so
-/// concurrent tasks cannot start a nested transaction before the active one
-/// finishes, and suppresses `libsql`'s drop-time rollback `.unwrap()` panic.
+/// Keeps the write connection serialized until a transaction finishes.
+/// Backend transaction handles roll back unfinished work when dropped.
 #[cfg(feature = "server")]
 pub struct DatabaseTransaction {
-    tx: Option<libsql::Transaction>,
+    tx: Option<crate::storage::Transaction>,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[cfg(feature = "server")]
 impl std::ops::Deref for DatabaseTransaction {
-    type Target = libsql::Transaction;
+    type Target = crate::storage::Transaction;
 
     fn deref(&self) -> &Self::Target {
         self.tx
@@ -213,25 +223,13 @@ impl std::ops::Deref for DatabaseTransaction {
 
 #[cfg(feature = "server")]
 impl DatabaseTransaction {
-    fn drop_quietly(tx: libsql::Transaction) {
+    fn drop_quietly(tx: crate::storage::Transaction) {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(tx))).is_err() {
             warn!("Suppressed libsql transaction rollback panic during drop");
         }
     }
 
-    /// Commits the transaction while keeping `self.tx` inside `self` across `.await`.
-    ///
-    /// We intentionally execute `COMMIT` directly instead of calling
-    /// `libsql::Transaction::commit(self)`:
-    /// 1. `libsql::Transaction::commit(self)` takes `local::Transaction` out of its
-    ///    `Option` and drops it *inside* `commit()` before returning `Err`, so a
-    ///    failed `COMMIT` triggers `local::Transaction::drop`'s `do_rollback().unwrap()`
-    ///    panic before the caller can intercept it.
-    /// 2. `local::Transaction::drop` checks `if self.conn.is_autocommit() { return; }`
-    ///    (`sqlite3_get_autocommit`) on its first line. Once `COMMIT` succeeds,
-    ///    SQLite returns to autocommit mode (`tx.is_autocommit() == true`), so
-    ///    dropping `self.tx` in `DatabaseTransaction::drop` is a no-op that never
-    ///    runs `ROLLBACK` or panics.
+    /// Commit the active backend transaction.
     pub async fn commit(self) -> Result<()> {
         if let Some(tx) = self.tx.as_ref() {
             if let Err(err) = tx.execute("COMMIT", ()).await {
@@ -245,11 +243,7 @@ impl DatabaseTransaction {
         Ok(())
     }
 
-    /// Rolls back the transaction while keeping `self.tx` inside `self` across `.await`.
-    ///
-    /// Once `ROLLBACK` succeeds, `tx.is_autocommit()` (`sqlite3_get_autocommit`)
-    /// is `true`, so `local::Transaction::drop` returns immediately without
-    /// issuing a second `ROLLBACK` or panicking.
+    /// Roll back the active backend transaction.
     pub async fn rollback(self) -> Result<()> {
         if let Some(tx) = self.tx.as_ref()
             && !tx.is_autocommit()
@@ -1371,6 +1365,68 @@ pub struct ForgeOutboxRow {
 
 #[cfg(feature = "server")]
 impl Database {
+    /// Open the configured daemon database backend.
+    pub async fn configured(settings: &crate::settings::Settings) -> Result<Self> {
+        use crate::settings::StorageMode;
+        match settings.storage.mode {
+            StorageMode::Libsql => Self::new(&settings.database).await,
+            StorageMode::Postgresql => Self::postgres(&settings.storage).await,
+            StorageMode::LibsqlSharedBugs => {
+                let mut db = Self::new(&settings.database).await?;
+                db.shared = Some(Arc::new(shared::SharedCatalog::new(
+                    settings.storage.clone(),
+                )));
+                Ok(db)
+            }
+        }
+    }
+
+    /// Open PostgreSQL in the configured schema.
+    pub async fn postgres(settings: &crate::settings::StorageSettings) -> Result<Self> {
+        let url = settings
+            .postgres_url
+            .clone()
+            .context("missing PostgreSQL URL")?;
+        let ca_file = settings.postgres_ca_file.clone();
+        let require_only = settings.postgres_tls_require_only;
+        let tls = tokio::task::spawn_blocking(move || -> Result<native_tls::TlsConnector> {
+            let mut tls = native_tls::TlsConnector::builder();
+            if let Some(path) = ca_file {
+                tls.add_root_certificate(native_tls::Certificate::from_pem(&std::fs::read(path)?)?);
+            }
+            if require_only {
+                tls.danger_accept_invalid_certs(true);
+                tls.danger_accept_invalid_hostnames(true);
+            }
+            Ok(tls.build()?)
+        })
+        .await??;
+        let conn = crate::storage::Connection::postgres(crate::storage::PgConfig {
+            url,
+            schema: settings.postgres_schema.clone(),
+            tls,
+        })
+        .await?;
+        Ok(Self {
+            tx_conn: conn.clone(),
+            conn,
+            tx_lock: Arc::new(tokio::sync::Mutex::new(())),
+            in_transaction: false,
+            bug_actor: "system".into(),
+            bug_tool: "sashiko".into(),
+            bug_model: None,
+            bug_claim: None,
+            shared: None,
+        })
+    }
+    fn owned_bug_clause(&self) -> &'static str {
+        if self.shared.is_some() {
+            "AND NOT EXISTS (SELECT 1 FROM shared_bug_sync mirror WHERE mirror.bug_id=bugs.id AND mirror.origin != (SELECT value FROM meta WHERE key='shared_instance'))"
+        } else {
+            ""
+        }
+    }
+
     pub fn has_bug_actor(&self) -> bool {
         self.bug_actor != "system" || self.bug_tool != "sashiko"
     }
@@ -1398,11 +1454,12 @@ impl Database {
             bug_tool: tool.into(),
             bug_model: model,
             bug_claim: self.bug_claim.clone(),
+            shared: self.shared.clone(),
         }
     }
 
     /// Keeps attribution attached to writes performed inside a transaction.
-    fn with_connection(&self, conn: libsql::Connection) -> Self {
+    fn with_connection(&self, conn: crate::storage::Connection) -> Self {
         Self {
             conn: conn.clone(),
             tx_conn: conn,
@@ -1412,6 +1469,7 @@ impl Database {
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
             bug_claim: self.bug_claim.clone(),
+            shared: self.shared.clone(),
         }
     }
 
@@ -1425,6 +1483,7 @@ impl Database {
             bug_actor: self.bug_actor.clone(),
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
+            shared: self.shared.clone(),
             bug_claim: Some(BugAnalysisClaim {
                 bug_id,
                 owner: owner.into(),
@@ -1443,7 +1502,7 @@ impl Database {
         &self,
         sql: &str,
         params: impl libsql::params::IntoParams,
-    ) -> std::result::Result<u64, libsql::Error> {
+    ) -> crate::storage::Result<u64> {
         let _guard = if self.in_transaction {
             None
         } else {
@@ -1453,10 +1512,7 @@ impl Database {
     }
 
     /// Executes a SQL batch on the serialized write connection.
-    pub async fn execute_batch(
-        &self,
-        sql: &str,
-    ) -> std::result::Result<libsql::BatchRows, libsql::Error> {
+    pub async fn execute_batch(&self, sql: &str) -> crate::storage::Result<()> {
         let _guard = if self.in_transaction {
             None
         } else {
@@ -1812,7 +1868,7 @@ impl Database {
             Builder::new_local(&settings.url).build().await?
         };
 
-        let conn = db.connect()?;
+        let conn = crate::storage::Connection::from(db.connect()?);
 
         // Enable WAL mode for better concurrency
         // PRAGMA journal_mode returns a row (the new mode), so we must use query() instead of execute()
@@ -1834,7 +1890,7 @@ impl Database {
         // never block `COMMIT` with `SQL statements in progress` or collide
         // with transaction state on the same `sqlite3*` handle.
         let tx_conn = if !is_remote && !settings.url.contains(":memory:") {
-            let tx_conn = db.connect()?;
+            let tx_conn = crate::storage::Connection::from(db.connect()?);
             tx_conn
                 .query("PRAGMA busy_timeout = 5000;", ())
                 .await?
@@ -1855,10 +1911,14 @@ impl Database {
             bug_tool: "sashiko".into(),
             bug_model: None,
             bug_claim: None,
+            shared: None,
         })
     }
 
     pub async fn migrate(&self) -> Result<()> {
+        if self.conn.is_postgres() {
+            return self.migrate_postgres().await;
+        }
         let current_version: u32 = {
             let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
             if let Some(row) = rows.next().await? {
@@ -2057,8 +2117,71 @@ impl Database {
             tx.commit().await?;
         }
 
+        if self.shared.is_some() {
+            self.initialize_shared_catalog().await?;
+        } else {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shared_bug_sync'",
+                    (),
+                )
+                .await?;
+            let installed = rows.next().await?.is_some();
+            drop(rows);
+            if installed {
+                self.execute("UPDATE meta SET value='0' WHERE key='shared_enabled'", ())
+                    .await?;
+            }
+        }
         info!("Database schema is up to date at version 13.");
 
+        Ok(())
+    }
+
+    async fn migrate_postgres(&self) -> Result<()> {
+        let tx = self.begin_transaction().await?;
+        let mut rows=tx.query("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='shared_bug_records'",()).await?;
+        anyhow::ensure!(
+            rows.next()
+                .await?
+                .context("missing schema check")?
+                .get::<i64>(0)?
+                == 0,
+            "Use a separate PostgreSQL schema for a full daemon database and a shared bug catalog"
+        );
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sashiko_schema_migrations (
+            scope TEXT NOT NULL, version BIGINT NOT NULL, applied_at BIGINT NOT NULL,
+            PRIMARY KEY (scope, version))",
+        )
+        .await?;
+        let mut rows = tx.query("SELECT coalesce(max(version), 0) FROM sashiko_schema_migrations WHERE scope = 'daemon'", ()).await?;
+        let version = rows
+            .next()
+            .await?
+            .context("missing schema version")?
+            .get::<i64>(0)?;
+        anyhow::ensure!(
+            version <= 1,
+            "PostgreSQL schema is newer than this Sashiko version"
+        );
+        if version == 0 {
+            tx.execute_batch(include_str!("migrations/postgresql/002_daemon.sql"))
+                .await?;
+            tx.execute_batch(include_str!("migrations/postgresql/003_bug_triggers.sql"))
+                .await?;
+            tx.execute_batch(include_str!(
+                "migrations/postgresql/004_query_functions.sql"
+            ))
+            .await?;
+            tx.execute(
+                "INSERT INTO sashiko_schema_migrations VALUES ('daemon', 1, ?)",
+                [chrono::Utc::now().timestamp()],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2074,7 +2197,7 @@ impl Database {
     /// is the one thing the statement will not rewrite, so the work left
     /// strictly shrinks and the repetition ends. The bound only guards
     /// against that reasoning being broken by a later edit to the statement.
-    async fn repair_borrowed_series_names(tx: &libsql::Transaction) -> Result<()> {
+    async fn repair_borrowed_series_names(tx: &crate::storage::Transaction) -> Result<()> {
         const MAX_PASSES: u32 = 16;
         let repair = include_str!("migrations/006_repair_borrowed_series_names.sql");
 
@@ -2097,8 +2220,8 @@ impl Database {
     /// Ensures the database is stamped for `project`, preventing two instances
     /// configured for different projects from sharing the same SQLite database.
     pub async fn ensure_project_stamp(&self, project: crate::project::ProjectId) -> Result<()> {
-        let mut rows = self
-            .conn
+        let tx = self.begin_transaction().await?;
+        let mut rows = tx
             .query("SELECT value FROM meta WHERE key = 'project'", ())
             .await?;
         if let Some(row) = rows.next().await? {
@@ -2110,14 +2233,18 @@ impl Database {
                     project
                 );
             }
+            drop(rows);
+            tx.commit().await?;
             return Ok(());
         }
 
-        self.execute(
+        tx.execute(
             "INSERT INTO meta (key, value) VALUES ('project', ?1)",
             libsql::params![project.as_str()],
         )
         .await?;
+        drop(rows);
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2142,7 +2269,7 @@ impl Database {
         mailing_list_id: i64,
     ) -> Result<()> {
         self.execute(
-                "INSERT OR IGNORE INTO messages_mailing_lists (message_id, mailing_list_id) VALUES (?, ?)",
+                "INSERT INTO messages_mailing_lists (message_id, mailing_list_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
                 libsql::params![message_id, mailing_list_id],
             )
             .await?;
@@ -2528,6 +2655,20 @@ impl Database {
         bug_id: i64,
         enrichment: &NewBugEnrichment,
     ) -> Result<i64> {
+        self.insert_bug_enrichment_with_metadata(
+            bug_id,
+            enrichment,
+            EnrichmentMetadata::ActorDefaults,
+        )
+        .await
+    }
+
+    async fn insert_bug_enrichment_with_metadata(
+        &self,
+        bug_id: i64,
+        enrichment: &NewBugEnrichment,
+        metadata: EnrichmentMetadata,
+    ) -> Result<i64> {
         let compressed_content = enrichment
             .content
             .as_ref()
@@ -2542,10 +2683,30 @@ impl Database {
             .data_json
             .as_ref()
             .and_then(|d| serde_json::to_string(d).ok());
-        let now = if enrichment.created_at > 0 {
-            enrichment.created_at
-        } else {
-            chrono::Utc::now().timestamp()
+        let (tool, model, author, now) = match metadata {
+            EnrichmentMetadata::ActorDefaults => (
+                if enrichment.tool.is_empty() {
+                    self.bug_tool.as_str()
+                } else {
+                    enrichment.tool.as_str()
+                },
+                enrichment.model.clone().or_else(|| self.bug_model.clone()),
+                enrichment
+                    .author
+                    .clone()
+                    .or_else(|| Some(self.bug_actor.clone())),
+                if enrichment.created_at > 0 {
+                    enrichment.created_at
+                } else {
+                    chrono::Utc::now().timestamp()
+                },
+            ),
+            EnrichmentMetadata::Preserve => (
+                enrichment.tool.as_str(),
+                enrichment.model.clone(),
+                enrichment.author.clone(),
+                enrichment.created_at,
+            ),
         };
 
         self.query_returning_i64(
@@ -2557,16 +2718,9 @@ impl Database {
             libsql::params![
                 bug_id,
                 enrichment.kind.as_str(),
-                if enrichment.tool.is_empty() {
-                    self.bug_tool.as_str()
-                } else {
-                    enrichment.tool.as_str()
-                },
-                enrichment.model.clone().or_else(|| self.bug_model.clone()),
-                enrichment
-                    .author
-                    .clone()
-                    .or_else(|| Some(self.bug_actor.clone())),
+                tool,
+                model,
+                author,
                 now,
                 compressed_content,
                 data_json_str,
@@ -2600,7 +2754,7 @@ impl Database {
         Ok(list)
     }
 
-    fn parse_bug_enrichment_row(row: &libsql::Row) -> Result<BugEnrichment> {
+    fn parse_bug_enrichment_row(row: &crate::storage::Row) -> Result<BugEnrichment> {
         let id: i64 = row.get(0)?;
         let bug_id: i64 = row.get(1)?;
         let kind: String = row.get(2)?;
@@ -3112,6 +3266,7 @@ impl Database {
         // Interaction logs are deliberately not loaded with the family, so ask
         // the table which records carry one before assembling the events.
         let family_ids: Vec<i64> = family.iter().map(|b| b.id).collect();
+        let foreign_events = self.foreign_shared_events(&family_ids).await?;
         let mut logged_records = std::collections::HashSet::<i64>::new();
         if !family_ids.is_empty() {
             let mut rows = self
@@ -3173,12 +3328,15 @@ impl Database {
                     tools.insert(t.clone());
                 }
 
-                let patchset_id = record
+                // Raw inputs retain their original payload. Only references
+                // produced by this instance can link to its patch database.
+                let local_record = record.filter(|e| !foreign_events.contains(&e.id));
+                let patchset_id = local_record
                     .and_then(|e| e.data_json.as_ref())
                     .and_then(|d| d.get("patchset_id"))
                     .and_then(|v| v.as_i64())
                     .or(bug.discovered_in_patchset_id);
-                let patch_id = record
+                let patch_id = local_record
                     .and_then(|e| e.data_json.as_ref())
                     .and_then(|d| d.get("patch_id"))
                     .and_then(|v| v.as_i64())
@@ -3468,7 +3626,7 @@ impl Database {
         tx.execute(
             "UPDATE bugs
                     SET assignee = ?1,
-                        assigned_at = CASE WHEN ?1 IS NULL THEN NULL ELSE ?2 END,
+                        assigned_at = CASE WHEN CAST(?1 AS TEXT) IS NULL THEN NULL ELSE CAST(?2 AS BIGINT) END,
                         updated_at = ?2,
                         audit_author = ?3,
                         audit_tool = ?4,
@@ -3591,7 +3749,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let id_opt = self
             .query_returning_i64(
-                "UPDATE bugs
+                &format!("UPDATE bugs
                     SET pipeline_state = 'running',
                         locked_by = ?1,
                         lease_expires_at = ?2,
@@ -3607,10 +3765,10 @@ impl Database {
                          AND (pipeline_state IN ('pending', 'failed')
                               OR (pipeline_state = 'running'
                                   AND (lease_expires_at IS NULL OR lease_expires_at < ?3)))
-                       ORDER BY created_at ASC
+                       {ownership} ORDER BY created_at ASC
                        LIMIT 1
                   )
-                  RETURNING id",
+                  RETURNING id", ownership=self.owned_bug_clause()),
                 libsql::params![
                     worker_id,
                     now + lease_ttl_seconds,
@@ -3680,7 +3838,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let count = self
             .execute(
-                "UPDATE bugs
+                &format!("UPDATE bugs
                     SET pipeline_state = 'abandoned',
                         locked_by = NULL,
                         lease_expires_at = NULL,
@@ -3691,7 +3849,7 @@ impl Database {
                   WHERE attempt_count >= ?2
                     AND (pipeline_state IN ('pending', 'failed')
                          OR (pipeline_state = 'running'
-                             AND (lease_expires_at IS NULL OR lease_expires_at < ?1)))",
+                             AND (lease_expires_at IS NULL OR lease_expires_at < ?1))) {ownership}", ownership=self.owned_bug_clause()),
                 libsql::params![now, max_attempts, self.bug_tool.as_str()],
             )
             .await?;
@@ -3722,7 +3880,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let count = self
             .execute(
-                "UPDATE bugs
+                &format!("UPDATE bugs
                     SET pipeline_state = 'pending',
                         locked_by = NULL,
                         lease_expires_at = NULL,
@@ -3731,7 +3889,7 @@ impl Database {
                         audit_tool = CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE pipeline_state = 'running'
-                    AND (lease_expires_at IS NULL OR lease_expires_at < ?1)",
+                    AND (lease_expires_at IS NULL OR lease_expires_at < ?1) {ownership}", ownership=self.owned_bug_clause()),
                 libsql::params![now, self.bug_tool.as_str()],
             )
             .await?;
@@ -4032,7 +4190,8 @@ impl Database {
         let ttl = lease_ttl_seconds.clamp(1, 86_400);
         let id_opt = self
             .query_returning_i64(
-                "UPDATE bugs
+                &format!(
+                    "UPDATE bugs
                     SET locked_by = ?1,
                         lease_expires_at = ?2,
                         updated_at = ?3
@@ -4045,10 +4204,12 @@ impl Database {
                          AND verified_on_sha != ''
                          AND verified_on_sha != ?4
                          AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
-                       ORDER BY updated_at ASC, id ASC
+                       {ownership} ORDER BY updated_at ASC, id ASC
                        LIMIT 1
                   )
                   RETURNING id",
+                    ownership = self.owned_bug_clause()
+                ),
                 libsql::params![
                     worker_id,
                     now.saturating_add(ttl),
@@ -4095,8 +4256,9 @@ impl Database {
                 AND verified_on_sha != ?1
                 AND (lease_expires_at IS NULL OR lease_expires_at <= ?2)
                 AND (?3 IS NULL OR updated_at > ?3 OR (updated_at = ?3 AND id > ?4))
-              ORDER BY updated_at ASC, id ASC
-              LIMIT ?5"
+              {ownership} ORDER BY updated_at ASC, id ASC
+              LIMIT ?5",
+            ownership = self.owned_bug_clause()
         );
         let mut rows = self
             .conn
@@ -4163,7 +4325,8 @@ impl Database {
         let ttl = lease_ttl_seconds.clamp(1, 86_400);
         let updated = self
             .execute(
-                "UPDATE bugs
+                &format!(
+                    "UPDATE bugs
                     SET locked_by = ?1,
                         lease_expires_at = ?2,
                         updated_at = ?3
@@ -4174,7 +4337,9 @@ impl Database {
                     AND verified_on_sha IS NOT NULL
                     AND verified_on_sha != ''
                     AND verified_on_sha != ?5
-                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)",
+                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?3) {ownership}",
+                    ownership = self.owned_bug_clause()
+                ),
                 libsql::params![worker_id, now.saturating_add(ttl), now, bug_id, linus],
             )
             .await?;
@@ -4481,6 +4646,18 @@ impl Database {
         Ok(())
     }
 
+    fn maintainer_section_fold_sql(&self) -> &'static str {
+        // Authorization and SQLite NOCASE fold ASCII only. Preserve distinct
+        // section names that differ in non-ASCII characters on both backends.
+        self.conn.sql(
+            "lower(subsystem)",
+            concat!(
+                "translate(subsystem, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', ",
+                "'abcdefghijklmnopqrstuvwxyz')"
+            ),
+        )
+    }
+
     pub async fn list_bugs(&self, params: ListBugsParams<'_>) -> Result<(Vec<Bug>, usize)> {
         let limit_val = params.limit.unwrap_or(50) as i64;
         let page_val = params.page.unwrap_or(1) as i64;
@@ -4502,17 +4679,18 @@ impl Database {
                 return Ok((Vec::new(), 0));
             }
             let placeholders = vec!["?"; titles.len()].join(", ");
+            let fold = self.maintainer_section_fold_sql();
             conditions.push(
                 format!(
                     "id IN (SELECT bug_id FROM bug_subsystems
-                            WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
+                            WHERE source = '{}' AND {fold} IN ({}))",
                     SubsystemSource::MaintainersSection.as_str(),
                     placeholders
                 )
                 .into(),
             );
             for title in titles {
-                query_params.push(libsql::Value::Text(title.to_string()));
+                query_params.push(libsql::Value::Text(title.to_ascii_lowercase()));
             }
         }
 
@@ -4770,12 +4948,13 @@ impl Database {
                     return Ok(Vec::new());
                 }
                 let placeholders = vec!["?"; titles.len()].join(", ");
+                let fold = self.maintainer_section_fold_sql();
                 for title in &titles {
-                    params.push(libsql::Value::Text((*title).to_string()));
+                    params.push(libsql::Value::Text(title.to_ascii_lowercase()));
                 }
                 format!(
                     " AND b.id IN (SELECT bug_id FROM bug_subsystems
-                                   WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
+                                   WHERE source = '{}' AND {fold} IN ({}))",
                     SubsystemSource::MaintainersSection.as_str(),
                     placeholders
                 )
@@ -4787,7 +4966,7 @@ impl Database {
                    JOIN bugs b ON bs.bug_id = b.id
                    WHERE b.lifecycle_status = ?{}
                    GROUP BY bs.subsystem
-                   HAVING bug_count > 0
+                   HAVING count(DISTINCT b.id) > 0
                    ORDER BY bug_count DESC, bs.subsystem ASC",
             scope_clause
         );
@@ -4841,7 +5020,7 @@ impl Database {
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(review_id, bug_id) DO UPDATE
                     SET is_newly_discovered =
-                        MAX(is_newly_discovered, excluded.is_newly_discovered)",
+                        CASE WHEN bug_reviews.is_newly_discovered > excluded.is_newly_discovered THEN bug_reviews.is_newly_discovered ELSE excluded.is_newly_discovered END",
             libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
         )
         .await?;
@@ -4948,8 +5127,8 @@ impl Database {
         // taking the schema default of 1 would report every fold as a fresh
         // discovery on the canonical bug.
         tx.execute(
-            "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
-             SELECT review_id, ?1, 0 FROM bug_reviews WHERE bug_id = ?2",
+            "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+             SELECT review_id, ?1, 0 FROM bug_reviews WHERE bug_id = ?2 ON CONFLICT DO NOTHING",
             libsql::params![params.canonical_id, params.ephemeral_id],
         )
         .await?;
@@ -4965,8 +5144,8 @@ impl Database {
 
     pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
         self.execute(
-            "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
-             SELECT review_id, ?, 0 FROM bug_reviews WHERE bug_id = ?",
+            "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+             SELECT review_id, ?, 0 FROM bug_reviews WHERE bug_id = ? ON CONFLICT DO NOTHING",
             libsql::params![to_bug_id, from_bug_id],
         )
         .await?;
@@ -5119,7 +5298,7 @@ impl Database {
 
     /// Parses a row selected with [`BUG_ROW_COLUMNS`]. The column order here and
     /// the order in that constant must be kept in step.
-    fn parse_bug_row_core(row: &libsql::Row) -> Result<Bug> {
+    fn parse_bug_row_core(row: &crate::storage::Row) -> Result<Bug> {
         let id: i64 = row.get(0)?;
         let bugid: String = row.get(1)?;
         let title: String = row.get(2)?;
@@ -5160,7 +5339,7 @@ impl Database {
         })
     }
 
-    pub async fn parse_bug_row(&self, row: &libsql::Row) -> Result<Bug> {
+    pub async fn parse_bug_row(&self, row: &crate::storage::Row) -> Result<Bug> {
         let mut bug = Self::parse_bug_row_core(row)?;
         bug.subsystems = self
             .get_subsystems_for_bug(bug.id)
@@ -5356,6 +5535,26 @@ impl Database {
         }))
     }
 
+    fn review_stats_sql(&self) -> String {
+        let index_hint = self.conn.sql(" INDEXED BY idx_ai_interactions_tokens", "");
+        format!(
+            "WITH last_reviews AS (
+            SELECT * FROM reviews ORDER BY id DESC LIMIT 1000
+        )
+        SELECT
+            r.provider,
+            r.model,
+            r.status,
+            count(*),
+            sum(COALESCE(ai.tokens_in, 0)),
+            sum(COALESCE(ai.tokens_out, 0)),
+            sum(COALESCE(ai.tokens_cached, 0))
+        FROM last_reviews r
+        LEFT JOIN ai_interactions ai{index_hint} ON r.interaction_id = ai.id
+        GROUP BY r.provider, r.model, r.status"
+        )
+    }
+
     pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
         let mut total_rows = self
             .conn
@@ -5383,22 +5582,7 @@ impl Database {
             0
         };
 
-        let sql = "WITH last_reviews AS (
-            SELECT * FROM reviews ORDER BY id DESC LIMIT 1000
-        )
-        SELECT
-            r.provider,
-            r.model,
-            r.status,
-            count(*),
-            sum(COALESCE(ai.tokens_in, 0)),
-            sum(COALESCE(ai.tokens_out, 0)),
-            sum(COALESCE(ai.tokens_cached, 0))
-        FROM last_reviews r
-        LEFT JOIN ai_interactions ai INDEXED BY idx_ai_interactions_tokens ON r.interaction_id = ai.id
-        GROUP BY r.provider, r.model, r.status";
-
-        let mut rows = self.conn.query(sql, ()).await?;
+        let mut rows = self.conn.query(&self.review_stats_sql(), ()).await?;
         let mut stats = Vec::new();
         #[allow(clippy::similar_names)]
         while let Ok(Some(row)) = rows.next().await {
@@ -5478,7 +5662,7 @@ impl Database {
         };
         self.tx_conn
             .execute(
-                "INSERT OR IGNORE INTO people (name, email) VALUES (?, ?)",
+                "INSERT INTO people (name, email) VALUES (?, ?) ON CONFLICT DO NOTHING",
                 libsql::params![name, email],
             )
             .await?;
@@ -5505,7 +5689,7 @@ impl Database {
         recipient_type: &str,
     ) -> Result<()> {
         self.execute(
-            "INSERT OR IGNORE INTO messages_recipients (message_id, person_id, recipient_type) VALUES (?, ?, ?)",
+            "INSERT INTO messages_recipients (message_id, person_id, recipient_type) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
             libsql::params![message_id, person_id, recipient_type],
         )
         .await?;
@@ -5534,7 +5718,7 @@ impl Database {
         };
         self.tx_conn
             .execute(
-                "INSERT OR IGNORE INTO subsystems (name, mailing_list_address) VALUES (?, ?)",
+                "INSERT INTO subsystems (name, mailing_list_address) VALUES (?, ?) ON CONFLICT DO NOTHING",
                 libsql::params![name, mailing_list_address],
             )
             .await?;
@@ -5579,7 +5763,7 @@ impl Database {
         subsystem_id: i64,
     ) -> Result<()> {
         self.execute(
-            "INSERT OR IGNORE INTO messages_subsystems (message_id, subsystem_id) VALUES (?, ?)",
+            "INSERT INTO messages_subsystems (message_id, subsystem_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             libsql::params![message_id_db, subsystem_id],
         )
         .await?;
@@ -5588,7 +5772,7 @@ impl Database {
 
     pub async fn add_subsystem_to_thread(&self, thread_id: i64, subsystem_id: i64) -> Result<()> {
         self.execute(
-            "INSERT OR IGNORE INTO threads_subsystems (thread_id, subsystem_id) VALUES (?, ?)",
+            "INSERT INTO threads_subsystems (thread_id, subsystem_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             libsql::params![thread_id, subsystem_id],
         )
         .await?;
@@ -5597,7 +5781,7 @@ impl Database {
 
     pub async fn add_subsystem_to_patch(&self, patch_id: i64, subsystem_id: i64) -> Result<()> {
         self.execute(
-            "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?)",
+            "INSERT INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             libsql::params![patch_id, subsystem_id],
         )
         .await?;
@@ -5610,7 +5794,7 @@ impl Database {
         subsystem_id: i64,
     ) -> Result<()> {
         self.execute(
-            "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
+            "INSERT INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             libsql::params![patchset_id, subsystem_id],
         )
         .await?;
@@ -5824,7 +6008,7 @@ impl Database {
 
             // 3. Merge subsystems
             tx.execute(
-                "UPDATE OR IGNORE threads_subsystems SET thread_id = ? WHERE thread_id = ?",
+                "INSERT INTO threads_subsystems (thread_id, subsystem_id) SELECT ?, subsystem_id FROM threads_subsystems WHERE thread_id = ? ON CONFLICT DO NOTHING",
                 libsql::params![thread_id, old_thread_id],
             )
             .await?;
@@ -5885,7 +6069,7 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id FROM baselines WHERE repo_url IS ? AND branch IS ? AND last_known_commit IS ?",
+                    "SELECT id FROM baselines WHERE repo_url IS NOT DISTINCT FROM ? AND branch IS NOT DISTINCT FROM ? AND last_known_commit IS NOT DISTINCT FROM ?",
                     libsql::params![repo_url, branch, commit],
                 )
                 .await?;
@@ -6902,13 +7086,13 @@ impl Database {
                     .await?;
 
                     tx.execute(
-                        "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id)
+                        "INSERT INTO patches_subsystems (patch_id, subsystem_id)
                          SELECT tp.id, ps.subsystem_id
                            FROM patches_subsystems ps
                            JOIN patches mp ON mp.id = ps.patch_id
                            JOIN patches tp ON tp.message_id = mp.message_id
                           WHERE mp.patchset_id = ?
-                            AND tp.patchset_id = ?",
+                            AND tp.patchset_id = ? ON CONFLICT DO NOTHING",
                         libsql::params![merge_from_id, target_id],
                     )
                     .await?;
@@ -6934,7 +7118,7 @@ impl Database {
 
                     // Reassign remaining patches
                     tx.execute(
-                        "UPDATE OR IGNORE patches SET patchset_id = ? WHERE patchset_id = ?",
+                        "UPDATE patches SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -6955,8 +7139,8 @@ impl Database {
 
                     // Merge subsystems
                     tx.execute(
-                        "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id)
-                         SELECT ?, subsystem_id FROM patchsets_subsystems WHERE patchset_id = ?",
+                        "INSERT INTO patchsets_subsystems (patchset_id, subsystem_id)
+                         SELECT ?, subsystem_id FROM patchsets_subsystems WHERE patchset_id = ? ON CONFLICT DO NOTHING",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -6991,7 +7175,7 @@ impl Database {
 
                     // Reassign or clean up forge_outbox entries referencing merge_from_id
                     tx.execute(
-                        "UPDATE OR IGNORE forge_outbox SET patchset_id = ? WHERE patchset_id = ?",
+                        "UPDATE forge_outbox SET patchset_id = ?1 WHERE patchset_id = ?2 AND NOT EXISTS (SELECT 1 FROM forge_outbox target WHERE target.patchset_id = ?1)",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -7606,7 +7790,7 @@ impl Database {
                 WHERE r.status = 'Reviewed'
                 GROUP BY r.patchset_id
              ) f ON p.id = f.patchset_id
-             GROUP BY p.id
+             GROUP BY p.id, f.low, f.medium, f.high, f.critical
              ORDER BY p.date DESC",
             where_clause
         );
@@ -10834,6 +11018,65 @@ mod tests {
             .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::Unrestricted)
             .await?;
         assert_eq!(counts.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_statistics_keep_the_libsql_covering_index() -> Result<()> {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+        let mut rows = db
+            .conn
+            .query(&format!("EXPLAIN QUERY PLAN {}", db.review_stats_sql()), ())
+            .await?;
+        let mut covering_index = false;
+        while let Some(row) = rows.next().await? {
+            covering_index |= row
+                .get::<String>(3)?
+                .contains("COVERING INDEX idx_ai_interactions_tokens");
+        }
+        assert!(
+            covering_index,
+            "statistics must avoid reading interaction payloads"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_scope_preserves_non_ascii_section_names() -> Result<()> {
+        let db = setup_db().await;
+        let title = "ÄTHERNET DRIVER";
+        let mut bug: NewBug = serde_json::from_value(json!({
+            "bugid": format!("sashiko-{}", uuid::Uuid::new_v4()),
+            "title": "Unicode section visibility"
+        }))?;
+        bug.subsystems = vec![AttributedSubsystem::from_maintainers(title)];
+        let id = db.create_bug(&bug).await?;
+        for (scope, expected) in [("ÄTHERNET driver", 1), ("äTHERNET driver", 0)] {
+            let scope = vec![scope.to_string()];
+            let (items, total) = db
+                .list_bugs(ListBugsParams {
+                    visibility: BugVisibility::Sections(&scope),
+                    ..Default::default()
+                })
+                .await?;
+            assert_eq!(total, expected);
+            assert!(items.iter().all(|bug| bug.id == id));
+            let counts = db
+                .get_subsystems_bug_counts(
+                    Some(BugLifecycleStatus::New),
+                    BugVisibility::Sections(&scope),
+                )
+                .await?;
+            assert_eq!(counts.len(), expected);
+            if expected != 0 {
+                assert_eq!(counts, vec![(title.to_string(), 1)]);
+            }
+        }
         Ok(())
     }
 
@@ -16188,8 +16431,8 @@ mod tests {
     async fn ensure_message(db: &Database, thread_id: i64, message_id: &str) {
         db.conn
             .execute(
-                "INSERT OR IGNORE INTO messages (message_id, thread_id, author, subject, date)
-                 VALUES (?, ?, 'An Author', 'A subject', 1000)",
+                "INSERT INTO messages (message_id, thread_id, author, subject, date)
+                 VALUES (?, ?, 'An Author', 'A subject', 1000) ON CONFLICT DO NOTHING",
                 libsql::params![message_id, thread_id],
             )
             .await
@@ -22346,6 +22589,11 @@ mod tests {
 
         let mut offenders = Vec::new();
         for path in files {
+            // The adapter owns the backend transaction protocol and serializes
+            // its own handles. This guard applies to callers of that boundary.
+            if path == manifest_dir.join("src/storage.rs") {
+                continue;
+            }
             let content = std::fs::read_to_string(&path).expect("readable source file");
             for pattern in forbidden {
                 if content.contains(pattern) {

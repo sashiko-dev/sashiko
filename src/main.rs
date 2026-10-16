@@ -541,7 +541,7 @@ async fn run_daemon(
     }
 
     // Initialize Database
-    let db = Arc::new(Database::new(&settings.database).await?);
+    let db = Arc::new(Database::configured(&settings).await?);
     db.migrate().await?;
     db.ensure_project_stamp(project).await?;
     match db.fail_interrupted_fetching_patchsets().await {
@@ -1152,6 +1152,23 @@ async fn run_daemon(
         None
     };
 
+    let shared_bug_sync_handle = if db.has_shared_bug_catalog() {
+        let shared_db = db.clone();
+        Some(spawn_supervised_worker("SharedBugCatalog", move || {
+            let shared_db = Arc::clone(&shared_db);
+            async move {
+                loop {
+                    if let Err(error) = shared_db.sync_shared_bugs().await {
+                        warn!("Shared bug catalog synchronization will retry: {error:#}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let bug_worker_handle = if settings.linux_bug.enabled {
         let provider =
             sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
@@ -1335,6 +1352,9 @@ async fn run_daemon(
         h.abort();
     }
     if let Some(h) = bug_worker_handle {
+        h.abort();
+    }
+    if let Some(h) = shared_bug_sync_handle {
         h.abort();
     }
     compressor_handle.abort();
@@ -3868,6 +3888,19 @@ mod tests {
         }
     }
 
+    fn terminal_pty() -> std::fs::File {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+        let master =
+            openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("allocate a pty master");
+        grantpt(&master).expect("grant access to the pty slave");
+        unlockpt(&master).expect("unlock the pty slave");
+        let slave_name = ptsname(&master, Vec::new()).expect("get the pty slave name");
+        let _slave = std::fs::File::open(slave_name.to_str().expect("valid pty path"))
+            .expect("open the pty slave");
+        std::fs::File::from(master)
+    }
+
     /// Sets a pty's window size, the way a terminal emulator does for the pty
     /// it owns.
     fn resize(pty: &std::fs::File, rows: u16, cols: u16) {
@@ -3885,7 +3918,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_resize_is_followed_while_the_review_runs() {
-        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let pty = terminal_pty();
         resize(&pty, 24, 80);
 
         let state = Arc::new(std::sync::Mutex::new(progress_state(reserving((24, 80)))));
@@ -3943,7 +3976,7 @@ mod tests {
     async fn test_a_resize_between_starting_and_listening_is_not_missed() {
         // The display starts from the size it was given, and the window changes
         // before anything is listening for the signal that says so.
-        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let pty = terminal_pty();
         resize(&pty, 24, 80);
         let state = Arc::new(std::sync::Mutex::new(progress_state(reserving((24, 80)))));
         resize(&pty, 24, 132);
@@ -3984,7 +4017,7 @@ mod tests {
 
         // Nor from a terminal whose size has never been set: a fresh pty master
         // answers isatty yes and zeroes for its window.
-        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let pty = terminal_pty();
         assert!(pty.is_terminal());
         assert_eq!(window_size(&pty), None);
 
@@ -4006,7 +4039,7 @@ mod tests {
     fn test_each_stream_is_asked_about_itself() {
         // std::io::IsTerminal cannot be implemented outside std, so these are
         // real descriptors: a pty master answers yes, /dev/null answers no.
-        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let pty = terminal_pty();
         let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
         let xterm = terminfo_for("xterm");
 
@@ -4046,7 +4079,7 @@ mod tests {
 
     #[test]
     fn test_color_is_the_terminals_answer_and_not_isattys() {
-        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let pty = terminal_pty();
 
         // A terminal with no color to set. isatty cannot tell this apart from an
         // xterm, and terminfo can.
@@ -4392,7 +4425,7 @@ mod tests {
 
     #[test]
     fn test_how_the_display_draws_is_the_terminals_answer_too() {
-        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let pty = terminal_pty();
         resize(&pty, 24, 80);
         let keeps_lines = |info: &terminfo::Database| {
             OutputStream::detect(ColorMode::Auto, &pty, Some(info)).reservation_capable
@@ -4433,7 +4466,7 @@ mod tests {
         // foot of the screen is not known, and lines placed against the 24x80
         // fallback would land in the middle of a taller one, over whatever was
         // there. A fresh pty master is exactly that terminal.
-        let sizeless = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let sizeless = terminal_pty();
         assert_eq!(window_size(&sizeless), None);
         if let Some(xterm) = terminfo_for("xterm") {
             let display = OutputStream::detect(ColorMode::Auto, &sizeless, Some(&xterm));
