@@ -1064,7 +1064,7 @@ async fn run_worker_in_worktree(
                 if let Some(wf) = err.downcast_ref::<crate::workflow::WorkflowFailure>() {
                     failed_outcomes.push((patch_index, wf.outcome.clone()));
                 }
-                let err = err.to_string();
+                let err = format!("{:?}", err);
                 mark_patch_review_incomplete(&mut patch_results, patch_index, &err);
                 review_errors.push((patch_index, err));
             }
