@@ -120,12 +120,39 @@ async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bo
     Ok(status.success())
 }
 
+/// Why a unit note was chosen for a review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteReason {
+    /// The unit covers a file the patch touches.
+    TouchedFiles,
+    /// The patch uses identifiers the unit's verified facts are about,
+    /// such as the API the unit provides.
+    UsedSymbols,
+}
+
+impl NoteReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            NoteReason::TouchedFiles => "touched files",
+            NoteReason::UsedSymbols => "used symbols",
+        }
+    }
+}
+
 /// A unit note chosen for a review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedNote {
     pub unit: String,
     pub text: String,
+    pub reason: NoteReason,
 }
+
+/// Units chosen for the symbols a patch uses, beyond those for its files.
+const MAX_SYMBOL_UNITS: usize = 3;
+/// A symbol ties a patch to a unit only when at most this many units'
+/// facts are about it; common helpers would otherwise pull in arbitrary
+/// units.
+const MAX_UNITS_PER_SYMBOL: usize = 3;
 
 /// Picks the unit notes for `touched_files`, most relevant first, within
 /// `max_bytes`. A unit is relevant when it covers a touched file; a touched
@@ -181,6 +208,72 @@ pub fn select_notes(
         out.push(SelectedNote {
             unit: unit.name.clone(),
             text,
+            reason: NoteReason::TouchedFiles,
+        });
+    }
+    out
+}
+
+/// Picks up to MAX_SYMBOL_UNITS more unit notes for the specific
+/// identifiers a patch uses (see diff_identifiers), skipping units already
+/// chosen. A unit scores one point per identifier its facts are about that
+/// at most MAX_UNITS_PER_SYMBOL units share; each chosen note keeps only
+/// the rules that name one of the identifiers, within what is left of
+/// `max_bytes`.
+pub fn select_symbol_notes(
+    set: &NotesSet,
+    identifiers: &HashSet<String>,
+    chosen: &[SelectedNote],
+    max_bytes: usize,
+) -> Vec<SelectedNote> {
+    let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (slug, unit) in &set.manifest.units {
+        for symbol in &unit.symbols {
+            if identifiers.contains(symbol) {
+                owners
+                    .entry(symbol.as_str())
+                    .or_default()
+                    .push(slug.as_str());
+            }
+        }
+    }
+    let mut score: BTreeMap<&str, usize> = BTreeMap::new();
+    for slugs in owners.values() {
+        if slugs.len() <= MAX_UNITS_PER_SYMBOL {
+            for slug in slugs {
+                *score.entry(slug).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(&str, usize)> = score.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+
+    let mut used: usize = chosen.iter().map(|n| n.text.len()).sum();
+    let mut out = Vec::new();
+    for (slug, _) in ranked {
+        if out.len() == MAX_SYMBOL_UNITS {
+            break;
+        }
+        let Some(unit) = set.manifest.units.get(slug) else {
+            continue;
+        };
+        if chosen.iter().any(|n| n.unit == unit.name) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(set.dir.join(&unit.note)) else {
+            continue;
+        };
+        let Some(text) = focus_note(&strip_citations(&text), identifiers) else {
+            continue;
+        };
+        if used + text.len() > max_bytes {
+            continue;
+        }
+        used += text.len();
+        out.push(SelectedNote {
+            unit: unit.name.clone(),
+            text,
+            reason: NoteReason::UsedSymbols,
         });
     }
     out
@@ -315,8 +408,9 @@ pub fn render_block(set: &NotesSet, notes: &[SelectedNote]) -> String {
     );
     for note in notes {
         block.push_str(&format!(
-            "\n<unit_note unit=\"{}\">\n{}\n</unit_note>\n",
+            "\n<unit_note unit=\"{}\" reason=\"{}\">\n{}\n</unit_note>\n",
             note.unit,
+            note.reason.as_str(),
             note.text.trim()
         ));
     }
@@ -487,8 +581,90 @@ mod tests {
 
         let block = render_block(set, &notes);
         assert!(block.contains("<code_notes set=\"s\" revision=\"r\">"));
-        assert!(block.contains("<unit_note unit=\"mm\">"));
+        assert!(block.contains("<unit_note unit=\"mm\" reason=\"touched files\">"));
         assert!(render_block(set, &[]).is_empty());
         assert!(select_notes(set, &["docs/x.rst".to_string()], None, 1000).is_empty());
+    }
+
+    #[test]
+    fn test_select_symbol_notes_by_owned_identifiers() {
+        let prompts = tempfile::tempdir().unwrap();
+        let note = |name: &str, rules: &str| format!("# {name}\n\nIntro.\n\n## Rules\n{rules}");
+        write_set(
+            prompts.path(),
+            "s",
+            "r",
+            &[
+                (
+                    "net",
+                    "net",
+                    &["net/core/dev.c"],
+                    &note("net", "- `netif_rx()` defers. [F1]\n"),
+                ),
+                (
+                    "lock",
+                    "lock",
+                    &["kernel/locking/spinlock.c"],
+                    &note(
+                        "lock",
+                        "- `spin_lock_irqsave()` saves flags. [F2]\n- `mutex_lock()` sleeps. [F3]\n",
+                    ),
+                ),
+                (
+                    "mm",
+                    "mm",
+                    &["mm/slab.c"],
+                    &note("mm", "- `kfree_bulk()` frees. [F4]\n"),
+                ),
+            ],
+        );
+        let mut set = load_sets(prompts.path()).remove(0);
+        let symbols = |set: &mut NotesSet, slug: &str, syms: &[&str]| {
+            set.manifest.units.get_mut(slug).unwrap().symbols =
+                syms.iter().map(|s| s.to_string()).collect();
+        };
+        symbols(&mut set, "net", &["netif_rx", "kfree_skb"]);
+        symbols(
+            &mut set,
+            "lock",
+            &["spin_lock_irqsave", "mutex_lock", "kfree_skb"],
+        );
+        symbols(&mut set, "mm", &["kfree_bulk", "kfree_skb"]);
+
+        let ids: HashSet<String> = ["spin_lock_irqsave", "kfree_bulk"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let chosen = select_notes(&set, &["net/core/dev.c".to_string()], None, 10_000);
+        let extra = select_symbol_notes(&set, &ids, &chosen, 10_000);
+        let units: Vec<&str> = extra.iter().map(|n| n.unit.as_str()).collect();
+        assert_eq!(units, vec!["lock", "mm"]);
+        assert!(extra.iter().all(|n| n.reason == NoteReason::UsedSymbols));
+        // Only the rules naming a used identifier are kept.
+        assert!(
+            extra[0].text.contains("spin_lock_irqsave") && !extra[0].text.contains("mutex_lock")
+        );
+
+        // A unit already chosen for its files is not chosen again.
+        let ids = HashSet::from(["netif_rx".to_string()]);
+        assert!(select_symbol_notes(&set, &ids, &chosen, 10_000).is_empty());
+
+        // A symbol shared by more than MAX_UNITS_PER_SYMBOL units ties the
+        // patch to none of them.
+        let mut shared = set.clone();
+        for slug in ["net", "lock", "mm"] {
+            shared
+                .manifest
+                .units
+                .get_mut(slug)
+                .unwrap()
+                .symbols
+                .push("common_helper".into());
+        }
+        let mut fourth = shared.manifest.units["mm"].clone();
+        fourth.name = "fourth".to_string();
+        shared.manifest.units.insert("fourth".to_string(), fourth);
+        let ids = HashSet::from(["common_helper".to_string()]);
+        assert!(select_symbol_notes(&shared, &ids, &[], 10_000).is_empty());
     }
 }

@@ -117,12 +117,19 @@ async fn select_code_notes(
         CodeNotesScope::Unit => None,
         CodeNotesScope::Touched => Some(crate::notes::select::diff_identifiers(diff)),
     };
-    let notes = crate::notes::select::select_notes(set, &files, identifiers.as_ref(), max_bytes);
+    let mut notes =
+        crate::notes::select::select_notes(set, &files, identifiers.as_ref(), max_bytes);
+    let specific = crate::notes::select::diff_identifiers(diff);
+    let symbol_notes = crate::notes::select::select_symbol_notes(set, &specific, &notes, max_bytes);
+    notes.extend(symbol_notes);
     tracing::info!(
-        "code notes: set {} with {} unit note(s) for {} touched file(s)",
+        "code notes: set {} for {} touched file(s): {:?}",
         set.manifest.set,
-        notes.len(),
-        files.len()
+        files.len(),
+        notes
+            .iter()
+            .map(|n| format!("{} ({:?})", n.unit, n.reason))
+            .collect::<Vec<_>>()
     );
     crate::notes::select::render_block(set, &notes)
 }
