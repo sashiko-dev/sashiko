@@ -26,6 +26,7 @@ pub mod entry_points;
 pub mod evidence;
 pub mod facts;
 pub mod history;
+pub mod maintainer_notes;
 pub mod output;
 pub mod plan;
 pub mod profile;

@@ -14,6 +14,7 @@ prompt bundle under the `kernel/` namespace.
 | `callstack.md` | The execution-flow stage |
 | `locking.md` | The locking stage |
 | `pointer-guards.md` | Named by `callstack.md` and `false-positive-guide.md` for `read_prompt` |
+| `maintainers/*.md` | Maintainer notes: the subjective preferences, policies and conventions of a subsystem's maintainers, selected per patch by their `paths` and `symbols` (see `src/notes/maintainer_notes.rs`) |
 | `notes/` | Code notes: the profile, the agenda, and notes sets built from the code by `sashiko notes build` |
 
 These prompts carry review procedures and judgment, not knowledge about the
