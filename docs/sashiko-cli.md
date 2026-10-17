@@ -227,6 +227,57 @@ sashiko-cli local HEAD --custom-prompt "Focus on locking correctness" \
 sashiko-cli --format json local HEAD --force-local
 ```
 
+### Active Codebase Scanning (`sashiko scan`)
+
+In addition to patch review, the `sashiko` binary provides an active codebase
+scanner that audits Linux kernel source files or subsystem directories for
+pre-existing `High` and `Critical` severity defects using structure-aware
+chunking and a two-phase map-reduce workflow.
+
+```
+sashiko scan [OPTIONS] <PATHS>...
+```
+
+**Arguments:**
+
+- `<PATHS>...` -- One or more repository-relative file or directory paths to
+  scan (e.g. `fs/smb/server/` or `net/core/dev.c`).
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--ref <REV>` | Git revision to scan (defaults to mainline or `HEAD`). |
+| `-r, --repo <PATH>` | Path to the git repository (defaults to current checkout or `Settings.toml`). |
+| `--concurrency <N>` | Maximum number of source chunks to scan concurrently (default: 4). |
+| `--max-files <N>` | Maximum number of source files to expand (default: 200). |
+| `--max-chunks <N>` | Optional upper bound on total source chunks to scan. |
+| `--exclude <PATTERN>` | Exclude files matching substring/prefix pattern (may be repeated). |
+| `--submit-bugs` | Submit verified `High`/`Critical` findings directly to the bug repository (`bugs`) for deduplication. |
+| `--custom-prompt <TEXT>` | Append custom focus instructions to the scan workflow. |
+| `--effort <MODE>` | Reasoning effort override (`mid`, `high`, or `dynamic`). |
+| `--format <FORMAT>` | Output format: `text` (default) or `json`. |
+
+Candidate defects discovered across source chunks are passed through the
+`linux_bug` pipeline (`NormalizeSession` -> `VerifySession` -> `TracingSession` ->
+`SeveritySession`) so every reported finding is ground-truth verified,
+calibrated for `High` or `Critical` severity, and traced to its introducing
+commit. When `--submit-bugs` is passed, candidate bugs are atomically claimed,
+verified, and deduplicated against the bug repository (`bugs`).
+
+**Examples:**
+
+```bash
+# Scan a kernel subsystem directory at HEAD
+sashiko scan fs/smb/server/
+
+# Scan specific files and submit verified bugs to the bug repository
+sashiko scan fs/smb/server/smb2pdu.c --submit-bugs
+
+# Scan at a specific tag with JSON output
+sashiko scan --ref v6.12 --format json net/sched/
+```
+
 ## Review Modes Compared
 
 Sashiko supports three modes of operation depending on your needs:
