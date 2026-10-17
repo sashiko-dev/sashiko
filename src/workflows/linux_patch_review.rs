@@ -42,6 +42,8 @@ pub struct LinuxPatchReviewState {
     pub prefetch_failed: bool,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
+    /// Local checkout worktree path of the target commit post-image.
+    pub worktree_path: Option<PathBuf>,
 
     /// Subsystem guide markdown files selected during the pre-screen and
     /// shared with every stage.
@@ -94,6 +96,43 @@ pub struct LinuxPatchReviewState {
     pub review_inline: String,
     /// Fix suggestions.
     pub fixes: String,
+}
+
+impl LinuxPatchReviewState {
+    /// Resolves and grounds finding line numbers, character offsets, and diff overlap
+    /// in place across all finding and concern collections using the worktree post-image.
+    pub fn resolve_locations(&mut self) {
+        let Some(worktree) = &self.worktree_path else {
+            return;
+        };
+        let worktree = worktree.clone();
+        let diff_ranges = crate::worker::parse_diff_ranges(&self.target_commit_diff);
+        let rev = if !self.target_commit_sha.is_empty() && self.target_commit_sha != "unknown" {
+            Some(self.target_commit_sha.as_str())
+        } else {
+            None
+        };
+
+        for collection in [
+            &mut self.findings,
+            &mut self.concerns,
+            &mut self.hard_cases,
+            &mut self.all_concerns,
+            &mut self.all_dismissed_concerns,
+            &mut self.deduplicated_dismissed_concerns,
+            &mut self.verification_findings,
+            &mut self.verification_dismissed,
+            &mut self.post_verification_findings,
+            &mut self.post_verification_dismissed,
+        ] {
+            crate::worker::resolve_finding_locations_with_ranges(
+                &worktree,
+                rev,
+                &diff_ranges,
+                collection,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4047,5 +4086,93 @@ mod tests {
         assert_eq!(state.findings[1]["id"], "PVF1");
         assert_eq!(state.findings[0]["stage_item_id"], "VF1");
         assert_eq!(state.findings[1]["stage_item_id"], "PVF1");
+    }
+
+    #[test]
+    fn test_apply_verification_resolves_finding_locations_with_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("net/core/dev.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file_path,
+            "int dev_queue_xmit(struct sk_buff *skb) {\n    return 0;\n}\n",
+        )
+        .unwrap();
+
+        let mut state = LinuxPatchReviewState {
+            worktree_path: Some(dir.path().to_path_buf()),
+            target_commit_diff: "diff --git a/net/core/dev.c b/net/core/dev.c\n--- a/net/core/dev.c\n+++ b/net/core/dev.c\n@@ -1,3 +1,3 @@\n int dev_queue_xmit(struct sk_buff *skb) {\n-    return 0;\n+    return 0;\n }\n".to_string(),
+            ..Default::default()
+        };
+
+        let ver_out = VerificationOutput {
+            findings: vec![json!({
+                "problem": "net: missing check in dev_queue_xmit",
+                "severity": "Medium",
+                "severity_explanation": "explain",
+                "preexisting": false,
+                "locations": [{
+                    "file": "net/core/dev.c",
+                    "code_snippet": "return 0;",
+                }]
+            })],
+            hard_cases: vec![],
+            dismissed_concerns: vec![],
+        };
+
+        apply_verification_stage_output(
+            &mut state,
+            ver_out,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        state.resolve_locations();
+
+        assert_eq!(state.findings.len(), 1);
+        let loc = &state.findings[0]["locations"][0];
+        assert_eq!(loc["file"], "net/core/dev.c");
+        assert_eq!(loc["line"], 2);
+        assert_eq!(loc["end_line"], 2);
+        assert_eq!(loc["line_range"], "2");
+        assert_eq!(loc["in_diff"], true);
+    }
+
+    #[test]
+    fn test_resolve_locations_resolves_all_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("kernel/sched/core.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file_path,
+            "void schedule(void) {\n    preempt_disable();\n    __schedule(SM_NONE);\n}\n",
+        )
+        .unwrap();
+
+        let mut state = LinuxPatchReviewState {
+            worktree_path: Some(dir.path().to_path_buf()),
+            target_commit_diff: "diff --git a/kernel/sched/core.c b/kernel/sched/core.c\n--- a/kernel/sched/core.c\n+++ b/kernel/sched/core.c\n@@ -2,1 +2,1 @@\n-    preempt_disable();\n+    preempt_disable();\n".to_string(),
+            findings: vec![json!({
+                "problem": "finding 1",
+                "locations": [{"file": "kernel/sched/core.c", "code_snippet": "preempt_disable();"}]
+            })],
+            concerns: vec![json!({
+                "problem": "concern 1",
+                "locations": [{"file": "kernel/sched/core.c", "code_snippet": "__schedule(SM_NONE);"}]
+            })],
+            hard_cases: vec![json!({
+                "problem": "hard case 1",
+                "locations": [{"file": "kernel/sched/core.c", "code_snippet": "void schedule(void)"}]
+            })],
+            ..Default::default()
+        };
+
+        state.resolve_locations();
+
+        assert_eq!(state.findings[0]["locations"][0]["line"], 2);
+        assert_eq!(state.findings[0]["locations"][0]["in_diff"], true);
+        assert_eq!(state.concerns[0]["locations"][0]["line"], 3);
+        assert_eq!(state.concerns[0]["locations"][0]["in_diff"], false);
+        assert_eq!(state.hard_cases[0]["locations"][0]["line"], 1);
+        assert_eq!(state.hard_cases[0]["locations"][0]["in_diff"], false);
     }
 }

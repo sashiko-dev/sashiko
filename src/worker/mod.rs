@@ -20,6 +20,7 @@ pub mod compressor;
 pub mod email;
 #[cfg(feature = "server")]
 pub mod forge;
+pub mod location_resolver;
 #[cfg(feature = "server")]
 pub mod patchwork;
 pub mod prefetch;
@@ -29,6 +30,7 @@ pub mod repack;
 #[cfg(feature = "server")]
 pub mod sync;
 
+pub use location_resolver::*;
 pub use prompts::*;
 
 use std::time::Duration;
