@@ -335,6 +335,277 @@ pub fn normalize_file_path_with_worktree(worktree: Option<&Path>, path: &str) ->
     }
 }
 
+/// Locates a snippet in a list of file lines.
+/// Returns 0-based `(start_idx, end_idx)` if a match is found.
+pub fn find_snippet_in_lines(
+    file_lines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    file_diff_ranges: Option<&Vec<(usize, usize)>>,
+    symbol_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    let raw_snippet_lines: Vec<&str> = snippet.lines().collect();
+    let start_trim = raw_snippet_lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(raw_snippet_lines.len());
+    let end_trim = raw_snippet_lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    if start_trim >= end_trim || file_lines.is_empty() {
+        return None;
+    }
+
+    let snippet_lines: Vec<&str> = raw_snippet_lines[start_trim..end_trim]
+        .iter()
+        .map(|l| l.trim())
+        .collect();
+
+    // 1. Multi-line trimmed match with blank-line tolerance
+    let first_snip = snippet_lines
+        .iter()
+        .find(|l| !l.is_empty())
+        .copied()
+        .unwrap_or("");
+    if !first_snip.is_empty() {
+        let mut candidates = Vec::new();
+        for (i, line) in file_lines.iter().enumerate() {
+            if line.trim() == first_snip
+                && let Some(end_idx) = match_snippet_subsequence(file_lines, &snippet_lines, i)
+            {
+                candidates.push((i, end_idx));
+            }
+        }
+        if let Some(best) =
+            pick_closest_candidate(candidates, hint_line, file_diff_ranges, symbol_line)
+        {
+            return Some(best);
+        }
+    }
+
+    // 2. Fall back to matching the longest non-trivial trimmed line
+    let mut longest_line = "";
+    let mut longest_chars = 0;
+    let mut longest_idx = 0;
+    for (idx, line) in snippet_lines.iter().enumerate() {
+        let count = line.chars().count();
+        if count > longest_chars {
+            longest_line = line;
+            longest_chars = count;
+            longest_idx = idx;
+        }
+    }
+
+    if longest_chars >= 4 {
+        let mut candidates = Vec::new();
+        for (i, line) in file_lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == longest_line || (longest_chars >= 8 && trimmed.contains(longest_line)) {
+                candidates.push(i);
+            }
+        }
+
+        if let Some(best_i) =
+            pick_closest_line(candidates, hint_line, file_diff_ranges, symbol_line)
+        {
+            let mut start_idx = best_i;
+            let mut end_idx = best_i;
+
+            // Expand backwards against snippet lines, allowing intervening blank lines
+            let mut curr_file_i = best_i;
+            for &raw in snippet_lines[..longest_idx].iter().rev() {
+                if raw.is_empty() {
+                    continue;
+                }
+                let mut found = false;
+                while curr_file_i > 0 {
+                    curr_file_i -= 1;
+                    let f_trim = file_lines[curr_file_i].trim();
+                    if f_trim.is_empty() {
+                        continue;
+                    }
+                    if f_trim == raw {
+                        start_idx = curr_file_i;
+                        found = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                if !found {
+                    break;
+                }
+            }
+
+            // Expand forwards against snippet lines, allowing intervening blank lines
+            let mut curr_file_i = best_i;
+            for &raw in snippet_lines[longest_idx + 1..].iter() {
+                if raw.is_empty() {
+                    continue;
+                }
+                let mut found = false;
+                while curr_file_i + 1 < file_lines.len() {
+                    curr_file_i += 1;
+                    let f_trim = file_lines[curr_file_i].trim();
+                    if f_trim.is_empty() {
+                        continue;
+                    }
+                    if f_trim == raw {
+                        end_idx = curr_file_i;
+                        found = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                if !found {
+                    break;
+                }
+            }
+
+            return Some((start_idx, end_idx));
+        }
+    }
+
+    None
+}
+
+fn match_snippet_subsequence(
+    file_lines: &[&str],
+    snippet_lines: &[&str],
+    start_file_idx: usize,
+) -> Option<usize> {
+    let mut snip_idx = 0;
+    let mut file_idx = start_file_idx;
+    let mut last_matched_file_idx = start_file_idx;
+
+    while snip_idx < snippet_lines.len() && file_idx < file_lines.len() {
+        let s_trim = snippet_lines[snip_idx];
+        if s_trim.is_empty() {
+            snip_idx += 1;
+            continue;
+        }
+
+        let f_trim = file_lines[file_idx].trim();
+        if f_trim.is_empty() {
+            file_idx += 1;
+            continue;
+        }
+
+        if f_trim == s_trim {
+            last_matched_file_idx = file_idx;
+            snip_idx += 1;
+            file_idx += 1;
+        } else {
+            return None;
+        }
+    }
+
+    while snip_idx < snippet_lines.len() && snippet_lines[snip_idx].is_empty() {
+        snip_idx += 1;
+    }
+
+    if snip_idx == snippet_lines.len() {
+        Some(last_matched_file_idx)
+    } else {
+        None
+    }
+}
+
+fn pick_closest_candidate(
+    candidates: Vec<(usize, usize)>,
+    hint_line: Option<usize>,
+    file_diff_ranges: Option<&Vec<(usize, usize)>>,
+    symbol_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(hint) = hint_line {
+        return candidates
+            .into_iter()
+            .min_by_key(|&(start, _)| (start + 1).abs_diff(hint));
+    }
+
+    // When hint_line is None:
+    // 1. Prioritize candidates that overlap modified diff hunks.
+    if let Some(diff) = file_diff_ranges {
+        let in_diff: Vec<(usize, usize)> = candidates
+            .iter()
+            .copied()
+            .filter(|&(s, e)| diff.iter().any(|&(ds, de)| s <= de && e >= ds))
+            .collect();
+        if in_diff.len() == 1 {
+            return Some(in_diff[0]);
+        }
+        if in_diff.len() > 1 {
+            if let Some(sym_line) = symbol_line {
+                return in_diff
+                    .into_iter()
+                    .min_by_key(|&(s, _)| (s + 1).abs_diff(sym_line));
+            }
+            return Some(in_diff[0]);
+        }
+    }
+
+    // 2. If no candidate overlaps diff, prioritize candidate nearest symbol_line if provided.
+    if let Some(sym_line) = symbol_line {
+        return candidates
+            .into_iter()
+            .min_by_key(|&(s, _)| (s + 1).abs_diff(sym_line));
+    }
+
+    candidates.into_iter().next()
+}
+
+fn pick_closest_line(
+    candidates: Vec<usize>,
+    hint_line: Option<usize>,
+    file_diff_ranges: Option<&Vec<(usize, usize)>>,
+    symbol_line: Option<usize>,
+) -> Option<usize> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(hint) = hint_line {
+        return candidates
+            .into_iter()
+            .min_by_key(|&line| (line + 1).abs_diff(hint));
+    }
+
+    // 1. Prioritize candidates that overlap modified diff hunks.
+    if let Some(diff) = file_diff_ranges {
+        let in_diff: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&l| diff.iter().any(|&(ds, de)| l >= ds && l <= de))
+            .collect();
+        if in_diff.len() == 1 {
+            return Some(in_diff[0]);
+        }
+        if in_diff.len() > 1 {
+            if let Some(sym_line) = symbol_line {
+                return in_diff
+                    .into_iter()
+                    .min_by_key(|&l| (l + 1).abs_diff(sym_line));
+            }
+            return Some(in_diff[0]);
+        }
+    }
+
+    // 2. Prioritize candidate nearest symbol_line if provided.
+    if let Some(sym_line) = symbol_line {
+        return candidates
+            .into_iter()
+            .min_by_key(|&l| (l + 1).abs_diff(sym_line));
+    }
+
+    candidates.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +757,134 @@ mod tests {
         );
         let ranges = parse_diff_ranges(&diff);
         assert!(ranges.contains_key("extreme.c"));
+    }
+
+    #[test]
+    fn test_find_snippet_multi_line_trimmed() {
+        let code = [
+            "int calculate(int x) {",
+            "    if (x < 0) {",
+            "        return -EINVAL;",
+            "    }",
+            "    return x * 2;",
+            "}",
+        ];
+        let snippet = "if (x < 0) {\n    return -EINVAL;\n}";
+        let res = find_snippet_in_lines(&code, snippet, None, None, None);
+        assert_eq!(res, Some((1, 3)));
+    }
+
+    #[test]
+    fn test_find_snippet_with_hint_disambiguation() {
+        let code = [
+            "int a() {",
+            "    return 0;",
+            "}",
+            "int b() {",
+            "    return 0;",
+            "}",
+        ];
+        let snippet = "return 0;";
+        // Hint for line 5 should pick the second occurrence (0-based index 4)
+        let res = find_snippet_in_lines(&code, snippet, Some(5), None, None);
+        assert_eq!(res, Some((4, 4)));
+
+        // Hint for line 2 should pick the first occurrence (0-based index 1)
+        let res1 = find_snippet_in_lines(&code, snippet, Some(2), None, None);
+        assert_eq!(res1, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_find_snippet_fallback_longest_line() {
+        let code = [
+            "static int do_read(struct file *f) {",
+            "    int ret = 0;",
+            "    if (!f) return -EINVAL;",
+            "    ret = vfs_read(f);",
+            "    return ret;",
+            "}",
+        ];
+        // Snippet where comments or formatting slightly diverge, but the core line is distinct
+        let snippet = "    /* reading */\n    ret = vfs_read(f);\n    /* done */";
+        let res = find_snippet_in_lines(&code, snippet, None, None, None);
+        assert_eq!(res, Some((3, 3)));
+    }
+
+    #[test]
+    fn test_snippet_with_blank_lines_matches_file_with_blank_lines() {
+        let code = [
+            "int handle_request(void) {",
+            "    int ret = 0;",
+            "",
+            "    ret = do_work();",
+            "",
+            "    return ret;",
+            "}",
+        ];
+        let snippet = "    ret = do_work();\n\n    return ret;";
+        let res = find_snippet_in_lines(&code, snippet, None, None, None);
+        assert_eq!(res, Some((3, 5)));
+    }
+
+    #[test]
+    fn test_snippet_without_blank_lines_matches_file_with_blank_lines() {
+        let code = [
+            "int handle_request(void) {",
+            "    int ret = 0;",
+            "",
+            "    ret = do_work();",
+            "",
+            "    return ret;",
+            "}",
+        ];
+        // LLM omitted internal blank line in snippet
+        let snippet = "    ret = do_work();\n    return ret;";
+        let res = find_snippet_in_lines(&code, snippet, None, None, None);
+        assert_eq!(res, Some((3, 5)));
+    }
+
+    #[test]
+    fn test_repeated_snippet_without_hint_prefers_diff_hunk_occurrence() {
+        let code = [
+            "int old_func(void) {",
+            "    return -ENOMEM;",
+            "}",
+            "",
+            "// ... other code ...",
+            "",
+            "int new_func(void) {",
+            "    return -ENOMEM;",
+            "}",
+        ];
+        let snippet = "return -ENOMEM;";
+        // Diff modified lines 7-9 (0-based 6..=8)
+        let diff_ranges = vec![(6, 8)];
+
+        // With no line hint and no diff ranges, it would pick line 2 (0-based 1).
+        let unguided = find_snippet_in_lines(&code, snippet, None, None, None);
+        assert_eq!(unguided, Some((1, 1)));
+
+        // With diff_ranges, it must pick line 8 (0-based 7) inside the diff!
+        let guided = find_snippet_in_lines(&code, snippet, None, Some(&diff_ranges), None);
+        assert_eq!(guided, Some((7, 7)));
+    }
+
+    #[test]
+    fn test_repeated_snippet_without_hint_prefers_symbol_occurrence() {
+        let code = [
+            "int first_func(void) {",
+            "    return -EINVAL;",
+            "}",
+            "",
+            "int target_func(void) {",
+            "    return -EINVAL;",
+            "}",
+        ];
+        let snippet = "return -EINVAL;";
+        // Symbol definition line 5
+        let symbol_line = Some(5);
+
+        let guided = find_snippet_in_lines(&code, snippet, None, None, symbol_line);
+        assert_eq!(guided, Some((5, 5)));
     }
 }
