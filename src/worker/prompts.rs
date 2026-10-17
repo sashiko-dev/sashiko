@@ -266,6 +266,11 @@ impl Worker {
                 target_commit_sha = sha.to_string();
             }
         }
+        if target_commit_sha == "unknown"
+            && let Some(vhead) = self.tools.get_virtual_head()
+        {
+            target_commit_sha = vhead;
+        }
 
         if let Some(patches) = patchset["patches"].as_array() {
             let target_patches: Vec<&Value> = if let Some(idx) = patchset["patch_index"].as_i64() {
@@ -350,6 +355,7 @@ impl Worker {
             prefetch_failed,
             series_range: self.series_range.clone(),
             follow_up_series_context,
+            worktree_path: Some(self.tools.get_worktree_path().to_path_buf()),
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
@@ -461,12 +467,12 @@ impl Worker {
                             }
                         }
                     }
-                    WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if crate::workflows::is_counted_stage(project, stage_name) {
-                            progress_cb(WorkerProgressEvent::StageFinished {
-                                stage: stage_name.to_string(),
-                            });
-                        }
+                    WorkflowEvent::StageFinished { stage_name, .. }
+                        if crate::workflows::is_counted_stage(project, stage_name) =>
+                    {
+                        progress_cb(WorkerProgressEvent::StageFinished {
+                            stage: stage_name.to_string(),
+                        });
                     }
                     WorkflowEvent::StageTurn {
                         stage_name,
@@ -487,6 +493,15 @@ impl Worker {
         let history_offset = self.global_history.len();
         let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await?;
         self.global_history.extend(outcome.history.clone());
+
+        if state.worktree_path.is_some() {
+            state = tokio::task::spawn_blocking(move || {
+                state.resolve_locations();
+                state
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed for location resolution: {}", e))?;
+        }
 
         let review_map = crate::workflows::review_map::build_review_map(
             self.project,
