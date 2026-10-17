@@ -191,6 +191,7 @@ fn rejects_temperature_parameter(error: &OpenAiCompatError) -> bool {
         || message.contains("unsupported parameter: temperature")
         || message.contains("temperature is not supported")
         || message.contains("'temperature' is not supported")
+        || message.contains("does not support temperature") // LiteLLM
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
