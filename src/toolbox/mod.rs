@@ -120,6 +120,11 @@ impl ToolBox {
         *vhead = Some(sha);
     }
 
+    /// Returns the virtual head commit SHA for the current review session, if set.
+    pub fn get_virtual_head(&self) -> Option<String> {
+        self.context.virtual_head.read().unwrap().clone()
+    }
+
     /// Sets the list of files modified by the patch currently under review.
     pub fn set_active_patch_files(&mut self, files: Vec<String>) {
         let mut active = self.context.active_patch_files.write().unwrap();

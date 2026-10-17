@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use regex::Regex;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::LazyLock;
@@ -294,45 +295,188 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
     files
 }
 
-/// Normalizes a relative or repository path by stripping leading `./` and optional `b/` or `a/` prefixes.
+/// Maximum file size (4 MiB) to inspect when resolving finding locations,
+/// guarding against unbounded memory allocation on massive generated files or binary blobs.
+pub const MAX_RESOLVE_FILE_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Resolved location with verified 1-based line numbers and character offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLocation {
+    pub file: String,
+    pub line: usize,
+    pub end_line: usize,
+    pub line_range: String,
+    pub start_character: Option<usize>,
+    pub end_character: Option<usize>,
+    pub in_diff: bool,
+    pub code_snippet: Option<String>,
+}
+
+/// Normalizes a repository-relative file path by stripping leading slashes and git diff prefixes,
+/// and rejecting path traversal or non-normal components.
 pub fn normalize_file_path(path: &str) -> Option<String> {
     normalize_file_path_with_worktree(None, path)
 }
 
-/// Normalizes a path, checking against an optional worktree directory before stripping `b/` or `a/`.
-/// If `b/foo.c` exists in the worktree, it is preserved rather than stripped to `foo.c`.
-pub fn normalize_file_path_with_worktree(worktree: Option<&Path>, path: &str) -> Option<String> {
-    let trimmed = path.trim();
+fn is_safe_git_ref(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-')
+}
+
+fn path_exists_in_git(worktree: &Path, revision: &str, path: &str) -> bool {
+    if !is_safe_git_ref(revision) || !is_safe_git_ref(path) || revision == "unknown" {
+        return false;
+    }
+    let mut cmd = crate::git_cmd::in_dir(worktree);
+    cmd.args(["cat-file", "-t", "--", &format!("{}:{}", revision, path)]);
+    if let Ok(output) = cmd.output()
+        && output.status.success()
+    {
+        output.stdout.starts_with(b"blob")
+    } else {
+        false
+    }
+}
+
+/// Normalizes a repository-relative file path against an optional worktree root and revision.
+/// Strips diff prefixes (`b/`, `a/`) while preserving legitimate paths that actually exist.
+pub fn normalize_file_path_with_worktree_and_rev(
+    worktree: Option<&Path>,
+    revision: Option<&str>,
+    path: &str,
+) -> Option<String> {
+    let trimmed = path.trim().trim_start_matches('/');
     if trimmed.is_empty() {
         return None;
     }
 
-    // Strip leading ./
-    let cleaned = trimmed.strip_prefix("./").unwrap_or(trimmed);
-    let p = Path::new(cleaned);
-
-    // Reject absolute paths or paths with parent component traversal
-    for comp in p.components() {
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in Path::new(trimmed).components() {
         match comp {
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-            _ => {}
+            Component::Normal(c) => {
+                let s = c.to_str()?;
+                if s.starts_with('-') {
+                    return None;
+                }
+                parts.push(s);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return None;
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let cleaned = parts.join("/");
+
+    let file_exists = |p_str: &str| -> bool {
+        let Some(wt) = worktree else {
+            return false;
+        };
+        if let Some(rev) = revision
+            && is_safe_git_ref(rev)
+            && rev != "unknown"
+            && path_exists_in_git(wt, rev, p_str)
+        {
+            return true;
+        }
+        wt.join(p_str).exists()
+    };
+
+    // If path starts with b/ or a/, check if it is a legitimate repository directory
+    if (cleaned.starts_with("b/") || cleaned.starts_with("a/")) && parts.len() > 1 {
+        if file_exists(&cleaned) {
+            return Some(cleaned);
+        }
+        let stripped = parts[1..].join("/");
+        if file_exists(&stripped) {
+            return Some(stripped);
+        }
+        return Some(stripped);
+    }
+
+    Some(cleaned)
+}
+
+/// Normalizes a repository-relative file path against an optional worktree root.
+/// If the path exists as-is (e.g. `b/main.c` where `b` is a legitimate directory),
+/// it preserves the prefix rather than stripping it.
+pub fn normalize_file_path_with_worktree(worktree: Option<&Path>, path: &str) -> Option<String> {
+    normalize_file_path_with_worktree_and_rev(worktree, None, path)
+}
+
+fn read_file_content(
+    worktree_path: &Path,
+    revision: Option<&str>,
+    norm_file: &str,
+) -> Option<String> {
+    if !is_safe_git_ref(norm_file) {
+        return None;
+    }
+
+    // 1. Try reading the git blob at the target revision (e.g. virtual_head or commit SHA)
+    if let Some(rev) = revision
+        && is_safe_git_ref(rev)
+        && rev != "unknown"
+    {
+        // 1a. Ensure object is a blob (not a tree or directory)
+        let mut type_cmd = crate::git_cmd::in_dir(worktree_path);
+        type_cmd.args(["cat-file", "-t", "--", &format!("{}:{}", rev, norm_file)]);
+        if let Ok(type_out) = type_cmd.output()
+            && type_out.status.success()
+            && type_out.stdout.starts_with(b"blob")
+        {
+            // 1b. Check size before buffering
+            let mut size_cmd = crate::git_cmd::in_dir(worktree_path);
+            size_cmd.args(["cat-file", "-s", "--", &format!("{}:{}", rev, norm_file)]);
+            if let Ok(size_out) = size_cmd.output()
+                && size_out.status.success()
+            {
+                let size_str = String::from_utf8_lossy(&size_out.stdout);
+                if let Ok(size) = size_str.trim().parse::<u64>()
+                    && size > MAX_RESOLVE_FILE_SIZE
+                {
+                    return None;
+                }
+            }
+
+            // 1c. Buffer verified blob
+            let mut blob_cmd = crate::git_cmd::in_dir(worktree_path);
+            blob_cmd.args(["cat-file", "blob", "--", &format!("{}:{}", rev, norm_file)]);
+            if let Ok(output) = blob_cmd.output()
+                && output.status.success()
+            {
+                if (output.stdout.len() as u64) > MAX_RESOLVE_FILE_SIZE {
+                    return None;
+                }
+                if let Ok(content) = String::from_utf8(output.stdout) {
+                    return Some(content);
+                }
+            }
         }
     }
 
-    // Check if path exists as-is in worktree before stripping b/ or a/
-    if let Some(wt) = worktree
-        && wt.join(cleaned).exists()
+    // 2. Fall back to reading from the physical worktree disk
+    let file_path = worktree_path.join(norm_file);
+    let Ok(metadata) = file_path.metadata() else {
+        return None;
+    };
+    if !metadata.is_file() || metadata.len() > MAX_RESOLVE_FILE_SIZE {
+        return None;
+    }
+    // Defense-in-depth: ensure canonical path does not escape worktree
+    if let (Ok(canon_worktree), Ok(canon_file)) =
+        (worktree_path.canonicalize(), file_path.canonicalize())
     {
-        return Some(cleaned.to_string());
+        if !canon_file.starts_with(&canon_worktree) {
+            return None;
+        }
+    } else {
+        return None;
     }
 
-    if let Some(rest) = cleaned.strip_prefix("b/") {
-        Some(rest.to_string())
-    } else if let Some(rest) = cleaned.strip_prefix("a/") {
-        Some(rest.to_string())
-    } else {
-        Some(cleaned.to_string())
-    }
+    std::fs::read_to_string(&file_path).ok()
 }
 
 /// Locates a snippet in a list of file lines.
@@ -606,101 +750,233 @@ fn pick_closest_line(
     candidates.into_iter().next()
 }
 
+/// Resolves a single finding location against the worktree file and diff hunks.
+pub fn resolve_single_location(
+    worktree_path: &Path,
+    revision: Option<&str>,
+    diff_ranges: &HashMap<String, Vec<(usize, usize)>>,
+    location: &Value,
+) -> Option<ResolvedLocation> {
+    let raw_file = location.get("file").and_then(Value::as_str)?;
+    let norm_file =
+        normalize_file_path_with_worktree_and_rev(Some(worktree_path), revision, raw_file)?;
+
+    let content = read_file_content(worktree_path, revision, &norm_file)?;
+    let file_lines: Vec<&str> = content.lines().collect();
+    if file_lines.is_empty() {
+        return None;
+    }
+
+    let file_diff = diff_ranges.get(&norm_file);
+
+    let raw_snippet = location
+        .get("code_snippet")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let hint_line = location
+        .get("line")
+        .and_then(Value::as_i64)
+        .filter(|&l| l > 0)
+        .and_then(|l| usize::try_from(l).ok());
+    let sym = location
+        .get("function_or_symbol")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    let symbol_line = if !sym.is_empty() {
+        file_lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains(sym))
+            .map(|(i, _)| i + 1)
+    } else {
+        None
+    };
+
+    let matched_range = if !raw_snippet.is_empty() {
+        find_snippet_in_lines(&file_lines, raw_snippet, hint_line, file_diff, symbol_line)
+    } else {
+        None
+    };
+
+    let hint_range = hint_line.filter(|&l| l <= file_lines.len()).map(|l| {
+        let idx = l.saturating_sub(1);
+        (idx, idx)
+    });
+
+    let (start_idx, end_idx) = if let Some(range) = matched_range {
+        range
+    } else if let Some(range) = hint_range {
+        range
+    } else if !sym.is_empty() {
+        let sym_match = file_lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains(sym))
+            .map(|(i, _)| (i, i));
+        sym_match?
+    } else {
+        return None;
+    };
+
+    let start_line = start_idx + 1;
+    let end_line = end_idx + 1;
+
+    let start_line_str = file_lines[start_idx];
+    let end_line_str = file_lines[end_idx];
+
+    let start_line_chars = start_line_str.chars().count();
+    let end_line_chars = end_line_str.chars().count();
+
+    let start_indent_chars = start_line_str
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    let end_trimmed_chars = end_line_str.trim_end().chars().count();
+
+    let (start_char, safe_end_char) = if start_line == end_line {
+        // Single-line range: Gerrit requires start_character < end_character
+        // when start_line == end_line. Omit characters on empty lines to avoid 400 Bad Request.
+        if start_line_chars == 0 {
+            (None, None)
+        } else {
+            let mut s = start_indent_chars.min(start_line_chars);
+            let mut e = end_trimmed_chars.min(start_line_chars);
+            if e <= s {
+                if s > 0 {
+                    s = 0;
+                }
+                e = e.max(s + 1).min(start_line_chars);
+            }
+            if s < e {
+                (Some(s), Some(e))
+            } else {
+                (None, None)
+            }
+        }
+    } else {
+        // Multi-line range: start_character applies to start_line, end_character applies to end_line.
+        let s = start_indent_chars.min(start_line_chars);
+        let e = if end_line_chars == 0 {
+            0
+        } else {
+            end_trimmed_chars.max(1).min(end_line_chars)
+        };
+        (Some(s), Some(e))
+    };
+
+    let line_range = if start_line == end_line {
+        format!("{start_line}")
+    } else {
+        format!("{start_line}-{end_line}")
+    };
+
+    let in_diff = diff_ranges
+        .get(&norm_file)
+        .map(|ranges| ranges.iter().any(|&(s, e)| start_idx <= e && end_idx >= s))
+        .unwrap_or(false);
+
+    let snippet_out = if raw_snippet.is_empty() {
+        Some(file_lines[start_idx..=end_idx].join("\n"))
+    } else {
+        None
+    };
+
+    Some(ResolvedLocation {
+        file: norm_file,
+        line: start_line,
+        end_line,
+        line_range,
+        start_character: start_char,
+        end_character: safe_end_char,
+        in_diff,
+        code_snippet: snippet_out,
+    })
+}
+
+/// Resolves and enriches finding locations using pre-parsed diff ranges.
+pub fn resolve_finding_locations_with_ranges(
+    worktree_path: &Path,
+    revision: Option<&str>,
+    diff_ranges: &HashMap<String, Vec<(usize, usize)>>,
+    findings: &mut [Value],
+) {
+    for finding in findings.iter_mut() {
+        if let Some(locs) = finding.get_mut("locations").and_then(Value::as_array_mut) {
+            for loc in locs.iter_mut() {
+                if let Some(resolved) =
+                    resolve_single_location(worktree_path, revision, diff_ranges, loc)
+                    && let Some(map) = loc.as_object_mut()
+                {
+                    map.insert("file".to_string(), json!(resolved.file));
+                    map.insert("line".to_string(), json!(resolved.line));
+                    map.insert("end_line".to_string(), json!(resolved.end_line));
+                    map.insert("line_range".to_string(), json!(resolved.line_range));
+                    if let Some(sc) = resolved.start_character {
+                        map.insert("start_character".to_string(), json!(sc));
+                    } else {
+                        map.remove("start_character");
+                    }
+                    if let Some(ec) = resolved.end_character {
+                        map.insert("end_character".to_string(), json!(ec));
+                    } else {
+                        map.remove("end_character");
+                    }
+                    map.insert("in_diff".to_string(), json!(resolved.in_diff));
+                    if let Some(snip) = resolved.code_snippet {
+                        map.insert("code_snippet".to_string(), json!(snip));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolves and enriches all finding locations in place using the target worktree and diff.
+pub fn resolve_finding_locations(
+    worktree_path: &Path,
+    target_commit_diff: &str,
+    findings: &mut [Value],
+) {
+    let diff_ranges = parse_diff_ranges(target_commit_diff);
+    resolve_finding_locations_with_ranges(worktree_path, None, &diff_ranges, findings);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::tempdir;
 
     #[test]
     fn test_normalize_file_path() {
         assert_eq!(
-            normalize_file_path("b/drivers/net/foo.c"),
-            Some("drivers/net/foo.c".to_string())
+            normalize_file_path("b/drivers/net/e1000.c"),
+            Some("drivers/net/e1000.c".to_string())
         );
         assert_eq!(
-            normalize_file_path("a/drivers/net/foo.c"),
-            Some("drivers/net/foo.c".to_string())
+            normalize_file_path("a/drivers/net/e1000.c"),
+            Some("drivers/net/e1000.c".to_string())
         );
         assert_eq!(
-            normalize_file_path("drivers/net/foo.c"),
-            Some("drivers/net/foo.c".to_string())
+            normalize_file_path("/drivers/net/e1000.c"),
+            Some("drivers/net/e1000.c".to_string())
         );
         assert_eq!(
-            normalize_file_path("./drivers/net/foo.c"),
-            Some("drivers/net/foo.c".to_string())
+            normalize_file_path("drivers/net/e1000.c"),
+            Some("drivers/net/e1000.c".to_string())
         );
+
+        // Path traversal rejection
+        assert_eq!(normalize_file_path("../etc/passwd"), None);
+        assert_eq!(normalize_file_path("b/../etc/passwd"), None);
+        assert_eq!(normalize_file_path("drivers/../../etc/shadow"), None);
         assert_eq!(normalize_file_path(""), None);
-        assert_eq!(normalize_file_path("../foo.c"), None);
-        assert_eq!(normalize_file_path("/etc/passwd"), None);
-    }
-
-    #[test]
-    fn test_normalize_file_path_preserves_legitimate_root_dir() {
-        let temp = tempfile::tempdir().unwrap();
-        let b_dir = temp.path().join("b");
-        std::fs::create_dir_all(&b_dir).unwrap();
-        std::fs::write(b_dir.join("test.c"), "int x;\n").unwrap();
-
-        let norm = normalize_file_path_with_worktree(Some(temp.path()), "b/test.c");
-        assert_eq!(norm, Some("b/test.c".to_string()));
-    }
-
-    #[test]
-    fn test_parse_diff_ranges_exact_and_no_gap_inflation() {
-        let diff = r#"diff --git a/foo.c b/foo.c
---- a/foo.c
-+++ b/foo.c
-@@ -10,15 +10,15 @@ void func(void) {
-     context_line_10();
-+    added_line_11();
-+    added_line_12();
-     context_line_13();
-     context_line_14();
-+    added_line_15();
-     context_line_16();
-"#;
-        let ranges = parse_diff_ranges(diff);
-        let foo_ranges = ranges.get("foo.c").expect("foo.c ranges");
-        // 0-based lines: 11 is 10, 12 is 11, 15 is 14
-        assert_eq!(foo_ranges, &[(10, 11), (14, 14)]);
-    }
-
-    #[test]
-    fn test_added_lines_starting_with_plus_plus_do_not_terminate_hunk() {
-        let diff = r#"diff --git a/test.c b/test.c
---- a/test.c
-+++ b/test.c
-@@ -1,5 +1,6 @@
- int a = 1;
-+++ i;
- int b = 2;
-"#;
-        let ranges = parse_diff_ranges(diff);
-        let test_ranges = ranges.get("test.c").expect("test.c ranges");
-        assert_eq!(test_ranges, &[(1, 1)]);
-    }
-
-    #[test]
-    fn test_whitespace_stripped_empty_context_lines_do_not_drift() {
-        // Line 2 is completely empty ("") with no leading space
-        let diff = "diff --git a/test.c b/test.c\n--- a/test.c\n+++ b/test.c\n@@ -1,3 +1,4 @@\n context 1\n\n+added 3\n context 4\n";
-        let ranges = parse_diff_ranges(diff);
-        let test_ranges = ranges.get("test.c").unwrap();
-        // Line 1 is idx 0, empty line 2 is idx 1, added line 3 is idx 2
-        assert_eq!(test_ranges, &vec![(2, 2)]);
-    }
-
-    #[test]
-    fn test_quoted_diff_header_file_paths() {
-        let diff = r#"diff --git "a/path with spaces/foo.c" "b/path with spaces/foo.c"
---- "a/path with spaces/foo.c"
-+++ "b/path with spaces/foo.c"
-@@ -1,3 +1,4 @@
- context();
-+added();
-"#;
-        let ranges = parse_diff_ranges(diff);
-        assert!(ranges.contains_key("path with spaces/foo.c"));
-        assert_eq!(ranges.get("path with spaces/foo.c").unwrap(), &[(1, 1)]);
+        assert_eq!(normalize_file_path("/"), None);
+        assert_eq!(normalize_file_path("."), None);
     }
 
     #[test]
@@ -795,6 +1071,233 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_single_location_in_worktree() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("kernel/sched/core.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        writeln!(f, "// Header").unwrap();
+        writeln!(f, "void balance(struct rq *rq) {{").unwrap();
+        writeln!(f, "    raw_spin_lock(&rq->lock);").unwrap();
+        writeln!(f, "    update_rq_clock(rq);").unwrap();
+        writeln!(f, "    raw_spin_unlock(&rq->lock);").unwrap();
+        writeln!(f, "}}").unwrap();
+
+        let diff = r#"diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 123456..789abc 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2,4 +2,5 @@
+ void balance(struct rq *rq) {
++    raw_spin_lock(&rq->lock);
+     update_rq_clock(rq);
+     raw_spin_unlock(&rq->lock);
+ }
+"#;
+        let diff_ranges = parse_diff_ranges(diff);
+
+        // Location with null line, but exact snippet
+        let loc = json!({
+            "file": "b/kernel/sched/core.c",
+            "code_snippet": "raw_spin_lock(&rq->lock);\nupdate_rq_clock(rq);",
+            "function_or_symbol": "balance"
+        });
+
+        let resolved = resolve_single_location(dir.path(), None, &diff_ranges, &loc).unwrap();
+        assert_eq!(resolved.file, "kernel/sched/core.c");
+        assert_eq!(resolved.line, 3);
+        assert_eq!(resolved.end_line, 4);
+        assert_eq!(resolved.line_range, "3-4");
+        assert_eq!(resolved.start_character, Some(4));
+        assert!(resolved.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_single_location_from_git_blob_revision() {
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path();
+
+        let mut init_cmd = crate::git_cmd::in_dir(repo_path);
+        init_cmd.args(["init"]);
+        assert!(init_cmd.status().unwrap().success());
+
+        let mut user_cmd = crate::git_cmd::in_dir(repo_path);
+        user_cmd.args(["config", "user.email", "test@example.com"]);
+        assert!(user_cmd.status().unwrap().success());
+        let mut name_cmd = crate::git_cmd::in_dir(repo_path);
+        name_cmd.args(["config", "user.name", "Test User"]);
+        assert!(name_cmd.status().unwrap().success());
+
+        let file_path = repo_path.join("kernel/sched/core.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file_path,
+            "// Header\nvoid balance(struct rq *rq) {\n    raw_spin_lock(&rq->lock);\n    update_rq_clock(rq);\n    raw_spin_unlock(&rq->lock);\n}\n",
+        )
+        .unwrap();
+
+        let mut add_cmd = crate::git_cmd::in_dir(repo_path);
+        add_cmd.args(["add", "kernel/sched/core.c"]);
+        assert!(add_cmd.status().unwrap().success());
+
+        let mut commit_cmd = crate::git_cmd::in_dir(repo_path);
+        commit_cmd.args(["commit", "-m", "Initial commit"]);
+        assert!(commit_cmd.status().unwrap().success());
+
+        let mut rev_cmd = crate::git_cmd::in_dir(repo_path);
+        rev_cmd.args(["rev-parse", "HEAD"]);
+        let rev_out = rev_cmd.output().unwrap();
+        assert!(rev_out.status.success());
+        let head_sha = String::from_utf8(rev_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Remove file from disk to guarantee resolution reads the git blob at head_sha
+        std::fs::remove_file(&file_path).unwrap();
+        assert!(!file_path.exists());
+
+        let content = read_file_content(repo_path, Some(&head_sha), "kernel/sched/core.c");
+        assert!(content.is_some(), "read_file_content should load git blob");
+        assert!(content.unwrap().contains("raw_spin_lock(&rq->lock);"));
+
+        let diff = r#"diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 123456..789abc 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2,4 +2,5 @@
+ void balance(struct rq *rq) {
++    raw_spin_lock(&rq->lock);
+     update_rq_clock(rq);
+     raw_spin_unlock(&rq->lock);
+ }
+"#;
+        let diff_ranges = parse_diff_ranges(diff);
+        let loc = json!({
+            "file": "b/kernel/sched/core.c",
+            "code_snippet": "raw_spin_lock(&rq->lock);\nupdate_rq_clock(rq);",
+            "function_or_symbol": "balance"
+        });
+
+        let resolved =
+            resolve_single_location(repo_path, Some(&head_sha), &diff_ranges, &loc).unwrap();
+        assert_eq!(resolved.file, "kernel/sched/core.c");
+        assert_eq!(resolved.line, 3);
+        assert_eq!(resolved.end_line, 4);
+        assert_eq!(resolved.line_range, "3-4");
+        assert_eq!(resolved.start_character, Some(4));
+        assert!(resolved.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_finding_locations_mutates_json() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("mm/page_alloc.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        for i in 1..=50 {
+            if i == 25 {
+                writeln!(f, "    kfree(ptr);").unwrap();
+            } else {
+                writeln!(f, "    // line {}", i).unwrap();
+            }
+        }
+
+        let diff = r#"diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -20,10 +20,10 @@
+"#;
+
+        let mut findings = vec![json!({
+            "problem": "Double free in alloc path",
+            "severity": "High",
+            "locations": [
+                {
+                    "file": "mm/page_alloc.c",
+                    "code_snippet": "kfree(ptr);",
+                    "line": null
+                }
+            ]
+        })];
+
+        resolve_finding_locations(dir.path(), diff, &mut findings);
+
+        let loc = &findings[0]["locations"][0];
+        assert_eq!(loc["file"], "mm/page_alloc.c");
+        assert_eq!(loc["line"], 25);
+        assert_eq!(loc["end_line"], 25);
+        assert_eq!(loc["line_range"], "25");
+        assert_eq!(loc["start_character"], 4);
+        assert_eq!(loc["in_diff"], true);
+    }
+
+    #[test]
+    fn test_resolve_location_outside_diff_marks_not_in_diff() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("fs/ext4/inode.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        for i in 1..=100 {
+            if i == 80 {
+                writeln!(f, "    brelse(bh);").unwrap();
+            } else {
+                writeln!(f, "    // line {}", i).unwrap();
+            }
+        }
+
+        // Diff touches lines 10..20, location is at line 80
+        let diff = r#"diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -10,10 +10,10 @@
+"#;
+
+        let mut findings = vec![json!({
+            "problem": "Unchecked buffer head release",
+            "locations": [
+                {
+                    "file": "fs/ext4/inode.c",
+                    "code_snippet": "brelse(bh);",
+                    "line": null
+                }
+            ]
+        })];
+
+        resolve_finding_locations(dir.path(), diff, &mut findings);
+
+        let loc = &findings[0]["locations"][0];
+        assert_eq!(loc["line"], 80);
+        assert_eq!(loc["in_diff"], false);
+    }
+
+    #[test]
+    fn test_resolve_location_nonexistent_file_preserves_original() {
+        let dir = tempdir().unwrap();
+        let mut findings = vec![json!({
+            "problem": "Dead code in removed file",
+            "locations": [
+                {
+                    "file": "nonexistent/file.c",
+                    "code_snippet": "foo();",
+                    "line": null
+                }
+            ]
+        })];
+
+        resolve_finding_locations(dir.path(), "", &mut findings);
+
+        // Location should remain untouched when file cannot be read
+        let loc = &findings[0]["locations"][0];
+        assert_eq!(loc["file"], "nonexistent/file.c");
+        assert!(loc.get("line").unwrap().is_null());
+        assert!(loc.get("in_diff").is_none());
+    }
+
+    #[test]
     fn test_find_snippet_fallback_longest_line() {
         let code = [
             "static int do_read(struct file *f) {",
@@ -808,6 +1311,119 @@ mod tests {
         let snippet = "    /* reading */\n    ret = vfs_read(f);\n    /* done */";
         let res = find_snippet_in_lines(&code, snippet, None, None, None);
         assert_eq!(res, Some((3, 3)));
+    }
+
+    #[test]
+    fn test_multiline_shorter_last_line_does_not_force_out_of_bounds_end_char() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("kernel/sched.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        writeln!(f, "        if (err) {{").unwrap(); // indent 8
+        writeln!(f, "}}").unwrap(); // length 1
+
+        let diff_ranges = HashMap::new();
+        let loc = json!({
+            "file": "kernel/sched.c",
+            "code_snippet": "        if (err) {\n}",
+        });
+
+        let resolved = resolve_single_location(dir.path(), None, &diff_ranges, &loc).unwrap();
+        assert_eq!(resolved.line, 1);
+        assert_eq!(resolved.end_line, 2);
+        assert_eq!(resolved.start_character, Some(8));
+        // end_character on line 2 must not be inflated by start_character (8)
+        assert_eq!(resolved.end_character, Some(1));
+    }
+
+    #[test]
+    fn test_multibyte_utf8_character_counts() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("drivers/misc.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        // Line with copyright symbol (2 bytes in UTF-8, 1 char)
+        writeln!(f, "    // Copyright © 2026").unwrap();
+
+        let diff_ranges = HashMap::new();
+        let loc = json!({
+            "file": "drivers/misc.c",
+            "line": 1,
+        });
+
+        let resolved = resolve_single_location(dir.path(), None, &diff_ranges, &loc).unwrap();
+        assert_eq!(resolved.line, 1);
+        assert_eq!(resolved.start_character, Some(4));
+        // 4 spaces + 19 chars = 23 characters (24 bytes in UTF-8)
+        assert_eq!(resolved.end_character, Some(23));
+    }
+
+    #[test]
+    fn test_empty_line_omits_character_range() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("drivers/empty.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        writeln!(f, "int a;").unwrap();
+        writeln!(f).unwrap(); // empty line 2
+        writeln!(f, "int b;").unwrap();
+
+        let diff_ranges = HashMap::new();
+        let loc = json!({
+            "file": "drivers/empty.c",
+            "line": 2,
+        });
+
+        let resolved = resolve_single_location(dir.path(), None, &diff_ranges, &loc).unwrap();
+        assert_eq!(resolved.line, 2);
+        assert_eq!(resolved.start_character, None);
+        assert_eq!(resolved.end_character, None);
+    }
+
+    #[test]
+    fn test_out_of_bounds_line_hint_falls_back_to_symbol() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("fs/buffer.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        writeln!(f, "static void sync_buffers() {{").unwrap();
+        writeln!(f, "    return;").unwrap();
+        writeln!(f, "}}").unwrap();
+
+        let diff_ranges = HashMap::new();
+        // LLM hallucinated line 999 (out of bounds for 3-line file), but gave symbol
+        let loc = json!({
+            "file": "fs/buffer.c",
+            "line": 999,
+            "function_or_symbol": "sync_buffers",
+        });
+
+        let resolved = resolve_single_location(dir.path(), None, &diff_ranges, &loc).unwrap();
+        assert_eq!(resolved.line, 1);
+    }
+
+    #[test]
+    fn test_file_size_exceeding_max_is_skipped() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("drivers/giant.bin");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let f = File::create(&file_path).unwrap();
+        // Truncate to MAX_RESOLVE_FILE_SIZE + 1 byte
+        f.set_len(MAX_RESOLVE_FILE_SIZE + 1).unwrap();
+
+        let diff_ranges = HashMap::new();
+        let loc = json!({
+            "file": "drivers/giant.bin",
+            "line": 1,
+        });
+
+        let resolved = resolve_single_location(dir.path(), None, &diff_ranges, &loc);
+        assert!(resolved.is_none());
     }
 
     #[test]
@@ -841,6 +1457,147 @@ mod tests {
         let snippet = "    ret = do_work();\n    return ret;";
         let res = find_snippet_in_lines(&code, snippet, None, None, None);
         assert_eq!(res, Some((3, 5)));
+    }
+
+    #[test]
+    fn test_resolve_finding_locations_inserts_missing_keys_without_panic() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("kernel/test.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        let mut f = File::create(&file_path).unwrap();
+        writeln!(f, "void test_func(void) {{").unwrap();
+        writeln!(f, "    return;").unwrap();
+        writeln!(f, "}}").unwrap();
+
+        // Object with ONLY file and code_snippet, missing all other keys
+        let mut findings = vec![json!({
+            "problem": "test problem",
+            "locations": [
+                {
+                    "file": "kernel/test.c",
+                    "code_snippet": "return;"
+                }
+            ]
+        })];
+
+        // Must not panic on missing keys!
+        resolve_finding_locations(dir.path(), "", &mut findings);
+
+        let loc = &findings[0]["locations"][0];
+        assert_eq!(loc["line"], 2);
+        assert_eq!(loc["end_line"], 2);
+        assert_eq!(loc["line_range"], "2");
+        assert_eq!(loc["start_character"], 4);
+        assert_eq!(loc["end_character"], 11);
+        assert_eq!(loc["in_diff"], false);
+    }
+
+    #[test]
+    fn test_parse_diff_ranges_exact_and_no_gap_inflation() {
+        let diff = r#"diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -10,6 +10,7 @@
+  context_line_10
+  context_line_11
++ added_line_12
+  context_line_13
+  context_line_14
+  context_line_15
+@@ -20,5 +21,6 @@
+  context_line_21
+  context_line_22
++ added_line_23
+  context_line_24
+"#;
+        let ranges = parse_diff_ranges(diff);
+        let ext4_ranges = ranges.get("fs/ext4/super.c").unwrap();
+
+        // Must ONLY contain lines 12 (idx 11) and 23 (idx 22).
+        // Must NOT include context lines 10, 11, 13, 14, 15, 21, 22, 24.
+        // Must NOT merge gap between line 12 and line 23!
+        assert_eq!(ext4_ranges, &vec![(11, 11), (22, 22)]);
+    }
+
+    #[test]
+    fn test_added_lines_starting_with_plus_plus_do_not_terminate_hunk() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
++++ b/fake_header;
+     println!("hello");
+ }
+"#;
+        let ranges = parse_diff_ranges(diff);
+        let main_ranges = ranges.get("src/main.rs").unwrap();
+        // Line 2 (idx 1) is the added line `++ b/fake_header;`
+        assert_eq!(main_ranges, &vec![(1, 1)]);
+    }
+
+    #[test]
+    fn test_whitespace_stripped_empty_context_lines_do_not_drift() {
+        // Line 2 is completely empty ("") with no leading space
+        let diff = "diff --git a/test.c b/test.c\n--- a/test.c\n+++ b/test.c\n@@ -1,3 +1,4 @@\n context 1\n\n+added 3\n context 4\n";
+        let ranges = parse_diff_ranges(diff);
+        let test_ranges = ranges.get("test.c").unwrap();
+        // Line 1 is idx 0, empty line 2 is idx 1, added line 3 is idx 2
+        assert_eq!(test_ranges, &vec![(2, 2)]);
+    }
+
+    #[test]
+    fn test_quoted_diff_header_file_paths() {
+        let diff = r#"diff --git "a/path with spaces.c" "b/path with spaces.c"
+--- "a/path with spaces.c"
++++ "b/path with spaces.c"
+@@ -1,2 +1,3 @@
+ line 1
++line 2
+"#;
+        let ranges = parse_diff_ranges(diff);
+        let space_ranges = ranges.get("path with spaces.c").unwrap();
+        assert_eq!(space_ranges, &vec![(1, 1)]);
+    }
+
+    #[test]
+    fn test_normalize_file_path_preserves_legitimate_root_dir() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("b/main.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "int main() {}\n").unwrap();
+
+        // When b/main.c actually exists in worktree, normalize_file_path_with_worktree must keep "b/main.c"
+        let norm = normalize_file_path_with_worktree(Some(dir.path()), "b/main.c").unwrap();
+        assert_eq!(norm, "b/main.c");
+
+        // When b/other.c does NOT exist, but other.c exists, it strips "b/"
+        let file_path2 = dir.path().join("other.c");
+        std::fs::write(&file_path2, "int other() {}\n").unwrap();
+        let norm2 = normalize_file_path_with_worktree(Some(dir.path()), "b/other.c").unwrap();
+        assert_eq!(norm2, "other.c");
+    }
+
+    #[test]
+    fn test_normalize_file_path_handles_leading_dot_slash_and_rejects_traversal() {
+        assert_eq!(
+            normalize_file_path("./kernel/sched.c"),
+            Some("kernel/sched.c".to_string())
+        );
+        assert_eq!(
+            normalize_file_path(".//kernel/sched.c"),
+            Some("kernel/sched.c".to_string())
+        );
+        assert_eq!(
+            normalize_file_path("/kernel/sched.c"),
+            Some("kernel/sched.c".to_string())
+        );
+        assert_eq!(normalize_file_path("../kernel/sched.c"), None);
+        assert_eq!(normalize_file_path("kernel/../sched.c"), None);
+        assert_eq!(normalize_file_path("-v/kernel/sched.c"), None);
+        assert_eq!(normalize_file_path(""), None);
+        assert_eq!(normalize_file_path("."), None);
     }
 
     #[test]
