@@ -85,6 +85,8 @@ subject_prefixes = ["bpf", "bpf-next"]
 ["damon@lists.linux.dev"]
 reply_to = ["author", "list"]
 positive_review = "all"
+embargo_hours = 0
+subject_prefixes = ["damon"]
 
 ["devicetree@vger.kernel.org"]
 nntp_group = "org.kernel.vger.linux-devicetree"
