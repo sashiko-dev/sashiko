@@ -491,13 +491,14 @@ Before reporting ANY regression, verify:
 ## Special Cases
 
 ### Test Code
-- Memory leaks in test programs → Usually OK
-- File descriptor leaks in tests → Usually OK
-- Unless it crashes/hangs the system → Report it
+- Memory leaks in one-shot test programs at process exit → Usually OK
+- File descriptor leaks in one-shot test programs at process exit → Usually OK (do report unclosed descriptors/sockets inside per-case helpers or loops that run multiple test cases in one process)
+- Unless it crashes/hangs the system or breaks test execution → Report it
 
 ### Host Build Utilities (`scripts/`, `tools/objtool/`)
-- Memory leaks (`realloc` losing old pointer on OOM, missing `free()` on error/exit paths) → Do NOT report (process exits immediately and OS reclaims memory)
-- File descriptor / `FILE *` leaks on fatal error paths (`ferror(f) || fclose(f)` before exit) → Do NOT report
+- Memory leaks on fatal `exit()`/`die()` paths or at process exit in one-shot host build generators → Do NOT report (process exits immediately and OS reclaims memory)
+- File descriptor / `FILE *` leaks on fatal exit paths (`ferror(f) || fclose(f)` before exit) in one-shot host build generators → Do NOT report
+- Do NOT apply this exception to runtime, tracing, profiling, or debugging utilities and libraries under `tools/` (such as `tools/tracing/`, `tools/perf/`, `tools/sched_ext/`, `tools/lib/`) or to non-fatal error-return paths that return control to a caller (such as `ptr = realloc(ptr, ...)` leaking the original buffer when returning an error) → Report those as bugs
 - Non-POSIX portability assumptions (`fopen(..., "w")` vs `"wb"`, `struct stat` `.st_mtim` vs `st_mtimespec`, standard coreutils like `seq`) → Do NOT report
 - Concurrent worker threads writing the same constant (`true`) to a plain `bool` status flag → Do NOT report
 
