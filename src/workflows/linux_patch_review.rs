@@ -1581,27 +1581,31 @@ pub fn planning_stage_with_effort(
         (
             r#"Analyze the provided patch and determine:
 1. Which of the following optional review stages are relevant and should be executed:
-- resources: Resource management (memory lifecycles, leaks, UAF, refcounts, cleanup)
-- locking: Locking and synchronization (spinlocks, mutexes, RCU, atomics, concurrency)
+- resources: Resource management (memory lifecycles, leaks, UAF, refcounts, devm, cleanup)
+- locking: Locking and synchronization (spinlocks, mutexes, RCU, atomics, concurrency, caller serialization)
 - security: Security audit (user input boundaries, bounds checks, integer overflows, privilege checks)
-- hardware: Hardware engineer's review (device registers, DMA, IRQs, MMIO, hardware state machines)
+- hardware: Hardware engineer's review (device registers, DMA, IRQs, MMIO, clocks/GPIO/pinctrl, DT bindings, hardware state machines)
 
-Include an optional stage when the patch touches or interacts with that domain; omit stages that are clearly irrelevant to the modified code (for example, omit hardware for pure software logic, or omit locking when no shared state or synchronization is involved). Core stages (goal, implementation, execution-flow) always run and should not be listed in relevant_stages.
+CRITICAL BIAS RULE: Always err on the side of running more stages. If you are not absolutely sure, include the stage.
+- Include "hardware" whenever the patch touches drivers/, sound/, arch/, device-tree (.dts/.dtsi/bindings), or any register, IRQ, DMA, clock, GPIO/pinctrl, PHY, timer, or bus/device code.
+- Include "resources" and "locking" on any non-trivial C or Rust code change (even small helper refactorings frequently alter error-path cleanup, object lifetimes, or caller locking assumptions).
+- Omit an optional stage ONLY when it is unmistakably irrelevant (for example, omit "hardware" for pure core-kernel software logic with no device/arch interaction, or omit stages for a trivial comment/typo fix). Core stages (goal, implementation, execution-flow) always run and should not be listed in relevant_stages.
 
 2. The reasoning effort ("medium" or "high") in stage_efforts for each stage that will run (goal, implementation, execution-flow, plus each stage selected in relevant_stages):
-- Use "high" for stages whose domain is central to the patch or where complex control flow, subtle error/teardown paths, concurrency, or non-trivial invariants must be verified.
-- Use "medium" for stages performing a routine check on a straightforward aspect of the patch.
+- Default to "high" for active technical stages (implementation, execution-flow, resources, locking, security, hardware) whenever the patch modifies executable C, Rust, Kbuild/Makefile, or device-tree logic. Small diffs (< 50 lines) that refactor helpers, error paths, or state transitions require "high" effort to trace callers and callees.
+- Use "medium" only for routine checks on straightforward, purely mechanical aspects (such as "goal" on a localized bug fix, or all stages on a trivial comment/documentation/spelling patch).
 
 You MUST respond with ONLY a JSON object, no other text. Example:
 ```json
 {
-  "relevant_stages": ["resources", "locking"],
+  "relevant_stages": ["resources", "locking", "hardware"],
   "stage_efforts": {
     "goal": "medium",
     "implementation": "high",
     "execution-flow": "high",
     "resources": "high",
-    "locking": "medium"
+    "locking": "high",
+    "hardware": "high"
   }
 }
 ```"#,
@@ -2785,6 +2789,15 @@ mod tests {
         assert_eq!(
             stage.policy.reasoning_effort,
             Some(crate::ai::ReasoningEffort::Low)
+        );
+        let rendered_prompt = stage
+            .user_prompt
+            .render_for_log(&LinuxPatchReviewState::default());
+        assert!(
+            rendered_prompt
+                .contains("CRITICAL BIAS RULE: Always err on the side of running more stages")
+                && rendered_prompt.contains("Default to \"high\" for active technical stages"),
+            "planning stage with dynamic_effort must bias toward running stages at high effort"
         );
         if let OutputFormat::Json {
             schema: Some(ref s),
