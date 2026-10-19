@@ -160,7 +160,7 @@ TOOL USAGE: When you need to gather information using tools, actively batch para
 If tool output is truncated ('truncated': true), page only if directly relevant to your active concerns.
 
 <global_review_guidelines>
-The following documents and any accompanying <maintainer_notes> and <code_notes> blocks contain the official technical patterns, architectural rules, verified code invariants, and subsystem-specific guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations, and actively check every modified function, struct, lock, lifecycle transition, and API call against the rules in <maintainer_notes> and <code_notes>. Because <code_notes> are generated from a reference kernel snapshot that may already include the commit under review, never use a <code_notes> entry describing a function's behavior to justify or dismiss a defect in lines added or modified by the target patch itself.
+The following documents and any accompanying <maintainer_notes> blocks contain the technical patterns, architectural rules, and subsystem-specific guidelines that you MUST adhere to during your review. Any accompanying <code_notes> blocks provide reference background notes generated from a fixed kernel snapshot to help you understand surrounding subsystem contracts, callers, and known pitfalls. However, <code_notes> are NOT a source of truth for the patch under review—that snapshot may be stale or may already incorporate the target commit's own buggy code. The repository source code at Target Commit SHA (and Baseline SHA) is always authoritative: actively check modified functions, structs, locks, lifecycle transitions, and API calls against the invariants described in <maintainer_notes> and <code_notes>, but NEVER use a <code_notes> entry to justify, excuse, or dismiss a suspected defect in the patch under review.
 @includes
 </global_review_guidelines>{{{{maintainer_notes}}}}{{{{code_notes}}}}
 
@@ -3411,6 +3411,14 @@ mod tests {
         let c = rendered.find("<code_notes>C").unwrap();
         let guidelines = rendered.find("</global_review_guidelines>").unwrap();
         assert!(guidelines < m && m < c);
+        assert!(
+            !rendered.contains("absolute source of truth"),
+            "system prompt must not call code_notes the absolute source of truth"
+        );
+        assert!(
+            rendered.contains("<code_notes> are NOT a source of truth"),
+            "system prompt must subordinate code_notes to the repository code"
+        );
     }
 
     #[tokio::test]
