@@ -79,7 +79,7 @@ fastrand = "2.4.1"
 flate2 = { version = "1.1.9", optional = true }
 futures = "0.3.31"
 lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "sendmail-transport", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
-libsql = { version = "0.9.29", optional = true }
+libsql = { version = "0.10.0", optional = true }
 mail-parser = "0.11.3"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json", "query"] }
