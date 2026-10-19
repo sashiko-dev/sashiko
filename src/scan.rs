@@ -83,6 +83,13 @@ pub struct ScanChunk {
     pub prefetched_headers: String,
 }
 
+impl ScanChunk {
+    /// Stable identifier for this chunk (`"<file_path>:<start_line>-<end_line>"`).
+    pub fn chunk_id(&self) -> String {
+        format!("{}:{}-{}", self.file_path, self.start_line, self.end_line)
+    }
+}
+
 /// Sanitizes a user-supplied target path into a clean repository-relative path string.
 pub fn sanitize_scan_path(path: &Path) -> Result<String> {
     let raw = path.to_string_lossy();
@@ -1041,6 +1048,821 @@ fn extract_rust_functions(source: &str) -> Vec<FunctionSpan> {
     spans
 }
 
+/// Configuration options for `sashiko scan`.
+#[derive(Debug, Clone)]
+pub struct ScanOptions {
+    pub repo_path: PathBuf,
+    pub paths: Vec<PathBuf>,
+    pub git_ref: Option<String>,
+    pub concurrency: usize,
+    pub max_files: usize,
+    pub max_chunks: Option<usize>,
+    pub exclude: Vec<String>,
+    pub submit_bugs: bool,
+    pub prompts: PathBuf,
+    pub custom_prompt: Option<String>,
+    pub stages: Option<Vec<String>>,
+    pub effort: Option<crate::ai::EffortMode>,
+}
+
+/// A verified `High` or `Critical` defect discovered by `sashiko scan`
+/// and processed through the `linux_bug` verification, origin-tracing,
+/// and severity calibration pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifiedScanBug {
+    pub canonical_title: String,
+    pub canonical_description: String,
+    pub severity: String,
+    pub severity_explanation: String,
+    pub subsystems: Vec<String>,
+    pub source_files: Vec<String>,
+    pub locations: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced_in_commit: Option<String>,
+    pub verified_on_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_bugid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_of_bugid: Option<String>,
+}
+
+impl VerifiedScanBug {
+    pub fn from_standalone(bug: crate::workflows::linux_bug::StandaloneVerifiedBug) -> Self {
+        Self {
+            canonical_title: bug.canonical_title,
+            canonical_description: bug.canonical_description,
+            severity: bug.severity.as_str().to_string(),
+            severity_explanation: bug.severity_explanation,
+            subsystems: bug.subsystems.into_iter().map(|s| s.name).collect(),
+            source_files: bug.source_files,
+            locations: bug.locations.unwrap_or_else(|| serde_json::json!([])),
+            introduced_in_commit: bug.introduced_in_commit,
+            verified_on_sha: bug.verified_on_sha,
+            submitted_bugid: None,
+            duplicate_of_bugid: None,
+        }
+    }
+
+    #[cfg(feature = "server")]
+    pub fn from_db_bug(
+        bug: &crate::db::Bug,
+        fallback_input: &crate::api::BugInput,
+        target_sha: &str,
+        submitted_bugid: Option<String>,
+        duplicate_of_bugid: Option<String>,
+    ) -> Self {
+        let subsystems = if bug.subsystems.is_empty() {
+            fallback_input
+                .subsystems
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        } else {
+            bug.subsystems.clone()
+        };
+        Self {
+            canonical_title: bug.title.clone(),
+            canonical_description: bug
+                .description()
+                .unwrap_or_else(|| fallback_input.reasoning.clone()),
+            severity: bug.severity().as_str().to_string(),
+            severity_explanation: bug.severity_explanation().unwrap_or_default(),
+            subsystems,
+            source_files: bug
+                .source_files()
+                .unwrap_or_else(|| fallback_input.source_files.clone()),
+            locations: bug
+                .locations()
+                .or_else(|| fallback_input.locations.clone())
+                .unwrap_or_else(|| serde_json::json!([])),
+            introduced_in_commit: bug.introduced_in_commit(),
+            verified_on_sha: bug
+                .verified_on_sha()
+                .unwrap_or_else(|| target_sha.to_string()),
+            submitted_bugid,
+            duplicate_of_bugid,
+        }
+    }
+}
+
+/// Progress events emitted during `sashiko scan`.
+#[derive(Debug, Clone)]
+pub enum ScanProgressEvent {
+    ResolvedTargets {
+        target_sha: String,
+        files_count: usize,
+        chunks_count: usize,
+    },
+    ChunkStarted {
+        chunk_id: String,
+        file_path: String,
+        start_line: usize,
+        end_line: usize,
+    },
+    ChunkStageStarted {
+        chunk_id: String,
+        stage: String,
+    },
+    ChunkFinished {
+        chunk_id: String,
+        findings_count: usize,
+        early_exited: bool,
+    },
+    ChunkFailed {
+        chunk_id: String,
+        error: String,
+    },
+    BugSubmitted {
+        canonical_title: String,
+        bugid: String,
+        is_duplicate: bool,
+    },
+}
+
+pub type ScanProgressCallback<'a> = dyn Fn(ScanProgressEvent) + Send + Sync + 'a;
+
+fn emit_scan_progress(progress: Option<&ScanProgressCallback<'_>>, event: ScanProgressEvent) {
+    if let Some(cb) = progress {
+        cb(event);
+    }
+}
+
+/// Complete summary of a `sashiko scan` execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanSummary {
+    pub target_sha: String,
+    pub files_scanned: usize,
+    pub chunks_total: usize,
+    pub chunks_analyzed: usize,
+    pub chunks_early_exited: usize,
+    pub chunks_failed: usize,
+    pub findings: Vec<VerifiedScanBug>,
+    pub dismissed_concerns: Vec<serde_json::Value>,
+    pub tokens_in: usize,
+    pub tokens_out: usize,
+    pub tokens_cached: usize,
+}
+
+fn normalize_title_tokens(title: &str) -> BTreeSet<String> {
+    title
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+fn extract_location_symbols(locations: &serde_json::Value) -> BTreeSet<(String, String)> {
+    let mut set = BTreeSet::new();
+    if let Some(arr) = locations.as_array() {
+        for loc in arr {
+            let file = loc
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let sym = loc
+                .get("function_or_symbol")
+                .or_else(|| loc.get("function"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches("()")
+                .to_string();
+            if !file.is_empty() && !sym.is_empty() {
+                set.insert((file, sym));
+            }
+        }
+    }
+    set
+}
+
+fn is_title_and_locations_duplicate(
+    existing_title: &str,
+    existing_locations: &serde_json::Value,
+    cand_title_norm: &str,
+    cand_tokens: &BTreeSet<String>,
+    cand_syms: &BTreeSet<(String, String)>,
+) -> bool {
+    if existing_title.trim().to_ascii_lowercase() == cand_title_norm {
+        return true;
+    }
+    let existing_syms = extract_location_symbols(existing_locations);
+    let shares_file_and_symbol = !cand_syms.is_empty() && !cand_syms.is_disjoint(&existing_syms);
+    if shares_file_and_symbol && !cand_tokens.is_empty() {
+        let existing_tokens = normalize_title_tokens(existing_title);
+        let intersection = cand_tokens.intersection(&existing_tokens).count();
+        let union = cand_tokens.union(&existing_tokens).count();
+        if union > 0 && (intersection as f64 / union as f64) >= 0.45 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether `candidate` is an in-run duplicate of any candidate [`crate::api::BugInput`]
+/// in `existing` (e.g., discovered in overlapping giant-function windows or caller/callee chunks).
+pub fn is_in_run_duplicate_input(
+    existing: &[crate::api::BugInput],
+    candidate: &crate::api::BugInput,
+) -> bool {
+    let cand_title_norm = candidate.problem.trim().to_ascii_lowercase();
+    let cand_tokens = normalize_title_tokens(&candidate.problem);
+    let empty_locs = serde_json::json!([]);
+    let cand_locs = candidate.locations.as_ref().unwrap_or(&empty_locs);
+    let cand_syms = extract_location_symbols(cand_locs);
+
+    existing.iter().any(|bug| {
+        let existing_locs = bug.locations.as_ref().unwrap_or(&empty_locs);
+        is_title_and_locations_duplicate(
+            &bug.problem,
+            existing_locs,
+            &cand_title_norm,
+            &cand_tokens,
+            &cand_syms,
+        )
+    })
+}
+
+/// Checks whether `candidate` is an in-run duplicate of any finding in `existing`.
+pub fn is_in_run_duplicate(existing: &[VerifiedScanBug], candidate: &VerifiedScanBug) -> bool {
+    let cand_title_norm = candidate.canonical_title.trim().to_ascii_lowercase();
+    let cand_tokens = normalize_title_tokens(&candidate.canonical_title);
+    let cand_syms = extract_location_symbols(&candidate.locations);
+
+    existing.iter().any(|bug| {
+        is_title_and_locations_duplicate(
+            &bug.canonical_title,
+            &bug.locations,
+            &cand_title_norm,
+            &cand_tokens,
+            &cand_syms,
+        )
+    })
+}
+
+struct ChunkScanResult {
+    chunk: ScanChunk,
+    early_exited: bool,
+    candidate_bugs: Vec<crate::api::BugInput>,
+    dismissed_concerns: Vec<serde_json::Value>,
+    tokens_in: usize,
+    tokens_out: usize,
+    tokens_cached: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_single_chunk(
+    chunk: ScanChunk,
+    target_sha: &str,
+    repo_path: &Path,
+    prompts_dir: &Path,
+    provider: std::sync::Arc<dyn crate::ai::AiProvider>,
+    maintainers: Option<std::sync::Arc<crate::maintainers::MaintainersIndex>>,
+    max_interactions: usize,
+    temperature: f32,
+    manual_stages: Option<Vec<String>>,
+    custom_prompt: Option<String>,
+    effort: Option<crate::ai::EffortMode>,
+    progress: Option<&ScanProgressCallback<'_>>,
+) -> Result<ChunkScanResult> {
+    let chunk_id = chunk.chunk_id();
+    emit_scan_progress(
+        progress,
+        ScanProgressEvent::ChunkStarted {
+            chunk_id: chunk_id.clone(),
+            file_path: chunk.file_path.clone(),
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
+        },
+    );
+
+    let mut tb =
+        crate::toolbox::ToolBox::new(repo_path.to_path_buf(), Some(prompts_dir.to_path_buf()));
+    tb.set_virtual_head(target_sha.to_string());
+    tb.set_active_patch_files(vec![chunk.file_path.clone()]);
+    let tools = std::sync::Arc::new(tb);
+
+    let maintainers_hint = maintainers.as_ref().and_then(|mindex| {
+        let matched = mindex.match_files(std::slice::from_ref(&chunk.file_path));
+        if matched.is_empty() {
+            None
+        } else {
+            Some(matched.join(", "))
+        }
+    });
+
+    let mut state = crate::workflows::linux_scan::LinuxScanState {
+        chunk_id: chunk_id.clone(),
+        file_path: chunk.file_path.clone(),
+        target_sha: target_sha.to_string(),
+        start_line: chunk.start_line,
+        end_line: chunk.end_line,
+        numbered_source: chunk.numbered_source.clone(),
+        chunk_functions_json: serde_json::to_string_pretty(&chunk.functions)
+            .unwrap_or_else(|_| "[]".to_string()),
+        file_function_index: chunk.file_function_index.clone(),
+        prefetched_context: chunk.prefetched_headers.clone(),
+        maintainers_hint,
+        manual_stages,
+        custom_prompt,
+        effort,
+        ..Default::default()
+    };
+
+    let workflow = crate::workflows::linux_scan::build_linux_scan_workflow_with_effort(
+        max_interactions,
+        temperature,
+        effort,
+    );
+    let env = crate::workflow::WorkflowEnv {
+        provider,
+        tools,
+        base_dir: prompts_dir,
+        context_tag: Some(format!("[scan:{}] ", chunk_id)),
+    };
+
+    let chunk_id_for_cb = chunk_id.clone();
+    let event_cb = move |event: crate::workflow::WorkflowEvent| {
+        if let crate::workflow::WorkflowEvent::StageStarted { stage_name } = event {
+            emit_scan_progress(
+                progress,
+                ScanProgressEvent::ChunkStageStarted {
+                    chunk_id: chunk_id_for_cb.clone(),
+                    stage: stage_name.to_string(),
+                },
+            );
+        }
+    };
+
+    let outcome =
+        crate::workflow::WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb))
+            .await?;
+
+    let tokens_in = outcome.tokens_in as usize;
+    let tokens_out = outcome.tokens_out as usize;
+    let tokens_cached = outcome.tokens_cached as usize;
+
+    let early_exited =
+        state.planned_stages.is_empty() && state.manual_stages.as_ref().is_none_or(Vec::is_empty);
+    let candidate_bugs = state.to_candidate_bug_inputs(maintainers.as_deref());
+
+    let dismissed = if !state.deduplicated_dismissed_concerns.is_empty() {
+        state.deduplicated_dismissed_concerns
+    } else {
+        state.all_dismissed_concerns
+    };
+
+    emit_scan_progress(
+        progress,
+        ScanProgressEvent::ChunkFinished {
+            chunk_id,
+            findings_count: candidate_bugs.len(),
+            early_exited,
+        },
+    );
+
+    Ok(ChunkScanResult {
+        chunk,
+        early_exited,
+        candidate_bugs,
+        dismissed_concerns: dismissed,
+        tokens_in,
+        tokens_out,
+        tokens_cached,
+    })
+}
+
+#[cfg(feature = "server")]
+struct TokenAccountingProvider {
+    inner: std::sync::Arc<dyn crate::ai::AiProvider>,
+    tokens_in: std::sync::atomic::AtomicUsize,
+    tokens_out: std::sync::atomic::AtomicUsize,
+    tokens_cached: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+impl crate::ai::AiProvider for TokenAccountingProvider {
+    async fn generate_content(
+        &self,
+        request: crate::ai::AiRequest,
+    ) -> Result<crate::ai::AiResponse> {
+        let resp = self.inner.generate_content(request).await?;
+        if let Some(ref usage) = resp.usage {
+            self.tokens_in
+                .fetch_add(usage.prompt_tokens, std::sync::atomic::Ordering::Relaxed);
+            self.tokens_out.fetch_add(
+                usage.completion_tokens,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.tokens_cached.fetch_add(
+                usage.cached_tokens.unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(resp)
+    }
+
+    fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+        self.inner.get_capabilities()
+    }
+
+    async fn forget(&self, request: &crate::ai::AiRequest) {
+        self.inner.forget(request).await;
+    }
+
+    fn cache_stats(&self) -> Option<crate::ai::CacheStats> {
+        self.inner.cache_stats()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.inner.cache_identity()
+    }
+}
+
+/// Executes an active scan across the requested files/directories in `options`.
+pub async fn run_scan(
+    options: ScanOptions,
+    settings: &crate::settings::Settings,
+    progress: Option<&ScanProgressCallback<'_>>,
+) -> Result<ScanSummary> {
+    #[cfg(not(feature = "server"))]
+    if options.submit_bugs {
+        bail!("--submit-bugs requires a sashiko binary built with the 'server' feature enabled");
+    }
+
+    #[cfg(feature = "server")]
+    let submit_db = if options.submit_bugs {
+        if settings.database.url.trim().is_empty() {
+            bail!("database.url must be configured in Settings.toml when --submit-bugs is enabled");
+        }
+        let db = std::sync::Arc::new(
+            crate::db::Database::new(&settings.database)
+                .await
+                .context("Failed to open database for --submit-bugs")?,
+        );
+        db.migrate()
+            .await
+            .context("Failed to run database migrations for --submit-bugs")?;
+        db.ensure_project_stamp(crate::project::ProjectId::Linux)
+            .await
+            .context("Database project stamp mismatch for --submit-bugs")?;
+        Some(db)
+    } else {
+        None
+    };
+
+    let target_sha = resolve_scan_revision(&options.repo_path, options.git_ref.as_deref()).await?;
+    let files = resolve_scan_targets(
+        &options.repo_path,
+        &target_sha,
+        &options.paths,
+        &options.exclude,
+        options.max_files,
+    )
+    .await?;
+
+    let mut all_chunks = Vec::new();
+    for file in &files {
+        let mut file_chunks =
+            build_scan_chunks_for_file(&options.repo_path, &target_sha, file).await?;
+        all_chunks.append(&mut file_chunks);
+        if let Some(limit) = options.max_chunks
+            && all_chunks.len() >= limit
+        {
+            all_chunks.truncate(limit);
+            break;
+        }
+    }
+
+    emit_scan_progress(
+        progress,
+        ScanProgressEvent::ResolvedTargets {
+            target_sha: target_sha.clone(),
+            files_count: files.len(),
+            chunks_count: all_chunks.len(),
+        },
+    );
+
+    let maintainers = if let Some(idx) = crate::maintainers::get_global_maintainers() {
+        Some(idx)
+    } else {
+        let repo_for_maintainers = options.repo_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::maintainers::MaintainersIndex::from_top_of_trunk(&repo_for_maintainers)
+                .ok()
+                .map(std::sync::Arc::new)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(ref idx) = loaded {
+            crate::maintainers::init_global_maintainers(idx.clone());
+        }
+        loaded
+    };
+
+    let raw_provider = crate::ai::create_provider_cached(&settings.ai, None)
+        .await
+        .context("Failed to create AI provider for scan")?;
+    let logged_provider: std::sync::Arc<dyn crate::ai::AiProvider> = if settings.ai.log_turns {
+        std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(
+            raw_provider,
+        ))
+    } else {
+        raw_provider
+    };
+    let llm_concurrency = crate::ai::concurrency_limited_provider::llm_permits(options.concurrency);
+    let llm_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(llm_concurrency));
+    let limited_provider: std::sync::Arc<dyn crate::ai::AiProvider> = std::sync::Arc::new(
+        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+            logged_provider,
+            llm_semaphore,
+        ),
+    );
+    let quota = std::sync::Arc::new(crate::ai::quota::QuotaManager::new());
+    let provider: std::sync::Arc<dyn crate::ai::AiProvider> = std::sync::Arc::new(
+        crate::ai::backoff_provider::BackoffProvider::new(limited_provider, quota, None),
+    );
+
+    let chunk_semaphore =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(options.concurrency.max(1)));
+    let max_interactions = settings.ai.max_interactions;
+    let temperature = settings.ai.temperature;
+    let effort = options.effort.or_else(|| settings.effective_effort());
+
+    let chunks_total = all_chunks.len();
+    let chunk_futures = all_chunks.into_iter().map(|chunk| {
+        let sem = chunk_semaphore.clone();
+        let target_sha_ref = &target_sha;
+        let repo_ref = options.repo_path.as_path();
+        let prompts_ref = options.prompts.as_path();
+        let prov = provider.clone();
+        let mindex = maintainers.clone();
+        let manual_stages = options.stages.clone();
+        let custom_prompt = options.custom_prompt.clone();
+        async move {
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .context("Scan chunk semaphore closed")?;
+            let chunk_id = chunk.chunk_id();
+            match scan_single_chunk(
+                chunk,
+                target_sha_ref,
+                repo_ref,
+                prompts_ref,
+                prov,
+                mindex,
+                max_interactions,
+                temperature,
+                manual_stages,
+                custom_prompt,
+                effort,
+                progress,
+            )
+            .await
+            {
+                Ok(res) => Ok(res),
+                Err(e) => {
+                    emit_scan_progress(
+                        progress,
+                        ScanProgressEvent::ChunkFailed {
+                            chunk_id,
+                            error: e.to_string(),
+                        },
+                    );
+                    Err(e)
+                }
+            }
+        }
+    });
+
+    let results = futures::future::join_all(chunk_futures).await;
+
+    let mut summary = ScanSummary {
+        target_sha: target_sha.clone(),
+        files_scanned: files.len(),
+        chunks_total,
+        ..Default::default()
+    };
+
+    let mut candidate_bugs: Vec<crate::api::BugInput> = Vec::new();
+    for res in results {
+        match res {
+            Ok(chunk_res) => {
+                let _ = &chunk_res.chunk;
+                if chunk_res.early_exited {
+                    summary.chunks_early_exited += 1;
+                } else {
+                    summary.chunks_analyzed += 1;
+                }
+                summary.tokens_in += chunk_res.tokens_in;
+                summary.tokens_out += chunk_res.tokens_out;
+                summary.tokens_cached += chunk_res.tokens_cached;
+                summary
+                    .dismissed_concerns
+                    .extend(chunk_res.dismissed_concerns);
+                for candidate in chunk_res.candidate_bugs {
+                    if !is_in_run_duplicate_input(&candidate_bugs, &candidate) {
+                        candidate_bugs.push(candidate);
+                    }
+                }
+            }
+            Err(e) => {
+                summary.chunks_failed += 1;
+                if let Some(wf) = e.downcast_ref::<crate::workflow::WorkflowFailure>() {
+                    summary.tokens_in += wf.outcome.tokens_in as usize;
+                    summary.tokens_out += wf.outcome.tokens_out as usize;
+                    summary.tokens_cached += wf.outcome.tokens_cached as usize;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "server")]
+    if let Some(db) = submit_db {
+        if !candidate_bugs.is_empty() {
+            let accounting_provider = std::sync::Arc::new(TokenAccountingProvider {
+                inner: provider.clone(),
+                tokens_in: std::sync::atomic::AtomicUsize::new(0),
+                tokens_out: std::sync::atomic::AtomicUsize::new(0),
+                tokens_cached: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let attributed_db = db.with_bug_actor(
+                "sashiko",
+                "sashiko:linux_scan",
+                Some(provider.get_capabilities().model_name),
+            );
+
+            let bug_worker = crate::worker::bug_worker::BugWorker::new(
+                db.clone(),
+                accounting_provider.clone(),
+                options.repo_path.to_string_lossy().to_string(),
+            )
+            .with_prompts_dir(options.prompts.clone())
+            .with_project(crate::project::ProjectId::Linux)
+            .with_settings(settings.linux_bug.clone());
+
+            for input in candidate_bugs {
+                let fallback_input = input.clone();
+                match bug_worker
+                    .submit_and_process_bug(&attributed_db, input)
+                    .await
+                {
+                    Ok(Some(crate::api::BugOutcome::NewlyDiscovered { bug: saved })) => {
+                        if matches!(
+                            saved.severity(),
+                            crate::db::Severity::High | crate::db::Severity::Critical
+                        ) {
+                            emit_scan_progress(
+                                progress,
+                                ScanProgressEvent::BugSubmitted {
+                                    canonical_title: saved.title.clone(),
+                                    bugid: saved.bugid.clone(),
+                                    is_duplicate: false,
+                                },
+                            );
+                            let verified = VerifiedScanBug::from_db_bug(
+                                &saved,
+                                &fallback_input,
+                                &target_sha,
+                                Some(saved.bugid.clone()),
+                                None,
+                            );
+                            if !is_in_run_duplicate(&summary.findings, &verified) {
+                                summary.findings.push(verified);
+                            }
+                        }
+                    }
+                    Ok(Some(crate::api::BugOutcome::Duplicate { existing_bug, .. })) => {
+                        if existing_bug.lifecycle_status == crate::db::BugLifecycleStatus::Open
+                            && matches!(
+                                existing_bug.severity(),
+                                crate::db::Severity::High | crate::db::Severity::Critical
+                            )
+                        {
+                            emit_scan_progress(
+                                progress,
+                                ScanProgressEvent::BugSubmitted {
+                                    canonical_title: existing_bug.title.clone(),
+                                    bugid: existing_bug.bugid.clone(),
+                                    is_duplicate: true,
+                                },
+                            );
+                            let verified = VerifiedScanBug::from_db_bug(
+                                &existing_bug,
+                                &fallback_input,
+                                &target_sha,
+                                None,
+                                Some(existing_bug.bugid.clone()),
+                            );
+                            if !is_in_run_duplicate(&summary.findings, &verified) {
+                                summary.findings.push(verified);
+                            }
+                        }
+                    }
+                    Ok(Some(crate::api::BugOutcome::Discarded { reason, .. })) => {
+                        summary.dismissed_concerns.push(serde_json::json!({
+                            "origin": "linux_bug_verification",
+                            "description": fallback_input.problem,
+                            "reasoning": reason,
+                        }));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to process and submit scan finding '{}' to bug repository: {}",
+                            fallback_input.problem,
+                            e
+                        );
+                    }
+                }
+            }
+            summary.tokens_in += accounting_provider
+                .tokens_in
+                .load(std::sync::atomic::Ordering::Relaxed);
+            summary.tokens_out += accounting_provider
+                .tokens_out
+                .load(std::sync::atomic::Ordering::Relaxed);
+            summary.tokens_cached += accounting_provider
+                .tokens_cached
+                .load(std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(summary);
+    }
+
+    let mut bug_tb =
+        crate::toolbox::ToolBox::new(options.repo_path.clone(), Some(options.prompts.clone()));
+    bug_tb.set_virtual_head(target_sha.clone());
+    let bug_tools = std::sync::Arc::new(bug_tb);
+
+    for input in candidate_bugs {
+        let problem = input.problem.clone();
+        match crate::workflows::linux_bug::run_standalone_bug_pipeline_for_project(
+            provider.as_ref(),
+            Some(bug_tools.clone()),
+            input,
+            Some("[scan:linux_bug] "),
+            crate::project::ProjectId::Linux,
+        )
+        .await
+        {
+            Ok(crate::workflows::linux_bug::StandaloneBugOutcome::Verified(bug)) => {
+                summary.tokens_in += bug.tokens_in;
+                summary.tokens_out += bug.tokens_out;
+                summary.tokens_cached += bug.tokens_cached;
+                let verified = VerifiedScanBug::from_standalone(*bug);
+                if !is_in_run_duplicate(&summary.findings, &verified) {
+                    summary.findings.push(verified);
+                }
+            }
+            Ok(crate::workflows::linux_bug::StandaloneBugOutcome::Discarded {
+                reason,
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+            }) => {
+                summary.tokens_in += tokens_in;
+                summary.tokens_out += tokens_out;
+                summary.tokens_cached += tokens_cached;
+                tracing::info!(
+                    "Scan candidate '{}' discarded by linux_bug pipeline: {}",
+                    problem,
+                    reason
+                );
+                summary.dismissed_concerns.push(serde_json::json!({
+                    "origin": "linux_bug_verification",
+                    "description": problem,
+                    "reasoning": reason,
+                }));
+            }
+            Err(e) => {
+                if let Some(pf) =
+                    e.downcast_ref::<crate::workflows::linux_bug::StandaloneBugPipelineFailure>()
+                {
+                    summary.tokens_in += pf.tokens_in;
+                    summary.tokens_out += pf.tokens_out;
+                    summary.tokens_cached += pf.tokens_cached;
+                } else if let Some(sf) = e.downcast_ref::<crate::ai::session::SessionFailure>() {
+                    summary.tokens_in += sf.usage.prompt_tokens;
+                    summary.tokens_out += sf.usage.completion_tokens;
+                    summary.tokens_cached += sf.usage.cached_tokens.unwrap_or(0);
+                }
+                tracing::warn!(
+                    "Failed to run linux_bug pipeline for scan candidate '{}': {}",
+                    problem,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,5 +2123,81 @@ pub fn second_fn() -> u32 {
             chunks[0].prefetched_headers
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_verified_scan_bug_and_in_run_dedup() {
+        let standalone = crate::workflows::linux_bug::StandaloneVerifiedBug {
+            canonical_title: "smb: server: memory leak in parse_durable_handle_context()"
+                .to_string(),
+            canonical_description: "Trigger / Preconditions: x\nFailure Mechanism: y\nImpact: z"
+                .to_string(),
+            severity: crate::db::Severity::High,
+            severity_explanation: "Leaks fp".to_string(),
+            subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                "SMB3 SERVER (KSMBD)",
+            )],
+            source_files: vec!["fs/smb/server/smb2pdu.c".to_string()],
+            locations: Some(serde_json::json!([{
+                "file": "fs/smb/server/smb2pdu.c",
+                "line": 412,
+                "function_or_symbol": "parse_durable_handle_context"
+            }])),
+            introduced_in_commit: Some(
+                "1234567890ab (\"smb: server: add durable handle\") [v6.6]".to_string(),
+            ),
+            verified_on_sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            tokens_cached: 0,
+        };
+
+        let bug1 = VerifiedScanBug::from_standalone(standalone);
+        assert_eq!(bug1.severity, "High");
+
+        let bug_same_fn = VerifiedScanBug {
+            canonical_title: "smb: server: fp memory leak in parse_durable_handle_context()"
+                .to_string(),
+            ..bug1.clone()
+        };
+        assert!(is_in_run_duplicate(
+            std::slice::from_ref(&bug1),
+            &bug_same_fn
+        ));
+
+        let bug_different = VerifiedScanBug {
+            canonical_title: "smb: server: use-after-free in smb2_close()".to_string(),
+            locations: serde_json::json!([{
+                "file": "fs/smb/server/smb2pdu.c",
+                "line": 900,
+                "function_or_symbol": "smb2_close"
+            }]),
+            ..bug1.clone()
+        };
+        assert!(!is_in_run_duplicate(
+            std::slice::from_ref(&bug1),
+            &bug_different
+        ));
+
+        let input1 = crate::api::BugInput {
+            problem: bug1.canonical_title.clone(),
+            reasoning: bug1.canonical_description.clone(),
+            locations: Some(bug1.locations.clone()),
+            subsystems: Vec::new(),
+            source_files: bug1.source_files.clone(),
+            commit_sha: Some(bug1.verified_on_sha.clone()),
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: Some(bug1.verified_on_sha.clone()),
+            review_id: None,
+        };
+        let input_same_fn = crate::api::BugInput {
+            problem: bug_same_fn.canonical_title.clone(),
+            ..input1.clone()
+        };
+        assert!(is_in_run_duplicate_input(
+            std::slice::from_ref(&input1),
+            &input_same_fn
+        ));
     }
 }

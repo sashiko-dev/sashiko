@@ -2419,6 +2419,43 @@ impl Database {
         Ok(id)
     }
 
+    /// Atomically inserts a candidate bug, records its initial enrichment, and
+    /// claims an active worker lease on the row within a single transaction so no
+    /// concurrent `BugWorker` can claim the row before synchronous deduplication.
+    pub async fn create_claimed_bug_with_enrichment(
+        &self,
+        bug: &NewBug,
+        enrichment: Option<&NewBugEnrichment>,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<Bug> {
+        let tx = self.begin_transaction().await?;
+        let scoped = self.with_connection((*tx).clone());
+        let id = scoped.insert_bug(bug).await?;
+        if let Some(enrichment) = enrichment {
+            scoped.insert_bug_enrichment(id, enrichment).await?;
+        }
+        let now = chrono::Utc::now().timestamp();
+        scoped
+            .execute(
+                "UPDATE bugs
+                    SET pipeline_state = 'running',
+                        locked_by = ?1,
+                        lease_expires_at = ?2,
+                        attempt_count = 1,
+                        updated_at = ?3
+                  WHERE id = ?4",
+                libsql::params![worker_id, now + lease_ttl_seconds, now, id],
+            )
+            .await?;
+        let claimed = scoped
+            .get_bug(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Claimed bug {} disappeared inside transaction", id))?;
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
     async fn insert_bug(&self, bug: &NewBug) -> Result<i64> {
         let now = if bug.reported_at > 0 {
             bug.reported_at
@@ -3670,6 +3707,83 @@ impl Database {
         tx.execute(
             "UPDATE bugs SET locked_by = NULL, lease_expires_at = NULL WHERE id = ?",
             libsql::params![id],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Acquires a cross-process deduplication lease in the `meta` table so that
+    /// a standalone CLI process (`sashiko scan --submit-bugs`) and the `sashiko`
+    /// server daemon's `BugWorker` cannot concurrently query open bug vectors,
+    /// run `DedupSession`, and commit duplicate open canonical bugs.
+    ///
+    /// `lease_ttl_seconds` governs crash-recovery expiration of the lease row
+    /// (renewed while the holder is active via [`Self::renew_bug_dedup_lease`]),
+    /// whereas contending callers wait up to `max(lease_ttl_seconds, 600)`
+    /// seconds so slow or rate-limited `DedupSession` calls do not cause
+    /// premature acquisition timeouts.
+    pub async fn acquire_bug_dedup_lease(&self, owner: &str, lease_ttl_seconds: i64) -> Result<()> {
+        let ttl = lease_ttl_seconds.max(5);
+        let wait_secs = (ttl as u64).max(600);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        loop {
+            let now = chrono::Utc::now().timestamp();
+            let lease_val = format!("{}:{}", now + ttl, owner);
+            let acquired = self
+                .query_returning_i64(
+                    "INSERT INTO meta (key, value)
+                     VALUES ('bug_dedup_lease', ?1)
+                     ON CONFLICT(key) DO UPDATE
+                        SET value = excluded.value
+                      WHERE CAST(substr(meta.value, 1, instr(meta.value, ':') - 1) AS INTEGER) <= ?2
+                         OR substr(meta.value, instr(meta.value, ':') + 1) = ?3
+                     RETURNING 1",
+                    libsql::params![lease_val.as_str(), now, owner],
+                )
+                .await?;
+            if acquired.is_some() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "Timed out waiting {}s to acquire cross-process bug_dedup_lease for {}",
+                    wait_secs,
+                    owner
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Extends the cross-process deduplication lease in `meta` if still owned
+    /// and unexpired by `owner`.
+    pub async fn renew_bug_dedup_lease(&self, owner: &str, lease_ttl_seconds: i64) -> Result<bool> {
+        let ttl = lease_ttl_seconds.max(5);
+        let now = chrono::Utc::now().timestamp();
+        let lease_val = format!("{}:{}", now + ttl, owner);
+        let renewed = self
+            .query_returning_i64(
+                "UPDATE meta
+                    SET value = ?1
+                  WHERE key = 'bug_dedup_lease'
+                    AND substr(value, instr(value, ':') + 1) = ?2
+                    AND CAST(substr(value, 1, instr(value, ':') - 1) AS INTEGER) >= ?3
+                  RETURNING 1",
+                libsql::params![lease_val.as_str(), owner, now],
+            )
+            .await?;
+        Ok(renewed.is_some())
+    }
+
+    /// Releases the cross-process deduplication lease in `meta` if still owned by `owner`.
+    pub async fn release_bug_dedup_lease(&self, owner: &str) -> Result<()> {
+        let tx = self.begin_transaction().await?;
+        tx.execute(
+            "DELETE FROM meta
+              WHERE key = 'bug_dedup_lease'
+                AND substr(value, instr(value, ':') + 1) = ?1",
+            libsql::params![owner],
         )
         .await?;
         tx.commit().await?;

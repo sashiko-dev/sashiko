@@ -21,7 +21,9 @@
 //! 4. Standalone LKML-style defect description generation for newly discovered bugs.
 //! 5. Database persistence and review linking.
 
-use crate::api::{BugInput, BugOutcome};
+use crate::api::BugInput;
+#[cfg(feature = "server")]
+use crate::api::BugOutcome;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -30,11 +32,14 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::ai::session::{LlmSession, SessionRunner, ValidationError};
+#[cfg(feature = "server")]
 use crate::ai::vector_search::{
     DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_TOP_CANDIDATES, extract_bug_vector, find_top_candidates,
 };
 use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool, ToolCall};
-use crate::db::{AttributedSubsystem, Bug, Database, NewBug, Severity};
+use crate::db::{AttributedSubsystem, Bug, Severity};
+#[cfg(feature = "server")]
+use crate::db::{Database, NewBug};
 use crate::project::ProjectId;
 use crate::toolbox::ToolBox;
 
@@ -575,14 +580,15 @@ pub fn extract_directory_subsystems_for_project(
 /// lookup order is unchanged: an available index wins, a directory prefix is
 /// the fallback, and a name the caller supplied is only used when no index can
 /// be consulted at all.
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 fn resolve_official_subsystems(
     tools: Option<&ToolBox>,
     input_subsystems: &[AttributedSubsystem],
     verified_files: &[String],
 ) -> Vec<AttributedSubsystem> {
     resolve_official_subsystems_for_project(
-        tools,
+        tools.is_some(),
+        None,
         input_subsystems,
         verified_files,
         ProjectId::Linux,
@@ -590,7 +596,8 @@ fn resolve_official_subsystems(
 }
 
 fn resolve_official_subsystems_for_project(
-    tools: Option<&ToolBox>,
+    has_tools: bool,
+    loaded_maintainers: Option<&crate::maintainers::MaintainersIndex>,
     input_subsystems: &[AttributedSubsystem],
     verified_files: &[String],
     project: ProjectId,
@@ -612,15 +619,13 @@ fn resolve_official_subsystems_for_project(
     };
 
     if project.uses_maintainers() {
-        if let Some(tb) = tools {
+        if let Some(index) = loaded_maintainers {
+            return from_index(index).unwrap_or_else(from_paths);
+        }
+        if has_tools {
             return match crate::maintainers::get_global_maintainers() {
                 Some(index) => from_index(&index).unwrap_or_else(from_paths),
-                None => {
-                    match crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()) {
-                        Ok(index) => from_index(&index).unwrap_or_else(from_paths),
-                        Err(_) => from_paths(),
-                    }
-                }
+                None => from_paths(),
             };
         }
 
@@ -644,8 +649,10 @@ fn resolve_official_subsystems_for_project(
 // 3. Deduplication Confirmation Session
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 const MAX_DEDUP_DESCRIPTION_BYTES: usize = 800;
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 fn format_known_bug_locations(bug: &Bug) -> String {
     if let Some(locs) = bug.locations()
         && let Some(arr) = locs.as_array()
@@ -698,6 +705,7 @@ fn format_known_bug_locations(bug: &Bug) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 fn find_known_bug_description_slice(bug: &Bug) -> Option<&str> {
     let report = bug.enrichments.iter().rev().find_map(|e| {
         if e.kind == "report" {
@@ -756,6 +764,7 @@ fn find_known_bug_description_slice(bug: &Bug) -> Option<&str> {
     })
 }
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 fn format_known_bug_description(bug: &Bug) -> String {
     let Some(raw) = find_known_bug_description_slice(bug) else {
         return "none".to_string();
@@ -790,6 +799,7 @@ fn format_known_bug_description(bug: &Bug) -> String {
     }
 }
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 struct DedupSession<'a> {
     project: ProjectId,
     candidate_problem: &'a str,
@@ -1125,6 +1135,7 @@ Return ONLY a valid JSON object matching:
 // 6. Standalone Description Generation Session (Enrichment)
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 struct ReportSession<'a> {
     project: ProjectId,
     problem: &'a str,
@@ -1487,6 +1498,7 @@ pub fn generate_slug() -> String {
 }
 
 /// Executes the standalone bug pipeline for a single candidate concern.
+#[cfg(feature = "server")]
 pub async fn process_issue(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
@@ -1506,37 +1518,30 @@ pub async fn process_issue(
     process_issue_for_project(provider, tools, db, input, context_tag, project).await
 }
 
-/// Executes the standalone bug pipeline for a single candidate concern in `project`.
-pub async fn process_issue_for_project(
+#[cfg(feature = "server")]
+fn build_candidate_bug_and_enrichment(
     provider: &dyn AiProvider,
-    _tools: Option<Arc<ToolBox>>,
     db: &Database,
-    input: BugInput,
-    _context_tag: Option<&str>,
+    input: &BugInput,
     project: ProjectId,
-) -> Result<BugOutcome> {
-    info!(
-        "Queueing candidate {} issue: '{}' in subsystems '{:?}'",
-        project.display_name(),
-        input.problem,
-        input.subsystems
-    );
+) -> (Database, NewBug, crate::db::NewBugEnrichment) {
     let default_tool = match project {
         ProjectId::Linux => "sashiko:linux_patch_review",
         ProjectId::Sashiko => "sashiko:sashiko_patch_review",
     };
-    let reviewer_db;
-    let db = if db.has_bug_actor() && db.bug_model().is_some() {
-        db
+    let effective_db = if db.has_bug_actor() && db.bug_model().is_some() {
+        db.with_bug_actor(
+            db.bug_actor(),
+            db.bug_tool(),
+            db.bug_model().map(str::to_string),
+        )
     } else {
         let (actor, tool) = if db.has_bug_actor() {
             (db.bug_actor().to_string(), db.bug_tool().to_string())
         } else {
             ("sashiko".to_string(), default_tool.to_string())
         };
-        reviewer_db =
-            db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name));
-        &reviewer_db
+        db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name))
     };
     let bugid = generate_bugid_for_project(project);
     let now = chrono::Utc::now().timestamp();
@@ -1552,12 +1557,12 @@ pub async fn process_issue_for_project(
         input.subsystems.clone()
     };
     let new_bug = NewBug {
-        bugid: bugid.clone(),
+        bugid,
         title: input.problem.clone(),
         lifecycle_status: crate::db::BugLifecycleStatus::New,
         pipeline_state: crate::db::BugPipelineState::Pending,
         assignee: None,
-        reporter: db.bug_actor().to_string(),
+        reporter: effective_db.bug_actor().to_string(),
         reported_at: now,
         discovered_in_patchset_id: input.patchset_id,
         discovered_in_patch_id: input.patch_id,
@@ -1567,29 +1572,136 @@ pub async fn process_issue_for_project(
         duplicate_of_id: None,
         subsystems: initial_subsystems,
     };
-    let id = db
-        .create_bug_with_enrichment(
-            &new_bug,
-            Some(&crate::db::NewBugEnrichment {
-                kind: "candidate".to_string(),
-                tool: db.bug_tool().to_string(),
-                model: db.bug_model().map(|s| s.to_string()),
-                author: Some(db.bug_actor().to_string()),
-                created_at: now,
-                content: Some(input.reasoning.clone()),
-                data_json: serde_json::to_value(&input).ok(),
-                ..Default::default()
-            }),
-        )
+    let enrichment = crate::db::NewBugEnrichment {
+        kind: "candidate".to_string(),
+        tool: effective_db.bug_tool().to_string(),
+        model: effective_db.bug_model().map(str::to_string),
+        author: Some(effective_db.bug_actor().to_string()),
+        created_at: now,
+        content: Some(input.reasoning.clone()),
+        data_json: serde_json::to_value(input).ok(),
+        ..Default::default()
+    };
+    (effective_db, new_bug, enrichment)
+}
+
+/// Executes the standalone bug pipeline for a single candidate concern in `project`.
+#[cfg(feature = "server")]
+pub async fn process_issue_for_project(
+    provider: &dyn AiProvider,
+    _tools: Option<Arc<ToolBox>>,
+    db: &Database,
+    input: BugInput,
+    _context_tag: Option<&str>,
+    project: ProjectId,
+) -> Result<BugOutcome> {
+    info!(
+        "Queueing candidate {} issue: '{}' in subsystems '{:?}'",
+        project.display_name(),
+        input.problem,
+        input.subsystems
+    );
+    let (effective_db, new_bug, enrichment) =
+        build_candidate_bug_and_enrichment(provider, db, &input, project);
+    let id = effective_db
+        .create_bug_with_enrichment(&new_bug, Some(&enrichment))
         .await?;
     info!("Queued raw bug {} for asynchronous processing", id);
-    let bug = db.get_bug(id).await?.unwrap();
+    let bug = effective_db.get_bug(id).await?.unwrap();
     Ok(BugOutcome::NewlyDiscovered { bug })
+}
+
+/// Atomically inserts and claims a candidate bug in `project` so that a
+/// synchronous caller (`sashiko scan --submit-bugs`) owns the row before any
+/// concurrent `BugWorker` can claim it.
+#[cfg(feature = "server")]
+pub async fn create_claimed_issue_for_project(
+    provider: &dyn AiProvider,
+    db: &Database,
+    input: BugInput,
+    project: ProjectId,
+    worker_id: &str,
+    lease_ttl_seconds: i64,
+) -> Result<Bug> {
+    info!(
+        "Creating and claiming candidate {} issue: '{}' in subsystems '{:?}'",
+        project.display_name(),
+        input.problem,
+        input.subsystems
+    );
+    let (effective_db, new_bug, enrichment) =
+        build_candidate_bug_and_enrichment(provider, db, &input, project);
+    effective_db
+        .create_claimed_bug_with_enrichment(
+            &new_bug,
+            Some(&enrichment),
+            worker_id,
+            lease_ttl_seconds,
+        )
+        .await
 }
 
 /// Serializes deduplication checks and canonical bug commits across concurrent
 /// `BugWorker` Tokio tasks running inside the single `sashiko` server daemon.
+#[cfg(feature = "server")]
 static BUG_DEDUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(feature = "server")]
+const BUG_DEDUP_LEASE_TTL_SECONDS: i64 = 60;
+
+#[cfg(feature = "server")]
+const BUG_DEDUP_LEASE_RENEW_INTERVAL_SECONDS: u64 = 20;
+
+#[cfg(feature = "server")]
+async fn maintain_bug_dedup_lease(db: &Database, owner: &str) {
+    let mut deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs((BUG_DEDUP_LEASE_TTL_SECONDS - 1) as u64);
+    loop {
+        let renewal = tokio::time::timeout_at(deadline, async {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                BUG_DEDUP_LEASE_RENEW_INTERVAL_SECONDS,
+            ))
+            .await;
+            let started = tokio::time::Instant::now();
+            (
+                started,
+                db.renew_bug_dedup_lease(owner, BUG_DEDUP_LEASE_TTL_SECONDS)
+                    .await,
+            )
+        })
+        .await;
+        match renewal {
+            Ok((started, Ok(true))) => {
+                deadline = started
+                    + std::time::Duration::from_secs((BUG_DEDUP_LEASE_TTL_SECONDS - 1) as u64);
+            }
+            Ok((_, Ok(false))) | Err(_) => return,
+            Ok((_, Err(e))) => {
+                warn!("Failed to renew bug_dedup_lease for {}: {}", owner, e);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+async fn run_with_bug_dedup_lease<T>(
+    db: &Database,
+    owner: &str,
+    critical_section: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
+    db.acquire_bug_dedup_lease(owner, BUG_DEDUP_LEASE_TTL_SECONDS)
+        .await?;
+    let outcome = tokio::select! {
+        res = critical_section => Some(res),
+        () = maintain_bug_dedup_lease(db, owner) => None,
+    };
+    let _ = db.release_bug_dedup_lease(owner).await;
+    match outcome {
+        Some(res) => res,
+        None => bail!("Lost cross-process bug_dedup_lease for {owner} while deduplicating"),
+    }
+}
 
 async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
     let tb = match tools {
@@ -1617,7 +1729,16 @@ async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
 }
 
 async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Option<String> {
-    let sha = sha?;
+    let sha = sha?.trim().to_string();
+    if sha.is_empty() {
+        return None;
+    }
+    if sha.contains(" (\"") {
+        return Some(sha);
+    }
+    if !(7..=40).contains(&sha.len()) || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
     let tb = match tools {
         Some(t) => t.clone(),
         None => return Some(sha),
@@ -1626,7 +1747,7 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
         let worktree = tb.get_worktree_path();
 
         let subject = crate::git_cmd::in_dir(worktree)
-            .args(["log", "-1", "--format=%s", &sha])
+            .args(["log", "-1", "--format=%s", "--end-of-options", &sha])
             .output()
             .ok()
             .and_then(|out| {
@@ -1639,7 +1760,7 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
             .unwrap_or_else(|| "unknown".to_string());
 
         let release = crate::git_cmd::in_dir(worktree)
-            .args(["describe", "--contains", &sha])
+            .args(["describe", "--contains", "--end-of-options", &sha])
             .output()
             .ok()
             .and_then(|out| {
@@ -1680,6 +1801,10 @@ pub async fn deterministic_blame_fallback(
     locations: &Option<Value>,
     target_sha: &str,
 ) -> Option<String> {
+    let target_sha = target_sha.trim();
+    if target_sha.is_empty() || target_sha.starts_with('-') {
+        return None;
+    }
     let tb = tools?;
     let loc_arr = locations.as_ref()?.as_array()?;
     let worktree = tb.get_worktree_path();
@@ -1764,6 +1889,10 @@ pub async fn prefetch_bug_locations(
     master_sha: &str,
     locations: &Option<Value>,
 ) -> String {
+    let master_sha = master_sha.trim();
+    if master_sha.is_empty() || master_sha.starts_with('-') {
+        return String::new();
+    }
     let Some(tools) = tools else {
         return String::new();
     };
@@ -1777,15 +1906,14 @@ pub async fn prefetch_bug_locations(
     // Step 1: Collect and sanitize candidate file paths (max 3 distinct valid C/Rust files)
     let mut files: Vec<String> = Vec::new();
     for loc in loc_arr {
-        let Some(file) = loc.get("file").and_then(|v| v.as_str()) else {
+        let Some(file) = loc
+            .get("file")
+            .and_then(|v| v.as_str())
+            .and_then(crate::workflows::linux_scan::sanitize_repo_relative_path)
+        else {
             continue;
         };
-        let file = file.trim();
-        if file.contains("..")
-            || file.starts_with('/')
-            || file.starts_with('\\')
-            || (!file.ends_with(".c") && !file.ends_with(".h") && !file.ends_with(".rs"))
-        {
+        if !file.ends_with(".c") && !file.ends_with(".h") && !file.ends_with(".rs") {
             continue;
         }
         if !files.contains(&file.to_string()) {
@@ -1814,7 +1942,11 @@ pub async fn prefetch_bug_locations(
             }
 
             let git_output = crate::git_cmd::in_dir(&worktree)
-                .args(["show", &format!("{}:{}", master_sha_owned, file)])
+                .args([
+                    "show",
+                    "--end-of-options",
+                    &format!("{}:{}", master_sha_owned, file),
+                ])
                 .output();
 
             let (out, actual_file) = match git_output {
@@ -1829,7 +1961,14 @@ pub async fn prefetch_bug_locations(
                         let sha = String::from_utf8_lossy(&lc.stdout).trim().to_string();
                         if !sha.is_empty() {
                             let diff_out = crate::git_cmd::in_dir(&worktree)
-                                .args(["show", "-M", "--name-status", "--format=", &sha])
+                                .args([
+                                    "show",
+                                    "-M",
+                                    "--name-status",
+                                    "--format=",
+                                    "--end-of-options",
+                                    &sha,
+                                ])
                                 .output();
                             if let Ok(do_out) = diff_out {
                                 let diff_str = String::from_utf8_lossy(&do_out.stdout);
@@ -1843,6 +1982,7 @@ pub async fn prefetch_bug_locations(
                                         let try_out = crate::git_cmd::in_dir(&worktree)
                                             .args([
                                                 "show",
+                                                "--end-of-options",
                                                 &format!("{}:{}", master_sha_owned, next_path),
                                             ])
                                             .output();
@@ -1861,7 +2001,14 @@ pub async fn prefetch_bug_locations(
                     if resolved.is_none() {
                         // Fallback: check git log --follow backwards
                         let rename_cmd = crate::git_cmd::in_dir(&worktree)
-                            .args(["log", "--follow", "--name-only", "--format=format:", &file])
+                            .args([
+                                "log",
+                                "--follow",
+                                "--name-only",
+                                "--format=format:",
+                                "--",
+                                &file,
+                            ])
                             .output();
                         if let Some(ro) = rename_cmd.ok().filter(|r| r.status.success()) {
                             let stdout = String::from_utf8_lossy(&ro.stdout);
@@ -1871,7 +2018,11 @@ pub async fn prefetch_bug_locations(
                                     continue;
                                 }
                                 let try_out = crate::git_cmd::in_dir(&worktree)
-                                    .args(["show", &format!("{}:{}", master_sha_owned, trimmed)])
+                                    .args([
+                                        "show",
+                                        "--end-of-options",
+                                        &format!("{}:{}", master_sha_owned, trimmed),
+                                    ])
                                     .output();
                                 if let Some(to) = try_out.ok().filter(|t| t.status.success()) {
                                     resolved = Some((to, trimmed.to_string()));
@@ -2039,8 +2190,396 @@ pub async fn prefetch_bug_locations(
     .unwrap_or_default()
 }
 
+/// Verified bug details produced by [`run_standalone_bug_pipeline_for_project`]
+/// when running without a database (e.g., `sashiko scan` without `--submit-bugs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StandaloneVerifiedBug {
+    pub canonical_title: String,
+    pub canonical_description: String,
+    pub severity: Severity,
+    pub severity_explanation: String,
+    pub subsystems: Vec<AttributedSubsystem>,
+    pub source_files: Vec<String>,
+    pub locations: Option<Value>,
+    pub introduced_in_commit: Option<String>,
+    pub verified_on_sha: String,
+    #[serde(default)]
+    pub tokens_in: usize,
+    #[serde(default)]
+    pub tokens_out: usize,
+    #[serde(default)]
+    pub tokens_cached: usize,
+}
+
+/// Outcome of running [`run_standalone_bug_pipeline_for_project`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StandaloneBugOutcome {
+    Discarded {
+        reason: String,
+        #[serde(default)]
+        tokens_in: usize,
+        #[serde(default)]
+        tokens_out: usize,
+        #[serde(default)]
+        tokens_cached: usize,
+    },
+    Verified(Box<StandaloneVerifiedBug>),
+}
+
+/// Error returned when [`run_standalone_bug_pipeline_for_project`] fails,
+/// preserving token usage accumulated across completed stages and the failing
+/// [`crate::ai::session::SessionFailure`].
+#[derive(Debug, Clone)]
+pub struct StandaloneBugPipelineFailure {
+    pub message: String,
+    pub tokens_in: usize,
+    pub tokens_out: usize,
+    pub tokens_cached: usize,
+}
+
+impl std::fmt::Display for StandaloneBugPipelineFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for StandaloneBugPipelineFailure {}
+
+fn wrap_standalone_bug_pipeline_error(
+    err: anyhow::Error,
+    mut tokens_in: usize,
+    mut tokens_out: usize,
+    mut tokens_cached: usize,
+) -> anyhow::Error {
+    if let Some(sf) = err.downcast_ref::<crate::ai::session::SessionFailure>() {
+        tokens_in += sf.usage.prompt_tokens;
+        tokens_out += sf.usage.completion_tokens;
+        tokens_cached += sf.usage.cached_tokens.unwrap_or(0);
+    }
+    anyhow::Error::new(StandaloneBugPipelineFailure {
+        message: err.to_string(),
+        tokens_in,
+        tokens_out,
+        tokens_cached,
+    })
+}
+
+async fn load_maintainers_for_bug_pipeline(
+    tools: Option<&Arc<ToolBox>>,
+) -> Option<Arc<crate::maintainers::MaintainersIndex>> {
+    if let Some(idx) = crate::maintainers::get_global_maintainers() {
+        return Some(idx);
+    }
+    let repo_path = tools?.get_worktree_path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
+            .ok()
+            .map(Arc::new)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Runs the `linux_bug` verification pipeline (`NormalizeSession` ->
+/// `VerifySession` -> `TracingSession` -> `SeveritySession`) without a database
+/// or LKML `ReportSession`, returning structured verified bug metadata for
+/// standalone CLI tools such as `sashiko scan`.
+pub async fn run_standalone_bug_pipeline_for_project(
+    provider: &dyn AiProvider,
+    tools: Option<Arc<ToolBox>>,
+    input: BugInput,
+    context_tag: Option<&str>,
+    project: ProjectId,
+) -> Result<StandaloneBugOutcome> {
+    let project_label = match project {
+        ProjectId::Linux => "Linux kernel",
+        ProjectId::Sashiko => "Sashiko",
+    };
+    info!(
+        "Processing standalone candidate {} issue: '{}' in subsystems '{:?}'",
+        project_label, input.problem, input.subsystems
+    );
+
+    let runner = SessionRunner::new(provider).with_max_turns(20);
+    let mut tokens_in = 0usize;
+    let mut tokens_out = 0usize;
+    let mut tokens_cached = 0usize;
+    let add_usage =
+        |usage: &crate::ai::AiUsage, tin: &mut usize, tout: &mut usize, tcached: &mut usize| {
+            *tin += usage.prompt_tokens;
+            *tout += usage.completion_tokens;
+            *tcached += usage.cached_tokens.unwrap_or(0);
+        };
+
+    let master_sha = match input
+        .baseline_sha
+        .as_deref()
+        .or(input.commit_sha.as_deref())
+        .map(str::trim)
+        .filter(|s| (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        Some(sha) => sha.to_string(),
+        None => get_master_sha(tools.as_ref()).await,
+    };
+
+    let mut effective_source_files: Vec<String> = input
+        .source_files
+        .iter()
+        .filter_map(|f| crate::workflows::linux_scan::sanitize_repo_relative_path(f))
+        .map(str::to_string)
+        .collect();
+    let mut effective_locations = input.locations.clone();
+
+    let trace_frames = parse_stack_trace(&format!("{}\n{}", input.problem, input.reasoning));
+    if !trace_frames.is_empty() {
+        let mut new_locs = Vec::new();
+        for (file, line) in trace_frames {
+            let Some(clean_file) = crate::workflows::linux_scan::sanitize_repo_relative_path(&file)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !effective_source_files.contains(&clean_file) {
+                effective_source_files.push(clean_file.clone());
+            }
+            new_locs.push(serde_json::json!({
+                "file": clean_file,
+                "line": line
+            }));
+        }
+        let has_no_locations = effective_locations
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .is_none_or(|a| a.is_empty());
+        if has_no_locations {
+            effective_locations = Some(Value::Array(new_locs));
+        }
+    }
+
+    if let Some(ref tb) = tools {
+        let repo_path = tb.get_worktree_path();
+        for file in &mut effective_source_files {
+            if crate::git_ops::git_file_exists_at(repo_path, file, Some(&master_sha)).await {
+                continue;
+            }
+            if let Some(renamed) =
+                crate::git_ops::git_find_file_rename(repo_path, file, Some(&master_sha)).await
+            {
+                info!("Traced renamed file from {} to {}", file, renamed);
+                *file = renamed;
+            }
+        }
+    }
+
+    info!("--- {} ---", BugStage::Normalization.title());
+    let loaded_maintainers = if project.uses_maintainers() {
+        load_maintainers_for_bug_pipeline(tools.as_ref()).await
+    } else {
+        None
+    };
+    let maintainers_hint = loaded_maintainers.as_ref().map(|mindex| {
+        let matched = mindex.match_files(&effective_source_files);
+        if matched.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Detected Subsystems from MAINTAINERS: {}",
+                matched.join(", ")
+            )
+        }
+    });
+
+    let raw_locations_str = effective_locations
+        .as_ref()
+        .and_then(|v| serde_json::to_string_pretty(v).ok())
+        .unwrap_or_else(|| "[]".to_string());
+
+    let mut norm_session = NormalizeSession {
+        problem: &input.problem,
+        reasoning: &input.reasoning,
+        locations: &raw_locations_str,
+        master_sha: &master_sha,
+        maintainers_hint,
+        tools: tools.clone(),
+        context_tag: context_tag.map(str::to_string),
+        project,
+    };
+
+    let norm_result = runner
+        .run(&mut norm_session)
+        .await
+        .map_err(|e| wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached))?;
+    add_usage(
+        &norm_result.usage,
+        &mut tokens_in,
+        &mut tokens_out,
+        &mut tokens_cached,
+    );
+    let norm = norm_result.output;
+
+    let mut verified_files = Vec::new();
+    let sanitized_norm_files: Vec<String> = norm
+        .affected_source_files
+        .iter()
+        .filter_map(|f| crate::workflows::linux_scan::sanitize_repo_relative_path(f))
+        .map(str::to_string)
+        .collect();
+    if let Some(ref tb) = tools {
+        let repo_path = tb.get_worktree_path();
+        for file in &sanitized_norm_files {
+            if crate::git_ops::git_file_exists_at(repo_path, file, Some(&master_sha)).await {
+                verified_files.push(file.clone());
+            }
+        }
+    } else {
+        verified_files = sanitized_norm_files;
+    }
+    if verified_files.is_empty() {
+        verified_files = effective_source_files;
+    }
+
+    let official_subsystems = resolve_official_subsystems_for_project(
+        tools.is_some(),
+        loaded_maintainers.as_deref(),
+        &input.subsystems,
+        &verified_files,
+        project,
+    );
+    let title_prefix = extract_title_prefix(&norm.canonical_title);
+
+    info!("--- {} ---", BugStage::Verification.title());
+    let prefetched_context =
+        prefetch_bug_locations(tools.as_ref(), &master_sha, &effective_locations).await;
+    let mut verify_session = VerifySession {
+        title: &norm.canonical_title,
+        description: &norm.canonical_description,
+        subsystem: title_prefix,
+        affected_files: &verified_files,
+        locations: effective_locations.as_ref(),
+        master_sha: master_sha.clone(),
+        tools: tools.clone(),
+        context_tag: context_tag.map(str::to_string),
+        prefetched_context,
+        project,
+    };
+
+    let verify_result = runner
+        .run(&mut verify_session)
+        .await
+        .map_err(|e| wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached))?;
+    add_usage(
+        &verify_result.usage,
+        &mut tokens_in,
+        &mut tokens_out,
+        &mut tokens_cached,
+    );
+    let verification = verify_result.output;
+    if verification.is_false_positive {
+        let reason = verification.refutation_evidence.unwrap_or_else(|| {
+            "Discarded as a hallucinated or disproved false positive".to_string()
+        });
+        return Ok(StandaloneBugOutcome::Discarded {
+            reason,
+            tokens_in,
+            tokens_out,
+            tokens_cached,
+        });
+    }
+
+    let verified_locations = verification
+        .relevant_code_locations
+        .or_else(|| input.locations.clone());
+    let verified_locations_str = verified_locations
+        .as_ref()
+        .and_then(|v| serde_json::to_string_pretty(v).ok())
+        .unwrap_or_else(|| "[]".to_string());
+
+    info!("--- {} ---", BugStage::OriginTracing.title());
+    let tracing_runner = SessionRunner::new(provider).with_max_turns(30);
+    let mut tracing_session = TracingSession {
+        input: &input,
+        master_sha: master_sha.clone(),
+        verification_reasoning: verification.verification_reasoning,
+        relevant_locations: verified_locations_str.clone(),
+        tools: tools.clone(),
+        context_tag: context_tag.map(str::to_string),
+        project,
+    };
+    let tracing_result = tracing_runner
+        .run(&mut tracing_session)
+        .await
+        .map_err(|e| wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached))?;
+    add_usage(
+        &tracing_result.usage,
+        &mut tokens_in,
+        &mut tokens_out,
+        &mut tokens_cached,
+    );
+    let tracing_output = tracing_result.output;
+    let introducing_commit_sha = match tracing_output.introducing_commit_sha {
+        Some(sha) => Some(sha),
+        None => {
+            deterministic_blame_fallback(tools.as_ref(), &verified_locations, &master_sha).await
+        }
+    };
+    let introduced_in_commit = format_commit(tools.as_ref(), introducing_commit_sha).await;
+
+    info!("--- {} ---", BugStage::SeverityAssessment.title());
+    let mut severity_session = SeveritySession {
+        canonical_title: &norm.canonical_title,
+        canonical_description: &norm.canonical_description,
+        locations: &verified_locations_str,
+        context_tag: context_tag.map(str::to_string),
+        project,
+    };
+    let severity_result = runner
+        .run(&mut severity_session)
+        .await
+        .map_err(|e| wrap_standalone_bug_pipeline_error(e, tokens_in, tokens_out, tokens_cached))?;
+    add_usage(
+        &severity_result.usage,
+        &mut tokens_in,
+        &mut tokens_out,
+        &mut tokens_cached,
+    );
+    let severity_output = severity_result.output;
+    let severity = Severity::from_str(&severity_output.severity);
+    if !matches!(severity, Severity::High | Severity::Critical) {
+        return Ok(StandaloneBugOutcome::Discarded {
+            reason: format!(
+                "Calibrated severity is {} (requires High or Critical): {}",
+                severity.as_str(),
+                severity_output.severity_explanation
+            ),
+            tokens_in,
+            tokens_out,
+            tokens_cached,
+        });
+    }
+
+    Ok(StandaloneBugOutcome::Verified(Box::new(
+        StandaloneVerifiedBug {
+            canonical_title: norm.canonical_title,
+            canonical_description: norm.canonical_description,
+            severity,
+            severity_explanation: severity_output.severity_explanation,
+            subsystems: official_subsystems,
+            source_files: verified_files,
+            locations: verified_locations,
+            introduced_in_commit,
+            verified_on_sha: master_sha,
+            tokens_in,
+            tokens_out,
+            tokens_cached,
+        },
+    )))
+}
+
 // Persist each completed stage immediately. If a later stage fails, its
 // predecessors' original interactions and usage remain available for inspection.
+#[cfg(feature = "server")]
 async fn record_bug_stage<T>(
     db: &Database,
     bug_id: i64,
@@ -2067,6 +2606,7 @@ async fn record_bug_stage<T>(
     Ok(())
 }
 
+#[cfg(feature = "server")]
 pub async fn process_issue_worker(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
@@ -2096,6 +2636,7 @@ pub async fn process_issue_worker(
     .await
 }
 
+#[cfg(feature = "server")]
 struct DedupAttemptContext<'a> {
     runner: &'a SessionRunner<'a>,
     db: &'a Database,
@@ -2111,6 +2652,7 @@ struct DedupAttemptContext<'a> {
     query_vector: &'a crate::ai::vector_search::BugVector,
 }
 
+#[cfg(feature = "server")]
 impl DedupAttemptContext<'_> {
     async fn check_and_fold(
         &self,
@@ -2202,6 +2744,7 @@ impl DedupAttemptContext<'_> {
     }
 }
 
+#[cfg(feature = "server")]
 pub async fn process_issue_worker_for_project(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
@@ -2235,26 +2778,55 @@ pub async fn process_issue_worker_for_project(
             ProjectId::Sashiko => "sashiko:sashiko_bug".to_string(),
         }
     };
+    let is_scan_candidate = tool == "sashiko:linux_scan"
+        || bug_row
+            .enrichments
+            .iter()
+            .any(|e| e.kind == "candidate" && e.tool == "sashiko:linux_scan");
     let attributed_db =
         db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name));
     let db = &attributed_db;
     let mut full_history = Vec::new();
     let runner = SessionRunner::new(provider).with_max_turns(20);
-    let master_sha = get_master_sha(tools.as_ref()).await;
+    let master_sha = if input.patchset_id.is_none()
+        && input.patch_id.is_none()
+        && input.review_id.is_none()
+        && let Some(sha) = input
+            .baseline_sha
+            .as_deref()
+            .or(input.commit_sha.as_deref())
+            .map(str::trim)
+            .filter(|s| (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        sha.to_string()
+    } else {
+        get_master_sha(tools.as_ref()).await
+    };
+    let dedup_owner = format!("bug:{}:pid:{}", bug_row.id, std::process::id());
 
     // Enrich source files and candidate locations via stack trace parsing and git rename tracking
-    let mut effective_source_files = input.source_files.clone();
+    let mut effective_source_files: Vec<String> = input
+        .source_files
+        .iter()
+        .filter_map(|f| crate::workflows::linux_scan::sanitize_repo_relative_path(f))
+        .map(str::to_string)
+        .collect();
     let mut effective_locations = input.locations.clone();
 
     let trace_frames = parse_stack_trace(&format!("{}\n{}", input.problem, input.reasoning));
     if !trace_frames.is_empty() {
         let mut new_locs = Vec::new();
         for (file, line) in trace_frames {
-            if !effective_source_files.contains(&file) {
-                effective_source_files.push(file.clone());
+            let Some(clean_file) = crate::workflows::linux_scan::sanitize_repo_relative_path(&file)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !effective_source_files.contains(&clean_file) {
+                effective_source_files.push(clean_file.clone());
             }
             new_locs.push(serde_json::json!({
-                "file": file,
+                "file": clean_file,
                 "line": line
             }));
         }
@@ -2284,29 +2856,22 @@ pub async fn process_issue_worker_for_project(
 
     // Normalization and canonical naming.
     info!("--- {} ---", BugStage::Normalization.title());
-    let maintainers_hint = if project.uses_maintainers() {
-        crate::maintainers::get_global_maintainers()
-            .or_else(|| {
-                tools.as_ref().and_then(|tb| {
-                    crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
-                        .ok()
-                        .map(std::sync::Arc::new)
-                })
-            })
-            .map(|mindex| {
-                let matched = mindex.match_files(&effective_source_files);
-                if matched.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "Detected Subsystems from MAINTAINERS: {}",
-                        matched.join(", ")
-                    )
-                }
-            })
+    let loaded_maintainers = if project.uses_maintainers() {
+        load_maintainers_for_bug_pipeline(tools.as_ref()).await
     } else {
         None
     };
+    let maintainers_hint = loaded_maintainers.as_ref().map(|mindex| {
+        let matched = mindex.match_files(&effective_source_files);
+        if matched.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Detected Subsystems from MAINTAINERS: {}",
+                matched.join(", ")
+            )
+        }
+    });
 
     let raw_locations_str = effective_locations
         .as_ref()
@@ -2332,15 +2897,21 @@ pub async fn process_issue_worker_for_project(
 
     // Verify affected source files against mainline tree, falling back to input locations if empty
     let mut verified_files = Vec::new();
+    let sanitized_norm_files: Vec<String> = norm
+        .affected_source_files
+        .iter()
+        .filter_map(|f| crate::workflows::linux_scan::sanitize_repo_relative_path(f))
+        .map(str::to_string)
+        .collect();
     if let Some(ref tb) = tools {
         let repo_path = tb.get_worktree_path();
-        for file in &norm.affected_source_files {
+        for file in &sanitized_norm_files {
             if crate::git_ops::git_file_exists_at(repo_path, file, Some(&master_sha)).await {
                 verified_files.push(file.clone());
             }
         }
     } else {
-        verified_files = norm.affected_source_files.clone();
+        verified_files = sanitized_norm_files;
     }
 
     if verified_files.is_empty() {
@@ -2348,7 +2919,8 @@ pub async fn process_issue_worker_for_project(
     }
 
     let official_subsystems = resolve_official_subsystems_for_project(
-        tools.as_deref(),
+        tools.is_some(),
+        loaded_maintainers.as_deref(),
         &input.subsystems,
         &verified_files,
         project,
@@ -2427,7 +2999,7 @@ pub async fn process_issue_worker_for_project(
         .and_then(|v| serde_json::to_string_pretty(v).ok())
         .unwrap_or_else(|| "[]".to_string());
 
-    // Deduplication confirmation, under BUG_DEDUP_LOCK.
+    // Deduplication confirmation, under BUG_DEDUP_LOCK + cross-process lease.
     info!("--- {} ---", BugStage::Deduplication.title());
     let query_vector = extract_bug_vector(
         &norm.canonical_title,
@@ -2451,17 +3023,16 @@ pub async fn process_issue_worker_for_project(
         query_vector: &query_vector,
     };
 
-    let (seen_bug_ids, early_dup_outcome) = {
-        let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
-
+    let (seen_bug_ids, early_dup_outcome) = run_with_bug_dedup_lease(db, &dedup_owner, async {
         let mut known_bugs = db.list_all_bugs_for_vector_search().await?;
         known_bugs.retain(|b| b.id != bug_row.id);
         let seen_ids: std::collections::HashSet<i64> = known_bugs.iter().map(|b| b.id).collect();
         let outcome = dedup_ctx
             .check_and_fold(&known_bugs, &mut full_history)
             .await?;
-        (seen_ids, outcome)
-    };
+        Ok((seen_ids, outcome))
+    })
+    .await?;
 
     if let Some(dup_outcome) = early_dup_outcome {
         return Ok(dup_outcome);
@@ -2514,6 +3085,36 @@ pub async fn process_issue_worker_for_project(
     let severity_output = severity_result.output;
     let severity = Severity::from_str(&severity_output.severity);
 
+    if is_scan_candidate && !matches!(severity, Severity::High | Severity::Critical) {
+        let reason = format!(
+            "Calibrated severity is {} (requires High or Critical): {}",
+            severity.as_str(),
+            severity_output.severity_explanation
+        );
+        info!("{} scan candidate discarded: {}", project_label, reason);
+        let logs = serde_json::to_string(&full_history).unwrap_or_default();
+        db.update_bug_outcome(
+            bug_row.id,
+            crate::db::UpdateBugOutcomeParams {
+                lifecycle_status: crate::db::BugLifecycleStatus::Dismissed,
+                problem: Some(&norm.canonical_title),
+                subsystems: Some(&official_subsystems),
+                source_files: Some(&verified_files),
+                locations: verified_locations.as_ref(),
+                severity,
+                severity_explanation: Some(&reason),
+                introduced_in_commit: introduced_in_commit.as_deref(),
+                verified_on_sha: Some(&master_sha),
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(BugOutcome::Discarded {
+            reason,
+            logs: Some(logs),
+        });
+    }
+
     // Standalone plaintext review generation, recorded as an enrichment.
     info!("--- {} ---", BugStage::ReportGeneration.title());
     let verified_prefetched =
@@ -2542,14 +3143,12 @@ pub async fn process_issue_worker_for_project(
 
     let inline_review = report_result.output;
 
-    // Final database write, serialized under BUG_DEDUP_LOCK so any canonical
-    // bug committed while Stages 4-6 were in flight is checked before this bug
-    // transitions to 'open' and publishes its vector.
+    // Final database write, serialized under BUG_DEDUP_LOCK + cross-process
+    // lease so any canonical bug committed while Stages 4-6 were in flight is
+    // checked before this bug transitions to 'open' and publishes its vector.
     info!("--- Final database write ---");
 
-    let late_dup_outcome = {
-        let _dedup_guard = BUG_DEDUP_LOCK.lock().await;
-
+    let late_dup_outcome = run_with_bug_dedup_lease(db, &dedup_owner, async {
         let mut newly_arrived_bugs = db.list_all_bugs_for_vector_search().await?;
         newly_arrived_bugs.retain(|b| b.id != bug_row.id && !seen_bug_ids.contains(&b.id));
         let late_dup = if !newly_arrived_bugs.is_empty() {
@@ -2561,7 +3160,7 @@ pub async fn process_issue_worker_for_project(
         };
 
         if let Some(dup_outcome) = late_dup {
-            Some(dup_outcome)
+            Ok(Some(dup_outcome))
         } else {
             db.update_bug_outcome(
                 bug_row.id,
@@ -2586,9 +3185,10 @@ pub async fn process_issue_worker_for_project(
                 },
             )
             .await?;
-            None
+            Ok(None)
         }
-    };
+    })
+    .await?;
 
     if let Some(dup_outcome) = late_dup_outcome {
         return Ok(dup_outcome);
@@ -2863,6 +3463,7 @@ pub async fn verify_commit_is_ancestor(
     }
 }
 
+#[cfg(feature = "server")]
 async fn commit_subject(repo_path: &std::path::Path, sha: &str) -> Option<String> {
     let out = run_git_query(repo_path, &["log", "-1", "--format=%s", sha])
         .await
@@ -3147,6 +3748,7 @@ pub async fn find_candidate_fix_commits(
     Ok(Some(candidates))
 }
 
+#[cfg(feature = "server")]
 async fn prefetch_candidate_fix_commits(
     repo_path: &std::path::Path,
     candidate_shas: &[String],
@@ -3226,6 +3828,7 @@ async fn prefetch_candidate_fix_commits(
     output
 }
 
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 struct VerifyUpstreamFixSession<'a> {
     bug: &'a Bug,
     affected_files: &'a [String],
@@ -3503,6 +4106,7 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
 ///    `linus_sha` without invoking the LLM.
 /// 3. Single-stage LLM verification (`VerifyUpstreamFixSession`) when candidate
 ///    commits exist, guarded by deterministic git commit + ancestry verification.
+#[cfg(feature = "server")]
 pub async fn check_bug_fixed_upstream(
     provider: &dyn AiProvider,
     repo_path: &std::path::Path,
@@ -3514,6 +4118,7 @@ pub async fn check_bug_fixed_upstream(
     check_bug_fixed_upstream_for_project(provider, repo_path, db, bug, linus_sha, project).await
 }
 
+#[cfg(feature = "server")]
 pub async fn check_bug_fixed_upstream_for_project(
     provider: &dyn AiProvider,
     repo_path: &std::path::Path,
@@ -3526,6 +4131,7 @@ pub async fn check_bug_fixed_upstream_for_project(
         .await
 }
 
+#[cfg(feature = "server")]
 pub async fn check_bug_fixed_upstream_with_candidates(
     provider: &dyn AiProvider,
     repo_path: &std::path::Path,
@@ -3703,7 +4309,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use crate::ai::{AiRequest, ProviderCapabilities};
@@ -6271,5 +6877,115 @@ F:	drivers/net/ethernet/intel/e1000/
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].0.id, canon_bug.id);
         assert!(!linked[0].1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_candidate_below_high_severity_is_dismissed_without_report() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let locs = json!([{
+            "file": "net/core/dev.c",
+            "line": 120,
+            "function_or_symbol": "dev_alloc"
+        }]);
+        let input = BugInput {
+            problem: "net: minor issue in dev_alloc()".to_string(),
+            reasoning: "Minor error code mismatch.".to_string(),
+            locations: Some(locs.clone()),
+            subsystems: vec![AttributedSubsystem::from_maintainers(
+                "NETWORKING [GENERAL]",
+            )],
+            source_files: vec!["net/core/dev.c".to_string()],
+            commit_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            review_id: None,
+        };
+
+        let dummy = MockAiProvider {
+            response_text: "{}".to_string(),
+        };
+        let scan_db = db.with_bug_actor("sashiko", "sashiko:linux_scan", Some("mock".to_string()));
+        let claimed = create_claimed_issue_for_project(
+            &dummy,
+            &scan_db,
+            input.clone(),
+            ProjectId::Linux,
+            "worker:1",
+            300,
+        )
+        .await
+        .unwrap();
+
+        // Only 4 responses provided (Normalize, Verify, Tracing, Severity=Medium).
+        // If ReportSession were invoked, QueuedMockAiProvider would return "{}" and
+        // the bug would be committed as Open instead of Dismissed.
+        let provider = QueuedMockAiProvider::new(vec![
+            json!({
+                "canonical_title": "net: minor error code in dev_alloc()",
+                "canonical_description": "Trigger: Error path.\nFailure Mechanism: Returns -EINVAL.\nImpact: Minor.",
+                "affected_source_files": ["net/core/dev.c"]
+            })
+            .to_string(),
+            json!({
+                "verification_reasoning": "Verified on tree.",
+                "is_false_positive": false,
+                "refutation_evidence": null,
+                "impact_severity": "Medium",
+                "relevant_code_locations": locs
+            })
+            .to_string(),
+            json!({
+                "introducing_commit_sha": "112233445566"
+            })
+            .to_string(),
+            json!({
+                "severity": "Medium",
+                "severity_explanation": "Cosmetic error code difference only."
+            })
+            .to_string(),
+        ]);
+
+        let worker_db = db.with_bug_claim(claimed.id, "worker:1").with_bug_actor(
+            "sashiko",
+            "sashiko:linux_bug",
+            Some("mock".to_string()),
+        );
+        let outcome = process_issue_worker_for_project(
+            &provider,
+            None,
+            &worker_db,
+            &claimed,
+            input,
+            Some("bug_worker"),
+            ProjectId::Linux,
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            BugOutcome::Discarded { reason, .. } => {
+                assert!(reason.contains("Calibrated severity is Medium"));
+            }
+            other => panic!("Expected Discarded outcome for Medium scan bug, got {other:?}"),
+        }
+
+        let stored = db.get_bug(claimed.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.lifecycle_status,
+            crate::db::BugLifecycleStatus::Dismissed
+        );
+        assert!(stored.vector_json.is_none());
+        assert!(
+            !stored.enrichments.iter().any(|e| e.kind == "report"),
+            "ReportSession must not run for dismissed scan candidates"
+        );
     }
 }

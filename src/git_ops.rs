@@ -372,13 +372,35 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn is_safe_repo_relative_path(file_path: &str) -> bool {
+    let trimmed = file_path.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.starts_with('/')
+        || trimmed.contains('\0')
+        || trimmed.chars().any(char::is_control)
+    {
+        return false;
+    }
+    Path::new(trimmed)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 /// Checks whether a specific file path exists in git at a specific commit (or HEAD).
 pub async fn git_file_exists_at(repo_path: &Path, file_path: &str, commit: Option<&str>) -> bool {
-    let target = commit.unwrap_or("HEAD");
+    let file_path = file_path.trim();
+    if !is_safe_repo_relative_path(file_path) {
+        return false;
+    }
+    let target = commit.unwrap_or("HEAD").trim();
+    if target.is_empty() || target.starts_with('-') || target.contains('\0') {
+        return false;
+    }
     let obj = format!("{}:{}", target, file_path);
     let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
-        .args(["cat-file", "-e", &obj])
+        .args(["cat-file", "-e", "--end-of-options", &obj])
         .output()
         .await;
 
@@ -392,7 +414,8 @@ pub async fn git_find_file_rename(
     file_path: &str,
     target_commit: Option<&str>,
 ) -> Option<String> {
-    if !repo_path.exists() {
+    let file_path = file_path.trim();
+    if !repo_path.exists() || !is_safe_repo_relative_path(file_path) {
         return None;
     }
 
@@ -418,13 +441,20 @@ pub async fn git_find_file_rename(
         let commit_sha = String::from_utf8_lossy(&last_commit_output.stdout)
             .trim()
             .to_string();
-        if commit_sha.is_empty() {
+        if commit_sha.is_empty() || commit_sha.starts_with('-') {
             break;
         }
 
         let diff_output = crate::git_cmd::in_dir_async(repo_path)
             .args(["-c", "safe.bareRepository=all"])
-            .args(["show", "-M", "--name-status", "--format=", &commit_sha])
+            .args([
+                "show",
+                "-M",
+                "--name-status",
+                "--format=",
+                "--end-of-options",
+                &commit_sha,
+            ])
             .output()
             .await
             .ok()?;
@@ -460,6 +490,7 @@ pub async fn git_find_file_rename(
         .arg("--follow")
         .arg("--name-only")
         .arg("--format=format:")
+        .arg("--")
         .arg(file_path);
 
     let Ok(output) = cmd.output().await else {
@@ -2258,6 +2289,13 @@ mod tests {
         // 4. Non-existent file returns None
         let nonexistent = git_find_file_rename(repo_dir.path(), "does_not_exist.c", None).await;
         assert_eq!(nonexistent, None);
+
+        // 5. Dash-prefixed flag injection attempt is rejected and creates no file
+        let injected_file = repo_dir.path().join("pwned.txt");
+        let flag_arg = format!("--output={}", injected_file.display());
+        let injected = git_find_file_rename(repo_dir.path(), &flag_arg, None).await;
+        assert_eq!(injected, None);
+        assert!(!injected_file.exists());
 
         Ok(())
     }

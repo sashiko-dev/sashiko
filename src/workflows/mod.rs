@@ -15,7 +15,6 @@
 use crate::project::ProjectId;
 
 pub mod guard;
-#[cfg(feature = "server")]
 pub mod linux_bug;
 pub mod linux_patch_review;
 pub mod linux_scan;
