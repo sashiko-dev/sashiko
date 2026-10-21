@@ -1311,7 +1311,7 @@ mod tests {
                 r#"{"findings": [], "hard_cases": [{"source_ids": ["C1"], "type": "Bug", "description": "some issue", "estimated_severity": "High", "signal_reason": "series_interaction", "concern_arguments": "reason", "dismissal_arguments": "", "verification_question": "check series end", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
             } else if last_user.contains("# Per-finding post-verification and conflict resolution")
             {
-                r#"{"findings": [], "dismissed_concerns": [{"source_ids": ["H1"], "description": "some issue", "reasoning": "fixed in patch 2", "locations": [{"file": "file2.c", "function_or_symbol": "patch2", "line": 1, "code_snippet": "int patch2;"}]}]}"#
+                r#"{"findings": [], "dismissed_concerns": [{"source_ids": ["H1"], "description": "some issue", "reasoning": "fixed in patch 2", "locations": [{"file": "file2.c", "function_or_symbol": "patch2", "line": 1, "code_snippet": "int patch2;", "side": "REVISION"}]}]}"#
             } else {
                 r#"{"concerns": [], "dismissed_concerns": []}"#
             };
@@ -1582,11 +1582,11 @@ mod tests {
                     .unwrap_or_default();
 
                 let content = if last_user.contains("# Analyze commit main goal") {
-                    r#"{"concerns": [{"type": "Memory Leak", "description": "Pre-existing leak in foo()", "reasoning": "Missing kfree", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "dismissed_concerns": []}"#
+                    r#"{"concerns": [{"type": "Memory Leak", "description": "Pre-existing leak in foo()", "reasoning": "Missing kfree", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "side": "REVISION", "why_this_location_matters": "leaks buf"}]}], "dismissed_concerns": []}"#
                 } else if last_user.contains("# Verification and severity estimation")
                     || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"source_ids": ["C1"], "problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
+                    r#"{"findings": [{"source_ids": ["C1"], "problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "side": "REVISION", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
                 } else if last_user.contains("# LKML-friendly report generation") {
                     "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\nSummary.\n\n> +int x;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but foo() leaks buf on error.\n"
                 } else {

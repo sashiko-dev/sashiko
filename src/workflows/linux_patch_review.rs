@@ -106,7 +106,7 @@ impl LinuxPatchReviewState {
             return;
         };
         let worktree = worktree.clone();
-        let diff_ranges = crate::worker::parse_diff_ranges(&self.target_commit_diff);
+        let parsed_diff = crate::worker::parse_two_sided_diff(&self.target_commit_diff);
         let rev = if !self.target_commit_sha.is_empty() && self.target_commit_sha != "unknown" {
             Some(self.target_commit_sha.as_str())
         } else {
@@ -125,10 +125,10 @@ impl LinuxPatchReviewState {
             &mut self.post_verification_findings,
             &mut self.post_verification_dismissed,
         ] {
-            crate::worker::resolve_finding_locations_with_ranges(
+            crate::worker::resolve_finding_locations_with_parsed_diff(
                 &worktree,
                 rev,
-                &diff_ranges,
+                &parsed_diff,
                 collection,
             );
         }
@@ -356,7 +356,8 @@ Each object in the 'concerns' array MUST use exactly the following keys: "type",
 - "description": A clear description of the problem.
 - "reasoning": A step-by-step explanation.
 - "preexisting": true if this bug already existed in the codebase before these patches were applied, false if the issue was newly introduced by the reviewed patchset.
-- "locations": An array of objects, each containing "file", "function_or_symbol", "line", "code_snippet" and "why_this_location_matters".
+- "locations": An array of objects, each containing "file", "function_or_symbol", "line", "code_snippet", "side" and "why_this_location_matters".
+- "side": "PARENT" if commenting on deleted or pre-patch code (e.g., '-' lines in the diff or baseline code), or "REVISION" if commenting on newly added or modified code (e.g., '+' lines in the diff or post-patch code). Default to "REVISION" when commenting on unchanged context lines.
 Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations". They mean the same as above, except that "description" is the candidate concern that was investigated and disproved, "reasoning" is the evidence proving it does not apply, and "locations" MUST cite the concrete disproving code (the exact guard, lock, cleanup path, or caller/callee implementation that proves the issue cannot occur — not merely repeating the suspected line from the diff).
 
 Use the 'dismissed_concerns' array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
@@ -388,6 +389,7 @@ Example Output:
           "function_or_symbol": "function_name",
           "line": 123,
           "code_snippet": "problematic_code();",
+          "side": "REVISION",
           "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
         }
       ]
@@ -404,6 +406,7 @@ Example Output:
           "function_or_symbol": "function_name",
           "line": 125,
           "code_snippet": "safe_code_path();",
+          "side": "REVISION",
           "why_this_location_matters": "This is where the cleanup path proves the candidate leak does not apply."
         }
       ]
@@ -433,8 +436,44 @@ pub(crate) fn has_valid_proof_location(item: &Value) -> bool {
             .get("code_snippet")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
-        has_file && has_symbol && has_snippet
+        let valid_side = match loc.get("side") {
+            Some(Value::String(s)) => {
+                s.eq_ignore_ascii_case("PARENT") || s.eq_ignore_ascii_case("REVISION")
+            }
+            _ => false,
+        };
+        has_file && has_symbol && has_snippet && valid_side
     })
+}
+
+pub(crate) fn validate_locations_side(
+    locations: &[Value],
+    container: &str,
+    idx: usize,
+) -> Result<(), String> {
+    for (l_idx, loc) in locations.iter().enumerate() {
+        if !loc.is_object() {
+            return Err(format!(
+                "{container}[{idx}].locations[{l_idx}] must be an object."
+            ));
+        }
+        let Some(side_val) = loc.get("side") else {
+            return Err(format!(
+                "{container}[{idx}].locations[{l_idx}] missing required 'side' ('PARENT' or 'REVISION')."
+            ));
+        };
+        let Some(side) = side_val.as_str() else {
+            return Err(format!(
+                "{container}[{idx}].locations[{l_idx}] 'side' must be a string ('PARENT' or 'REVISION')."
+            ));
+        };
+        if !side.eq_ignore_ascii_case("PARENT") && !side.eq_ignore_ascii_case("REVISION") {
+            return Err(format!(
+                "{container}[{idx}].locations[{l_idx}] 'side' must be 'PARENT' or 'REVISION'."
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_concerns_output(
@@ -455,6 +494,11 @@ fn validate_concerns_output(
                 "concerns[{idx}] must have non-empty 'description' and 'reasoning' strings."
             ));
         }
+        let locations = concern.get("locations").and_then(Value::as_array);
+        if locations.is_none() {
+            return Err(format!("concerns[{idx}] must have a 'locations' array."));
+        }
+        validate_locations_side(locations.unwrap(), "concerns", idx)?;
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
@@ -471,9 +515,12 @@ fn validate_concerns_output(
                 "dismissed_concerns[{idx}] must have non-empty 'description' and 'reasoning' strings proving why the candidate concern does not apply."
             ));
         }
+        if let Some(locations) = dismissed.get("locations").and_then(Value::as_array) {
+            validate_locations_side(locations, "dismissed_concerns", idx)?;
+        }
         if !has_valid_proof_location(dismissed) {
             return Err(format!(
-                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
+                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', valid 'side' ('PARENT' or 'REVISION'), and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
             ));
         }
     }
@@ -507,12 +554,14 @@ fn validate_finding_object(finding: &Value, idx: usize) -> Result<(), String> {
         .and_then(Value::as_str)
         .is_some_and(|s| !s.trim().is_empty());
     let has_preexisting = finding.get("preexisting").is_some_and(Value::is_boolean);
-    let has_locations = finding.get("locations").is_some_and(Value::is_array);
-    if !has_problem || !has_severity || !has_explanation || !has_preexisting || !has_locations {
+    let locations = finding.get("locations").and_then(Value::as_array);
+    if !has_problem || !has_severity || !has_explanation || !has_preexisting || locations.is_none()
+    {
         return Err(format!(
             "findings[{idx}] must have non-empty 'problem', valid 'severity' (Low, Medium, High, Critical, or Unknown), non-empty 'severity_explanation', boolean 'preexisting', and a 'locations' array."
         ));
     }
+    validate_locations_side(locations.unwrap(), "findings", idx)?;
     Ok(())
 }
 
@@ -568,6 +617,9 @@ pub fn validate_verification_stage_output(
                 "hard_cases[{idx}] must have non-empty 'type', 'description', 'signal_reason', 'concern_arguments', and 'verification_question' strings, valid 'estimated_severity' (Low, Medium, High, Critical, or Unknown), string 'dismissal_arguments', boolean 'preexisting', and a 'locations' array."
             ));
         }
+        if let Some(locations) = hard_case.get("locations").and_then(Value::as_array) {
+            validate_locations_side(locations, "hard_cases", idx)?;
+        }
     }
 
     if state.all_dismissed_concerns.is_empty() && !output.dismissed_concerns.is_empty() {
@@ -592,9 +644,12 @@ pub fn validate_verification_stage_output(
                 "dismissed_concerns[{idx}] must have non-empty 'description' and 'reasoning' strings."
             ));
         }
+        if let Some(locations) = dismissed.get("locations").and_then(Value::as_array) {
+            validate_locations_side(locations, "dismissed_concerns", idx)?;
+        }
         if !has_valid_proof_location(dismissed) {
             return Err(format!(
-                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', and disproving 'code_snippet'. Unproven or assumption-based dismissals must be classified into 'hard_cases' with signal_reason 'speculative_dismissal'."
+                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', valid 'side' ('PARENT' or 'REVISION'), and disproving 'code_snippet'. Unproven or assumption-based dismissals must be classified into 'hard_cases' with signal_reason 'speculative_dismissal'."
             ));
         }
         let matches_raised_concern = state.all_concerns.iter().any(|c| {
@@ -774,9 +829,12 @@ pub fn validate_post_verification_batch_output(
                 "dismissed_concerns[{idx}] must be an object with non-empty 'description' and 'reasoning' strings."
             ));
         }
+        if let Some(locations) = dismissed.get("locations").and_then(Value::as_array) {
+            validate_locations_side(locations, "dismissed_concerns", idx)?;
+        }
         if !has_valid_proof_location(dismissed) {
             return Err(format!(
-                "dismissed_concerns[{idx}] must include a non-empty 'locations' array with at least one entry containing a non-empty 'code_snippet' proving why the candidate hard case is not a bug."
+                "dismissed_concerns[{idx}] must include a non-empty 'locations' array with at least one entry containing a valid 'side' ('PARENT' or 'REVISION') and non-empty 'code_snippet' proving why the candidate hard case is not a bug."
             ));
         }
     }
@@ -2286,9 +2344,9 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
 - LINEAGE REQUIREMENT ('source_ids'): Every input item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every input item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every output object across 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the exact input "id" string(s) merged into that item (e.g. ["C1", "D2"]). Every input "id" (all C* and D* IDs) MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference C* IDs (any contested C* + D* or promoted D* must go to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference D* IDs (never C* IDs).
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
-- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
+- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations" (array of location objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
 
 Example Output:
 ```json
@@ -2306,6 +2364,7 @@ Example Output:
           "function_or_symbol": "function_name",
           "line": 123,
           "code_snippet": "problematic_code();",
+          "side": "REVISION",
           "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
         }}
       ]
@@ -2328,6 +2387,7 @@ Example Output:
           "function_or_symbol": "parse_tree",
           "line": 88,
           "code_snippet": "return -EINVAL;",
+          "side": "REVISION",
           "why_this_location_matters": "Early error return after allocation without local kfree."
         }}
       ]
@@ -2415,8 +2475,8 @@ Candidate Hard Case(s) to Verify:
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (ONLY if concrete code disproves the candidate; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Each candidate hard case in this batch has an "id" (e.g. "H1"). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the candidate "id"(s) from this batch that it resolves (e.g. ["H1"]), and every candidate "id" in this batch must be accounted for.
-- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; true when the bug already existed at Baseline SHA before the patch series and was already triggerable before the patch, even if it lives in the same function, caller/callee, or cleanup path modified by the patch), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
-- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces the bug or newly exposes, triggers, or makes reachable a latent defect that could not be triggered before the patch; true when the bug already existed at Baseline SHA before the patch series and was already triggerable before the patch, even if it lives in the same function, caller/callee, or cleanup path modified by the patch), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION", quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
 
 Example Output:
 ```json
@@ -2434,6 +2494,7 @@ Example Output:
           "function_or_symbol": "function_name",
           "line": 123,
           "code_snippet": "problematic_code();",
+          "side": "REVISION",
           "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
         }}
       ]
@@ -2450,6 +2511,7 @@ Example Output:
           "function_or_symbol": "caller_fn",
           "line": 125,
           "code_snippet": "err_out:\n\tbar_free(bar);",
+          "side": "REVISION",
           "why_this_location_matters": "This caller error path frees the resource when foo_init() returns an error."
         }}
       ]
@@ -3072,6 +3134,7 @@ mod tests {
                     "function_or_symbol": "bar_probe",
                     "line": 42,
                     "code_snippet": "return -ENOMEM;",
+                    "side": "REVISION",
                     "why_this_location_matters": "Early return leaks buf"
                 }]
             })],
@@ -3084,6 +3147,7 @@ mod tests {
                     "function_or_symbol": "bar_ioctl",
                     "line": 108,
                     "code_snippet": "guard(mutex)(&bar->mutex);\nret = bar_update(bar);",
+                    "side": "REVISION",
                     "why_this_location_matters": "Proves mutex is held by caller"
                 }]
             })],
@@ -3102,6 +3166,7 @@ mod tests {
                     "function_or_symbol": "bar_ioctl",
                     "line": null,
                     "code_snippet": "   ",
+                    "side": "REVISION",
                     "why_this_location_matters": "Unverified assumption"
                 }]
             })],
@@ -3110,6 +3175,75 @@ mod tests {
             .expect_err("dismissed_concern without disproving snippet must fail");
         assert!(err.contains("dismissed_concerns[0]"));
         assert!(err.contains("move the candidate issue to 'concerns'"));
+
+        // Missing side in concerns is rejected.
+        let missing_side = StageConcernsOutput {
+            concerns: vec![json!({
+                "type": "Defect",
+                "description": "Bad code",
+                "reasoning": "Crash",
+                "locations": [{
+                    "file": "foo.c",
+                    "function_or_symbol": "foo",
+                    "code_snippet": "foo();"
+                }]
+            })],
+            dismissed_concerns: vec![],
+        };
+        let missing_side_err = validate_concerns_output(&missing_side, &state)
+            .expect_err("missing side must fail validation");
+        assert!(missing_side_err.contains("missing required 'side'"));
+
+        // Invalid side in concerns is rejected with an actionable error.
+        let invalid_side = StageConcernsOutput {
+            concerns: vec![json!({
+                "type": "Defect",
+                "description": "Bad code",
+                "reasoning": "Crash",
+                "locations": [{
+                    "file": "foo.c",
+                    "function_or_symbol": "foo",
+                    "code_snippet": "foo();",
+                    "side": "INVALID_SIDE"
+                }]
+            })],
+            dismissed_concerns: vec![],
+        };
+        let side_err = validate_concerns_output(&invalid_side, &state)
+            .expect_err("invalid side must fail validation");
+        assert!(side_err.contains("'side' must be 'PARENT' or 'REVISION'"));
+
+        // Non-string side in concerns is rejected with type-specific feedback.
+        let non_string_side = StageConcernsOutput {
+            concerns: vec![json!({
+                "type": "Defect",
+                "description": "Bad code",
+                "reasoning": "Crash",
+                "locations": [{
+                    "file": "foo.c",
+                    "function_or_symbol": "foo",
+                    "code_snippet": "foo();",
+                    "side": 123
+                }]
+            })],
+            dismissed_concerns: vec![],
+        };
+        let type_err = validate_concerns_output(&non_string_side, &state)
+            .expect_err("non-string side must fail validation");
+        assert!(type_err.contains("must be a string ('PARENT' or 'REVISION')"));
+
+        // Missing locations in concerns is rejected.
+        let missing_locs = StageConcernsOutput {
+            concerns: vec![json!({
+                "type": "Defect",
+                "description": "Bad code",
+                "reasoning": "Crash"
+            })],
+            dismissed_concerns: vec![],
+        };
+        let loc_err = validate_concerns_output(&missing_locs, &state)
+            .expect_err("missing locations array must fail validation");
+        assert!(loc_err.contains("must have a 'locations' array"));
     }
 
     #[test]
@@ -3157,7 +3291,7 @@ mod tests {
                 "severity": "High",
                 "severity_explanation": "Leaks buf on error path",
                 "preexisting": false,
-                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo"}]
+                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo", "side": "REVISION"}]
             })],
             hard_cases: vec![],
             dismissed_concerns: vec![json!({
@@ -3167,7 +3301,8 @@ mod tests {
                 "locations": [{
                     "file": "mm/bar.c",
                     "function_or_symbol": "bar",
-                    "code_snippet": "spin_lock(&lock);"
+                    "code_snippet": "spin_lock(&lock);",
+                    "side": "REVISION"
                 }]
             })],
         };
@@ -3187,7 +3322,8 @@ mod tests {
                 "locations": [{
                     "file": "mm/baz.c",
                     "function_or_symbol": "baz",
-                    "code_snippet": "if (!ptr) return -EINVAL;"
+                    "code_snippet": "if (!ptr) return -EINVAL;",
+                    "side": "REVISION"
                 }]
             })],
         };
@@ -3203,7 +3339,7 @@ mod tests {
                 "severity": "High",
                 "severity_explanation": "Leaks buf on error path",
                 "preexisting": false,
-                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo"}]
+                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo", "side": "REVISION"}]
             })],
             hard_cases: vec![],
             dismissed_concerns: vec![],
@@ -3227,7 +3363,7 @@ mod tests {
                 "severity": "High",
                 "severity_explanation": "Leaks buf on error path",
                 "preexisting": false,
-                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo"}]
+                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo", "side": "REVISION"}]
             })],
             hard_cases: vec![json!({
                 "type": "Locking",
@@ -3238,7 +3374,7 @@ mod tests {
                 "dismissal_arguments": "Caller might hold lock",
                 "verification_question": "Does caller hold lock across bar()?",
                 "preexisting": false,
-                "locations": [{"file": "mm/bar.c", "function_or_symbol": "bar"}]
+                "locations": [{"file": "mm/bar.c", "function_or_symbol": "bar", "side": "REVISION"}]
             })],
             dismissed_concerns: vec![
                 json!({
@@ -3248,7 +3384,8 @@ mod tests {
                     "locations": [{
                         "file": "mm/baz.c",
                         "function_or_symbol": "baz",
-                        "code_snippet": "if (!ptr) return -EINVAL;"
+                        "code_snippet": "if (!ptr) return -EINVAL;",
+                        "side": "REVISION"
                     }]
                 }),
                 json!({
@@ -3258,7 +3395,8 @@ mod tests {
                     "locations": [{
                         "file": "mm/foo.c",
                         "function_or_symbol": "foo",
-                        "code_snippet": "if (!arg) return -EINVAL;"
+                        "code_snippet": "if (!arg) return -EINVAL;",
+                        "side": "REVISION"
                     }]
                 }),
             ],
@@ -3289,7 +3427,8 @@ mod tests {
                     "file": "mm/foo.c",
                     "function_or_symbol": "bar",
                     "line": 88,
-                    "code_snippet": "if (err) kfree(buf);"
+                    "code_snippet": "if (err) kfree(buf);",
+                    "side": "REVISION"
                 }]
             })],
         };
@@ -3304,7 +3443,8 @@ mod tests {
                 "locations": [{
                     "file": "mm/foo.c",
                     "function_or_symbol": "bar",
-                    "line": 88
+                    "line": 88,
+                    "side": "REVISION"
                 }]
             })],
         };
@@ -3322,7 +3462,7 @@ mod tests {
                 "severity": "High",
                 "severity_explanation": "Buffer allocated in foo() is not freed on error return.",
                 "preexisting": false,
-                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo", "line": 42}]
+                "locations": [{"file": "mm/foo.c", "function_or_symbol": "foo", "line": 42, "side": "REVISION"}]
             })],
             dismissed_concerns: vec![],
         };
@@ -3742,7 +3882,7 @@ mod tests {
                 "severity": "High",
                 "severity_explanation": "foo_tx() mutates x without holding foo_lock",
                 "preexisting": true,
-                "locations": [{"file": "net/foo.c", "function_or_symbol": "foo_tx", "line": 42, "code_snippet": "x++;", "why_this_location_matters": "unlocked"}]
+                "locations": [{"file": "net/foo.c", "function_or_symbol": "foo_tx", "line": 42, "code_snippet": "x++;", "side": "REVISION", "why_this_location_matters": "unlocked"}]
             })],
             hard_cases: vec![],
             dismissed_concerns: vec![],
@@ -3854,7 +3994,7 @@ mod tests {
                 "description": "Deadlock in foo_lock()",
                 "reasoning": "Takes spin_lock inside rcu",
                 "preexisting": false,
-                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42}]
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42, "side": "REVISION"}]
             })],
             "locking",
             "General",
@@ -3872,7 +4012,7 @@ mod tests {
                 "type": "Execution Flow",
                 "description": "Deadlock in foo_lock()",
                 "reasoning": "Claimed safe",
-                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 44, "code_snippet": "spin_lock(&l);"}]
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 44, "code_snippet": "spin_lock(&l);", "side": "REVISION"}]
             })],
             "execution-flow",
             &exec_prompts,
@@ -3914,7 +4054,7 @@ mod tests {
                 "dismissal_arguments": "Claimed safe",
                 "verification_question": "Is foo_lock() called under RCU?",
                 "preexisting": false,
-                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42}]
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42, "side": "REVISION"}]
             })],
             dismissed_concerns: vec![],
         };
@@ -3953,7 +4093,7 @@ mod tests {
                 "severity": "High",
                 "severity_explanation": "Verified deadlock",
                 "preexisting": false,
-                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42}]
+                "locations": [{"file": "net/core/dev.c", "function_or_symbol": "foo_lock", "line": 42, "side": "REVISION"}]
             })],
             dismissed_concerns: vec![],
         };
@@ -4015,7 +4155,8 @@ mod tests {
             "file": "net/core/dev.c",
             "function_or_symbol": "foo",
             "line": 10,
-            "code_snippet": "if (!ptr) return;"
+            "code_snippet": "if (!ptr) return;",
+            "side": "REVISION"
         }]);
 
         // Missing C2 in source_ids must be rejected.
@@ -4224,6 +4365,7 @@ mod tests {
                 "locations": [{
                     "file": "net/core/dev.c",
                     "code_snippet": "return 0;",
+                    "side": "REVISION"
                 }]
             })],
             hard_cases: vec![],

@@ -35,8 +35,9 @@ use crate::workflows::linux_patch_review::{
     batch_hard_cases_by_severity, build_stage_efforts_schema, collect_stage_prompts,
     extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
     format_post_verification_feedback, format_verification_stage_feedback,
-    has_valid_proof_location, resolve_stage_effort, validate_planning_stage_efforts,
-    validate_post_verification_batch_items, validate_verification_stage_output,
+    has_valid_proof_location, resolve_stage_effort, validate_locations_side,
+    validate_planning_stage_efforts, validate_post_verification_batch_items,
+    validate_verification_stage_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -299,7 +300,9 @@ After:
 const CONCERN_JSON_SCHEMA_EXAMPLE: &str = r#"Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
 Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
 Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations".
-In each 'dismissed_concerns' object, "description" is the candidate concern that was investigated and disproved, "reasoning" is the step-by-step explanation of why it is not a bug (citing the exact guard, caller, or invariant), and "locations" MUST cite the concrete disproving code (file, function_or_symbol, line, verbatim code_snippet, and why_this_location_matters).
+Each location object in "locations" (for both 'concerns' and 'dismissed_concerns') MUST include "file", "function_or_symbol", "line", "code_snippet", "side", and "why_this_location_matters".
+- "side": "PARENT" if commenting on deleted or pre-patch code (e.g., '-' lines in the diff or baseline code), or "REVISION" if commenting on newly added or modified code (e.g., '+' lines in the diff or post-patch code). Default to "REVISION" when commenting on unchanged context lines.
+In each 'dismissed_concerns' object, "description" is the candidate concern that was investigated and disproved, "reasoning" is the step-by-step explanation of why it is not a bug (citing the exact guard, caller, or invariant), and "locations" MUST cite the concrete disproving code (file, function_or_symbol, line, verbatim code_snippet, side, and why_this_location_matters).
 Use the 'dismissed_concerns' array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
 
 PRE-EXISTING BUGS: Do not actively hunt for unrelated bugs outside the reviewed commit and its call paths. However, if while analyzing the commit you spot a concrete bug that already existed in the codebase before this series (`Baseline SHA`) and is not fixed by the commit, you MUST still report it in 'concerns' with `"preexisting": true` (`"preexisting": true` items are routed to the pre-existing bug tracker and are not posted as patch regressions). Never silently drop a real pre-existing bug or place it in 'dismissed_concerns' merely because it was not introduced by this change.
@@ -325,6 +328,7 @@ Example Output:
           "function_or_symbol": "Worker::run",
           "line": 45,
           "code_snippet": "let res = provider.call().await;",
+          "side": "REVISION",
           "why_this_location_matters": "Yielding to Tokio runtime while holding a synchronous MutexGuard can deadlock worker threads."
         }
       ]
@@ -341,6 +345,7 @@ Example Output:
           "function_or_symbol": "format_subject",
           "line": 88,
           "code_snippet": "let cutoff = s.char_indices().nth(max_len)...",
+          "side": "REVISION",
           "why_this_location_matters": "Proves slice index is always on a UTF-8 character boundary."
         }
       ]
@@ -568,9 +573,11 @@ fn validate_concerns_output(
                 "concerns[{idx}] must have a boolean 'preexisting' field (true or false)."
             ));
         }
-        if !obj.get("locations").is_some_and(Value::is_array) {
+        let locations = obj.get("locations").and_then(Value::as_array);
+        if locations.is_none() {
             return Err(format!("concerns[{idx}] must have a 'locations' array."));
         }
+        validate_locations_side(locations.unwrap(), "concerns", idx)?;
     }
 
     for (idx, dismissed) in output.dismissed_concerns.iter().enumerate() {
@@ -595,9 +602,12 @@ fn validate_concerns_output(
                 "dismissed_concerns[{idx}] must have a non-empty 'reasoning' string."
             ));
         }
+        if let Some(locations) = obj.get("locations").and_then(Value::as_array) {
+            validate_locations_side(locations, "dismissed_concerns", idx)?;
+        }
         if !has_valid_proof_location(dismissed) {
             return Err(format!(
-                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
+                "dismissed_concerns[{idx}] must include at least one entry in 'locations' with non-empty 'file', 'function_or_symbol', valid 'side' ('PARENT' or 'REVISION'), and verbatim disproving 'code_snippet' proving the candidate concern cannot occur. If you do not have concrete code proof, move the candidate issue to 'concerns' instead."
             ));
         }
     }
@@ -1017,9 +1027,9 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
 - LINEAGE REQUIREMENT ('source_ids'): Every item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every object in 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact input "C*" and/or "D*" IDs consolidated into that output item. Every input "C*" and "D*" ID MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference "C*" IDs (any contested "C*" + "D*" or promoted "D*" must be routed to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference "D*" IDs in "source_ids" (never "C*" IDs).
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of "C*" IDs only), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
-- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts"."#
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of "C*" IDs only), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
+- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations" (array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION"), and may include "stages" and "prompts"."#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -1100,8 +1110,8 @@ Candidate Hard Case(s) to Verify:
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (if disproved by concrete code or excluded by rules 1-2; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Every candidate hard case in this batch has an "id" ("H1", "H2", ...). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact candidate "H*" ID(s) from this batch that it resolves, and every candidate "H*" ID in this batch MUST be accounted for in at least one output item's "source_ids".
-- Each object in 'findings' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, Critical, or Unknown), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).
-- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code or target snippet)."#
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, Critical, or Unknown), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" for deleted/pre-patch code or "REVISION" for added/modified/context code).
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, side, and why_this_location_matters; side MUST be "PARENT" or "REVISION", quoting the verbatim disproving code or target snippet)."#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -1877,6 +1887,24 @@ mod tests {
             STAGE_POST_VERIFICATION_INSTRUCTION.contains("SYMMETRICAL PROOF BAR")
                 && STAGE_POST_VERIFICATION_INSTRUCTION.contains("ALL-CALLERS VERIFICATION"),
             "Sashiko post-verification stage must enforce symmetrical proof bar and all-callers verification"
+        );
+
+        let state = SashikoPatchReviewState::default();
+        let v_stage = verification_stage(5, 0.2);
+        assert!(
+            v_stage
+                .user_prompt
+                .render_for_log(&state)
+                .contains(r#"side MUST be "PARENT""#),
+            "Sashiko verification stage user prompt must define valid side enum values"
+        );
+        let pv_stage = post_verification_stage("post-verification-1", vec![], 5, 0.2);
+        assert!(
+            pv_stage
+                .user_prompt
+                .render_for_log(&state)
+                .contains(r#"side MUST be "PARENT""#),
+            "Sashiko post-verification stage user prompt must define valid side enum values"
         );
     }
 }
