@@ -2511,10 +2511,14 @@ impl Database {
         bug_id: i64,
         enrichment: &NewBugEnrichment,
     ) -> Result<i64> {
-        if self.bug_claim.is_none() {
+        if self.in_transaction {
             return self.insert_bug_enrichment(bug_id, enrichment).await;
         }
-        let tx = self.begin_bug_write(bug_id).await?;
+        let tx = if self.bug_claim.is_some() {
+            self.begin_bug_write(bug_id).await?
+        } else {
+            self.begin_transaction().await?
+        };
         let id = self
             .with_connection((*tx).clone())
             .insert_bug_enrichment(bug_id, enrichment)
@@ -2547,37 +2551,68 @@ impl Database {
         } else {
             chrono::Utc::now().timestamp()
         };
+        let effective_tool = if enrichment.tool.is_empty() {
+            self.bug_tool.as_str()
+        } else {
+            enrichment.tool.as_str()
+        };
+        let effective_model = enrichment.model.clone().or_else(|| self.bug_model.clone());
 
-        self.query_returning_i64(
-            "INSERT INTO bug_enrichments (
-                bug_id, kind, tool, model, author, created_at, content, data_json,
-                tokens_in, tokens_out, tokens_cached, logs
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING id",
-            libsql::params![
-                bug_id,
-                enrichment.kind.as_str(),
-                if enrichment.tool.is_empty() {
-                    self.bug_tool.as_str()
-                } else {
-                    enrichment.tool.as_str()
-                },
-                enrichment.model.clone().or_else(|| self.bug_model.clone()),
-                enrichment
-                    .author
-                    .clone()
-                    .or_else(|| Some(self.bug_actor.clone())),
-                now,
-                compressed_content,
-                data_json_str,
-                enrichment.tokens_in.map(|t| t as i64),
-                enrichment.tokens_out.map(|t| t as i64),
-                enrichment.tokens_cached.map(|t| t as i64),
-                compressed_logs,
-            ],
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Failed to insert bug enrichment: no id returned"))
+        let id = self
+            .query_returning_i64(
+                "INSERT INTO bug_enrichments (
+                    bug_id, kind, tool, model, author, created_at, content, data_json,
+                    tokens_in, tokens_out, tokens_cached, logs
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 RETURNING id",
+                libsql::params![
+                    bug_id,
+                    enrichment.kind.as_str(),
+                    effective_tool,
+                    effective_model.clone(),
+                    enrichment
+                        .author
+                        .clone()
+                        .or_else(|| Some(self.bug_actor.clone())),
+                    now,
+                    compressed_content.clone(),
+                    data_json_str,
+                    enrichment.tokens_in.map(|t| t as i64),
+                    enrichment.tokens_out.map(|t| t as i64),
+                    enrichment.tokens_cached.map(|t| t as i64),
+                    compressed_logs,
+                ],
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Failed to insert bug enrichment: no id returned"))?;
+
+        if enrichment.tokens_in.is_some()
+            || enrichment.tokens_out.is_some()
+            || enrichment.tokens_cached.is_some()
+        {
+            let interaction_id = format!("bug_enrichment:{id}");
+            self.execute(
+                "INSERT OR REPLACE INTO ai_interactions (
+                    id, parent_interaction_id, workflow_id, provider, model,
+                    input_context, output_raw, tokens_in, tokens_out, tokens_cached, created_at
+                 ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    interaction_id,
+                    effective_tool,
+                    effective_tool,
+                    effective_model.unwrap_or_default(),
+                    enrichment.kind.as_str(),
+                    compressed_content,
+                    enrichment.tokens_in.unwrap_or(0) as i64,
+                    enrichment.tokens_out.unwrap_or(0) as i64,
+                    enrichment.tokens_cached.unwrap_or(0) as i64,
+                    now,
+                ],
+            )
+            .await?;
+        }
+
+        Ok(id)
     }
 
     pub async fn get_bug_enrichments(&self, bug_id: i64) -> Result<Vec<BugEnrichment>> {
@@ -4921,27 +4956,24 @@ impl Database {
         )
         .await?;
 
-        let compressed_logs = params
-            .logs
-            .map(crate::compression::compress_string_if_needed)
-            .unwrap_or(libsql::Value::Null);
-
-        tx.execute(
-            "INSERT INTO bug_enrichments (
-                bug_id, kind, tool, author, model, created_at, content, tokens_in, tokens_out, tokens_cached, logs
-             ) VALUES (?, 'deduplication', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            libsql::params![
+        self.with_connection((*tx).clone())
+            .insert_bug_enrichment(
                 params.ephemeral_id,
-                self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(),
-                now,
-                params.reasoning,
-                params.tokens_in.map(|t| t as i64),
-                params.tokens_out.map(|t| t as i64),
-                params.tokens_cached.map(|t| t as i64),
-                compressed_logs,
-            ],
-        )
-        .await?;
+                &NewBugEnrichment {
+                    kind: "deduplication".to_string(),
+                    tool: self.bug_tool.clone(),
+                    author: Some(self.bug_actor.clone()),
+                    model: self.bug_model.clone(),
+                    created_at: now,
+                    content: Some(params.reasoning.to_string()),
+                    tokens_in: params.tokens_in,
+                    tokens_out: params.tokens_out,
+                    tokens_cached: params.tokens_cached,
+                    logs: params.logs.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         // is_newly_discovered is written explicitly. A migrated link records a
         // review that rediscovered an existing bug, so omitting the column and
@@ -5421,10 +5453,44 @@ impl Database {
             }));
         }
 
+        let bug_sql = "WITH last_bugs AS (
+            SELECT id FROM bugs ORDER BY id DESC LIMIT 1000
+        )
+        SELECT
+            count(DISTINCT e.bug_id),
+            count(*),
+            COALESCE(sum(COALESCE(e.tokens_in, 0)), 0),
+            COALESCE(sum(COALESCE(e.tokens_out, 0)), 0),
+            COALESCE(sum(COALESCE(e.tokens_cached, 0)), 0)
+        FROM last_bugs b
+        JOIN bug_enrichments e INDEXED BY idx_bug_enrichments_bug_id ON e.bug_id = b.id
+        WHERE e.tokens_in IS NOT NULL OR e.tokens_out IS NOT NULL OR e.tokens_cached IS NOT NULL";
+
+        let mut bug_rows = self.conn.query(bug_sql, ()).await?;
+        let (bug_count, bug_stage_count, bug_tokens_in, bug_tokens_out, bug_tokens_cached) =
+            if let Ok(Some(row)) = bug_rows.next().await {
+                (
+                    row.get::<i64>(0).unwrap_or(0),
+                    row.get::<i64>(1).unwrap_or(0),
+                    row.get::<i64>(2).unwrap_or(0),
+                    row.get::<i64>(3).unwrap_or(0),
+                    row.get::<i64>(4).unwrap_or(0),
+                )
+            } else {
+                (0, 0, 0, 0, 0)
+            };
+
         Ok(json!({
             "total_reviews": total_reviews,
             "total_failures": total_failures,
-            "reviews": stats
+            "reviews": stats,
+            "bug_tokens": {
+                "bugs_analyzed": bug_count,
+                "enrichment_stages": bug_stage_count,
+                "tokens_in": bug_tokens_in,
+                "tokens_out": bug_tokens_out,
+                "tokens_cached": bug_tokens_cached
+            }
         }))
     }
 
@@ -18830,6 +18896,32 @@ mod tests {
         assert_eq!(bug.tokens_in(), 4000 + 1500 + 2000);
         assert_eq!(bug.tokens_out(), 500 + 200 + 150);
         assert_eq!(bug.tokens_cached(), 3000 + 1000 + 1500);
+
+        // Verify bug enrichment token usage is mirrored to ai_interactions and get_review_stats
+        let mut ai_rows = db
+            .conn
+            .query(
+                "SELECT count(*), COALESCE(sum(tokens_in), 0), COALESCE(sum(tokens_out), 0), COALESCE(sum(tokens_cached), 0)
+                 FROM ai_interactions WHERE id LIKE 'bug_enrichment:%'",
+                (),
+            )
+            .await
+            .unwrap();
+        let ai_row = ai_rows.next().await.unwrap().unwrap();
+        assert_eq!(ai_row.get::<i64>(0).unwrap(), 3);
+        assert_eq!(ai_row.get::<i64>(1).unwrap(), 4000 + 1500 + 2000);
+        assert_eq!(ai_row.get::<i64>(2).unwrap(), 500 + 200 + 150);
+        assert_eq!(ai_row.get::<i64>(3).unwrap(), 3000 + 1000 + 1500);
+
+        let review_stats = db.get_review_stats().await.unwrap();
+        assert_eq!(review_stats["bug_tokens"]["bugs_analyzed"], 1);
+        assert_eq!(review_stats["bug_tokens"]["enrichment_stages"], 3);
+        assert_eq!(review_stats["bug_tokens"]["tokens_in"], 4000 + 1500 + 2000);
+        assert_eq!(review_stats["bug_tokens"]["tokens_out"], 500 + 200 + 150);
+        assert_eq!(
+            review_stats["bug_tokens"]["tokens_cached"],
+            3000 + 1000 + 1500
+        );
 
         // Verify enrichments timeline length and chronological order
         assert_eq!(bug.enrichments.len(), 9);

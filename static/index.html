@@ -6597,6 +6597,19 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 html += renderStatCard('Cached tokens/patch', formatTokenCount(avgTokensCached));
                 html += renderStatCard('Out tokens/patch', formatTokenCount(avgTokensOut));
                 html += '</div>';
+
+                const bugTokens = reviewsData.bug_tokens;
+                if (bugTokens && bugTokens.bugs_analyzed > 0) {
+                    const bugUncachedIn = Math.max(0, (bugTokens.tokens_in || 0) - (bugTokens.tokens_cached || 0));
+                    const avgBugIn = Math.round(bugUncachedIn / bugTokens.bugs_analyzed);
+                    const avgBugCached = Math.round((bugTokens.tokens_cached || 0) / bugTokens.bugs_analyzed);
+                    const avgBugOut = Math.round((bugTokens.tokens_out || 0) / bugTokens.bugs_analyzed);
+                    html += '<h3>Bug Pipeline Token Usage (last 1k bugs)</h3><div class="stat-card-grid">';
+                    html += renderStatCard('Input tokens/bug', formatTokenCount(avgBugIn));
+                    html += renderStatCard('Cached tokens/bug', formatTokenCount(avgBugCached));
+                    html += renderStatCard('Out tokens/bug', formatTokenCount(avgBugOut));
+                    html += '</div>';
+                }
                 
                 html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
 
