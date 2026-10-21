@@ -160,8 +160,20 @@ pub struct UsageMetadata {
     pub total_token_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_content_token_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thoughts_token_count: Option<u32>,
     #[serde(flatten)]
     pub extra: Option<std::collections::HashMap<String, Value>>,
+}
+
+impl UsageMetadata {
+    /// Total output tokens billed by Gemini, combining visible candidate tokens
+    /// and internal reasoning (`thoughtsTokenCount`) tokens.
+    pub fn output_token_count(&self) -> u32 {
+        self.candidates_token_count
+            .unwrap_or(0)
+            .saturating_add(self.thoughts_token_count.unwrap_or(0))
+    }
 }
 
 #[async_trait]
@@ -390,11 +402,13 @@ pub(crate) async fn read_generate_content_response(
             Some(usage) => {
                 let cached = usage.cached_content_token_count.unwrap_or(0);
                 tracing::info!(
-                    "{}Gemini response received. Tokens: in={}, cached={}, out={}",
+                    "{}Gemini response received. Tokens: in={}, cached={}, out={} (candidates={}, thoughts={})",
                     crate::ai::get_log_prefix(),
                     usage.prompt_token_count.saturating_sub(cached),
                     cached,
-                    usage.candidates_token_count.unwrap_or(0)
+                    usage.output_token_count(),
+                    usage.candidates_token_count.unwrap_or(0),
+                    usage.thoughts_token_count.unwrap_or(0)
                 );
             }
             None => tracing::info!(
@@ -808,6 +822,8 @@ pub(crate) fn merge_continuation_response(
                 acc_u.cached_content_token_count,
                 next_u.cached_content_token_count,
             );
+            acc_u.thoughts_token_count =
+                sum_optional_u32(acc_u.thoughts_token_count, next_u.thoughts_token_count);
         }
         (None, Some(next_u)) => {
             acc.usage_metadata = Some(next_u);
@@ -1228,7 +1244,7 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
 
     let usage = resp.usage_metadata.map(|m| AiUsage {
         prompt_tokens: m.prompt_token_count as usize,
-        completion_tokens: m.candidates_token_count.unwrap_or(0) as usize,
+        completion_tokens: m.output_token_count() as usize,
         total_tokens: m.total_token_count as usize,
         cached_tokens: m.cached_content_token_count.map(|c| c as usize),
     });
@@ -1968,6 +1984,7 @@ mod tests {
                 candidates_token_count: Some(20),
                 total_token_count: 30,
                 cached_content_token_count: None,
+                thoughts_token_count: None,
                 extra: None,
             }),
         };
@@ -2465,13 +2482,21 @@ mod tests {
             "usageMetadata": {
                 "promptTokenCount": 100,
                 "candidatesTokenCount": 50,
-                "totalTokenCount": 150
+                "thoughtsTokenCount": 150,
+                "totalTokenCount": 300
             }
         });
 
         let parsed: GenerateContentResponse = serde_json::from_value(raw)?;
         let ai_resp = translate_ai_response(parsed)?;
         assert_eq!(ai_resp.thought.as_deref(), Some("thinking part 1 "));
+        let usage = ai_resp.usage.expect("expected usage metadata");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(
+            usage.completion_tokens, 200,
+            "completion_tokens must sum candidatesTokenCount and thoughtsTokenCount"
+        );
+        assert_eq!(usage.total_tokens, 300);
         let calls = ai_resp.tool_calls.expect("expected tool call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function_name, "git_diff");
@@ -2544,7 +2569,8 @@ mod tests {
                     "usageMetadata": {
                         "promptTokenCount": 1000,
                         "candidatesTokenCount": 32768,
-                        "totalTokenCount": 33768,
+                        "thoughtsTokenCount": 1000,
+                        "totalTokenCount": 34768,
                         "cachedContentTokenCount": 800
                     }
                 }),
@@ -2561,7 +2587,8 @@ mod tests {
                     "usageMetadata": {
                         "promptTokenCount": 33768,
                         "candidatesTokenCount": 120,
-                        "totalTokenCount": 33888,
+                        "thoughtsTokenCount": 200,
+                        "totalTokenCount": 34088,
                         "cachedContentTokenCount": 33000
                     }
                 }),
@@ -2636,8 +2663,8 @@ mod tests {
         assert_eq!(ai_resp.content.as_deref(), Some("{\"findings\": []}"));
         let usage = ai_resp.usage.expect("expected usage metadata");
         assert_eq!(usage.prompt_tokens, 34_768);
-        assert_eq!(usage.completion_tokens, 32_888);
-        assert_eq!(usage.total_tokens, 67_656);
+        assert_eq!(usage.completion_tokens, 34_088);
+        assert_eq!(usage.total_tokens, 68_856);
         assert_eq!(usage.cached_tokens, Some(33_800));
 
         Ok(())

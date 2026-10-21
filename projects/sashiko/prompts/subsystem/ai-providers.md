@@ -85,8 +85,12 @@ fn cache_identity(&self) -> String { self.get_capabilities().model_name }
   fires; one that under-reports `prompt_tokens` does the same.
 
   **When a diff touches usage parsing, verify by hand:**
-  `cached_tokens <= prompt_tokens` for every path, and
-  `prompt_tokens` includes the cached prefix.
+  `cached_tokens <= prompt_tokens` for every path,
+  `prompt_tokens` includes the cached prefix, and `completion_tokens`
+  includes billed reasoning/thinking tokens (for Gemini,
+  `candidatesTokenCount + thoughtsTokenCount`, since Gemini reports
+  `thoughtsTokenCount` separately while billing it at the output rate and
+  counting it against `maxOutputTokens`).
 
 - **`tool_calls[].id`** — the id is what `SessionRunner` writes back as
   `tool_call_id` on the `AiRole::Tool` message, and what each provider's
