@@ -679,6 +679,8 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
 /// guarding against unbounded memory allocation on massive generated files or binary blobs.
 pub const MAX_RESOLVE_FILE_SIZE: u64 = 4 * 1024 * 1024;
 
+/// Resolved location with verified 1-based line numbers and character offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLocation {
     pub file: String,
     pub line: usize,
@@ -687,6 +689,7 @@ pub struct ResolvedLocation {
     pub start_character: Option<usize>,
     pub end_character: Option<usize>,
     pub in_diff: bool,
+    pub side: Option<String>,
     pub code_snippet: Option<String>,
 }
 
@@ -835,7 +838,11 @@ fn read_file_content(
         }
     }
 
-    // 2. Fall back to reading from the physical worktree disk
+    // 2. Fall back to reading from the physical worktree disk ONLY when no explicit revision was requested
+    if revision.is_some() {
+        return None;
+    }
+
     let file_path = worktree_path.join(norm_file);
     let Ok(metadata) = file_path.metadata() else {
         return None;
@@ -857,16 +864,8 @@ fn read_file_content(
     std::fs::read_to_string(&file_path).ok()
 }
 
-/// Locates a snippet in a list of file lines.
-/// Returns 0-based `(start_idx, end_idx)` if a match is found.
-pub fn find_snippet_in_lines(
-    file_lines: &[&str],
-    snippet: &str,
-    hint_line: Option<usize>,
-    file_diff_ranges: Option<&Vec<(usize, usize)>>,
-    symbol_line: Option<usize>,
-) -> Option<(usize, usize)> {
-    let raw_snippet_lines: Vec<&str> = snippet.lines().collect();
+fn parse_snippet_lines<'a>(snippet: &'a str) -> Option<Vec<&'a str>> {
+    let raw_snippet_lines: Vec<&'a str> = snippet.lines().collect();
     let start_trim = raw_snippet_lines
         .iter()
         .position(|l| !l.trim().is_empty())
@@ -877,55 +876,78 @@ pub fn find_snippet_in_lines(
         .map(|p| p + 1)
         .unwrap_or(0);
 
-    if start_trim >= end_trim || file_lines.is_empty() {
+    if start_trim >= end_trim {
         return None;
     }
 
-    let snippet_lines: Vec<&str> = raw_snippet_lines[start_trim..end_trim]
-        .iter()
-        .map(|l| l.trim())
-        .collect();
+    Some(
+        raw_snippet_lines[start_trim..end_trim]
+            .iter()
+            .map(|l| l.trim())
+            .collect(),
+    )
+}
 
-    // 1. Multi-line trimmed match with blank-line tolerance
+/// Locates a full multi-line snippet in a list of file lines as an exact subsequence.
+pub fn find_snippet_in_lines_exact(
+    file_lines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    file_diff_ranges: Option<&Vec<(usize, usize)>>,
+    symbol_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    if file_lines.is_empty() {
+        return None;
+    }
+    let snippet_lines = parse_snippet_lines(snippet)?;
     let first_snip = snippet_lines
         .iter()
         .find(|l| !l.is_empty())
         .copied()
         .unwrap_or("");
-    if !first_snip.is_empty() {
-        let mut candidates = Vec::new();
-        for (i, line) in file_lines.iter().enumerate() {
-            if line.trim() == first_snip
-                && let Some(end_idx) = match_snippet_subsequence(file_lines, &snippet_lines, i)
-            {
-                candidates.push((i, end_idx));
-            }
-        }
-        if let Some(best) =
-            pick_closest_candidate(candidates, hint_line, file_diff_ranges, symbol_line)
+    if first_snip.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    for (i, line) in file_lines.iter().enumerate() {
+        if line.trim() == first_snip
+            && let Some(end_idx) = match_snippet_subsequence(file_lines, &snippet_lines, i)
         {
-            return Some(best);
+            candidates.push((i, end_idx));
         }
     }
+    pick_closest_candidate(candidates, hint_line, file_diff_ranges, symbol_line)
+}
 
-    // 2. Fall back to matching the longest non-trivial trimmed line
-    let mut longest_line = "";
-    let mut longest_chars = 0;
-    let mut longest_idx = 0;
-    for (idx, line) in snippet_lines.iter().enumerate() {
-        let count = line.chars().count();
-        if count > longest_chars {
-            longest_line = line;
-            longest_chars = count;
-            longest_idx = idx;
-        }
+/// Locates a snippet in a list of file lines by falling back to matching candidate
+/// lines in descending order of length (for lines >= 4 chars) and expanding outwards.
+pub fn find_snippet_in_lines_fallback(
+    file_lines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    file_diff_ranges: Option<&Vec<(usize, usize)>>,
+    symbol_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    if file_lines.is_empty() {
+        return None;
     }
+    let snippet_lines = parse_snippet_lines(snippet)?;
 
-    if longest_chars >= 4 {
+    let mut candidate_lines: Vec<(usize, &str)> = snippet_lines
+        .iter()
+        .enumerate()
+        .map(|(idx, &l)| (idx, l))
+        .filter(|(_, l)| l.chars().count() >= 4)
+        .collect();
+    candidate_lines.sort_by_key(|(_, l)| std::cmp::Reverse(l.chars().count()));
+
+    for (cand_idx, cand_line) in candidate_lines {
+        let cand_chars = cand_line.chars().count();
         let mut candidates = Vec::new();
         for (i, line) in file_lines.iter().enumerate() {
             let trimmed = line.trim();
-            if trimmed == longest_line || (longest_chars >= 8 && trimmed.contains(longest_line)) {
+            if trimmed == cand_line || (cand_chars >= 8 && trimmed.contains(cand_line)) {
                 candidates.push(i);
             }
         }
@@ -938,7 +960,7 @@ pub fn find_snippet_in_lines(
 
             // Expand backwards against snippet lines, allowing intervening blank lines
             let mut curr_file_i = best_i;
-            for &raw in snippet_lines[..longest_idx].iter().rev() {
+            for &raw in snippet_lines[..cand_idx].iter().rev() {
                 if raw.is_empty() {
                     continue;
                 }
@@ -964,7 +986,7 @@ pub fn find_snippet_in_lines(
 
             // Expand forwards against snippet lines, allowing intervening blank lines
             let mut curr_file_i = best_i;
-            for &raw in snippet_lines[longest_idx + 1..].iter() {
+            for &raw in snippet_lines[cand_idx + 1..].iter() {
                 if raw.is_empty() {
                     continue;
                 }
@@ -993,6 +1015,33 @@ pub fn find_snippet_in_lines(
     }
 
     None
+}
+
+/// Locates a snippet in a list of file lines.
+/// Returns 0-based `(start_idx, end_idx)` if a match is found.
+pub fn find_snippet_in_lines(
+    file_lines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    file_diff_ranges: Option<&Vec<(usize, usize)>>,
+    symbol_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    find_snippet_in_lines_exact(
+        file_lines,
+        snippet,
+        hint_line,
+        file_diff_ranges,
+        symbol_line,
+    )
+    .or_else(|| {
+        find_snippet_in_lines_fallback(
+            file_lines,
+            snippet,
+            hint_line,
+            file_diff_ranges,
+            symbol_line,
+        )
+    })
 }
 
 fn match_snippet_subsequence(
@@ -1129,82 +1178,11 @@ fn pick_closest_line(
 }
 
 /// Resolves a single finding location against the worktree file and diff hunks.
-pub fn resolve_single_location(
-    worktree_path: &Path,
-    revision: Option<&str>,
-    diff_ranges: &HashMap<String, Vec<(usize, usize)>>,
-    location: &Value,
-) -> Option<ResolvedLocation> {
-    let raw_file = location.get("file").and_then(Value::as_str)?;
-    let norm_file =
-        normalize_file_path_with_worktree_and_rev(Some(worktree_path), revision, raw_file)?;
-
-    let content = read_file_content(worktree_path, revision, &norm_file)?;
-    let file_lines: Vec<&str> = content.lines().collect();
-    if file_lines.is_empty() {
-        return None;
-    }
-
-    let file_diff = diff_ranges.get(&norm_file);
-
-    let raw_snippet = location
-        .get("code_snippet")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let hint_line = location
-        .get("line")
-        .and_then(Value::as_i64)
-        .filter(|&l| l > 0)
-        .and_then(|l| usize::try_from(l).ok());
-    let sym = location
-        .get("function_or_symbol")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-
-    let symbol_line = if !sym.is_empty() {
-        file_lines
-            .iter()
-            .enumerate()
-            .find(|(_, line)| line.contains(sym))
-            .map(|(i, _)| i + 1)
-    } else {
-        None
-    };
-
-    let matched_range = if !raw_snippet.is_empty() {
-        find_snippet_in_lines(&file_lines, raw_snippet, hint_line, file_diff, symbol_line)
-    } else {
-        None
-    };
-
-    let hint_range = hint_line.filter(|&l| l <= file_lines.len()).map(|l| {
-        let idx = l.saturating_sub(1);
-        (idx, idx)
-    });
-
-    let (start_idx, end_idx) = if let Some(range) = matched_range {
-        range
-    } else if let Some(range) = hint_range {
-        range
-    } else if !sym.is_empty() {
-        let sym_match = file_lines
-            .iter()
-            .enumerate()
-            .find(|(_, line)| line.contains(sym))
-            .map(|(i, _)| (i, i));
-        sym_match?
-    } else {
-        return None;
-    };
-
-    let start_line = start_idx + 1;
-    let end_line = end_idx + 1;
-
-    let start_line_str = file_lines[start_idx];
-    let end_line_str = file_lines[end_idx];
-
+fn compute_character_offsets(
+    start_line_str: &str,
+    end_line_str: &str,
+    is_single_line: bool,
+) -> (Option<usize>, Option<usize>) {
     let start_line_chars = start_line_str.chars().count();
     let end_line_chars = end_line_str.chars().count();
 
@@ -1214,9 +1192,7 @@ pub fn resolve_single_location(
         .count();
     let end_trimmed_chars = end_line_str.trim_end().chars().count();
 
-    let (start_char, safe_end_char) = if start_line == end_line {
-        // Single-line range: Gerrit requires start_character < end_character
-        // when start_line == end_line. Omit characters on empty lines to avoid 400 Bad Request.
+    if is_single_line {
         if start_line_chars == 0 {
             (None, None)
         } else {
@@ -1235,7 +1211,6 @@ pub fn resolve_single_location(
             }
         }
     } else {
-        // Multi-line range: start_character applies to start_line, end_character applies to end_line.
         let s = start_indent_chars.min(start_line_chars);
         let e = if end_line_chars == 0 {
             0
@@ -1243,49 +1218,724 @@ pub fn resolve_single_location(
             end_trimmed_chars.max(1).min(end_line_chars)
         };
         (Some(s), Some(e))
-    };
+    }
+}
 
+/// Locates a full multi-line snippet in deleted lines with strict contiguity and blank-line tolerance.
+pub fn find_snippet_in_deleted_lines_exact(
+    deleted_lines: &[(usize, String)],
+    snippet: &str,
+    hint_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    if deleted_lines.is_empty() {
+        return None;
+    }
+    let snip_lines = parse_snippet_lines(snippet)?;
+    let non_empty_snips: Vec<&str> = snip_lines
+        .iter()
+        .copied()
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let &first_snip = non_empty_snips.first()?;
+    let mut candidates = Vec::new();
+    for (i, &(line_idx, ref text)) in deleted_lines.iter().enumerate() {
+        if text.trim() == first_snip {
+            let mut match_ok = true;
+            let mut del_curr = i;
+            let mut last_line_idx = line_idx;
+            for &snip in &non_empty_snips[1..] {
+                let mut found_next = false;
+                while del_curr + 1 < deleted_lines.len() {
+                    del_curr += 1;
+                    let (next_idx, ref next_text) = deleted_lines[del_curr];
+                    if next_idx != last_line_idx + 1 {
+                        // Enforce contiguity across deleted lines; cannot cross unmodified context or hunks
+                        break;
+                    }
+                    let trimmed = next_text.trim();
+                    if trimmed.is_empty() {
+                        last_line_idx = next_idx;
+                        continue;
+                    }
+                    if trimmed == snip {
+                        last_line_idx = next_idx;
+                        found_next = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                if !found_next {
+                    match_ok = false;
+                    break;
+                }
+            }
+            if match_ok {
+                candidates.push((line_idx, last_line_idx));
+            }
+        }
+    }
+    if !candidates.is_empty() {
+        if let Some(hint) = hint_line {
+            return candidates
+                .into_iter()
+                .min_by_key(|&(s, _)| (s + 1).abs_diff(hint));
+        }
+        return candidates.into_iter().next();
+    }
+
+    None
+}
+
+/// Locates a snippet in deleted lines by matching candidate lines in descending order of length.
+pub fn find_snippet_in_deleted_lines_fallback(
+    deleted_lines: &[(usize, String)],
+    snippet: &str,
+    hint_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    if deleted_lines.is_empty() {
+        return None;
+    }
+    let snip_lines = parse_snippet_lines(snippet)?;
+
+    let mut candidate_lines: Vec<&str> = snip_lines
+        .iter()
+        .copied()
+        .filter(|l| l.chars().count() >= 4)
+        .collect();
+    candidate_lines.sort_by_key(|l| std::cmp::Reverse(l.chars().count()));
+    candidate_lines.dedup();
+
+    for cand in candidate_lines {
+        let cand_len = cand.chars().count();
+        let mut candidates = Vec::new();
+        for &(line_idx, ref text) in deleted_lines {
+            let trimmed = text.trim();
+            if trimmed == cand || (cand_len >= 8 && trimmed.contains(cand)) {
+                candidates.push((line_idx, line_idx));
+            }
+        }
+        if !candidates.is_empty() {
+            if let Some(hint) = hint_line {
+                return candidates
+                    .into_iter()
+                    .min_by_key(|&(s, _)| (s + 1).abs_diff(hint));
+            }
+            return candidates.into_iter().next();
+        }
+    }
+
+    None
+}
+
+pub fn find_snippet_in_deleted_lines(
+    deleted_lines: &[(usize, String)],
+    snippet: &str,
+    hint_line: Option<usize>,
+) -> Option<(usize, usize)> {
+    find_snippet_in_deleted_lines_exact(deleted_lines, snippet, hint_line)
+        .or_else(|| find_snippet_in_deleted_lines_fallback(deleted_lines, snippet, hint_line))
+}
+
+fn make_resolved_deleted_location(
+    norm_file: &str,
+    dl: &[(usize, String)],
+    del_s: usize,
+    del_e: usize,
+) -> Option<ResolvedLocation> {
+    let start_line = del_s + 1;
+    let end_line = del_e + 1;
+    let s_text = dl
+        .iter()
+        .find(|e| e.0 == del_s)
+        .map(|e| e.1.as_str())
+        .unwrap_or("");
+    let e_text = dl
+        .iter()
+        .find(|e| e.0 == del_e)
+        .map(|e| e.1.as_str())
+        .unwrap_or("");
+    let (sc, ec) = compute_character_offsets(s_text, e_text, start_line == end_line);
     let line_range = if start_line == end_line {
         format!("{start_line}")
     } else {
         format!("{start_line}-{end_line}")
     };
-
-    let in_diff = diff_ranges
-        .get(&norm_file)
-        .map(|ranges| ranges.iter().any(|&(s, e)| start_idx <= e && end_idx >= s))
-        .unwrap_or(false);
-
-    let snippet_out = if raw_snippet.is_empty() {
-        Some(file_lines[start_idx..=end_idx].join("\n"))
-    } else {
-        None
-    };
-
     Some(ResolvedLocation {
-        file: norm_file,
+        file: norm_file.to_string(),
         line: start_line,
         end_line,
         line_range,
-        start_character: start_char,
-        end_character: safe_end_char,
-        in_diff,
-        code_snippet: snippet_out,
+        start_character: sc,
+        end_character: ec,
+        in_diff: true,
+        side: Some("PARENT".to_string()),
+        code_snippet: None,
     })
 }
 
-/// Resolves and enriches finding locations using pre-parsed diff ranges.
-pub fn resolve_finding_locations_with_ranges(
+fn resolve_in_deleted_lines_exact(
+    norm_file: &str,
+    dl: &[(usize, String)],
+    snippet: &str,
+    hint_line: Option<usize>,
+) -> Option<ResolvedLocation> {
+    let (del_s, del_e) = find_snippet_in_deleted_lines_exact(dl, snippet, hint_line)?;
+    make_resolved_deleted_location(norm_file, dl, del_s, del_e)
+}
+
+fn resolve_in_deleted_lines_fallback(
+    norm_file: &str,
+    dl: &[(usize, String)],
+    snippet: &str,
+    hint_line: Option<usize>,
+) -> Option<ResolvedLocation> {
+    let (del_s, del_e) = find_snippet_in_deleted_lines_fallback(dl, snippet, hint_line)?;
+    make_resolved_deleted_location(norm_file, dl, del_s, del_e)
+}
+
+#[allow(dead_code)]
+fn resolve_in_deleted_lines(
+    norm_file: &str,
+    dl: &[(usize, String)],
+    snippet: &str,
+    hint_line: Option<usize>,
+) -> Option<ResolvedLocation> {
+    resolve_in_deleted_lines_exact(norm_file, dl, snippet, hint_line)
+        .or_else(|| resolve_in_deleted_lines_fallback(norm_file, dl, snippet, hint_line))
+}
+
+fn make_resolved_parent_location(
+    norm_file: &str,
+    plines: &[&str],
+    pre_diff: Option<&Vec<(usize, usize)>>,
+    ps: usize,
+    pe: usize,
+) -> Option<ResolvedLocation> {
+    let start_line = ps + 1;
+    let end_line = pe + 1;
+    let (sc, ec) = compute_character_offsets(plines[ps], plines[pe], start_line == end_line);
+    let in_diff = pre_diff.is_some_and(|ranges| ranges.iter().any(|&(s, e)| ps <= e && pe >= s));
+    let line_range = if start_line == end_line {
+        format!("{start_line}")
+    } else {
+        format!("{start_line}-{end_line}")
+    };
+    Some(ResolvedLocation {
+        file: norm_file.to_string(),
+        line: start_line,
+        end_line,
+        line_range,
+        start_character: sc,
+        end_character: ec,
+        in_diff,
+        side: Some("PARENT".to_string()),
+        code_snippet: None,
+    })
+}
+
+fn resolve_in_parent_lines_exact(
+    norm_file: &str,
+    plines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    pre_diff: Option<&Vec<(usize, usize)>>,
+    sym: &str,
+) -> Option<ResolvedLocation> {
+    let sym_line = if !sym.is_empty() {
+        plines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains(sym))
+            .map(|(i, _)| i + 1)
+    } else {
+        None
+    };
+    let (ps, pe) = find_snippet_in_lines_exact(plines, snippet, hint_line, pre_diff, sym_line)?;
+    make_resolved_parent_location(norm_file, plines, pre_diff, ps, pe)
+}
+
+fn resolve_in_parent_lines_fallback(
+    norm_file: &str,
+    plines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    pre_diff: Option<&Vec<(usize, usize)>>,
+    sym: &str,
+) -> Option<ResolvedLocation> {
+    let sym_line = if !sym.is_empty() {
+        plines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains(sym))
+            .map(|(i, _)| i + 1)
+    } else {
+        None
+    };
+    let (ps, pe) = find_snippet_in_lines_fallback(plines, snippet, hint_line, pre_diff, sym_line)?;
+    make_resolved_parent_location(norm_file, plines, pre_diff, ps, pe)
+}
+
+#[allow(dead_code)]
+fn resolve_in_parent_lines(
+    norm_file: &str,
+    plines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    pre_diff: Option<&Vec<(usize, usize)>>,
+    sym: &str,
+) -> Option<ResolvedLocation> {
+    resolve_in_parent_lines_exact(norm_file, plines, snippet, hint_line, pre_diff, sym).or_else(
+        || resolve_in_parent_lines_fallback(norm_file, plines, snippet, hint_line, pre_diff, sym),
+    )
+}
+
+fn make_resolved_post_location(
+    norm_file: &str,
+    flines: &[&str],
+    post_diff: Option<&Vec<(usize, usize)>>,
+    start_idx: usize,
+    end_idx: usize,
+) -> Option<ResolvedLocation> {
+    let in_diff =
+        post_diff.is_some_and(|ranges| ranges.iter().any(|&(s, e)| start_idx <= e && end_idx >= s));
+    let start_line = start_idx + 1;
+    let end_line = end_idx + 1;
+    let (sc, ec) =
+        compute_character_offsets(flines[start_idx], flines[end_idx], start_line == end_line);
+    let line_range = if start_line == end_line {
+        format!("{start_line}")
+    } else {
+        format!("{start_line}-{end_line}")
+    };
+    Some(ResolvedLocation {
+        file: norm_file.to_string(),
+        line: start_line,
+        end_line,
+        line_range,
+        start_character: sc,
+        end_character: ec,
+        in_diff,
+        side: Some("REVISION".to_string()),
+        code_snippet: None,
+    })
+}
+
+fn resolve_in_post_lines_exact(
+    norm_file: &str,
+    flines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    post_diff: Option<&Vec<(usize, usize)>>,
+    sym: &str,
+) -> Option<ResolvedLocation> {
+    let sym_line = if !sym.is_empty() {
+        flines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains(sym))
+            .map(|(i, _)| i + 1)
+    } else {
+        None
+    };
+    let (start_idx, end_idx) =
+        find_snippet_in_lines_exact(flines, snippet, hint_line, post_diff, sym_line)?;
+    make_resolved_post_location(norm_file, flines, post_diff, start_idx, end_idx)
+}
+
+fn resolve_in_post_lines_fallback(
+    norm_file: &str,
+    flines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    post_diff: Option<&Vec<(usize, usize)>>,
+    sym: &str,
+) -> Option<ResolvedLocation> {
+    let sym_line = if !sym.is_empty() {
+        flines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains(sym))
+            .map(|(i, _)| i + 1)
+    } else {
+        None
+    };
+    let (start_idx, end_idx) =
+        find_snippet_in_lines_fallback(flines, snippet, hint_line, post_diff, sym_line)?;
+    make_resolved_post_location(norm_file, flines, post_diff, start_idx, end_idx)
+}
+
+#[allow(dead_code)]
+fn resolve_in_post_lines(
+    norm_file: &str,
+    flines: &[&str],
+    snippet: &str,
+    hint_line: Option<usize>,
+    post_diff: Option<&Vec<(usize, usize)>>,
+    sym: &str,
+) -> Option<ResolvedLocation> {
+    resolve_in_post_lines_exact(norm_file, flines, snippet, hint_line, post_diff, sym).or_else(
+        || resolve_in_post_lines_fallback(norm_file, flines, snippet, hint_line, post_diff, sym),
+    )
+}
+
+/// Strips leading diff markers (`-` or `+`) from snippet lines only if all non-empty
+/// lines uniformly carry the marker. Returns the stripped snippet and whether it was a minus marker.
+fn try_strip_diff_markers(raw: &str) -> Option<(String, bool)> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let non_empty: Vec<&str> = lines
+        .iter()
+        .map(|l| l.trim_start())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+    let all_minus = non_empty.iter().all(|l| l.starts_with('-'));
+    let all_plus = non_empty.iter().all(|l| l.starts_with('+'));
+
+    if all_minus && !all_plus {
+        let stripped = lines
+            .iter()
+            .map(|l| {
+                let trimmed = l.trim_start();
+                if let Some(rest) = trimmed.strip_prefix('-') {
+                    rest
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((stripped, true))
+    } else if all_plus && !all_minus {
+        let stripped = lines
+            .iter()
+            .map(|l| {
+                let trimmed = l.trim_start();
+                if let Some(rest) = trimmed.strip_prefix('+') {
+                    rest
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((stripped, false))
+    } else {
+        None
+    }
+}
+
+/// Resolves a single finding location against post-image, pre-image, and two-sided diff hunks.
+pub fn resolve_single_location_two_sided(
+    worktree_path: &Path,
+    revision: Option<&str>,
+    parsed_diff: &ParsedDiff,
+    location: &Value,
+) -> Option<ResolvedLocation> {
+    let raw_file = location.get("file").and_then(Value::as_str)?;
+    let norm_file =
+        normalize_file_path_with_worktree_and_rev(Some(worktree_path), revision, raw_file)
+            .or_else(|| normalize_file_path(raw_file))?;
+
+    let raw_snippet = location
+        .get("code_snippet")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let hint_line = location
+        .get("line")
+        .and_then(Value::as_i64)
+        .filter(|&l| l > 0)
+        .and_then(|l| usize::try_from(l).ok());
+    let sym = location
+        .get("function_or_symbol")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    let explicit_side = location.get("side").and_then(Value::as_str).map(str::trim);
+    let is_parent_hint = explicit_side.is_some_and(|s| {
+        s.eq_ignore_ascii_case("PARENT")
+            || s.eq_ignore_ascii_case("LEFT")
+            || s.eq_ignore_ascii_case("OLD")
+    });
+
+    let post_file = parsed_diff
+        .pre_to_post
+        .get(&norm_file)
+        .cloned()
+        .unwrap_or_else(|| norm_file.clone());
+    let parent_file = parsed_diff
+        .post_to_pre
+        .get(&norm_file)
+        .cloned()
+        .unwrap_or_else(|| norm_file.clone());
+
+    let post_content = read_file_content(worktree_path, revision, &post_file);
+    let post_lines: Option<Vec<&str>> = post_content.as_deref().map(|c| c.lines().collect());
+
+    let parent_rev = revision.map(|r| format!("{r}~1"));
+    let parent_content = parent_rev
+        .as_deref()
+        .and_then(|pr| read_file_content(worktree_path, Some(pr), &parent_file));
+    let parent_lines: Option<Vec<&str>> = parent_content.as_deref().map(|c| c.lines().collect());
+
+    let post_diff = parsed_diff
+        .post_ranges
+        .get(&norm_file)
+        .or_else(|| parsed_diff.post_ranges.get(&post_file));
+    let pre_diff = parsed_diff
+        .pre_ranges
+        .get(&norm_file)
+        .or_else(|| parsed_diff.pre_ranges.get(&parent_file));
+    let del_lines = parsed_diff
+        .deleted_lines
+        .get(&norm_file)
+        .or_else(|| parsed_diff.deleted_lines.get(&parent_file));
+
+    let try_resolve_exact = |snip: &str, prefer_parent: bool| -> Option<ResolvedLocation> {
+        if snip.is_empty() {
+            return None;
+        }
+        if prefer_parent {
+            if let Some(dl) = del_lines
+                && let Some(loc) = resolve_in_deleted_lines_exact(&norm_file, dl, snip, hint_line)
+            {
+                return Some(loc);
+            }
+            if let Some(plines) = parent_lines.as_deref()
+                && let Some(loc) = resolve_in_parent_lines_exact(
+                    &norm_file, plines, snip, hint_line, pre_diff, sym,
+                )
+            {
+                return Some(loc);
+            }
+            if let Some(flines) = post_lines.as_deref()
+                && let Some(loc) =
+                    resolve_in_post_lines_exact(&norm_file, flines, snip, hint_line, post_diff, sym)
+            {
+                return Some(loc);
+            }
+        } else {
+            if let Some(flines) = post_lines.as_deref()
+                && let Some(loc) =
+                    resolve_in_post_lines_exact(&norm_file, flines, snip, hint_line, post_diff, sym)
+            {
+                if !loc.in_diff
+                    && let Some(dl) = del_lines
+                    && let Some(del_loc) =
+                        resolve_in_deleted_lines_exact(&norm_file, dl, snip, hint_line)
+                {
+                    return Some(del_loc);
+                }
+                return Some(loc);
+            }
+            if let Some(dl) = del_lines
+                && let Some(loc) = resolve_in_deleted_lines_exact(&norm_file, dl, snip, hint_line)
+            {
+                return Some(loc);
+            }
+            if let Some(plines) = parent_lines.as_deref()
+                && let Some(loc) = resolve_in_parent_lines_exact(
+                    &norm_file, plines, snip, hint_line, pre_diff, sym,
+                )
+            {
+                return Some(loc);
+            }
+        }
+        None
+    };
+
+    let try_resolve_fallback = |snip: &str, prefer_parent: bool| -> Option<ResolvedLocation> {
+        if snip.is_empty() {
+            return None;
+        }
+        if prefer_parent {
+            if let Some(dl) = del_lines
+                && let Some(loc) =
+                    resolve_in_deleted_lines_fallback(&norm_file, dl, snip, hint_line)
+            {
+                return Some(loc);
+            }
+            if let Some(plines) = parent_lines.as_deref()
+                && let Some(loc) = resolve_in_parent_lines_fallback(
+                    &norm_file, plines, snip, hint_line, pre_diff, sym,
+                )
+            {
+                return Some(loc);
+            }
+            if let Some(flines) = post_lines.as_deref()
+                && let Some(loc) = resolve_in_post_lines_fallback(
+                    &norm_file, flines, snip, hint_line, post_diff, sym,
+                )
+            {
+                return Some(loc);
+            }
+        } else {
+            if let Some(flines) = post_lines.as_deref()
+                && let Some(loc) = resolve_in_post_lines_fallback(
+                    &norm_file, flines, snip, hint_line, post_diff, sym,
+                )
+            {
+                if !loc.in_diff
+                    && let Some(dl) = del_lines
+                    && let Some(del_loc) =
+                        resolve_in_deleted_lines_fallback(&norm_file, dl, snip, hint_line)
+                {
+                    return Some(del_loc);
+                }
+                return Some(loc);
+            }
+            if let Some(dl) = del_lines
+                && let Some(loc) =
+                    resolve_in_deleted_lines_fallback(&norm_file, dl, snip, hint_line)
+            {
+                return Some(loc);
+            }
+            if let Some(plines) = parent_lines.as_deref()
+                && let Some(loc) = resolve_in_parent_lines_fallback(
+                    &norm_file, plines, snip, hint_line, pre_diff, sym,
+                )
+            {
+                return Some(loc);
+            }
+        }
+        None
+    };
+
+    if !raw_snippet.is_empty() {
+        let stripped_info = try_strip_diff_markers(raw_snippet);
+
+        // Phase 1: Try exact matching across all candidate sources
+        if let Some(resolved) = try_resolve_exact(raw_snippet, is_parent_hint) {
+            return Some(resolved);
+        }
+
+        if let Some((ref stripped, is_minus)) = stripped_info {
+            let stripped_trimmed = stripped.trim();
+            if !stripped_trimmed.is_empty() {
+                let prefer_parent = is_parent_hint || is_minus;
+                if let Some(resolved) = try_resolve_exact(stripped_trimmed, prefer_parent) {
+                    return Some(resolved);
+                }
+            }
+        }
+
+        // Phase 2: If exact matching across all sources returned None, fall back to partial line matching
+        if let Some(resolved) = try_resolve_fallback(raw_snippet, is_parent_hint) {
+            return Some(resolved);
+        }
+
+        if let Some((ref stripped, is_minus)) = stripped_info {
+            let stripped_trimmed = stripped.trim();
+            if !stripped_trimmed.is_empty() {
+                let prefer_parent = is_parent_hint || is_minus;
+                if let Some(resolved) = try_resolve_fallback(stripped_trimmed, prefer_parent) {
+                    return Some(resolved);
+                }
+            }
+        }
+    }
+
+    // Fall back to hint_line or symbol if available
+    let fallback_lines = if is_parent_hint && parent_lines.is_some() {
+        parent_lines.as_deref()
+    } else {
+        post_lines.as_deref()
+    };
+    let fallback_diff = if is_parent_hint && parent_lines.is_some() {
+        pre_diff
+    } else {
+        post_diff
+    };
+    let fallback_side = if is_parent_hint && parent_lines.is_some() {
+        "PARENT"
+    } else {
+        "REVISION"
+    };
+
+    if let Some(flines) = fallback_lines
+        && !flines.is_empty()
+    {
+        let hint_range = hint_line.filter(|&l| l <= flines.len()).map(|l| {
+            let idx = l.saturating_sub(1);
+            (idx, idx)
+        });
+        let (start_idx, end_idx) = if let Some(range) = hint_range {
+            range
+        } else if !sym.is_empty() {
+            let sym_match = flines
+                .iter()
+                .enumerate()
+                .find(|(_, line)| line.contains(sym))
+                .map(|(i, _)| (i, i));
+            sym_match?
+        } else {
+            return None;
+        };
+
+        let start_line = start_idx + 1;
+        let end_line = end_idx + 1;
+        let (sc, ec) =
+            compute_character_offsets(flines[start_idx], flines[end_idx], start_line == end_line);
+        let line_range = if start_line == end_line {
+            format!("{start_line}")
+        } else {
+            format!("{start_line}-{end_line}")
+        };
+        let in_diff = fallback_diff
+            .is_some_and(|ranges| ranges.iter().any(|&(s, e)| start_idx <= e && end_idx >= s));
+        let snippet_out = if raw_snippet.is_empty() {
+            Some(flines[start_idx..=end_idx].join("\n"))
+        } else {
+            None
+        };
+
+        return Some(ResolvedLocation {
+            file: norm_file,
+            line: start_line,
+            end_line,
+            line_range,
+            start_character: sc,
+            end_character: ec,
+            in_diff,
+            side: Some(fallback_side.to_string()),
+            code_snippet: snippet_out,
+        });
+    }
+
+    None
+}
+
+/// Resolves a single finding location against the worktree file and diff hunks.
+pub fn resolve_single_location(
     worktree_path: &Path,
     revision: Option<&str>,
     diff_ranges: &HashMap<String, Vec<(usize, usize)>>,
+    location: &Value,
+) -> Option<ResolvedLocation> {
+    let parsed_diff = ParsedDiff {
+        post_ranges: diff_ranges.clone(),
+        ..Default::default()
+    };
+    resolve_single_location_two_sided(worktree_path, revision, &parsed_diff, location)
+}
+
+/// Resolves and enriches finding locations using pre-parsed two-sided diff details.
+pub fn resolve_finding_locations_with_parsed_diff(
+    worktree_path: &Path,
+    revision: Option<&str>,
+    parsed_diff: &ParsedDiff,
     findings: &mut [Value],
 ) {
     for finding in findings.iter_mut() {
         if let Some(locs) = finding.get_mut("locations").and_then(Value::as_array_mut) {
             for loc in locs.iter_mut() {
                 if let Some(resolved) =
-                    resolve_single_location(worktree_path, revision, diff_ranges, loc)
+                    resolve_single_location_two_sided(worktree_path, revision, parsed_diff, loc)
                     && let Some(map) = loc.as_object_mut()
                 {
                     map.insert("file".to_string(), json!(resolved.file));
@@ -1303,6 +1953,9 @@ pub fn resolve_finding_locations_with_ranges(
                         map.remove("end_character");
                     }
                     map.insert("in_diff".to_string(), json!(resolved.in_diff));
+                    if let Some(side) = &resolved.side {
+                        map.insert("side".to_string(), json!(side));
+                    }
                     if let Some(snip) = resolved.code_snippet {
                         map.insert("code_snippet".to_string(), json!(snip));
                     }
@@ -1312,46 +1965,32 @@ pub fn resolve_finding_locations_with_ranges(
     }
 }
 
+/// Resolves and enriches finding locations using pre-parsed post-image diff ranges.
+pub fn resolve_finding_locations_with_ranges(
+    worktree_path: &Path,
+    revision: Option<&str>,
+    diff_ranges: &HashMap<String, Vec<(usize, usize)>>,
+    findings: &mut [Value],
+) {
+    let parsed_diff = ParsedDiff {
+        post_ranges: diff_ranges.clone(),
+        ..Default::default()
+    };
+    resolve_finding_locations_with_parsed_diff(worktree_path, revision, &parsed_diff, findings);
+}
+
 /// Resolves and enriches all finding locations in place using the target worktree and diff.
 pub fn resolve_finding_locations(
     worktree_path: &Path,
     target_commit_diff: &str,
     findings: &mut [Value],
 ) {
-    let diff_ranges = parse_diff_ranges(target_commit_diff);
-    resolve_finding_locations_with_ranges(worktree_path, None, &diff_ranges, findings);
+    let parsed_diff = parse_two_sided_diff(target_commit_diff);
+    resolve_finding_locations_with_parsed_diff(worktree_path, None, &parsed_diff, findings);
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_parse_two_sided_diff_captures_pre_and_post_ranges_and_deleted_lines() {
-        let diff = r#"diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
---- a/kernel/bpf/verifier.c
-+++ b/kernel/bpf/verifier.c
-@@ -100,6 +100,5 @@ int check_map(void) {
-     validate_map();
--    if (btf_record_has_field(map, BPF_TIMER))
--        return -EINVAL;
-+    check_timer();
-     return 0;
- }
-"#;
-        let parsed = parse_two_sided_diff(diff);
-        let post = parsed.post_ranges.get("kernel/bpf/verifier.c").unwrap();
-        assert_eq!(post, &vec![(100, 100)]);
-
-        let pre = parsed.pre_ranges.get("kernel/bpf/verifier.c").unwrap();
-        assert_eq!(pre, &vec![(100, 101)]);
-
-        let del = parsed.deleted_lines.get("kernel/bpf/verifier.c").unwrap();
-        assert_eq!(del.len(), 2);
-        assert_eq!(del[0].0, 100);
-        assert_eq!(del[0].1, "    if (btf_record_has_field(map, BPF_TIMER))");
-        assert_eq!(del[1].0, 101);
-        assert_eq!(del[1].1, "        return -EINVAL;");
-    }
-
     use super::*;
     use std::fs::File;
     use std::io::Write;
@@ -1594,6 +2233,89 @@ index 123456..789abc 100644
         assert_eq!(resolved.line_range, "3-4");
         assert_eq!(resolved.start_character, Some(4));
         assert!(resolved.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_single_location_parent_git_blob_fallback() {
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path();
+
+        let mut init_cmd = crate::git_cmd::in_dir(repo_path);
+        init_cmd.args(["init"]);
+        assert!(init_cmd.status().unwrap().success());
+
+        let mut user_cmd = crate::git_cmd::in_dir(repo_path);
+        user_cmd.args(["config", "user.email", "test@example.com"]);
+        assert!(user_cmd.status().unwrap().success());
+        let mut name_cmd = crate::git_cmd::in_dir(repo_path);
+        name_cmd.args(["config", "user.name", "Test User"]);
+        assert!(name_cmd.status().unwrap().success());
+
+        let file_path = repo_path.join("kernel/sched/core.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        // 1. Initial parent commit
+        std::fs::write(
+            &file_path,
+            "// Header\nvoid balance(struct rq *rq) {\n    old_code();\n    update_rq_clock(rq);\n}\n",
+        )
+        .unwrap();
+        let mut add1 = crate::git_cmd::in_dir(repo_path);
+        add1.args(["add", "kernel/sched/core.c"]);
+        assert!(add1.status().unwrap().success());
+        let mut commit1 = crate::git_cmd::in_dir(repo_path);
+        commit1.args(["commit", "-m", "Parent commit"]);
+        assert!(commit1.status().unwrap().success());
+
+        // 2. Child commit removing old_code and adding new_code
+        std::fs::write(
+            &file_path,
+            "// Header\nvoid balance(struct rq *rq) {\n    new_code();\n    update_rq_clock(rq);\n}\n",
+        )
+        .unwrap();
+        let mut add2 = crate::git_cmd::in_dir(repo_path);
+        add2.args(["add", "kernel/sched/core.c"]);
+        assert!(add2.status().unwrap().success());
+        let mut commit2 = crate::git_cmd::in_dir(repo_path);
+        commit2.args(["commit", "-m", "Child commit"]);
+        assert!(commit2.status().unwrap().success());
+
+        let mut rev_cmd = crate::git_cmd::in_dir(repo_path);
+        rev_cmd.args(["rev-parse", "HEAD"]);
+        let rev_out = rev_cmd.output().unwrap();
+        let child_sha = String::from_utf8(rev_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Remove file from disk so resolution relies on git blobs
+        std::fs::remove_file(&file_path).unwrap();
+
+        let diff = r#"diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3,2 +3,2 @@
+-    old_code();
++    new_code();
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        // Query an untouched line from parent that is not in deleted_lines.
+        // With side: "PARENT" and disk file removed, this strictly exercises
+        // reading and parsing the git blob at child_sha~1 via resolve_in_parent_lines.
+        let loc = json!({
+            "file": "kernel/sched/core.c",
+            "code_snippet": "update_rq_clock(rq);",
+            "function_or_symbol": "balance",
+            "side": "PARENT"
+        });
+
+        let resolved =
+            resolve_single_location_two_sided(repo_path, Some(&child_sha), &parsed, &loc).unwrap();
+        assert_eq!(resolved.file, "kernel/sched/core.c");
+        assert_eq!(resolved.line, 4);
+        assert_eq!(resolved.end_line, 4);
+        assert_eq!(resolved.side, Some("PARENT".to_string()));
+        assert!(!resolved.in_diff);
     }
 
     #[test]
@@ -2058,7 +2780,7 @@ similarity index 90%
 rename from old_dir/foo.c
 rename to new_dir/foo.c
 --- a/old_dir/foo.c
-++++ b/new_dir/foo.c
++++ b/new_dir/foo.c
 @@ -10,3 +10,4 @@ void run(void) {
 -    old_work();
 +    new_work();
@@ -2067,7 +2789,7 @@ rename to new_dir/foo.c
 diff --git a/created.c b/created.c
 new file mode 100644
 --- /dev/null
-++++ b/created.c
++++ b/created.c
 @@ -0,0 +1,2 @@
 +int new_func(void) { return 0; }
 +"#;
@@ -2284,5 +3006,420 @@ index 1111111..2222222 100644
         assert_eq!(res.post_ranges.get("file1.rs").unwrap().len(), 1);
         assert_eq!(res.pre_ranges.get("file1.rs"), Some(&vec![(0, 0)]));
         assert_eq!(res.pre_ranges.get("file2.rs"), Some(&vec![(0, 0)]));
+    }
+
+    #[test]
+    fn test_parse_two_sided_diff_captures_pre_and_post_ranges_and_deleted_lines() {
+        let diff = r#"diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -100,6 +100,5 @@ int check_map(void) {
+     validate_map();
+-    if (btf_record_has_field(map, BPF_TIMER))
+-        return -EINVAL;
++    check_timer();
+     return 0;
+ }
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        let post = parsed.post_ranges.get("kernel/bpf/verifier.c").unwrap();
+        assert_eq!(post, &vec![(100, 100)]);
+
+        let pre = parsed.pre_ranges.get("kernel/bpf/verifier.c").unwrap();
+        assert_eq!(pre, &vec![(100, 101)]);
+
+        let del = parsed.deleted_lines.get("kernel/bpf/verifier.c").unwrap();
+        assert_eq!(del.len(), 2);
+        assert_eq!(del[0].0, 100);
+        assert_eq!(del[0].1, "    if (btf_record_has_field(map, BPF_TIMER))");
+        assert_eq!(del[1].0, 101);
+        assert_eq!(del[1].1, "        return -EINVAL;");
+    }
+
+    #[test]
+    fn test_resolve_location_deleted_lines_resolves_to_parent() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("kernel/bpf/verifier.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+
+        // In post-image, the if statement is deleted and replaced with check_timer()
+        std::fs::write(
+            &file_path,
+            "int check_map(void) {\n    validate_map();\n    check_timer();\n    return 0;\n}\n",
+        )
+        .unwrap();
+
+        let diff = r#"diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -100,6 +100,5 @@ int check_map(void) {
+     validate_map();
+-    if (btf_record_has_field(map, BPF_TIMER))
+-        return -EINVAL;
++    check_timer();
+     return 0;
+ }
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        let loc = json!({
+            "file": "kernel/bpf/verifier.c",
+            "line": 101,
+            "code_snippet": "if (btf_record_has_field(map, BPF_TIMER))\n    return -EINVAL;",
+            "function_or_symbol": "check_map"
+        });
+
+        let resolved = resolve_single_location_two_sided(dir.path(), None, &parsed, &loc).unwrap();
+        assert_eq!(resolved.file, "kernel/bpf/verifier.c");
+        assert_eq!(resolved.line, 101);
+        assert_eq!(resolved.end_line, 102);
+        assert_eq!(resolved.line_range, "101-102");
+        assert_eq!(resolved.side, Some("PARENT".to_string()));
+        assert!(resolved.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_location_leading_minus_stripped_resolves_parent() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("include/linux/mm.h");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "struct page {\n    int refcount;\n};\n").unwrap();
+
+        let diff = r#"diff --git a/include/linux/mm.h b/include/linux/mm.h
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -150,5 +150,3 @@ struct page {
+-#ifdef CONFIG_OFFLOAD
+-    void *pool;
+-#endif
+     int refcount;
+ };
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        let loc = json!({
+            "file": "include/linux/mm.h",
+            "line": 150,
+            "code_snippet": "-#ifdef CONFIG_OFFLOAD\n-    void *pool;\n-#endif",
+            "function_or_symbol": "struct page"
+        });
+
+        let resolved = resolve_single_location_two_sided(dir.path(), None, &parsed, &loc).unwrap();
+        assert_eq!(resolved.file, "include/linux/mm.h");
+        assert_eq!(resolved.line, 150);
+        assert_eq!(resolved.end_line, 152);
+        assert_eq!(resolved.side, Some("PARENT".to_string()));
+        assert!(resolved.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_location_added_and_context_lines_marked_revision() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("fs/inode.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file_path,
+            "void init(void) {\n    int x = 0;\n    mutex_init(&lock);\n    return;\n}\n",
+        )
+        .unwrap();
+
+        let diff = r#"diff --git a/fs/inode.c b/fs/inode.c
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -2,3 +2,4 @@ void init(void) {
+     int x = 0;
++    mutex_init(&lock);
+     return;
+ }
+"#;
+        let parsed = parse_two_sided_diff(diff);
+
+        // 1. Added line
+        let added_loc = json!({
+            "file": "fs/inode.c",
+            "code_snippet": "+    mutex_init(&lock);",
+            "line": 3
+        });
+        let resolved_added =
+            resolve_single_location_two_sided(dir.path(), None, &parsed, &added_loc).unwrap();
+        assert_eq!(resolved_added.line, 3);
+        assert_eq!(resolved_added.side, Some("REVISION".to_string()));
+        assert!(resolved_added.in_diff);
+
+        // 2. Context line
+        let ctx_loc = json!({
+            "file": "fs/inode.c",
+            "code_snippet": "int x = 0;",
+            "line": 2
+        });
+        let resolved_ctx =
+            resolve_single_location_two_sided(dir.path(), None, &parsed, &ctx_loc).unwrap();
+        assert_eq!(resolved_ctx.line, 2);
+        assert_eq!(resolved_ctx.side, Some("REVISION".to_string()));
+        assert!(!resolved_ctx.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_finding_locations_decorates_side_in_json() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("net/core/dev.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file_path,
+            "int dev_queue(void) {\n    new_call();\n    return 0;\n}\n",
+        )
+        .unwrap();
+
+        let diff = r#"diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1,4 +1,4 @@
+ int dev_queue(void) {
+-    old_call();
++    new_call();
+     return 0;
+ }
+"#;
+        let mut findings = vec![
+            json!({
+                "problem": "Removal of old_call causes regression",
+                "locations": [{
+                    "file": "net/core/dev.c",
+                    "code_snippet": "-    old_call();",
+                    "line": 2
+                }]
+            }),
+            json!({
+                "problem": "new_call missing check",
+                "locations": [{
+                    "file": "net/core/dev.c",
+                    "code_snippet": "new_call();",
+                    "line": 2
+                }]
+            }),
+        ];
+
+        resolve_finding_locations(dir.path(), diff, &mut findings);
+
+        assert_eq!(findings[0]["locations"][0]["side"], "PARENT");
+        assert_eq!(findings[0]["locations"][0]["line"], 2);
+        assert_eq!(findings[0]["locations"][0]["in_diff"], true);
+
+        assert_eq!(findings[1]["locations"][0]["side"], "REVISION");
+        assert_eq!(findings[1]["locations"][0]["line"], 2);
+        assert_eq!(findings[1]["locations"][0]["in_diff"], true);
+    }
+
+    #[test]
+    fn test_find_snippet_in_deleted_lines_with_blank_lines() {
+        let deleted = vec![
+            (10, "void cleanup(void)".to_string()),
+            (11, "{".to_string()),
+            (12, "".to_string()), // blank line
+            (13, "    kfree(buf);".to_string()),
+            (14, "}".to_string()),
+        ];
+
+        // Snippet that also contains a blank line
+        let snip_with_blank = "void cleanup(void)\n{\n\n    kfree(buf);\n}";
+        let res = find_snippet_in_deleted_lines(&deleted, snip_with_blank, None);
+        assert_eq!(res, Some((10, 14)));
+
+        // Snippet that omitted the blank line
+        let snip_without_blank = "void cleanup(void)\n{\n    kfree(buf);\n}";
+        let res2 = find_snippet_in_deleted_lines(&deleted, snip_without_blank, None);
+        assert_eq!(res2, Some((10, 14)));
+    }
+
+    #[test]
+    fn test_resolve_location_does_not_strip_unary_minus_when_matching_code() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("src/math.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file_path,
+            "int negate(int y) {\n    int x = -y;\n    return x;\n}\n",
+        )
+        .unwrap();
+
+        let diff = r#"diff --git a/src/math.c b/src/math.c
+--- a/src/math.c
++++ b/src/math.c
+@@ -1,4 +1,4 @@
+ int negate(int y) {
+-    int x = y;
++    int x = -y;
+     return x;
+ }
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        let loc = json!({
+            "file": "src/math.c",
+            "line": 2,
+            "code_snippet": "    int x = -y;\n    return x;",
+            "function_or_symbol": "negate"
+        });
+
+        let resolved = resolve_single_location_two_sided(dir.path(), None, &parsed, &loc).unwrap();
+        assert_eq!(resolved.file, "src/math.c");
+        assert_eq!(resolved.line, 2);
+        assert_eq!(resolved.end_line, 3);
+        assert_eq!(resolved.side, Some("REVISION".to_string()));
+        assert!(resolved.in_diff);
+    }
+
+    #[test]
+    fn test_resolve_location_unary_minus_verbatim_match_preserves_revision_margin() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("src/neg.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "int x = 1;\nint z = -y;\n").unwrap();
+
+        let diff = r#"diff --git a/src/neg.c b/src/neg.c
+--- a/src/neg.c
++++ b/src/neg.c
+@@ -1,2 +1,2 @@
+ int x = 1;
+-int z = 0;
++int z = -y;
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        let loc = json!({
+            "file": "src/neg.c",
+            "line": 2,
+            "code_snippet": "-y;",
+            "function_or_symbol": "z"
+        });
+
+        let resolved = resolve_single_location_two_sided(dir.path(), None, &parsed, &loc).unwrap();
+        assert_eq!(resolved.file, "src/neg.c");
+        assert_eq!(resolved.line, 2);
+        assert_eq!(resolved.side, Some("REVISION".to_string()));
+        assert!(resolved.in_diff);
+    }
+
+    #[test]
+    fn test_find_snippet_in_deleted_lines_rejects_non_contiguous_lines() {
+        let deleted = vec![
+            (10, "int x = 1;".to_string()),
+            // Separate hunk / deletion block across context lines
+            (50, "int y = 2;".to_string()),
+        ];
+        let snip = "int x = 1;\nint y = 2;";
+        assert_eq!(
+            find_snippet_in_deleted_lines_exact(&deleted, snip, None),
+            None
+        );
+        // Fallback should match the longest line ("int x = 1;" or "int y = 2;", both 10 chars)
+        let fallback = find_snippet_in_deleted_lines_fallback(&deleted, snip, None);
+        assert!(fallback.is_some());
+        let (s, e) = fallback.unwrap();
+        assert_eq!(s, e);
+    }
+
+    #[test]
+    fn test_resolve_location_prefers_exact_multiline_match_over_partial_deleted() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("src/demo.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        // File on disk has a 3-line function at lines 20-22 outside the diff
+        let mut content = String::new();
+        for i in 1..=30 {
+            if i == 20 {
+                content.push_str("void existing_fn(void) {\n    kfree(ptr);\n}\n");
+            } else if !(20..=22).contains(&i) {
+                content.push_str(&format!("// line {i}\n"));
+            }
+        }
+        std::fs::write(&file_path, &content).unwrap();
+
+        // Diff has deleted line `kfree(ptr);` at line 5
+        let diff = r#"diff --git a/src/demo.c b/src/demo.c
+--- a/src/demo.c
++++ b/src/demo.c
+@@ -4,3 +4,2 @@
+ int a = 1;
+-    kfree(ptr);
+ int b = 2;
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        let loc = json!({
+            "file": "src/demo.c",
+            "code_snippet": "void existing_fn(void) {\n    kfree(ptr);\n}",
+            "line": 20
+        });
+
+        let resolved = resolve_single_location_two_sided(dir.path(), None, &parsed, &loc).unwrap();
+        // Must resolve to the exact 3-line match on REVISION at line 20,
+        // NOT truncated to a 1-line match on PARENT at line 5!
+        assert_eq!(resolved.file, "src/demo.c");
+        assert_eq!(resolved.line, 20);
+        assert_eq!(resolved.end_line, 22);
+        assert_eq!(resolved.side, Some("REVISION".to_string()));
+        assert!(!resolved.in_diff);
+    }
+
+    #[test]
+    fn test_find_snippet_in_lines_fallback_tries_candidate_lines_in_descending_order() {
+        let file_lines = vec![
+            "void compute(void)",
+            "{",
+            "    int status = perform_calculation();",
+            "    return status;",
+            "}",
+        ];
+        // Snippet where the longest line diverged / is not in the file,
+        // but the second-longest line is in the file.
+        let snip = "    int very_long_diverged_variable_name_not_in_file = 0;\n    int status = perform_calculation();";
+        let res = find_snippet_in_lines_fallback(&file_lines, snip, None, None, None);
+        assert_eq!(res, Some((2, 2)));
+    }
+
+    #[test]
+    fn test_resolve_location_renamed_file_resolves_deleted_and_added_lines() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("new_dir/worker.c");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file_path,
+            "// header\nint process(void) {\n    new_logic();\n    return 0;\n}\n",
+        )
+        .unwrap();
+
+        let diff = r#"diff --git a/old_dir/worker.c b/new_dir/worker.c
+similarity index 85%
+rename from old_dir/worker.c
+rename to new_dir/worker.c
+--- a/old_dir/worker.c
++++ b/new_dir/worker.c
+@@ -2,3 +2,3 @@
+ int process(void) {
+-    old_logic();
++    new_logic();
+     return 0;
+"#;
+        let parsed = parse_two_sided_diff(diff);
+
+        // 1. Finding citing deleted code under post-rename path
+        let deleted_loc = json!({
+            "file": "new_dir/worker.c",
+            "code_snippet": "-    old_logic();",
+            "line": 3
+        });
+        let resolved_del =
+            resolve_single_location_two_sided(dir.path(), None, &parsed, &deleted_loc).unwrap();
+        assert_eq!(resolved_del.line, 3);
+        assert_eq!(resolved_del.side, Some("PARENT".to_string()));
+        assert!(resolved_del.in_diff);
+
+        // 2. Finding citing added code under post-rename path
+        let added_loc = json!({
+            "file": "new_dir/worker.c",
+            "code_snippet": "+    new_logic();",
+            "line": 3
+        });
+        let resolved_added =
+            resolve_single_location_two_sided(dir.path(), None, &parsed, &added_loc).unwrap();
+        assert_eq!(resolved_added.line, 3);
+        assert_eq!(resolved_added.side, Some("REVISION".to_string()));
+        assert!(resolved_added.in_diff);
     }
 }
