@@ -21,18 +21,158 @@ use std::sync::LazyLock;
 static CHUNK_HEADER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").unwrap());
 
+fn parse_c_quoted_path(s: &str) -> Option<(&str, &str)> {
+    if !s.starts_with('"') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 1;
+    let mut escaped = false;
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+        } else if bytes[i] == b'\\' {
+            escaped = true;
+        } else if bytes[i] == b'"' {
+            let inside = &s[1..i];
+            let remainder = &s[i + 1..];
+            return Some((inside, remainder));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn unescape_c_path(s: &str) -> String {
+    let unescaped = s.replace(r#"\""#, "\"").replace(r#"\\"#, "\\");
+    if let Some(stripped) = unescaped.strip_prefix("a/") {
+        stripped.to_string()
+    } else if let Some(stripped) = unescaped.strip_prefix("b/") {
+        stripped.to_string()
+    } else {
+        unescaped
+    }
+}
+
+fn parse_diff_git_paths(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("diff --git ")?.trim();
+
+    if rest.starts_with('"') {
+        let (src_raw, remainder) = parse_c_quoted_path(rest)?;
+        let src = unescape_c_path(src_raw);
+        let rem = remainder.trim();
+        let dst = if rem.starts_with('"') {
+            let (dst_raw, _) = parse_c_quoted_path(rem)?;
+            unescape_c_path(dst_raw)
+        } else {
+            let stripped = rem
+                .strip_prefix("b/")
+                .or_else(|| rem.strip_prefix("a/"))
+                .unwrap_or(rem);
+            stripped.to_string()
+        };
+        return Some((src, dst));
+    }
+
+    if let Some(pos) = rest.find(r#" "b/"#).or_else(|| rest.find(r#" ""#)) {
+        let src_raw = &rest[..pos];
+        let rem = rest[pos + 1..].trim();
+        if let Some((dst_raw, _)) = parse_c_quoted_path(rem) {
+            let src = src_raw.strip_prefix("a/").unwrap_or(src_raw).to_string();
+            let dst = unescape_c_path(dst_raw);
+            return Some((src, dst));
+        }
+    }
+
+    // Symmetric non-rename check: a/<path> b/<path>
+    if rest.starts_with("a/") && rest.len() >= 5 && (rest.len() - 5) % 2 == 0 {
+        let k = (rest.len() - 5) / 2;
+        if rest.get(2 + k..2 + k + 3) == Some(" b/")
+            && let (Some(left), Some(right)) = (rest.get(2..2 + k), rest.get(2 + k + 3..))
+            && left == right
+        {
+            return Some((left.to_string(), left.to_string()));
+        }
+    }
+
+    let occurrences: Vec<usize> = rest.match_indices(" b/").map(|(i, _)| i).collect();
+    if occurrences.len() == 1 {
+        let pos = occurrences[0];
+        let a_part = &rest[..pos];
+        let b_part = &rest[pos + 3..];
+        let src = a_part.strip_prefix("a/").unwrap_or(a_part);
+        let dst = b_part.strip_prefix("b/").unwrap_or(b_part);
+        return Some((src.to_string(), dst.to_string()));
+    } else if let Some(pos) = rest.rfind(" b/") {
+        let a_part = &rest[..pos];
+        let b_part = &rest[pos + 3..];
+        let src = a_part.strip_prefix("a/").unwrap_or(a_part);
+        let dst = b_part.strip_prefix("b/").unwrap_or(b_part);
+        return Some((src.to_string(), dst.to_string()));
+    }
+
+    None
+}
+
+fn extract_diff_git_source(line: &str) -> Option<String> {
+    parse_diff_git_paths(line).map(|(src, _)| src)
+}
+
+fn extract_diff_git_target(line: &str) -> Option<String> {
+    parse_diff_git_paths(line).map(|(_, dst)| dst)
+}
+
 fn extract_target_file(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("+++ ")?.trim();
+    let rest = line
+        .strip_prefix("++++ ")
+        .or_else(|| line.strip_prefix("+++ "))?
+        .trim();
     if rest == "/dev/null" {
         return None;
     }
-    let unquoted = if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
-        &rest[1..rest.len() - 1]
+    if rest.starts_with('"')
+        && let Some((inside, _)) = parse_c_quoted_path(rest)
+    {
+        return Some(unescape_c_path(inside));
+    }
+    let path_part = if let Some(pos) = rest.find('\t') {
+        &rest[..pos]
     } else {
         rest
     };
-    let unescaped = unquoted.replace(r#"\""#, "\"").replace(r#"\\"#, "\\");
+    let unescaped = path_part.replace(r#"\""#, "\"").replace(r#"\\"#, "\\");
     let target = if let Some(s) = unescaped.strip_prefix("b/") {
+        s
+    } else if let Some(s) = unescaped.strip_prefix("a/") {
+        s
+    } else {
+        &unescaped
+    };
+    Some(target.to_string())
+}
+
+fn extract_source_file(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("---- ")
+        .or_else(|| line.strip_prefix("--- "))?
+        .trim();
+    if rest == "/dev/null" {
+        return None;
+    }
+    if rest.starts_with('"')
+        && let Some((inside, _)) = parse_c_quoted_path(rest)
+    {
+        return Some(unescape_c_path(inside));
+    }
+    let path_part = if let Some(pos) = rest.find('\t') {
+        &rest[..pos]
+    } else {
+        rest
+    };
+    let unescaped = path_part.replace(r#"\""#, "\"").replace(r#"\\"#, "\\");
+    let target = if let Some(s) = unescaped.strip_prefix("a/") {
+        s
+    } else if let Some(s) = unescaped.strip_prefix("b/") {
         s
     } else {
         &unescaped
@@ -41,7 +181,10 @@ fn extract_target_file(line: &str) -> Option<String> {
 }
 
 fn is_diff_pre_image_header(line: &str) -> bool {
-    if let Some(rest) = line.strip_prefix("--- ") {
+    let rest_opt = line
+        .strip_prefix("---- ")
+        .or_else(|| line.strip_prefix("--- "));
+    if let Some(rest) = rest_opt {
         let trimmed = rest.trim();
         trimmed.starts_with("a/")
             || trimmed.starts_with("b/")
@@ -54,92 +197,176 @@ fn is_diff_pre_image_header(line: &str) -> bool {
     }
 }
 
-fn extract_diff_git_target(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("diff --git ")?.trim();
-    if let Some(pos) = rest.rfind(r#" "b/"#) {
-        let b_part = &rest[pos + 4..];
-        let unquoted = b_part.trim_end_matches('"');
-        return Some(unquoted.replace(r#"\""#, "\"").replace(r#"\\"#, "\\"));
+fn is_diff_post_image_header(line: &str) -> bool {
+    let rest_opt = line
+        .strip_prefix("++++ ")
+        .or_else(|| line.strip_prefix("+++ "));
+    if let Some(rest) = rest_opt {
+        let trimmed = rest.trim();
+        trimmed.starts_with("a/")
+            || trimmed.starts_with("b/")
+            || trimmed == "/dev/null"
+            || trimmed.starts_with("\"a/")
+            || trimmed.starts_with("\"b/")
+            || rest.contains('\t')
+    } else {
+        false
     }
-    if let Some(pos) = rest.rfind(" b/") {
-        let b_part = &rest[pos + 3..];
-        return Some(b_part.trim().to_string());
-    }
-    None
 }
 
-/// Parses a unified diff and returns a map of filename -> list of exact modified (added/replaced)
-/// line ranges in the post-image. Line numbers are 0-based indices.
-/// Unlike prefetch ranges, unmodified context lines and gap lines between hunks are never included.
-pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
-    let mut files: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    let mut current_file: Option<String> = None;
+/// Two-sided diff parsing results tracking both post-image (added) and pre-image (deleted) ranges and contents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedDiff {
+    /// Post-image (revision) added/modified line ranges (0-based start, 0-based end inclusive).
+    pub post_ranges: HashMap<String, Vec<(usize, usize)>>,
+    /// Pre-image (parent) deleted/modified line ranges (0-based start, 0-based end inclusive).
+    pub pre_ranges: HashMap<String, Vec<(usize, usize)>>,
+    /// Deleted lines in pre-image: map of filename -> list of (0-based pre line index, line text without leading '-').
+    pub deleted_lines: HashMap<String, Vec<(usize, String)>>,
+    /// Rename mapping from pre-image source path to post-image target path.
+    pub pre_to_post: HashMap<String, String>,
+    /// Rename mapping from post-image target path to pre-image source path.
+    pub post_to_pre: HashMap<String, String>,
+}
+
+/// Parses a unified diff into two-sided line ranges and deleted line content.
+pub fn parse_two_sided_diff(diff: &str) -> ParsedDiff {
+    let mut post_files: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut pre_files: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut deleted_lines: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut pre_to_post: HashMap<String, String> = HashMap::new();
+    let mut post_to_pre: HashMap<String, String> = HashMap::new();
+
+    let mut current_post_file: Option<String> = None;
+    let mut current_pre_file: Option<String> = None;
+
+    let mut current_pre_line: usize = 0;
     let mut current_post_line: usize = 0;
-    let mut hunk_start_0: usize = 0;
-    let mut hunk_count: usize = 0;
+
+    let mut hunk_pre_start_0: usize = 0;
+    let mut hunk_post_start_0: usize = 0;
+    let mut hunk_pre_count: usize = 0;
+    let mut hunk_post_count: usize = 0;
+
     let mut hunk_pre_target: usize = 0;
     let mut hunk_post_target: usize = 0;
     let mut hunk_pre_consumed: usize = 0;
     let mut hunk_post_consumed: usize = 0;
+
     let mut hunk_has_body = false;
     let mut hunk_added_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut hunk_deleted_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut hunk_deleted_lines: Vec<(usize, String)> = Vec::new();
     let mut in_hunk = false;
 
-    let flush_hunk = |file: &Option<String>,
+    let flush_hunk = |post_file: &Option<String>,
+                      pre_file: &Option<String>,
                       in_hunk: bool,
                       hunk_has_body: bool,
-                      hunk_start_0: usize,
-                      hunk_count: usize,
+                      hunk_post_start_0: usize,
+                      hunk_post_count: usize,
+                      hunk_pre_start_0: usize,
+                      hunk_pre_count: usize,
                       hunk_added_ranges: &mut Vec<(usize, usize)>,
-                      files: &mut HashMap<String, Vec<(usize, usize)>>| {
+                      hunk_deleted_ranges: &mut Vec<(usize, usize)>,
+                      hunk_deleted_lines: &mut Vec<(usize, String)>,
+                      post_files: &mut HashMap<String, Vec<(usize, usize)>>,
+                      pre_files: &mut HashMap<String, Vec<(usize, usize)>>,
+                      deleted_lines: &mut HashMap<String, Vec<(usize, String)>>,
+                      pre_to_post: &mut HashMap<String, String>,
+                      post_to_pre: &mut HashMap<String, String>| {
         if !in_hunk {
             return;
         }
-        if let Some(fname) = file {
-            let ranges = files.entry(fname.clone()).or_default();
-            if !hunk_has_body && hunk_count > 0 {
-                // Header-only diff without body lines: fall back to header span
+        if let Some(post) = post_file.as_ref() {
+            let ranges = post_files.entry(post.clone()).or_default();
+            if !hunk_has_body && hunk_post_count > 0 {
                 ranges.push((
-                    hunk_start_0,
-                    hunk_start_0.saturating_add(hunk_count.saturating_sub(1)),
+                    hunk_post_start_0,
+                    hunk_post_start_0.saturating_add(hunk_post_count.saturating_sub(1)),
                 ));
             } else {
-                ranges.append(hunk_added_ranges);
+                ranges.extend(hunk_added_ranges.iter().copied());
             }
         }
+
+        if let Some(pre) = pre_file.as_ref() {
+            let ranges = pre_files.entry(pre.clone()).or_default();
+            if !hunk_has_body && hunk_pre_count > 0 {
+                ranges.push((
+                    hunk_pre_start_0,
+                    hunk_pre_start_0.saturating_add(hunk_pre_count.saturating_sub(1)),
+                ));
+            } else {
+                ranges.extend(hunk_deleted_ranges.iter().copied());
+            }
+            deleted_lines
+                .entry(pre.clone())
+                .or_default()
+                .extend(hunk_deleted_lines.iter().cloned());
+        }
+
+        if let (Some(pre), Some(post)) = (pre_file.as_ref(), post_file.as_ref())
+            && pre != post
+        {
+            pre_to_post.insert(pre.clone(), post.clone());
+            post_to_pre.insert(post.clone(), pre.clone());
+        }
+
         hunk_added_ranges.clear();
+        hunk_deleted_ranges.clear();
+        hunk_deleted_lines.clear();
     };
 
     for line in diff.lines() {
         if in_hunk {
             if line.starts_with("@@") {
                 flush_hunk(
-                    &current_file,
+                    &current_post_file,
+                    &current_pre_file,
                     in_hunk,
                     hunk_has_body,
-                    hunk_start_0,
-                    hunk_count,
+                    hunk_post_start_0,
+                    hunk_post_count,
+                    hunk_pre_start_0,
+                    hunk_pre_count,
                     &mut hunk_added_ranges,
-                    &mut files,
+                    &mut hunk_deleted_ranges,
+                    &mut hunk_deleted_lines,
+                    &mut post_files,
+                    &mut pre_files,
+                    &mut deleted_lines,
+                    &mut pre_to_post,
+                    &mut post_to_pre,
                 );
                 if let Some(caps) = CHUNK_HEADER_RE.captures(line) {
+                    let pre_start: usize = caps
+                        .get(1)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(1);
                     let pre_count: usize = caps
                         .get(2)
                         .and_then(|m| m.as_str().parse().ok())
                         .unwrap_or(1);
-                    let start: usize = caps
+                    let post_start: usize = caps
                         .get(3)
                         .and_then(|m| m.as_str().parse().ok())
                         .unwrap_or(1);
-                    let count: usize = caps
+                    let post_count: usize = caps
                         .get(4)
                         .and_then(|m| m.as_str().parse().ok())
                         .unwrap_or(1);
-                    current_post_line = start;
-                    hunk_start_0 = start.saturating_sub(1);
-                    hunk_count = count;
+
+                    current_pre_line = pre_start;
+                    current_post_line = post_start;
+
+                    hunk_pre_start_0 = pre_start.saturating_sub(1);
+                    hunk_post_start_0 = post_start.saturating_sub(1);
+                    hunk_pre_count = pre_count;
+                    hunk_post_count = post_count;
+
                     hunk_pre_target = pre_count;
-                    hunk_post_target = count;
+                    hunk_post_target = post_count;
                     hunk_pre_consumed = 0;
                     hunk_post_consumed = 0;
                     in_hunk = true;
@@ -149,27 +376,77 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
                 }
             } else if line.starts_with("diff --git ") {
                 flush_hunk(
-                    &current_file,
+                    &current_post_file,
+                    &current_pre_file,
                     in_hunk,
                     hunk_has_body,
-                    hunk_start_0,
-                    hunk_count,
+                    hunk_post_start_0,
+                    hunk_post_count,
+                    hunk_pre_start_0,
+                    hunk_pre_count,
                     &mut hunk_added_ranges,
-                    &mut files,
+                    &mut hunk_deleted_ranges,
+                    &mut hunk_deleted_lines,
+                    &mut post_files,
+                    &mut pre_files,
+                    &mut deleted_lines,
+                    &mut pre_to_post,
+                    &mut post_to_pre,
                 );
-                current_file = extract_diff_git_target(line);
+                current_post_file = extract_diff_git_target(line);
+                current_pre_file = extract_diff_git_source(line);
+                if let (Some(pre), Some(post)) =
+                    (current_pre_file.as_ref(), current_post_file.as_ref())
+                    && pre != post
+                {
+                    pre_to_post.insert(pre.clone(), post.clone());
+                    post_to_pre.insert(post.clone(), pre.clone());
+                }
                 in_hunk = false;
                 hunk_has_body = false;
             } else if hunk_pre_consumed >= hunk_pre_target && is_diff_pre_image_header(line) {
                 flush_hunk(
-                    &current_file,
+                    &current_post_file,
+                    &current_pre_file,
                     in_hunk,
                     hunk_has_body,
-                    hunk_start_0,
-                    hunk_count,
+                    hunk_post_start_0,
+                    hunk_post_count,
+                    hunk_pre_start_0,
+                    hunk_pre_count,
                     &mut hunk_added_ranges,
-                    &mut files,
+                    &mut hunk_deleted_ranges,
+                    &mut hunk_deleted_lines,
+                    &mut post_files,
+                    &mut pre_files,
+                    &mut deleted_lines,
+                    &mut pre_to_post,
+                    &mut post_to_pre,
                 );
+                current_pre_file = extract_source_file(line);
+                current_post_file = None;
+                in_hunk = false;
+                hunk_has_body = false;
+            } else if hunk_post_consumed >= hunk_post_target && is_diff_post_image_header(line) {
+                flush_hunk(
+                    &current_post_file,
+                    &current_pre_file,
+                    in_hunk,
+                    hunk_has_body,
+                    hunk_post_start_0,
+                    hunk_post_count,
+                    hunk_pre_start_0,
+                    hunk_pre_count,
+                    &mut hunk_added_ranges,
+                    &mut hunk_deleted_ranges,
+                    &mut hunk_deleted_lines,
+                    &mut post_files,
+                    &mut pre_files,
+                    &mut deleted_lines,
+                    &mut pre_to_post,
+                    &mut post_to_pre,
+                );
+                current_post_file = extract_target_file(line);
                 in_hunk = false;
                 hunk_has_body = false;
             } else if line.starts_with('+') {
@@ -186,13 +463,22 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
                 current_post_line = current_post_line.saturating_add(1);
                 if hunk_post_consumed >= hunk_post_target && hunk_pre_consumed >= hunk_pre_target {
                     flush_hunk(
-                        &current_file,
+                        &current_post_file,
+                        &current_pre_file,
                         in_hunk,
                         hunk_has_body,
-                        hunk_start_0,
-                        hunk_count,
+                        hunk_post_start_0,
+                        hunk_post_count,
+                        hunk_pre_start_0,
+                        hunk_pre_count,
                         &mut hunk_added_ranges,
-                        &mut files,
+                        &mut hunk_deleted_ranges,
+                        &mut hunk_deleted_lines,
+                        &mut post_files,
+                        &mut pre_files,
+                        &mut deleted_lines,
+                        &mut pre_to_post,
+                        &mut post_to_pre,
                     );
                     in_hunk = false;
                 }
@@ -200,80 +486,152 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
                 hunk_has_body = true;
                 hunk_pre_consumed = hunk_pre_consumed.saturating_add(1);
                 hunk_post_consumed = hunk_post_consumed.saturating_add(1);
+                current_pre_line = current_pre_line.saturating_add(1);
                 current_post_line = current_post_line.saturating_add(1);
                 if hunk_post_consumed >= hunk_post_target && hunk_pre_consumed >= hunk_pre_target {
                     flush_hunk(
-                        &current_file,
+                        &current_post_file,
+                        &current_pre_file,
                         in_hunk,
                         hunk_has_body,
-                        hunk_start_0,
-                        hunk_count,
+                        hunk_post_start_0,
+                        hunk_post_count,
+                        hunk_pre_start_0,
+                        hunk_pre_count,
                         &mut hunk_added_ranges,
-                        &mut files,
+                        &mut hunk_deleted_ranges,
+                        &mut hunk_deleted_lines,
+                        &mut post_files,
+                        &mut pre_files,
+                        &mut deleted_lines,
+                        &mut pre_to_post,
+                        &mut post_to_pre,
                     );
                     in_hunk = false;
                 }
             } else if line.starts_with('-') {
                 hunk_has_body = true;
                 hunk_pre_consumed = hunk_pre_consumed.saturating_add(1);
+                let line_0 = current_pre_line.saturating_sub(1);
+                if let Some(last) = hunk_deleted_ranges.last_mut()
+                    && last.1.saturating_add(1) == line_0
+                {
+                    last.1 = line_0;
+                } else {
+                    hunk_deleted_ranges.push((line_0, line_0));
+                }
+                let text = line.strip_prefix('-').unwrap_or(line).to_string();
+                hunk_deleted_lines.push((line_0, text));
+                current_pre_line = current_pre_line.saturating_add(1);
                 if hunk_post_consumed >= hunk_post_target && hunk_pre_consumed >= hunk_pre_target {
                     flush_hunk(
-                        &current_file,
+                        &current_post_file,
+                        &current_pre_file,
                         in_hunk,
                         hunk_has_body,
-                        hunk_start_0,
-                        hunk_count,
+                        hunk_post_start_0,
+                        hunk_post_count,
+                        hunk_pre_start_0,
+                        hunk_pre_count,
                         &mut hunk_added_ranges,
-                        &mut files,
+                        &mut hunk_deleted_ranges,
+                        &mut hunk_deleted_lines,
+                        &mut post_files,
+                        &mut pre_files,
+                        &mut deleted_lines,
+                        &mut pre_to_post,
+                        &mut post_to_pre,
                     );
                     in_hunk = false;
                 }
             } else if line.starts_with('\\') {
-                // \ No newline at end of file: ignore
+                // Git emits "\ No newline at end of file" when EOF newline changes; ignore without exiting hunk.
             } else {
                 // Non-hunk line (headers, signatures, commit logs): flush and exit hunk
                 flush_hunk(
-                    &current_file,
+                    &current_post_file,
+                    &current_pre_file,
                     in_hunk,
                     hunk_has_body,
-                    hunk_start_0,
-                    hunk_count,
+                    hunk_post_start_0,
+                    hunk_post_count,
+                    hunk_pre_start_0,
+                    hunk_pre_count,
                     &mut hunk_added_ranges,
-                    &mut files,
+                    &mut hunk_deleted_ranges,
+                    &mut hunk_deleted_lines,
+                    &mut post_files,
+                    &mut pre_files,
+                    &mut deleted_lines,
+                    &mut pre_to_post,
+                    &mut post_to_pre,
                 );
                 in_hunk = false;
-                if line.starts_with("+++ ") {
-                    current_file = extract_target_file(line);
+                hunk_has_body = false;
+                if line.starts_with("diff --git ") {
+                    current_post_file = extract_diff_git_target(line);
+                    current_pre_file = extract_diff_git_source(line);
+                    if let (Some(pre), Some(post)) =
+                        (current_pre_file.as_ref(), current_post_file.as_ref())
+                        && pre != post
+                    {
+                        pre_to_post.insert(pre.clone(), post.clone());
+                        post_to_pre.insert(post.clone(), pre.clone());
+                    }
+                } else if is_diff_pre_image_header(line) {
+                    current_pre_file = extract_source_file(line);
+                    current_post_file = None;
+                } else if is_diff_post_image_header(line) {
+                    current_post_file = extract_target_file(line);
                 }
             }
         } else {
             // Outside of hunks: parse headers
             if line.starts_with("diff --git ") {
-                if let Some(target) = extract_diff_git_target(line) {
-                    current_file = Some(target);
+                current_post_file = extract_diff_git_target(line);
+                current_pre_file = extract_diff_git_source(line);
+                if let (Some(pre), Some(post)) =
+                    (current_pre_file.as_ref(), current_post_file.as_ref())
+                    && pre != post
+                {
+                    pre_to_post.insert(pre.clone(), post.clone());
+                    post_to_pre.insert(post.clone(), pre.clone());
                 }
-            } else if line.starts_with("+++ ") {
-                current_file = extract_target_file(line);
+            } else if is_diff_pre_image_header(line) {
+                current_pre_file = extract_source_file(line);
+                current_post_file = None;
+            } else if is_diff_post_image_header(line) {
+                current_post_file = extract_target_file(line);
             } else if line.starts_with("@@")
                 && let Some(caps) = CHUNK_HEADER_RE.captures(line)
             {
+                let pre_start: usize = caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(1);
                 let pre_count: usize = caps
                     .get(2)
                     .and_then(|m| m.as_str().parse().ok())
                     .unwrap_or(1);
-                let start: usize = caps
+                let post_start: usize = caps
                     .get(3)
                     .and_then(|m| m.as_str().parse().ok())
                     .unwrap_or(1);
-                let count: usize = caps
+                let post_count: usize = caps
                     .get(4)
                     .and_then(|m| m.as_str().parse().ok())
                     .unwrap_or(1);
-                current_post_line = start;
-                hunk_start_0 = start.saturating_sub(1);
-                hunk_count = count;
+
+                current_pre_line = pre_start;
+                current_post_line = post_start;
+
+                hunk_pre_start_0 = pre_start.saturating_sub(1);
+                hunk_post_start_0 = post_start.saturating_sub(1);
+                hunk_pre_count = pre_count;
+                hunk_post_count = post_count;
+
                 hunk_pre_target = pre_count;
-                hunk_post_target = count;
+                hunk_post_target = post_count;
                 hunk_pre_consumed = 0;
                 hunk_post_consumed = 0;
                 in_hunk = true;
@@ -283,24 +641,44 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
     }
 
     flush_hunk(
-        &current_file,
+        &current_post_file,
+        &current_pre_file,
         in_hunk,
         hunk_has_body,
-        hunk_start_0,
-        hunk_count,
+        hunk_post_start_0,
+        hunk_post_count,
+        hunk_pre_start_0,
+        hunk_pre_count,
         &mut hunk_added_ranges,
-        &mut files,
+        &mut hunk_deleted_ranges,
+        &mut hunk_deleted_lines,
+        &mut post_files,
+        &mut pre_files,
+        &mut deleted_lines,
+        &mut pre_to_post,
+        &mut post_to_pre,
     );
 
-    files
+    ParsedDiff {
+        post_ranges: post_files,
+        pre_ranges: pre_files,
+        deleted_lines,
+        pre_to_post,
+        post_to_pre,
+    }
+}
+
+/// Parses a unified diff and returns a map of filename -> list of exact modified (added/replaced)
+/// line ranges in the post-image. Line numbers are 0-based indices.
+/// Unlike prefetch ranges, unmodified context lines and gap lines between hunks are never included.
+pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
+    parse_two_sided_diff(diff).post_ranges
 }
 
 /// Maximum file size (4 MiB) to inspect when resolving finding locations,
 /// guarding against unbounded memory allocation on massive generated files or binary blobs.
 pub const MAX_RESOLVE_FILE_SIZE: u64 = 4 * 1024 * 1024;
 
-/// Resolved location with verified 1-based line numbers and character offsets.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLocation {
     pub file: String,
     pub line: usize,
@@ -946,6 +1324,34 @@ pub fn resolve_finding_locations(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_parse_two_sided_diff_captures_pre_and_post_ranges_and_deleted_lines() {
+        let diff = r#"diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -100,6 +100,5 @@ int check_map(void) {
+     validate_map();
+-    if (btf_record_has_field(map, BPF_TIMER))
+-        return -EINVAL;
++    check_timer();
+     return 0;
+ }
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        let post = parsed.post_ranges.get("kernel/bpf/verifier.c").unwrap();
+        assert_eq!(post, &vec![(100, 100)]);
+
+        let pre = parsed.pre_ranges.get("kernel/bpf/verifier.c").unwrap();
+        assert_eq!(pre, &vec![(100, 101)]);
+
+        let del = parsed.deleted_lines.get("kernel/bpf/verifier.c").unwrap();
+        assert_eq!(del.len(), 2);
+        assert_eq!(del[0].0, 100);
+        assert_eq!(del[0].1, "    if (btf_record_has_field(map, BPF_TIMER))");
+        assert_eq!(del[1].0, 101);
+        assert_eq!(del[1].1, "        return -EINVAL;");
+    }
+
     use super::*;
     use std::fs::File;
     use std::io::Write;
@@ -1643,5 +2049,240 @@ index 123456..789abc 100644
 
         let guided = find_snippet_in_lines(&code, snippet, None, None, symbol_line);
         assert_eq!(guided, Some((5, 5)));
+    }
+
+    #[test]
+    fn test_parse_two_sided_diff_handles_file_renames_and_null_files() {
+        let diff = r#"diff --git a/old_dir/foo.c b/new_dir/foo.c
+similarity index 90%
+rename from old_dir/foo.c
+rename to new_dir/foo.c
+--- a/old_dir/foo.c
+++++ b/new_dir/foo.c
+@@ -10,3 +10,4 @@ void run(void) {
+-    old_work();
++    new_work();
++    more_work();
+ }
+diff --git a/created.c b/created.c
+new file mode 100644
+--- /dev/null
+++++ b/created.c
+@@ -0,0 +1,2 @@
++int new_func(void) { return 0; }
++"#;
+        let parsed = parse_two_sided_diff(diff);
+
+        // Pre-ranges and deleted lines belong to old path; post-ranges belong to new path
+        assert!(parsed.deleted_lines.contains_key("old_dir/foo.c"));
+        assert!(!parsed.deleted_lines.contains_key("new_dir/foo.c"));
+        assert_eq!(
+            parsed.deleted_lines.get("old_dir/foo.c").unwrap()[0].1,
+            "    old_work();"
+        );
+
+        assert!(!parsed.post_ranges.contains_key("old_dir/foo.c"));
+        assert!(parsed.post_ranges.contains_key("new_dir/foo.c"));
+
+        // Rename mappings are tracked cleanly without cross-contaminating line ranges
+        assert_eq!(
+            parsed.pre_to_post.get("old_dir/foo.c"),
+            Some(&"new_dir/foo.c".to_string())
+        );
+        assert_eq!(
+            parsed.post_to_pre.get("new_dir/foo.c"),
+            Some(&"old_dir/foo.c".to_string())
+        );
+
+        // Created file should have post-ranges but no pre-ranges
+        assert!(parsed.post_ranges.contains_key("created.c"));
+        assert!(!parsed.pre_ranges.contains_key("created.c"));
+        assert!(!parsed.deleted_lines.contains_key("created.c"));
+    }
+
+    #[test]
+    fn test_extract_diff_git_source_unquoted_with_spaces() {
+        let line = "diff --git a/path with spaces/source.c b/path with spaces/target.c";
+        assert_eq!(
+            extract_diff_git_source(line),
+            Some("path with spaces/source.c".to_string())
+        );
+        assert_eq!(
+            extract_diff_git_target(line),
+            Some("path with spaces/target.c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_diff_git_source_quoted_with_escaped_quotes() {
+        let line = r#"diff --git "a/path \"with\" quotes/foo.c" "b/path \"with\" quotes/foo.c""#;
+        assert_eq!(
+            extract_diff_git_source(line),
+            Some(r#"path "with" quotes/foo.c"#.to_string())
+        );
+        assert_eq!(
+            extract_diff_git_target(line),
+            Some(r#"path "with" quotes/foo.c"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_diff_git_source_unquoted_with_embedded_b_slash() {
+        let line = "diff --git a/sub b/file.txt b/sub b/file.txt";
+        assert_eq!(
+            extract_diff_git_source(line),
+            Some("sub b/file.txt".to_string())
+        );
+        assert_eq!(
+            extract_diff_git_target(line),
+            Some("sub b/file.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_diff_git_multibyte_utf8_paths() {
+        // Multi-byte UTF-8 in symmetric paths
+        let line = "diff --git a/🦀/test.rs b/🦀/test.rs";
+        assert_eq!(
+            extract_diff_git_source(line),
+            Some("🦀/test.rs".to_string())
+        );
+        assert_eq!(
+            extract_diff_git_target(line),
+            Some("🦀/test.rs".to_string())
+        );
+
+        // Path where (rest.len() - 5) / 2 falls on a non-char-boundary must not panic
+        let malformed = "diff --git a/😊x😊";
+        assert_eq!(extract_diff_git_source(malformed), None);
+        assert_eq!(extract_diff_git_target(malformed), None);
+    }
+
+    #[test]
+    fn test_multi_file_diff_without_diff_git_updates_pre_file_correctly() {
+        let diff = r#"--- a/file1.c
++++ b/file1.c
+@@ -1,1 +1,1 @@
+-old1
++new1
+--- a/file2.c
++++ b/file2.c
+@@ -1,1 +1,1 @@
+-old2
++new2
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        assert!(parsed.post_ranges.contains_key("file1.c"));
+        assert!(parsed.post_ranges.contains_key("file2.c"));
+        assert!(parsed.deleted_lines.contains_key("file1.c"));
+        assert!(parsed.deleted_lines.contains_key("file2.c"));
+        assert_eq!(
+            parsed.deleted_lines["file1.c"],
+            vec![(0, "old1".to_string())]
+        );
+        assert_eq!(
+            parsed.deleted_lines["file2.c"],
+            vec![(0, "old2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_unparseable_diff_git_header_does_not_leak_previous_file_state() {
+        let diff = r#"diff --git a/valid.c b/valid.c
+--- a/valid.c
++++ b/valid.c
+@@ -1,1 +1,1 @@
+-old_valid
++new_valid
+diff --git unparseable_header
+@@ -10,1 +10,1 @@
+-old_corrupt
++new_corrupt
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        assert_eq!(parsed.post_ranges.get("valid.c"), Some(&vec![(0, 0)]));
+        assert_eq!(
+            parsed.deleted_lines.get("valid.c"),
+            Some(&vec![(0, "old_valid".to_string())])
+        );
+        // The unparseable hunk must not leak into valid.c
+        assert!(!parsed.post_ranges.contains_key("unparseable_header"));
+    }
+
+    #[test]
+    fn test_combined_diff_header_terminates_hunk_correctly() {
+        let diff = r#"--- a/file1.c
++++ b/file1.c
+@@ -1,1 +1,1 @@
+-old1
++new1
+---- a/file2.c
+++++ b/file2.c
+@@ -1,1 +1,1 @@
+-old2
++new2
+"#;
+        let parsed = parse_two_sided_diff(diff);
+        assert!(parsed.post_ranges.contains_key("file1.c"));
+        assert!(parsed.post_ranges.contains_key("file2.c"));
+        assert!(parsed.deleted_lines.contains_key("file1.c"));
+        assert!(parsed.deleted_lines.contains_key("file2.c"));
+        assert_eq!(
+            parsed.deleted_lines["file1.c"],
+            vec![(0, "old1".to_string())]
+        );
+        assert_eq!(
+            parsed.deleted_lines["file2.c"],
+            vec![(0, "old2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_two_sided_diff_with_no_newline_marker_and_empty_context_lines() {
+        let diff = r#"diff --git a/foo.rs b/foo.rs
+index 1111111..2222222 100644
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,3 +1,3 @@
+ context 1
+-old line without newline
+\ No newline at end of file
++new line without newline
+\ No newline at end of file
+ context 2
+"#;
+        let res = parse_two_sided_diff(diff);
+        assert_eq!(res.post_ranges.get("foo.rs"), Some(&vec![(1, 1)]));
+        assert_eq!(res.pre_ranges.get("foo.rs"), Some(&vec![(1, 1)]));
+        assert_eq!(
+            res.deleted_lines.get("foo.rs"),
+            Some(&vec![(1, "old line without newline".to_string())])
+        );
+
+        // Also verify stripped empty context lines do not abort hunks
+        let stripped_diff = "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,4 +1,4 @@\n context 1\n\n-old line\n+new line\n context 2\n";
+        let res_stripped = parse_two_sided_diff(stripped_diff);
+        assert_eq!(res_stripped.post_ranges.get("foo.rs"), Some(&vec![(2, 2)]));
+        assert_eq!(res_stripped.pre_ranges.get("foo.rs"), Some(&vec![(2, 2)]));
+    }
+
+    #[test]
+    fn test_missing_post_image_header_does_not_leak_previous_file_target() {
+        let diff = r#"diff --git a/file1.rs b/file1.rs
+--- a/file1.rs
++++ b/file1.rs
+@@ -1,1 +1,1 @@
+-old1
++new1
+--- a/file2.rs
+@@ -1,1 +1,1 @@
+-old2
++new2
+"#;
+        let res = parse_two_sided_diff(diff);
+        assert_eq!(res.post_ranges.get("file1.rs"), Some(&vec![(0, 0)]));
+        assert_eq!(res.post_ranges.get("file1.rs").unwrap().len(), 1);
+        assert_eq!(res.pre_ranges.get("file1.rs"), Some(&vec![(0, 0)]));
+        assert_eq!(res.pre_ranges.get("file2.rs"), Some(&vec![(0, 0)]));
     }
 }
