@@ -334,3 +334,6 @@ reply_to = ["author", "list", "recipients"]
 
 ["keyrings@vger.kernel.org"]
 reply_to = ["author", "list", "recipients"]
+
+["linux-efi@vger.kernel.org"]
+reply_to = ["author", "list", "recipients"]
