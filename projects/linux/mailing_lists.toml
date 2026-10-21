@@ -38,7 +38,6 @@ ignored_emails = ["patchwork@emeril.freedesktop.org"]
 ["linux-block@vger.kernel.org"]
 ["linux-bluetooth@vger.kernel.org"]
 ["linux-cifs@vger.kernel.org"]
-["linux-crypto@vger.kernel.org"]
 ["linux-erofs@lists.ozlabs.org"]
 ["linux-f2fs-devel@lists.sourceforge.net"]
 ["linux-hardening@vger.kernel.org"]
@@ -329,3 +328,9 @@ embargo_hours = 24
 
 ["linux-sound@vger.kernel.org"]
 reply_to = ["author", "list"]
+
+["linux-crypto@vger.kernel.org"]
+reply_to = ["author", "list", "recipients"]
+
+["keyrings@vger.kernel.org"]
+reply_to = ["author", "list", "recipients"]
