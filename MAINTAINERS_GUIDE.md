@@ -17,11 +17,58 @@ To request tracking for a new lore or NNTP mailing list, you can either:
 1.  **Submit a Pull Request:** Add a `["<list-email>"]` section to [`projects/linux/mailing_lists.toml`](projects/linux/mailing_lists.toml). Sashiko automatically derives the Lore NNTP group name by reversing the domain components and appending the list's local part (e.g., `bpf@vger.kernel.org` becomes `org.kernel.vger.bpf`). If the NNTP group name on `nntp.lore.kernel.org` does not follow this convention, set `nntp_group = "..."` explicitly in the section.
 2.  **Send an Email:** Contact the Sashiko development mailing list (`sashiko@lists.linux.dev`) and `Cc: Roman Gushchin <roman.gushchin@linux.dev>` with your request.
 
-## Adding Subsystem-Specific Prompts
+## Adding and Updating Maintainer Notes
 
-Sashiko learns how your subsystem's code works by reading and verifying the source itself (its code notes), so there is no need to describe the code. What it cannot learn from the code is what you and your community expect: coding preferences, patch and process policies, conventions and review priorities. To record those, submit a pull request adding or editing a maintainer note under [`projects/linux/prompts/maintainers/`](projects/linux/prompts/maintainers/): one markdown file per subsystem, with front matter naming the paths and symbols it covers (see the existing notes and `projects/linux/prompts/README.md`).
+Sashiko separates objective codebase facts from human maintainer guidance:
 
-> **Note:** Please keep maintainer notes small and focused on preferences and policies. Facts about the code belong in the code, not in a note.
+*   **Automatic Code Notes (`projects/linux/prompts/notes/`):** Extracted and verified directly from the kernel source tree by `sashiko notes`. You do not need to write prompts explaining what functions return, which locks protect a struct field, or how refcounts work.
+*   **Maintainer Notes (`projects/linux/prompts/maintainers/*.md`):** Short, human-written markdown files recording what you and your community expect beyond what is visible in the C/Rust code—coding preferences, deprecated vs. preferred APIs, patch and tree policies, and what classes of noise to ignore.
+
+During every review, Sashiko deterministically loads all maintainer notes whose `paths` or `symbols` match the patch under review and injects them as authoritative `<maintainer_notes>` policy.
+
+### File Format & Front Matter
+
+Each maintainer note lives at [`projects/linux/prompts/maintainers/<subsystem>.md`](projects/linux/prompts/maintainers/) and begins with a `+++`-delimited TOML front matter block followed by a markdown body of bullet points:
+
+```markdown
++++
+title = "Networking Drivers"
+paths = ["drivers/net/"]
+symbols = ["ethtool_ops", "netdev_*"]
++++
+# Networking Drivers: maintainer notes
+
+- Prefer standard device statistics over custom ethtool counters when a standard counter exists.
+- Do not suggest devm_* helpers for net_device allocation or registration lifecycles.
+```
+
+The front matter supports three keys (no unknown keys are permitted):
+
+*   **`title`** *(required)*: Human-readable subsystem or topic name (rendered in `<maintainer_note subsystem="...">`).
+*   **`paths`** *(optional if `symbols` is non-empty)*: `MAINTAINERS`-style file patterns matched against every file touched by the patch:
+    *   Directory prefix ending in `/` (e.g., `"drivers/net/"`, `"fs/nfsd/"`) matches any file under that directory tree.
+    *   Exact file path or glob (e.g., `"*.rs"`, `"include/linux/bpf*.h"`, `"drivers/pci/quirks.c"`).
+    *   `"*"` matches every patch (reserved for [`general.md`](projects/linux/prompts/maintainers/general.md); subsystem notes must scope `paths` to their own files).
+*   **`symbols`** *(optional if `paths` is non-empty)*: C/Rust identifiers or `<prefix>*` wildcards (e.g., `"ethtool_ops"`, `"netdev_*"`, `"bpf_*"`) matched against identifiers on added/removed diff lines and `@@` hunk headers. Avoid short or ubiquitous C tokens (such as `"dev*"`, `"err"`, or `"lock*"`) that would match unrelated patches across the kernel.
+
+At least one of `paths` or `symbols` must be non-empty, and the markdown body after the closing `+++` must not be empty.
+
+### Guidelines for Writing Effective Notes
+
+*   **Focus on policies and preferences, not code facts:** State review rules that cannot be derived from reading the source code (preferred helpers, subsystem conventions, tree/UAPI policies, or recurring nitpicks to suppress). Facts about how the code works belong in source comments or automatic code notes.
+*   **Scope "do not report" rules narrowly:** Because Sashiko treats `<maintainer_notes>` as binding policy, an overly broad ignore rule can hide real bugs. Always state the exact boundary of what to ignore versus what to still report—for example, in [`rust.md`](projects/linux/prompts/maintainers/rust.md):
+    > - Do not flag ordinary build failures or Clippy style lints in the default config; CI already checks those.
+    > - Do report conditional-compilation problems (including broken rustdoc intra-doc links to `CONFIG_*`-gated types) as bugs.
+*   **One rule per bullet:** Keep bullets direct, concrete, and self-contained.
+
+### Validating & Submitting Your Note
+
+1.  Add or edit `projects/linux/prompts/maintainers/<subsystem>.md` (`build.rs` discovers and bundles all `maintainers/*.md` files automatically).
+2.  Verify that all maintainer notes parse cleanly:
+    ```bash
+    cargo test test_shipped_maintainer_notes_parse
+    ```
+3.  Submit a GitHub Pull Request, or email your proposed bullets to `sashiko@lists.linux.dev` (`Cc: Roman Gushchin <roman.gushchin@linux.dev>`).
 
 ## How Sashiko Detects the Baseline for Your Patch
 
