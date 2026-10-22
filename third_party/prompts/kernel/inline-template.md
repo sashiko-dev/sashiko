@@ -8,7 +8,9 @@ any summary, comments or questions you add should be wrapped at 78 characters
 
 - Never include bugs filtered out as false positives in the report
 
-- Always end the report with a blank line.
+- End the report immediately after your last review comment. Do not include
+  any trailing quoted diff lines, [ ... ] snip markers, or closing remarks
+  after the last comment.
 
 - The report must be conversational with undramatic wording, fit for sending
 as a reply to the patch introducing the regression on the LKML mailing list
@@ -274,14 +276,15 @@ Create a note for these items, all of which your report should include:
   - [ ] Check every hunk to see if it is relevant to the review comments.
   - [ ] ensure diff headers are retained for the files owning any hunks keep
     - Never include diff headers for entirely snipped files
-  - [ ] Replace any content you snip with [ ... ]
+  - [ ] Replace any content you snip before or between review comments with
+        [ ... ]; never place [ ... ] after the last review comment
   - [ ] aggressively snip entire files unrelated to the review comments
   - [ ] aggressively snip entire hunks from quoted files if they are unrelated to the review
   - [ ] aggressively snip entire functions from the quoted hunks unrelated to the review
   - [ ] aggressively snip any portions of large functions from quoted hunks if unrelated to the review
   - [ ] ensure you only keep enough quoted material for the review to make sense
-  - [ ] aggressively snip trailing hunks and files after your last review comments unless
-        you need them for the review to make sense
+  - [ ] omit all trailing diff lines, hunks, files, and [ ... ] markers after
+        your last review comment; end the report at the last review comment
   - [ ] The review should contain only the portions of hunks needed to explain the review's concerns.
 
 Sample:
@@ -344,20 +347,6 @@ updates are getting lost.
                  ^^^^^^^^
 [Severity: Low]
                  this isn't a bug, but you've duplicated this line
-
-> +		 * failure is not critical. Scanning one cluster still
-> +		 * keeps the list rotated and reclaimed (for HAS_CACHE).
-> +		 */
-> +		ci = isolate_lock_cluster(si, &si->frag_clusters[order]);
-> +		if (ci) {
->  			found = alloc_swap_scan_cluster(si, ci, cluster_offset(si, ci),
->  							order, usage);
->  			if (found)
->  				goto done;
-> -			frags++;
->  		}
->  	}
->  
 ```
 
 Sample commit message issue:
