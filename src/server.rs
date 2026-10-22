@@ -2193,6 +2193,7 @@ async fn get_config(
         "bugs_enabled": state.settings.linux_bug.enabled,
         "bug_fix_check_enabled": state.settings.linux_bug.fix_check_enabled,
         "read_only": state.read_only,
+        "login_enabled": state.settings.server.login_enabled,
         "permissions": {
             "review": can_review,
             "cancel": can_cancel,
@@ -2200,7 +2201,7 @@ async fn get_config(
         },
         "user": {
             "email": auth.0.as_ref().map(|u| &u.email),
-            "is_authenticated": auth.0.is_some(),
+            "is_authenticated": auth.0.is_some() || !state.settings.server.login_enabled,
         },
         "version": env!("CARGO_PKG_VERSION"),
         "git_hash": env!("GIT_HASH"),
@@ -2931,6 +2932,137 @@ mod tests {
         let id = generate_synthetic_id("test");
         assert!(id.starts_with("sashiko-test-"));
         assert!(id.ends_with("@sashiko.local"));
+    }
+
+    #[tokio::test]
+    async fn test_get_config_login_enabled_false() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.login_enabled = false;
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(settings, db, event_tx, fetch_tx, ServerOptions::default());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .get(format!("http://{}/api/config", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let config: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(config["login_enabled"], false);
+        assert_eq!(config["user"]["is_authenticated"], true);
+    }
+
+    #[tokio::test]
+    async fn test_login_disabled_unauthenticated_bugs_access() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.login_enabled = false;
+        settings.server.testing_mode = false;
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(settings, db, event_tx, fetch_tx, ServerOptions::default());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .get(format!("http://{}/api/bugs", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_login_disabled_request_link_not_implemented() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.login_enabled = false;
+        settings.server.jwt_secret = Some("secret".to_string());
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(settings, db, event_tx, fetch_tx, ServerOptions::default());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "test@example.org" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let res_verify = client
+            .get(format!("http://{}/api/auth/verify?token=sample", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_verify.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let res_refresh = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_refresh.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
@@ -5980,7 +6112,7 @@ pub fn is_authorized(
             return false;
         }
     }
-    if state.settings.server.testing_mode {
+    if !state.settings.server.login_enabled || state.settings.server.testing_mode {
         return true;
     }
     if state.allow_all_submit {
@@ -6090,6 +6222,9 @@ async fn request_link(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Result<StatusCode, StatusCode> {
+    if !state.settings.server.login_enabled {
+        return Err(StatusCode::NOT_IMPLEMENTED);
+    }
     if let Some(secret) = resolve_jwt_secret(&state) {
         let payload: Option<RequestLinkRequest> = serde_json::from_slice(&body).ok();
         let email = payload.as_ref().map(|p| p.email.trim()).unwrap_or("");
@@ -6191,6 +6326,9 @@ async fn verify_link(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<VerifyLinkQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    if !state.settings.server.login_enabled {
+        return Err((StatusCode::NOT_IMPLEMENTED, "Login is disabled"));
+    }
     if let Some(secret) = resolve_jwt_secret(&state) {
         let claims = crate::auth::verify_token(&query.token, &secret)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid sign-in link"))?;
@@ -6222,6 +6360,9 @@ async fn refresh_token(
     auth: crate::auth::OptionalAuthUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    if !state.settings.server.login_enabled {
+        return Err((StatusCode::NOT_IMPLEMENTED, "Login is disabled"));
+    }
     if let Some(secret) = resolve_jwt_secret(&state) {
         if let Some(user) = auth.0 {
             if user.typ.as_deref() != Some("session") {

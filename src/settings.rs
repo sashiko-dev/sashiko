@@ -815,6 +815,8 @@ pub struct ServerSettings {
     pub read_only: bool,
     #[serde(default)]
     pub testing_mode: bool,
+    #[serde(default = "default_login_enabled")]
+    pub login_enabled: bool,
     pub jwt_secret: Option<String>,
     /// Prints sign-in links in full to the log.
     ///
@@ -848,11 +850,16 @@ impl Default for ServerSettings {
             public_base_url: None,
             read_only: false,
             testing_mode: false,
+            login_enabled: true,
             jwt_secret: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
         }
     }
+}
+
+fn default_login_enabled() -> bool {
+    true
 }
 
 impl ServerSettings {
@@ -1834,6 +1841,7 @@ mod tests {
             public_base_url: Some("https://sashiko.example.org/".to_string()),
             read_only: false,
             testing_mode: false,
+            login_enabled: true,
             jwt_secret: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
@@ -1854,6 +1862,7 @@ mod tests {
             public_base_url: Some("https://sashiko.example.org/".to_string()),
             read_only: false,
             testing_mode: false,
+            login_enabled: true,
             jwt_secret: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
@@ -2071,5 +2080,15 @@ mod tests {
 
         settings.ai.model = "gemini-3.1-pro-preview".to_string();
         assert_eq!(settings.effective_effort(), None);
+    }
+
+    #[test]
+    fn test_login_enabled_defaults_to_true_and_can_be_disabled() {
+        let server: ServerSettings = toml::from_str("host = \"::\"\nport = 8080").unwrap();
+        assert!(server.login_enabled);
+
+        let disabled: ServerSettings =
+            toml::from_str("host = \"::\"\nport = 8080\nlogin_enabled = false").unwrap();
+        assert!(!disabled.login_enabled);
     }
 }

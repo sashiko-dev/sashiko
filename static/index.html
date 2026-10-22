@@ -1872,17 +1872,22 @@
         // to show a top-level announcement banner. Once a user clicks the banner
         // to read the announcement or dismisses it with `×`, it stays hidden in
         // their browser until the content is updated.
+        // Set `requiresLogin: true` on an item (or on `WHATS_NEW` itself) to hide
+        // it when `server.login_enabled` is false; optionally set `headlineNoLogin`
+        // or `bodyNoLogin` to customize the text shown when login is disabled.
         // Leave `headline`, `body`, and `items` empty to keep the banner hidden.
         const WHATS_NEW = {
             id: '2026-10-12-whats-new-v2',
             title: "What's New in Sashiko",
             date: '2026-10-12',
             headline: "What's new: maintainer embargo access & early embargo release, shareable bug links, and review map",
+            headlineNoLogin: "What's new: shareable bug links, review map, and prerequisite patch support",
             body: '',
             items: [
                 {
                     title: 'Maintainer embargo access & early embargo release',
-                    description: 'Signed-in maintainers can view embargoed reviews immediately without waiting for the timer, and use the new "Release Embargo" button on a patchset page to publish results early.'
+                    description: 'Signed-in maintainers can view embargoed reviews immediately without waiting for the timer, and use the new "Release Embargo" button on a patchset page to publish results early.',
+                    requiresLogin: true
                 },
                 {
                     title: 'Shareable bug links',
@@ -1898,7 +1903,8 @@
                 },
                 {
                     title: 'New mailing lists & 30-day login',
-                    description: 'Now tracking linux-usb, linux-kbuild, linux-erofs, linux-fscrypt, and linux-fsverity. Web sign-ins stay active for 30 days.'
+                    description: 'Now tracking linux-usb, linux-kbuild, linux-erofs, linux-fscrypt, and linux-fsverity. Web sign-ins stay active for 30 days.',
+                    requiresLogin: true
                 }
             ]
         };
@@ -2019,6 +2025,7 @@
         }
 
         function canPerformBugActions() {
+            if (config && config.login_enabled === false) return !config.read_only;
             if (config && config.read_only) return false;
             return !!getAuthToken();
         }
@@ -2026,6 +2033,9 @@
         function getCommentDisabledTitle() {
             if (config && config.read_only) {
                 return "Server is running in read-only mode.";
+            }
+            if (config && config.login_enabled === false) {
+                return "";
             }
             const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
             if (!isAuthed) {
@@ -2038,6 +2048,9 @@
             if (config && config.read_only) {
                 return "Server is running in read-only mode.";
             }
+            if (config && config.login_enabled === false) {
+                return "";
+            }
             const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
             if (!isAuthed) {
                 return "Please sign in with maintainer credentials to manage this bug.";
@@ -2048,6 +2061,9 @@
         function getActionDisabledTitle() {
             if (config && config.read_only) {
                 return "Server is running in read-only mode.";
+            }
+            if (config && config.login_enabled === false) {
+                return "";
             }
             const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
             if (!isAuthed) {
@@ -2159,6 +2175,11 @@
         }
 
         function updateAuthUI() {
+            if (config && config.login_enabled === false) {
+                const authHeader = document.getElementById('auth-header');
+                if (authHeader) authHeader.style.display = 'none';
+                return;
+            }
             const email = getAuthEmail();
             const emailSpan = document.getElementById('auth-email');
             const btn = document.getElementById('auth-btn');
@@ -2191,6 +2212,7 @@
         let authRequestInFlight = false;
 
         function openAuthModal(noticeMessage) {
+            if (config && config.login_enabled === false) return;
             const input = document.getElementById('authEmailInput');
             const note = document.getElementById('authNote');
             const submitBtn = document.getElementById('authSubmitBtn');
@@ -2461,6 +2483,10 @@
                 const res = await fetch('/api/config');
                 if (res.ok) {
                     config = await res.json();
+                    if (config && config.login_enabled === false) {
+                        const authHeader = document.getElementById('auth-header');
+                        if (authHeader) authHeader.style.display = 'none';
+                    }
                     document.title = getHeaderTitle();
                     if (config.project_description && config.project_description.trim() !== "") {
                         document.getElementById('about-text-content').innerHTML = `
@@ -2473,6 +2499,7 @@
                     }
                 }
             } catch(e) { console.error("Failed to load config", e); }
+            initWhatsNewBanner();
         }
 
         async function router() {
@@ -2622,12 +2649,41 @@
 
         const WHATS_NEW_STORAGE_KEY = 'sashiko_whats_new_dismissed';
 
+        function getEffectiveWhatsNew() {
+            const loginDisabled = !!(config && config.login_enabled === false);
+            if (loginDisabled && WHATS_NEW.requiresLogin) {
+                return { id: '', title: '', date: '', headline: '', body: '', items: [] };
+            }
+            const rawItems = Array.isArray(WHATS_NEW.items) ? WHATS_NEW.items : [];
+            const items = loginDisabled
+                ? rawItems.filter(item => !item.requiresLogin)
+                : rawItems;
+            const body = (loginDisabled && typeof WHATS_NEW.bodyNoLogin === 'string')
+                ? WHATS_NEW.bodyNoLogin.trim()
+                : (WHATS_NEW.body || '').trim();
+            let headline = (loginDisabled && typeof WHATS_NEW.headlineNoLogin === 'string')
+                ? WHATS_NEW.headlineNoLogin.trim()
+                : (WHATS_NEW.headline || '').trim();
+            if (loginDisabled && rawItems.length > 0 && items.length === 0 && !body) {
+                headline = '';
+            }
+            return {
+                id: (WHATS_NEW.id || '').trim(),
+                title: (WHATS_NEW.title || "What's New").trim(),
+                date: (WHATS_NEW.date || '').trim(),
+                headline,
+                body,
+                items
+            };
+        }
+
         function getWhatsNewDigest() {
-            const headline = (WHATS_NEW.headline || '').trim();
-            const body = (WHATS_NEW.body || '').trim();
-            const items = Array.isArray(WHATS_NEW.items) ? WHATS_NEW.items : [];
+            const current = getEffectiveWhatsNew();
+            const headline = current.headline;
+            const body = current.body;
+            const items = current.items;
             if (!headline && !body && items.length === 0) return '';
-            const id = (WHATS_NEW.id || '').trim();
+            const id = current.id;
             const itemsKey = items.map(i => `${i.title || ''}:${i.description || ''}`).join('|');
             return id ? `${id}:${headline}:${body}:${itemsKey}` : `${headline}:${body}:${itemsKey}`;
         }
@@ -2640,7 +2696,8 @@
                 banner.style.display = 'none';
                 return;
             }
-            const headline = (WHATS_NEW.headline || WHATS_NEW.body || '').trim();
+            const current = getEffectiveWhatsNew();
+            const headline = (current.headline || current.body || '').trim();
             const headlineEl = document.getElementById('whatsNewBannerHeadline');
             if (headlineEl) headlineEl.textContent = headline;
             banner.style.display = 'flex';
@@ -2658,11 +2715,12 @@
         function openWhatsNewModal() {
             const digest = getWhatsNewDigest();
             if (!digest) return;
-            const title = (WHATS_NEW.title || "What's New").trim();
-            const headline = (WHATS_NEW.headline || '').trim();
-            const body = (WHATS_NEW.body || '').trim();
-            const date = (WHATS_NEW.date || '').trim();
-            const items = Array.isArray(WHATS_NEW.items) ? WHATS_NEW.items : [];
+            const current = getEffectiveWhatsNew();
+            const title = current.title;
+            const headline = current.headline;
+            const body = current.body;
+            const date = current.date;
+            const items = current.items;
 
             const titleEl = document.getElementById('whatsNewModalTitle');
             if (titleEl) titleEl.textContent = title;
@@ -6802,7 +6860,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         });
 
         loadSettings();
-        initWhatsNewBanner();
         fetchConfig().then(router);
         function getBugActionDraft(id) {
             if (!state.bugActionDrafts) state.bugActionDrafts = {};
