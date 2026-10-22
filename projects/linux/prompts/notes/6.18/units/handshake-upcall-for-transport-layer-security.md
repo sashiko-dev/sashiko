@@ -1,0 +1,64 @@
+# HANDSHAKE UPCALL FOR TRANSPORT LAYER SECURITY
+
+This component provides an in-kernel generic netlink upcall service (`HANDSHAKE` family) that allows kernel socket consumers (such as sunrpc/NFS or NVMe-over-TCP) to delegate transport layer security handshakes (primarily TLS via `tlshd`) to a userspace daemon. It manages the lifecycle of per-socket handshake requests (`struct handshake_req`), tracks pending requests per network namespace, installs the kernel socket into the userspace handler's file descriptor table upon `HANDSHAKE_CMD_ACCEPT`, invokes the consumer's completion callback upon `HANDSHAKE_CMD_DONE`, and provides helpers for TLS Alert records and record content-type control messages.
+
+## Architecture & Data Flow
+
+- Any new TLS parameter added to `struct tls_handshake_args` must be copied into `struct tls_handshake_req` in `tls_handshake_req_init()` (or the mode-specific `tls_*_hello_*()` functions) and serialized as a `HANDSHAKE_A_ACCEPT_*` netlink attribute in `tls_handshake_accept()`. [F41]
+- In `tls_handshake_accept()`, `switch (treq->th_auth_mode)` must allow `HANDSHAKE_AUTH_UNAUTH` (set by `tls_client_hello_anon()`) to pass through without error, emitting extra attributes only for `HANDSHAKE_AUTH_PSK` and `HANDSHAKE_AUTH_X509`. Broken by: adding a `default:` branch that returns an error. [F52]
+- In `handshake_net_init()`, the memory-scaled limit `si.totalram / (25 * si.mem_unit)` must be evaluated and clamped in `unsigned long` (`clamp(tmp, 3UL, 50UL)`) before assigning to the 32-bit signed `int hn->hn_pending_max` to avoid 64-bit truncation or signed overflow. [F56]
+- Trace events in `include/trace/events/handshake.h` (such as `handshake_alert_class`) that populate `saddr` and `daddr` with `TP_STORE_ADDR_PORTS()` and format them with `%pISpc` must size both `__u8` arrays to `sizeof(struct sockaddr_in6)` and zero-initialize them before storing the address. [F63]
+
+## Synchronization
+
+- Spinlock `hn->hn_lock` must be released before calling `handshake_genl_notify()`, `req->hr_proto->hp_accept()`, or `handshake_complete()`, because those paths perform memory allocations, sleepable key lookups (`lookup_user_key()`, `key_link()`), netlink transmissions, and consumer `hp_done` callbacks. [F18]
+- In `handshake_req_submit()`, `req->hr_sk` and `req->hr_odestruct` must be assigned before `handshake_req_hash_add()` and `__add_pending_locked()` publish `req`, because `handshake_rhash_params` hashes `hr_sk` and concurrent `handshake_nl_accept_doit()` readers immediately dereference `req->hr_sk`. [F12]
+- `hn->hn_lock` must be held across all modifications to `hn->hn_pending` and `hn->hn_requests`, and `__remove_pending_locked()` must use `list_del_init(&req->hr_list)` so `remove_pending()` can reliably check `!list_empty(&req->hr_list)` under `hn->hn_lock` to detect whether `req` is still pending. [F14]
+- When `handshake_genl_notify()` fails in `handshake_req_submit()`, `req` must be destroyed via `goto out_err` only if `remove_pending(hn, req)` returns `true`; if it returns `false`, `req` was already dequeued after `hn->hn_lock` was released and `handshake_req_submit()` must fall through to `sock_hold(req->hr_sk)` and return `0`. [F53]
+- In `handshake_net_exit()`, `HANDSHAKE_F_NET_DRAINING` must be set in `hn->hn_flags` under `hn->hn_lock`, and `handshake_req_submit()` must check `test_bit(HANDSHAKE_F_NET_DRAINING, &hn->hn_flags)` while holding `hn->hn_lock` before adding `req` to `handshake_rhashtbl` and `hn->hn_requests`. [F17]
+- `tls_handshake_done()` must set `HANDSHAKE_F_REQ_SESSION` in `req->hr_flags` on successful completion (`!status`) before invoking `treq->th_consumer_done()`, and `tls_handshake_close()` must use `test_and_clear_bit(HANDSHAKE_F_REQ_SESSION, &req->hr_flags)` to gate `tls_alert_send()`. [F19]
+
+## Object Lifetimes
+
+- Once `handshake_req_submit()` succeeds, `struct handshake_req` must remain in `handshake_rhashtbl` across `handshake_req_next()`, `handshake_complete()`, and `handshake_req_cancel()` until `handshake_sk_destruct()` calls `handshake_req_destroy()`, so `handshake_nl_done_doit()`, `tls_handshake_close()`, and `handshake_sk_destruct()` can look up `req` by `sk`. [F35]
+- The `sock_hold(req->hr_sk)` reference taken in `handshake_req_submit()` must be released by `sock_put(sk)` at most once, gated by winning either `remove_pending(hn, req)` in `handshake_req_cancel()` or `test_and_set_bit(HANDSHAKE_F_REQ_COMPLETED, &req->hr_flags)` in `handshake_complete()` or `handshake_req_cancel()`. [F5]
+- Once `handshake_nl_accept_doit()` installs `get_file(sock->file)` into the userspace process file descriptor table, that file reference belongs exclusively to the file descriptor and must never be released via `fput()` by `handshake_req_cancel()`, `handshake_complete()`, or `handshake_net_exit()`. [F7]
+- In `handshake_nl_done_doit()`, `sockfd_put(sock)` must be called only after all dereferences of `sock` and `sock->sk` (including `trace_handshake_cmd_done_err()` and `handshake_complete()`) have finished, and `sock->sk` must never be dereferenced when `sockfd_lookup()` returns `NULL`. [F8]
+- `tls_handshake_req_init()` stores `args->ta_peername` as a shallow pointer in `treq->th_peername` for `nla_put_string()` in `tls_handshake_accept()`, so a non-`NULL` `ta_peername` passed to `tls_client_hello_*()` or `tls_server_hello_*()` must be a NUL-terminated string valid until the handshake completes or is canceled. [F58]
+- In `handshake_init()`, `register_pernet_subsys(&handshake_genl_net_ops)` must be called last after `handshake_req_hash_init()` and `genl_register_family()`, and `handshake_exit()` must call `unregister_pernet_subsys()` and zero `handshake_net_id` before destroying the hash table. [F10]
+
+## API Contracts
+
+- `handshake_req_submit()` requires non-`NULL` `sock`, `sock->file`, and `sock->sk`, and on any negative errno return it frees or destroys `req` internally and guarantees the completion callback will not be invoked. Broken by: calling `kfree(req)` or `handshake_req_cancel()` after submission returns a negative errno. [F25]
+- `handshake_sk_destruct()`, `handshake_req_destroy()`, and any `handshake_proto.hp_destroy` callback execute from `sk->sk_destruct` during final `struct sock` destruction (which may run in softirq/RCU teardown context) and therefore must not sleep. [F66]
+- `handshake_req_alloc()` requires a non-`NULL` `proto` with `hp_handler_class` strictly between `HANDSHAKE_HANDLER_CLASS_NONE` and `HANDSHAKE_HANDLER_CLASS_MAX` and non-`NULL` `hp_accept` and `hp_done` callbacks, returning `NULL` (never an `ERR_PTR`) on invalid parameters or allocation failure. [F23]
+- Production `struct handshake_proto` definitions must set `BIT(HANDSHAKE_F_PROTO_NOTIFY)` in `hp_flags` because `handshake_genl_notify()` checks `test_bit(HANDSHAKE_F_PROTO_NOTIFY, &proto->hp_flags)` and silently skips sending `HANDSHAKE_CMD_READY` multicast notifications when the bit is clear. [F71]
+- The TLS handshake submission entry points (`tls_client_hello_anon()`, `tls_client_hello_x509()`, `tls_client_hello_psk()`, `tls_server_hello_x509()`, `tls_server_hello_psk()`) must propagate their caller-supplied `gfp_t flags` through `handshake_req_alloc()`, `handshake_req_submit()`, and `handshake_genl_notify()` (`genlmsg_new()` and `genlmsg_multicast_netns()`). [F64]
+- `tls_handshake_done()` negates its unsigned `status` argument (`-status`) when invoking `treq->th_consumer_done()`, converting the non-negative errno reported in `HANDSHAKE_A_DONE_STATUS` into `0` or a negative errno for the kernel consumer callback. [F80]
+- `tls_client_hello_psk()` must validate that `args->ta_num_peerids` is between `1` and `ARRAY_SIZE(treq->th_peerid)` (5) inclusive, returning `-EINVAL` before allocating `req` if out of bounds. [F30]
+- `tls_alert_send()` must zero-initialize its `CMSG_SPACE(sizeof(record_type))` control buffer, set `cmsg->cmsg_len = CMSG_LEN(sizeof(record_type))`, pass `MSG_DONTWAIT` in `msg.msg_flags` so `sock_sendmsg()` (e.g. during `tls_handshake_close()`) never blocks, and normalize the return value (`ret < 0 ? ret : 0`). [F32, F67]
+- `tls_get_record_type()` directly reads `cmsg->cmsg_level`, `cmsg->cmsg_type`, and `*((u8 *)CMSG_DATA(cmsg))` without checking `cmsg` for `NULL` or validating `cmsg->cmsg_len`, so callers must supply a valid, initialized `struct cmsghdr` buffer of at least `CMSG_LEN(sizeof(u8))` bytes. [F48]
+- `tls_alert_recv()` reads the 2-byte TLS alert directly from `msg->msg_iter.kvec->iov_base` without checking iterator type or offset, so callers must pass a `struct msghdr` whose `msg_iter` is an `ITER_KVEC` with `msg_iter.kvec` pointing to the alert segment (calling `iov_iter_revert()` first if `sock_recvmsg()` exhausted the `kvec`). [F57]
+
+## Error Handling
+
+- In `handshake_nl_accept_doit()`, once `handshake_req_next()` dequeues `req`, any failure in `get_unused_fd_flags()` or `req->hr_proto->hp_accept()` must release any allocated `fd` via `put_unused_fd(fd)` before `fd_install()` and jump to `out_complete` to call `handshake_complete(req, -EIO, NULL)` while preserving `err`. [F27]
+- In `handshake_nl_accept_doit()`, local pointer `req` must be initialized to `NULL` before any `goto out_status` jump because the `out_status` cleanup path unconditionally passes `req` to `trace_handshake_cmd_accept_err()`. [F20]
+- `tls_handshake_done()` must reset `treq->th_peerid[0] = TLS_NO_PEERID` and check `if (info)` before calling `tls_handshake_remote_peerids(treq, info)`, because `treq->th_peerid[]` holds local PSK peer IDs from submission and `info` is `NULL` on abort paths or may lack `HANDSHAKE_A_DONE_REMOTE_AUTH`. [F28]
+- `tls_handshake_private_keyring()` must return `0` when `treq->th_keyring == TLS_NO_KEYRING`, check `lookup_user_key()` results with `IS_ERR()` and extract negative errnos via `PTR_ERR()`, and convert valid `key_ref_t` handles with `key_ref_to_ptr()` for `key_link()` while releasing them via `key_ref_put()`. [F29]
+- `struct handshake_proto.hp_destroy` is optional (for example, `tls_handshake_proto` leaves it `NULL`), so `handshake_req_destroy()` must check `if (req->hr_proto->hp_destroy)` before invoking it. [F24]
+
+## External Contracts
+
+- `net/handshake/genl.c`, `net/handshake/genl.h`, and `include/uapi/linux/handshake.h` are auto-generated from `Documentation/netlink/specs/handshake.yaml`; changes to the `handshake` Generic Netlink schema, policies (`handshake_accept_nl_policy`, `handshake_done_nl_policy`), or `handshake_nl_ops` must be made in the YAML spec and regenerated. [F68]
+- Netlink attributes carrying socket file descriptors (`HANDSHAKE_A_ACCEPT_SOCKFD`, `HANDSHAKE_A_DONE_SOCKFD`) and X.509 key serial numbers (`HANDSHAKE_A_X509_CERT`, `HANDSHAKE_A_X509_PRIVKEY`) are typed as `NLA_S32` and must be accessed with `nla_get_s32()` and `nla_put_s32()`. [F78]
+- Because `HANDSHAKE_A_DONE_REMOTE_AUTH` is a multi-attribute, `tls_handshake_remote_peerids()` must walk the attribute stream with `nla_for_each_attr()` rather than reading `info->attrs[HANDSHAKE_A_DONE_REMOTE_AUTH]` directly, and must clamp `treq->th_num_peerids` to `ARRAY_SIZE(treq->th_peerid)`. [F79]
+
+## Known Pitfalls
+
+- `trace_handshake_cmd_accept()` and `trace_handshake_cmd_done()` (defined via `DECLARE_EVENT_CLASS(handshake_fd_class, ...)`) dereference `req->hr_sk` inside `TP_fast_assign`, so callers must never invoke them when `req` is `NULL` (use the `_err` variants instead). [F21]
+- In `handshake_sk_destruct()`, `req->hr_odestruct` must be saved to a local variable before calling `handshake_req_destroy(req)` and invoked afterwards, because `handshake_req_destroy()` kfrees `req` before the chained socket destructor runs. [F36]
+- `handshake_rhashtbl` is configured in `handshake_rhash_params` with `key_len = sizeof_field(struct handshake_req, hr_sk)` and `key_offset = offsetof(struct handshake_req, hr_sk)`, so `rhashtable` lookups (`handshake_req_hash_lookup()`) must pass the address of a `struct sock *` variable (`&sk`) rather than `sk` itself. [F59]
+- Flag enums `hn_flags_bits`, `hr_flags_bits`, and `hp_flags_bits` define bit indices (such as `HANDSHAKE_F_PROTO_NOTIFY = 0`), so bitops (`test_bit`, `set_bit`, `test_and_set_bit`, `test_and_clear_bit`) must take the enum constant directly whereas `.hp_flags` mask initializers must wrap it in `BIT()`. [F31]
+- In `handshake_req_next()`, the `list_for_each_entry(pos, &hn->hn_requests, hr_list)` loop must assign `req = pos` and `break` immediately after `__remove_pending_locked(hn, pos)` rather than continuing iteration or returning `pos` after loop termination. [F49]
+- `handshake_req_alloc()` must size `struct handshake_req` and its flexible array `hr_priv` via `struct_size(req, hr_priv, proto->hp_privsize)` (not raw addition, which can wrap on 32-bit `size_t`), and any `struct handshake_proto` casting `handshake_req_private(req)` to a private struct must set `hp_privsize` to at least `sizeof` that struct. [F55, F60]

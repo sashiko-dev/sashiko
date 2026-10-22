@@ -20,6 +20,7 @@ email_policy.toml
 .gemini/
 .claude/
 benchmark_results*.json
+*.facts.json
 .sashiko-local-token
 .sashiko/
 
