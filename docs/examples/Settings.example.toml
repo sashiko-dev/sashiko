@@ -13,4 +13,4 @@ explicit_prompt_caching = false
 # Reviews run concurrently up to this many patches. Sized for one developer's
 # machine; the daemon's own Settings.toml uses a much larger fan-out.
 concurrency = 4
-# effort = "mid"  # Options: "mid" (default for Argon 4), "high", "dynamic"
+# effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"

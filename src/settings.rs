@@ -972,10 +972,10 @@ pub struct ReviewSettings {
     /// Conservative default; set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
-    /// Reasoning effort mode (`"mid"`, `"high"`, or `"dynamic"`) for models
-    /// that support configurable effort levels (currently Argon 4). Defaults
-    /// to `"mid"` when the model supports effort levels and is ignored
-    /// otherwise.
+    /// Reasoning effort mode (`"low"`, `"mid"`, `"high"`, or `"dynamic"`) for
+    /// models that support configurable effort levels (currently Argon 4).
+    /// Defaults to `"mid"` when the model supports effort levels and is
+    /// ignored otherwise.
     #[serde(default)]
     pub effort: Option<EffortMode>,
     #[serde(skip)]
@@ -1192,10 +1192,45 @@ impl Settings {
     ///
     /// Returns `None` when `self.ai.model` does not support configurable
     /// effort levels (currently only Argon 4 supports it). When the model
-    /// supports effort levels, resolves `[review] effort` and defaults to
-    /// [`EffortMode::Mid`].
+    /// supports effort levels, resolves `[review] effort`, falls back to
+    /// [`EffortMode::Low`] if the provider's global thinking level is set to
+    /// `"low"`, and otherwise defaults to [`EffortMode::Mid`].
     pub fn effective_effort(&self) -> Option<EffortMode> {
-        self.review.effective_effort(&self.ai.model)
+        if !model_supports_effort(&self.ai.model) {
+            return None;
+        }
+        if let Some(effort) = self.review.effort {
+            return Some(effort);
+        }
+        if self.has_global_low_thinking_level() {
+            return Some(EffortMode::Low);
+        }
+        Some(EffortMode::Mid)
+    }
+
+    fn has_global_low_thinking_level(&self) -> bool {
+        fn non_empty(opt: Option<&str>) -> Option<&str> {
+            opt.map(str::trim).filter(|s| !s.is_empty())
+        }
+        let gemini_level = self
+            .ai
+            .gemini
+            .as_ref()
+            .and_then(|g| non_empty(g.thinking_level.as_deref()));
+        #[cfg(feature = "vertex")]
+        let vertex_level = self.ai.vertex.as_ref().and_then(|v| {
+            non_empty(v.effort.as_deref()).or_else(|| non_empty(v.thinking.as_deref()))
+        });
+        #[cfg(feature = "vertex")]
+        let level = if self.ai.provider.eq_ignore_ascii_case("vertex") {
+            vertex_level.or(gemini_level)
+        } else {
+            gemini_level.or(vertex_level)
+        };
+        #[cfg(not(feature = "vertex"))]
+        let level = gemini_level;
+
+        level.is_some_and(|s| s.eq_ignore_ascii_case("low"))
     }
 
     /// Refuses a configuration that names no database, no repository, or no
@@ -2068,6 +2103,41 @@ mod tests {
 
         settings.review.effort = Some(EffortMode::High);
         assert_eq!(settings.effective_effort(), Some(EffortMode::High));
+
+        settings.review.effort = Some(EffortMode::Low);
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Low));
+
+        settings.review.effort = None;
+        settings.ai.gemini = Some(GeminiSettings {
+            thinking_level: Some("LOW".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(settings.effective_effort(), Some(EffortMode::Low));
+
+        #[cfg(feature = "vertex")]
+        {
+            settings.ai.provider = "vertex".to_string();
+            settings.ai.vertex = Some(VertexSettings {
+                project_id: None,
+                region: None,
+                prompt_caching: true,
+                max_tokens: None,
+                thinking: Some("adaptive".to_string()),
+                effort: Some("low".to_string()),
+            });
+            settings.ai.gemini = Some(GeminiSettings {
+                thinking_level: Some("HIGH".to_string()),
+                ..Default::default()
+            });
+            assert_eq!(settings.effective_effort(), Some(EffortMode::Low));
+
+            settings.ai.vertex.as_mut().unwrap().effort = Some("high".to_string());
+            settings.ai.gemini = Some(GeminiSettings {
+                thinking_level: Some("LOW".to_string()),
+                ..Default::default()
+            });
+            assert_eq!(settings.effective_effort(), Some(EffortMode::Mid));
+        }
 
         settings.ai.model = "gemini-3.1-pro-preview".to_string();
         assert_eq!(settings.effective_effort(), None);

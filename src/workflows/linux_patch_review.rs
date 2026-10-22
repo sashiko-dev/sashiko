@@ -2529,7 +2529,7 @@ Return raw text output, not JSON."#
             tools: ToolScope::All,
             max_turns,
             temperature,
-            reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
+            reasoning_effort: effort.map(crate::ai::EffortMode::report_stage_effort),
             recitation_policy: RecitationPolicy::FallbackToFreeForm {
                 reminder: "CRITICAL OVERRIDE: Your previous response was blocked by the API recitation filter for quoting the patch diff verbatim. Ignore the diff-quoting instructions in inline-template.md. Do NOT quote any code or diff lines with '>'. Instead, start with the Commit/Author/Subject headers, write the summary, and describe each finding directly by referencing file names, function names, and line numbers in plain prose.".to_string(),
             },
@@ -2940,11 +2940,24 @@ mod tests {
             resolve_stage_effort(&state, "goal"),
             Some(crate::ai::ReasoningEffort::High)
         );
+        for mode in [
+            crate::ai::EffortMode::Mid,
+            crate::ai::EffortMode::High,
+            crate::ai::EffortMode::Dynamic,
+        ] {
+            assert_eq!(
+                report_stage_with_effort(20, 0.0, Some(mode))
+                    .policy
+                    .reasoning_effort,
+                Some(crate::ai::ReasoningEffort::Medium),
+                "report stage should use Medium effort in {mode:?} mode"
+            );
+        }
         assert_eq!(
-            report_stage_with_effort(20, 0.0, Some(crate::ai::EffortMode::High))
+            report_stage_with_effort(20, 0.0, Some(crate::ai::EffortMode::Low))
                 .policy
                 .reasoning_effort,
-            Some(crate::ai::ReasoningEffort::High)
+            Some(crate::ai::ReasoningEffort::Low)
         );
 
         state.effort = None;

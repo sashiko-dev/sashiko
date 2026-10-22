@@ -161,23 +161,28 @@ impl ReasoningEffort {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum EffortMode {
+    /// Uniform `Low` reasoning effort across all review stages.
+    Low,
     /// Uniform `Medium` reasoning effort across all review stages (default
     /// when the model supports effort levels).
     #[default]
     #[serde(alias = "medium")]
     Mid,
-    /// Uniform `High` reasoning effort across all review stages.
+    /// `High` reasoning effort across screening, planning, analysis, and
+    /// verification stages, with `Medium` on report formatting.
     High,
     /// Dynamic per-stage reasoning effort: `Low` for screening, planning,
-    /// report, and summary stages; planned `Medium` or `High` per analysis
-    /// stage; `High` for verification and post-verification stages.
+    /// and summary stages; planned `Medium` or `High` per analysis stage;
+    /// `High` for verification and post-verification stages; `Medium` for
+    /// report formatting.
     Dynamic,
 }
 
 impl EffortMode {
-    /// Returns the canonical lowercase string (`"mid"`, `"high"`, `"dynamic"`).
+    /// Returns the canonical lowercase string (`"low"`, `"mid"`, `"high"`, `"dynamic"`).
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Low => "low",
             Self::Mid => "mid",
             Self::High => "high",
             Self::Dynamic => "dynamic",
@@ -185,12 +190,21 @@ impl EffortMode {
     }
 
     /// Reasoning effort for lightweight stages (`pre-screen`, `planning`,
-    /// `report`, `summary`).
+    /// `summary`).
     pub fn lightweight_stage_effort(self) -> ReasoningEffort {
         match self {
+            Self::Low | Self::Dynamic => ReasoningEffort::Low,
             Self::Mid => ReasoningEffort::Medium,
             Self::High => ReasoningEffort::High,
-            Self::Dynamic => ReasoningEffort::Low,
+        }
+    }
+
+    /// Reasoning effort for the `report` stage: always `Medium` unless `Low`
+    /// is configured globally.
+    pub fn report_stage_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Low => ReasoningEffort::Low,
+            Self::Mid | Self::High | Self::Dynamic => ReasoningEffort::Medium,
         }
     }
 
@@ -198,6 +212,7 @@ impl EffortMode {
     /// `post-verification`).
     pub fn verification_stage_effort(self) -> ReasoningEffort {
         match self {
+            Self::Low => ReasoningEffort::Low,
             Self::Mid => ReasoningEffort::Medium,
             Self::High | Self::Dynamic => ReasoningEffort::High,
         }
@@ -207,6 +222,7 @@ impl EffortMode {
     /// selected by the planning stage.
     pub fn analysis_stage_effort(self, planned: Option<ReasoningEffort>) -> ReasoningEffort {
         match self {
+            Self::Low => ReasoningEffort::Low,
             Self::Mid => ReasoningEffort::Medium,
             Self::High => ReasoningEffort::High,
             Self::Dynamic => planned.unwrap_or(ReasoningEffort::High),

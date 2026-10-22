@@ -1219,7 +1219,7 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             tools: ToolScope::All,
             max_turns,
             temperature,
-            reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
+            reasoning_effort: effort.map(crate::ai::EffortMode::report_stage_effort),
             recitation_policy: RecitationPolicy::FallbackToFreeForm {
                 reminder: "Do not quote large blocks of code verbatim. Summarize concisely."
                     .to_string(),

@@ -53,7 +53,7 @@ sashiko benchmark [OPTIONS] <FILE>
 | `--analyze-only` | Skip ingestion and reviews; re-evaluate an existing benchmark database. |
 | `--concurrency <N>` | Override review and judge concurrency. |
 | `--ai-provider <PROVIDER>` | Override the AI provider. |
-| `--effort <MODE>` | Override reasoning effort mode (`mid`, `high`, or `dynamic`). |
+| `--effort <MODE>` | Override reasoning effort mode (`low`, `mid`, `high`, or `dynamic`). |
 | `--report-preexisting` | Include pre-existing bugs in verification and report generation (`benchmark_preexisting.json` enables this automatically). |
 | `--settings <PATH>` | Settings file override. |
 | `--prompts <PATH>` | Prompt directory override. |

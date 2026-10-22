@@ -2547,7 +2547,11 @@ async fn run_review_tool_with_cmd_and_overrides(
         cmd.arg("--stages").arg(stages_str);
     }
 
-    if let Some(effort) = settings.review.effort {
+    if let Some(effort) = settings
+        .review
+        .effort
+        .or_else(|| settings.effective_effort())
+    {
         cmd.arg("--effort").arg(effort.as_str());
     }
 
