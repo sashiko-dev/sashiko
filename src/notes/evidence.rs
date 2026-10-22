@@ -139,7 +139,7 @@ impl<'a> RevisionFiles<'a> {
         // Explorers often copy code verbatim but misremember where it is.
         // Verbatim code elsewhere in the file still backs the claim.
         Ok(
-            relocate(&wanted, lines, start).map_or(check, |(start_line, end_line)| {
+            relocate(&wanted, lines, start, end).map_or(check, |(start_line, end_line)| {
                 EvidenceCheck::Relocated {
                     start_line,
                     end_line,
@@ -168,11 +168,17 @@ fn match_in_order(wanted: &[String], window: &[String]) -> EvidenceCheck {
 
 /// The 1-based line range of the compact in-order match of `wanted` in
 /// `lines` that starts closest to `cited_start`. A match may span at most
-/// twice the snippet's length plus a little, so scattered common lines do
-/// not count as a match.
-fn relocate(wanted: &[String], lines: &[String], cited_start: usize) -> Option<(usize, usize)> {
+/// twice the snippet's length (or the cited line span when elisions were used)
+/// plus a little, so scattered common lines do not count as a match.
+fn relocate(
+    wanted: &[String],
+    lines: &[String],
+    cited_start: usize,
+    cited_end: usize,
+) -> Option<(usize, usize)> {
     let first = wanted.first()?;
-    let max_span = wanted.len() * 2 + 10;
+    let cited_span = cited_end.saturating_sub(cited_start) + 1;
+    let max_span = (wanted.len() * 2).max(cited_span) + 10;
     let mut best: Option<(usize, usize)> = None;
     for (i, line) in lines.iter().enumerate() {
         if !line.contains(first.as_str()) {

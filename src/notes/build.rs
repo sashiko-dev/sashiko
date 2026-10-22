@@ -392,10 +392,18 @@ pub async fn build_unit(
     // 5. Independent verification, then the same deterministic check on
     //    the verifier's own evidence.
     let saved_verdicts: Option<Vec<FactVerdict>> = load_step(&work, "verdicts", cfg.resume)?;
+    let all_have_verdict = saved_verdicts.as_ref().is_some_and(|saved| {
+        checked
+            .iter()
+            .all(|c| saved.iter().any(|v| v.fact_id == c.fact.id))
+    });
     let verdicts: Vec<FactVerdict> = match saved_verdicts {
-        Some(saved) if !extended => saved,
+        Some(saved) if !extended && all_have_verdict => saved,
         saved => {
-            // An extended build verifies only the facts without a verdict.
+            if saved.is_some() {
+                extended = true;
+            }
+            // An extended or partial build verifies only the facts without a verdict.
             let previous = saved.unwrap_or_default();
             let pending: Vec<CheckedFact> = checked
                 .iter()
