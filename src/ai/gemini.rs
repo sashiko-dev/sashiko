@@ -1005,17 +1005,23 @@ pub(crate) fn translate_ai_request_with_options(
             }
             AiRole::Assistant => {
                 let mut parts = Vec::new();
-                if let Some(thought) = msg.thought {
-                    parts.push(Part::Text {
-                        text: thought,
-                        thought_signature: None,
-                        thought: true,
-                    });
-                }
+                // Thought summaries (`msg.thought`) are output-only telemetry for
+                // logs and UI; Gemini reconstructs prior-turn reasoning from
+                // `thoughtSignature` alone.
+                let mut pending_signature = msg.thought_signature.filter(|s| !s.is_empty());
+                let call_needs_sig = msg.tool_calls.as_ref().is_some_and(|calls| {
+                    calls
+                        .iter()
+                        .any(|c| c.thought_signature.as_deref().unwrap_or("").is_empty())
+                });
                 if let Some(text) = msg.content {
                     parts.push(Part::Text {
                         text,
-                        thought_signature: None,
+                        thought_signature: if call_needs_sig {
+                            None
+                        } else {
+                            pending_signature.take()
+                        },
                         thought: false,
                     });
                 }
@@ -1027,15 +1033,28 @@ pub(crate) fn translate_ai_request_with_options(
                         } else {
                             None
                         };
+                        let sig = call
+                            .thought_signature
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| pending_signature.take());
                         parts.push(Part::FunctionCall {
                             function_call: FunctionCall {
                                 id: call_id,
                                 name: call.function_name,
                                 args: call.arguments,
                             },
-                            thought_signature: call.thought_signature,
+                            thought_signature: sig,
                         });
                     }
+                }
+                if parts.is_empty()
+                    && let Some(sig) = pending_signature.take()
+                {
+                    parts.push(Part::Text {
+                        text: String::new(),
+                        thought_signature: Some(sig),
+                        thought: false,
+                    });
                 }
                 // Gemini rejects a Content with an empty parts array, and a
                 // turn with nothing in it carries no information anyway.
@@ -1286,7 +1305,11 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
         } else {
             Some(thought)
         },
-        thought_signature: None,
+        thought_signature: if tool_calls.is_empty() {
+            last_thought_signature
+        } else {
+            None
+        },
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
@@ -2613,6 +2636,128 @@ mod tests {
             Some("sig_from_hop_1"),
             "thoughtSignature from preceding part must propagate to FunctionCall"
         );
+        assert_eq!(
+            ai_resp.thought_signature, None,
+            "signature consumed by FunctionCall must not be duplicated on AiResponse"
+        );
+
+        // Non-tool-call responses must retain last_thought_signature on AiResponse,
+        // and re-serializing the turn must omit unsigned thought summary text while
+        // preserving the signature on the text part.
+        let raw_text_only = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "redacted summary", "thought": true, "thoughtSignature": "sig_text_turn"},
+                        {"text": "final answer"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let text_resp = translate_ai_response(serde_json::from_value(raw_text_only)?)?;
+        assert_eq!(text_resp.thought.as_deref(), Some("redacted summary"));
+        assert_eq!(text_resp.content.as_deref(), Some("final answer"));
+        assert_eq!(
+            text_resp.thought_signature.as_deref(),
+            Some("sig_text_turn")
+        );
+
+        let retry_req = translate_ai_request(AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("Review this.".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::Assistant,
+                    content: text_resp.content,
+                    thought: text_resp.thought,
+                    thought_signature: text_resp.thought_signature,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("Fix format.".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        })?;
+        assert_eq!(retry_req.contents.len(), 3);
+        assert_eq!(retry_req.contents[1].role, "model");
+        assert_eq!(
+            retry_req.contents[1].parts.len(),
+            1,
+            "unsigned thought summary must not be replayed into model parts"
+        );
+        if let Part::Text {
+            text,
+            thought_signature,
+            thought,
+        } = &retry_req.contents[1].parts[0]
+        {
+            assert_eq!(text, "final answer");
+            assert_eq!(thought_signature.as_deref(), Some("sig_text_turn"));
+            assert!(!thought);
+        } else {
+            panic!("expected single signed Part::Text on model turn");
+        }
+
+        // If an Assistant turn has both text and a tool call that already carries
+        // its own signature, the message-level thought_signature attaches to the
+        // Part::Text rather than being dropped.
+        let both_signed_req = translate_ai_request(AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::Assistant,
+                content: Some("calling git_diff".to_string()),
+                thought: Some("redacted summary".to_string()),
+                thought_signature: Some("text_sig".to_string()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "git_diff".to_string(),
+                    arguments: json!({}),
+                    thought_signature: Some("call_sig".to_string()),
+                }]),
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        })?;
+        assert_eq!(both_signed_req.contents[0].parts.len(), 2);
+        assert!(matches!(
+            &both_signed_req.contents[0].parts[0],
+            Part::Text {
+                text,
+                thought_signature: Some(sig),
+                thought: false,
+            } if text == "calling git_diff" && sig == "text_sig"
+        ));
+        assert!(matches!(
+            &both_signed_req.contents[0].parts[1],
+            Part::FunctionCall {
+                thought_signature: Some(sig),
+                ..
+            } if sig == "call_sig"
+        ));
 
         // When a FunctionCall carries its own explicit thoughtSignature, any
         // earlier pending signature must be cleared so it does not leak to a
