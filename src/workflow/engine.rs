@@ -67,7 +67,7 @@ impl std::fmt::Display for WorkflowFailure {
 
 impl std::error::Error for WorkflowFailure {}
 
-fn stage_outcome_from_error(err: &anyhow::Error) -> StageOutcome {
+pub(crate) fn stage_outcome_from_error(err: &anyhow::Error) -> StageOutcome {
     if let Some(failure) = err.downcast_ref::<crate::ai::SessionFailure>() {
         StageOutcome {
             tokens_in: u32::try_from(failure.usage.prompt_tokens).unwrap_or(u32::MAX),

@@ -558,6 +558,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let result = run_worker_from_stdin(
                     WorkerOptions {
+                        failure_policy: Default::default(),
                         project,
                         baseline: baseline.clone(),
                         prompts: resolve_prompts_path(prompts.clone(), project)?,
@@ -3063,6 +3064,24 @@ fn write_review_result(
         writeln!(out, "\nPre-existing Findings:")?;
         write_finding_counts(out, &preexisting_counts)?;
         write_grouped_findings(out, &preexisting_findings, true)?;
+    }
+
+    if let Some(candidates) = review.get("unverified_concerns").and_then(Value::as_array)
+        && !candidates.is_empty()
+    {
+        writeln!(out, "\nUnverified candidates (review incomplete):")?;
+        for candidate in candidates {
+            let patch = candidate
+                .get("patch_index")
+                .and_then(Value::as_i64)
+                .map(|index| format!("Patch {index}: "))
+                .unwrap_or_default();
+            let description = candidate
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed concern");
+            writeln!(out, "  {patch}{description}")?;
+        }
     }
 
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())

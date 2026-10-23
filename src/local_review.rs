@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::workflows::recovery::{ReviewFailurePolicy, VerificationProgress};
 use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     settings::{AiSettings, Settings},
@@ -41,6 +42,8 @@ use tracing::{error, info};
 /// merges those onto the settings it read, so there is one answer to read.
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
+    /// Only local Git reviews opt into preserving partial results.
+    pub failure_policy: ReviewFailurePolicy,
     pub project: crate::project::ProjectId,
     pub baseline: Option<String>,
     pub prompts: PathBuf,
@@ -57,6 +60,7 @@ pub struct WorkerOptions {
 impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
+            failure_policy: ReviewFailurePolicy::Abort,
             project: crate::project::ProjectId::Linux,
             baseline: None,
             prompts: PathBuf::from("third_party/prompts/kernel"),
@@ -259,6 +263,7 @@ pub async fn run_git_review(
     run_worker(
         review_input,
         WorkerOptions {
+            failure_policy: ReviewFailurePolicy::PreservePartial,
             project: options.project,
             baseline,
             prompts: options.prompts,
@@ -512,6 +517,7 @@ async fn review_single_patch(
         });
     let max_attempts = worker_max_attempts(ai);
     let mut last_error = None;
+    let mut partial_result: Option<PartialReview> = None;
     for attempt in 1..=max_attempts {
         emit(
             progress,
@@ -581,6 +587,7 @@ async fn review_single_patch(
             std::sync::Arc::new(tools),
             prompts,
             WorkerConfig {
+                failure_policy: options.failure_policy,
                 project: options.project,
                 max_input_tokens: ai.max_input_tokens,
                 max_interactions: ai.max_interactions,
@@ -659,6 +666,47 @@ async fn review_single_patch(
             .await
         {
             Ok(result) => {
+                if let Some(err) = &result.error {
+                    error!("AI review for patch {} failed: {}", p.index, err);
+                    let inline_review = result
+                        .output
+                        .as_ref()
+                        .and_then(|output| output.get("review_inline"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let candidate = json!({
+                        "patch_index": p.index,
+                        "review": result.output,
+                        "error": err,
+                        "partial": true,
+                        "inline_review": inline_review,
+                        "history": result.history,
+                        "input_context": result.input_context,
+                        "tokens_in": result.tokens_in,
+                        "tokens_out": result.tokens_out,
+                        "tokens_cached": result.tokens_cached,
+                    });
+                    if result.verification_progress.is_complete() {
+                        emit(
+                            progress,
+                            ProgressEvent::AiReviewFailed {
+                                patch_index: p.index,
+                            },
+                        );
+                        return Ok(candidate);
+                    }
+                    let score = partial_review_score(&candidate, result.verification_progress);
+                    if partial_result
+                        .as_ref()
+                        .is_none_or(|previous| score > previous.score)
+                    {
+                        partial_result = Some(PartialReview {
+                            result: candidate,
+                            score,
+                        });
+                    }
+                    continue;
+                }
                 let inline_content = if options.agent {
                     None
                 } else {
@@ -702,6 +750,15 @@ async fn review_single_patch(
         }
     }
 
+    if let Some(result) = partial_result {
+        emit(
+            progress,
+            ProgressEvent::AiReviewFailed {
+                patch_index: p.index,
+            },
+        );
+        return Ok(result.result);
+    }
     emit(
         progress,
         ProgressEvent::AiReviewFailed {
@@ -792,6 +849,38 @@ fn append_patch_inline_review(
     }
 }
 
+struct PartialReview {
+    result: Value,
+    score: (u8, usize, usize, usize),
+}
+
+fn partial_review_score(
+    result: &Value,
+    progress: VerificationProgress,
+) -> (u8, usize, usize, usize) {
+    let review = &result["review"];
+    let (phase, completed) = progress.rank();
+    let findings = review["findings"].as_array().map_or(0, Vec::len);
+    let candidates = review["unverified_concerns"].as_array().map_or(0, Vec::len);
+    (phase, findings, completed, candidates)
+}
+
+fn mark_patch_review_status(patches: &mut [Value], patch_index: i64, error: Option<&str>) {
+    if let Some(patch) = patches
+        .iter_mut()
+        .find(|patch| patch["index"].as_i64() == Some(patch_index))
+    {
+        patch["review_status"] = json!(if error.is_some() {
+            "incomplete"
+        } else {
+            "complete"
+        });
+        if let Some(error) = error {
+            patch["review_error"] = json!(error);
+        }
+    }
+}
+
 /// Assembles the combined review payload for a review.
 ///
 /// Pre-existing concerns are preserved in the payload so that daemon-spawned
@@ -801,15 +890,17 @@ fn build_review_output(
     summary: String,
     findings: Vec<Value>,
     concerns: Vec<Value>,
+    unverified_concerns: Vec<Value>,
     dismissed_concerns: Vec<Value>,
-    concerns_count: u64,
-    dismissed_concerns_count: u64,
+    concern_counts: (u64, u64),
     review_map: Option<Value>,
 ) -> Value {
+    let (concerns_count, dismissed_concerns_count) = concern_counts;
     let mut out = json!({
         "summary": summary,
         "findings": findings,
         "concerns": concerns,
+        "unverified_concerns": unverified_concerns,
         "dismissed_concerns": dismissed_concerns,
         "concerns_count": concerns_count,
         "dismissed_concerns_count": dismissed_concerns_count
@@ -1078,6 +1169,7 @@ async fn run_worker_in_worktree(
     let mut combined_summary = String::new();
     let mut combined_findings = Vec::new();
     let mut combined_concerns = Vec::new();
+    let mut combined_unverified_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
@@ -1103,6 +1195,14 @@ async fn run_worker_in_worktree(
     for res in results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
         let history_offset = combined_history.len();
+        if let Some(err) = res.get("error").and_then(Value::as_str) {
+            review_errors.push((p_idx, err.to_string()));
+            if options.failure_policy == ReviewFailurePolicy::PreservePartial {
+                mark_patch_review_status(&mut patch_results, p_idx, Some(err));
+            }
+        } else if options.failure_policy == ReviewFailurePolicy::PreservePartial {
+            mark_patch_review_status(&mut patch_results, p_idx, None);
+        }
         let patch_subject = patches_to_review
             .iter()
             .find(|p| p.index == p_idx)
@@ -1137,6 +1237,14 @@ async fn run_worker_in_worktree(
                     concern_val["patch_index"] = json!(p_idx);
                     concern_val["patch_subject"] = json!(patch_subject);
                     combined_concerns.push(concern_val);
+                }
+            }
+            if let Some(concerns) = review.get("unverified_concerns").and_then(Value::as_array) {
+                for concern in concerns {
+                    let mut candidate = concern.clone();
+                    candidate["patch_index"] = json!(p_idx);
+                    candidate["patch_subject"] = json!(patch_subject);
+                    combined_unverified_concerns.push(candidate);
                 }
             }
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
@@ -1188,15 +1296,20 @@ async fn run_worker_in_worktree(
             total_tokens_cached.saturating_add(res["tokens_cached"].as_u64().unwrap_or(0));
     }
 
-    let review_output = build_review_output(
+    let mut review_output = build_review_output(
         combined_summary,
         combined_findings,
         combined_concerns,
+        combined_unverified_concerns,
         combined_dismissed_concerns,
-        total_concerns_count,
-        total_dismissed_concerns_count,
+        (total_concerns_count, total_dismissed_concerns_count),
         single_review_map,
     );
+    if options.failure_policy == ReviewFailurePolicy::Abort
+        && let Some(fields) = review_output.as_object_mut()
+    {
+        fields.remove("unverified_concerns");
+    }
 
     let mut combined_result = json!({
         "patchset_id": patchset_id,
@@ -1371,6 +1484,11 @@ pub fn format_agent_review_output(result: &Value) -> Value {
         "patches": patches,
         "findings": findings,
         "concerns": concerns,
+        "unverified_concerns": result
+            .get("review")
+            .and_then(|review| review.get("unverified_concerns"))
+            .cloned()
+            .unwrap_or_else(|| json!([])),
         "tokens_in": result.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
         "tokens_out": result.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
         "tokens_cached": result.get("tokens_cached").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -2180,8 +2298,8 @@ mod tests {
             vec![json!({"problem": "new regression"})],
             vec![json!({"problem": "preexisting bug"})],
             vec![],
-            3,
-            0,
+            vec![],
+            (3, 0),
             Some(offset_review_map_log_bounds(&single_map, 0)),
         );
 
@@ -2219,6 +2337,53 @@ mod tests {
         let mut patches = vec![json!({"index": 1}), json!({"index": 2})];
         mark_patch_review_incomplete(&mut patches, 2, "output truncated");
         assert!(patches[0].get("review_status").is_none());
+        assert_eq!(patches[1]["review_status"], "incomplete");
+        assert_eq!(patches[1]["review_error"], "output truncated");
+    }
+
+    #[test]
+    fn partial_retry_prefers_verified_findings_over_candidates() {
+        let candidates = json!({"review": {
+            "findings": [],
+            "unverified_concerns": [{"description": "a"}, {"description": "b"}]
+        }});
+        let verified = json!({"review": {
+            "findings": [{"problem": "verified"}],
+            "unverified_concerns": []
+        }});
+        assert!(
+            partial_review_score(&verified, VerificationProgress::Complete)
+                > partial_review_score(&candidates, VerificationProgress::Pending)
+        );
+    }
+
+    #[test]
+    fn partial_retry_prefers_verification_progress_over_raw_candidates() {
+        let raw = json!({"review": {
+            "findings": [],
+            "unverified_concerns": vec![json!({"description": "raw concern"}); 10]
+        }});
+        let verified = json!({"review": {
+            "findings": [],
+            "unverified_concerns": [{"description": "remaining hard case"}]
+        }});
+        let mut progress = VerificationProgress::after_verification(2);
+        assert!(
+            partial_review_score(&verified, progress)
+                > partial_review_score(&raw, VerificationProgress::Pending)
+        );
+
+        let before = partial_review_score(&verified, progress);
+        progress.resolve_cases(1);
+        assert!(partial_review_score(&verified, progress) > before);
+    }
+
+    #[test]
+    fn patch_status_records_success_and_partial_failure_separately() {
+        let mut patches = vec![json!({"index": 1}), json!({"index": 2})];
+        mark_patch_review_status(&mut patches, 1, None);
+        mark_patch_review_status(&mut patches, 2, Some("output truncated"));
+        assert_eq!(patches[0]["review_status"], "complete");
         assert_eq!(patches[1]["review_status"], "incomplete");
         assert_eq!(patches[1]["review_error"], "output truncated");
     }
@@ -2307,6 +2472,7 @@ mod tests {
         assert_eq!(formatted_clean["status"], "clean");
         assert_eq!(formatted_clean["baseline"], "abc1234");
         assert_eq!(formatted_clean["findings"], json!([]));
+        assert_eq!(formatted_clean["unverified_concerns"], json!([]));
         assert_eq!(formatted_clean["concerns"].as_array().unwrap().len(), 1);
         assert_eq!(formatted_clean["tokens_in"], 1200);
         assert_eq!(formatted_clean["tokens_out"], 300);
@@ -2346,7 +2512,16 @@ mod tests {
         let errored = json!({
             "baseline": "abc1234",
             "patches": [{"index": 1, "status": "applied", "review_status": "incomplete"}],
-            "review": {"findings": [], "concerns": []},
+            "review": {
+                "findings": [],
+                "concerns": [],
+                "unverified_concerns": [{
+                    "patch_index": 1,
+                    "description": "candidate awaiting verification",
+                    "reasoning": "analysis completed before verification failed",
+                    "locations": [{"file": "kernel/sched/core.c", "line": 42}]
+                }]
+            },
             "partial": true,
             "error": "patch 1: timed out",
             "tokens_in": 50,
@@ -2357,5 +2532,9 @@ mod tests {
         assert_eq!(formatted_err["status"], "error");
         assert_eq!(formatted_err["partial"], true);
         assert_eq!(formatted_err["error"], "patch 1: timed out");
+        assert_eq!(
+            formatted_err["unverified_concerns"],
+            errored["review"]["unverified_concerns"]
+        );
     }
 }

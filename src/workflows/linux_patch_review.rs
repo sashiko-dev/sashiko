@@ -27,6 +27,7 @@ use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
 use crate::workflow::stage::{ExecutableStage, Stage};
+use crate::workflows::recovery::{RecoverableStage, ReviewFailurePolicy, VerificationProgress};
 
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
@@ -87,6 +88,14 @@ pub struct LinuxPatchReviewState {
 
     /// Verified findings from the verification and post-verification stages.
     pub findings: Vec<Value>,
+    /// Local reviews opt into partial-result recovery; daemon reviews abort.
+    pub failure_policy: ReviewFailurePolicy,
+    /// Candidates carried past a failed consolidation stage for verification.
+    pub unverified_concerns: Vec<Value>,
+    /// Recoverable stage failures retained in the final review status.
+    pub stage_errors: Vec<ReviewStageError>,
+    /// Verification phase and the hard cases still awaiting resolution.
+    pub verification_progress: VerificationProgress,
 
     /// Concise plain-text summary of the change generated at the end of review.
     pub summary: String,
@@ -94,6 +103,20 @@ pub struct LinuxPatchReviewState {
     pub review_inline: String,
     /// Fix suggestions.
     pub fixes: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewStageKind {
+    Verification,
+    PostVerification,
+    Report,
+    Summary,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewStageError {
+    pub stage: ReviewStageKind,
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2165,6 +2188,7 @@ pub fn apply_verification_stage_output(
         .extend(out.dismissed_concerns.clone());
     record_verified_findings(state, out.findings);
     state.hard_cases = out.hard_cases;
+    state.verification_progress = VerificationProgress::after_verification(state.hard_cases.len());
     state
         .deduplicated_dismissed_concerns
         .extend(out.dismissed_concerns);
@@ -2178,6 +2202,7 @@ pub fn apply_post_verification_stage_output(
     outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
+    state.verification_progress.resolve_cases(batch.len());
     enrich_post_verification_output(
         &state.selected_guides,
         batch,
@@ -2487,13 +2512,19 @@ pub fn resolve_post_verification_stages_with_options(
         .enumerate()
         .map(|(idx, batch)| {
             let stage_name = POST_VERIFICATION_STAGE_NAMES[idx];
-            Box::new(post_verification_stage_with_effort(
+            let stage = Box::new(post_verification_stage_with_effort(
                 stage_name,
-                batch,
+                batch.clone(),
                 max_turns,
                 temperature,
                 effort,
-            )) as Box<dyn ExecutableStage<LinuxPatchReviewState>>
+            )) as Box<dyn ExecutableStage<LinuxPatchReviewState>>;
+            match state.failure_policy {
+                ReviewFailurePolicy::Abort => stage,
+                ReviewFailurePolicy::PreservePartial => {
+                    RecoverableStage::boxed_with_candidates(stage, batch)
+                }
+            }
         })
         .collect()
 }

@@ -38,6 +38,7 @@ use crate::workflows::linux_patch_review::{
     has_valid_proof_location, resolve_stage_effort, validate_planning_stage_efforts,
     validate_post_verification_batch_items, validate_verification_stage_output,
 };
+use crate::workflows::recovery::{RecoverableStage, ReviewFailurePolicy};
 
 /// State container for a Sashiko patch review run.
 pub type SashikoPatchReviewState = LinuxPatchReviewState;
@@ -1173,13 +1174,19 @@ pub fn resolve_post_verification_stages_with_options(
         .enumerate()
         .map(|(idx, batch)| {
             let stage_name = POST_VERIFICATION_STAGE_NAMES[idx];
-            Box::new(post_verification_stage_with_effort(
+            let stage = Box::new(post_verification_stage_with_effort(
                 stage_name,
-                batch,
+                batch.clone(),
                 max_turns,
                 temperature,
                 effort,
-            )) as Box<dyn ExecutableStage<SashikoPatchReviewState>>
+            )) as Box<dyn ExecutableStage<SashikoPatchReviewState>>;
+            match state.failure_policy {
+                ReviewFailurePolicy::Abort => stage,
+                ReviewFailurePolicy::PreservePartial => {
+                    RecoverableStage::boxed_with_candidates(stage, batch)
+                }
+            }
         })
         .collect()
 }

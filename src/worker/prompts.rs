@@ -14,6 +14,7 @@
 
 use crate::ai::{AiErrorClass, AiMessage, AiProvider, ClassifyAiError};
 use crate::toolbox::ToolBox;
+use crate::workflows::recovery::{ReviewFailurePolicy, VerificationProgress};
 use anyhow::Result;
 
 /// Typed errors that must not be silently retried.
@@ -90,6 +91,8 @@ pub struct ReviewInput {
 
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
+    /// Daemon workers abort; local reviews may retain partial results.
+    pub failure_policy: ReviewFailurePolicy,
     pub project: ProjectId,
     pub max_input_tokens: usize,
     pub max_interactions: usize,
@@ -124,6 +127,7 @@ pub enum WorkerProgressEvent {
 }
 
 pub struct WorkerResult {
+    pub verification_progress: VerificationProgress,
     pub output: Option<Value>,
     pub error: Option<String>,
     pub input_context: String,
@@ -169,6 +173,7 @@ impl PromptRegistry {
 }
 
 pub struct Worker {
+    failure_policy: ReviewFailurePolicy,
     project: ProjectId,
     provider: Arc<dyn AiProvider>,
     tools: Arc<ToolBox>,
@@ -194,6 +199,7 @@ impl Worker {
         config: WorkerConfig,
     ) -> Self {
         Self {
+            failure_policy: config.failure_policy,
             project: config.project,
             provider,
             tools,
@@ -369,6 +375,10 @@ impl Worker {
             hard_cases: Vec::new(),
             concerns: Vec::new(),
             findings: Vec::new(),
+            failure_policy: self.failure_policy,
+            unverified_concerns: Vec::new(),
+            stage_errors: Vec::new(),
+            verification_progress: VerificationProgress::Pending,
             summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
@@ -401,6 +411,12 @@ impl Worker {
                 self.temperature,
                 self.effort,
             ),
+        };
+        let workflow = match self.failure_policy {
+            ReviewFailurePolicy::Abort => workflow,
+            ReviewFailurePolicy::PreservePartial => {
+                crate::workflows::recovery::recover_workflow(workflow)
+            }
         };
         let env = WorkflowEnv {
             provider: self.provider.clone(),
@@ -485,7 +501,39 @@ impl Worker {
         };
 
         let history_offset = self.global_history.len();
-        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await?;
+        let execution = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await;
+        let execution = match execution {
+            Err(error) if self.failure_policy == ReviewFailurePolicy::Abort => {
+                return Err(error);
+            }
+            result => result,
+        };
+        // Linux clean reviews exit before verification; no verification is needed.
+        if self.failure_policy == ReviewFailurePolicy::PreservePartial
+            && execution.is_ok()
+            && state.stage_errors.is_empty()
+            && state.all_concerns.is_empty()
+            && state.all_dismissed_concerns.is_empty()
+            && state.verification_progress == VerificationProgress::Pending
+        {
+            state.verification_progress = VerificationProgress::Complete;
+        }
+        let mut errors: Vec<String> = state
+            .stage_errors
+            .iter()
+            .map(|stage_error| stage_error.message.clone())
+            .collect();
+        if let Err(error) = &execution {
+            errors.push(error.to_string());
+        }
+        let error = (!errors.is_empty()).then(|| errors.join("; "));
+        let outcome = match &execution {
+            Ok(outcome) => outcome.clone(),
+            Err(error) => error
+                .downcast_ref::<crate::workflow::WorkflowFailure>()
+                .map(|failure| failure.outcome.clone())
+                .unwrap_or_default(),
+        };
         self.global_history.extend(outcome.history.clone());
 
         let review_map = crate::workflows::review_map::build_review_map(
@@ -503,13 +551,24 @@ impl Worker {
         };
         let dismissed_concerns_count = dismissed_concerns.len();
 
-        let review_inline = if state.review_inline.is_empty() && !self.skip_report {
-            "No issues found.".to_string()
+        // A failed consolidation stage still leaves completed analysis in
+        // state. Keep it separate from findings, which require verification.
+        let unverified_concerns = if !state.unverified_concerns.is_empty() {
+            state.unverified_concerns.clone()
+        } else if execution.is_err() && !state.verification_progress.is_complete() {
+            partial_concerns(&state)
         } else {
-            state.review_inline
+            Vec::new()
         };
 
-        let final_output = json!({
+        let review_inline =
+            if state.review_inline.is_empty() && error.is_none() && !self.skip_report {
+                "No issues found.".to_string()
+            } else {
+                state.review_inline
+            };
+
+        let mut final_output = json!({
             "summary": state.summary,
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
@@ -520,11 +579,21 @@ impl Worker {
             "dismissed_concerns_count": dismissed_concerns_count,
             "review_map": review_map,
         });
+        if self.failure_policy == ReviewFailurePolicy::PreservePartial {
+            final_output["unverified_concerns"] = json!(unverified_concerns);
+            final_output["verification_complete"] =
+                json!(state.verification_progress.is_complete());
+        }
 
         Ok(WorkerResult {
+            verification_progress: state.verification_progress,
             output: Some(final_output),
-            error: None,
-            input_context: "Multi-stage execution completed".to_string(),
+            input_context: if error.is_some() {
+                "Multi-stage execution".to_string()
+            } else {
+                "Multi-stage execution completed".to_string()
+            },
+            error,
             history: self.global_history.clone(),
             history_before_pruning: self.global_history.clone(),
             history_after_pruning: self.global_history.clone(),
@@ -532,6 +601,16 @@ impl Worker {
             tokens_out: outcome.tokens_out,
             tokens_cached: outcome.tokens_cached,
         })
+    }
+}
+
+fn partial_concerns(state: &LinuxPatchReviewState) -> Vec<Value> {
+    if state.verification_progress.is_complete() {
+        Vec::new()
+    } else if !state.hard_cases.is_empty() {
+        state.hard_cases.clone()
+    } else {
+        state.all_concerns.clone()
     }
 }
 
@@ -773,6 +852,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn partial_concerns_keep_completed_analysis_without_relabeling_findings() {
+        let mut state = LinuxPatchReviewState {
+            all_concerns: vec![serde_json::json!({"description": "raw"})],
+            ..Default::default()
+        };
+        assert_eq!(partial_concerns(&state)[0]["description"], "raw");
+        state.hard_cases = vec![serde_json::json!({"description": "hard case"})];
+        assert_eq!(partial_concerns(&state)[0]["description"], "hard case");
+        state.verification_progress = VerificationProgress::Complete;
+        assert!(partial_concerns(&state).is_empty());
+    }
+
+    #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
         assert_eq!(
             crate::workflows::planned_stages_from(
@@ -1009,6 +1101,101 @@ mod tests {
     }
 
     struct MockProviderAlwaysFails;
+
+    struct CleanReviewProvider {
+        fail_summary: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for CleanReviewProvider {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> Result<crate::ai::AiResponse> {
+            let summary = request.messages.iter().any(|message| {
+                message.role == crate::ai::AiRole::User
+                    && message
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("# Summarize the proposed change")
+            });
+            if summary && self.fail_summary {
+                anyhow::bail!("simulated summary failure");
+            }
+            Ok(crate::ai::AiResponse {
+                content: Some(if summary {
+                    "This change updates internal behavior.".to_string()
+                } else {
+                    r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()
+                }),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            MockProviderAlwaysFails.get_capabilities()
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_local_reviews_finish_verification_before_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        for (project, fail_summary) in [
+            (ProjectId::Linux, false),
+            (ProjectId::Sashiko, false),
+            (ProjectId::Sashiko, true),
+        ] {
+            let mut worker = Worker::new(
+                Arc::new(CleanReviewProvider { fail_summary }),
+                Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+                PromptRegistry::new(temp.path().to_path_buf()),
+                WorkerConfig {
+                    project,
+                    failure_policy: ReviewFailurePolicy::PreservePartial,
+                    max_input_tokens: 10000,
+                    max_interactions: 1,
+                    temperature: 0.0,
+                    series_range: None,
+                    baseline_sha: None,
+                    custom_prompt: None,
+                    stages: Some(vec!["goal".to_string()]),
+                    skip_report: false,
+                    report_preexisting: false,
+                    effort: None,
+                },
+            );
+            let result = worker
+                .run(
+                    json!({
+                        "id": 1,
+                        "patch_index": 1,
+                        "patches": [{"index": 1, "diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            if fail_summary {
+                assert!(
+                    result
+                        .error
+                        .unwrap()
+                        .contains("summary: simulated summary failure")
+                );
+            } else {
+                assert!(result.error.is_none());
+            }
+            assert!(result.verification_progress.is_complete());
+            let output = result.output.unwrap();
+            assert_eq!(output["verification_complete"], true);
+            assert_eq!(output["unverified_concerns"], json!([]));
+        }
+    }
     #[async_trait::async_trait]
     impl crate::ai::AiProvider for MockProviderAlwaysFails {
         async fn generate_content(
@@ -1026,14 +1213,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_failure_aborts_review() {
+    async fn test_stage_failure_preserves_results_only_for_local_reviews() {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
 
-        let provider = std::sync::Arc::new(MockProviderAlwaysFails);
-        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
-        let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
             project: ProjectId::Linux,
             max_input_tokens: 10000,
@@ -1044,23 +1228,46 @@ mod tests {
             custom_prompt: None,
             stages: None,
             skip_report: false,
+            failure_policy: ReviewFailurePolicy::Abort,
             report_preexisting: false,
             effort: None,
         };
-        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
-
         let patchset = serde_json::json!({
             "id": 1,
             "patch_index": 1,
             "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
         });
 
-        match worker.run(patchset, None).await {
-            Ok(_) => panic!("Expected stage failure error, got Ok"),
-            Err(e) => assert!(
-                e.to_string().contains("simulated AI failure"),
-                "unexpected error: {e}"
-            ),
+        for project in [ProjectId::Linux, ProjectId::Sashiko] {
+            for failure_policy in [
+                ReviewFailurePolicy::Abort,
+                ReviewFailurePolicy::PreservePartial,
+            ] {
+                let mut config = config.clone();
+                config.project = project;
+                config.failure_policy = failure_policy;
+                let tools = ToolBox::new(temp_dir.path().to_path_buf(), None);
+                let mut worker = Worker::new(
+                    std::sync::Arc::new(MockProviderAlwaysFails),
+                    std::sync::Arc::new(tools),
+                    PromptRegistry::new(prompts_dir.clone()),
+                    config,
+                );
+                match failure_policy {
+                    ReviewFailurePolicy::Abort => {
+                        let error = worker.run(patchset.clone(), None).await.err().unwrap();
+                        assert!(error.to_string().contains("simulated AI failure"));
+                    }
+                    ReviewFailurePolicy::PreservePartial => {
+                        let result = worker.run(patchset.clone(), None).await.unwrap();
+                        assert!(result.error.unwrap().contains("simulated AI failure"));
+                        let output = result.output.unwrap();
+                        assert_eq!(output["findings"], serde_json::json!([]));
+                        assert_eq!(output["unverified_concerns"], serde_json::json!([]));
+                        assert_eq!(output["review_inline"], "");
+                    }
+                }
+            }
         }
     }
 
@@ -1155,6 +1362,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            failure_policy: ReviewFailurePolicy::Abort,
             report_preexisting: false,
             effort: None,
         };
@@ -1193,6 +1401,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            failure_policy: ReviewFailurePolicy::Abort,
             report_preexisting: false,
             effort: None,
         };
@@ -1235,6 +1444,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            failure_policy: ReviewFailurePolicy::Abort,
             report_preexisting: false,
             effort: None,
         };
@@ -1338,6 +1548,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
+            failure_policy: ReviewFailurePolicy::Abort,
             report_preexisting: false,
             effort: None,
         };
@@ -1523,6 +1734,7 @@ mod tests {
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: true,
+                failure_policy: ReviewFailurePolicy::Abort,
                 report_preexisting: false,
                 effort: None,
             };
@@ -1539,6 +1751,8 @@ mod tests {
                 .await
                 .expect("worker should succeed");
             let output = res.output.expect("worker output");
+            assert!(output.get("unverified_concerns").is_none());
+            assert!(output.get("verification_complete").is_none());
             assert_eq!(output["findings"].as_array().unwrap().len(), 1);
             assert_eq!(output["findings"][0]["id"], "VF1");
             assert_eq!(output["review_map"]["project"], project.as_str());
@@ -1624,6 +1838,7 @@ mod tests {
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: false,
+                failure_policy: ReviewFailurePolicy::Abort,
                 report_preexisting: false,
                 effort: None,
             },
@@ -1656,6 +1871,7 @@ mod tests {
                 custom_prompt: None,
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: false,
+                failure_policy: ReviewFailurePolicy::Abort,
                 report_preexisting: true,
                 effort: None,
             },
