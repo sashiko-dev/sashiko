@@ -128,14 +128,16 @@ misinterpretation it permits and what the model would do instead.
 
 ### 8. Pre-existing issues
 
-Set `preexisting: false` whenever the patch introduces, modifies, triggers,
-exposes, or relies on the buggy code path, caller/callee interaction, or error
-path (even if the underlying helper or check already existed). Mark
-`preexisting: true` **only** if the problem is in untouched code whose
-reachability, inputs, and behavior are completely unaffected by this
-commit/series, so the workflow routes it exclusively to the bugs database
-rather than reporting it alongside new patch findings. Check the parent
-revision (`HEAD~1` or `Baseline SHA`) when in doubt, not just the `+` lines.
+Set `preexisting: false` whenever the patch introduces the bug or newly
+exposes, triggers, or makes reachable a latent defect that could not be
+triggered before the patch. Set `preexisting: true` when the problem already
+existed at `Baseline SHA` (before the commit/series) and was already
+triggerable before the patch—even if it lives in the same function,
+caller/callee, or error path modified by the patch without fixing it—so the
+workflow routes it to the pre-existing bug tracker rather than reporting it as
+a new patch regression. Never dismiss a real bug into `dismissed_concerns`
+merely because it already existed before the patch. Check the baseline revision
+(`HEAD~1` or `Baseline SHA`) when in doubt, not just the `+` lines.
 
 ### 9. Test code
 
