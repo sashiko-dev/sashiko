@@ -190,6 +190,14 @@ field. Sashiko retries an explicit unsupported-temperature
 `ValidationException` without the field and omits it on later requests
 to the same model.
 
+**Non-Claude models:** `prompt_caching` and `thinking` under
+`[ai.bedrock]` are Anthropic-specific; set `prompt_caching = false` and
+leave `thinking` unset. For model IDs containing `openai.`, `effort` is
+sent as `reasoning.effort` instead of `output_config.effort` (GPT-6
+Astra accepts `low`, `medium`, `high`, `xhigh`, `max`); for
+other non-Claude models leave it unset. Application inference profile
+ARNs carry no model name and always get the Anthropic fields.
+
 ## Google Cloud Vertex AI
 
 Uses Claude and Gemini models via Google Cloud infrastructure. Requires

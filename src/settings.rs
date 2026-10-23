@@ -405,8 +405,10 @@ pub struct BedrockSettings {
     /// Leave unset to omit (thinking disabled). Valid values: "adaptive".
     #[serde(default)]
     pub thinking: Option<String>,
-    /// output_config.effort level. Valid values: "low", "medium", "high", "xhigh", "max".
-    /// Leave unset to use the model default. "xhigh" is Opus 4.7-only.
+    /// Reasoning effort level. Sent as output_config.effort for Anthropic models
+    /// ("low", "medium", "high", "xhigh", "max"; "xhigh" is Opus 4.7-only) and as
+    /// reasoning.effort for model IDs containing "openai.".
+    /// Leave unset to use the model default.
     #[serde(default)]
     pub effort: Option<String>,
 }

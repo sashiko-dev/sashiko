@@ -96,6 +96,7 @@ pub struct BedrockClient {
     /// Learned from a rejected request; some models (e.g. OpenAI reasoning
     /// models) refuse inferenceConfig.temperature.
     temperature_unsupported: AtomicBool,
+    openai_style: bool,
 }
 
 impl BedrockClient {
@@ -112,6 +113,10 @@ impl BedrockClient {
         } else {
             128_000
         };
+        let openai_style = is_openai_model(&model_id);
+        if openai_style && thinking.is_some() {
+            warn!("[ai.bedrock] thinking is Anthropic-only; ignoring it for {model_id}");
+        }
 
         Self {
             client: tokio::sync::OnceCell::new(),
@@ -123,6 +128,7 @@ impl BedrockClient {
             thinking,
             effort,
             temperature_unsupported: AtomicBool::new(false),
+            openai_style,
         }
     }
 
@@ -140,6 +146,13 @@ impl BedrockClient {
     }
 
     fn converse_params(&self, request: &AiRequest) -> Result<ConverseParams> {
+        if self.openai_style {
+            let mut params =
+                translate_request(request, self.enable_caching, self.max_tokens, None, None)?;
+            params.additional_model_request_fields =
+                build_openai_additional_fields(self.effort.as_deref());
+            return Ok(params);
+        }
         translate_request(
             request,
             self.enable_caching,
@@ -206,6 +219,21 @@ struct ConverseParams {
     tool_config: Option<ToolConfiguration>,
     inference_config: Option<InferenceConfiguration>,
     additional_model_request_fields: Option<Document>,
+}
+
+/// Application inference profile ARNs carry no model name and fall back to Anthropic fields.
+fn is_openai_model(model_id: &str) -> bool {
+    model_id.contains("openai.")
+}
+
+/// OpenAI models on Bedrock take Responses-style `reasoning.effort`; top-level `reasoning_effort` is rejected.
+fn build_openai_additional_fields(effort: Option<&str>) -> Option<Document> {
+    let e = effort?;
+    let mut reasoning: HashMap<String, Document> = HashMap::new();
+    reasoning.insert("effort".to_string(), Document::String(e.to_string()));
+    let mut map: HashMap<String, Document> = HashMap::new();
+    map.insert("reasoning".to_string(), Document::Object(reasoning));
+    Some(Document::Object(map))
 }
 
 fn build_additional_fields(thinking: Option<&str>, effort: Option<&str>) -> Option<Document> {
@@ -789,6 +817,48 @@ mod tests {
         let params = translate_request(&req, false, 4096, None, None)?;
         assert!(params.tool_config.is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_openai_model_detection() {
+        assert!(is_openai_model("global.openai.gpt-6-astra"));
+        assert!(is_openai_model("openai.gpt-oss-120b-1:0"));
+        assert!(!is_openai_model("global.anthropic.claude-opus-5-5"));
+    }
+
+    #[test]
+    fn test_openai_additional_fields_use_reasoning_effort() {
+        assert!(build_openai_additional_fields(None).is_none());
+        let json = document_to_json(&build_openai_additional_fields(Some("high")).unwrap());
+        assert_eq!(json, serde_json::json!({"reasoning": {"effort": "high"}}));
+    }
+
+    #[test]
+    fn test_converse_params_shape_effort_per_model_family() -> Result<()> {
+        let cases = [
+            (
+                "global.openai.gpt-6-astra",
+                json!({"reasoning": {"effort": "high"}}),
+            ),
+            (
+                "global.anthropic.claude-opus-5-5",
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}),
+            ),
+        ];
+        for (model_id, expected) in cases {
+            let bedrock = BedrockClient::new(
+                model_id.to_string(),
+                None,
+                false,
+                4096,
+                Some("adaptive".to_string()),
+                Some("high".to_string()),
+            );
+            let params = bedrock.converse_params(&make_request(vec![]))?;
+            let fields = params.additional_model_request_fields.unwrap();
+            assert_eq!(document_to_json(&fields), expected, "{model_id}");
+        }
         Ok(())
     }
 
