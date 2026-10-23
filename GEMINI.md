@@ -55,7 +55,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `bin/`: CLI binary (`sashiko-cli.rs`).
 - `lib.rs`: Shared library root and `ReviewStatus` types.
 - `benchmark.rs`: Built-in benchmark runner, per-run database/artifact preservation, and structured AI judge telemetry (`#[cfg(feature = "server")]`).
-- `worker/`: Background workers (`bug_worker.rs`, `email.rs`, `forge.rs`, `patchwork.rs`, `compressor.rs`, `repack.rs`, `sync.rs`, `prefetch.rs`, `prompts.rs`).
+- `worker/`: Background workers (`bug_worker.rs`, `email.rs`, `forge.rs`, `patchwork.rs`, `repack.rs`, `sync.rs`, `prefetch.rs`, `prompts.rs`).
 - `workflow/`: Core state-machine LLM workflow engine.
 - `workflows/`: Declarative review and bug pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`), plus shared security/normalization helpers (`guard.rs`) and the review-map lineage builder (`review_map.rs`).
 - `toolbox/`: Agent tools for inspecting git repositories and worktrees.

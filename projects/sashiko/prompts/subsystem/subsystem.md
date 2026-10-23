@@ -33,4 +33,4 @@ trigger is enough.
 | Async and Tokio | `async fn`, `.await`, `tokio::spawn`, `spawn_blocking`, `select!`, timeouts, child processes, `src/worker/` | rust-async.md |
 | Error Handling | `Result`, `?`, `anyhow`, `unwrap`, `expect`, `panic!`, indexing, slicing, `as` casts, swallowed errors | error-handling.md |
 | Concurrency | `Arc`, `Mutex`, `RwLock`, `Semaphore`, `OnceLock`, statics, shared state, races between the daemon and its workers | concurrency.md |
-| Resource Limits | Unbounded collections or channels, token budget, `concurrency`, timeouts, temporary directories, child processes, row growth, `src/worker/compressor.rs`, `src/worker/repack.rs` | resource-limits.md |
+| Resource Limits | Unbounded collections or channels, token budget, `concurrency`, timeouts, temporary directories, child processes, row growth, `src/compression.rs`, `src/worker/repack.rs` | resource-limits.md |

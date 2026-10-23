@@ -85,7 +85,7 @@ a durable queue polled by background workers (`lock_pending_email`,
    In `libsql`, `Connection::clone()` clones an `Arc` to the *exact same*
    underlying `sqlite3*` connection handle. Because `Arc<Database>` is shared
    across concurrent in-process Tokio tasks (`Ingestor`, `EmailWorker`,
-   `PatchworkWorker`, `ForgeWorker`, `BugWorker`, `Compressor`, HTTP handlers),
+   `PatchworkWorker`, `ForgeWorker`, `BugWorker`, HTTP handlers),
    every explicit transaction **must** be opened via `self.begin_transaction()`
    or `self.begin_immediate_transaction()`, which acquires `self.tx_lock` and
    runs on `self.tx_conn` wrapped in `DatabaseTransaction`.

@@ -25,7 +25,7 @@ including HTTP health checks and LLM timeout timers.
   minutes.
 - **Synchronous filesystem walks and heavy I/O**: recursive directory scans
   (`walkdir` or `std::fs::read_dir`), reading large patch archives, or
-  compressing logs (`zstd` in `src/worker/compressor.rs`).
+  compressing large diffs or logs (`flate2` in `src/compression.rs`).
 - **CPU-bound parsing or hashing**: computing content digests over large trees
   or parsing multi-megabyte mbox archives synchronously.
 
@@ -122,7 +122,7 @@ error-handling flow unless its `JoinHandle` is awaited.
 ### Invariants
 
 1. **Never silently ignore `JoinHandle` on critical workers**: If a background
-   daemon loop (`Ingestor`, `Reviewer`, `EmailWorker`, `Compressor`) panics or
+   daemon loop (`Ingestor`, `Reviewer`, `EmailWorker`, `ForgeWorker`) panics or
    returns an unexpected `Err`, silently dropping the `JoinHandle` hides the
    failure while the server continues running in a degraded state. Log task
    termination explicitly or monitor handles in `src/main.rs`.

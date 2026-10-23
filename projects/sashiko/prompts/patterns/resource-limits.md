@@ -2,7 +2,7 @@
 
 Covers memory, disk, token budget, and I/O bounds across Sashiko: LLM token
 budgets (`src/ai/`, `src/toolbox/`), worktree and log storage
-(`src/worker/compressor.rs`, `src/worker/repack.rs`), database growth
+(`src/compression.rs`, `src/worker/repack.rs`), database growth
 (`src/db.rs`), and network/IPC channels.
 
 Sashiko runs unattended as a long-lived daemon processing patches and pull
@@ -60,8 +60,8 @@ enforces a hard context window limit.
 Sashiko creates high-churn disk artifacts during operation:
 - Temporary git worktrees under `review_trees/`
 - Raw email archives under `archives/`
-- Full LLM interaction transcripts in `ai_interactions` (compressed by
-  `src/worker/compressor.rs`)
+- Full LLM interaction transcripts, review logs, and diffs (gzip-compressed on
+  write by `src/compression.rs`)
 - Git objects accumulated from fetched patch series or PR refs (`src/worker/repack.rs`)
 
 ### Invariants
@@ -70,11 +70,10 @@ Sashiko creates high-churn disk artifacts during operation:
    or baseline check must be removed when the review finishes, fails, or times
    out. Ensure error paths (`?` early returns and panics/timeouts) do not
    bypass cleanup.
-2. **Idempotent housekeeping workers**: Background maintenance workers
-   (`compressor.rs` for zstd compression of old `ai_interactions` payloads,
-   `repack.rs` for git repository maintenance) must run in bounded batches per
-   tick so a large backlog does not stall the daemon or hold disk locks
-   indefinitely.
+2. **Idempotent housekeeping workers**: Background maintenance workers (such as
+   `repack.rs` for git repository maintenance) must run in bounded batches or
+   intervals per tick so a large backlog does not stall the daemon or hold disk
+   locks indefinitely.
 3. **Temporary files in tests and CLI**: Any temporary file or directory
    created during unit/integration tests or CLI commands must use RAII guards
    (`tempfile::TempDir` / `NamedTempFile`) or reside inside designated

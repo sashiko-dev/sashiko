@@ -85,6 +85,30 @@ if [ "$LIVE_DUPES" -gt 0 ]; then
         "SELECT id, bugid, pipeline_state, duplicate_of_id, lease_expires_at FROM bugs WHERE lifecycle_status = 'duplicate' AND pipeline_state NOT IN ('succeeded', 'abandoned');"
 fi
 
+# Invariant 7: every write path compresses strings longer than 1024 bytes on
+# insert or update, so no compressed column should contain uncompressed text
+# exceeding 1024 bytes.
+check_compressed_column() {
+    local table="$1"
+    local column="$2"
+    local bad
+    bad=$(count "SELECT count(*) FROM $table WHERE typeof($column) = 'text' AND length($column) > 1024;")
+    if [ "$bad" -gt 0 ]; then
+        report "Found $bad uncompressed rows > 1024 bytes in $table.$column!" \
+            "SELECT id, length($column) FROM $table WHERE typeof($column) = 'text' AND length($column) > 1024 LIMIT 20;"
+    fi
+}
+
+check_compressed_column messages body
+check_compressed_column patches diff
+check_compressed_column patchsets baseline_logs
+check_compressed_column reviews logs
+check_compressed_column reviews inline_review
+check_compressed_column ai_interactions input_context
+check_compressed_column ai_interactions output_raw
+check_compressed_column bug_enrichments content
+check_compressed_column bug_enrichments logs
+
 if [ "$FAILED" -ne 0 ]; then
     exit 1
 fi

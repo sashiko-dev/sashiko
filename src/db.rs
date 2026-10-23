@@ -2279,13 +2279,10 @@ impl Database {
         logs: Option<&str>,
     ) -> Result<()> {
         if let Some(l) = logs {
+            let compressed_logs = crate::compression::compress_string_async(l).await;
             self.execute(
                 "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                libsql::params![
-                    status,
-                    crate::compression::compress_string_if_needed(l),
-                    review_id
-                ],
+                libsql::params![status, compressed_logs, review_id],
             )
             .await?;
         } else {
@@ -2309,15 +2306,31 @@ impl Database {
         inline_review: Option<&str>,
         logs: Option<&str>,
     ) -> Result<()> {
+        let compressed_inline_review =
+            crate::compression::compress_opt_string_async(inline_review).await;
+        let compressed_logs = crate::compression::compress_opt_string_async(logs).await;
         self.execute(
             "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-            libsql::params![status, result, summary, interaction_id, inline_review.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), review_id],
+            libsql::params![
+                status,
+                result,
+                summary,
+                interaction_id,
+                compressed_inline_review,
+                compressed_logs,
+                review_id
+            ],
         )
         .await?;
         Ok(())
     }
 
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
+        let compressed_input = crate::compression::compress_string_async(params.input).await;
+        let compressed_output = crate::compression::compress_string_async(params.output).await;
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
         self.execute(
             "INSERT INTO ai_interactions (id, parent_interaction_id, workflow_id, provider, model, input_context, output_raw, tokens_in, tokens_out, tokens_cached, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2327,12 +2340,12 @@ impl Database {
                 params.workflow_id,
                 params.provider,
                 params.model,
-                crate::compression::compress_string_if_needed(params.input),
-                crate::compression::compress_string_if_needed(params.output),
+                compressed_input,
+                compressed_output,
                 params.tokens_in,
                 params.tokens_out,
                 params.tokens_cached,
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64
+                created_at
             ],
         ).await?;
         Ok(())
@@ -2532,16 +2545,10 @@ impl Database {
         bug_id: i64,
         enrichment: &NewBugEnrichment,
     ) -> Result<i64> {
-        let compressed_content = enrichment
-            .content
-            .as_ref()
-            .map(|c| crate::compression::compress_string_if_needed(c))
-            .unwrap_or(libsql::Value::Null);
-        let compressed_logs = enrichment
-            .logs
-            .as_ref()
-            .map(|l| crate::compression::compress_string_if_needed(l))
-            .unwrap_or(libsql::Value::Null);
+        let compressed_content =
+            crate::compression::compress_opt_string_async(enrichment.content.as_deref()).await;
+        let compressed_logs =
+            crate::compression::compress_opt_string_async(enrichment.logs.as_deref()).await;
         let data_json_str = enrichment
             .data_json
             .as_ref()
@@ -3445,13 +3452,17 @@ impl Database {
         status: BugLifecycleStatus,
         reason: Option<&str>,
     ) -> Result<()> {
+        let compressed_reason = match reason.filter(|s| !s.trim().is_empty()) {
+            Some(reason) => Some(crate::compression::compress_string_async(reason).await),
+            None => None,
+        };
         let tx = self.begin_transaction().await?;
         let now = chrono::Utc::now().timestamp();
         tx.execute("UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
             libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id]).await?;
-        if let Some(reason) = reason.filter(|s| !s.trim().is_empty()) {
+        if let Some(compressed_reason) = compressed_reason {
             tx.execute("INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
-                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason]).await?;
+                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, compressed_reason]).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -3482,6 +3493,10 @@ impl Database {
         notice: Option<&TransactionalEmail<'_>>,
     ) -> Result<bool> {
         let assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
+        let compressed_reason = match reason.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(reason) => Some(crate::compression::compress_string_async(reason).await),
+            None => None,
+        };
         let now = chrono::Utc::now().timestamp();
         let tx = self.begin_transaction().await?;
         let found = {
@@ -3519,10 +3534,10 @@ impl Database {
             ],
         )
         .await?;
-        if let Some(reason) = reason.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(compressed_reason) = compressed_reason {
             tx.execute(
                 "INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
-                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason],
+                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, compressed_reason],
             )
             .await?;
         }
@@ -5852,7 +5867,7 @@ impl Database {
         mailing_list: Option<&str>,
         references_hdr: Option<&str>,
     ) -> Result<()> {
-        let compressed_body = crate::compression::compress_string_if_needed(body);
+        let compressed_body = crate::compression::compress_string_async(body).await;
         let tx = self.begin_immediate_transaction().await?;
 
         // Check for thread merge (Thread split resolution)
@@ -9717,11 +9732,19 @@ impl Database {
         logs: Option<&str>,
         provider: Option<&str>,
     ) -> Result<()> {
+        let compressed_logs = crate::compression::compress_opt_string_async(logs).await;
         self.execute(
-                "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
-                libsql::params![baseline_id, model_name, prompts_hash, logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), provider, id],
-            )
-            .await?;
+            "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
+            libsql::params![
+                baseline_id,
+                model_name,
+                prompts_hash,
+                compressed_logs,
+                provider,
+                id
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -22568,5 +22591,203 @@ mod tests {
              Offenders: {}",
             offenders.join(", ")
         );
+    }
+
+    #[tokio::test]
+    async fn test_all_compressed_columns_stored_as_blob_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compressed_columns.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let large = "x".repeat(2048);
+        let now = chrono::Utc::now().timestamp();
+
+        let thread_id = db
+            .create_thread("<compress-test@example.com>", "Compress test", now)
+            .await
+            .unwrap();
+        db.create_message(
+            "<compress-test@example.com>",
+            thread_id,
+            None,
+            "Author <a@example.com>",
+            "Compress test",
+            now,
+            &large,
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "<compress-test@example.com>",
+                "Compress test",
+                "Author <a@example.com>",
+                now,
+                1,
+                1,
+                "",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_id, "<compress-test@example.com>", 1, &large)
+            .await
+            .unwrap();
+
+        db.update_patchset_baseline_info(
+            ps_id,
+            None,
+            Some("test-model"),
+            Some("hash"),
+            Some(&large),
+            Some("gemini"),
+        )
+        .await
+        .unwrap();
+
+        let review_id = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await
+            .unwrap();
+        db.update_review_status(review_id, "In Review", Some(&large))
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "ok",
+            Some("summary"),
+            None,
+            Some(&large),
+            Some(&large),
+        )
+        .await
+        .unwrap();
+
+        db.create_ai_interaction(AiInteractionParams {
+            id: "ai-compress-1",
+            parent_id: None,
+            workflow_id: Some("patch_review"),
+            provider: "gemini",
+            model: "test-model",
+            input: &large,
+            output: &large,
+            tokens_in: 10,
+            tokens_out: 20,
+            tokens_cached: 0,
+        })
+        .await
+        .unwrap();
+
+        let bug_id = db
+            .create_bug_with_enrichment(
+                &NewBug {
+                    bugid: "linux-compress-test".to_string(),
+                    title: "Compress test bug".to_string(),
+                    lifecycle_status: BugLifecycleStatus::Open,
+                    pipeline_state: BugPipelineState::Succeeded,
+                    reporter: "sashiko".to_string(),
+                    reported_at: now,
+                    assignee: None,
+                    discovered_in_patchset_id: None,
+                    discovered_in_patch_id: None,
+                    discovered_in_commit: None,
+                    source_ref: None,
+                    vector_json: None,
+                    duplicate_of_id: None,
+                    subsystems: vec![],
+                },
+                Some(&NewBugEnrichment {
+                    kind: "report".to_string(),
+                    tool: "sashiko".to_string(),
+                    created_at: now,
+                    content: Some(large.clone()),
+                    logs: Some(large.clone()),
+                    tokens_in: Some(10),
+                    tokens_out: Some(20),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.change_bug_status_with_reason(bug_id, BugLifecycleStatus::Closed, Some(&large))
+            .await
+            .unwrap();
+        assert!(
+            db.assign_bug(bug_id, Some("dev@example.com"), Some(&large), None)
+                .await
+                .unwrap()
+        );
+
+        let compressed_columns = [
+            ("messages", "body"),
+            ("patches", "diff"),
+            ("patchsets", "baseline_logs"),
+            ("reviews", "logs"),
+            ("reviews", "inline_review"),
+            ("ai_interactions", "input_context"),
+            ("ai_interactions", "output_raw"),
+            ("bug_enrichments", "content"),
+            ("bug_enrichments", "logs"),
+        ];
+
+        for (table, col) in compressed_columns {
+            let mut blob_rows = db
+                .conn
+                .query(
+                    &format!("SELECT count(*) FROM {table} WHERE typeof({col}) = 'blob'"),
+                    (),
+                )
+                .await
+                .unwrap();
+            let blob_count: i64 = blob_rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert!(
+                blob_count > 0,
+                "expected at least 1 compressed blob row in {table}.{col}"
+            );
+
+            let mut uncompressed_rows = db
+                .conn
+                .query(
+                    &format!(
+                        "SELECT count(*) FROM {table} WHERE typeof({col}) = 'text' AND length({col}) > 1024"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+            let uncompressed_count: i64 = uncompressed_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(
+                uncompressed_count, 0,
+                "unexpected uncompressed text row > 1024 bytes in {table}.{col}"
+            );
+        }
     }
 }

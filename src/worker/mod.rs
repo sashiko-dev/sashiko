@@ -15,8 +15,6 @@
 #[cfg(feature = "server")]
 pub mod bug_worker;
 #[cfg(feature = "server")]
-pub mod compressor;
-#[cfg(feature = "server")]
 pub mod email;
 #[cfg(feature = "server")]
 pub mod forge;

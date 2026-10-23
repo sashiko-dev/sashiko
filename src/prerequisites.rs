@@ -2495,8 +2495,8 @@ mod tests {
         let diff = "x".repeat(2048);
         let patchset_id = insert_local_patch(&db, message_id, &diff, patch_id).await?;
 
-        // Simulate an uncompressed row that the background compressor has not
-        // processed yet, then re-ingest it through the compressed write path.
+        // Simulate a legacy uncompressed row, then re-ingest it through the
+        // compressed write path.
         db.conn
             .execute(
                 "UPDATE patches SET diff = ? WHERE message_id = ?",

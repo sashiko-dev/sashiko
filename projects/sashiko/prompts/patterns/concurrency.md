@@ -25,7 +25,7 @@ Sashiko's concurrency model spans **two levels**:
 
 Because child review workers open their own connections to `sashiko.db` while
 the main daemon simultaneously runs `Ingestor`, `EmailWorker`,
-`PatchworkWorker`, `ForgeWorker`, `BugWorker`, `Compressor`, and HTTP API
+`PatchworkWorker`, `ForgeWorker`, `BugWorker`, and HTTP API
 handlers sharing an `Arc<Database>`:
 
 ### Invariants
@@ -53,7 +53,7 @@ handlers sharing an `Arc<Database>`:
    `SELECT` followed by an unconditional `UPDATE` is a TOCTOU race.
 5. **Supervise long-lived background workers (`spawn_supervised_worker`) and bound network calls**:
    Long-running daemon workers (`EmailWorker`, `PatchworkWorker`, `ForgeWorker`,
-   `BugWorker`, `Compressor`) must be spawned through `spawn_supervised_worker`
+   `BugWorker`) must be spawned through `spawn_supervised_worker`
    in `src/main.rs` so an unexpected panic in a worker loop is logged and
    restarted rather than silently killing background processing for the rest of
    the daemon's lifetime. External network calls inside worker loops (such as

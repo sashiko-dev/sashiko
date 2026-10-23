@@ -1350,15 +1350,6 @@ async fn run_daemon(
         info!("Bug worker disabled via settings (linux_bug.enabled = false).");
         None
     };
-    // Initialize custom remotes
-    // Start Background Compressor Worker
-    let compressor_db = db.clone();
-    let compressor_handle = spawn_supervised_worker("Compressor", move || {
-        let db = Arc::clone(&compressor_db);
-        async move {
-            sashiko::worker::compressor::run_compressor(db).await;
-        }
-    });
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 
     // Clean up stale worktree directories on disk first. validate_for_daemon
@@ -1513,7 +1504,6 @@ async fn run_daemon(
     if let Some(h) = bug_worker_handle {
         h.abort();
     }
-    compressor_handle.abort();
     commit_graph_handle.abort();
     sync_handle.abort();
     repack_handle.abort();
