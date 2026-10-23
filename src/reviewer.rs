@@ -15,8 +15,7 @@
 use crate::ReviewStatus;
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
-    create_provider_cached,
+    AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error, create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
@@ -2313,6 +2312,9 @@ impl Reviewer {
                         }
                         return Ok(PatchResult::Cancelled);
                     }
+                    let budget_exceeded = e
+                        .downcast_ref::<ReviewError>()
+                        .is_some_and(|re| matches!(re, ReviewError::BudgetExceeded(_)));
                     error!("Review execution failed for {}: {}", patchset_id, e);
                     let _ = ctx
                         .db
@@ -2326,7 +2328,7 @@ impl Reviewer {
                             None,
                         )
                         .await;
-                    if retries < max_retries {
+                    if !budget_exceeded && retries < max_retries {
                         retries += 1;
                         continue;
                     }
@@ -2646,6 +2648,7 @@ async fn run_review_tool_with_cmd_and_overrides(
                 };
 
                 tokio::select! {
+                    biased;
                     Some(err) = abort_rx.recv() => {
                         return Err(err);
                     }
@@ -2769,21 +2772,6 @@ async fn run_review_tool_with_cmd_and_overrides(
                                                         let token_budget = settings_clone.review.max_total_tokens;
                                                         if token_budget > 0 && current_total > token_budget {
                                                             let err_msg = format!("Token budget exceeded: {} uncached input + output tokens used > {} limit", current_total, token_budget);
-
-                                                            let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
-                                                            let reply = json!({
-                                                                "type": "error",
-                                                                "tx_id": tx_id,
-                                                                "payload": payload
-                                                            });
-                                                            let mut reply_str = serde_json::to_string(&reply).unwrap();
-                                                            reply_str.push('\n');
-                                                            {
-                                                                let mut writer = stdin_clone.lock().await;
-                                                                let _ = writer.write_all(reply_str.as_bytes()).await;
-                                                                let _ = writer.flush().await;
-                                                            }
-
                                                             let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
                                                             return;
                                                         }
@@ -2791,21 +2779,6 @@ async fn run_review_tool_with_cmd_and_overrides(
                                                         let output_budget = settings_clone.review.max_total_output_tokens;
                                                         if output_budget > 0 && current_output > output_budget {
                                                             let err_msg = format!("Output token budget exceeded: {} output tokens used > {} limit", current_output, output_budget);
-
-                                                            let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
-                                                            let reply = json!({
-                                                                "type": "error",
-                                                                "tx_id": tx_id,
-                                                                "payload": payload
-                                                            });
-                                                            let mut reply_str = serde_json::to_string(&reply).unwrap();
-                                                            reply_str.push('\n');
-                                                            {
-                                                                let mut writer = stdin_clone.lock().await;
-                                                                let _ = writer.write_all(reply_str.as_bytes()).await;
-                                                                let _ = writer.flush().await;
-                                                            }
-
                                                             let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
                                                             return;
                                                         }
@@ -2910,6 +2883,10 @@ async fn run_review_tool_with_cmd_and_overrides(
                 }
             }
 
+            if let Ok(err) = abort_rx.try_recv() {
+                return Err(err);
+            }
+
             // Return result
             if let Some(res) = final_result {
                 Ok(res)
@@ -2944,6 +2921,12 @@ async fn run_review_tool_with_cmd_and_overrides(
             .is_some_and(|re| matches!(re, ReviewError::Cancelled)),
         Ok(_) => false,
     };
+    let budget_exceeded = match &interaction_result {
+        Err(e) => e
+            .downcast_ref::<ReviewError>()
+            .is_some_and(|re| matches!(re, ReviewError::BudgetExceeded(_))),
+        Ok(_) => false,
+    };
 
     if timed_out {
         error!(
@@ -2955,6 +2938,13 @@ async fn run_review_tool_with_cmd_and_overrides(
     } else if cancelled {
         info!(
             "Review tool aborted because patchset {} was cancelled. Killing process.",
+            patchset_id
+        );
+        let _ = child.start_kill();
+        let _ = timeout(Duration::from_secs(5), child.wait()).await;
+    } else if budget_exceeded {
+        error!(
+            "Review tool aborted because patchset {} exceeded token budget. Killing process.",
             patchset_id
         );
         let _ = child.start_kill();
@@ -4732,6 +4722,11 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             .await
             .expect_err("Expected token budget error");
         assert!(
+            err.downcast_ref::<ReviewError>()
+                .is_some_and(|re| matches!(re, ReviewError::BudgetExceeded(_))),
+            "expected ReviewError::BudgetExceeded, got: {err}"
+        );
+        assert!(
             err.to_string().contains("Token budget exceeded"),
             "unexpected error: {err}"
         );
@@ -4755,6 +4750,11 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         let err = run_two_request_mock(settings, provider)
             .await
             .expect_err("Expected output token budget error");
+        assert!(
+            err.downcast_ref::<ReviewError>()
+                .is_some_and(|re| matches!(re, ReviewError::BudgetExceeded(_))),
+            "expected ReviewError::BudgetExceeded, got: {err}"
+        );
         assert!(
             err.to_string().contains("Output token budget exceeded"),
             "unexpected error: {err}"

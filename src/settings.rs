@@ -961,15 +961,13 @@ pub struct ReviewSettings {
     pub ignore_files: Vec<String>,
     #[serde(default = "default_email_policy_path")]
     pub email_policy_path: String,
-    /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
-    /// single review. Cached input tokens are excluded because they cost ~10x less and don't
-    /// reflect runaway model behaviour. At Sonnet 4.6 pricing ($3/M uncached input, $15/M
-    /// output) the 5M default costs roughly $15–75 depending on input/output mix; a typical
-    /// 7-stage review uses ~300–500k tokens total. Set to 0 to disable.
+    /// Maximum cumulative non-cached tokens (uncached input + output, including thinking
+    /// tokens) across all turns in a single review. Cached input tokens are excluded because
+    /// they cost ~10x less and don't reflect runaway model behaviour. Set to 0 to disable.
     #[serde(default = "default_max_total_tokens")]
     pub max_total_tokens: usize,
-    /// Maximum cumulative output tokens across all turns in a single review.
-    /// Conservative default; set to 0 to disable.
+    /// Maximum cumulative output tokens (including thinking tokens) across all turns in a
+    /// single review. Set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
     /// Reasoning effort mode (`"low"`, `"mid"`, `"high"`, or `"dynamic"`) for
@@ -998,11 +996,11 @@ impl ReviewSettings {
 }
 
 fn default_max_total_tokens() -> usize {
-    5_000_000
+    10_000_000
 }
 
 fn default_max_total_output_tokens() -> usize {
-    500_000
+    1_000_000
 }
 
 fn default_max_lines_changed() -> usize {
