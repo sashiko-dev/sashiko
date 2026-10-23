@@ -3069,6 +3069,15 @@
             return escaped;
         }
 
+        // A date as YYYY-MM-DD in the viewer's time zone, the zone every time
+        // shown beside it is in. toISOString() is UTC: in the evening west of
+        // Greenwich it names the next day, so a list row once paired the UTC
+        // date with the local time.
+        function localDateString(d) {
+            const pad = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+        }
+
         function formatDateParts(unix) {
             if (unix === null || unix === undefined || unix === '') {
                 return { dateStr: '-', timeStr: '' };
@@ -3083,7 +3092,7 @@
                 return { dateStr: '-', timeStr: '' };
             }
             try {
-                const dateStr = d.toISOString().split('T')[0];
+                const dateStr = localDateString(d);
                 const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
                 return { dateStr, timeStr };
             } catch (e) {
@@ -3099,7 +3108,7 @@
             const d = new Date(millis);
             if (isNaN(d.getTime())) return '-';
             try {
-                return full ? d.toLocaleString() : d.toISOString().split('T')[0];
+                return full ? d.toLocaleString() : localDateString(d);
             } catch (e) {
                 return '-';
             }
