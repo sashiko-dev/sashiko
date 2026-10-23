@@ -206,6 +206,84 @@ fn is_ping_subject(subject: &str) -> bool {
     subject_prefix_tokens(subject).any(|tok| tok.to_ascii_lowercase().starts_with("ping"))
 }
 
+pub fn is_promotable_reply_patch_subject(subject: &str) -> bool {
+    let lower = subject.trim().to_lowercase();
+    let starts_with_reply = lower.starts_with("re:")
+        || lower.starts_with("aw:")
+        || lower.starts_with("回复:")
+        || lower.starts_with("回复：")
+        || lower.starts_with("答复:")
+        || lower.starts_with("答复：");
+    if !starts_with_reply {
+        return false;
+    }
+    if lower.contains("fwd:")
+        || lower.contains("forwarded:")
+        || lower.contains("wg:")
+        || lower.contains("[reproducer]")
+        || lower.contains("(was ")
+        || lower.contains("(was:")
+    {
+        return false;
+    }
+    let has_patch_tag = subject_prefix_tokens(subject)
+        .any(|tok| tok.eq_ignore_ascii_case("patch") || tok.eq_ignore_ascii_case("rfc"));
+    has_patch_tag && !clean_subject(subject).is_empty()
+}
+
+pub fn promote_reply_patch_subject(subject: &str, version: u32) -> String {
+    let mut stripped = subject.trim();
+    let prefixes = ["re:", "aw:", "回复:", "回复：", "答复:", "答复："];
+    loop {
+        let lower = stripped.to_lowercase();
+        let mut matched = false;
+        for prefix in &prefixes {
+            if lower.starts_with(prefix)
+                && let Some(rest) = stripped.get(prefix.len()..)
+            {
+                stripped = rest.trim();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+
+    if version <= 1 || parse_subject_version(stripped) == Some(version) {
+        return stripped.to_string();
+    }
+
+    static RE_BRACKET_VER: OnceLock<Regex> = OnceLock::new();
+    let re_ver =
+        RE_BRACKET_VER.get_or_init(|| Regex::new(r"(?i)\[([^\]]*?)\bv\d+\b([^\]]*?)\]").unwrap());
+    if let Some(caps) = re_ver.captures(stripped)
+        && let Some(m) = caps.get(0)
+    {
+        let mut out = String::with_capacity(stripped.len() + 4);
+        out.push_str(&stripped[..m.start()]);
+        out.push_str(&format!("[{}v{}{}]", &caps[1], version, &caps[2]));
+        out.push_str(&stripped[m.end()..]);
+        return out;
+    }
+
+    static RE_BRACKET_TAG: OnceLock<Regex> = OnceLock::new();
+    let re_tag = RE_BRACKET_TAG
+        .get_or_init(|| Regex::new(r"(?i)\[([^\]]*?\b(?:PATCH|RFC)\b)([^\]]*?)\]").unwrap());
+    if let Some(caps) = re_tag.captures(stripped)
+        && let Some(m) = caps.get(0)
+    {
+        let mut out = String::with_capacity(stripped.len() + 8);
+        out.push_str(&stripped[..m.start()]);
+        out.push_str(&format!("[{} v{}{}]", &caps[1], version, &caps[2]));
+        out.push_str(&stripped[m.end()..]);
+        return out;
+    }
+
+    format!("[PATCH v{version}] {stripped}")
+}
+
 pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)> {
     let received_date = extract_received_date(raw_email);
 
@@ -575,7 +653,17 @@ pub fn clean_subject(subject: &str) -> String {
 
     // 2. Remove Re:, Fwd: prefixes (case insensitive)
     let mut cleaned = no_brackets.trim().to_string();
-    let prefixes = ["re:", "fwd:", "aw:", "forwarded:", "回复:", "回复："];
+    let prefixes = [
+        "re:",
+        "fwd:",
+        "aw:",
+        "wg:",
+        "forwarded:",
+        "回复:",
+        "回复：",
+        "答复:",
+        "答复：",
+    ];
 
     let mut changed = true;
     while changed {
@@ -1886,6 +1974,36 @@ On Thu, Oct 22, Author wrote:\r\n\
         assert_eq!(
             parse_subject_index("[gccrs COMMIT 10/12] gccrs: add check"),
             (10, 12)
+        );
+    }
+
+    #[test]
+    fn test_promote_reply_patch_subject() {
+        assert!(is_promotable_reply_patch_subject(
+            "Re: [PATCH] lra: Handle subregs in get_dependent_filter."
+        ));
+        assert!(!is_promotable_reply_patch_subject(
+            "Forwarded: Re: [PATCH] lra: Handle subregs."
+        ));
+        assert!(!is_promotable_reply_patch_subject(
+            "Re: [syzbot] bug report"
+        ));
+        assert!(!is_promotable_reply_patch_subject(
+            "Re: [syzbot] bug in patch handler"
+        ));
+        assert_eq!(
+            promote_reply_patch_subject(
+                "Re: [PATCH] lra: Handle subregs in get_dependent_filter.",
+                2
+            ),
+            "[PATCH v2] lra: Handle subregs in get_dependent_filter."
+        );
+        assert_eq!(
+            promote_reply_patch_subject(
+                "Re: [PATCH v2] lra: Handle subregs in get_dependent_filter.",
+                3
+            ),
+            "[PATCH v3] lra: Handle subregs in get_dependent_filter."
         );
     }
 }

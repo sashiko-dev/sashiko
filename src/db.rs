@@ -6608,6 +6608,91 @@ impl Database {
             && crate::patch::authors_match(&candidate_author, author))
     }
 
+    /// Check whether an in-thread reply carrying a diff is an updated version
+    /// of an existing single-patch submission in `thread_id` from the same
+    /// author with the same cleaned subject, and return the next version number.
+    pub async fn find_in_thread_followup_version(
+        &self,
+        thread_id: i64,
+        message_id: &str,
+        author: &str,
+        subject: &str,
+        git_patch_id: Option<&str>,
+        diff: &str,
+    ) -> Result<Option<u32>> {
+        let target_clean = crate::patch::clean_subject(subject);
+        if target_clean.is_empty() {
+            return Ok(None);
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, cover_letter_message_id, author, subject, total_parts FROM patchsets WHERE thread_id = ? ORDER BY id ASC",
+                libsql::params![thread_id],
+            )
+            .await?;
+
+        let mut matched_prior = false;
+        let mut max_version = 1u32;
+        while let Some(row) = rows.next().await? {
+            let ps_id: i64 = row.get(0)?;
+            let cover_msg_id: Option<String> = row.get(1).ok();
+            let existing_author: String = row.get(2).unwrap_or_default();
+            let existing_subject: String = row.get(3).unwrap_or_default();
+            let total_parts: u32 = row.get(4).unwrap_or(1);
+            let existing_version = crate::patch::parse_subject_version(&existing_subject);
+
+            if cover_msg_id.as_deref() == Some(message_id)
+                || self.patchset_holds_message(ps_id, message_id).await?
+            {
+                return Ok(existing_version.filter(|&v| v > 1));
+            }
+
+            if total_parts == 1
+                && crate::patch::authors_match(&existing_author, author)
+                && crate::patch::clean_subject(&existing_subject) == target_clean
+            {
+                matched_prior = true;
+                max_version = max_version.max(existing_version.unwrap_or(1));
+            }
+        }
+
+        if !matched_prior {
+            return Ok(None);
+        }
+
+        let mut patch_rows = self
+            .conn
+            .query(
+                "SELECT p.git_patch_id, p.diff FROM patches p \
+                 JOIN patchsets ps ON p.patchset_id = ps.id \
+                 WHERE ps.thread_id = ?",
+                libsql::params![thread_id],
+            )
+            .await?;
+
+        let trimmed_diff = diff.trim();
+        while let Some(row) = patch_rows.next().await? {
+            let existing_patch_id: Option<String> = row.get(0).ok();
+            if let (Some(new_id), Some(old_id)) = (git_patch_id, existing_patch_id.as_deref())
+                && new_id == old_id
+            {
+                return Ok(None);
+            }
+            let existing_diff =
+                crate::compression::get_compressed_string(&row, 1).unwrap_or_default();
+            if existing_diff.trim() == trimmed_diff {
+                return Ok(None);
+            }
+        }
+
+        let next_version = crate::patch::parse_subject_version(subject)
+            .filter(|&v| v > max_version)
+            .unwrap_or(max_version + 1);
+        Ok(Some(next_version))
+    }
+
     /// Determine whether an incoming message's version tag is compatible with an
     /// existing candidate patchset.
     fn versions_are_compatible(
@@ -19853,6 +19938,103 @@ mod tests {
                 .await
                 .unwrap(),
             "a message that was never ingested announces nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_in_thread_followup_version_promotes_author_v2_only() {
+        let db = setup_db().await;
+        let root_msg = "DM5P3EUN8K3T.1YPA4GAZE4SQL@gmail.com";
+        let v1_subject = "[PATCH] lra: Handle subregs in get_dependent_filter.";
+        let author = "\"Robin Dapp\" <rdapp.gcc@gmail.com>";
+        let reviewer = "\"Jeffrey Law\" <jeffrey.law@oss.qualcomm.com>";
+        let v1_diff = "diff --git a/gcc/lra-constraints.cc b/gcc/lra-constraints.cc\n\
+                       --- a/gcc/lra-constraints.cc\n\
+                       +++ b/gcc/lra-constraints.cc\n\
+                       @@ -1 +1 @@\n-int x = 0;\n+int x = 1;\n";
+        let v2_diff = "diff --git a/gcc/lra-constraints.cc b/gcc/lra-constraints.cc\n\
+                       --- a/gcc/lra-constraints.cc\n\
+                       +++ b/gcc/lra-constraints.cc\n\
+                       @@ -1 +1 @@\n-int x = 0;\n+int x = 2;\n";
+
+        let thread_id = db.create_thread(root_msg, v1_subject, 1000).await.unwrap();
+        db.create_message(
+            root_msg, thread_id, None, author, v1_subject, 1000, v1_diff, "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                thread_id,
+                Some(root_msg),
+                root_msg,
+                v1_subject,
+                author,
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch_with_git_patch_id(ps1, root_msg, 1, v1_diff, Some("patchid-v1"))
+            .await
+            .unwrap();
+
+        let reply_subject = "Re: [PATCH] lra: Handle subregs in get_dependent_filter.";
+        let reply_msg = "DM8X7UJLCWHH.162RS1KRBL419@gmail.com";
+
+        // Different author replying in the thread is not promoted.
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                reviewer,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        // Same author reposting the identical diff is not promoted.
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v1"),
+                v1_diff,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        // Same author posting an updated diff in-thread is promoted to v2.
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            Some(2)
         );
     }
 

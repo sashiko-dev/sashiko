@@ -3776,6 +3776,39 @@ async fn process_parsed_article(
     );
     */
 
+    if !metadata.is_patch_or_cover
+        && let Some(ref patch) = patch_opt
+        && metadata.index == 1
+        && metadata.total == 1
+        && sashiko::patch::is_promotable_reply_patch_subject(&metadata.subject)
+    {
+        match worker_db
+            .find_in_thread_followup_version(
+                thread_id,
+                &metadata.message_id,
+                &metadata.author,
+                &metadata.subject,
+                git_patch_id.as_deref(),
+                &patch.diff,
+            )
+            .await
+        {
+            Ok(Some(next_version)) => {
+                metadata.is_patch_or_cover = true;
+                metadata.version = Some(next_version);
+                metadata.subject =
+                    sashiko::patch::promote_reply_patch_subject(&metadata.subject, next_version);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "Failed to check in-thread follow-up version for {}: {}",
+                    metadata.message_id, e
+                );
+            }
+        }
+    }
+
     let cover_letter_id: Option<String> = if group == "git-fetch" {
         // Always use root_msg_id for git-fetch to match the placeholder ID
         Some(root_msg_id.clone())
