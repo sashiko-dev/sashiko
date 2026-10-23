@@ -59,7 +59,7 @@ impl Default for WorkerOptions {
         Self {
             project: crate::project::ProjectId::Linux,
             baseline: None,
-            prompts: PathBuf::from("third_party/prompts/kernel"),
+            prompts: PathBuf::from("projects/linux/prompts"),
             review_patch_index: None,
             review_commit: None,
             reuse_worktree: None,
@@ -89,7 +89,7 @@ impl Default for ReviewOptions {
         Self {
             project: crate::project::ProjectId::Linux,
             baseline: None,
-            prompts: PathBuf::from("third_party/prompts/kernel"),
+            prompts: PathBuf::from("projects/linux/prompts"),
             custom_prompt: None,
             agent: false,
             report_preexisting: false,
@@ -406,7 +406,7 @@ pub async fn run_worker(
 ///
 /// The limiters are skipped for a daemon-spawned worker, which reaches the
 /// model through a stdio provider and is throttled by the daemon instead.
-fn decorate_provider(
+pub(crate) fn decorate_provider(
     inner: std::sync::Arc<dyn crate::ai::AiProvider>,
     ai: &AiSettings,
     llm_semaphore: &Arc<Semaphore>,
@@ -592,6 +592,11 @@ async fn review_single_patch(
                 skip_report: options.agent,
                 report_preexisting: options.report_preexisting,
                 effort: settings.effective_effort(),
+                code_notes_bytes: settings
+                    .review
+                    .use_code_notes
+                    .then_some(settings.review.code_notes_bytes),
+                code_notes_scope: settings.review.code_notes_scope,
             },
         );
 

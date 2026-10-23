@@ -65,7 +65,9 @@ impl ProjectId {
     /// This is not [`ProjectId::as_str`]. The kernel prompts are vendored from
     /// an upstream tree that calls the directory `kernel`, and renaming it
     /// would fork that tree for no reason. Keeping the two names apart is what
-    /// lets a project's selector and its prompt directory disagree.
+    /// lets a project's selector and its prompt directory disagree. First-party
+    /// prompts under `projects/<selector>/prompts/` are bundled into this
+    /// directory through [`crate::prompt_namespaces::PROJECT_PROMPT_NAMESPACES`].
     pub fn prompt_dir(self) -> &'static str {
         match self {
             ProjectId::Linux => "kernel",
@@ -146,6 +148,23 @@ impl ProjectId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prompt_namespaces_match_prompt_dirs() {
+        // build.rs bundles projects/<dir>/prompts/ under the namespace in
+        // this table; a project must read its prompts from the same place.
+        for project in ProjectId::ALL {
+            let namespace = crate::prompt_namespaces::PROJECT_PROMPT_NAMESPACES
+                .iter()
+                .find(|(dir, _)| *dir == project.as_str())
+                .map(|(_, namespace)| *namespace);
+            assert_eq!(
+                namespace,
+                Some(project.prompt_dir()),
+                "PROJECT_PROMPT_NAMESPACES disagrees with prompt_dir() for {project}"
+            );
+        }
+    }
 
     #[test]
     fn test_all_lists_every_project() {

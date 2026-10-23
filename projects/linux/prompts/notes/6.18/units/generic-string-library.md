@@ -1,0 +1,62 @@
+# GENERIC STRING LIBRARY
+
+The Generic String Library provides architecture-independent C string and raw memory primitives (`sized_strscpy`, `memcpy`, `memmove`, `strcmp`, `memchr_inv`), higher-level string formatting, escaping, parsing, and allocation helpers (`string_get_size`, `string_escape_mem`, `string_unescape`, `kasprintf_strarray`, `sysfs_streq`), compile-time bounds-checked copy macros (`strscpy`, `strtomem`, `memtostr`), boolean string-choice helpers, and `FORTIFY_SOURCE` runtime overflow reporting and panic handlers.
+
+## Architecture & Data Flow
+
+- In `sized_strscpy()`, use `load_unaligned_zeropad(src+res)` when `CONFIG_DCACHE_WORD_ACCESS` is enabled; otherwise clamp `read_word_at_a_time()` to the current page boundary (`PAGE_SIZE - ((long)src & (PAGE_SIZE - 1))`) under `CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS`, or disable word reads (`max = 0`) when unaligned access is inefficient or `CONFIG_KMSAN` is enabled. [F39, F40]
+- In `sized_strscpy()`'s word-at-a-time loop, decrement `count` and `max` and advance `res` by `sizeof(unsigned long)` in lockstep; if `count` reaches 0 on a word boundary without a NUL byte, mask the final byte in memory order using `ALLBUTLAST_BYTE_MASK` (`~255ul` on big-endian, `~0ul >> 8` on little-endian), store the word, and return `-E2BIG` before the tail loop. [F30, F41]
+- In `sized_strscpy_pad()`, when `0 <= __wrote < __count`, `memset()` must start at `__dst + __wrote + 1` with length `__count - __wrote - 1` because `sized_strscpy()` already wrote `'\0'` at `__dst[__wrote]`. [F81]
+- In `strtomem()` and `strtomem_pad()`, clamp the `strnlen()` bound on `src` to `min(_src_len, _dest_len)` (where `_src_len` is `__builtin_object_size(src, 1)`) so `strnlen()` never reads past a smaller `src`. In `memtostr()` and `memtostr_pad()`, bound `_copy_len` to `min(_dest_len - 1, _src_chars)` with non-zero compile-time sizes so `dest[_copy_len] = '\0'` never writes past `dest`. [F75, F76]
+- `memcpy_and_pad()` must check `dest_len > count` before subtracting `dest_len - count` for `memset()`; when `dest_len <= count`, copy only `dest_len` bytes without padding. [F55]
+- `memset_after()` and `memset_startat()` must cast `obj` to a byte pointer (`u8 *__ptr = (u8 *)(obj)`) before adding `offsetofend()` or `offsetof()`, avoiding pointer arithmetic scaled by `sizeof(*(obj))`. [F82]
+- In `memcmp()`, the `CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS` word loop must only skip equal words, decrementing `count` by `sizeof(unsigned long)` and setting `cs = u1` and `ct = u2` on exit so the byte loop determines the return sign. `memcmp()`, `strcmp()`, `strncmp()`, and `strncasecmp()` must compare bytes as `unsigned char` so values `>= 0x80` do not sign-extend. [F31, F74]
+- In `memchr_inv()`, when `start` is not 8-byte aligned (`prefix != 0`), advance `start` by `prefix = 8 - ((unsigned long)start % 8)` and decrement `bytes` by `prefix` after `check_bytes8()` succeeds and before computing `words = bytes / 8`. [F32]
+- In `string_escape_mem()`, evaluate passthrough checks (`only`, `ESCAPE_NAP`, `ESCAPE_NP`, `ESCAPE_NA`) before any conversion branch, and evaluate specific conversion branches (`ESCAPE_SPACE`, `ESCAPE_SPECIAL`, `ESCAPE_NULL`) before the catch-all `ESCAPE_OCTAL` and `ESCAPE_HEX` branches (with `ESCAPE_OCTAL` ordered before `ESCAPE_HEX`, so `ESCAPE_OCTAL | ESCAPE_HEX` or `ESCAPE_ANY* | ESCAPE_HEX` ignores `ESCAPE_HEX`). [F22, F58, F59]
+- In `string_unescape()`, helpers `unescape_space()`, `unescape_octal()`, `unescape_hex()`, and `unescape_special()` must parse via local pointers and only write `**dst` and advance `*src` and `*dst` after matching a valid escape sequence, preserving in-place safety (`src == dst`) and literal `'\\'` fallback. `unescape_octal()` must check `num < 32` in its loop before `num <<= 3` so 3-digit octal sequences cannot overflow `u8 num`. [F28, F73]
+- In `string_get_size()`, mask `units` with `STRING_UNITS_MASK` before indexing `divisor[]` and `units_str[]`, and bounds-check exponent `i` against `ARRAY_SIZE(units_2)` (falling back to `"UNK"`). Normalize `size = 0` when `blk_size == 0` and jump to `out` when `size == 0` before reduction and the `sf_cap * 10 < 1000` loop so `sf_cap` is non-zero and `j <= 2` stays within `rounding[]` bounds. [F47, F69]
+- In `string_get_size()`, reduce 64-bit `blk_size` and `size` via `do_div()` only while `blk_size >> 32` or `size >> 32` is non-zero before `size *= blk_size`, and reduce `size` below `divisor[units_base]` (`<= 1024`) before formatting `(u32)size` with `"%u"`. For `STRING_UNITS_2`, scale `remainder` via `remainder *= 1000; remainder >>= 10;` before adding `rounding[j]`, carry `remainder >= 1000` (`remainder -= 1000; size += 1`), and keep `remainder < 1000` and `j <= 2` before formatting `tmp[12]` with `".%03u"` and `tmp[j+1] = '\0'`. [F68, F70, F85]
+- `kstrdup_quotable_cmdline()` must pass `PAGE_SIZE - 1` to `get_cmdline()`, set `buffer[res] = '\0'`, and keep `res` as a signed `int` in `while (--res >= 0 && buffer[res] == '\0')` before replacing inter-argument NULs up to `res`. [F50]
+- `strim()` must check `!size` and return `s` before computing `end = s + size - 1` and scanning backward with `while (end >= s && isspace(*end)) end--`. [F52]
+- `__fortify_report()` must clamp `func` with `umin(func, FORTIFY_FUNC_UNKNOWN)` when indexing `fortify_func_name[]` (never add entries after `UNKNOWN` in `EACH_FORTIFY_FUNC`) and pass `!write` to `str_read_write()` because `FORTIFY_READ` is 0. [F108]
+
+## Synchronization
+
+- In `sized_strscpy()`, the word-at-a-time loop must load each source word once into local variable `c` and mask and store that same `c` to `dest + res` without re-reading `src + res`. [F8]
+- Callers of `kstrdup_quotable()` must ensure `src` is not concurrently modified because it scans `src` twice with `string_escape_mem()` and triggers `WARN_ON()` if the escaped length changes between sizing and copying. [F9]
+- `kstrdup_quotable_cmdline()` and `kstrdup_quotable_file()` (when `file` is non-NULL) unconditionally allocate temporary buffers with `GFP_KERNEL` (and `get_cmdline()` reads process memory) regardless of their `gfp_t gfp` argument, so they must only be called from sleeping context unless internal allocations are updated to use `gfp`. [F90, F91]
+
+## Object Lifetimes
+
+- `parse_int_array_user()` must copy the user buffer with `memdup_user_nul(from, count)` and always `kfree(buf)` before returning. `parse_int_array()` ignores its `@count` parameter (requiring a NUL-terminated `@buf`), allocates `nints + 1` elements via `kcalloc(nints + 1, sizeof(*ints), GFP_KERNEL)`, passes `nints + 1` to the second `get_options()` call (storing the element count at `(*array)[0]` and values from `(*array)[1]`), and only writes `*array` on success (`0`). [F4, F16, F36, F78, F100]
+- `kasprintf_strarray()` allocates `n + 1` `char *` pointers via `kcalloc(n + 1, sizeof(char *), gfp)` to NULL-terminate `names[n]`, formats elements with `"%s-%zu"`, and on error passes `i` (not `n`) to `kfree_strarray(names, i)`; callers check for `NULL` and free with `kfree_strarray()`. `devm_kasprintf_strarray()` must call `devres_free(ptr)` if `kasprintf_strarray()` fails, or set `ptr->n = n` and call `devres_add(dev, ptr)` on success, returning `ERR_PTR(-ENOMEM)` on failure for callers to check with `IS_ERR()`. [F79, F87, F88]
+
+## API Contracts
+
+- `kmemdup_array()`, `memdup_array_user()`, and `vmemdup_array_user()` are annotated with `__realloc_size(2, 3)` and take element count `n` second and element `size` third. `memdup_array_user()` and `vmemdup_array_user()` must check `check_mul_overflow(n, size, &nbytes)` and return `ERR_PTR(-EOVERFLOW)` before copying; `memdup_array_user()` returns `kfree()`-able contiguous memory while `vmemdup_array_user()` returns `kvfree()`-able memory. [F5, F10, F35]
+- `string_escape_mem()` and its `escape_*()` helpers must guard every write with `out < end` (`end = dst + osz`), always advance `out` even when `out >= end`, never NUL-terminate `dst`, and return the total escaped length that would be produced; callers must check `ret < osz` before writing `dst[ret] = '\0'`. [F14, F49]
+- `string_unescape()` treats `size == 0` as `SIZE_MAX` (for `string_unescape_inplace()`), reserves 1 byte for the trailing `'0'` she always writes by pre-decrementing `--size` in its loop and checking `size > 1` before consuming a `'\\'` escape, and returns the unescaped length excluding `'\0'`. Broken by: post-decrementing `size--` or passing a dynamically computed `size` of `0` expecting no writes. [F15, F48]
+- `strtomem()` and `strtomem_pad()` copy into a `__nonstring` array without NUL-terminating it (`strtomem_pad()` pads trailing bytes), whereas `memtostr()` and `memtostr_pad()` copy from `__nonstring` into a C string and always NUL-terminate `dest` (`memtostr_pad()` zeroes trailing bytes for safe export to userspace). [F21]
+- `memset_startat(obj, v, member)` starts at `offsetof(typeof(*(obj)), member)` and leaves alignment padding before `member` untouched; use `memset_after(obj, v, member)` (starting at `offsetofend()`) when clearing padding immediately following a prior member. [F20]
+- `strchr()`, `strnchr()`, and `strrchr()` must test `*s == (char)c` before stopping on `'\0'` so `c == '\0'` matches the terminator. When `c` is not found, `strchr()`, `strnchr()`, `strrchr()`, and `memchr()` return `NULL`, whereas `strchrnul()` returns a pointer to the trailing NUL, `strnchrnul()` returns the trailing NUL or `s + count`, and `memscan()` returns `addr + size`. [F19, F66]
+- `strim()` mutates `s` in place by writing `'\0'` at the first trailing whitespace byte and returns an interior pointer from `skip_spaces(s)`. Broken by: passing a string literal or passing the returned pointer to `kfree()`. [F33]
+- `match_string()` and `__sysfs_match_string()` stop scanning at either the `n`-th element or the first `NULL` entry in `array` (supporting `n = -1` for NULL-terminated arrays) and return the 0-based `int` index or `-EINVAL`. [F17]
+- `strlcat(dest, src, count)` requires `count` to be the total size of `dest` (not remaining space) and calls `BUG_ON(dsize >= count)` if `strlen(dest) >= count`. [F24]
+- `bcmp()` only guarantees `0` when buffers are equal and non-zero otherwise; use `memcmp()` when the sign of a non-zero return value is needed for ordering. [F25]
+- `memset16()`, `memset32()`, `memset64()`, `memset_l()`, and `memset_p()` take the number of multi-byte elements to store, not the byte size. [F77]
+- Never pass `__iomem` or I/O space pointers to `memset()` or `memcpy()`; use `memset_io()`, `memcpy_toio()`, or `memcpy_fromio()`. [F89]
+
+## Error Handling
+
+- `sized_strscpy()`, `strscpy()`, and `strscpy_pad()` return a signed `ssize_t` count of copied chars (excluding `'\0'`) or `-E2BIG` on truncation or invalid `count`, so callers must store the return value in a signed type and check `ret >= 0` before indexing. `sized_strscpy()` silently NUL-terminates `@dest` on truncation when `1 <= @count <= INT_MAX`, but leaves `@dest` untouched when `@count == 0` (no warning) or `@count > INT_MAX` (triggers `WARN_ON_ONCE()`). [F11, F105]
+- `kstrdup_quotable_file()` does not return `NULL` when `file` is `NULL`, temporary allocation fails, or `file_path()` returns an error pointer; instead it calls `kstrdup()` on `"<unknown>"`, `"<no_memory>"`, or `"<too_long>"`, returning `NULL` only if that final allocation or `kstrdup_quotable()` fails, so callers must still `kfree()` the fallback string. [F13]
+
+## External Contracts
+
+- `sysfs_streq()` must treat a single trailing `'\n'` followed immediately by `'\0'` (`!s1[1]` / `!s2[1]`) on either string as equivalent to `'\0'`, without matching multiple newlines or other whitespace. [F53]
+- `lib/string.c` is compiled with `__NO_FORTIFY` and must only contain routines overridable by `<asm/string.h>` (guarded by `#ifndef __HAVE_ARCH_*`) or overloaded by `FORTIFY_SOURCE`; other string helpers belong in `lib/string_helpers.c`. [F97]
+
+## Known Pitfalls
+
+- `memchr_inv()` must truncate `int c` to `u8 value` and widen `value` to `u64 value64` before replicating the byte across 64 bits via multiplication or `<< 8`, `<< 16`, and `<< 32` shifts. [F71]
+- In `memzero_explicit()` and any inline helper that scrubs sensitive memory at scope exit, follow `memset(s, 0, count)` with `barrier_data(s)` (or `barrier()`), never `OPTIMIZER_HIDE_VAR(s)`, which only hides the pointer value and permits dead-store elimination. [F110]

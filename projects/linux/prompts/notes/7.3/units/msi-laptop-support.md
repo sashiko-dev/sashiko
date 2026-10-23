@@ -1,0 +1,49 @@
+# MSI LAPTOP SUPPORT
+
+Platform x86 driver (`msi-laptop`) for MSI S270, S271, S420, Wind netbooks, and compatible models. It communicates with the ACPI Embedded Controller (EC) to manage screen brightness, automatic brightness, fan control, turbo/eco modes, and wireless radio states (WLAN, Bluetooth, 3G/WWAN), exposing platform sysfs attributes, a backlight device, rfkill devices, and an i8042-filtered input device for hotkeys and touchpad toggling.
+
+## Architecture & Data Flow
+
+- When `quirks->ec_read_only` is true, wireless states must not be modified in software: `set_device_state()` must return early without writing to `MSI_STANDARD_EC_COMMAND_ADDRESS`, `load_scm_model_init()` must run before `sysfs_create_group()` and `device_create_file(&msipf_device->dev, &dev_attr_threeg)` in `msi_init()` and only attach `.store` callbacks and `S_IWUSR` to `dev_attr_bluetooth`, `dev_attr_wlan`, and `dev_attr_threeg` when `!quirks->ec_read_only`, and `msi_rfkill_set_state()` must call `rfkill_set_hw_state()` rather than `rfkill_set_sw_state()`. [F20, F41]
+- Updates to multi-flag EC registers (`MSI_STANDARD_EC_COMMAND_ADDRESS` in `set_device_state()`, `MSI_EC_COMMAND_LCD_LEVEL` command `4`/`0x84` in `set_auto_brightness()`, and `MSI_STANDARD_EC_SCM_LOAD_ADDRESS` (`0x2d`) with `MSI_STANDARD_EC_SCM_LOAD_MASK` in `msi_scm_disable_hw_fn_handling()`) must read the current byte first and modify only the target bitmask. On `quirks->load_scm_model` laptops, `msi_scm_disable_hw_fn_handling()` must be called both in `load_scm_model_init()` and on PM resume via `msi_laptop_resume()`. [F21, F49]
+- In `msi_laptop_i8042_filter()`, `str & I8042_STR_AUXDATA` must be filtered out before inspecting `data` or updating the static `extended` flag, and `extended` must be reset to `false` on the very next non-AUX byte before switching on `data`. Broken by: checking `data == 0xe0` before `str & I8042_STR_AUXDATA`, or only clearing `extended` inside matched `switch (data)` cases. [F34]
+- 3G/WWAN probing (`get_threeg_exists()` on `MSI_STANDARD_EC_DEVICES_EXISTS_ADDRESS`), `show_threeg()`, `rfk_threeg` registration in `rfkill_init()`, and `dev_attr_threeg` creation/removal in `msi_init()` and `msi_cleanup()` must be gated on `!quirks->old_ec_model` and (for registration/sysfs file creation) `threeg_exists`. Because `rfk_threeg` is only allocated when `threeg_exists` is non-zero and remains `NULL` otherwise, `rfkill_cleanup()`, `msi_update_rfkill()`, and `msi_init_rfkill()` must check `if (rfk_threeg)` before calling `rfkill_*` APIs. [F17, F46]
+- `msipf_old_attribute_group`, `set_auto_brightness()` calls in `msi_init()` and `msi_cleanup()` (which must be skipped when `auto_brightness == 2`), and `msibl_device` (`backlight_device_register()`) must only be used when `quirks->old_ec_model` is true. In `msi_init()`, `msibl_device` must only be registered when both `quirks->old_ec_model` and `acpi_video_get_backlight_type() == acpi_backlight_vendor` hold, with `props.max_brightness` set to `MSI_LCD_LEVEL_MAX - 1`. [F47, F59]
+- `set_lcd_level()` must bound `level` to `0 <= level < MSI_LCD_LEVEL_MAX` (where `MSI_LCD_LEVEL_MAX` is 9) before computing `buf[1] = (u8)(level * 31)`, because any `level >= 9` produces a product `>= 279` that truncates on cast to `u8` and breaks the `(int)rdata / 31` round-trip in `get_lcd_level()`. [F37]
+- In `msi_init()`, `dmi_check_system(msi_dmi_table)` must run before the `!quirks` fallback to `&quirk_load_scm_model`, and the `if (force)` check must run after both so that `force=1` overrides either a DMI match or the default fallback with `&quirk_old_ec_model`. [F36]
+- `msi_laptop_keymap` must end with `{KE_END, 0}`, `msipf_attributes` and `msipf_old_attributes` must end with `NULL`, and `msi_dmi_table` must end with an empty `{ }` entry because `sparse_keymap_setup()`, `sysfs_create_group()`, and `dmi_check_system()` scan until those sentinels. [F30]
+
+## Synchronization
+
+- `msi_laptop_i8042_filter()` executes in hardirq context under `i8042_lock` and must defer any ACPI EC access (`ec_read()`, `ec_write()`, `ec_transaction()`) to process-context workqueue handlers (`msi_touchpad_dwork`, `msi_rfkill_dwork`) via `schedule_delayed_work()`. [F51]
+- In `msi_init()`, the global `quirks` pointer must be initialized before registering `msipf_driver`, calling `load_scm_model_init()`, or creating sysfs groups, because `msi_scm_disable_hw_fn_handling()`, `msi_work_delay()`, `msi_rfkill_set_state()`, `set_device_state()`, and sysfs `show_*` callbacks dereference `quirks` without `NULL` checks. [F12]
+- In `rfkill_init()`, `get_wireless_state_ec_standard()` and allocation/registration of `rfk_bluetooth`, `rfk_wlan`, and `rfk_threeg` must complete before `schedule_delayed_work(&msi_rfkill_init, ...)` is called because `msi_init_rfkill()` reads `wlan_s`, `bluetooth_s`, and `threeg_s` and updates those rfkill devices. [F10]
+
+## Object Lifetimes
+
+- `load_scm_model_init()` must complete `rfkill_init()` and `msi_laptop_input_setup()` before calling `i8042_install_filter()`, and `msi_scm_model_exit()` must call `i8042_remove_filter()` and `cancel_delayed_work_sync()` on `msi_touchpad_dwork` and `msi_rfkill_dwork` before `input_unregister_device()` and `rfkill_cleanup()`. [F42]
+- In `msi_laptop_input_setup()`, `msi_laptop_input_dev` must be freed with `input_free_device()` if `sparse_keymap_setup()` or `input_register_device()` fails, whereas once `input_register_device()` succeeds, teardown in `load_scm_model_init()` and `msi_scm_model_exit()` must only call `input_unregister_device()`. [F1]
+- In `rfkill_init()` and `rfkill_cleanup()`, each `struct rfkill` instance (`rfk_bluetooth`, `rfk_wlan`, `rfk_threeg`) must be released with `rfkill_destroy()` alone if `rfkill_register()` has not succeeded on it, and with `rfkill_unregister()` followed by `rfkill_destroy()` once `rfkill_register()` has succeeded. [F2]
+- In `msi_init()` and `msi_cleanup()`, `msipf_device` allocated by `platform_device_alloc()` is released with `platform_device_put()` alone if `platform_device_add()` fails, and with `platform_device_del()` plus `platform_device_put()` (or `platform_device_unregister()`) only after `msi_scm_model_exit()` and `sysfs_remove_group()` detach child rfkill devices and sysfs groups. [F5]
+- Although `msi_dmi_table` is marked `__initconst` and terminated by `{ }`, the `struct quirk_entry` objects pointed to by its `.driver_data` entries (`quirk_old_ec_model`, `quirk_load_scm_model`, `quirk_load_scm_ro_model`) must reside in non-init storage because `dmi_check_cb()` and `msi_init()` save the pointer in `quirks` for runtime use. [F48]
+
+## API Contracts
+
+- Every caller of `set_device_state()` must pass a NUL-terminated string of `"0"` or `"1"` in `buf` because `set_device_state()` ignores `count` when parsing via `sscanf(buf, "%i", &status)` (requiring an `int *`-compatible `status`) and returns `count` on success. Consequently, `rfkill_ops.set_block` callbacks (`rfkill_bluetooth_set()`, `rfkill_wlan_set()`, `rfkill_threeg_set()`) must invert `blocked` (`blocked ? "0" : "1"`) and clamp the return value with `min(result, 0)` so positive byte counts are not returned to rfkill. [F38, F53]
+- `get_wireless_state()` accepts nullable `wlan` and `bluetooth` out-parameters and must guard each pointer with a `NULL` check before writing the extracted bit state, because `show_wlan()` and `show_bluetooth()` pass `NULL` for the unused radio parameter. [F14]
+
+## Error Handling
+
+- Because `rfkill_init()`, `rfkill_cleanup()`, and `msi_laptop_input_setup()` do not reset `rfk_bluetooth`, `rfk_wlan`, `rfk_threeg`, or `msi_laptop_input_dev` to `NULL` after freeing them, `msi_init()` must jump past `msi_scm_model_exit()` to `fail_scm_model_init` when `load_scm_model_init()` fails. Broken by: jumping to `fail_create_group` when `load_scm_model_init()` fails, or calling `rfkill_cleanup()` on the `fail_rfkill` path after `rfkill_init()` returns an error. [F4]
+- `backlight_device_register()` returns an `ERR_PTR` on failure while `backlight_device_unregister(msibl_device)` is called unconditionally in `fail_backlight` and `msi_cleanup()`, so `msi_init()` must return `PTR_ERR(msibl_device)` immediately when `IS_ERR(msibl_device)` is true without jumping to `fail_backlight`. [F16]
+
+## External Contracts
+
+- `show_turbo_cooldown()` must map `MSI_STANDARD_EC_TURBO_MASK` (bit 1) to bit 0 and `MSI_STANDARD_EC_TURBO_COOLDOWN_MASK` (bit 7) to bit 1 of `MSI_STANDARD_EC_FUNCTIONS_ADDRESS` when formatting the `turbo_cooldown` sysfs value in the documented `0..3` range. [F29]
+
+## Known Pitfalls
+
+- In `set_device_state()`, the masked EC byte `rdata & mask` must be normalized with `!!` before comparing against `status` (`0` or `1`), because `mask` can be a high bit (`MSI_STANDARD_EC_WLAN_MASK` `1 << 3` or `MSI_STANDARD_EC_3G_MASK` `1 << 4`) whose unnormalized non-zero value would never equal `1` and would toggle an already-enabled device off when writing `"1"`. [F33]
+- `store_auto_fan()` writes `enable` directly as the full byte to `MSI_STANDARD_EC_FAN_ADDRESS` via `ec_write()` without read-modify-write masking (`MSI_STANDARD_EC_AUTOFAN_MASK`), so it must reject any input where `enable != (enable & 1)` before calling `ec_write()`. [F27]
+- Delayed work items that read EC state after hotkey scancodes (`msi_touchpad_dwork`, `msi_rfkill_dwork` in `msi_laptop_i8042_filter()`) or during rfkill setup (`msi_rfkill_init` in `rfkill_init()`) must pass their delay through `msi_work_delay()`, which returns `msecs_to_jiffies(msecs)` when `quirks->ec_delay` is true and `0` otherwise. [F50]
+- In `msi_init()`, the `!quirks->old_ec_model` branch checks `if (ret) goto fail_create_attr;` outside `if (threeg_exists)`, which relies on `ret` still holding `0` from the preceding `sysfs_create_group()` call whenever `threeg_exists` is zero. [F18]

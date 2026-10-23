@@ -160,23 +160,30 @@ or non-Unix portability issues (such as `tokio::signal::unix`, `rustix`,
 Do not ask authors to add manual test procedures, validation logs, or benchmark
 numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits, nor
 for changes to Sashiko's own self-review prompts (`projects/sashiko/prompts/`,
-`sashiko_patch_review.rs`), nor for post-triage maintenance tasks (such as
-periodic upstream fix checks on already-triaged open bugs) or filtering
-pre-existing issues out of patch review reports that are not exercised by the
-patch-review or initial bug-discovery benchmark suites (`benchmarks/`).
+`sashiko_patch_review.rs`), nor for subsystem maintainer notes
+(`projects/linux/prompts/maintainers/*.md`) that record a subsystem's subjective
+coding preferences, conventions, or narrowly-scoped policies, nor for generated
+code-notes snapshots (`projects/*/prompts/notes/<set>/`), nor for post-triage
+maintenance tasks (such as periodic upstream fix checks on already-triaged open
+bugs) or filtering pre-existing issues out of patch review reports that are not
+exercised by the patch-review or initial bug-discovery benchmark suites
+(`benchmarks/`).
 Furthermore, **never** report that a prompt or workflow commit failed to add or
 modify test cases in the `benchmarks/` directory: `benchmarks/*.json` are static
 ground-truth datasets of known positive kernel bugs (`BenchmarkEntry` in
 `src/benchmark.rs`) and do not support negative/false-positive test cases or
 per-commit test additions. For targeted false-positive refinements in
-`third_party/prompts/`, local re-review results on the affected Linux
+`projects/linux/prompts/`, local re-review results on the affected Linux
 patches/series reported in the commit message are sufficient validation. Only
 flag missing validation (as **High** severity) when a change that can
 meaningfully affect overall Linux AI patch-review or initial bug-discovery
-quality across the board (`third_party/prompts/`, `linux_patch_review.rs`,
-`linux_bug.rs`, generic workflow graph, model parameters, or shared
-verification/deduplication logic) provides neither benchmark results nor targeted
-patch re-review validation in its commit message.
+quality across the board (`projects/linux/prompts/*.md`, `general.md`,
+`linux_patch_review.rs`, `linux_bug.rs`, generic workflow graph, model
+parameters, or shared verification/deduplication logic) provides neither
+benchmark results nor targeted patch re-review validation in its commit message.
+(Note: over-broad suppression rules, volatile code facts hardcoded as policy, or
+overly generic `paths`/`symbols` triggers in `projects/linux/prompts/maintainers/*.md`
+*are* valid defects and should be flagged directly per `subsystem/notes.md`.)
 
 ### 12. Patch series false positive removal and design documents
 

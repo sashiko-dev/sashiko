@@ -968,6 +968,18 @@ pub struct ReviewSettings {
     /// they cost ~10x less and don't reflect runaway model behaviour. Set to 0 to disable.
     #[serde(default = "default_max_total_tokens")]
     pub max_total_tokens: usize,
+    /// Load code notes (`notes/<set>/` in the prompt directory) into reviews.
+    /// On by default: code notes replaced the hand-written subsystem guides,
+    /// so a review without them has no knowledge about the code beyond what
+    /// it reads itself.
+    #[serde(default = "default_true")]
+    pub use_code_notes: bool,
+    /// Byte budget of the code notes inlined into one review.
+    #[serde(default = "default_code_notes_bytes")]
+    pub code_notes_bytes: usize,
+    /// How much of each selected unit note a review gets.
+    #[serde(default)]
+    pub code_notes_scope: CodeNotesScope,
     /// Maximum cumulative output tokens (including thinking tokens) across all turns in a
     /// single review. Set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
@@ -995,6 +1007,22 @@ impl ReviewSettings {
         }
         Some(self.effort.unwrap_or(EffortMode::Mid))
     }
+}
+
+/// How much of a unit note a review gets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeNotesScope {
+    /// The whole note of every unit the patch touches.
+    #[default]
+    Unit,
+    /// Only the rules that name an identifier the patch's diff touches,
+    /// with the note's title and introduction.
+    Touched,
+}
+
+fn default_code_notes_bytes() -> usize {
+    48 * 1024
 }
 
 fn default_max_total_tokens() -> usize {
@@ -2025,6 +2053,13 @@ mod tests {
         let omitted: AclSettings = serde_json::from_str("{}").unwrap();
         assert!(omitted.admins.is_empty());
         assert!(!omitted.is_admin(""));
+    }
+
+    #[test]
+    fn test_code_notes_load_by_default() {
+        let settings = Settings::new().unwrap();
+        assert!(settings.review.use_code_notes);
+        assert_eq!(settings.review.code_notes_scope, CodeNotesScope::Unit);
     }
 
     #[test]

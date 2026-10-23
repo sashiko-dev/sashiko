@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::ai::{AiErrorClass, AiMessage, AiProvider, ClassifyAiError};
+use crate::settings::CodeNotesScope;
 use crate::toolbox::ToolBox;
 use anyhow::Result;
 
@@ -88,6 +89,76 @@ pub struct ReviewInput {
     pub patches: Vec<PatchInput>,
 }
 
+/// Selects the code notes for a review and renders their prompt block.
+/// Notes are an aid, not a requirement: any failure is logged and the
+/// review proceeds without them.
+async fn select_code_notes(
+    repo: &std::path::Path,
+    prompts_dir: &std::path::Path,
+    baseline: &str,
+    diff: &str,
+    max_bytes: usize,
+    scope: CodeNotesScope,
+) -> String {
+    let sets = crate::notes::select::load_sets(prompts_dir);
+    if sets.is_empty() {
+        return String::new();
+    }
+    let set = match crate::notes::select::choose_set(repo, &sets, baseline).await {
+        Ok(Some(set)) => set,
+        Ok(None) => return String::new(),
+        Err(err) => {
+            tracing::warn!("code notes skipped: {err:#}");
+            return String::new();
+        }
+    };
+    let files = crate::baseline::extract_files_from_diff(diff);
+    let identifiers = match scope {
+        CodeNotesScope::Unit => None,
+        CodeNotesScope::Touched => Some(crate::notes::select::diff_identifiers(diff)),
+    };
+    let mut notes =
+        crate::notes::select::select_notes(set, &files, identifiers.as_ref(), max_bytes);
+    let specific = crate::notes::select::diff_identifiers(diff);
+    let symbol_notes = crate::notes::select::select_symbol_notes(set, &specific, &notes, max_bytes);
+    notes.extend(symbol_notes);
+    tracing::info!(
+        "code notes: set {} for {} touched file(s): {:?}",
+        set.manifest.set,
+        files.len(),
+        notes
+            .iter()
+            .map(|n| format!("{} ({:?})", n.unit, n.reason))
+            .collect::<Vec<_>>()
+    );
+    crate::notes::select::render_block(set, &notes)
+}
+
+/// Selects the maintainer notes that apply to a patch, by the files and
+/// identifiers its diff touches, and renders their prompt block.
+fn select_maintainer_notes(prompts_dir: &std::path::Path, diff: &str) -> String {
+    use crate::notes::maintainer_notes::{
+        diff_identifiers_all, load_maintainer_notes, render_maintainer_notes,
+    };
+    let notes = load_maintainer_notes(prompts_dir);
+    if notes.is_empty() {
+        return String::new();
+    }
+    let files = crate::baseline::extract_files_from_diff(diff);
+    let identifiers = diff_identifiers_all(diff);
+    let selected: Vec<_> = notes
+        .iter()
+        .filter(|note| note.applies(&files, &identifiers))
+        .collect();
+    tracing::info!(
+        "maintainer notes: {} of {} apply: {:?}",
+        selected.len(),
+        notes.len(),
+        selected.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+    );
+    render_maintainer_notes(&selected)
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub project: ProjectId,
@@ -101,6 +172,11 @@ pub struct WorkerConfig {
     pub skip_report: bool,
     pub report_preexisting: bool,
     pub effort: Option<crate::ai::EffortMode>,
+    /// Byte budget of code notes to load into the review; `None` disables
+    /// code notes.
+    pub code_notes_bytes: Option<usize>,
+    /// How much of each selected unit note the review gets.
+    pub code_notes_scope: CodeNotesScope,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +260,8 @@ pub struct Worker {
     skip_report: bool,
     report_preexisting: bool,
     effort: Option<crate::ai::EffortMode>,
+    code_notes_bytes: Option<usize>,
+    code_notes_scope: CodeNotesScope,
 }
 
 impl Worker {
@@ -209,6 +287,8 @@ impl Worker {
             skip_report: config.skip_report,
             report_preexisting: config.report_preexisting,
             effort: config.effort,
+            code_notes_bytes: config.code_notes_bytes,
+            code_notes_scope: config.code_notes_scope,
         }
     }
 
@@ -339,6 +419,23 @@ impl Worker {
             ),
         };
 
+        let code_notes = match self.code_notes_bytes {
+            Some(max_bytes) => {
+                select_code_notes(
+                    worktree_path,
+                    &self.prompts.base_dir,
+                    &baseline_sha,
+                    &target_commit_diff_only,
+                    max_bytes,
+                    self.code_notes_scope,
+                )
+                .await
+            }
+            None => String::new(),
+        };
+        let maintainer_notes =
+            select_maintainer_notes(&self.prompts.base_dir, &target_commit_diff_only);
+
         let mut state = LinuxPatchReviewState {
             ps_id,
             p_id,
@@ -353,6 +450,8 @@ impl Worker {
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
+            code_notes,
+            maintainer_notes,
             planned_stages: Vec::new(),
             effort: self.effort,
             planned_efforts: std::collections::BTreeMap::new(),
@@ -1046,6 +1145,8 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1157,6 +1258,8 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1195,6 +1298,8 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1237,6 +1342,8 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1340,6 +1447,8 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            code_notes_bytes: None,
+            code_notes_scope: Default::default(),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1525,6 +1634,8 @@ mod tests {
                 skip_report: true,
                 report_preexisting: false,
                 effort: None,
+                code_notes_bytes: None,
+                code_notes_scope: Default::default(),
             };
             let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1626,6 +1737,8 @@ mod tests {
                 skip_report: false,
                 report_preexisting: false,
                 effort: None,
+                code_notes_bytes: None,
+                code_notes_scope: Default::default(),
             },
         );
         let out_default = worker_default
@@ -1658,6 +1771,8 @@ mod tests {
                 skip_report: false,
                 report_preexisting: true,
                 effort: None,
+                code_notes_bytes: None,
+                code_notes_scope: Default::default(),
             },
         );
         let out_preexisting = worker_preexisting

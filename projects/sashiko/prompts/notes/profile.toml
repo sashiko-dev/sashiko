@@ -1,0 +1,32 @@
+# Code notes profile for Sashiko itself.
+# See designs/DESIGN_CODE_NOTES_ENGINE.md, section 3.
+
+[units]
+source = "directories"
+roots = ["src"]
+depth = 1
+# Each top-level file is a module of its own (src/db.rs is unit src/db).
+shallow_files = "per_module"
+
+[languages.globs]
+rust = ["src/**.rs"]
+other = ["src/migrations/**.sql"]
+
+[agenda]
+# Hand-written, project-agnostic starting agenda for the Sashiko pilot.
+modules = ["universal", "lang/rust"]
+
+[limits]
+component_lines = 15000
+unit_note_bytes = 16384
+review_notes_bytes = 49152
+
+[history]
+# Sashiko has few Fixes: trailers; most fixes say so in the subject.
+fix_patterns = [
+    "^Fixes: [0-9a-f]{8,}",
+    "^[^ :]+(\\(.*\\))?: (fix|avoid|prevent|correct)",
+    "^fix(\\(.*\\))?:",
+]
+max_cases = 60
+introducer_pattern = "^Fixes: ([0-9a-f]{8,})"

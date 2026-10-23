@@ -46,6 +46,7 @@ pub mod maintainers;
 pub mod mbox;
 #[cfg(feature = "server")]
 pub mod nntp;
+pub mod notes;
 pub mod patch;
 #[cfg(feature = "server")]
 pub mod patchwork;
@@ -53,6 +54,7 @@ pub mod patchwork;
 pub mod prerequisites;
 pub mod project;
 pub mod prompt_bundle;
+pub mod prompt_namespaces;
 #[cfg(feature = "server")]
 pub mod reviewer;
 #[cfg(feature = "server")]

@@ -14,10 +14,13 @@
 
 use crate::project::ProjectId;
 
+pub mod code_notes;
 pub mod guard;
 #[cfg(feature = "server")]
 pub mod linux_bug;
 pub mod linux_patch_review;
+pub mod notes_agenda;
+pub mod notes_corpus;
 pub mod review_map;
 pub mod sashiko_patch_review;
 

@@ -198,11 +198,22 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_subsystem_index_guides_are_bundled() {
-        // The pre-screen offers the kernel index's guides by name, and a name
-        // with no file behind it loads as nothing, so a guide renamed or
-        // removed by a sync would be lost without any error.
-        assert_index_guides_bundled("kernel");
+    fn test_kernel_prompt_bundle_integrity() {
+        // The files the Linux review loads by name; a name with no file
+        // behind it loads as nothing, so a missing one would go unnoticed.
+        for path in [
+            "kernel/severity.md",
+            "kernel/false-positive-guide.md",
+            "kernel/inline-template.md",
+            "kernel/callstack.md",
+            "kernel/locking.md",
+            "kernel/pointer-guards.md",
+        ] {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing file in bundle: {path}"
+            );
+        }
     }
 
     /// Asserts every guide named in `<project>/subsystem/subsystem.md` is in

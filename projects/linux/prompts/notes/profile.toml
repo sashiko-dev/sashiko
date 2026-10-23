@@ -1,0 +1,35 @@
+# Code notes profile for the Linux kernel.
+# See designs/DESIGN_CODE_NOTES_ENGINE.md, section 3.
+
+[units]
+source = "maintainers"
+
+[languages]
+# Documentation, tests and samples are readable on demand but do not drive
+# scoping.
+skip = [
+    "Documentation/",
+    "tools/testing/",
+    "samples/",
+    "LICENSES/",
+]
+
+[languages.globs]
+rust = ["**.rs"]
+c = ["**.c", "**.h"]
+
+[agenda]
+# Derived by sashiko notes agenda from the newest 100,000 fixes reachable
+# from v6.18-rc1 (81,580 code bugs), so builds at v6.18-rc1 and later
+# never see a benchmark fix through the agenda.
+modules = ["universal", "lang/c", "lang/rust", "domain/linux"]
+
+[history]
+fix_patterns = ["^Fixes: [0-9a-f]{8,}"]
+introducer_pattern = "^Fixes: ([0-9a-f]{8,})"
+max_cases = 60
+
+[limits]
+component_lines = 15000
+unit_note_bytes = 16384
+review_notes_bytes = 49152

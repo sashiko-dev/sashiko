@@ -33,7 +33,7 @@ mod tests {
         let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         // Use current repo as the test repo
         let linux_path = root.clone();
-        let prompts_path = root.join("third_party/prompts/kernel");
+        let prompts_path = root.join("projects/linux/prompts");
         (linux_path, prompts_path)
     }
 
@@ -440,19 +440,19 @@ mod tests {
 
         // Ensure we have a dummy prompt file to read
         // The real review-prompts might not be populated in test env, check first
-        // Or assume technical-patterns.md exists as per repo structure.
+        // Or assume severity.md exists as per repo structure.
         // But tests might run in clean env. Let's create a dummy one if we can or check existence.
         // Since we are running in the actual repo, review-prompts should exist.
 
-        let args = json!({ "name": "technical-patterns.md" });
-        if prompts_path.join("technical-patterns.md").exists() {
+        let args = json!({ "name": "severity.md" });
+        if prompts_path.join("severity.md").exists() {
             let result = rt
                 .block_on(toolbox.call("read_prompt", args.clone()))
                 .expect("Failed to call read_prompt");
             assert!(result.get("content").is_some());
         } else {
             // If file doesn't exist (e.g. CI), skip assertion on content but check tool availability
-            println!("Skipping read_prompt content check: technical-patterns.md not found");
+            println!("Skipping read_prompt content check: severity.md not found");
         }
 
         // Test disabled tool
@@ -473,7 +473,7 @@ mod tests {
         // A guide the workflow already loads by name, so it cannot go missing
         // without breaking the review itself. The nested path also covers the
         // subdirectory case, which is most of what the tool is asked for.
-        let args = json!({ "name": "subsystem/locking.md" });
+        let args = json!({ "name": "locking.md" });
 
         let toolbox = ToolBox::new(linux_path.clone(), Some(prompts_path.clone()));
         let result = rt
@@ -481,7 +481,7 @@ mod tests {
             .expect("a name under the prompt directory must resolve");
         assert!(!result["content"].as_str().unwrap_or_default().is_empty());
 
-        for alt in ["review-prompts/kernel/subsystem/locking.md", "locking.md"] {
+        for alt in ["review-prompts/kernel/locking.md", "./locking.md"] {
             let alt_res = rt
                 .block_on(toolbox.call("read_prompt", json!({ "name": alt })))
                 .unwrap_or_else(|e| panic!("expected {alt} to resolve: {e}"));

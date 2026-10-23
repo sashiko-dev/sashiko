@@ -278,8 +278,8 @@ A diff adding a `ProjectId` variant must also add it to `ProjectId::ALL`
 (`test_all_lists_every_project` asserts the count), give it a `prompt_dir()`
 that actually exists in the bundle, define `mailing_lists_path()`, and decide
 `uses_maintainers()`. Note `prompt_dir()` is deliberately not `as_str()` —
-Linux maps to `third_party/prompts/kernel` while Sashiko maps to
-`projects/sashiko/prompts` — and `test_prompt_dir_is_not_the_project_name`
+Linux maps to the `kernel/` bundle namespace (built from
+`projects/linux/prompts`) while Sashiko maps to `sashiko/` — and `test_prompt_dir_is_not_the_project_name`
 exists to stop that being "simplified".
 
 ## 8. Parse failures must stay loud

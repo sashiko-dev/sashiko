@@ -37,6 +37,7 @@ Review, the core loop:
 | `src/worker/prompts.rs` | Builds the workflow state and runs the engine |
 | `src/workflow/` | The generic, project-agnostic stage engine |
 | `src/workflows/` | The actual pipelines, per project |
+| `src/notes/` | Maintainer notes (`maintainers/*.md`), code notes engine (`notes/`), and deterministic per-patch note selection |
 | `src/toolbox/` | The tools a stage can call: git grep, log, show, blame, read files, read prompt |
 | `src/ai/` | Provider abstraction, sessions, token budget, truncation, backoff, caching |
 | `src/baseline.rs` | Baseline commit detection |
@@ -93,6 +94,9 @@ authentication is a security boundary.
 Do not demand benchmark data, measurements, or manual test procedures for ordinary
 code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
 Sashiko's own self-review prompts (`projects/sashiko/prompts/`, `sashiko_patch_review.rs`),
+nor for subsystem maintainer notes (`projects/linux/prompts/maintainers/*.md`) that
+record a subsystem's subjective coding preferences, conventions, or narrowly-scoped
+policies, nor for generated code-notes snapshots (`projects/*/prompts/notes/<set>/`),
 nor for post-triage maintenance tasks (such as periodic upstream fix checks on
 already-triaged open bugs), cross-bug database deduplication against previously
 stored bugs (`DedupSession`, `BUG_DEDUP_LOCK`, `list_all_bugs_for_vector_search`),
@@ -103,16 +107,18 @@ affect overall Linux AI patch-review or initial bug-discovery quality across the
 board — such as global Linux patch-review or initial bug-discovery stage
 instructions (`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph
 structure, model parameters, shared verification/deduplication logic, or broad
-Linux prompt changes (`third_party/prompts/`) — must include validation evidence
-in the commit message (either benchmark suite evaluation results or, for targeted
-false-positive prompt refinements, local re-review results on the affected Linux
-patches/series). Note that the JSON files in `benchmarks/` are static
+cross-subsystem Linux prompt changes (`projects/linux/prompts/*.md`, `general.md`) —
+must include validation evidence in the commit message (either benchmark suite
+evaluation results or, for targeted false-positive prompt refinements, local
+re-review results on the affected Linux patches/series). Note that the JSON files in `benchmarks/` are static
 ground-truth corpora of known positive bugs (`BenchmarkEntry` in
 `src/benchmark.rs`) and do not store negative/false-positive test cases;
 **never** demand that a prompt or workflow commit modify or add files in the
 `benchmarks/` directory. Flag Linux review-quality changes that provide no
 validation evidence in the commit message or risk silent regressions in detection
-rate or precision as **High** severity.
+rate or precision (including over-broad suppression bullets or overly generic
+`paths`/`symbols` triggers in `projects/linux/prompts/maintainers/*.md`) as
+**High** severity.
 
 **6. Zero Regressions and No Silent Failures.**
 Avoid regressions in CLI flags, `Settings.toml` parsing, or API contracts.
@@ -130,9 +136,11 @@ Every commit message must meet Sashiko's repository standards:
   necessary (motivation/rationale), rather than having an empty body or merely
   repeating a complex diff. However, trivial or self-explanatory commits — such
   as adding a mailing list to track, configuring an email policy or subsystem
-  git remote, simple configuration/deployment updates, or typo fixes — are
-  completely self-sufficient with a brief one-sentence description and must NOT
-  be flagged for lacking additional rationale.
+  git remote, adding or updating a subsystem's maintainer note in
+  `projects/linux/prompts/maintainers/*.md`, simple configuration/deployment
+  updates, or typo fixes — are completely self-sufficient with a brief
+  one-sentence description and must NOT be flagged for lacking additional
+  rationale.
 - **Formatting & Wrapping:** Commit messages must never use backticks (`) to
   quote code, function names, or variables, and must not contain internal metadata
   tags (such as `TAG=` or `CONV=`). Do NOT nitpick minor line-length overruns

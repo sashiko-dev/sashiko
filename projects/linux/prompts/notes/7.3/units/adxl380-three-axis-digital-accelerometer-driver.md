@@ -1,0 +1,53 @@
+# ADXL380 THREE-AXIS DIGITAL ACCELEROMETER DRIVER
+
+Core IIO accelerometer driver and I2C/SPI bus glue for the Analog Devices ADXL380 and ADXL382 3-axis digital accelerometers, providing direct raw channel reads (X, Y, Z acceleration and temperature), configurable scale/ODR/LPF/HPF filters, hardware FIFO buffered capture via kfifo, and activity/inactivity and single/double tap IIO events.
+
+## Architecture & Data Flow
+
+- Runtime modifications to sensor configuration, filter, range, calibration, event, or FIFO registers must place the device in standby via `adxl380_set_measure_en(st, false)` before writing registers and restore measurement via `adxl380_set_measure_en(st, true)` under `st->lock`. [F65]
+- When enabling measurement in `adxl380_set_measure_en`, `ADXL380_OP_MODE_REG` must be set to `ADXL380_OP_MODE_VLP` rather than `ADXL380_OP_MODE_HP` whenever `ADXL380_ACT_EN_MSK` or `ADXL380_INACT_EN_MSK` is set in `ADXL380_ACT_INACT_CTL_REG`; `adxl380_act_inact_config` must therefore write `ADXL380_ACT_INACT_CTL_REG` via `adxl380_write_act_inact_en` before calling `adxl380_set_measure_en(st, true)`. [F26]
+- In `struct adxl380_state`, `fifo_buf` (315 `__be16` elements, 630 bytes) is used for DMA-capable `regmap_noinc_read` transfers and is not a multiple of `IIO_DMA_MINALIGN`, so it must remain the last member aligned to `IIO_DMA_MINALIGN`. Broken by: adding fields after `fifo_buf` without `IIO_DMA_MINALIGN` alignment. [F38]
+- In `struct adxl380_state`, `st->transf_buf` must remain exactly 3 bytes long because `_adxl380_set_act_inact_time_ms` passes `sizeof(st->transf_buf)` to `regmap_bulk_write` for the 24-bit `ADXL380_TIME_ACT_H_REG` and `ADXL380_TIME_INACT_H_REG` registers. [F37]
+- Neither `adxl380_probe` nor the bus glue (`adxl380_i2c_probe`, `adxl380_spi_probe`) calls `dev_set_drvdata`; `struct adxl380_state` lives only in `iio_priv(indio_dev)`, so device attribute callbacks must recover `indio_dev` via `dev_to_iio_dev(dev)` and IRQ handlers receive `indio_dev` as their `void *` cookie. Broken by: calling `dev_get_drvdata`, `i2c_get_clientdata`, or `spi_get_drvdata`. [F59]
+- Channel `scan_index` values in `adxl380_channels` must remain 0, 1, 2 for X, Y, Z and 3 for TEMP, and callers of `adxl380_read_calibbias_value` / `adxl380_write_calibbias_value` must pass `chan->scan_index` (not `chan->address`), because `scan_index` is added directly to `ADXL380_X_DSM_OFFSET_REG` and used as the bit offset in `ADXL380_CHAN_EN_MSK(chan)` for `ADXL380_DIG_EN_REG`. [F22, F41]
+- `adxl380_read_calibbias_value` must sign-extend the 8-bit unsigned register value read from `ADXL380_X_DSM_OFFSET_REG + chan_addr` at bit 7 using `sign_extend32(reg_val, 7)` to match the signed `s8` offset written by `adxl380_write_calibbias_value`. [F56]
+- Because `adxl380_read_event_value` and `adxl380_read_event_config` read cached state from `struct adxl380_state`, `adxl380_write_act_inact_threshold`, `_adxl380_set_act_inact_time_ms`, `adxl380_set_tap_threshold_value`, `_adxl380_write_tap_time_us`, and `adxl380_write_tap_axis` must update their shadow fields in `st` only after the register writes succeed. [F31]
+- In `adxl380_buffer_postenable`, `st->fifo_set_size` must be computed from the `active_scan_mask` weight before clamping `st->watermark` to `ADXL380_FIFO_SAMPLES / st->fifo_set_size` and programming `st->watermark * st->fifo_set_size` into hardware via `adxl380_set_fifo_samples`. [F33]
+- All runtime interrupt routing accessors (`adxl380_read_act_inact_int`, `adxl380_write_act_inact_int`, `adxl380_read_tap_int`, `adxl380_write_tap_int`) must address map registers via `st->int_map[0]` and `st->int_map[1]` set by `adxl380_config_irq` rather than hardcoding `INT0` or `INT1` register addresses. [F36]
+- `adxl380_fill_lpf_tbl()` and `adxl380_fill_hpf_tbl()` must be called during `adxl380_setup()` and after updating `ADXL380_TRIG_CFG_REG` in `adxl380_set_odr()` so `st->lpf_tbl` and `st->hpf_tbl` are populated before any LPF/HPF read, write, or `read_avail` callback accesses them. [F19]
+- In `adxl380_set_lpf` and `adxl380_set_hpf`, writing the filter index to `ADXL380_FILTER_LPF_MODE_MSK` or `ADXL380_FILTER_HPF_CORNER_MSK` in `ADXL380_FILTER_REG` must be paired with setting `ADXL380_FILTER_EQ_FILT_MSK` or `ADXL380_FILTER_HPF_PATH_MSK` to 1 when the index is non-zero and 0 when the index is 0. [F30]
+- In `adxl380_read_event_config`, `IIO_EV_DIR_SINGLETAP` and `IIO_EV_DIR_DOUBLETAP` must return `(int_en && tap_axis_en)` to qualify the shared tap interrupt bit against `st->tap_axis_en` for `chan->channel2`, whereas `IIO_EV_DIR_RISING` and `IIO_EV_DIR_FALLING` return `int_en` directly. [F53]
+- `adxl380_push_event` must test `ADXL380_STATUS_1_ACT_MSK`, `ADXL380_STATUS_1_INACT_MSK`, `ADXL380_STATUS_1_SINGLE_TAP_MSK`, and `ADXL380_STATUS_1_DOUBLE_TAP_MSK` with independent `if` branches (not `else if`), and `adxl380_irq_handler` must call it before checking `ADXL380_STATUS_0_FIFO_WM_MSK` on the bulk-read status bytes. [F49]
+- In `adxl380_setup`, writing `ADXL380_RESET_CODE` to `ADXL380_RESET_REG` must be followed by `fsleep(500)` before programming any configuration registers (`ADXL380_DIG_EN_REG`, `ADXL380_FIFO_CONFIG_0_REG`, `ADXL380_SNSR_AXIS_EN_REG`, `adxl380_config_irq`, or `adxl380_set_measure_en`). [F62]
+- `adxl380_fifo_attributes` and `adxl380_event_attributes` must remain `NULL`-terminated for `devm_iio_kfifo_buffer_setup_ext` and sysfs attribute group registration. [F46]
+
+## Synchronization
+
+- When a code path acquires both IIO direct mode (via `iio_device_claim_direct`) and `st->lock`, `iio_device_claim_direct` must be acquired before `st->lock`, matching `adxl380_read_raw`, `adxl380_buffer_postenable`, and `adxl380_buffer_predisable`. Broken by: calling `iio_device_claim_direct(indio_dev)` while holding `st->lock`. [F9]
+- Internal helpers `adxl380_write_tap_dur_us`, `_adxl380_write_tap_time_us`, `_adxl380_set_act_inact_time_ms`, `adxl380_write_act_inact_threshold`, `adxl380_get_status`, and `adxl380_get_fifo_entries` assume the caller holds `st->lock` and must neither acquire `st->lock` internally nor be called unlocked at runtime; after probe-time `adxl380_setup`, all accesses to `st->transf_buf` (including in `adxl380_read_chn`) must also be serialized under `st->lock` across both the `regmap_bulk_read`/`regmap_bulk_write` call and the buffer pack/unpack. [F6, F71]
+- `adxl380_buffer_postenable`, `adxl380_buffer_predisable`, and `adxl380_irq_handler` must hold `st->lock` while configuring FIFO watermark interrupts (`ADXL380_INT_MAP0_FIFO_WM_INT0_MSK`), updating `st->fifo_set_size`, and draining `ADXL380_FIFO_DATA` into `st->fifo_buf`. [F10]
+- `adxl380_config_irq` registers `adxl380_irq_handler` as a threaded-only interrupt handler (`NULL` hardirq handler, `IRQF_ONESHOT`), so it executes in sleepable process context where acquiring `st->lock` and performing regmap I/O is legal. Broken by: registering `adxl380_irq_handler` as a primary hardirq handler or calling it from atomic context. [F70]
+
+## API Contracts
+
+- `adxl380_scale_act_inact_thresholds(st, old_range, new_range)` indexes `adxl380_range_scale_factor_tbl[3]` with `old_range` as numerator and `new_range` as denominator, so `adxl380_set_range()` must call it with `(st, st->range, range)` before overwriting `st->range = range` and before writing thresholds back to hardware. [F23]
+- Unlike `adxl380_find_match_1d_tbl` (which falls back to `size - 1`), `adxl380_find_match_2d_tbl` returns `-EINVAL` when no row matches `(val, val2)`, so callers in `adxl380_write_raw` must check for a negative return value before calling `adxl380_set_hpf` or `adxl380_set_range`. [F52]
+- `adxl380_read_chn` must return the 16-bit register reading as a non-negative `int` via `get_unaligned_be16` so `adxl380_read_raw` can check `ret < 0` for errors before right-shifting by `chan->scan_type.shift` and sign-extending with `sign_extend32`. Broken by: sign-extending the 16-bit value inside `adxl380_read_chn` (e.g., casting to `s16`). [F55]
+- `adxl380_write_raw_get_fmt` must return `IIO_VAL_INT_PLUS_NANO` for `IIO_CHAN_INFO_SCALE` (on `IIO_ACCEL`) and `IIO_VAL_INT_PLUS_MICRO` for `IIO_CHAN_INFO_HIGH_PASS_FILTER_3DB_FREQUENCY` so `val2` passed to `adxl380_write_raw` matches the fractional scaling in `scale_tbl` and `hpf_tbl`. [F77]
+- In `adxl380_read_event_value` and `adxl380_write_event_value`, IIO event time attributes (`IIO_EV_INFO_PERIOD`, `IIO_EV_INFO_RESET_TIMEOUT`, `IIO_EV_INFO_TAP2_MIN_DELAY`) use seconds at the IIO boundary, requiring `IIO_VAL_FRACTIONAL` divisors (`1000` for ms, `1000000` for us) on read and conversion from `(val, val2)` seconds+microseconds on write. [F80]
+- Each bus `regmap_config` (`adxl380_regmap_config` and `adxl380_spi_regmap_config`) must set `.readable_noinc_reg = adxl380_readable_noinc_reg` so `regmap_noinc_read` on `ADXL380_FIFO_DATA` in `adxl380_irq_handler` is permitted. [F69]
+- `adxl380_reg_access` (`iio_info.debugfs_reg_access`) must test `readval` first, performing `regmap_read(st->regmap, reg, readval)` when `readval` is non-`NULL` and calling `regmap_write(st->regmap, reg, writeval)` only when `readval` is `NULL`. [F82]
+
+## Error Handling
+
+- In `adxl380_read_raw()`, `iio_device_claim_direct()` returns `bool` (`false` when buffered mode is active, requiring an immediate `-EBUSY` return), and once it returns `true`, `iio_device_release_direct()` must be called before returning on a negative `adxl380_read_chn()` status. [F15]
+- `devm_regmap_init_i2c()` in `adxl380_i2c_probe()` and `devm_regmap_init_spi()` in `adxl380_spi_probe()` return `ERR_PTR`-encoded pointers that must be checked with `IS_ERR()` and converted via `PTR_ERR()`, whereas `devm_iio_device_alloc()` in `adxl380_probe()` returns `NULL` on failure. [F16]
+
+## External Contracts
+
+- `in_accel_gesture_tap_maxtomin_time_store` must parse sysfs input with `iio_str_to_fixpoint(buf, 100000, &val_int, &val_fract_us)`, reject inputs where `val_int || val_fract_us > 159375 || val_fract_us < 0` with `-EINVAL`, and return `len` on success. [F81]
+
+## Known Pitfalls
+
+- While multi-byte channel data, part ID, and activity/inactivity time registers are big-endian, `ADXL380_FIFO_STATUS_0_REG` (`0x1E`) and `0x1F` store the 9-bit FIFO entry count with bits[7:0] in `transf_buf[0]` and bit[8] in `BIT(0)` of `transf_buf[1]`. Broken by: replacing the manual bit assembly in `adxl380_get_fifo_entries` with `get_unaligned_be16(st->transf_buf)`. [F44]
+- In `adxl380_fill_hpf_tbl`, scaling `odr_hz` by `MEGA` and `adxl380_hpf_mul[i]` exceeds 32-bit range and must use `mul_u64_u32_shr` for 64-bit multiplication together with `div64_u64_rem` and `div_u64` for 64-bit division. Broken by: using 32-bit multiplication or raw `/` or `%` operators. [F54]
