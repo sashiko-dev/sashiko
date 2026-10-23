@@ -304,7 +304,7 @@ pub async fn run(
             let sha = resolve_revision(repo, rev).await?;
             let maintainers = match profile.units {
                 UnitsConfig::Maintainers {} => Some(load_maintainers_at(repo, &sha).await?),
-                UnitsConfig::Directories { .. } => None,
+                UnitsConfig::Directories { .. } | UnitsConfig::ComponentMap { .. } => None,
             };
             let report = build_plan(repo, &sha, &profile, maintainers.as_ref(), units).await?;
             if *json {
@@ -337,7 +337,7 @@ pub async fn run(
             let sha = resolve_revision(repo, rev).await?;
             let maintainers = match profile.units {
                 UnitsConfig::Maintainers {} => Some(load_maintainers_at(repo, &sha).await?),
-                UnitsConfig::Directories { .. } => None,
+                UnitsConfig::Directories { .. } | UnitsConfig::ComponentMap { .. } => None,
             };
             let selection = match select {
                 Some(path) => Some(read_selection(path)?),

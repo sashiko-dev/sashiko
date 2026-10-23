@@ -106,6 +106,10 @@ pub enum UnitsConfig {
     },
     /// Sections of the project's `MAINTAINERS` file.
     Maintainers {},
+    /// Named components mapped to path globs in `[units.components]`.
+    ComponentMap {
+        components: BTreeMap<String, Vec<String>>,
+    },
 }
 
 fn default_directory_depth() -> usize {
@@ -200,25 +204,41 @@ impl NotesProfile {
     }
 
     fn validate(&self) -> Result<()> {
-        if let UnitsConfig::Directories { roots, depth, .. } = &self.units {
-            if roots.is_empty() {
-                bail!("units.roots must list at least one directory");
-            }
-            for root in roots {
-                let trimmed = root.trim();
-                if trimmed.starts_with('/') && !trimmed.trim_matches('/').is_empty() {
-                    bail!(
-                        "units.roots entry {root:?} is absolute; use a path relative to the \
-                         repository root (\".\" for the root itself)"
-                    );
+        match &self.units {
+            UnitsConfig::Directories { roots, depth, .. } => {
+                if roots.is_empty() {
+                    bail!("units.roots must list at least one directory");
                 }
-                if trimmed.split('/').any(|part| part == "..") {
-                    bail!("units.roots entry {root:?} must not contain \"..\"");
+                for root in roots {
+                    let trimmed = root.trim();
+                    if trimmed.starts_with('/') && !trimmed.trim_matches('/').is_empty() {
+                        bail!(
+                            "units.roots entry {root:?} is absolute; use a path relative to the \
+                             repository root (\".\" for the root itself)"
+                        );
+                    }
+                    if trimmed.split('/').any(|part| part == "..") {
+                        bail!("units.roots entry {root:?} must not contain \"..\"");
+                    }
+                }
+                if !(1..=MAX_DIRECTORY_DEPTH).contains(depth) {
+                    bail!("units.depth must be between 1 and {MAX_DIRECTORY_DEPTH}, got {depth}");
                 }
             }
-            if !(1..=MAX_DIRECTORY_DEPTH).contains(depth) {
-                bail!("units.depth must be between 1 and {MAX_DIRECTORY_DEPTH}, got {depth}");
+            UnitsConfig::ComponentMap { components } => {
+                if components.is_empty() {
+                    bail!("units.components must define at least one component");
+                }
+                for (name, patterns) in components {
+                    if name.trim().is_empty() {
+                        bail!("units.components keys must not be empty");
+                    }
+                    if patterns.is_empty() || patterns.iter().any(|p| p.trim().is_empty()) {
+                        bail!("units.components.{name:?} must list at least one non-empty pattern");
+                    }
+                }
             }
+            UnitsConfig::Maintainers {} => {}
         }
         if self.languages.globs.is_empty() {
             bail!("languages.globs must name at least one language");
@@ -431,6 +451,22 @@ max_cases = 20
             (
                 "[units]\nsource = \"maintainers\"\nextra = 1\n[languages.globs]\nrust = [\"**.rs\"]\n",
                 "invalid notes profile",
+            ),
+            (
+                "[units]\nsource = \"component_map\"\n[units.components]\n[languages.globs]\nrust = [\"**.rs\"]\n",
+                "units.components must define at least one component",
+            ),
+            (
+                "[units]\nsource = \"component_map\"\n[units.components]\n\" \" = [\"src/\"]\n[languages.globs]\nrust = [\"**.rs\"]\n",
+                "units.components keys must not be empty",
+            ),
+            (
+                "[units]\nsource = \"component_map\"\n[units.components]\ncore = []\n[languages.globs]\nrust = [\"**.rs\"]\n",
+                "must list at least one non-empty pattern",
+            ),
+            (
+                "[units]\nsource = \"component_map\"\n[units.components]\ncore = [\" \"]\n[languages.globs]\nrust = [\"**.rs\"]\n",
+                "must list at least one non-empty pattern",
             ),
         ];
         for (text, expected) in cases {

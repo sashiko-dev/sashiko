@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::maintainers::{FileMatcher, MaintainersIndex};
+use crate::maintainers::{CompiledPattern, FileMatcher, MaintainersIndex};
 use crate::notes::profile::{ShallowFiles, UnitsConfig};
 use crate::notes::scope::SourceFile;
 
@@ -234,6 +234,53 @@ impl UnitSource for MaintainersUnits<'_> {
     }
 }
 
+/// Units from a profile's `[units.components]` glob map (`units.source =
+/// "component_map"`).
+pub struct ComponentMapUnits {
+    components: Vec<(String, Vec<(CompiledPattern, usize)>)>,
+}
+
+impl ComponentMapUnits {
+    pub fn new(map: &BTreeMap<String, Vec<String>>) -> Self {
+        let components = map
+            .iter()
+            .map(|(name, raw_patterns)| {
+                let compiled = raw_patterns
+                    .iter()
+                    .map(|raw| {
+                        let trimmed = raw.trim().trim_start_matches("./");
+                        let literal_len = trimmed.chars().filter(|&c| c != '*' && c != '?').count();
+                        (CompiledPattern::compile(trimmed), literal_len)
+                    })
+                    .collect();
+                (name.clone(), compiled)
+            })
+            .collect();
+        Self { components }
+    }
+}
+
+impl UnitSource for ComponentMapUnits {
+    fn owners(&self, path: &str) -> Vec<String> {
+        let normalized = path.trim_start_matches("./");
+        let mut hits: Vec<((usize, usize), &str)> = Vec::new();
+        for (name, patterns) in &self.components {
+            let mut best: Option<(usize, usize)> = None;
+            for (pat, lit_len) in patterns {
+                if pat.is_match(normalized) {
+                    let spec = (pat.depth(), *lit_len);
+                    best = Some(best.map_or(spec, |curr| curr.max(spec)));
+                }
+            }
+            if let Some(spec) = best {
+                hits.push((spec, name.as_str()));
+            }
+        }
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        hits.into_iter().map(|(_, name)| name.to_string()).collect()
+    }
+}
+
 /// Builds the unit source a profile asks for. `maintainers` is required for
 /// the `maintainers` source and ignored otherwise.
 pub fn unit_source<'a>(
@@ -251,6 +298,9 @@ pub fn unit_source<'a>(
                 anyhow::anyhow!("the maintainers unit source needs a MAINTAINERS file")
             })?;
             Ok(Box::new(MaintainersUnits::new(index)))
+        }
+        UnitsConfig::ComponentMap { components } => {
+            Ok(Box::new(ComponentMapUnits::new(components)))
         }
     }
 }
@@ -412,6 +462,53 @@ F:\t*/
         assert_eq!(unique_slug("A/B", &mut used), "a-b");
         assert_eq!(unique_slug("a b", &mut used), "a-b-2");
         assert_eq!(unique_slug("***", &mut used), "unit");
+    }
+
+    #[test]
+    fn test_component_map_units_specificity_and_overlap() {
+        let mut components = BTreeMap::new();
+        components.insert(
+            "gimple-middle-end".to_string(),
+            vec!["gcc/gimple*".to_string()],
+        );
+        components.insert(
+            "tree-optimization".to_string(),
+            vec!["gcc/gimple-ssa-*".to_string()],
+        );
+        components.insert("alpha".to_string(), vec!["gcc/shared/*.cc".to_string()]);
+        components.insert("beta".to_string(), vec!["gcc/shared/*.cc".to_string()]);
+
+        let cfg = UnitsConfig::ComponentMap { components };
+        let source = unit_source(&cfg, None).unwrap();
+
+        // Longer literal pattern at the same directory depth wins primary ownership,
+        // while the broader matching component still receives the file as shared.
+        assert_eq!(
+            source.owners("./gcc/gimple-ssa-warn-access.cc"),
+            vec!["tree-optimization", "gimple-middle-end"]
+        );
+        assert_eq!(
+            source.owners("gcc/gimple-fold.cc"),
+            vec!["gimple-middle-end"]
+        );
+        // Equal specificity breaks ties lexicographically by component name.
+        assert_eq!(source.owners("gcc/shared/foo.cc"), vec!["alpha", "beta"]);
+        assert!(source.owners("libcpp/lex.cc").is_empty());
+
+        let files = [
+            file("gcc/gimple-ssa-warn-access.cc", 100),
+            file("gcc/gimple-fold.cc", 50),
+            file("libcpp/lex.cc", 20),
+        ];
+        let assignment = assign_units(&*source, &files);
+        let gimple = assignment
+            .units
+            .iter()
+            .find(|u| u.name == "gimple-middle-end")
+            .unwrap();
+        assert_eq!(gimple.files, vec![file("gcc/gimple-fold.cc", 50)]);
+        assert_eq!(gimple.shared, vec!["gcc/gimple-ssa-warn-access.cc"]);
+        assert_eq!(assignment.unassigned, vec![file("libcpp/lex.cc", 20)]);
     }
 
     #[test]
