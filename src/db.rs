@@ -9681,9 +9681,27 @@ impl Database {
     }
 
     pub async fn fail_interrupted_fetching_patchsets(&self) -> Result<u64> {
-        let count = self.execute(
+        // Restore normal mailing-list cover letters (0 received parts, positive
+        // total_parts, non-placeholder subject, non-local message ID, and no MR
+        // URL) that an earlier startup sweep wrongly transitioned from
+        // 'Incomplete' to 'Failed'.
+        self.execute(
+            "UPDATE patchsets SET status = 'Incomplete', failed_reason = NULL
+             WHERE status = 'Failed'
+               AND failed_reason = 'Interrupted before fetch completed'
+               AND COALESCE(received_parts, 0) = 0
+               AND COALESCE(total_parts, 0) > 0
+               AND COALESCE(subject, '') != '(placeholder)'
+               AND COALESCE(cover_letter_message_id, '') NOT LIKE '%@sashiko.local'
+               AND mr_url IS NULL",
+            (),
+        )
+        .await?;
+
+        let count = self
+            .execute(
                 "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed'
-                 WHERE status = 'Fetching' OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0)",
+                 WHERE status = 'Fetching'",
                 (),
             )
             .await?;
@@ -22140,12 +22158,91 @@ mod tests {
         );
         assert!(db.has_patchset_by_msgid("msg-fetching-2").await.unwrap());
 
+        // An Incomplete mailing-list cover letter (received_parts = 0, total_parts > 0)
+        // must NOT be marked Failed by fail_interrupted_fetching_patchsets, and any
+        // cover letter previously marked 'Interrupted before fetch completed' must be
+        // restored to 'Incomplete'.
+        let cover_tid = db
+            .ensure_thread_for_message("msg-cover-0", 1700000050)
+            .await
+            .unwrap();
+        let cover_ps_id = db
+            .create_patchset(
+                cover_tid,
+                Some("msg-cover-0"),
+                "msg-cover-0",
+                "[PATCH 0/3] normal cover letter",
+                "Author <author@example.com>",
+                1700000050,
+                3,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("expected cover letter patchset id");
+
+        let corrupted_tid = db
+            .ensure_thread_for_message("msg-cover-corrupted", 1700000060)
+            .await
+            .unwrap();
+        let corrupted_ps_id = db
+            .create_patchset(
+                corrupted_tid,
+                Some("msg-cover-corrupted"),
+                "msg-cover-corrupted",
+                "[PATCH 0/2] previously corrupted cover letter",
+                "Author <author@example.com>",
+                1700000060,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("expected corrupted cover letter patchset id");
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed' WHERE id = ?",
+                libsql::params![corrupted_ps_id],
+            )
+            .await
+            .unwrap();
+
         let cleaned = db.fail_interrupted_fetching_patchsets().await.unwrap();
         assert_eq!(cleaned, 1);
         assert!(
             !db.has_patchset_by_msgid("msg-fetching-2").await.unwrap(),
             "Interrupted fetching patchset should allow retry after startup cleanup"
         );
+
+        for id in [cover_ps_id, corrupted_ps_id] {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT status, failed_reason FROM patchsets WHERE id = ?",
+                    libsql::params![id],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "Incomplete");
+            assert!(row.get::<Option<String>>(1).unwrap().is_none());
+        }
 
         // Re-ingesting a Failed singleton without calling create_fetching_patchset
         // (e.g. via NNTP retry) must reopen the patchset and transition it to Pending.
