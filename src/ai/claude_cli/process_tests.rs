@@ -254,3 +254,47 @@ printf '%s' '{"result":"OK","is_error":false}'
     .unwrap();
     assert_eq!(response.content.as_deref(), Some("OK"));
 }
+
+fn request_with_tools(tools: Vec<crate::ai::AiTool>) -> AiRequest {
+    AiRequest {
+        tools: Some(tools),
+        ..request()
+    }
+}
+
+#[tokio::test]
+async fn cli_passes_json_schema_only_for_requests_with_tools() {
+    let tool = crate::ai::AiTool {
+        name: "git_grep".to_string(),
+        description: "Search the tree".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    };
+    let provider = ClaudeCliProvider {
+        model: "test-model".to_string(),
+        effort: None,
+    };
+    for (request, expect_schema) in [
+        (request(), false),
+        (request_with_tools(vec![]), false),
+        (request_with_tools(vec![tool]), true),
+    ] {
+        let fixture = fake_cli(
+            r#"{"result":"{\"content\":\"OK\"}","structured_output":{"content":"OK"},"is_error":false}"#,
+            0,
+        );
+        let response = provider
+            .generate_content_with_binary(
+                request,
+                fixture.path().join("claude").as_os_str(),
+                Duration::from_secs(600),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content.as_deref(), Some("OK"));
+        let captured = std::fs::read_to_string(fixture.path().join("args")).unwrap();
+        assert_eq!(
+            captured.lines().any(|arg| arg == "--json-schema"),
+            expect_schema
+        );
+    }
+}
