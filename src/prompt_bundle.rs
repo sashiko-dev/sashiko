@@ -241,6 +241,7 @@ mod tests {
             "gcc/technical-patterns.md",
             "gcc/subsystem/subsystem.md",
             "gcc/maintainers/general.md",
+            "gcc/notes/profile.toml",
         ];
         for path in required_framing {
             assert!(

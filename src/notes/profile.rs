@@ -387,7 +387,7 @@ max_cases = 20
     #[test]
     fn test_shipped_profiles_parse() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        for project in ["sashiko", "linux"] {
+        for project in ["sashiko", "linux", "gcc"] {
             let path = root
                 .join("projects")
                 .join(project)

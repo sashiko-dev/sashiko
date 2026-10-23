@@ -1,0 +1,179 @@
+# Code notes profile for GCC (GNU Compiler Collection).
+# See designs/DESIGN_CODE_NOTES_ENGINE.md, section 3.
+
+[units]
+source = "component_map"
+
+[units.components]
+"match-fold" = [
+    "gcc/match.pd",
+    "gcc/generic-match*",
+    "gcc/gimple-match*",
+    "gcc/fold-const*",
+    "gcc/wide-int*",
+    "gcc/poly-int*",
+]
+"tree-optimization" = [
+    "gcc/tree-ssa-*",
+    "gcc/gimple-ssa-*",
+    "gcc/tree-scalar-evolution*",
+    "gcc/tree-tailcall*",
+    "gcc/tree-vrp*",
+    "gcc/value-range*",
+    "gcc/range-*",
+    "gcc/gimple-range*",
+    "gcc/vr-values*",
+]
+"vectorizer" = [
+    "gcc/tree-vect-*",
+    "gcc/tree-vectorizer*",
+    "gcc/tree-if-conv*",
+    "gcc/tree-predcom*",
+    "gcc/tree-data-ref*",
+]
+"gimple-middle-end" = [
+    "gcc/gimple*",
+    "gcc/tree.cc",
+    "gcc/tree.h",
+    "gcc/tree-core.h",
+    "gcc/tree-cfg*",
+    "gcc/tree-eh*",
+    "gcc/tree-inline*",
+    "gcc/tree-nested*",
+    "gcc/tree-sra*",
+    "gcc/tree-complex*",
+    "gcc/tree-switch-conversion*",
+    "gcc/expr*",
+    "gcc/calls*",
+    "gcc/builtins*",
+    "gcc/function*",
+    "gcc/cfg*",
+    "gcc/stor-layout*",
+    "gcc/machmode*",
+    "gcc/coretypes.h",
+    "gcc/params.opt",
+]
+"rtl-optimization" = [
+    "gcc/combine*",
+    "gcc/simplify-rtx*",
+    "gcc/rtlanal*",
+    "gcc/ifcvt*",
+    "gcc/loop-*",
+    "gcc/bb-reorder*",
+    "gcc/avoid-store-forwarding*",
+    "gcc/read-rtl*",
+    "gcc/rtl*",
+    "gcc/emit-rtl*",
+    "gcc/explow*",
+    "gcc/expmed*",
+    "gcc/optabs*",
+    "gcc/recog*",
+    "gcc/cse*",
+    "gcc/gcse*",
+    "gcc/fwprop*",
+    "gcc/postreload*",
+    "gcc/ree*",
+    "gcc/regcprop*",
+    "gcc/sched-*",
+    "gcc/haifa-sched*",
+    "gcc/sel-sched*",
+    "gcc/ira*",
+    "gcc/lra*",
+    "gcc/reload*",
+]
+"ipa-lto" = [
+    "gcc/ipa-*",
+    "gcc/cgraph*",
+    "gcc/symtab*",
+    "gcc/varpool*",
+    "gcc/lto-streamer*",
+    "gcc/lto-*",
+    "gcc/lto/",
+    "gcc/auto-profile*",
+    "gcc/predict*",
+    "gcc/profile*",
+    "gcc/value-prof*",
+]
+"omp-sanitizer" = [
+    "gcc/omp-*",
+    "gcc/asan*",
+    "gcc/tsan*",
+    "gcc/ubsan*",
+    "gcc/sancov*",
+]
+"ggc-containers" = [
+    "gcc/ggc*",
+    "gcc/gengtype*",
+    "gcc/vec*",
+    "gcc/hash-table*",
+    "gcc/hash-map*",
+    "gcc/hash-set*",
+    "gcc/bitmap*",
+    "gcc/sbitmap*",
+    "gcc/obstack*",
+]
+"c-family" = ["gcc/c/", "gcc/c-family/"]
+"cp" = ["gcc/cp/"]
+"fortran" = ["gcc/fortran/"]
+"rust" = ["gcc/rust/"]
+"ada" = ["gcc/ada/"]
+"cobol" = ["gcc/cobol/"]
+"d" = ["gcc/d/"]
+"go" = ["gcc/go/"]
+"m2" = ["gcc/m2/"]
+"jit" = ["gcc/jit/"]
+"analyzer" = ["gcc/analyzer/"]
+"diagnostics" = ["gcc/diagnostic*", "gcc/pretty-print*"]
+"config-aarch64" = ["gcc/config/aarch64/", "gcc/common/config/aarch64/"]
+"config-i386" = ["gcc/config/i386/", "gcc/common/config/i386/"]
+"config-riscv" = ["gcc/config/riscv/", "gcc/common/config/riscv/"]
+"config-arm" = ["gcc/config/arm/", "gcc/common/config/arm/"]
+"config-rs6000" = ["gcc/config/rs6000/", "gcc/common/config/rs6000/"]
+"config-s390" = ["gcc/config/s390/", "gcc/common/config/s390/"]
+"config-loongarch" = ["gcc/config/loongarch/", "gcc/common/config/loongarch/"]
+"config-sparc" = ["gcc/config/sparc/", "gcc/common/config/sparc/"]
+"config-mips" = ["gcc/config/mips/", "gcc/common/config/mips/"]
+"config-sh" = ["gcc/config/sh/", "gcc/common/config/sh/"]
+"config-avr" = ["gcc/config/avr/", "gcc/common/config/avr/"]
+"config-gcn" = ["gcc/config/gcn/", "gcc/common/config/gcn/"]
+"config-nvptx" = ["gcc/config/nvptx/", "gcc/common/config/nvptx/"]
+"libstdc++-v3" = ["libstdc++-v3/"]
+"libgomp" = ["libgomp/"]
+"libgfortran" = ["libgfortran/"]
+"libgcc" = ["libgcc/"]
+"libcpp" = ["libcpp/", "libiberty/", "include/"]
+
+[languages]
+skip = [
+    "gcc/testsuite/",
+    "libstdc++-v3/testsuite/",
+    "libstdc++-v3/doc/",
+    "libstdc++-v3/po/",
+    "libgomp/testsuite/",
+    "libgfortran/testsuite/",
+    "libgfortran/generated/",
+    "gcc/doc/",
+    "gcc/po/",
+    "gcc/ada/doc/",
+]
+
+[languages.globs]
+cpp = ["**.cc", "**.C", "**.h", "**.tcc"]
+c = ["**.c"]
+rust = ["**.rs"]
+other = ["**.md", "**.pd", "**.def", "**.opt"]
+
+[agenda]
+modules = ["universal", "lang/c", "lang/cpp", "lang/rust", "domain/gcc"]
+
+[history]
+fix_patterns = [
+    "^[[:space:]]*PR [a-z0-9+-]+/[0-9]+",
+    "^Fixes: [0-9a-f]{8,}",
+]
+introducer_pattern = "r[0-9]+-[0-9]+-g([0-9a-f]{8,})"
+max_cases = 60
+
+[limits]
+component_lines = 15000
+unit_note_bytes = 16384
