@@ -18,6 +18,8 @@ use crate::ai::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::Client;
+use aws_sdk_bedrockruntime::error::SdkError;
+use aws_sdk_bedrockruntime::operation::converse::{ConverseError, ConverseOutput};
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ConversationRole, InferenceConfiguration,
     Message, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
@@ -25,7 +27,8 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::{Document, Number};
 use std::collections::HashMap;
-use tracing::info;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{info, warn};
 
 // --- serde_json::Value <-> aws_smithy_types::Document conversion ---
 
@@ -90,6 +93,9 @@ pub struct BedrockClient {
     max_tokens: u32,
     thinking: Option<String>,
     effort: Option<String>,
+    /// Learned from a rejected request; some models (e.g. OpenAI reasoning
+    /// models) refuse inferenceConfig.temperature.
+    temperature_unsupported: AtomicBool,
 }
 
 impl BedrockClient {
@@ -116,6 +122,7 @@ impl BedrockClient {
             max_tokens,
             thinking,
             effort,
+            temperature_unsupported: AtomicBool::new(false),
         }
     }
 
@@ -131,6 +138,64 @@ impl BedrockClient {
             })
             .await
     }
+
+    fn converse_params(&self, request: &AiRequest) -> Result<ConverseParams> {
+        translate_request(
+            request,
+            self.enable_caching,
+            self.max_tokens,
+            self.thinking.as_deref(),
+            self.effort.as_deref(),
+        )
+    }
+
+    async fn converse(
+        &self,
+        params: ConverseParams,
+    ) -> std::result::Result<ConverseOutput, SdkError<ConverseError>> {
+        self.get_client()
+            .await
+            .converse()
+            .model_id(&self.model_id)
+            .set_messages(Some(params.messages))
+            .set_system(params.system)
+            .set_tool_config(params.tool_config)
+            .set_inference_config(params.inference_config)
+            .set_additional_model_request_fields(params.additional_model_request_fields)
+            .send()
+            .await
+    }
+
+    async fn converse_error(&self, e: SdkError<ConverseError>) -> anyhow::Error {
+        let is_throttle = format!("{e:?}").contains("ThrottlingException");
+        if is_throttle {
+            tracing::warn!("Bedrock throttled, waiting 30s before retry...");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        anyhow::anyhow!(
+            "Bedrock Converse API error (model_id={}): {}",
+            self.model_id,
+            aws_smithy_types::error::display::DisplayErrorContext(&e)
+        )
+    }
+}
+
+/// Bedrock reports a request field the model does not accept as a
+/// ValidationException; only one that names temperature as unsupported counts.
+fn rejects_temperature_parameter(error: &ConverseError) -> bool {
+    let ConverseError::ValidationException(e) = error else {
+        return false;
+    };
+    let message = e.message().unwrap_or_default().to_ascii_lowercase();
+    message.contains("temperature")
+        && [
+            "unsupported",
+            "not supported",
+            "not permitted",
+            "not allowed",
+        ]
+        .iter()
+        .any(|phrase| message.contains(phrase))
 }
 
 // --- Request translation ---
@@ -440,42 +505,38 @@ fn translate_response(
 
 #[async_trait]
 impl AiProvider for BedrockClient {
-    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let params = translate_request(
-            &request,
-            self.enable_caching,
-            self.max_tokens,
-            self.thinking.as_deref(),
-            self.effort.as_deref(),
-        )?;
+    async fn generate_content(&self, mut request: AiRequest) -> Result<AiResponse> {
+        if self.temperature_unsupported.load(Ordering::Relaxed) {
+            request.temperature = None;
+        }
+        let params = self.converse_params(&request)?;
+        let sent_temperature = params
+            .inference_config
+            .as_ref()
+            .and_then(|c| c.temperature())
+            .is_some();
 
-        let resp = self
-            .get_client()
-            .await
-            .converse()
-            .model_id(&self.model_id)
-            .set_messages(Some(params.messages))
-            .set_system(params.system)
-            .set_tool_config(params.tool_config)
-            .set_inference_config(params.inference_config)
-            .set_additional_model_request_fields(params.additional_model_request_fields)
-            .send()
-            .await;
-
-        let resp = match resp {
+        let resp = match self.converse(params).await {
             Ok(r) => r,
-            Err(e) => {
-                let is_throttle = format!("{e:?}").contains("ThrottlingException");
-                if is_throttle {
-                    tracing::warn!("Bedrock throttled, waiting 30s before retry...");
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Err(e)
+                if sent_temperature
+                    && e.as_service_error()
+                        .is_some_and(rejects_temperature_parameter) =>
+            {
+                self.temperature_unsupported.store(true, Ordering::Relaxed);
+                warn!(
+                    "{}Bedrock model {} rejected temperature; retrying without it",
+                    crate::ai::get_log_prefix(),
+                    self.model_id
+                );
+                request.temperature = None;
+                let params = self.converse_params(&request)?;
+                match self.converse(params).await {
+                    Ok(r) => r,
+                    Err(e) => return Err(self.converse_error(e).await),
                 }
-                return Err(anyhow::anyhow!(
-                    "Bedrock Converse API error (model_id={}): {}",
-                    self.model_id,
-                    aws_smithy_types::error::display::DisplayErrorContext(&e)
-                ));
             }
+            Err(e) => return Err(self.converse_error(e).await),
         };
 
         let usage_str = resp
@@ -522,6 +583,7 @@ impl AiProvider for BedrockClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_http;
     use crate::ai::{AiMessage, AiRequest, AiRole, AiTool, ToolCall};
     use serde_json::json;
 
@@ -986,5 +1048,148 @@ mod tests {
         assert_ne!(us_east.cache_identity(), us_west.cache_identity());
         assert_ne!(us_east.cache_identity(), thinking.cache_identity());
         assert_ne!(us_east.cache_identity(), more_tokens.cache_identity());
+    }
+
+    const CONVERSE_OK: &str = r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2},"metrics":{"latencyMs":1}}"#;
+    const TEMPERATURE_REJECTED: &str =
+        "Unsupported parameter: 'temperature' is not supported with this model.";
+
+    fn converse_ok() -> Vec<u8> {
+        test_http::complete("200 OK", "", CONVERSE_OK)
+    }
+
+    fn validation_error(message: &str) -> Vec<u8> {
+        test_http::complete(
+            "400 Bad Request",
+            "x-amzn-ErrorType: ValidationException\r\n",
+            &json!({ "message": message }).to_string(),
+        )
+    }
+
+    fn local_bedrock(url: &str) -> BedrockClient {
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_bedrockruntime::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .endpoint_url(url)
+            .build();
+        let bedrock = BedrockClient::new(
+            "openai.gpt-test".to_string(),
+            Some("us-east-1".to_string()),
+            false,
+            1024,
+            None,
+            None,
+        );
+        bedrock
+            .client
+            .set(Client::from_conf(config))
+            .unwrap_or_else(|_| panic!("client already set"));
+        bedrock
+    }
+
+    fn sampled_request(temperature: Option<f32>) -> AiRequest {
+        let mut req = make_request(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("Hi".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        req.temperature = temperature;
+        req
+    }
+
+    fn sent_temperatures(bodies: &std::sync::Mutex<Vec<String>>) -> Vec<Option<f64>> {
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| {
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                body["inferenceConfig"]["temperature"].as_f64()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn temperature_fallback_matches_only_explicit_unsupported_errors() {
+        use aws_sdk_bedrockruntime::types::error::{ThrottlingException, ValidationException};
+
+        let validation = |message: &str| {
+            ConverseError::ValidationException(
+                ValidationException::builder().message(message).build(),
+            )
+        };
+        let cases = [
+            (validation(TEMPERATURE_REJECTED), true),
+            (
+                validation(
+                    "The model returned the following errors: temperature: Extra inputs are not permitted",
+                ),
+                true,
+            ),
+            (validation("temperature must be between 0 and 1"), false),
+            (
+                validation("max_tokens is not supported for this model"),
+                false,
+            ),
+            (
+                ConverseError::ThrottlingException(
+                    ThrottlingException::builder()
+                        .message("temperature is not supported")
+                        .build(),
+                ),
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(rejects_temperature_parameter(&error), expected, "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn temperature_rejection_retries_once_and_is_remembered() -> Result<()> {
+        let (server, bodies) = test_http::serve_sequence(vec![
+            validation_error(TEMPERATURE_REJECTED),
+            converse_ok(),
+            converse_ok(),
+        ])
+        .await;
+        let bedrock = local_bedrock(&server.url);
+
+        let first = bedrock.generate_content(sampled_request(Some(0.5))).await?;
+        let second = bedrock.generate_content(sampled_request(Some(0.5))).await?;
+        server.finish().await;
+
+        assert_eq!(first.content.as_deref(), Some("ok"));
+        assert_eq!(second.content.as_deref(), Some("ok"));
+        assert_eq!(sent_temperatures(&bodies), vec![Some(0.5), None, None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn temperature_fallback_ignores_unrelated_or_unsampled_failures() {
+        let cases = [
+            ("max_tokens is not supported for this model", Some(0.5)),
+            (TEMPERATURE_REJECTED, None),
+        ];
+        for (message, temperature) in cases {
+            let (server, bodies) = test_http::serve_sequence(vec![validation_error(message)]).await;
+            let bedrock = local_bedrock(&server.url);
+
+            let err = bedrock
+                .generate_content(sampled_request(temperature))
+                .await
+                .expect_err("validation error must propagate");
+            server.finish().await;
+
+            assert!(err.to_string().contains("ValidationException"), "{err:#}");
+            assert_eq!(bodies.lock().unwrap().len(), 1, "{message}");
+            assert!(!bedrock.temperature_unsupported.load(Ordering::Relaxed));
+        }
     }
 }

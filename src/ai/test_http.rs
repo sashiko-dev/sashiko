@@ -70,6 +70,35 @@ pub(crate) async fn serve(bytes: Vec<u8>) -> TestServer {
     TestServer::start(Some(1), move |_| bytes.clone()).await
 }
 
+/// Answers one connection per response, in order, and records each request
+/// body it received.
+#[cfg(feature = "bedrock")]
+pub(crate) async fn serve_sequence(
+    responses: Vec<Vec<u8>>,
+) -> (TestServer, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&bodies);
+    let handle = tokio::spawn(async move {
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = read_request(&mut stream).await;
+            recorded
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&body).into_owned());
+            stream.write_all(&response).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    });
+    let server = TestServer {
+        url: format!("http://{address}"),
+        handle,
+    };
+    (server, bodies)
+}
+
 pub(crate) struct RedirectLoop(TestServer);
 
 impl RedirectLoop {
@@ -110,7 +139,7 @@ impl RefusedPort {
     }
 }
 
-async fn read_request(stream: &mut TcpStream) {
+async fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -132,6 +161,7 @@ async fn read_request(stream: &mut TcpStream) {
         assert!(n > 0, "client closed before sending the request body");
         buf.extend_from_slice(&chunk[..n]);
     }
+    buf.split_off(header_end)
 }
 
 fn response(status: &str, extra_headers: &str, content_length: usize, body: &str) -> Vec<u8> {

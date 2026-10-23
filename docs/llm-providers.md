@@ -185,6 +185,11 @@ cp docs/examples/Settings.claude-bedrock.toml Settings.toml
 - Cross-region inference profiles (e.g. `us.anthropic.claude-*`)
 - Full tool/function calling support
 
+Some models (e.g. OpenAI reasoning models) reject the `temperature`
+field. Sashiko retries an explicit unsupported-temperature
+`ValidationException` without the field and omits it on later requests
+to the same model.
+
 ## Google Cloud Vertex AI
 
 Uses Claude and Gemini models via Google Cloud infrastructure. Requires
