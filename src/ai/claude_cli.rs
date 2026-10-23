@@ -25,6 +25,10 @@
 //! instructions; managed MCP configurations can prevent strict-mode startup.
 //! These restrictions disable agent functionality, not operating-system
 //! access: the CLI is still trusted to read credentials and contact the model.
+//!
+//! A request with tools also gets `--json-schema`. Claude Code serves it with
+//! a single StructuredOutput tool that takes the reply object and nothing
+//! else, so it gives the model no access to files, commands or the network.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -136,9 +140,15 @@ pub struct ClaudeCliProvider {
     pub effort: Option<String>,
 }
 
+/// Constrains a reply to the tool-calling format `build_prompt` asks for. With
+/// `--tools ""` the API has no tool for the model's native tool-call syntax to
+/// end on, so the model can write it as text and keep inventing calls and
+/// results until the CLI times out.
+const TOOL_REPLY_SCHEMA: &str = r#"{"type":"object","properties":{"tool_calls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"function_name":{"type":"string"},"arguments":{"type":"object"}},"required":["id","function_name","arguments"]}},"content":{"type":"string"}}}"#;
+
 /// Returns the argv passed to `claude` (the prompt goes on stdin). Extracted
 /// so tests can assert that no tool survives.
-pub fn build_claude_args(model: &str, effort: Option<&str>) -> Vec<String> {
+pub fn build_claude_args(model: &str, effort: Option<&str>, has_tools: bool) -> Vec<String> {
     // Isolation arguments/settings verified with Claude Code 2.1.170.
     let mut args = vec![
         "--print".to_string(),
@@ -172,6 +182,11 @@ pub fn build_claude_args(model: &str, effort: Option<&str>) -> Vec<String> {
         args.push(effort.to_string());
     }
 
+    if has_tools {
+        args.push("--json-schema".to_string());
+        args.push(TOOL_REPLY_SCHEMA.to_string());
+    }
+
     args
 }
 
@@ -188,7 +203,11 @@ impl ClaudeCliProvider {
 
         let working_directory = tempfile::tempdir().map_err(ClaudeCliError::WorkingDirectory)?;
         let child = Command::new(binary)
-            .args(build_claude_args(&self.model, self.effort.as_deref()))
+            .args(build_claude_args(
+                &self.model,
+                self.effort.as_deref(),
+                request.tools.as_ref().is_some_and(|t| !t.is_empty()),
+            ))
             .current_dir(working_directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -244,7 +263,7 @@ impl AiProvider for ClaudeCliProvider {
             &self.model,
             &[
                 ("effort", self.effort.as_deref()),
-                ("completion_profile", Some("restricted-v1")),
+                ("completion_profile", Some("restricted-v2")),
             ],
         )
     }
@@ -676,13 +695,24 @@ mod tests {
 
     #[test]
     fn test_claude_args_disable_every_tool() {
-        let args = build_claude_args("sonnet", Some("high"));
+        let args = build_claude_args("sonnet", Some("high"), true);
         let tools = args.iter().position(|a| a == "--tools").unwrap();
         assert_eq!(args[tools + 1], "");
         let denied = args.iter().position(|a| a == "--disallowedTools").unwrap();
         assert_eq!(args[denied + 1], "mcp__*");
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains(&"--print".to_string()));
+    }
+
+    #[test]
+    fn test_claude_args_schema_only_with_tools() {
+        let with = build_claude_args("sonnet", None, true);
+        let schema = with.iter().position(|a| a == "--json-schema").unwrap();
+        let parsed: Value = serde_json::from_str(&with[schema + 1]).unwrap();
+        assert!(parsed["properties"]["tool_calls"].is_object());
+        assert!(parsed["properties"]["content"].is_object());
+        let without = build_claude_args("sonnet", None, false);
+        assert!(!without.contains(&"--json-schema".to_string()));
     }
 
     #[test]
