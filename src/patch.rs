@@ -84,10 +84,133 @@ pub fn extract_received_date(raw_email: &[u8]) -> Option<i64> {
     None
 }
 
+pub fn has_unquoted_diff(text: &str) -> bool {
+    let mut has_minus = false;
+    let mut has_plus = false;
+    let mut has_hunk = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with("diff --git ") {
+            return true;
+        }
+        if line.starts_with("--- ") {
+            has_minus = true;
+        } else if line.starts_with("+++ ") {
+            has_plus = true;
+        } else if line.starts_with("@@ -") {
+            has_hunk = true;
+        }
+        if has_minus && has_plus && has_hunk {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if `line` is a `git format-patch` mbox separator line of the
+/// form `From <hex-sha> <ctime-timestamp>` (e.g.
+/// `From 0123456789abcdef0123456789abcdef01234567 Mon Sep 17 00:00:00 2001`).
+fn is_format_patch_mbox_from(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("From ") else {
+        return false;
+    };
+    let Some((sha, tail)) = rest.split_once(' ') else {
+        return false;
+    };
+    if sha.len() < 7 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let b = tail.trim_end().as_bytes();
+    let len = b.len();
+    len >= 20 && b[len - 8] == b':' && b[len - 11] == b':' && b[len - 5] == b' '
+}
+
+/// Strips only a leading `git format-patch` `From <sha> <timestamp>` mbox
+/// separator line when the patch appears at the very start of the message body,
+/// leaving any subsequent `From:`, `Date:`, and `Subject:` lines at the top of
+/// the body for `git mailinfo` (`git am`) to consume as in-body overrides.
+fn strip_leading_mbox_from_line(text: &str) -> &str {
+    let Some((first, rest)) = text.split_once('\n') else {
+        return text;
+    };
+    if is_format_patch_mbox_from(first.trim_end_matches('\r')) {
+        rest
+    } else {
+        text
+    }
+}
+
+/// Strips a leading `git format-patch` mbox/RFC header block (`From <sha> ...`,
+/// `From:`, `Date:`, `Subject:`, etc.) from an attached patch so `git am` does
+/// not split on an embedded `From ` separator line when the attachment is
+/// appended to the email body.
+fn strip_format_patch_headers(text: &str) -> &str {
+    let first_line = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r');
+    let starts_with_mbox_from = is_format_patch_mbox_from(first_line);
+    let starts_with_header = ["from:", "date:", "subject:"]
+        .iter()
+        .any(|p| first_line.to_ascii_lowercase().starts_with(p));
+    if !starts_with_mbox_from && !starts_with_header {
+        return text;
+    }
+
+    let mut offset = 0;
+    let mut line_idx = 0;
+    let mut saw_patch_header = false;
+
+    for raw_line in text.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        offset += raw_line.len();
+        if line.is_empty() {
+            if saw_patch_header && line_idx > 0 {
+                return &text[offset..];
+            }
+            return text;
+        }
+        if line_idx == 0 && starts_with_mbox_from {
+            line_idx += 1;
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            line_idx += 1;
+            continue;
+        }
+        if let Some((name, _)) = line.split_once(':')
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_graphic() && !c.is_ascii_whitespace())
+        {
+            let lower = name.to_ascii_lowercase();
+            if matches!(lower.as_str(), "from" | "date" | "subject") {
+                saw_patch_header = true;
+            }
+            line_idx += 1;
+            continue;
+        }
+        return text;
+    }
+
+    text
+}
+
+fn is_ping_subject(subject: &str) -> bool {
+    let lower = subject.trim().to_ascii_lowercase();
+    if lower.starts_with("ping:") || lower.starts_with("ping ") || lower.starts_with("ping^") {
+        return true;
+    }
+    subject_prefix_tokens(subject).any(|tok| tok.to_ascii_lowercase().starts_with("ping"))
+}
+
 pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)> {
     let received_date = extract_received_date(raw_email);
 
     let message = MessageParser::default()
+        .with_mime_headers()
         .with_address_headers()
         .with_message_ids()
         .header_text(mail_parser::HeaderName::Subject)
@@ -231,16 +354,46 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     let mut body = String::new();
     for i in 0..message.text_body_count() {
         if let Some(text) = message.body_text(i) {
+            let normalized = text.replace("\r\n", "\n");
+            let content = if has_unquoted_diff(&normalized) {
+                if body.trim().is_empty() {
+                    body.clear();
+                    strip_leading_mbox_from_line(&normalized)
+                } else {
+                    strip_format_patch_headers(&normalized)
+                }
+            } else {
+                normalized.as_str()
+            };
             if !body.is_empty() {
                 body.push('\n');
             }
-            body.push_str(&text);
+            body.push_str(content);
         }
     }
 
-    let diff = if body.contains("diff --git")
-        || (body.contains("--- ") && body.contains("+++ ") && body.contains("@@ -"))
-    {
+    for attachment in message.attachments() {
+        if let Some(att_text) = attachment.text_contents()
+            && has_unquoted_diff(att_text)
+        {
+            let normalized = att_text.replace("\r\n", "\n");
+            let stripped = if body.trim().is_empty() {
+                body.clear();
+                strip_leading_mbox_from_line(&normalized)
+            } else {
+                strip_format_patch_headers(&normalized)
+            };
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(stripped);
+        }
+    }
+
+    let diff = if has_unquoted_diff(&body) {
         body.clone()
     } else {
         String::new()
@@ -249,6 +402,7 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     // Detection logic
     let subject_lower = subject.to_lowercase();
     let subject_clean = subject_lower.trim();
+    let has_diff = !diff.is_empty();
     let is_reply = subject_clean.starts_with("re:")
         || subject_clean.starts_with("fwd:")
         || subject_clean.starts_with("forwarded:")
@@ -260,9 +414,9 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
         || subject_clean.starts_with("答复：") // Chinese 'Reply'
         || subject_clean.starts_with("[reproducer]") // Reproducers
         || subject_lower.contains("(was ")
-        || subject_lower.contains("(was:");
+        || subject_lower.contains("(was:")
+        || (!has_diff && is_ping_subject(&subject));
     let has_patch_tag = subject_clean.contains("patch") || subject_clean.contains("rfc");
-    let has_diff = !diff.is_empty();
 
     // A message is part of a series if it's a cover letter (index 0) or has multiple parts (total > 1)
     let is_series_metadata = total > 1 || index == 0;
@@ -307,9 +461,9 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
 /// A subject that carries no counter reads as part 1 of 1.
 pub fn parse_subject_index(subject: &str) -> (u32, u32) {
     static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
-    // Match [ ... M/N ... ] but strictly require PATCH, RFC, RESEND or vN before the M/N
+    // Match [ ... M/N ... ] but strictly require PATCH, RFC, RESEND, COMMIT or vN before the M/N
     let re_brackets = RE_BRACKETS.get_or_init(|| {
-        Regex::new(r"(?i)\[.*?\b(?:PATCH|RFC|RESEND|v\d+)\b.*?(\d+)/(\d+).*?\]").unwrap()
+        Regex::new(r"(?i)\[.*?\b(?:PATCH|RFC|RESEND|COMMIT|v\d+)\b.*?(\d+)/(\d+).*?\]").unwrap()
     });
 
     if let Some(caps) = re_brackets.captures(subject)
@@ -322,8 +476,8 @@ pub fn parse_subject_index(subject: &str) -> (u32, u32) {
 
     static RE_LOOSE: OnceLock<Regex> = OnceLock::new();
     // Match PATCH M/N or RFC M/N (case insensitive)
-    let re_loose =
-        RE_LOOSE.get_or_init(|| Regex::new(r"(?i)\b(?:PATCH|RFC|RESEND)\s+(\d+)/(\d+)\b").unwrap());
+    let re_loose = RE_LOOSE
+        .get_or_init(|| Regex::new(r"(?i)\b(?:PATCH|RFC|RESEND|COMMIT)\s+(\d+)/(\d+)\b").unwrap());
 
     if let Some(caps) = re_loose.captures(subject)
         && let (Some(i), Some(t)) = (caps.get(1), caps.get(2))
@@ -1619,5 +1773,119 @@ diff --git a/file.c b/file.c";
             ]
         );
         assert_eq!(patch_ids, vec!["0123456789abcdef0123456789abcdef01234567"]);
+    }
+
+    #[test]
+    fn test_parse_email_decodes_quoted_printable_diff() {
+        let raw = b"Message-ID: <qp-patch@example.com>\r\n\
+From: Robin Dapp <rdapp.gcc@gmail.com>\r\n\
+Subject: [PATCH] lra: Handle subregs in get_dependent_filter.\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=UTF-8\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+Fix subreg handling.\r\n\
+\r\n\
+diff --git a/gcc/lra-constraints.cc b/gcc/lra-constraints.cc\r\n\
+index 7b74ee2bef7..8685c4f97e4 100644\r\n\
+--- a/gcc/lra-constraints.cc\r\n\
++++ b/gcc/lra-constraints.cc\r\n\
+@@ -1,3 +1,3 @@\r\n\
+-  int x =3D 0;\r\n\
++  int x =3D 1;\r\n";
+
+        let (meta, patch) = parse_email(raw).unwrap();
+        assert!(meta.is_patch_or_cover);
+        let patch = patch.expect("expected decoded patch");
+        assert!(patch.diff.contains("-  int x = 0;\n+  int x = 1;"));
+        assert!(!patch.diff.contains("=3D"));
+    }
+
+    #[test]
+    fn test_parse_email_extracts_attached_format_patch() {
+        let raw = b"Message-ID: <attached-patch@example.com>\r\n\
+From: Dev <dev@gcc.gnu.org>\r\n\
+Subject: [PATCH] tree-vect: fix loop bound\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+\r\n\
+--BOUNDARY\r\n\
+Content-Type: text/plain; charset=UTF-8\r\n\
+\r\n\
+Bootstrapped and regtested on x86_64-pc-linux-gnu.\r\n\
+--BOUNDARY\r\n\
+Content-Type: text/x-patch; name=\"0001-fix.patch\"\r\n\
+Content-Disposition: attachment; filename=\"0001-fix.patch\"\r\n\
+\r\n\
+From 0123456789abcdef0123456789abcdef01234567 Mon Sep 17 00:00:00 2001\r\n\
+From: Dev <dev@gcc.gnu.org>\r\n\
+Date: Thu, 22 Oct 2026 10:00:00 +0000\r\n\
+Subject: [PATCH] tree-vect: fix loop bound\r\n\
+\r\n\
+gcc/ChangeLog:\r\n\
+\t* tree-vect-loop.cc: Fix bound.\r\n\
+---\r\n\
+diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc\r\n\
+index 1111111..2222222 100644\r\n\
+--- a/gcc/tree-vect-loop.cc\r\n\
++++ b/gcc/tree-vect-loop.cc\r\n\
+@@ -10,3 +10,3 @@\r\n\
+-  return 0;\r\n\
++  return 1;\r\n\
+--BOUNDARY--\r\n";
+
+        let (meta, patch) = parse_email(raw).unwrap();
+        assert!(meta.is_patch_or_cover);
+        let patch = patch.expect("expected attached patch to be extracted");
+        assert!(patch.diff.contains("diff --git a/gcc/tree-vect-loop.cc"));
+        assert!(
+            !patch.diff.contains("From 0123456789abcdef"),
+            "format-patch envelope header should be stripped"
+        );
+    }
+
+    #[test]
+    fn test_quoted_diff_does_not_produce_patch() {
+        let raw = b"Message-ID: <quoted-diff@example.com>\r\n\
+From: Reviewer <reviewer@gcc.gnu.org>\r\n\
+Subject: Re: [PATCH] fix bug\r\n\
+\r\n\
+On Thu, Oct 22, Author wrote:\r\n\
+> diff --git a/file.c b/file.c\r\n\
+> --- a/file.c\r\n\
+> +++ b/file.c\r\n\
+> @@ -1 +1 @@\r\n\
+> -old\r\n\
+> +new\r\n";
+
+        let (meta, patch) = parse_email(raw).unwrap();
+        assert!(!meta.is_patch_or_cover);
+        assert!(patch.is_none());
+    }
+
+    #[test]
+    fn test_diffless_ping_is_not_patchset() {
+        for subject in [
+            "Ping: [PATCH] c++: fix template",
+            "[PING] [PATCH] c++: fix template",
+            "[PING^2][PATCH] c++: fix template",
+        ] {
+            let raw =
+                format!("Message-ID: <ping@example.com>\r\nSubject: {subject}\r\n\r\nPing!\r\n");
+            let (meta, patch) = parse_email(raw.as_bytes()).unwrap();
+            assert!(
+                !meta.is_patch_or_cover,
+                "diffless ping '{subject}' should not be treated as a patchset"
+            );
+            assert!(patch.is_none());
+        }
+    }
+
+    #[test]
+    fn test_commit_tag_subject_index() {
+        assert_eq!(
+            parse_subject_index("[gccrs COMMIT 10/12] gccrs: add check"),
+            (10, 12)
+        );
     }
 }
