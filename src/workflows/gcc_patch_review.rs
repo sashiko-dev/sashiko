@@ -18,8 +18,9 @@
 //! reusing [`LinuxPatchReviewState`] and shared verification helpers while
 //! organizing discovery into seven orthogonal issue-class stages (`goal`,
 //! `implementation`, `execution-flow`, `resources`, `types-math`,
-//! `state-invalidation`, and `diagnostics-abi`) paired with dynamic subsystem
-//! guide selection in `pre-screen`.
+//! `state-invalidation`, and `diagnostics-abi`) paired with per-patch
+//! maintainer notes (`<maintainer_notes>`) and auto-generated code notes
+//! (`<code_notes>`).
 
 use std::path::PathBuf;
 
@@ -29,11 +30,11 @@ use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
     StagePolicy, ToolScope, Workflow,
 };
-use crate::workflows::guard::{normalize_guide_name, normalize_stage_name, sanitize_guide_name};
+use crate::workflows::guard::{normalize_guide_name, normalize_stage_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PlanningOutput, PostVerificationOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER,
-    StageConcernsOutput, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
+    PlanningOutput, PostVerificationOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
+    VerificationOutput, append_stage_dismissed_concerns_with_prompts,
     append_stage_items_with_prompts, apply_planning_stage_output,
     apply_post_verification_stage_output, apply_verification_stage_output,
     batch_hard_cases_by_severity, build_stage_efforts_schema, collect_stage_prompts,
@@ -126,8 +127,9 @@ Target Commit:
         let mut paths = vec![PathBuf::from("review-core.md")];
         if !s.selected_guides.is_empty() {
             for guide in &s.selected_guides {
-                paths.push(PathBuf::from("subsystem").join(guide));
-                paths.push(PathBuf::from("patterns").join(guide));
+                let name = normalize_guide_name(guide);
+                paths.push(PathBuf::from("subsystem").join(name));
+                paths.push(PathBuf::from("patterns").join(name));
             }
         }
         paths
@@ -395,7 +397,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "execution-flow",
         short: "Execution Flow",
         instruction: STAGE_EXECUTION_FLOW_INSTRUCTION,
-        guides: &["technical-patterns.md"],
+        guides: &[],
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
@@ -664,56 +666,6 @@ fn format_inline_feedback(violation: &str) -> String {
 // ---------------------------------------------------------------------------
 // Stage Builders
 // ---------------------------------------------------------------------------
-
-pub fn prescreen_stage() -> Stage<GccPatchReviewState, PrescreenOutput> {
-    prescreen_stage_with_effort(None)
-}
-
-pub fn prescreen_stage_with_effort(
-    effort: Option<crate::ai::EffortMode>,
-) -> Stage<GccPatchReviewState, PrescreenOutput> {
-    Stage::builder("pre-screen")
-        .system_prompt(PromptTemplate::<GccPatchReviewState>::new(
-            "You are an AI assistant preparing a GCC compiler patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"gimple-ssa.md\", \"match-fold.md\"]}\n```",
-        ))
-        .user_prompt(
-            PromptTemplate::<GccPatchReviewState>::new(
-                "<subsystem_guide_index>\n@include(\"subsystem/subsystem.md\")\n</subsystem_guide_index>\n\n<patch>\n{{target_commit_diff}}\n</patch>",
-            )
-            .with_var("target_commit_diff", |s: &GccPatchReviewState| {
-                s.target_commit_diff.clone()
-            })
-            .include_file("subsystem/subsystem.md"),
-        )
-        .output_format(OutputFormat::json_with_schema(json!({
-            "type": "object",
-            "properties": {
-                "selected_prompts": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                }
-            },
-            "required": ["selected_prompts"]
-        })))
-        .policy(StagePolicy {
-            tools: ToolScope::None,
-            max_turns: 1,
-            reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
-            ..Default::default()
-        })
-        .skip_if(|s| s.manual_stages.is_some())
-        .reduce(|state, out: PrescreenOutput| {
-            let prompts: Vec<String> = out
-                .selected_prompts
-                .into_iter()
-                .map(|name| normalize_guide_name(&name).to_string())
-                .filter(|name| !is_stage_exclusive_guide(name))
-                .filter(|name| sanitize_guide_name(name))
-                .collect();
-            state.selected_guides = prompts;
-        })
-        .build()
-}
 
 pub fn validate_gcc_planning_output_with_effort(
     out: &PlanningOutput,
@@ -1196,7 +1148,6 @@ pub fn build_gcc_patch_review_workflow_with_effort(
 ) -> Workflow<GccPatchReviewState> {
     let stage_max_turns = max_turns.min(20);
     Workflow::builder("gcc_patch_review")
-        .stage(prescreen_stage_with_effort(effort))
         .dynamic_parallel(
             planning_stage_with_effort(effort),
             move |state| resolve_analysis_stages_with_options(state, stage_max_turns, temperature),
@@ -1308,23 +1259,50 @@ mod tests {
     }
 
     #[test]
-    fn test_gcc_subsystem_guides_not_filtered_by_stage_exclusive_check() {
-        assert!(is_stage_exclusive_guide("technical-patterns.md"));
-        for guide in [
-            "gimple-ssa.md",
-            "match-fold.md",
-            "rtl-backend.md",
-            "c-cpp-frontend.md",
-            "fortran-frontend.md",
-            "ipa-lto.md",
-            "ggc-memory.md",
-            "libstdcxx.md",
-        ] {
+    fn test_gcc_no_stage_exclusive_guides_after_notes_migration() {
+        for def in ANALYSIS_STAGES {
             assert!(
-                !is_stage_exclusive_guide(guide),
-                "subsystem guide {guide} must not be treated as stage-exclusive so pre-screen can inject it into all stages"
+                def.guides.is_empty(),
+                "stage {} should rely on maintainer_notes and code_notes instead of static stage guides",
+                def.name
             );
         }
+        assert!(!is_stage_exclusive_guide("technical-patterns.md"));
+    }
+
+    #[test]
+    fn test_gcc_resolve_notes_selects_maintainer_and_code_notes() {
+        let prompts_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("projects/gcc/prompts");
+        let files = vec!["gcc/tree-ssa-phiopt.cc".to_string()];
+        let diff = "\
+diff --git a/gcc/tree-ssa-phiopt.cc b/gcc/tree-ssa-phiopt.cc
+--- a/gcc/tree-ssa-phiopt.cc
++++ b/gcc/tree-ssa-phiopt.cc
+@@ -100,3 +100,4 @@
++  reset_flow_sensitive_info (lhs);
+";
+
+        let all_maint = crate::notes::maintainer_notes::load_maintainer_notes(&prompts_dir);
+        let idents = crate::notes::maintainer_notes::diff_identifiers_all(diff);
+        let matched_maint: Vec<_> = all_maint
+            .iter()
+            .filter(|n| n.applies(&files, &idents))
+            .collect();
+        let maint_block = crate::notes::maintainer_notes::render_maintainer_notes(&matched_maint);
+        assert!(
+            maint_block.contains("GIMPLE, SSA, and Algebraic Folding"),
+            "expected middle-end maintainer note to be selected"
+        );
+
+        let sets = crate::notes::select::load_sets(&prompts_dir);
+        assert!(!sets.is_empty(), "expected GCC notes/17 set to load");
+        let code_notes = crate::notes::select::select_notes(&sets[0], &files, None);
+        let code_block = crate::notes::select::render_block(&sets[0], &code_notes);
+        assert!(
+            code_block.contains("tree-optimization"),
+            "expected tree-optimization code note to be selected"
+        );
     }
 
     #[test]

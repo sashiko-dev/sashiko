@@ -238,10 +238,14 @@ mod tests {
             "gcc/severity.md",
             "gcc/false-positive-guide.md",
             "gcc/inline-template.md",
-            "gcc/technical-patterns.md",
-            "gcc/subsystem/subsystem.md",
             "gcc/maintainers/general.md",
+            "gcc/maintainers/c-cpp-frontend.md",
+            "gcc/maintainers/middle-end.md",
+            "gcc/maintainers/rtl-backend.md",
+            "gcc/maintainers/libstdcxx.md",
             "gcc/notes/profile.toml",
+            "gcc/notes/17/manifest.json",
+            "gcc/notes/17/units/tree-optimization.md",
         ];
         for path in required_framing {
             assert!(
