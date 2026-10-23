@@ -766,6 +766,17 @@ pub fn extract_version_tag(subject: &str) -> Option<String> {
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
 }
 
+pub fn extract_gcc_release_branch(subject: &str) -> Option<u32> {
+    static GCC_BRANCH_RE: OnceLock<Regex> = OnceLock::new();
+    let re = GCC_BRANCH_RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:\breleases/gcc-(\d{1,2})\b|\[[^\]]*\bgcc[- ]?(\d{1,2})\b[^\]]*\])")
+            .unwrap()
+    });
+    let caps = re.captures(subject)?;
+    let num = caps.get(1).or_else(|| caps.get(2))?.as_str();
+    num.parse().ok()
+}
+
 fn subject_version_candidates(
     subject: &str,
     has_non_linux_mainline: bool,
@@ -777,6 +788,14 @@ fn subject_version_candidates(
             .then(|| (version.strip_suffix(".y").unwrap_or(version), None))
     });
     let mut candidates = Vec::new();
+    if let Some(gcc_major) = extract_gcc_release_branch(subject) {
+        candidates.push(BaselineResolution::LocalRef(format!(
+            "origin/releases/gcc-{gcc_major}"
+        )));
+        candidates.push(BaselineResolution::LocalRef(format!(
+            "releases/gcc-{gcc_major}"
+        )));
+    }
     if !has_non_linux_mainline && let Some((first, last)) = stable_versions {
         for version in std::iter::once(first).chain(last) {
             candidates.push(BaselineResolution::RemoteTarget {
@@ -1709,6 +1728,37 @@ F: patterns/
                 name: "origin".to_string(),
                 branch: Some("master".to_string()),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gcc_release_branch_subject_candidates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: temp_dir.path().to_path_buf(),
+            mainline_remote: Some((
+                "git://gcc.gnu.org/git/gcc.git".to_string(),
+                "origin".to_string(),
+            )),
+        };
+
+        let candidates = registry
+            .resolve_candidates(&[], "[PATCH gcc-15] c++: backport fix", None)
+            .await;
+        assert_eq!(
+            candidates,
+            vec![
+                BaselineResolution::LocalRef("origin/releases/gcc-15".to_string()),
+                BaselineResolution::LocalRef("releases/gcc-15".to_string()),
+                BaselineResolution::RemoteTarget {
+                    url: "git://gcc.gnu.org/git/gcc.git".to_string(),
+                    name: "origin".to_string(),
+                    branch: Some("master".to_string()),
+                },
+            ]
         );
     }
 }

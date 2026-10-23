@@ -287,18 +287,23 @@ impl GitWorktree {
         Ok(worktree)
     }
 
-    #[allow(dead_code)]
-    pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
-        info!("Applying patch in {:?}", self.path);
-
-        let mut child = crate::git_cmd::in_dir_async(&self.path)
-            .env("LC_ALL", "C")
+    async fn run_git_am(
+        &self,
+        patch_content: &str,
+        three_way: bool,
+    ) -> Result<std::process::Output> {
+        let mut cmd = crate::git_cmd::in_dir_async(&self.path);
+        cmd.env("LC_ALL", "C")
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
             .env("GIT_COMMITTER_NAME", "Sashiko Bot")
             .env("GIT_COMMITTER_EMAIL", "sashiko@localhost")
             .args(["-c", "safe.bareRepository=all"])
-            .arg("am")
+            .arg("am");
+        if three_way {
+            cmd.arg("--3way");
+        }
+        let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -310,20 +315,40 @@ impl GitWorktree {
             stdin.write_all(patch_content.as_bytes()).await?;
         }
 
-        let output = child.wait_with_output().await?;
+        Ok(child.wait_with_output().await?)
+    }
 
-        if !output.status.success() {
-            let _ = crate::git_cmd::in_dir_async(&self.path)
-                .args(["-c", "safe.bareRepository=all"])
-                .arg("am")
-                .arg("--abort")
-                .output()
-                .await;
+    async fn abort_git_am(&self) {
+        let _ = crate::git_cmd::in_dir_async(&self.path)
+            .args(["-c", "safe.bareRepository=all"])
+            .arg("am")
+            .arg("--abort")
+            .output()
+            .await;
+    }
 
-            return Err(GitAmError::new(&output.stdout, &output.stderr).into());
+    #[allow(dead_code)]
+    pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
+        info!("Applying patch in {:?}", self.path);
+
+        let output = self.run_git_am(patch_content, false).await?;
+        if output.status.success() {
+            return Ok(());
         }
 
-        Ok(())
+        self.abort_git_am().await;
+        let first_err = GitAmError::new(&output.stdout, &output.stderr);
+
+        if first_err.kind == PatchApplyFailure::ContextMismatch
+            && let Ok(retry_output) = self.run_git_am(patch_content, true).await
+        {
+            if retry_output.status.success() {
+                return Ok(());
+            }
+            self.abort_git_am().await;
+        }
+
+        Err(first_err.into())
     }
 
     pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
@@ -2108,6 +2133,50 @@ mod tests {
                 run_test_git(&worktree.path, &["rev-parse", "--git-path", "rebase-apply"]).await?;
             assert!(!worktree.path.join(am_state).exists());
         }
+        worktree.remove().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_falls_back_to_three_way_merge() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        run_test_git(repo.path(), &["init", "-q", "-b", "main"]).await?;
+        run_test_git(repo.path(), &["config", "user.name", "Test User"]).await?;
+        run_test_git(repo.path(), &["config", "user.email", "test@example.com"]).await?;
+
+        std::fs::write(
+            repo.path().join("value.txt"),
+            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n",
+        )?;
+        run_test_git(repo.path(), &["add", "value.txt"]).await?;
+        run_test_git(repo.path(), &["commit", "-q", "-s", "-m", "base"]).await?;
+        let base_sha = get_commit_hash(repo.path(), "HEAD").await?;
+
+        std::fs::write(
+            repo.path().join("value.txt"),
+            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8_modified\n",
+        )?;
+        run_test_git(repo.path(), &["commit", "-q", "-a", "-s", "-m", "patch"]).await?;
+        let mbox = run_test_git(repo.path(), &["format-patch", "--stdout", "-1", "HEAD"]).await?;
+
+        run_test_git(repo.path(), &["reset", "--hard", &base_sha]).await?;
+        std::fs::write(
+            repo.path().join("value.txt"),
+            "prepended\nline1\nline2\nline3\nline4\nline5\nline6_changed_context\nline7\nline8\n",
+        )?;
+        run_test_git(
+            repo.path(),
+            &["commit", "-q", "-a", "-s", "-m", "advance main"],
+        )
+        .await?;
+        let head = get_commit_hash(repo.path(), "HEAD").await?;
+
+        let worktree = GitWorktree::new(repo.path(), &head, None).await?;
+        worktree.apply_patch(&mbox).await?;
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("value.txt"))?,
+            "prepended\nline1\nline2\nline3\nline4\nline5\nline6_changed_context\nline7\nline8_modified\n"
+        );
         worktree.remove().await?;
         Ok(())
     }

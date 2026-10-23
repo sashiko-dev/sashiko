@@ -1753,17 +1753,13 @@ impl Reviewer {
                     "Failed to resolve prerequisites: {}\n",
                     redact_secret(&format!("{e:#}")),
                 );
-                error!("{}", message.trim());
+                warn!("{}", message.trim());
                 attempts.push(BaselineAttempt {
                     baseline: "prerequisites".to_string(),
                     status: "Failed".to_string(),
                     log: message,
                 });
-                return (
-                    None,
-                    HashMap::new(),
-                    serde_json::to_string(&attempts).unwrap_or_default(),
-                );
+                Vec::new()
             }
         };
         let repo_path = PathBuf::from(&ctx.settings.git.repository_path);

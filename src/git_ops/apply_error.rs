@@ -115,7 +115,7 @@ impl PatchApplyFailure {
 #[derive(Debug, thiserror::Error)]
 #[error("git am failed. stdout: {stdout}\nstderr: {stderr}")]
 pub(super) struct GitAmError {
-    kind: PatchApplyFailure,
+    pub(super) kind: PatchApplyFailure,
     stdout: String,
     stderr: String,
 }
