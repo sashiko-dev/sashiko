@@ -157,6 +157,10 @@ impl Reviewer {
             .expect("Failed to create AI provider");
 
         let llm_concurrency = crate::ai::concurrency_limited_provider::llm_permits(concurrency);
+        let quota_manager = Arc::new(QuotaManager::with_limits(
+            settings.ai.max_rps,
+            settings.ai.max_tpm,
+        ));
 
         Self {
             db,
@@ -164,7 +168,7 @@ impl Reviewer {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             llm_semaphore: Arc::new(Semaphore::new(llm_concurrency)),
             baseline_registry,
-            quota_manager: Arc::new(QuotaManager::new()),
+            quota_manager,
             provider,
             worker_overrides: WorkerSubprocessOverrides::default(),
             initialized: std::sync::atomic::AtomicBool::new(false),
@@ -2454,16 +2458,6 @@ async fn run_review_tool_with_cmd_and_overrides(
     llm_semaphore: Arc<Semaphore>,
     worker_overrides: &WorkerSubprocessOverrides,
 ) -> Result<serde_json::Value> {
-    // Cap concurrent model calls with the shared limiter instead of taking the
-    // semaphore by hand around each call. This also releases the permit as soon
-    // as the call returns, so a request that is backing off no longer occupies
-    // a slot while it sleeps.
-    let provider: Arc<dyn AiProvider> = Arc::new(
-        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
-            provider,
-            llm_semaphore.clone(),
-        ),
-    );
     // Always, in practice: the daemon is required to name one. Without the flag
     // a worker puts its worktree under the system temporary directory.
     if !settings.git.repository_path.trim().is_empty() {
@@ -2607,15 +2601,30 @@ async fn run_review_tool_with_cmd_and_overrides(
     // Retry rate-limited and transient failures with the shared limiter rather
     // than an open-coded loop. A review is bounded by its activity deadline
     // rather than an attempt count, and time spent waiting out a rate limit is
-    // credited back so it does not consume that budget.
-    let provider: Arc<dyn AiProvider> =
+    // credited back only when no sibling request is actively in flight.
+    // Wrap concurrency and backoff decorators inside any outer response cache,
+    // so cache hits do not acquire concurrency permits or consume rate-limit quota.
+    let quota_manager = quota_manager.clone();
+    let deadline_budget = Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
+        deadline.clone(),
+    ));
+    let budget_for_watchdog = deadline_budget.clone();
+    let llm_semaphore = llm_semaphore.clone();
+    let provider: Arc<dyn AiProvider> = crate::ai::decorate_uncached(provider, move |p| {
+        let limited: Arc<dyn AiProvider> = Arc::new(
+            crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+                p,
+                llm_semaphore.clone(),
+            )
+            .with_budget(Some(deadline_budget.clone()))
+            .with_quota(Some(quota_manager.clone())),
+        );
         Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
-            provider,
+            limited,
             quota_manager.clone(),
-            Some(Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
-                deadline.clone(),
-            ))),
-        ));
+            Some(deadline_budget.clone()),
+        ))
+    });
 
     let mut spawned_tasks = Vec::new();
     let interaction_result =
@@ -2642,10 +2651,7 @@ async fn run_review_tool_with_cmd_and_overrides(
             cancel_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
-                let current_deadline = {
-                    let d = deadline.lock().unwrap();
-                    *d
-                };
+                let current_deadline = budget_for_watchdog.current_deadline();
 
                 tokio::select! {
                     biased;
@@ -2667,6 +2673,15 @@ async fn run_review_tool_with_cmd_and_overrides(
                         let line_result = match line_res {
                             Ok(res) => res,
                             Err(_) => {
+                                let new_deadline = budget_for_watchdog.current_deadline();
+                                if new_deadline > tokio::time::Instant::now() {
+                                    let remaining = new_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    if remaining < Duration::from_millis(100) {
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    continue;
+                                }
                                 return Err(anyhow::anyhow!(
                                     "Review tool timed out (active time exceeded)"
                                 ));

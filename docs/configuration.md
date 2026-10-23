@@ -131,6 +131,8 @@ Core AI settings that apply to all providers.
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
 | `response_cache` | bool | `false` | Cache AI responses to disk. The daemon keeps the cache beside its database; a local review, which has none, keeps it under `$XDG_DATA_HOME/sashiko/`. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. |
 | `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). Entries stranded by a settings change age out on this schedule. |
+| `max_rps` | float | -- | Maximum outgoing AI review requests per second across the review pipeline (e.g. `1.0`, or `0.2` for one request every 5 seconds). Unset or `0` disables RPS pacing. |
+| `max_tpm` | integer | -- | Maximum tokens per minute (trailing 60-second sliding-window limit on completed uncached input + completion tokens) across the review pipeline. Unset or `0` disables client-side TPM throttling. |
 
 #### `[ai.claude]`
 
@@ -291,7 +293,7 @@ pass.
 |-----|------|---------|-------------|
 | `concurrency` | integer | -- | Number of concurrent reviews. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during daemon reviews. The daemon empties it on startup, so it must hold nothing else. |
-| `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
+| `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). Idle wait time spent parked on shared rate limits (RPS/TPM pacing or 429 backoff) while no requests of this review are in flight is credited back to the deadline. |
 | `max_retries` | integer | `3` | Retry count on transient failures. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |

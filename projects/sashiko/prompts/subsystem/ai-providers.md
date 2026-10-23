@@ -311,18 +311,23 @@ order is not cosmetic.
 
 ```
 local_review::decorate_provider          reviewer::run_review_tool_with_cmd
-  BackoffProvider          (outermost)     BackoffProvider (+ DeadlineBudget)
-  ConcurrencyLimitedProvider              ConcurrencyLimitedProvider
   LoggingProvider (if [ai] log_turns)     (turn logging lives in the worker)
-  CachingAiProvider (if response_cache)   CachingAiProvider
+  CachingAiProvider (if response_cache)   CachingAiProvider (if response_cache)
+  BackoffProvider                         BackoffProvider (+ DeadlineBudget)
+  ConcurrencyLimitedProvider              ConcurrencyLimitedProvider
   concrete provider                       concrete provider
 ```
 
 The cache is applied by `create_provider_cached(ai, database)`, taking an
 `&AiSettings` and an `Option<&str>` location hint, which wraps the raw
-provider *before* anything else sees it; the limiters are added later, by
-the front end. It consults `ai.response_cache` itself and hands back the
-bare provider when that is off or the provider is `stdio-*`, so
+provider *before* anything else sees it; the front ends then call
+`decorate_uncached(provider, ...)` to wrap the inner provider with
+`ConcurrencyLimitedProvider` and `BackoffProvider` while keeping
+`CachingAiProvider` outermost (with `LoggingProvider` outermost when
+`log_turns` is enabled so cached turns are also logged). That way, cache
+hits return immediately without acquiring concurrency permits or consuming
+rate-limit quota. It consults `ai.response_cache` itself and hands back
+the bare provider when that is off or the provider is `stdio-*`, so
 `create_provider` and `create_provider_from_ai` never cache at all. What
 `database` does with the location is section 5(b).
 
@@ -333,18 +338,15 @@ same point about the daemon, which previously held the semaphore across
 its backoff sleep. Inverting these two is a correctness bug that presents
 as a review that stalls with idle capacity.
 
-**Invariant: the cache stays innermost.** `BackoffProvider`,
-`ConcurrencyLimitedProvider` and `LoggingProvider` each forward
-`get_capabilities` and `cache_stats` but **none of them override
-`cache_identity`** — they inherit the trait default, which returns
-`get_capabilities().model_name`. Today that is harmless because
-`CachingAiProvider` wraps the concrete provider directly. A diff that
-reorders the stack so the cache sits outside any decorator silently drops
-every knob from the cache key — a raised `max_tokens` or `effort` would
-then replay the answer recorded under the old one, which is precisely
-what `f53ca41c8c98`/`17725fcef7b9` existed to prevent. **If a diff adds a
-fourth decorator, it should forward `cache_identity` too, even though
-nothing needs it yet.**
+**Invariant: decorators inside the cache forward `cache_identity` and `cache_stats`.**
+Because `CachingAiProvider` sits outside concurrency and backoff, it queries
+`self.inner.cache_identity()` to incorporate provider knobs (such as
+`max_tokens` or `effort`) into cache keys. `BackoffProvider` and
+`ConcurrencyLimitedProvider` forward `cache_identity`, `get_capabilities`,
+and `cache_stats` down to the inner provider (while `LoggingProvider` sits
+outermost above `CachingAiProvider` and forwards `cache_stats` and `forget`).
+Any decorator placed inside `CachingAiProvider` must forward `cache_identity`
+so knob changes are not lost from the cache key.
 
 **Invariant: one semaphore per run, not per provider.**
 `ConcurrencyLimitedProvider::new` takes an `Arc<Semaphore>` the caller
@@ -393,11 +395,11 @@ distinction is the point of the file:
   carries no `Retry-After`, so without it concurrent callers re-collide.
 - `Fatal` → returned immediately, no sleep.
 
-`DeadlineBudget` credits quota wait time back to the caller's deadline so
-a rate-limit window does not eat a review's activity budget. Its
-`last_credit_end` de-duplication matters because several concurrent tasks
-wake from the *same* window and each reports the full sleep;
-`deadline_budget_credit_wait_deduplicates_overlapping_sleeps` pins it.
+`DeadlineBudget` credits quota wait time back to the caller's deadline only
+when no sibling requests of the review are in flight, so a rate-limit window
+while completely idle does not eat a review's activity budget. Its
+`last_credit_end` and `last_active_end` tracking de-duplicates overlapping
+sleeps and clamps credit to intervals after previous active requests finished.
 With a budget, `max_attempts` is `None` and the loop runs until the
 deadline; without one it falls back to `MAX_ATTEMPTS = 6`.
 
@@ -608,8 +610,10 @@ Things a diff must not undo:
 - [ ] New retry path in `SessionRunner`: does it decrement `turns`? Is it
       bounded by a counter?
 - [ ] New `LlmSession`: can `call_tools` return `Err`? It must not.
-- [ ] Decorator order unchanged (backoff outermost, cache innermost), and
-      any new decorator forwards `cache_identity` and `cache_stats`.
+- [ ] Decorator order maintained (`LoggingProvider` outermost when enabled,
+      `CachingAiProvider` outside backoff and concurrency limit), and any
+      decorator inside `CachingAiProvider` forwards `cache_identity`,
+      `cache_stats`, and `forget`.
 - [ ] New logging: prefixed with `get_log_prefix()`, no secrets, errors
       formatted `{:#}`.
 - [ ] Subprocess providers: `.kill_on_drop(true)` (`c3e31b737178`), prompt

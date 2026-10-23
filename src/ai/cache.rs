@@ -6,16 +6,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities, get_log_prefix};
+use super::{
+    AiProvider, AiProviderDecorator, AiRequest, AiResponse, CacheStats, ProviderCapabilities,
+    get_log_prefix,
+};
 
-pub struct CachingAiProvider {
-    inner: Arc<dyn AiProvider>,
+pub struct ResponseCacheStore {
     conn: libsql::Connection,
     session_start: i64,
     hits_this: AtomicU64,
     hits_prev: AtomicU64,
     tokens_saved_this: AtomicU64,
     tokens_saved_prev: AtomicU64,
+}
+
+pub struct CachingAiProvider {
+    inner: Arc<dyn AiProvider>,
+    store: Arc<ResponseCacheStore>,
 }
 
 impl CachingAiProvider {
@@ -74,15 +81,16 @@ impl CachingAiProvider {
 
         info!("Response cache enabled ({})", cache_path);
 
-        Ok(Self {
-            inner,
+        let store = Arc::new(ResponseCacheStore {
             conn,
             session_start,
             hits_this: AtomicU64::new(0),
             hits_prev: AtomicU64::new(0),
             tokens_saved_this: AtomicU64::new(0),
             tokens_saved_prev: AtomicU64::new(0),
-        })
+        });
+
+        Ok(Self { inner, store })
     }
 
     fn compute_cache_key(&self, request: &AiRequest) -> String {
@@ -107,11 +115,23 @@ impl CachingAiProvider {
 
 #[async_trait]
 impl AiProvider for CachingAiProvider {
+    fn map_cached_inner(
+        &self,
+        decorator: &mut Option<AiProviderDecorator>,
+    ) -> Option<Arc<dyn AiProvider>> {
+        let f = decorator.take()?;
+        Some(Arc::new(Self {
+            inner: f(self.inner.clone()),
+            store: self.store.clone(),
+        }))
+    }
+
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let hash = self.compute_cache_key(&request);
         let hash_prefix = &hash[..12];
 
         let mut rows = self
+            .store
             .conn
             .query(
                 "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
@@ -124,16 +144,18 @@ impl AiProvider for CachingAiProvider {
             let tokens_saved: i64 = row.get(1)?;
             let created_at: i64 = row.get(2)?;
             if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
-                let (origin, total) = if created_at >= self.session_start {
-                    self.hits_this.fetch_add(1, Ordering::Relaxed);
+                let (origin, total) = if created_at >= self.store.session_start {
+                    self.store.hits_this.fetch_add(1, Ordering::Relaxed);
                     let t = self
+                        .store
                         .tokens_saved_this
                         .fetch_add(tokens_saved as u64, Ordering::Relaxed)
                         + tokens_saved as u64;
                     ("this session", t)
                 } else {
-                    self.hits_prev.fetch_add(1, Ordering::Relaxed);
+                    self.store.hits_prev.fetch_add(1, Ordering::Relaxed);
                     let t = self
+                        .store
                         .tokens_saved_prev
                         .fetch_add(tokens_saved as u64, Ordering::Relaxed)
                         + tokens_saved as u64;
@@ -173,6 +195,7 @@ impl AiProvider for CachingAiProvider {
             .as_secs() as i64;
 
         let _ = self
+            .store
             .conn
             .execute(
                 "INSERT OR REPLACE INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -201,10 +224,10 @@ impl AiProvider for CachingAiProvider {
 
     fn cache_stats(&self) -> Option<CacheStats> {
         Some(CacheStats {
-            hits_this_session: self.hits_this.load(Ordering::Relaxed),
-            hits_prev_session: self.hits_prev.load(Ordering::Relaxed),
-            tokens_saved_this_session: self.tokens_saved_this.load(Ordering::Relaxed),
-            tokens_saved_prev_session: self.tokens_saved_prev.load(Ordering::Relaxed),
+            hits_this_session: self.store.hits_this.load(Ordering::Relaxed),
+            hits_prev_session: self.store.hits_prev.load(Ordering::Relaxed),
+            tokens_saved_this_session: self.store.tokens_saved_this.load(Ordering::Relaxed),
+            tokens_saved_prev_session: self.store.tokens_saved_prev.load(Ordering::Relaxed),
         })
     }
 
@@ -213,6 +236,7 @@ impl AiProvider for CachingAiProvider {
         // Like the insert above, a failure here is not fatal: the worst case
         // is that a retry is served this answer again, as it was before.
         let result = self
+            .store
             .conn
             .execute(
                 "DELETE FROM response_cache WHERE request_hash = ?",

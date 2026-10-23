@@ -107,6 +107,7 @@ jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"], optional = true
 rcgen = "0.14"
 # Self-signalling, to test what the display does when the terminal is resized.
 rustix = { version = "1.1.4", features = ["process"] }
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.dev]
 debug = 1
