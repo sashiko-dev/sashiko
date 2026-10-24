@@ -340,6 +340,13 @@ fn classify_generate_content_failure(
     error_text: &str,
 ) -> GeminiError {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if error_text.contains("is out of capacity") {
+            let retry_after = retry_after_secs
+                .and_then(valid_retry_after_secs)
+                .unwrap_or(Duration::from_secs(2));
+            let summary = summarize_gemini_error(status, error_text);
+            return GeminiError::TransientError(retry_after, summary);
+        }
         let retry_after = retry_after_secs
             .and_then(valid_retry_after_secs)
             .or_else(|| retry_after_from_body(error_text).and_then(valid_retry_after_secs))
@@ -1519,6 +1526,18 @@ mod tests {
         assert!(matches!(
             err,
             GeminiError::QuotaExceeded(d) if d == Duration::from_secs_f64(31.0)
+        ));
+
+        let err = classify_generate_content_failure(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            None,
+            r#"{"error":{"code":429,"message":"UTA enforcement: Endpoint 'aistudio' is out of capacity."}}"#,
+        );
+        assert!(matches!(
+            err,
+            GeminiError::TransientError(d, summary)
+                if d == Duration::from_secs(2)
+                    && summary == "429 Too Many Requests: UTA enforcement: Endpoint 'aistudio' is out of capacity."
         ));
 
         let err =
