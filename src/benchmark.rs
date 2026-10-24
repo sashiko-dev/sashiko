@@ -580,6 +580,12 @@ pub async fn run_benchmark(
     info!("Evaluating {} benchmark entries...", entries.len());
     let commit_map = load_all_commit_review_data(&db, &unique_commits).await?;
     let ai_provider = create_provider(&settings).context("Failed to create AI provider")?;
+    let ai_provider: Arc<dyn AiProvider> =
+        Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+            ai_provider,
+            Arc::new(crate::ai::quota::QuotaManager::new()),
+            None,
+        ));
     let results = evaluate_benchmark_entries(
         &entries,
         &commit_map,
