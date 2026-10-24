@@ -165,6 +165,7 @@ pub struct ForgeMetadata {
     pub head_sha: String,
     pub pr_number: i64,
     pub pr_title: Option<String>,
+    pub pr_body: Option<String>,
     pub pr_url: Option<String>,
     pub author: Option<String>,
 }
@@ -250,6 +251,19 @@ pub trait ForgeProvider: Send + Sync {
     fn review_intent(&self, action: &str) -> ReviewIntent;
 }
 
+/// Maximum byte length of a forge PR/MR description stored in the database.
+const MAX_PR_BODY_BYTES: usize = 64 * 1024;
+
+fn truncate_pr_body(raw: &str) -> String {
+    if raw.len() <= MAX_PR_BODY_BYTES {
+        return raw.to_string();
+    }
+    format!(
+        "{}\n...[truncated]...",
+        crate::utils::utf8_prefix(raw, MAX_PR_BODY_BYTES)
+    )
+}
+
 /// GitHub forge provider
 pub struct GitHubForge;
 
@@ -327,6 +341,11 @@ impl ForgeProvider for GitHubForge {
         }
 
         let pr_title = pr["title"].as_str().map(|s| s.to_string());
+        // A cleared description arrives as JSON null; keep it as an empty
+        // body so the stored text is replaced rather than left behind.
+        let pr_body = pr
+            .get("body")
+            .map(|b| truncate_pr_body(b.as_str().unwrap_or("")));
         let pr_url = pr["html_url"].as_str().map(|s| s.to_string());
         let author = pr["user"]["login"]
             .as_str()
@@ -349,6 +368,7 @@ impl ForgeProvider for GitHubForge {
             head_sha,
             pr_number,
             pr_title,
+            pr_body,
             pr_url,
             author,
         };
@@ -459,6 +479,9 @@ impl ForgeProvider for GitLabForge {
         }
 
         let pr_title = attrs["title"].as_str().map(|s| s.to_string());
+        let pr_body = attrs
+            .get("description")
+            .map(|b| truncate_pr_body(b.as_str().unwrap_or("")));
         let pr_url = attrs["url"].as_str().map(|s| s.to_string());
         let author = payload["user"]["username"].as_str().map(|s| s.to_string());
 
@@ -478,6 +501,7 @@ impl ForgeProvider for GitLabForge {
             head_sha,
             pr_number,
             pr_title,
+            pr_body,
             pr_url,
             author,
         };
@@ -607,20 +631,24 @@ pub fn compose_pr_review_comment(
     }
 
     for patch in patches_with_findings {
-        let short_sha = patch
-            .commit_id
-            .as_deref()
-            .filter(|s| s.len() >= 8)
-            .map(|s| &s[..8]);
-        let title_line = match short_sha {
-            Some(sha) => format!(
-                "#### Commit {}/{} — `{}` {}\n\n",
-                patch.part_index, patch.total_parts, sha, patch.subject
-            ),
-            None => format!(
-                "#### Commit {}/{} — {}\n\n",
-                patch.part_index, patch.total_parts, patch.subject
-            ),
+        let title_line = if patch.part_index == 0 {
+            "#### Series / PR Review\n\n".to_string()
+        } else {
+            let short_sha = patch
+                .commit_id
+                .as_deref()
+                .filter(|s| s.len() >= 8)
+                .map(|s| crate::utils::utf8_prefix(s, 8));
+            match short_sha {
+                Some(sha) => format!(
+                    "#### Commit {}/{} — `{}` {}\n\n",
+                    patch.part_index, patch.total_parts, sha, patch.subject
+                ),
+                None => format!(
+                    "#### Commit {}/{} — {}\n\n",
+                    patch.part_index, patch.total_parts, patch.subject
+                ),
+            }
         };
         out.push_str(&title_line);
 
@@ -1059,6 +1087,7 @@ mod tests {
                 "base": {"sha": &base_sha},
                 "number": 42,
                 "title": "Fix something",
+                "body": "Detailed PR motivation and problem statement.",
                 "html_url": "https://github.com/org/repo/pull/42"
             },
             "repository": {"clone_url": "https://github.com/org/repo.git"}
@@ -1068,6 +1097,10 @@ mod tests {
         assert_eq!(action, "opened");
         assert_eq!(metadata.pr_number, 42);
         assert_eq!(metadata.head_sha, valid_sha);
+        assert_eq!(
+            metadata.pr_body.as_deref(),
+            Some("Detailed PR motivation and problem statement.")
+        );
     }
 
     #[test]
@@ -1122,6 +1155,7 @@ mod tests {
                 "diff_refs": {"base_sha": &valid_sha},
                 "iid": 10,
                 "title": "Fix bug",
+                "description": "GitLab MR description body.",
                 "url": "https://gitlab.com/org/repo/-/merge_requests/10"
             },
             "project": {"git_http_url": "https://gitlab.com/org/repo.git"}
@@ -1130,6 +1164,10 @@ mod tests {
         let (action, metadata) = forge.parse_payload(&body).unwrap();
         assert_eq!(action, "merge_request");
         assert_eq!(metadata.pr_number, 10);
+        assert_eq!(
+            metadata.pr_body.as_deref(),
+            Some("GitLab MR description body.")
+        );
     }
 
     // --- HMAC verification tests ---
@@ -1588,6 +1626,39 @@ mod tests {
                 "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-v3)"
             )
         );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_with_series_review_finding() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 0,
+                total_parts: 2,
+                commit_id: None,
+                subject: "Series / PR Review".to_string(),
+                inline_review: Some(
+                    "Severity: MEDIUM\nPR description claims a metrics endpoint is added, but no endpoint is registered.".to_string(),
+                ),
+            },
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 2,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "clean commit".to_string(),
+                inline_review: Some("No issues found.".to_string()),
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(2),
+            1,
+            Some("Series summary text."),
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/mr-502-v2",
+        );
+        assert!(body.starts_with("### Sashiko review — v2\n\n"));
+        assert!(!body.contains("No issues found"));
+        assert!(body.contains("#### Series / PR Review\n\nSeverity: MEDIUM\nPR description claims a metrics endpoint is added"));
+        assert!(!body.contains("clean commit"));
     }
 
     #[test]

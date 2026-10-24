@@ -595,6 +595,441 @@ pub fn inject_changelog_into_git_show(git_show: &str, changelog: &str) -> String
     }
 }
 
+const MAX_TRAILER_SCAN_LINES: usize = 2000;
+const MAX_TRAILER_LINE_BYTES: usize = 2048;
+const MAX_EXTRACTED_REF_IDS: usize = 128;
+
+fn is_valid_b4_change_id_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Metadata extracted from a `b4 prep` empty cover-letter / tracking commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct B4TrackerCommit {
+    pub change_id: Option<String>,
+    pub edited_subject: Option<String>,
+    pub edited_body: Option<String>,
+}
+
+fn is_git_trailer_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some((key, value)) = trimmed.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && !value.trim().is_empty()
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Detect and parse a `b4 prep` empty tracking commit (`--- b4-submit-tracking ---`).
+/// Returns `None` if the commit has a non-empty diff or lacks the tracking marker.
+/// Unedited `EDITME` / `*** SUBJECT HERE ***` / `*** BLURB HERE ***` placeholders
+/// and trailer-only default bodies produce `edited_subject: None` / `edited_body: None`.
+pub fn parse_b4_submit_tracking(
+    subject: &str,
+    message: &str,
+    diff: &str,
+) -> Option<B4TrackerCommit> {
+    if !diff.trim().is_empty() {
+        return None;
+    }
+    if !message
+        .lines()
+        .take(MAX_TRAILER_SCAN_LINES)
+        .any(|l| l.trim() == "--- b4-submit-tracking ---")
+    {
+        return None;
+    }
+
+    let change_id = parse_b4_change_id(message);
+
+    let cleaned_subj = clean_subject(subject);
+    let subj_trimmed = cleaned_subj.trim();
+    let subj_upper = subj_trimmed.to_ascii_uppercase();
+    let edited_subject = if subj_trimmed.is_empty()
+        || subj_upper.starts_with("EDITME")
+        || subj_trimmed == "*** SUBJECT HERE ***"
+    {
+        None
+    } else {
+        Some(subject.trim().to_string())
+    };
+
+    let mut body_lines = Vec::new();
+    let mut has_non_trailer_prose = false;
+    for line in message.lines().take(MAX_TRAILER_SCAN_LINES) {
+        let trimmed = line.trim();
+        if trimmed == "--- b4-submit-tracking ---" {
+            break;
+        }
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let unescaped = if let Some(rest) = line.strip_prefix(">#") {
+            format!("#{}", rest)
+        } else {
+            line.to_string()
+        };
+        let u_trimmed = unescaped.trim();
+        let u_upper = u_trimmed.to_ascii_uppercase();
+        if u_upper.starts_with("EDITME") || u_trimmed == "*** BLURB HERE ***" {
+            continue;
+        }
+        if !u_trimmed.is_empty() && !is_git_trailer_line(u_trimmed) {
+            has_non_trailer_prose = true;
+        }
+        body_lines.push(unescaped);
+    }
+
+    let edited_body = if has_non_trailer_prose {
+        let joined = body_lines.join("\n").trim().to_string();
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    } else {
+        None
+    };
+
+    Some(B4TrackerCommit {
+        change_id,
+        edited_subject,
+        edited_body,
+    })
+}
+
+/// Extract the `b4` `change-id` from a cover letter, patch body, or
+/// `--- b4-submit-tracking ---` JSON block.
+/// Stops scanning at the start of a unified diff and ignores quoted lines or
+/// `prerequisite-change-id:` trailers.
+pub fn parse_b4_change_id(body: &str) -> Option<String> {
+    let mut in_b4_tracking_block = false;
+    for line in body.lines().take(MAX_TRAILER_SCAN_LINES) {
+        if line.starts_with("diff --git ")
+            || line.starts_with("--- a/")
+            || line.starts_with("--- /dev/null")
+        {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed == "--- b4-submit-tracking ---" {
+            in_b4_tracking_block = true;
+            continue;
+        }
+        if trimmed.len() > MAX_TRAILER_LINE_BYTES || trimmed.starts_with('>') {
+            continue;
+        }
+        if in_b4_tracking_block {
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(pos) = trimmed.find("\"change-id\"") {
+                let after_key = &trimmed[pos + "\"change-id\"".len()..];
+                if let Some((_, rhs)) = after_key.split_once(':') {
+                    let rhs = rhs.trim_start();
+                    if let Some(rest) = rhs.strip_prefix('"')
+                        && let Some(end_quote) = rest.find('"')
+                    {
+                        let token = &rest[..end_quote];
+                        if is_valid_b4_change_id_token(token) {
+                            return Some(token.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("change-id") {
+            continue;
+        };
+        let token = value.trim();
+        if is_valid_b4_change_id_token(token) {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_candidate_msgid(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\'' | ',' | '.'
+            )
+        })
+        .trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.len() > MAX_TRAILER_LINE_BYTES || !trimmed.is_ascii() {
+        return None;
+    }
+    let decoded = if trimmed.contains("%40") || trimmed.contains("%2B") || trimmed.contains("%2b") {
+        trimmed
+            .replace("%40", "@")
+            .replace("%2B", "+")
+            .replace("%2b", "+")
+    } else {
+        trimmed.to_string()
+    };
+    if decoded.is_empty()
+        || decoded.len() > 998
+        || decoded
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        || decoded.contains(['<', '>', ':'])
+    {
+        return None;
+    }
+    let (local, domain) = decoded.split_once('@')?;
+    if local.is_empty()
+        || local.starts_with('/')
+        || local.ends_with('/')
+        || domain.is_empty()
+        || !domain.contains('.')
+        || domain.contains('/')
+    {
+        return None;
+    }
+    Some(decoded)
+}
+
+fn lore_url_regex() -> &'static Regex {
+    static RE_LORE_URL: OnceLock<Regex> = OnceLock::new();
+    RE_LORE_URL.get_or_init(|| {
+        Regex::new(
+            r"(?i)https?://(?:lore\.kernel\.org|lkml\.kernel\.org|patchwork\.kernel\.org)/(?:project/[a-z0-9._-]+/(?:patch|cover)/|(?:patch|cover)/|r/|all/|lkml/|[a-z0-9._-]+/)?([^\s?#<>()\[\]]+(?:@|%40)[^/\s?#<>()\[\]]+)",
+        )
+        .expect("static Lore URL regex must compile")
+    })
+}
+
+fn version_msgid_regex() -> &'static Regex {
+    static RE_VER_MSGID: OnceLock<Regex> = OnceLock::new();
+    RE_VER_MSGID.get_or_init(|| {
+        Regex::new(
+            r"(?i)^\s*(?:-\s*)?(?:v\d+|version\s+\d+|previous(?:\s+version)?|link(?:\s+to\s+v\d+)?)\s*:\s*<?([^>\s]+@[^>\s]+)>?",
+        )
+        .expect("static version reference Message-ID regex must compile")
+    })
+}
+
+fn extract_msgid_or_lore_url(value: &str) -> Option<String> {
+    if value.len() > MAX_TRAILER_LINE_BYTES {
+        return None;
+    }
+    if let Some(msgid) = lore_url_regex()
+        .captures(value)
+        .and_then(|cap| cap.get(1))
+        .and_then(|m| normalize_candidate_msgid(m.as_str()))
+    {
+        return Some(msgid);
+    }
+    normalize_candidate_msgid(value)
+}
+
+fn is_non_version_trailer_line(trimmed: &str) -> bool {
+    // Changelog bullets ("- Closes: <url>") carry the same trailers.
+    let unbulleted = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed)
+        .trim_start();
+    let Some((key, _)) = unbulleted.split_once(':') else {
+        return false;
+    };
+    let key = key.trim();
+    key.eq_ignore_ascii_case("based-on")
+        || key.eq_ignore_ascii_case("base-commit")
+        || key.eq_ignore_ascii_case("prerequisite-message-id")
+        || key.eq_ignore_ascii_case("prerequisite-patch-id")
+        || key.eq_ignore_ascii_case("prerequisite-change-id")
+        || key.eq_ignore_ascii_case("closes")
+        || key.eq_ignore_ascii_case("fixes")
+        || key.eq_ignore_ascii_case("reported-by")
+        || key.eq_ignore_ascii_case("buglink")
+}
+
+/// A bare "Link:" trailer. In the commit message it names the bug report or
+/// discussion a patch responds to; under a changelog heading it names the
+/// posting of the previous version, so the caller decides by section.
+fn is_link_trailer_line(trimmed: &str) -> bool {
+    let unbulleted = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed)
+        .trim_start();
+    unbulleted
+        .split_once(':')
+        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("link"))
+}
+
+fn line_is_changelog_heading(trimmed: &str) -> bool {
+    static RE_CHANGELOG_HEADING: OnceLock<Regex> = OnceLock::new();
+    let re = RE_CHANGELOG_HEADING.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(?:#+\s*)?(?:changes\s+(?:in|since|from)\s+v\d+\b|changelog\b|revision\s+history\b|version\s+history\b|v\d+\s*->\s*v\d+\b|(?:v\d+|version\s+\d+|previous(?:\s+version)?)\s*:?\s*$)",
+        )
+        .expect("static changelog heading regex must compile")
+    });
+    re.is_match(trimmed)
+}
+
+fn line_has_version_context(trimmed: &str) -> bool {
+    static RE_VER_CTX: OnceLock<Regex> = OnceLock::new();
+    let re = RE_VER_CTX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^\s*(?:changes\s+(?:in|since|from)\s+v\d+\b|changelog\b|previous(?:\s+version)?\s*:|version\s+\d+\s*:)|\b(?:link\s+to\s+v\d+|previous\s+version|earlier\s+version|since\s+v\d+|in\s+v\d+)\b|->\s*v\d+\b)",
+        )
+        .expect("static version context regex must compile")
+    });
+    re.is_match(trimmed) || version_msgid_regex().is_match(trimmed)
+}
+
+/// Extract candidate Message-IDs that may identify earlier versions of the same
+/// patch or series from email headers (`In-Reply-To`, `References`) and from
+/// Lore/LKML links or version notes in the cover letter / changelog body.
+/// Explicitly ignores dependency and bug-report trailers (`Based-on:`,
+/// `prerequisite-message-id:`, `Closes:`, `Fixes:`, `Reported-by:`).
+pub fn extract_version_reference_msgids(
+    body: &str,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> Vec<String> {
+    let re_lore = lore_url_regex();
+    let re_ver_msgid = version_msgid_regex();
+    let (prereq_msgids_vec, _) = extract_prerequisite_message_and_patch_ids(body);
+    let prereq_msgids: std::collections::HashSet<String> = prereq_msgids_vec.into_iter().collect();
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push_unique = |candidate: &str| {
+        if out.len() >= MAX_EXTRACTED_REF_IDS {
+            return;
+        }
+        if let Some(msgid) = normalize_candidate_msgid(candidate)
+            && !prereq_msgids.contains(&msgid)
+            && seen.insert(msgid.clone())
+        {
+            out.push(msgid);
+        }
+    };
+
+    if let Some(irt) = in_reply_to {
+        for token in irt.split_whitespace().take(MAX_EXTRACTED_REF_IDS) {
+            push_unique(token);
+        }
+    }
+    if let Some(refs) = references {
+        // RFC 2822 appends newer message references at the end of References;
+        // iterate in reverse with .take() so we prioritize the most recent
+        // parents without allocating an unbounded vector on untrusted headers.
+        for token in refs.split_whitespace().rev().take(MAX_EXTRACTED_REF_IDS) {
+            push_unique(token);
+        }
+    }
+
+    let mut in_changelog_section = false;
+    for line in body.lines().take(MAX_TRAILER_SCAN_LINES) {
+        if line.starts_with("diff --git ")
+            || line.starts_with("--- a/")
+            || line.starts_with("--- /dev/null")
+        {
+            break;
+        }
+        let trimmed = line.trim();
+        // The commentary below "---" is where changelogs conventionally go,
+        // but it also carries unrelated discussion links. Only a changelog
+        // heading or a line with explicit version context qualifies a Lore
+        // URL as a previous-version reference, so a stray link to another
+        // thread by the same author cannot be mistaken for lineage.
+        if trimmed == "---" {
+            continue;
+        }
+        if trimmed.len() > MAX_TRAILER_LINE_BYTES
+            || trimmed.starts_with('>')
+            || is_non_version_trailer_line(trimmed)
+            || (!in_changelog_section && is_link_trailer_line(trimmed))
+        {
+            continue;
+        }
+        if line_is_changelog_heading(trimmed) {
+            in_changelog_section = true;
+        }
+        let has_ver_ctx = line_has_version_context(trimmed);
+        if in_changelog_section || has_ver_ctx {
+            for cap in re_lore.captures_iter(trimmed) {
+                if let Some(m) = cap.get(1) {
+                    push_unique(m.as_str());
+                }
+            }
+        }
+        if let Some(cap) = re_ver_msgid.captures(trimmed)
+            && let Some(m) = cap.get(1)
+        {
+            push_unique(m.as_str());
+        }
+    }
+
+    out
+}
+
+/// Extract prerequisite series Message-IDs (`Based-on:`, `prerequisite-message-id:`)
+/// and prerequisite patch IDs (`prerequisite-patch-id:`) from a cover letter or
+/// patch body so version discovery never mistakes a prerequisite series by the
+/// same author for an earlier version of the current series.
+pub fn extract_prerequisite_message_and_patch_ids(body: &str) -> (Vec<String>, Vec<String>) {
+    let mut msgids = Vec::new();
+    let mut seen_msgids = std::collections::HashSet::new();
+    let mut patch_ids = Vec::new();
+    let mut seen_patch_ids = std::collections::HashSet::new();
+
+    for line in body.lines().take(MAX_TRAILER_SCAN_LINES) {
+        if line.starts_with("diff --git ")
+            || line.starts_with("--- a/")
+            || line.starts_with("--- /dev/null")
+        {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.len() > MAX_TRAILER_LINE_BYTES || trimmed.starts_with('>') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("based-on")
+            || key.eq_ignore_ascii_case("prerequisite-message-id")
+        {
+            if msgids.len() < MAX_EXTRACTED_REF_IDS
+                && let Some(msgid) = extract_msgid_or_lore_url(value)
+                && seen_msgids.insert(msgid.clone())
+            {
+                msgids.push(msgid);
+            }
+        } else if key.eq_ignore_ascii_case("prerequisite-patch-id")
+            && patch_ids.len() < MAX_EXTRACTED_REF_IDS
+            && value.len() == 40
+            && value.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let lower = value.to_ascii_lowercase();
+            if seen_patch_ids.insert(lower.clone()) {
+                patch_ids.push(lower);
+            }
+        }
+    }
+
+    (msgids, patch_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,5 +1521,103 @@ diff --git a/file.c b/file.c";
             inject_changelog_into_git_show(git_show, changelog),
             expected
         );
+    }
+
+    #[test]
+    fn test_parse_b4_change_id() {
+        let body = "Cover letter text\n\n---\nchange-id: 20261012-net-foo-teardown-8a9b1c2d3e4f\nbase-commit: 1234567890abcdef\n";
+        assert_eq!(
+            parse_b4_change_id(body),
+            Some("20261012-net-foo-teardown-8a9b1c2d3e4f".to_string())
+        );
+
+        let tracking_json = "Cover prose\n\n--- b4-submit-tracking ---\n# This section is used by b4 prep for tracking purposes.\n{\n  \"series\": {\n    \"revision\": 1,\n    \"change-id\": \"20261012-net-foo-teardown-8a9b1c2d3e4f\",\n    \"prefixes\": []\n  }\n}\n";
+        assert_eq!(
+            parse_b4_change_id(tracking_json),
+            Some("20261012-net-foo-teardown-8a9b1c2d3e4f".to_string())
+        );
+
+        let quoted = "> change-id: 20261012-quoted-111111\nprerequisite-change-id: 20261010-prereq-222222\ndiff --git a/foo.c b/foo.c\n+change-id: 20261012-in-diff-333333\n";
+        assert_eq!(parse_b4_change_id(quoted), None);
+    }
+
+    #[test]
+    fn test_parse_b4_submit_tracking() {
+        let unedited_msg = "# Lines starting with # will be removed from the cover letter.\n\nSigned-off-by: Dev <dev@example.com>\n\n--- b4-submit-tracking ---\n# This section is used by b4 prep for tracking purposes.\n{\n  \"series\": {\n    \"revision\": 1,\n    \"change-id\": \"20261012-b4-prep-11223344\",\n    \"prefixes\": []\n  }\n}\n";
+        let unedited =
+            parse_b4_submit_tracking("EDITME: cover title for b4-prep-branch", unedited_msg, "")
+                .expect("should detect unedited b4 tracker commit");
+        assert_eq!(
+            unedited.change_id.as_deref(),
+            Some("20261012-b4-prep-11223344")
+        );
+        assert_eq!(unedited.edited_subject, None);
+        assert_eq!(unedited.edited_body, None);
+
+        let edited_msg = "# Comment line ignored\n># Architecture Overview\n\nExplain why patch 1 prepares the lock before patch 2 drops the old helper.\n\nSigned-off-by: Dev <dev@example.com>\n\n--- b4-submit-tracking ---\n{\"series\": {\"change-id\": \"20261012-b4-prep-11223344\", \"revision\": 2}}\n";
+        let edited = parse_b4_submit_tracking("net: foo: refactor lock lifecycle", edited_msg, "")
+            .expect("should detect edited b4 tracker commit");
+        assert_eq!(
+            edited.change_id.as_deref(),
+            Some("20261012-b4-prep-11223344")
+        );
+        assert_eq!(
+            edited.edited_subject.as_deref(),
+            Some("net: foo: refactor lock lifecycle")
+        );
+        assert_eq!(
+            edited.edited_body.as_deref(),
+            Some(
+                "# Architecture Overview\n\nExplain why patch 1 prepares the lock before patch 2 drops the old helper.\n\nSigned-off-by: Dev <dev@example.com>"
+            )
+        );
+
+        assert!(
+            parse_b4_submit_tracking(
+                "net: foo: real commit",
+                edited_msg,
+                "diff --git a/foo.c b/foo.c\n"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_extract_version_reference_msgids() {
+        let body = "Fix race in foo_remove when allocating in vmalloc() and setting ptr -> value.\nReported at https://lore.kernel.org/r/20260901-bug-report@kernel.org\nSee discussion at https://lore.kernel.org/r/20260903-unrelated-thread@kernel.org\nCloses: https://lore.kernel.org/r/20260902-closes-bug@kernel.org\nLink: https://lore.kernel.org/r/20260904-link-trailer-discussion@kernel.org\nDepends on https://lore.kernel.org/r/20260925-prereq-url@kernel.org\n\n---\nAlso see my other series at https://lore.kernel.org/r/20261005-other-series-v1-0-cccc@kernel.org\n\nChanges in v3:\n- Address locking feedback\n- Closes: https://lore.kernel.org/r/20260905-bulleted-closes@kernel.org\n- Link to v2: https://lore.kernel.org/r/20261010-foo-v2-0-aaaa@kernel.org\n- Link to v1: https://lore.kernel.org/netdev/20261001-foo-v1-1-bbbb%40kernel.org/\n- Patchwork link: https://patchwork.kernel.org/project/netdev/patch/20261001-pw-v1@kernel.org/\n- Link with slash in local-part: https://lore.kernel.org/r/abc/def+123@kernel.org/\nLink: https://lore.kernel.org/r/20260930-changelog-link-v0@kernel.org\n- Link to v0: <20260929-link-to-v0-msgid@kernel.org>\nv1: <20261001-explicit-v1@kernel.org>\nBased-on: <20260925-prereq-series@kernel.org>\nBased-on: https://lore.kernel.org/r/20260925-prereq-url@kernel.org\nprerequisite-message-id: <20260920-b4-prereq@kernel.org>\ndiff --git a/foo.c b/foo.c\n+https://lore.kernel.org/r/should-ignore-diff@kernel.org\n";
+        let refs = extract_version_reference_msgids(
+            body,
+            Some("<20261010-irt//v2@kernel.org>"),
+            Some("<20261001-ref-v1@kernel.org> <20261010-irt//v2@kernel.org>"),
+        );
+        assert_eq!(
+            refs,
+            vec![
+                "20261010-irt//v2@kernel.org",
+                "20261001-ref-v1@kernel.org",
+                "20261010-foo-v2-0-aaaa@kernel.org",
+                "20261001-foo-v1-1-bbbb@kernel.org",
+                "20261001-pw-v1@kernel.org",
+                "abc/def+123@kernel.org",
+                "20260930-changelog-link-v0@kernel.org",
+                "20260929-link-to-v0-msgid@kernel.org",
+                "20261001-explicit-v1@kernel.org",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_prerequisite_message_and_patch_ids() {
+        let body = "Cover letter\n---\nBased-on: <20260925-prereq-series@kernel.org>\nBased-on: https://lore.kernel.org/r/20260925-prereq-url%40kernel.org/\nprerequisite-message-id: 20260920-b4-prereq@kernel.org\nprerequisite-patch-id: 0123456789abcdef0123456789abcdef01234567\n";
+        let (msgids, patch_ids) = extract_prerequisite_message_and_patch_ids(body);
+        assert_eq!(
+            msgids,
+            vec![
+                "20260925-prereq-series@kernel.org",
+                "20260925-prereq-url@kernel.org",
+                "20260920-b4-prereq@kernel.org"
+            ]
+        );
+        assert_eq!(patch_ids, vec!["0123456789abcdef0123456789abcdef01234567"]);
     }
 }

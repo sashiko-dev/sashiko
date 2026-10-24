@@ -511,6 +511,11 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         if let Some(ref predicate) = self.skip_if
             && predicate(state)
         {
+            if let Some(cb) = event_cb {
+                cb(WorkflowEvent::StageSkipped {
+                    stage_name: self.name,
+                });
+            }
             return Ok((
                 StageOutcome {
                     history: Vec::new(),
