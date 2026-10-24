@@ -93,6 +93,7 @@ pub struct BugWorker {
     db: Arc<Database>,
     provider: Arc<dyn AiProvider>,
     repo_path: String,
+    prompts_dir: Option<std::path::PathBuf>,
     project: crate::project::ProjectId,
     settings: crate::settings::LinuxBugSettings,
     /// Identifies this worker in the lease it takes, so that a lease which
@@ -107,6 +108,7 @@ impl BugWorker {
             db,
             provider,
             repo_path,
+            prompts_dir: None,
             project: crate::project::ProjectId::Linux,
             settings: crate::settings::LinuxBugSettings {
                 lease_ttl_seconds: BUG_LEASE_TTL_SECONDS,
@@ -119,6 +121,11 @@ impl BugWorker {
                 std::process::id()
             ),
         }
+    }
+
+    pub fn with_prompts_dir(mut self, prompts_dir: std::path::PathBuf) -> Self {
+        self.prompts_dir = Some(prompts_dir);
+        self
     }
 
     pub fn with_project(mut self, project: crate::project::ProjectId) -> Self {
@@ -605,120 +612,12 @@ impl BugWorker {
                 .await
             {
                 Ok(Some(bug)) => {
-                    let provider = self.provider.clone();
-                    let db = self.db.clone();
-                    let repo_path = self.repo_path.clone();
-                    let worker_project = self.project;
-
+                    let worker = self.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let effective_project =
-                            crate::workflows::linux_bug::infer_project_from_bug_or_tool(
-                                Some(&bug.bugid),
-                                None,
-                                worker_project,
-                            );
-                        let bug_tool = match effective_project {
-                            crate::project::ProjectId::Linux => "sashiko:linux_bug",
-                            crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
-                        };
-                        let actor = if !bug.reporter.is_empty() {
-                            bug.reporter.as_str()
-                        } else {
-                            "sashiko"
-                        };
-                        let db = db.with_bug_claim(bug.id, &claim_id).with_bug_actor(
-                            actor,
-                            bug_tool,
-                            Some(provider.get_capabilities().model_name),
-                        );
-                        info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
-
-                        let input = if let Some(raw) = bug.raw_input() {
-                            serde_json::from_str::<BugInput>(&raw).ok()
-                        } else {
-                            None
-                        }
-                        .unwrap_or_else(|| BugInput {
-                            problem: bug.problem().to_string(),
-                            reasoning: bug
-                                .severity_explanation()
-                                .unwrap_or_else(|| "No reasoning provided.".to_string()),
-                            locations: bug.locations(),
-                            // The stored bug keeps the subsystem names but the
-                            // read model drops their provenance, so they are
-                            // rebuilt as caller supplied. Nothing is lost: the
-                            // analysis re-resolves subsystems from MAINTAINERS
-                            // before the outcome is written back.
-                            subsystems: bug
-                                .subsystems
-                                .iter()
-                                .map(|name| {
-                                    AttributedSubsystem::new(name, SubsystemSource::CallerSupplied)
-                                })
-                                .collect(),
-                            source_files: bug.source_files().unwrap_or_default(),
-                            commit_sha: bug.discovered_in_commit.clone(),
-                            patchset_id: bug.discovered_in_patchset_id,
-                            patch_id: bug.discovered_in_patch_id,
-                            baseline_sha: bug.discovered_in_commit.clone(),
-                            review_id: None,
-                        });
-
-                        let mut tb = ToolBox::new(std::path::PathBuf::from(&repo_path), None);
-                        if let Some(ref sha) = bug.discovered_in_commit {
-                            tb.set_virtual_head(sha.clone());
-                        }
-                        let tools = Some(Arc::new(tb));
-
-                        let analysis = run_while_leased(
-                            crate::workflows::linux_bug::process_issue_worker_for_project(
-                                provider.as_ref(),
-                                tools,
-                                &db,
-                                &bug,
-                                input,
-                                Some("bug_worker"),
-                                effective_project,
-                            ),
-                            maintain_lease(
-                                &db,
-                                bug.id,
-                                &claim_id,
-                                lease_ttl_seconds,
-                                lease_deadline(claim_started, lease_ttl_seconds),
-                            ),
-                        )
-                        .await;
-                        let Some(analysis) = analysis else {
-                            warn!(
-                                "Cancelled analysis of bug {} after losing its lease",
-                                bug.id
-                            );
-                            return;
-                        };
-
-                        match analysis {
-                            Ok(outcome) => {
-                                info!("Successfully processed raw bug {}: {}", bug.id, outcome);
-                                // The workflow records the outcome; this only
-                                // drops the claim so the row stops looking
-                                // like it is still being worked on.
-                                if let Err(e) = db.release_bug_lease(bug.id).await {
-                                    error!("Failed to release lease on bug {}: {}", bug.id, e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to process bug {}: {}", bug.id, e);
-                                let error_msg = format!("Error during async processing: {}", e);
-                                if let Err(e) = db.fail_bug_analysis(bug.id, &error_msg).await {
-                                    warn!(
-                                        "Could not settle failed analysis of bug {}: {}",
-                                        bug.id, e
-                                    );
-                                }
-                            }
-                        }
+                        let _ = worker
+                            .process_claimed_bug(bug, &claim_id, claim_started, lease_ttl_seconds)
+                            .await;
                     });
                 }
                 Ok(None) => {
@@ -735,6 +634,150 @@ impl BugWorker {
                     error!("Database error while claiming a bug for analysis: {}", e);
                     sleep(Duration::from_secs(10)).await;
                 }
+            }
+        }
+    }
+
+    /// Atomically inserts, claims, and synchronously processes a candidate bug
+    /// in a single step so no concurrent `BugWorker` can claim the pending row
+    /// between insertion and deduplication.
+    pub async fn submit_and_process_bug(
+        &self,
+        attributed_db: &crate::db::Database,
+        input: crate::api::BugInput,
+    ) -> anyhow::Result<Option<crate::api::BugOutcome>> {
+        let lease_ttl_seconds = clamp_lease_ttl_seconds(self.settings.lease_ttl_seconds);
+        let claim_id = new_claim_id(&self.worker_id);
+        let claim_started = tokio::time::Instant::now();
+        let bug = crate::workflows::linux_bug::create_claimed_issue_for_project(
+            self.provider.as_ref(),
+            attributed_db,
+            input,
+            self.project,
+            &claim_id,
+            lease_ttl_seconds,
+        )
+        .await?;
+        self.process_claimed_bug(bug, &claim_id, claim_started, lease_ttl_seconds)
+            .await
+    }
+
+    async fn process_claimed_bug(
+        &self,
+        bug: crate::db::Bug,
+        claim_id: &str,
+        claim_started: tokio::time::Instant,
+        lease_ttl_seconds: i64,
+    ) -> anyhow::Result<Option<crate::api::BugOutcome>> {
+        let effective_project = crate::workflows::linux_bug::infer_project_from_bug_or_tool(
+            Some(&bug.bugid),
+            None,
+            self.project,
+        );
+        let bug_tool = match effective_project {
+            crate::project::ProjectId::Linux => "sashiko:linux_bug",
+            crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
+        };
+        let actor = if !bug.reporter.is_empty() {
+            bug.reporter.as_str()
+        } else {
+            "sashiko"
+        };
+        let db = self.db.with_bug_claim(bug.id, claim_id).with_bug_actor(
+            actor,
+            bug_tool,
+            Some(self.provider.get_capabilities().model_name),
+        );
+        info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
+
+        let input = if let Some(raw) = bug.raw_input() {
+            serde_json::from_str::<BugInput>(&raw).ok()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| BugInput {
+            problem: bug.problem().to_string(),
+            reasoning: bug
+                .severity_explanation()
+                .unwrap_or_else(|| "No reasoning provided.".to_string()),
+            locations: bug.locations(),
+            // The stored bug keeps the subsystem names but the
+            // read model drops their provenance, so they are
+            // rebuilt as caller supplied. Nothing is lost: the
+            // analysis re-resolves subsystems from MAINTAINERS
+            // before the outcome is written back.
+            subsystems: bug
+                .subsystems
+                .iter()
+                .map(|name| AttributedSubsystem::new(name, SubsystemSource::CallerSupplied))
+                .collect(),
+            source_files: bug.source_files().unwrap_or_default(),
+            commit_sha: bug.discovered_in_commit.clone(),
+            patchset_id: bug.discovered_in_patchset_id,
+            patch_id: bug.discovered_in_patch_id,
+            baseline_sha: bug.discovered_in_commit.clone(),
+            review_id: None,
+        });
+
+        let mut tb = ToolBox::new(
+            std::path::PathBuf::from(&self.repo_path),
+            self.prompts_dir.clone(),
+        );
+        if let Some(ref sha) = bug.discovered_in_commit {
+            tb.set_virtual_head(sha.clone());
+        }
+        let tools = Some(Arc::new(tb));
+
+        let analysis = run_while_leased(
+            crate::workflows::linux_bug::process_issue_worker_for_project(
+                self.provider.as_ref(),
+                tools,
+                &db,
+                &bug,
+                input,
+                Some("bug_worker"),
+                effective_project,
+            ),
+            maintain_lease(
+                &db,
+                bug.id,
+                claim_id,
+                lease_ttl_seconds,
+                lease_deadline(claim_started, lease_ttl_seconds),
+            ),
+        )
+        .await;
+        let dedup_owner = format!("bug:{}:pid:{}", bug.id, std::process::id());
+        let _ = db.release_bug_dedup_lease(&dedup_owner).await;
+        let Some(analysis) = analysis else {
+            warn!(
+                "Cancelled analysis of bug {} after losing its lease",
+                bug.id
+            );
+            return Ok(None);
+        };
+
+        match analysis {
+            Ok(outcome) => {
+                info!("Successfully processed raw bug {}: {}", bug.id, outcome);
+                // The workflow records the outcome; this only
+                // drops the claim so the row stops looking
+                // like it is still being worked on.
+                if let Err(e) = db.release_bug_lease(bug.id).await {
+                    error!("Failed to release lease on bug {}: {}", bug.id, e);
+                }
+                Ok(Some(outcome))
+            }
+            Err(e) => {
+                error!("Failed to process bug {}: {}", bug.id, e);
+                let error_msg = format!("Error during async processing: {}", e);
+                if let Err(db_err) = db.fail_bug_analysis(bug.id, &error_msg).await {
+                    warn!(
+                        "Could not settle failed analysis of bug {}: {}",
+                        bug.id, db_err
+                    );
+                }
+                Err(e)
             }
         }
     }

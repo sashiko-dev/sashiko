@@ -183,96 +183,182 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
     symbols.truncate(50);
 
     // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
-    if !symbols.is_empty() {
-        let regex_pattern = format!(
-            "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
-            symbols.join("|")
-        );
+    lookup_symbol_definitions(
+        repository,
+        &mut snapshot,
+        &symbols,
+        &file_ranges,
+        &mut range_map,
+        None,
+    )
+    .await?;
 
-        let caller_dirs: HashSet<&str> = file_ranges
-            .keys()
-            .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
-            .collect();
+    render_range_map_with_budget(&range_map, &mut snapshot, &file_ranges, MAX_PREFETCH_CHARS).await
+}
 
-        let mut cmd = crate::git_cmd::in_dir_async(repository);
-        cmd.arg("grep")
-            .arg("--full-name")
-            .arg("--no-color")
-            .arg("-z")
-            .arg("-n")
-            .arg("-I")
-            .arg("-P")
-            .arg("-e")
-            .arg(&regex_pattern)
-            .arg(&snapshot.sha)
-            .arg("--")
-            .arg("*.c")
-            .arg("*.h")
-            .kill_on_drop(true);
+/// Prefetches external struct, enum, macro, and helper definitions referenced within
+/// `start_line..=end_line` (1-based inclusive) of `file_path` at `target_sha`,
+/// excluding definitions already located inside `file_path`.
+pub async fn prefetch_external_definitions(
+    repository: &Path,
+    target_sha: &str,
+    file_path: &str,
+    start_line_1based: usize,
+    end_line_1based: usize,
+    max_chars: usize,
+) -> Result<String> {
+    if !file_path.ends_with(".c") && !file_path.ends_with(".h") {
+        return Ok(String::new());
+    }
+    let mut snapshot = SourceSnapshot::new(repository, target_sha).await?;
+    let path_buf = PathBuf::from(file_path);
+    let content = snapshot.read(&path_buf).await?;
+    let total_lines = content.lines().count();
+    if total_lines == 0 {
+        return Ok(String::new());
+    }
 
-        let output = match cmd.output().await {
-            Ok(o) => o,
-            Err(e) => return Err(anyhow!("Failed to run git grep: {}", e)),
-        };
+    let start_0 = start_line_1based.saturating_sub(1);
+    let end_0 = end_line_1based
+        .saturating_sub(1)
+        .min(total_lines.saturating_sub(1));
 
-        if !output.status.success() && output.status.code() != Some(1) {
-            // git grep returns exit status 1 if no matches are found, which is not a hard error.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("git grep failed: {}", stderr));
-        }
+    let mut file_ranges = HashMap::new();
+    file_ranges.insert(file_path.to_string(), vec![(start_0, end_0)]);
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut candidates: HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)> =
-            HashMap::new();
+    let already_extracted = extract_defined_names(&content, 0, total_lines.saturating_sub(1));
+    let mut symbols_to_lookup = extract_type_names(&content, start_0, end_0);
+    let mut called_functions = extract_called_functions(&content, &[(start_0, end_0)]);
 
-        let revision_prefix = format!("{}:", snapshot.sha);
-        for line in stdout.lines() {
-            if let Some(line) = line.strip_prefix(&revision_prefix)
-                && let Some((path_str, rest)) = line.split_once('\0')
-                && let Some((line_num_str, line_content)) = rest.split_once('\0')
-                && let Ok(line_num) = line_num_str.parse::<u64>()
-            {
-                let path = PathBuf::from(path_str);
-                if is_noisy_tree(path_str) {
-                    continue;
-                }
+    for sym in &already_extracted {
+        symbols_to_lookup.remove(sym);
+    }
 
-                let rel = path_str;
-                let is_priority = rel.starts_with("include/")
-                    || caller_dirs
-                        .iter()
-                        .any(|d| rel.starts_with(d) && rel.as_bytes().get(d.len()) == Some(&b'/'));
+    let opaque = find_opaque_types(&symbols_to_lookup, &file_ranges, &snapshot);
+    for sym in &opaque {
+        symbols_to_lookup.remove(sym);
+    }
 
-                for sym in &symbols {
-                    if line_matches_symbol(line_content, sym) {
-                        let (general, priority) = candidates
-                            .entry(sym.clone())
-                            .or_insert_with(|| (Vec::new(), Vec::new()));
+    called_functions.retain(|f| !already_extracted.contains(f));
+    symbols_to_lookup.extend(called_functions);
+    symbols_to_lookup.retain(|s| !s.ends_with("_ops"));
 
-                        if is_priority {
-                            if priority.len() < 32 {
-                                priority.push((path.clone(), line_num));
-                            }
-                        } else if general.len() < 32 {
-                            general.push((path.clone(), line_num));
+    let mut symbols: Vec<String> = symbols_to_lookup.into_iter().collect();
+    symbols.sort();
+    symbols.truncate(40);
+
+    let mut range_map: LineRangeMap = BTreeMap::new();
+    lookup_symbol_definitions(
+        repository,
+        &mut snapshot,
+        &symbols,
+        &file_ranges,
+        &mut range_map,
+        Some(&path_buf),
+    )
+    .await?;
+
+    render_range_map_with_budget(&range_map, &mut snapshot, &file_ranges, max_chars).await
+}
+
+async fn lookup_symbol_definitions(
+    repository: &Path,
+    snapshot: &mut SourceSnapshot<'_>,
+    symbols: &[String],
+    file_ranges: &HashMap<String, Vec<(usize, usize)>>,
+    range_map: &mut LineRangeMap,
+    exclude_file: Option<&Path>,
+) -> Result<()> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    let regex_pattern = format!(
+        "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
+        symbols.join("|")
+    );
+
+    let caller_dirs: HashSet<&str> = file_ranges
+        .keys()
+        .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+        .collect();
+
+    let mut cmd = crate::git_cmd::in_dir_async(repository);
+    cmd.arg("grep")
+        .arg("--full-name")
+        .arg("--no-color")
+        .arg("-z")
+        .arg("-n")
+        .arg("-I")
+        .arg("-P")
+        .arg("-e")
+        .arg(&regex_pattern)
+        .arg(&snapshot.sha)
+        .arg("--")
+        .arg("*.c")
+        .arg("*.h")
+        .kill_on_drop(true);
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => return Err(anyhow!("Failed to run git grep: {}", e)),
+    };
+
+    if !output.status.success() && output.status.code() != Some(1) {
+        // git grep returns exit status 1 if no matches are found, which is not a hard error.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("git grep failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut candidates: HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)> =
+        HashMap::new();
+
+    let revision_prefix = format!("{}:", snapshot.sha);
+    for line in stdout.lines() {
+        if let Some(line) = line.strip_prefix(&revision_prefix)
+            && let Some((path_str, rest)) = line.split_once('\0')
+            && let Some((line_num_str, line_content)) = rest.split_once('\0')
+            && let Ok(line_num) = line_num_str.parse::<u64>()
+        {
+            let path = PathBuf::from(path_str);
+            if exclude_file.is_some_and(|ex| ex == path.as_path()) || is_noisy_tree(path_str) {
+                continue;
+            }
+
+            let rel = path_str;
+            let is_priority = rel.starts_with("include/")
+                || caller_dirs
+                    .iter()
+                    .any(|d| rel.starts_with(d) && rel.as_bytes().get(d.len()) == Some(&b'/'));
+
+            for sym in symbols {
+                if line_matches_symbol(line_content, sym) {
+                    let (general, priority) = candidates
+                        .entry(sym.clone())
+                        .or_insert_with(|| (Vec::new(), Vec::new()));
+
+                    if is_priority {
+                        if priority.len() < 32 {
+                            priority.push((path.clone(), line_num));
                         }
+                    } else if general.len() < 32 {
+                        general.push((path.clone(), line_num));
                     }
                 }
             }
         }
-
-        for (sym, (general, priority)) in candidates {
-            let mut hits = priority;
-            hits.extend(general);
-            if let Some((path, start, end)) =
-                best_definition_range(&sym, &hits, &mut snapshot, &caller_dirs).await?
-            {
-                add_range(&mut range_map, path, start, end);
-            }
-        }
     }
 
-    render_range_map(&range_map, &mut snapshot, &file_ranges).await
+    for (sym, (general, priority)) in candidates {
+        let mut hits = priority;
+        hits.extend(general);
+        if let Some((path, start, end)) =
+            best_definition_range(&sym, &hits, snapshot, &caller_dirs).await?
+        {
+            add_range(range_map, path, start, end);
+        }
+    }
+    Ok(())
 }
 
 /// Merge overlapping or adjacent ranges (within `gap` lines).
@@ -294,10 +380,11 @@ fn merge_ranges(ranges: &BTreeSet<(usize, usize)>, gap: usize) -> Vec<(usize, us
 
 /// Render the collected line ranges into the final prefetch context string.
 /// Modified files are rendered first (higher priority when nearing budget).
-async fn render_range_map(
+async fn render_range_map_with_budget(
     range_map: &LineRangeMap,
     snapshot: &mut SourceSnapshot<'_>,
     modified_files: &HashMap<String, Vec<(usize, usize)>>,
+    max_chars: usize,
 ) -> Result<String> {
     let mut output = String::new();
     let mut current_chars = 0;
@@ -339,7 +426,7 @@ async fn render_range_map(
                 String::new()
             };
 
-            if current_chars + header.len() + block.len() + 1 > MAX_PREFETCH_CHARS {
+            if current_chars + header.len() + block.len() + 1 > max_chars {
                 output.push_str("\n... (Context prefetch limits reached)\n");
                 return Ok(output);
             }

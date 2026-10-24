@@ -57,14 +57,14 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `benchmark.rs`: Built-in benchmark runner, per-run database/artifact preservation, and structured AI judge telemetry (`#[cfg(feature = "server")]`).
 - `worker/`: Background workers (`bug_worker.rs`, `email.rs`, `forge.rs`, `patchwork.rs`, `repack.rs`, `sync.rs`, `prefetch.rs`, `prompts.rs`).
 - `workflow/`: Core state-machine LLM workflow engine.
-- `workflows/`: Declarative review and bug pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `sashiko_patch_review.rs`), plus shared security/normalization helpers (`guard.rs`) and the review-map lineage builder (`review_map.rs`).
+- `workflows/`: Declarative review, bug, and scan pipelines per project (`linux_patch_review.rs`, `linux_bug.rs`, `linux_scan.rs`, `sashiko_patch_review.rs`), plus shared security/normalization helpers (`guard.rs`) and the review-map lineage builder (`review_map.rs`).
 - `toolbox/`: Agent tools for inspecting git repositories and worktrees.
 - `ai/`: LLM provider integrations, session runner, and response caching.
 - `auth.rs` & `access.rs`: Authentication (`LocalToken`, JWTs) and capability/subsystem bug access control (`Principal`, `BugAccess`).
 - `maintainers.rs`: `MAINTAINERS` file parser and subsystem/maintainer lookup index.
 - `ingestor.rs`, `fetcher.rs`, `mbox.rs`, `nntp.rs`, `patchwork.rs`, `backfill.rs`: Mailing list, Lore mbox, NNTP, and Patchwork ingestion pipelines.
 - `reviewer.rs`: Patchset review worker orchestration.
-- `local_review.rs`: Local review execution (`sashiko review`).
+- `local_review.rs` & `scan.rs`: Local review execution (`sashiko review`) and active codebase scanning (`sashiko scan`).
 - `git_cmd.rs` & `git_ops.rs`: Safe git process spawning and repository operations.
 - `patch.rs`, `baseline.rs`, `prerequisites.rs`: Patch parsing, baseline detection, and prerequisite series resolution.
 - `forge.rs`: Webhook integration and review posting for external forges (GitHub, GitLab).

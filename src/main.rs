@@ -244,7 +244,6 @@ enum Commands {
         #[arg(long, hide = true)]
         report_preexisting: bool,
     },
-
     /// Run a benchmark suite against an isolated per-run database
     Benchmark {
         /// Benchmark JSON file path (positional or via --file)
@@ -309,6 +308,73 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         color: ColorMode,
     },
+
+    /// Actively scan Linux kernel source files or directories for serious defects
+    Scan {
+        /// Repository-relative file or directory paths to scan
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Git revision to scan (defaults to mainline or HEAD)
+        #[arg(long = "ref", alias = "rev")]
+        git_ref: Option<String>,
+
+        /// Path to the git repository (defaults to current git toplevel or Settings.toml)
+        #[arg(short, long)]
+        repo: Option<PathBuf>,
+
+        /// Path to settings file
+        #[arg(long)]
+        settings: Option<PathBuf>,
+
+        /// Maximum number of chunks to scan concurrently
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+
+        /// Maximum number of source files to expand (safety cap)
+        #[arg(long, default_value_t = 200)]
+        max_files: usize,
+
+        /// Maximum number of source chunks to scan
+        #[arg(long)]
+        max_chunks: Option<usize>,
+
+        /// Exclude files matching substring/prefix pattern (may be repeated)
+        #[arg(long)]
+        exclude: Vec<String>,
+
+        /// Submit verified High/Critical findings to the bug repository for deduplication
+        #[arg(long)]
+        submit_bugs: bool,
+
+        /// Custom prompt instructions appended to the scan workflow
+        #[arg(long)]
+        custom_prompt: Option<String>,
+
+        /// AI provider override
+        #[arg(long)]
+        ai_provider: Option<String>,
+
+        /// Reasoning effort mode override (mid, high, or dynamic) for supported models
+        #[arg(long)]
+        effort: Option<EffortMode>,
+
+        /// Prompt directory
+        #[arg(long)]
+        prompts: Option<PathBuf>,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+
+        /// When to use color
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
+
+        /// Run only these specialist analysis stages, by name
+        #[arg(long, hide = true, value_delimiter = ',')]
+        stages: Option<Vec<String>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -346,6 +412,19 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             no_ai: *no_ai,
             ai_provider: ai_provider.clone(),
             ai_model: model.clone(),
+            effort: effort.or(cli.effort),
+            stages: stages.clone(),
+            ..Default::default()
+        },
+        Some(Commands::Scan {
+            repo,
+            ai_provider,
+            effort,
+            stages,
+            ..
+        }) => Overrides {
+            repository_path: repo.as_deref().map(path_string),
+            ai_provider: ai_provider.clone(),
             effort: effort.or(cli.effort),
             stages: stages.clone(),
             ..Default::default()
@@ -413,9 +492,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same file the command works from. A failure is not fatal yet, because most
     // commands only talk to a running server and need no settings file at all.
     let named_settings = match &cli.command {
-        Some(Commands::Review { settings, .. }) | Some(Commands::Benchmark { settings, .. }) => {
-            settings.clone()
-        }
+        Some(Commands::Review { settings, .. })
+        | Some(Commands::Benchmark { settings, .. })
+        | Some(Commands::Scan { settings, .. }) => settings.clone(),
         _ => None,
     };
     let settings_path = Settings::resolve_path(named_settings.as_deref());
@@ -423,11 +502,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine log level
     // 1. CLI --debug takes precedence (implies "info")
-    // 2. Review command defaults to "warn" (unless --debug)
+    // 2. Review/Scan commands default to "warn" (unless --debug)
     // 3. Settings log_level
     // 4. Worker command defaults to "info" (worker logs progress on stderr)
     // 5. Fallback to "warn" (if settings failed)
-    let is_review = matches!(cli.command, Some(Commands::Review { .. }));
+    let is_review = matches!(
+        cli.command,
+        Some(Commands::Review { .. }) | Some(Commands::Scan { .. })
+    );
     let is_worker = matches!(cli.command, Some(Commands::Worker { .. }));
     let log_level = if cli.debug {
         "info"
@@ -527,6 +609,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     resolve_prompts_path(prompts.clone(), project)?,
                     *format,
                     *agent,
+                    *color,
+                )
+                .await;
+            }
+            Commands::Scan {
+                paths,
+                git_ref,
+                repo,
+                concurrency,
+                max_files,
+                max_chunks,
+                exclude,
+                submit_bugs,
+                custom_prompt,
+                prompts,
+                format,
+                color,
+                ..
+            } => {
+                let settings = anyhow::Context::with_context(settings_result, || {
+                    format!("Failed to load settings from {}", settings_path.display())
+                })?;
+
+                return handle_scan_command(
+                    project,
+                    paths.clone(),
+                    git_ref.clone(),
+                    repo.clone(),
+                    settings,
+                    *concurrency,
+                    *max_files,
+                    *max_chunks,
+                    exclude.clone(),
+                    *submit_bugs,
+                    custom_prompt.clone(),
+                    resolve_prompts_path(prompts.clone(), project)?,
+                    *format,
                     *color,
                 )
                 .await;
@@ -2981,6 +3100,223 @@ fn write_benchmark_report(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_scan_command(
+    project: ProjectId,
+    paths: Vec<PathBuf>,
+    git_ref: Option<String>,
+    repo_override: Option<PathBuf>,
+    mut settings: Settings,
+    concurrency: usize,
+    max_files: usize,
+    max_chunks: Option<usize>,
+    exclude: Vec<String>,
+    submit_bugs: bool,
+    custom_prompt: Option<String>,
+    prompts: PathBuf,
+    format: OutputFormat,
+    color: ColorMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let terminal = terminfo::Database::from_env().ok();
+    let report = OutputStream::detect(color, &std::io::stdout(), terminal.as_ref());
+
+    if submit_bugs && settings.database.url.trim().is_empty() {
+        return Err(
+            "database.url must be configured in Settings.toml when --submit-bugs is enabled".into(),
+        );
+    }
+
+    let repo_path = if let Some(repo) = repo_override {
+        repo
+    } else if let Ok(top) = current_git_toplevel() {
+        top
+    } else if !settings.git.repository_path.trim().is_empty() {
+        PathBuf::from(&settings.git.repository_path)
+    } else {
+        return Err("could not determine git repository path; pass --repo <PATH> or run inside a git checkout".into());
+    };
+    settings.git.repository_path = repo_path.to_string_lossy().into_owned();
+
+    if project.uses_maintainers() && sashiko::maintainers::get_global_maintainers().is_none() {
+        let repo_for_maintainers = repo_path.clone();
+        if let Ok(Ok(idx)) = tokio::task::spawn_blocking(move || {
+            sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_for_maintainers)
+        })
+        .await
+        {
+            sashiko::maintainers::init_global_maintainers(Arc::new(idx));
+        }
+    }
+
+    let progress = move |event: sashiko::scan::ScanProgressEvent| match event {
+        sashiko::scan::ScanProgressEvent::ResolvedTargets {
+            target_sha,
+            files_count,
+            chunks_count,
+        } => {
+            eprintln!(
+                "Scanning {} file(s) ({} chunk(s)) at {}...",
+                files_count,
+                chunks_count,
+                &target_sha[..target_sha.len().min(12)]
+            );
+        }
+        sashiko::scan::ScanProgressEvent::ChunkStarted {
+            chunk_id,
+            start_line,
+            end_line,
+            ..
+        } => {
+            eprintln!("  [Scan] {} (lines {}..{})", chunk_id, start_line, end_line);
+        }
+        sashiko::scan::ScanProgressEvent::ChunkStageStarted { chunk_id, stage } => {
+            eprintln!("  [Scan] {} -> {}", chunk_id, stage);
+        }
+        sashiko::scan::ScanProgressEvent::ChunkFinished {
+            chunk_id,
+            findings_count,
+            early_exited,
+        } => {
+            if early_exited {
+                eprintln!("  [Scan] {} | Early exit (benign)", chunk_id);
+            } else {
+                eprintln!(
+                    "  [Scan] {} | Finished ({} verified finding(s))",
+                    chunk_id, findings_count
+                );
+            }
+        }
+        sashiko::scan::ScanProgressEvent::ChunkFailed { chunk_id, error } => {
+            eprintln!("  [Scan] {} | Failed: {}", chunk_id, error);
+        }
+        sashiko::scan::ScanProgressEvent::BugSubmitted {
+            canonical_title,
+            bugid,
+            is_duplicate,
+        } => {
+            if is_duplicate {
+                eprintln!("  [BugRepo] Duplicate of {} ({})", bugid, canonical_title);
+            } else {
+                eprintln!("  [BugRepo] Opened {} ({})", bugid, canonical_title);
+            }
+        }
+    };
+
+    let summary = sashiko::scan::run_scan(
+        sashiko::scan::ScanOptions {
+            repo_path,
+            paths,
+            git_ref,
+            concurrency,
+            max_files,
+            max_chunks,
+            exclude,
+            submit_bugs,
+            prompts,
+            custom_prompt,
+            stages: settings.review.stages.clone(),
+            effort: settings.effective_effort(),
+        },
+        &settings,
+        Some(&progress),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        OutputFormat::Text => {
+            let mut stdout = StandardStream::stdout(report.color);
+            write_scan_result(&mut stdout, &summary)?;
+        }
+    }
+
+    if summary.chunks_failed > 0 && summary.chunks_analyzed == 0 && summary.chunks_early_exited == 0
+    {
+        std::process::exit(3);
+    }
+    if !summary.findings.is_empty() {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn write_scan_result(
+    out: &mut impl WriteColor,
+    summary: &sashiko::scan::ScanSummary,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "\nScan Summary ({}): {} file(s), {} chunk(s) ({} analyzed, {} early-exited, {} failed)",
+        &summary.target_sha[..summary.target_sha.len().min(12)],
+        summary.files_scanned,
+        summary.chunks_total,
+        summary.chunks_analyzed,
+        summary.chunks_early_exited,
+        summary.chunks_failed
+    )?;
+
+    if summary.findings.is_empty() {
+        write_colored(out, Color::Green, "\nNo High or Critical defects found.\n")?;
+    } else {
+        writeln!(out, "\nVerified Findings ({}):", summary.findings.len())?;
+        for (idx, bug) in summary.findings.iter().enumerate() {
+            writeln!(out)?;
+            write!(out, "{}. ", idx + 1)?;
+            let badge_color = if bug.severity.eq_ignore_ascii_case("Critical") {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+            write_colored(
+                out,
+                badge_color,
+                &format!("[{}]", bug.severity.to_uppercase()),
+            )?;
+            writeln!(out, " {}", bug.canonical_title)?;
+            if !bug.subsystems.is_empty() {
+                writeln!(out, "   Subsystems: {}", bug.subsystems.join(", "))?;
+            }
+            if let Some(ref intro) = bug.introduced_in_commit {
+                writeln!(out, "   Introduced: {}", intro)?;
+            }
+            if let Some(ref bugid) = bug.submitted_bugid {
+                writeln!(out, "   Bug ID:     {} (newly discovered)", bugid)?;
+            } else if let Some(ref dup_bugid) = bug.duplicate_of_bugid {
+                writeln!(out, "   Bug ID:     {} (duplicate)", dup_bugid)?;
+            }
+            if let Some(locs) = bug.locations.as_array() {
+                for loc in locs {
+                    if let Some(formatted) = format_location(loc) {
+                        writeln!(out, "   Location:   {}", formatted)?;
+                    }
+                }
+            }
+            writeln!(out)?;
+            for line in bug.canonical_description.lines() {
+                writeln!(out, "   {}", line)?;
+            }
+            if !bug.severity_explanation.trim().is_empty() {
+                writeln!(out)?;
+                writeln!(out, "   Severity Rationale:")?;
+                for line in bug.severity_explanation.lines() {
+                    writeln!(out, "   {}", line)?;
+                }
+            }
+        }
+    }
+
+    if summary.tokens_in > 0 || summary.tokens_out > 0 || summary.tokens_cached > 0 {
+        writeln!(
+            out,
+            "\nTokens: {} in / {} out / {} cached",
+            summary.tokens_in, summary.tokens_out, summary.tokens_cached
+        )?;
+    }
+    Ok(())
+}
 fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let output = sashiko::git_cmd::in_dir(&cwd)
@@ -5272,6 +5608,61 @@ mod tests {
                 assert!(agent);
             }
             _ => panic!("expected worker command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_scan() {
+        let args = vec![
+            "sashiko",
+            "scan",
+            "fs/smb/server/",
+            "net/core/dev.c",
+            "--ref",
+            "v6.12",
+            "--concurrency",
+            "8",
+            "--max-files",
+            "50",
+            "--max-chunks",
+            "20",
+            "--exclude",
+            "trace.h",
+            "--submit-bugs",
+            "--format",
+            "json",
+        ];
+        let cli = Cli::parse_from(args);
+        let overrides = cli_overrides(&cli);
+        assert_eq!(overrides.effort, None);
+        match cli.command {
+            Some(Commands::Scan {
+                paths,
+                git_ref,
+                concurrency,
+                max_files,
+                max_chunks,
+                exclude,
+                submit_bugs,
+                format,
+                ..
+            }) => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        PathBuf::from("fs/smb/server/"),
+                        PathBuf::from("net/core/dev.c")
+                    ]
+                );
+                assert_eq!(git_ref.as_deref(), Some("v6.12"));
+                assert_eq!(concurrency, 8);
+                assert_eq!(max_files, 50);
+                assert_eq!(max_chunks, Some(20));
+                assert_eq!(exclude, vec!["trace.h".to_string()]);
+                assert!(submit_bugs);
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected scan command"),
         }
     }
 
