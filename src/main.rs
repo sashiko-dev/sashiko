@@ -257,6 +257,12 @@ enum Commands {
         report_preexisting: bool,
     },
 
+    /// Clone or refresh the tree the daemon reviews
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+
     /// Run a benchmark suite against an isolated per-run database
     Benchmark {
         /// Benchmark JSON file path (positional or via --file)
@@ -320,6 +326,17 @@ enum Commands {
         /// When to use color
         #[arg(long, default_value = "auto")]
         color: ColorMode,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RepoCommand {
+    /// Clone the project's tree if it is missing, otherwise fetch its upstream
+    Sync {
+        /// Directory of the tree (default: [git] repository_path, else
+        /// third_party/<project>)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -403,6 +420,8 @@ fn cli_overrides(cli: &Cli) -> Overrides {
         Some(Commands::Init { .. }) => Overrides::default(),
         // Planning reads no settings either.
         Some(Commands::Notes { .. }) => Overrides::default(),
+        // Reads only the repository path, which no flag here shadows.
+        Some(Commands::Repo { .. }) => Overrides::default(),
     }
 }
 
@@ -446,7 +465,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Review { .. } | Commands::Notes { .. })
     );
     let is_worker = matches!(cli.command, Some(Commands::Worker { .. }));
-    let log_level = if cli.debug {
+    // A sync can run for most of an hour; its progress is the point.
+    let is_repo = matches!(cli.command, Some(Commands::Repo { .. }));
+    let log_level = if cli.debug || is_repo {
         "info"
     } else if is_review {
         "warn"
@@ -611,6 +632,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => exit_worker_with_error(e.to_string()),
                 }
+            }
+            Commands::Repo {
+                command: RepoCommand::Sync { path },
+            } => {
+                // A missing or unreadable settings file only means there is
+                // no configured path to prefer over the project's default.
+                let configured = settings_result
+                    .as_ref()
+                    .ok()
+                    .map(|settings| settings.git.repository_path.as_str());
+                let path = sashiko::repo_sync::resolve_path(path.as_deref(), configured, project);
+                let outcome = sashiko::repo_sync::sync(&path, project.upstream()).await?;
+                println!("{project} tree at {}: {outcome}", path.display());
+                return Ok(());
             }
             Commands::Benchmark {
                 file,
