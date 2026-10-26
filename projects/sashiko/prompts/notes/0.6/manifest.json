@@ -1,0 +1,1827 @@
+{
+  "project": "Sashiko",
+  "set": "0.6",
+  "revision": "4e21ccac9066d5a8eadcf15b07464628450444a8",
+  "units": {
+    "ai": {
+      "name": "ai",
+      "note": "units/ai.md",
+      "facts": "units/ai.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:02:43Z",
+      "note_bytes": 12618,
+      "confirmed_facts": 72,
+      "files": [
+        {
+          "path": "src/ai/acp.rs",
+          "blob": "dcc0d6c8a21028b8cb41bf48a5f143760360860a"
+        },
+        {
+          "path": "src/ai/backoff_provider.rs",
+          "blob": "938c49cd29c26efdfe1eefbe3bdc38691fe69934"
+        },
+        {
+          "path": "src/ai/bedrock.rs",
+          "blob": "033111295f3f63b5d5d1497bef01d4e55a915c1a"
+        },
+        {
+          "path": "src/ai/cache.rs",
+          "blob": "352c74362cc9cba3939a08de6837239ef2869056"
+        },
+        {
+          "path": "src/ai/claude.rs",
+          "blob": "bf7027f4c68cb3a83d0ca1b7840d6283288bb461"
+        },
+        {
+          "path": "src/ai/claude_cli.rs",
+          "blob": "042f532025b9cebad829dc8b33869905d3c4b383"
+        },
+        {
+          "path": "src/ai/claude_cli/isolation_tests.rs",
+          "blob": "c30ae7ef2d6661e944a3c7e8bf5f5e2a5bdbd7d1"
+        },
+        {
+          "path": "src/ai/claude_cli/process_tests.rs",
+          "blob": "5838902c2f0b6fc1320d577bd70976581e760fc8"
+        },
+        {
+          "path": "src/ai/cli_common.rs",
+          "blob": "01eddf879eb2e5c094fce3ef9a79bca556744d2a"
+        },
+        {
+          "path": "src/ai/codex_cli.rs",
+          "blob": "0c793bd6db30aa19dfe38e1239d3078e7e694157"
+        },
+        {
+          "path": "src/ai/concurrency_limited_provider.rs",
+          "blob": "e2150df845d983e8b13785a288cac44f40dd90ef"
+        },
+        {
+          "path": "src/ai/copilot_cli.rs",
+          "blob": "3c8e51ab9c3cb410400c78b8ac2473d35aac8172"
+        },
+        {
+          "path": "src/ai/devin_cli.rs",
+          "blob": "1cfb027400f0767d87fd03268b6a3ae004d46cfa"
+        },
+        {
+          "path": "src/ai/gemini.rs",
+          "blob": "68159c42773438c6a62179781070f9cc575831fc"
+        },
+        {
+          "path": "src/ai/goose_cli.rs",
+          "blob": "68b0854c5c906bdceb92e61705b4413fffaa7d72"
+        },
+        {
+          "path": "src/ai/kiro_cli.rs",
+          "blob": "f8d07a5e5261433bdc6d57eaf86adffb2347e4e7"
+        },
+        {
+          "path": "src/ai/logging_provider.rs",
+          "blob": "be7a9c338ca4c424be920782185612da9dc6017d"
+        },
+        {
+          "path": "src/ai/mod.rs",
+          "blob": "87ca872fd1a804d50331f3a74f6deccda8468a8f"
+        },
+        {
+          "path": "src/ai/ollama.rs",
+          "blob": "46132b132ea63a6abb34172d0a10ba4fbc514979"
+        },
+        {
+          "path": "src/ai/ollama/format_tests.rs",
+          "blob": "bdc8c5f8b13033009a1f82ec778f5f752ac024a2"
+        },
+        {
+          "path": "src/ai/openai.rs",
+          "blob": "8729aa19db29c38ad8b3d29166921ca163255f13"
+        },
+        {
+          "path": "src/ai/proxy.rs",
+          "blob": "ddc15df75c95a49e861e0709042eef287c0dbd7d"
+        },
+        {
+          "path": "src/ai/quota.rs",
+          "blob": "fff943a52d845c6f80bb1cfe393cdc86eac75498"
+        },
+        {
+          "path": "src/ai/session.rs",
+          "blob": "4493eef2b6a1d775bb9dfa5f42197590dd51b6b4"
+        },
+        {
+          "path": "src/ai/test_http.rs",
+          "blob": "2b86528227bfa50c2aa9182e9c2b40c69de69093"
+        },
+        {
+          "path": "src/ai/token_budget.rs",
+          "blob": "f5d2b7a0b18d23f86f988875f4df66fc7154abd3"
+        },
+        {
+          "path": "src/ai/truncator.rs",
+          "blob": "605202d3aaebf87f78cf282bd8ba58c716ef36fe"
+        },
+        {
+          "path": "src/ai/vector_search.rs",
+          "blob": "7a2b5dafa223f853b1fa1642105853a83b20b5c5"
+        },
+        {
+          "path": "src/ai/vertex.rs",
+          "blob": "9467fdef1bd024465761c85b48c671b9e51eee87"
+        },
+        {
+          "path": "src/ai/vllm.rs",
+          "blob": "44d2ea57ab72d7c4fe0d9799094d582bc70f65f1"
+        }
+      ],
+      "symbols": [
+        "AGENT_JSON",
+        "AcpProcess",
+        "AiErrorClass",
+        "AiUsage",
+        "BYTES_PER_TOKEN",
+        "BackoffProvider",
+        "BedrockClient",
+        "BugVector",
+        "CONFIG_YAML",
+        "CandidateMatch",
+        "ClaudeCliProvider",
+        "ClaudeError",
+        "CliIoError",
+        "CodexCliProvider",
+        "ConcurrencyLimitedProvider",
+        "DENY_ALL_HOOK",
+        "DeadlineBudget",
+        "DevinCliProvider",
+        "ErrorAction",
+        "FRAME_TAGS",
+        "FunctionCall",
+        "FunctionResponse",
+        "GeminiError",
+        "GooseCliProvider",
+        "GroupGuard",
+        "IPC_READER",
+        "IPC_REGISTRY",
+        "IPC_WRITER",
+        "IpcEnvelope",
+        "IsolatedHome",
+        "KiroCliProvider",
+        "LIVE_GROUPS",
+        "MAX_ATTEMPTS",
+        "MAX_CONTINUATION_HOPS",
+        "MAX_RETRY_AFTER",
+        "OllamaOptions",
+        "OllamaRequest",
+        "Part",
+        "ProxyGuard",
+        "RetryBudget",
+        "STDERR_PREVIEW_LIMIT",
+        "SessionFailure",
+        "StderrPreview",
+        "StdioClaudeClient",
+        "StdioGeminiClient",
+        "UsageMetadata",
+        "ValidationError",
+        "abort_all",
+        "approximate_tokens",
+        "assign_unique_ids",
+        "build_claude_args",
+        "build_copilot_args",
+        "build_env",
+        "build_prompt",
+        "cache_identity",
+        "cache_identity_with",
+        "cache_stats",
+        "call_tool",
+        "call_tools",
+        "check",
+        "check_error_message",
+        "classify_ai_error",
+        "classify_generate_content_failure",
+        "compute_cache_key",
+        "cosine_similarity",
+        "create_http_client",
+        "create_isolated_workspace",
+        "create_provider_cached",
+        "credit_wait",
+        "default_base_url_for_model",
+        "default_context_window_for_model",
+        "digest_env",
+        "disarm",
+        "dispatch",
+        "effective_base_url",
+        "ensure_stdin_reader",
+        "error_message",
+        "escape_frames",
+        "extract_json",
+        "find_fence_opener",
+        "find_top_candidates",
+        "fit_messages_to_budget",
+        "forget",
+        "forget_envelope",
+        "generate_content",
+        "head_of",
+        "idle",
+        "ipc_forget",
+        "ipc_registry",
+        "ipc_writer",
+        "is_approval_policy_substitution",
+        "is_effort_substitution",
+        "is_permanent_transport_error",
+        "kill_and_reap",
+        "kill_live_groups",
+        "llm_permits",
+        "log_user_prompt",
+        "next_continuation_token",
+        "normalize_base_url",
+        "output_token_count",
+        "post_request",
+        "read_generate_content_response",
+        "record_stderr_line",
+        "refresh_client",
+        "register",
+        "rejects_temperature_parameter",
+        "report_quota_error",
+        "report_success",
+        "resolve_vertex_max_tokens",
+        "response_cache_path",
+        "run",
+        "run_prompt",
+        "scrub_thought_signatures",
+        "spawn_cli",
+        "start_proxy_command",
+        "translate_request",
+        "transport_error",
+        "trim_stderr_preview",
+        "wait_for_access"
+      ]
+    },
+    "api-server": {
+      "name": "api-server",
+      "note": "units/api-server.md",
+      "facts": "units/api-server.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T20:55:47Z",
+      "note_bytes": 14596,
+      "confirmed_facts": 45,
+      "files": [
+        {
+          "path": "src/access.rs",
+          "blob": "6a13c5308120b3d671b61214d607710af98cacea"
+        },
+        {
+          "path": "src/api.rs",
+          "blob": "783721df624e71fc3030cd31a85ea6e82aa34c0c"
+        },
+        {
+          "path": "src/auth.rs",
+          "blob": "5000501996d61faf9f00cd5125ed60b725230ed0"
+        },
+        {
+          "path": "src/server.rs",
+          "blob": "8604ba6ab807f7806bf145de4708374929852744"
+        }
+      ],
+      "symbols": [
+        "ASSIGNMENT_NOTE_BYTES",
+        "ASSIGNMENT_SUBJECT_TITLE_BYTES",
+        "AppState",
+        "AuthUser",
+        "BugAccess",
+        "BugAction",
+        "BugActionPayload",
+        "BugListQuery",
+        "BugQuery",
+        "BugSubsystemsQuery",
+        "Claims",
+        "EMAIL_WORKER_STALE_SECONDS",
+        "FetchRequest",
+        "LocalToken",
+        "MAX_PATCHSET_PAGE_SIZE",
+        "MAX_SESSION_LIFETIME_SECONDS",
+        "Pagination",
+        "PatchQuery",
+        "Principal",
+        "SectionTitle",
+        "SignInLinkRateLimiter",
+        "SubmitRequest",
+        "ToolBox",
+        "access_to",
+        "access_to_patchset",
+        "access_to_with_bugid",
+        "analyze_bug",
+        "anonymous",
+        "as_str",
+        "assignment_notice",
+        "attach_patchset_flags",
+        "bug_access",
+        "bug_access_for_query",
+        "bug_lookup_denial",
+        "build_bug_assignment_email",
+        "build_router",
+        "by_bugid",
+        "can_comment",
+        "can_manage",
+        "can_read",
+        "check_and_record",
+        "clamp_page_size",
+        "create_auth_token",
+        "create_token",
+        "create_token_with_session",
+        "effective_bugid",
+        "enforce_review_embargo",
+        "fetch_and_inject_thread",
+        "forge_webhook",
+        "get_bug",
+        "get_bug_enrichments",
+        "get_patchset",
+        "has_global_bug_visibility",
+        "health_check",
+        "invalidate",
+        "is_auth_blocklisted",
+        "is_authorized",
+        "is_notifiable_address",
+        "is_token_shaped",
+        "list_bug_subsystems",
+        "list_bugs",
+        "list_mailing_lists",
+        "list_messages",
+        "list_patchsets",
+        "maintained_section_names",
+        "may_release_embargo",
+        "may_view_embargoed",
+        "normalize_thread_message_id",
+        "original",
+        "page_size",
+        "populate_embargoed_patchset_findings",
+        "presents_local_token",
+        "principal",
+        "process_issue_for_project",
+        "read_from",
+        "readable_bug",
+        "readable_bug_for_view",
+        "readable_bug_ids",
+        "redact_embedded_bugs",
+        "redact_inaccessible_duplicate_enrichments",
+        "referenced_duplicate_ids",
+        "refresh_token",
+        "request_link",
+        "resolve",
+        "resolve_bug_read_principal",
+        "resolve_patchset_embargo_access",
+        "set_virtual_head",
+        "submit_patch",
+        "transcript_bug",
+        "verify_link",
+        "visibility",
+        "with_bug_actor",
+        "with_max_access",
+        "write_to"
+      ]
+    },
+    "cli-config": {
+      "name": "cli-config",
+      "note": "units/cli-config.md",
+      "facts": "units/cli-config.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T20:51:21Z",
+      "note_bytes": 14645,
+      "confirmed_facts": 73,
+      "files": [
+        {
+          "path": "build.rs",
+          "blob": "1caa88dda84f10ee1eb29d6df6559b16072b861a"
+        },
+        {
+          "path": "src/bin/sashiko-cli.rs",
+          "blob": "63a46f010b2a96cda7807373ccec347141c33c35"
+        },
+        {
+          "path": "src/compression.rs",
+          "blob": "67a28893d043cbda3bbc3fe85d431588411c44de"
+        },
+        {
+          "path": "src/events.rs",
+          "blob": "9566f3003f66ebe979bdf1046c828d0ae18a8d35"
+        },
+        {
+          "path": "src/lib.rs",
+          "blob": "3ec5deaf9b3d60ea05c4be68b75754f05efda3a4"
+        },
+        {
+          "path": "src/logging.rs",
+          "blob": "53bd830aa6ea4ddf6a165c1322b50080da95353e"
+        },
+        {
+          "path": "src/main.rs",
+          "blob": "1558bd89303bbab9fc87395d71fdaed65c448bd0"
+        },
+        {
+          "path": "src/metrics.rs",
+          "blob": "9cb7df8b88135bf9b33209d1cf6d17be49f90714"
+        },
+        {
+          "path": "src/project.rs",
+          "blob": "ccb9867b75457235e92d89bb5eca7afab9bf15d2"
+        },
+        {
+          "path": "src/prompt_bundle.rs",
+          "blob": "93d0bd3e8ca0089657f8eb6145536977c5691433"
+        },
+        {
+          "path": "src/prompt_fingerprint.rs",
+          "blob": "3bbe8af41965335874407eca438c9e0e81d2d383"
+        },
+        {
+          "path": "src/prompt_namespaces.rs",
+          "blob": "28228dc72470a9657e24d34e7e8b679ea337fd82"
+        },
+        {
+          "path": "src/settings.rs",
+          "blob": "a1545696c843e10b08f838e3d3c8699f30de1552"
+        },
+        {
+          "path": "src/test_support.rs",
+          "blob": "af16a957bf6323bb4c863757dbeaf9186bf8fc10"
+        },
+        {
+          "path": "src/utils.rs",
+          "blob": "d2d5b83be3ead9027abf878013abf20cfe988674"
+        }
+      ],
+      "symbols": [
+        "ALL",
+        "AbortOnDrop",
+        "AclSettings",
+        "AiSettings",
+        "BLOCKING_COMPRESSION_THRESHOLD_BYTES",
+        "BedrockSettings",
+        "COMPRESSION_THRESHOLD_BYTES",
+        "Commands",
+        "DEFAULT_SENDMAIL_PATH",
+        "Event",
+        "ForgePostMode",
+        "ForgeSettings",
+        "GZIP_MAGIC",
+        "IgnoreBrokenPipe",
+        "IgnoreBrokenPipeWriter",
+        "IngestReceipt",
+        "LOCAL_TOKEN_FILE_NAME",
+        "MailTransport",
+        "MailingListsSettings",
+        "Overrides",
+        "PROGRESS_LINE_PREFIX",
+        "PROJECT_PROMPT_NAMESPACES",
+        "PROMPT_BUNDLE_REVISION",
+        "ParsedArticle",
+        "PatchState",
+        "PatchStatus",
+        "Permission",
+        "ProcessStatus",
+        "ProgressState",
+        "ProjectId",
+        "RegionExit",
+        "ReviewStatus",
+        "Settings",
+        "SmtpSettings",
+        "VertexSettings",
+        "add_patchset_maintainer_sections",
+        "add_subsystem_to_patchset",
+        "apply_overrides",
+        "as_str",
+        "build_client",
+        "clean_json_string",
+        "collect_files",
+        "compress_string_async",
+        "compress_string_if_needed",
+        "content_fingerprint",
+        "current_git_toplevel",
+        "decompress_string_value",
+        "default_gemini_max_tokens",
+        "default_gemini_max_tokens_for_model",
+        "deserialize_string_or_vec",
+        "effective_effort",
+        "effective_project",
+        "exit_on_interrupt",
+        "exit_worker_with_error",
+        "fail_fetching_patchset_logged",
+        "find_worker_command",
+        "finish_progress",
+        "format_subject",
+        "from_str",
+        "get_compressed_string",
+        "get_compressed_string_opt",
+        "granted_by_local_token",
+        "handle_local",
+        "has_global_low_thinking_level",
+        "has_permission",
+        "identify_subsystems",
+        "install_prompt_bundle",
+        "is_blocklisted",
+        "is_known_identity",
+        "is_mbox_separator",
+        "is_reachable_base_url",
+        "kernel_severity_guide",
+        "list_contains",
+        "local_token_path",
+        "mailed_link_base_url",
+        "mailing_lists_path",
+        "on_stderr",
+        "outbox_status",
+        "paint_progress",
+        "paint_progress_plain",
+        "patch_stage_total",
+        "prepare_mbox_payload",
+        "process_parsed_article",
+        "process_recipients",
+        "project_prompts_path",
+        "prompt_dir",
+        "publish_local_token",
+        "release_progress_region",
+        "release_region_on_panic",
+        "run_daemon",
+        "sashiko_severity_guide",
+        "sections_for_diff",
+        "sendmail_command",
+        "settle",
+        "severity_guide",
+        "should_start_nntp_ingestor",
+        "sign_in_base_url",
+        "spawn_supervised_worker",
+        "spawn_supervised_worker_with_backoff",
+        "split_mbox",
+        "take_safe_mark",
+        "utf8_prefix",
+        "validate",
+        "validate_for_daemon",
+        "validate_sign_in_delivery",
+        "wait_until_quiet",
+        "window_size",
+        "worth_reserving",
+        "write_executable_script"
+      ]
+    },
+    "db": {
+      "name": "db",
+      "note": "units/db.md",
+      "facts": "units/db.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:06:29Z",
+      "note_bytes": 15911,
+      "confirmed_facts": 79,
+      "files": [
+        {
+          "path": "src/db.rs",
+          "blob": "8662f66265eaa23638567ea306d14613ff60fd8b"
+        },
+        {
+          "path": "src/migrations/001_initial.sql",
+          "blob": "59f6ae6d110a3bbbaebb488aa912f1f5115153e1"
+        },
+        {
+          "path": "src/migrations/002_bugs.sql",
+          "blob": "04944879ddfe8ffaf5e5f3288d540752af92faa7"
+        },
+        {
+          "path": "src/migrations/003_email_outbox_kind.sql",
+          "blob": "2597eeb991b6a5a79c41fd619c44268ef8442661"
+        },
+        {
+          "path": "src/migrations/004_retire_folded_bug_pipelines.sql",
+          "blob": "bab2be2ea3fc2ff110de829fda1952f2ab6c0d52"
+        },
+        {
+          "path": "src/migrations/005_index_patches_message_id.sql",
+          "blob": "4037673319cd0a2296541955a2cb91196ad0b456"
+        },
+        {
+          "path": "src/migrations/006_repair_borrowed_series_names.sql",
+          "blob": "c8b92d25b24ac8e993a4e6bfb97c83be9f256bea"
+        },
+        {
+          "path": "src/migrations/007_fold_shadow_cover_rows.sql",
+          "blob": "bf291e32b0818dfe8915421ac1f9df54064af2eb"
+        },
+        {
+          "path": "src/migrations/008_meta_table.sql",
+          "blob": "bc814b7f3cb77bd3021f32e331acc01688233a23"
+        },
+        {
+          "path": "src/migrations/009_patchset_maintainer_sections.sql",
+          "blob": "f49959e08d0244418803e81b038aa291b5164a46"
+        },
+        {
+          "path": "src/migrations/010_forge_outbox.sql",
+          "blob": "6ddd1588f8f4e081cecc41d04e4fba604aeeb2f4"
+        },
+        {
+          "path": "src/migrations/011_index_patchsets_mr_number.sql",
+          "blob": "74602e1c214a051647442531923e7c895a9566cc"
+        },
+        {
+          "path": "src/migrations/012_git_patch_id.sql",
+          "blob": "79b74b1e1e73858af60eb1303ac0deb9a076723a"
+        },
+        {
+          "path": "src/migrations/013_index_bugs_fix_check.sql",
+          "blob": "516ef08edd23b12d54d087093ad64380328eaffa"
+        }
+      ],
+      "symbols": [
+        "AttributedSubsystem",
+        "BUG_ROW_COLUMNS",
+        "Bug",
+        "BugAnalysisClaim",
+        "BugLifecycleStatus",
+        "BugPipelineState",
+        "BugVisibility",
+        "CLEAN_PATCHSET_PREDICATE",
+        "CLOSED_TO_NEW_PARTS_SQL",
+        "Database",
+        "DatabaseTransaction",
+        "EmailKind",
+        "MarkDuplicateBugParams",
+        "PATCH_WRITE_MAX_ATTEMPTS",
+        "PatchWriteOutcome",
+        "PatchsetRow",
+        "SIGN_IN_LINK_LIFETIME_SECONDS",
+        "Severity",
+        "StoredPrerequisiteSeries",
+        "SubsystemSource",
+        "TransactionalEmail",
+        "_shadow_cover_fold",
+        "abandon_exhausted_bugs",
+        "advance_open_bugs_without_llm_batch",
+        "assign_bug",
+        "authorizing_sections_for_bugs",
+        "authorizing_sections_for_patchsets",
+        "begin_immediate_transaction",
+        "bug_discovery_summaries",
+        "bug_family",
+        "build_search",
+        "cancel_patchset",
+        "claim_open_bug_for_fix_check",
+        "claim_pending_bug",
+        "claim_specific_open_bug_for_fix_check",
+        "confers_authority",
+        "count_patchsets",
+        "deserialize",
+        "ensure_project_stamp",
+        "execute",
+        "fail_bug_analysis",
+        "find_patchset_id_by_msgid",
+        "from_i32",
+        "from_stored",
+        "from_str",
+        "get_bug_enrichments",
+        "get_bug_on_write_conn",
+        "get_embargoed_patchset_reviews",
+        "get_message_details",
+        "get_messages",
+        "get_msgid_candidates",
+        "get_patch_diffs",
+        "get_patchset_details",
+        "get_patchset_finding_counts",
+        "get_patchset_reviews_for_patches",
+        "get_patchsets",
+        "get_stored_prerequisite_series",
+        "get_subsystems_bug_counts",
+        "get_tool_usage_stats",
+        "hydrate_bugs_batch",
+        "is_closed_to_new_parts",
+        "list_all_bugs_for_vector_search",
+        "list_open_bugs_for_fix_check",
+        "parse_bug_row",
+        "parse_bug_row_core",
+        "patch_diffs_only",
+        "patchsets_missing_maintainer_sections",
+        "reconcile_superseded_pr_patchsets",
+        "reconcile_superseded_series_patchsets",
+        "recover_stale_running_bugs",
+        "renew_bug_lease",
+        "repair_borrowed_series_names",
+        "rerun_patchset",
+        "select_git_patch_id",
+        "severity",
+        "touch_bug_fix_check_timestamp",
+        "touch_open_bugs_fix_check_batch",
+        "transactional_list_label",
+        "trg_bug_subsystems_audit_insert",
+        "trg_bugs_audit_lifecycle_status",
+        "vector_json",
+        "with_connection",
+        "write_patch_if_unchanged",
+        "write_patch_transaction"
+      ]
+    },
+    "email-delivery": {
+      "name": "email-delivery",
+      "note": "units/email-delivery.md",
+      "facts": "units/email-delivery.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T20:48:43Z",
+      "note_bytes": 12872,
+      "confirmed_facts": 40,
+      "files": [
+        {
+          "path": "src/email_policy.rs",
+          "blob": "31941afebdd9e8434fe6edfd8170ab13d1307135"
+        },
+        {
+          "path": "src/email_router.rs",
+          "blob": "bbb7dad82abe0cfbf2dc150a60c2e0e52b0548b3"
+        },
+        {
+          "path": "src/patchwork.rs",
+          "blob": "244ef856126d836af304d0f50d21fe077caed30e"
+        },
+        {
+          "path": "src/worker/email.rs",
+          "blob": "70114222d32e65453fed85c1002e4fbca534d6f3"
+        },
+        {
+          "path": "src/worker/forge.rs",
+          "blob": "478b8f363b27f6fe609c3660daa56193ba1a516f"
+        },
+        {
+          "path": "src/worker/patchwork.rs",
+          "blob": "63dc062c893c45dbba6f82c087438b3f49f26559"
+        }
+      ],
+      "symbols": [
+        "Action",
+        "AutoSubmitted",
+        "EmailPolicyConfig",
+        "EmailRouter",
+        "EmailWorker",
+        "KNOWN_MAILING_LIST_DOMAINS",
+        "ListId",
+        "MAX_RELAYED_RECIPIENTS",
+        "PatchworkCheckError",
+        "PatchworkCheckRequest",
+        "PatchworkPolicy",
+        "PatchworkWorker",
+        "PositiveReviewPolicy",
+        "ReplyTarget",
+        "SENDMAIL_TIMEOUT",
+        "SMTP_SEND_TIMEOUT",
+        "SMTP_SOCKET_TIMEOUT",
+        "address_matches_list",
+        "apply_token_override",
+        "backoff_seconds",
+        "build_email_message",
+        "build_outbox_client",
+        "cached_token",
+        "check_sendmail_path",
+        "clean_display_name",
+        "compose_patchwork_email",
+        "dedup_addresses",
+        "email",
+        "email_policy",
+        "email_router",
+        "extract_bare_email",
+        "forge",
+        "handle_failure",
+        "heartbeat",
+        "invalidate_cached_token",
+        "is_ignored_author",
+        "is_mailing_list_address",
+        "is_permanent_failure",
+        "is_transient_smtp_error",
+        "load",
+        "load_async",
+        "log_sign_in_links",
+        "merge_policies",
+        "merge_severity_opt",
+        "normalize",
+        "outbox_client",
+        "parse_content",
+        "parse_lenient",
+        "patchwork",
+        "record_heartbeat",
+        "resolve_recipients",
+        "resolve_token",
+        "run",
+        "send_email",
+        "send_via_sendmail",
+        "send_via_smtp",
+        "test_build_email_message_sets_deterministic_message_id",
+        "test_display_name_does_not_select_list_policy",
+        "test_sendmail_recipient_cannot_be_an_option",
+        "test_sendmail_timeout_kills_the_child",
+        "too_many_individuals",
+        "transactional_list_label",
+        "validate"
+      ]
+    },
+    "git-baseline": {
+      "name": "git-baseline",
+      "note": "units/git-baseline.md",
+      "facts": "units/git-baseline.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T20:53:16Z",
+      "note_bytes": 13634,
+      "confirmed_facts": 56,
+      "files": [
+        {
+          "path": "src/baseline.rs",
+          "blob": "409b7d878ef0b8779460ddfaa0c227a091bb6379"
+        },
+        {
+          "path": "src/git_cmd.rs",
+          "blob": "272ec26c5720827f11f09575d8592c4e8555c9f5"
+        },
+        {
+          "path": "src/git_ops.rs",
+          "blob": "917a8350254bfe52d55a3942cf79352d91f406ea"
+        },
+        {
+          "path": "src/git_ops/apply_error.rs",
+          "blob": "8b182c7b034d59fa8e75688b0c891693cf1a4582"
+        },
+        {
+          "path": "src/maintainers.rs",
+          "blob": "d073f162c82f151f68b97ddadd89ae93faa61234"
+        },
+        {
+          "path": "src/prerequisites.rs",
+          "blob": "6350d6ea3eae7540d679900628571a83dc063f88"
+        }
+      ],
+      "symbols": [
+        "BackoffError",
+        "BaselineResolution",
+        "CommitId",
+        "CompiledPattern",
+        "FetchOutcome",
+        "FileMatcher",
+        "GIT_PATCH_ID_SEMAPHORE",
+        "GIT_PATCH_ID_TIMEOUT",
+        "GIT_PROTOCOL_RESTRICTIONS",
+        "GLOBAL_INDEX_TEST_LOCK",
+        "GLOBAL_MAINTAINERS",
+        "GRAPH_RETRY_FLOOR",
+        "GitAmError",
+        "GitWorktree",
+        "INHERITED_LOCATION_VARS",
+        "LINUX_NEXT_URL",
+        "MAX_CONCURRENT_GIT_PATCH_IDS",
+        "MAX_LORE_OPERATIONS",
+        "MAX_MBOX_MESSAGES",
+        "MAX_PREREQUISITE_DEPTH",
+        "MAX_PREREQUISITE_PATCH_IDS",
+        "MaintainerSection",
+        "MaintainersIndex",
+        "MaintainersIndex::match_file",
+        "OFFLINE_GIT_TIMEOUT",
+        "PatchApplyFailure",
+        "PrerequisiteMetadata",
+        "PrerequisitePatch",
+        "append_patch",
+        "apply_patch",
+        "as_str",
+        "baseline",
+        "cache_hinted_patches",
+        "cache_required_patches",
+        "calculate_git_patch_id",
+        "calculate_git_patch_id_batch",
+        "catch_all",
+        "classify",
+        "clean_message_id",
+        "cleanup_worktree_dir",
+        "clear_global_maintainers",
+        "compile",
+        "count_remote_operation",
+        "detached_async",
+        "drop_commit_graph",
+        "ensure_gc_disabled",
+        "ensure_remote",
+        "ensure_submodule_config_compat",
+        "explicit_stable_versions",
+        "extract_base_commit",
+        "fetch_remote",
+        "fetch_thread_patches",
+        "from_error",
+        "from_path",
+        "from_reader",
+        "from_sections",
+        "get_commit_hash",
+        "get_global_config_lock",
+        "get_global_maintainers",
+        "get_object_store_lock",
+        "get_remote_lock",
+        "get_worktree_lock",
+        "git_cmd",
+        "git_file_exists_at",
+        "git_find_file_rename",
+        "git_ops",
+        "git_status",
+        "has_matching_cover_ancestor",
+        "in_dir",
+        "in_dir_async",
+        "init_global_maintainers",
+        "is_dirty",
+        "is_global_maintainer",
+        "is_managed",
+        "is_merged_default_head",
+        "is_stale_commit_graph",
+        "load_git_remotes",
+        "load_series",
+        "maintainer_address",
+        "maintainer_addresses",
+        "maintainers",
+        "match_file",
+        "new",
+        "new_scratch_clone",
+        "normalize_patch_id",
+        "object_dir",
+        "offline_git",
+        "pack_stats",
+        "parse",
+        "parse_based_on_message_id",
+        "parse_mbox_messages",
+        "parse_message_id",
+        "parse_prerequisite_metadata",
+        "parse_prerequisite_patch_ids",
+        "parse_prerequisite_series_ids",
+        "parse_prerequisite_thread_hints",
+        "prerequisites",
+        "prune_worktrees",
+        "public_message",
+        "redact_secret",
+        "refresh_remote",
+        "remove",
+        "repack_repository",
+        "resolve_candidates",
+        "resolve_patch_ids",
+        "resolve_series",
+        "resolve_target",
+        "run_git_patch_id_command",
+        "run_offline_git",
+        "schedule_commit_graph_rebuild",
+        "sections_for_diff",
+        "series_from_storage",
+        "stable_series_version",
+        "subject_version_candidates",
+        "subsystems_for_address",
+        "test_no_git_command_is_spawned_outside_this_module",
+        "write_commit_graph"
+      ]
+    },
+    "ingestion-forge": {
+      "name": "ingestion-forge",
+      "note": "units/ingestion-forge.md",
+      "facts": "units/ingestion-forge.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:06:48Z",
+      "note_bytes": 15819,
+      "confirmed_facts": 48,
+      "files": [
+        {
+          "path": "src/backfill.rs",
+          "blob": "a438064fddcd8d59cb5538de3ae1a85ae3eec810"
+        },
+        {
+          "path": "src/fetcher.rs",
+          "blob": "9864f296e876ab9f004431a8313d9b693b83406b"
+        },
+        {
+          "path": "src/forge.rs",
+          "blob": "60ab89747800c8e8804bac7dce936daa21f3aacf"
+        },
+        {
+          "path": "src/ingestor.rs",
+          "blob": "8c683e791bd8a12942a6640a2a0ef475576b1220"
+        },
+        {
+          "path": "src/mbox.rs",
+          "blob": "21f44216ba56e10f9663ca5e747ecea7bd2884b1"
+        },
+        {
+          "path": "src/nntp.rs",
+          "blob": "2843f08e5857940b861c3413a9fb33e95470daa0"
+        },
+        {
+          "path": "src/patch.rs",
+          "blob": "ebdb049b3fbc2b3d1c5fe70ad4216fd9c727d067"
+        }
+      ],
+      "symbols": [
+        "ClientConfig",
+        "DEFAULT_TIMEOUT",
+        "FetchAgent",
+        "FetchRequest",
+        "ForgeEvent",
+        "ForgeMetadata",
+        "GLOBAL_INDEX_TEST_LOCK",
+        "GroupInfo",
+        "LoreFetchFailure",
+        "MAX_GITHUB_COMMENT_BYTES",
+        "MAX_LOGGED_LEN",
+        "MAX_MANIFEST_DECOMPRESSED",
+        "MAX_MBOX_DECOMPRESSED",
+        "NntpClient",
+        "Patch",
+        "PatchReviewSummaryItem",
+        "PatchsetMetadata",
+        "ReviewIntent",
+        "SECTIONS_BACKFILLED_KEY",
+        "backfill_patchset_maintainer_sections",
+        "bootstrap_clone_command",
+        "bootstrap_fetch_command",
+        "bootstrap_repo",
+        "clean_display_name",
+        "clean_subject",
+        "client_config",
+        "commit_article_mark",
+        "compose_pr_review_comment",
+        "crypto_provider",
+        "decode_manifest",
+        "decode_webhook_secret",
+        "decompress_mbox",
+        "ensure_remote",
+        "event_label",
+        "extract_changelog_from_body",
+        "extract_mr_version_from_subject",
+        "extract_patch",
+        "fetch",
+        "fetch_all",
+        "fetch_once",
+        "fetch_thread",
+        "fetch_with_graph_retry",
+        "find_epoch_urls",
+        "format_mailbox",
+        "format_mr_subject",
+        "group",
+        "ingest_git_objects",
+        "inject_changelog_into_git_show",
+        "is_b4_alias",
+        "is_mbox_separator",
+        "is_present",
+        "is_retryable_status",
+        "is_safe_repo_url",
+        "is_valid_git_sha",
+        "is_valid_repo_url",
+        "loggable",
+        "mr_metadata",
+        "native_tls_config",
+        "parse_email",
+        "parse_payload",
+        "parse_subject_index",
+        "patch_diffs_only",
+        "process_nntp_cycle",
+        "quit",
+        "read_line_with_timeout",
+        "replace_patchset_maintainer_sections",
+        "resolve_tracked_group",
+        "review_intent",
+        "run_git_bootstrap",
+        "search_patch_id",
+        "sections_for_patchset",
+        "send_command",
+        "split_address_list",
+        "split_mbox",
+        "strip_existing_mr_prefix",
+        "thread_url",
+        "validate_event",
+        "verify_github_signature",
+        "verify_secret_token",
+        "verify_standard_webhook_signature"
+      ]
+    },
+    "notes": {
+      "name": "notes",
+      "note": "units/notes.md",
+      "facts": "units/notes.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:07:07Z",
+      "note_bytes": 14726,
+      "confirmed_facts": 63,
+      "files": [
+        {
+          "path": "src/notes/agenda.rs",
+          "blob": "0189f8abbe40af5c6794e573f622247464aab109"
+        },
+        {
+          "path": "src/notes/agenda_derive.rs",
+          "blob": "22b297f4bc1c7e683ed65d4e004aa68489bb821a"
+        },
+        {
+          "path": "src/notes/build.rs",
+          "blob": "694af012ff02c696e4cf332791284f8f906ed558"
+        },
+        {
+          "path": "src/notes/cli.rs",
+          "blob": "6e88b43a76bce0b46b6299798ca69d640587cfe4"
+        },
+        {
+          "path": "src/notes/components.rs",
+          "blob": "7cc67709edea33201720aaf8fdbcff7124ca0774"
+        },
+        {
+          "path": "src/notes/corpus.rs",
+          "blob": "b47924d2e9a1c02593966f545b06eded79c1661f"
+        },
+        {
+          "path": "src/notes/entry_points.rs",
+          "blob": "910ea416e1b5f5968ca8c0d09634ef607f591655"
+        },
+        {
+          "path": "src/notes/evidence.rs",
+          "blob": "7786d5b3ca0020d8f5026568cc7c68c995869738"
+        },
+        {
+          "path": "src/notes/facts.rs",
+          "blob": "17532caeb20b53ace0d011b4d2e1f25a261a63e7"
+        },
+        {
+          "path": "src/notes/history.rs",
+          "blob": "845c99025095dfbde5fbb97d038d42128620b305"
+        },
+        {
+          "path": "src/notes/maintainer_notes.rs",
+          "blob": "5636d8a2a2363437d51748afd7ea3280c63e08e9"
+        },
+        {
+          "path": "src/notes/mod.rs",
+          "blob": "ed45b7c6c956138086ed4b12fee08b1bd9678784"
+        },
+        {
+          "path": "src/notes/output.rs",
+          "blob": "aec8a3beddb114b9f1726e9783a2028bd4e3a8cb"
+        },
+        {
+          "path": "src/notes/plan.rs",
+          "blob": "c96f3158f30b8dcfc2bb9e3f43e7f327b06af11d"
+        },
+        {
+          "path": "src/notes/profile.rs",
+          "blob": "e12d6ba6d8634e29a9733faee7c853c8a8eee925"
+        },
+        {
+          "path": "src/notes/rule_comments.rs",
+          "blob": "567a59df08e45e944fb01b5c06990f0f731dd46f"
+        },
+        {
+          "path": "src/notes/scope.rs",
+          "blob": "84d90fbf96392c62c22f6aada4c929c89dbdd18e"
+        },
+        {
+          "path": "src/notes/select.rs",
+          "blob": "02ea39409ab4ea9a34bd17b1a11a04a5234a2912"
+        },
+        {
+          "path": "src/notes/units.rs",
+          "blob": "c3272eba453fe69f767f1f24bbf0b30197f6844b"
+        }
+      ],
+      "symbols": [
+        "BuildConfig",
+        "COMPONENT_OVERHEAD_HIGH",
+        "COMPONENT_OVERHEAD_LOW",
+        "CONTEXT_PASSES_HIGH",
+        "CONTEXT_PASSES_LOW",
+        "CORPUS_BATCH_SIZE",
+        "CORPUS_STAGE_NAMES",
+        "CorpusCase",
+        "CorpusMeta",
+        "CorpusRecord",
+        "DIFF_CHARS",
+        "EvidenceCheck",
+        "FIX_DIFF_CHARS",
+        "HistoryCase",
+        "INTRODUCED_DIFF_CHARS",
+        "IntroducedChange",
+        "LINE_CHARS",
+        "LOCK_FILE",
+        "LessonKind",
+        "MANIFEST_FILE",
+        "MAX_FACTS_PER_STAGE",
+        "MAX_FINAL_THEMES",
+        "MAX_INTRODUCED",
+        "MAX_MERGE_LEVELS",
+        "MAX_UNITS_PER_SYMBOL",
+        "MESSAGE_CHARS",
+        "META_FILE",
+        "MaintainerNote",
+        "MaintainersUnits",
+        "Manifest",
+        "ManifestUnit",
+        "NoteReason",
+        "NotesSet",
+        "PATHS_PER_CALL",
+        "ReviewValue",
+        "RevisionFiles",
+        "SelectedNote",
+        "Selection",
+        "SourceFile",
+        "THEME_EXAMPLES",
+        "TOKENS_PER_LINE",
+        "TokenEstimate",
+        "ToolBox",
+        "UNITS_DIR",
+        "UnitFacts",
+        "UnitPlan",
+        "VERIFY_BATCH_SIZE",
+        "VERIFY_STAGE_NAMES",
+        "VerdictKind",
+        "WorkflowEnv",
+        "all_component_names",
+        "analyze",
+        "append_records",
+        "assign_units",
+        "build_unit",
+        "bullet_subject_symbols",
+        "check",
+        "check_fact",
+        "check_unique_ids",
+        "check_verifier_evidence",
+        "choose_set",
+        "claim",
+        "clause_subject_spans",
+        "collect_fix_commits",
+        "commit_time",
+        "component_slug_map",
+        "count_lines_output",
+        "dir_components",
+        "extract_entry_points",
+        "fallback_note",
+        "fix_id",
+        "focus_symbol_note",
+        "for_component",
+        "grep_lines",
+        "ground_symbols",
+        "hydrate_history_cases",
+        "is_ancestor",
+        "is_partial_selection",
+        "is_safe_module_name",
+        "is_safe_set_id",
+        "is_split_unit",
+        "lines",
+        "list_source_files",
+        "llm_env",
+        "load_maintainer_notes",
+        "load_sets",
+        "map_themes",
+        "merge_themes",
+        "multi_component_unit_history",
+        "neutralize_directives",
+        "noted_facts",
+        "owners",
+        "parse",
+        "parse_agenda_module",
+        "parse_count_output",
+        "parse_grep_records",
+        "parse_selection",
+        "parse_tree_paths",
+        "place_lessons",
+        "plan_unit",
+        "prune_stale_unit_entries",
+        "read_at_revision",
+        "records_for",
+        "relocate",
+        "render_block",
+        "render_maintainer_notes",
+        "renumber_facts",
+        "resolve_commit",
+        "resolve_revision",
+        "rule_comments",
+        "run_groups",
+        "run_step",
+        "rust_test_boundaries",
+        "salvage_explore",
+        "save_step",
+        "select_symbol_notes",
+        "select_units",
+        "split_dir",
+        "strip_citations",
+        "strip_paren_span",
+        "synthesize_and_write_components",
+        "truncate_chars",
+        "unique_slug",
+        "unit_group",
+        "verified_facts",
+        "write_atomic",
+        "write_unit"
+      ]
+    },
+    "review-runtime": {
+      "name": "review-runtime",
+      "note": "units/review-runtime.md",
+      "facts": "units/review-runtime.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:14:51Z",
+      "note_bytes": 16354,
+      "confirmed_facts": 69,
+      "files": [
+        {
+          "path": "src/benchmark.rs",
+          "blob": "f28ecb5d82f6f6ac8c05cde3d31b69a286f31eaf"
+        },
+        {
+          "path": "src/local_review.rs",
+          "blob": "b805ca6d3c7c7b23538865f8e04d27101abb9104"
+        },
+        {
+          "path": "src/reviewer.rs",
+          "blob": "996cb6356ca3b279f664b6622b9f54705eaa7fe5"
+        },
+        {
+          "path": "src/worker/bug_worker.rs",
+          "blob": "d1633a7a798953c125a84745c935556ee105c6d8"
+        },
+        {
+          "path": "src/worker/location_resolver.rs",
+          "blob": "c9cf431289f819f5ccdb600aa98f0ff1f6d33655"
+        },
+        {
+          "path": "src/worker/mod.rs",
+          "blob": "ea79a664b1dd0611ebe8656b114917192d103318"
+        },
+        {
+          "path": "src/worker/prefetch.rs",
+          "blob": "fc862b2a31b9dc5a876aec2e1736e2cfb649176a"
+        },
+        {
+          "path": "src/worker/prefetch/revision_tests.rs",
+          "blob": "ca3b7fc8baef951eec7a04c97e9d3aeda0674d09"
+        },
+        {
+          "path": "src/worker/prompts.rs",
+          "blob": "5ac4ceade5941f8507cafa280aa3c4086af9778a"
+        },
+        {
+          "path": "src/worker/prompts/prefetch_tests.rs",
+          "blob": "cc775dae6a4d441852e9ce1d68ec23cff00270e0"
+        },
+        {
+          "path": "src/worker/repack.rs",
+          "blob": "873149033e9ad472ef37ff54354648bd177bda33"
+        },
+        {
+          "path": "src/worker/sync.rs",
+          "blob": "10888064526b0c162beff990b2200bb75845b51a"
+        }
+      ],
+      "symbols": [
+        "AbortTaskOnDrop",
+        "BackoffProvider",
+        "BaselineResolution",
+        "ClassifyAiError",
+        "CommitReviewData",
+        "ConcurrencyLimitedProvider",
+        "DeadlineBudget",
+        "EmailRouter::is_ignored_author",
+        "FETCH_TIMEOUT",
+        "FIX_CHECK_SCAN_CHUNK_SIZE",
+        "MAX_CACHED_RANGES_PER_SWEEP",
+        "MAX_FIX_CHECK_SCAN_CHUNKS",
+        "MAX_PREFETCH_CHARS",
+        "MAX_RESOLVE_FILE_SIZE",
+        "OUTBOX_CONNECT_TIMEOUT",
+        "OUTBOX_REQUEST_TIMEOUT",
+        "PROGRESS_LINE_PREFIX",
+        "ParsedDiff",
+        "ProgressEvent",
+        "ResolvedLocation",
+        "ReviewError",
+        "Reviewer",
+        "SourceSnapshot",
+        "ValidJob",
+        "Worker",
+        "WorkerProgressEvent",
+        "WorkerSubprocessOverrides",
+        "attach_patch_review_map",
+        "best_definition_range",
+        "build_benchmark_summary",
+        "build_outbox_client",
+        "build_review_output",
+        "claim_patchset_for_review",
+        "claim_pending_bug",
+        "clear_patchset_embargo",
+        "combined_review_error",
+        "compute_character_offsets",
+        "configure_benchmark_settings",
+        "extract_inline_review",
+        "find_opaque_types",
+        "forget",
+        "format_agent_review_output",
+        "initialized",
+        "is_completed_review",
+        "load_bugs_for_review",
+        "location_resolver",
+        "maintain_lease",
+        "mark_patch_review_incomplete",
+        "mark_patchset_failed_unless_cancelled",
+        "normalize_file_path",
+        "normalize_file_path_with_worktree",
+        "normalize_file_path_with_worktree_and_rev",
+        "offset_review_map_log_bounds",
+        "outbox_client",
+        "parse_diff_ranges",
+        "parse_judge_verdict",
+        "parse_two_sided_diff",
+        "path_exists_in_git",
+        "populate_dismissed_from_output",
+        "prefetch",
+        "print_worker_json",
+        "process_patch_review",
+        "progress_line",
+        "progress_to_stderr",
+        "prompts",
+        "read_file_content",
+        "refresh_remote",
+        "render_range_map",
+        "reset_reviewing_status",
+        "resolve_finding_locations",
+        "resolve_locations",
+        "resolve_single_location_two_sided",
+        "result_has_error",
+        "review_patchset_task",
+        "review_single_patch",
+        "run",
+        "run_benchmark_reviews",
+        "run_review_tool_with_cmd_and_overrides",
+        "run_while_leased",
+        "run_worker_in_worktree",
+        "semaphore",
+        "spawn_supervised_patchset_review",
+        "split_address_list",
+        "start",
+        "try_fetch_within",
+        "worker_max_attempts",
+        "write_benchmark_artifacts"
+      ]
+    },
+    "toolbox": {
+      "name": "toolbox",
+      "note": "units/toolbox.md",
+      "facts": "units/toolbox.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:08:27Z",
+      "note_bytes": 9894,
+      "confirmed_facts": 32,
+      "files": [
+        {
+          "path": "src/toolbox/command.rs",
+          "blob": "64467a3b0472cfde67bd3d247d2ec9d8d5f95578"
+        },
+        {
+          "path": "src/toolbox/framework.rs",
+          "blob": "eb0b8f84499cfb22cb863d6fd2e3a6a04271c7d1"
+        },
+        {
+          "path": "src/toolbox/git_blame.rs",
+          "blob": "d865d84a9285fdb0eeeb2f8693cc0a9ab0f7c8b8"
+        },
+        {
+          "path": "src/toolbox/git_diff.rs",
+          "blob": "8a49dd6663c2c082d7bcc6974de44a21ef81bb99"
+        },
+        {
+          "path": "src/toolbox/git_find_files.rs",
+          "blob": "d9e500ccd59d0bc8ccaf720b8dbd1a521fafab11"
+        },
+        {
+          "path": "src/toolbox/git_grep.rs",
+          "blob": "674c164b713c12e1d7cfc1c2156504911d3b1927"
+        },
+        {
+          "path": "src/toolbox/git_log.rs",
+          "blob": "d893ca3c152c64e7641ed1dd18c2efafb1498e0d"
+        },
+        {
+          "path": "src/toolbox/git_ls.rs",
+          "blob": "68e45c428d140187c110902f289ab3316dce34ee"
+        },
+        {
+          "path": "src/toolbox/git_read_files.rs",
+          "blob": "0b207e67ed545c893c4ef51188fd17457615128b"
+        },
+        {
+          "path": "src/toolbox/git_show.rs",
+          "blob": "a46b45242e42500adc53853b8cd744b920b43f85"
+        },
+        {
+          "path": "src/toolbox/mod.rs",
+          "blob": "980715df75283151a3113d1a1fb45b43053da8b4"
+        },
+        {
+          "path": "src/toolbox/read_prompt.rs",
+          "blob": "e529810ec74fed286bfa5ab4588e85489299f581"
+        },
+        {
+          "path": "src/toolbox/tools_test.rs",
+          "blob": "828b2745cae7c1f2faeb99e69ee8b0395139df57"
+        },
+        {
+          "path": "src/toolbox/utils.rs",
+          "blob": "95a413a70f4c63ddad67ad7fc6af926b1cf0aca0"
+        }
+      ],
+      "symbols": [
+        "CappedOutput",
+        "GitGrepTool",
+        "GitReadFilesTool",
+        "GitShowTool",
+        "LlmTool",
+        "MAX_CAPTURED_STDERR",
+        "MAX_CAPTURED_STDOUT",
+        "MAX_LINE_BYTES",
+        "ReadPromptTool",
+        "SashikoToolContext",
+        "TOOL_COMMAND_TIMEOUT",
+        "ToolBox",
+        "ToolRegistry",
+        "Truncator",
+        "call",
+        "capped_output",
+        "capped_output_with_limit",
+        "capped_output_within",
+        "clean_relative_path",
+        "declarations",
+        "drain_capped",
+        "for_each_line",
+        "for_each_line_within",
+        "get_declarations_generic",
+        "get_priority_score",
+        "glob_to_regex",
+        "is_usable",
+        "new",
+        "normalize_args",
+        "normalize_json_numbers",
+        "normalize_tool_args",
+        "read_single_file",
+        "resolve_prompt_path",
+        "set_active_patch_files",
+        "set_virtual_head",
+        "validate_path",
+        "virtualize_ref"
+      ]
+    },
+    "workflow-engine": {
+      "name": "workflow-engine",
+      "note": "units/workflow-engine.md",
+      "facts": "units/workflow-engine.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:12:11Z",
+      "note_bytes": 9628,
+      "confirmed_facts": 29,
+      "files": [
+        {
+          "path": "src/workflow/engine.rs",
+          "blob": "dd421dc538aefeb86e8193dc9026d678435b4f89"
+        },
+        {
+          "path": "src/workflow/events.rs",
+          "blob": "db393ea61fb988a398af5ffb3aa870473a95dee5"
+        },
+        {
+          "path": "src/workflow/graph.rs",
+          "blob": "9b7bdf98bf181cd5b42466e915a5a34c81cc46b2"
+        },
+        {
+          "path": "src/workflow/mod.rs",
+          "blob": "2688e4a516de43cd7dc6790776d23bef4dc519ac"
+        },
+        {
+          "path": "src/workflow/output.rs",
+          "blob": "521614ded61e9831f7b173f7f0ffa031f8604a9f"
+        },
+        {
+          "path": "src/workflow/policy.rs",
+          "blob": "748e437a44606c926b3e2606567579a19ce91701"
+        },
+        {
+          "path": "src/workflow/prompt.rs",
+          "blob": "9df16bb1eb576c0c251add6c9f5e7214174160b8"
+        },
+        {
+          "path": "src/workflow/stage.rs",
+          "blob": "ce0ccf144a69cd37a9e1734d447551c0e77852e0"
+        }
+      ],
+      "symbols": [
+        "DynamicParallel",
+        "ExecutableStage",
+        "OutputFormat",
+        "ParallelPolicy",
+        "ParallelResolved",
+        "Segment",
+        "SessionRunner",
+        "Stage",
+        "StageOutcome",
+        "StageRunRecord",
+        "StageSession",
+        "StateMutation",
+        "ToolScope",
+        "WorkflowEngine",
+        "WorkflowEvent",
+        "WorkflowFailure",
+        "WorkflowOutcome",
+        "WorkflowStep",
+        "assemble",
+        "build",
+        "call_tool",
+        "call_tools",
+        "execute",
+        "execute_isolated",
+        "execute_parallel_batch",
+        "execute_steps",
+        "json",
+        "json_with_schema",
+        "last_tool_call",
+        "merge_workflow_outcome",
+        "output_format",
+        "parse_json_from_text",
+        "place",
+        "read_prompts",
+        "record_stage_outcome",
+        "reduce",
+        "reduce_with_outcome",
+        "response_format",
+        "schema",
+        "stage_outcome_from_error",
+        "substitute_vars",
+        "text_with_validator",
+        "user_prompt",
+        "validate_with_recitation_fallback",
+        "with_feedback_formatter",
+        "with_max_turns",
+        "with_max_validation_attempts",
+        "with_validator"
+      ]
+    },
+    "workflows": {
+      "name": "workflows",
+      "note": "units/workflows.md",
+      "facts": "units/workflows.facts.json",
+      "agenda_version": "06c177517b14bb3c",
+      "model": "gemini-4-argon",
+      "built_at": "2026-10-26T21:21:30Z",
+      "note_bytes": 15515,
+      "confirmed_facts": 58,
+      "files": [
+        {
+          "path": "src/workflows/code_notes.rs",
+          "blob": "b5fc9a0a733de13a6e8f917346d4fd85b265cade"
+        },
+        {
+          "path": "src/workflows/guard.rs",
+          "blob": "f2cbc9674ed711affe865627a51178909e185e74"
+        },
+        {
+          "path": "src/workflows/linux_bug.rs",
+          "blob": "9948793d1490bf14d2026ed92c1ea1390df18b7a"
+        },
+        {
+          "path": "src/workflows/linux_patch_review.rs",
+          "blob": "4d767319ebc3e55e45bb3b3db234e3bc66093206"
+        },
+        {
+          "path": "src/workflows/mod.rs",
+          "blob": "437b1e6ac09fe91a296e57ab127e5ccf26361e63"
+        },
+        {
+          "path": "src/workflows/notes_agenda.rs",
+          "blob": "4469c584c3994ee35064fa29d5c3044bd16a8d2a"
+        },
+        {
+          "path": "src/workflows/notes_corpus.rs",
+          "blob": "67e475da63d82e14fac18939a32cc6f7fb1cce9f"
+        },
+        {
+          "path": "src/workflows/review_map.rs",
+          "blob": "2b7efc0167f5e97145d47ec4f66ffb56da5c583b"
+        },
+        {
+          "path": "src/workflows/sashiko_patch_review.rs",
+          "blob": "cef189d0575ace40a2fff6c08f93366f404baf90"
+        }
+      ],
+      "symbols": [
+        "AgendaState",
+        "AnalysisStage",
+        "AttributedSubsystem",
+        "BUG_DEDUP_LOCK",
+        "BugStage",
+        "CONSOLIDATION_STAGES",
+        "CheckedFact",
+        "CommitRangeLookup",
+        "DedupOutput",
+        "HARD_MAX_BULLET_CHARS",
+        "IDENTIFIER",
+        "LinuxPatchReviewState",
+        "MAX_BUG_PREFETCH_CHARS",
+        "MAX_BUG_PREFETCH_FILES",
+        "MAX_BUG_PREFETCH_SNIPPETS_TOTAL",
+        "MAX_BUG_SNIPPET_LINES",
+        "MAX_BULLET_CHARS",
+        "MAX_DEDUP_DESCRIPTION_BYTES",
+        "MAX_FIX_CANDIDATE_COMMITS",
+        "MAX_FIX_CHECK_PREFETCH_BYTES",
+        "MAX_FULL_COMMIT_PREFETCH_BYTES",
+        "MAX_INDEXED_RANGE_COMMITS",
+        "MAX_POST_VERIFICATION_STAGES",
+        "POST_VERIFICATION_STAGE_NAMES",
+        "PlanningOutput",
+        "RESERVED_TOPIC_IDS",
+        "ReportSession",
+        "SERIES_CONTEXT_PLACEHOLDER",
+        "STAGE_POST_VERIFICATION_INSTRUCTION",
+        "STAGE_VERIFICATION_INSTRUCTION",
+        "SeveritySession",
+        "TracingSession",
+        "UPSTREAM_GIT_TIMEOUT",
+        "UpstreamFixCheckOutcome",
+        "agenda_workflow",
+        "analysis_stage",
+        "apply_planning_stage_output",
+        "apply_post_verification_stage_output",
+        "batch_hard_cases_by_severity",
+        "build_commit_range_index",
+        "build_linux_patch_review_workflow_with_effort",
+        "build_review_map",
+        "build_sashiko_patch_review_workflow_with_effort",
+        "build_sashiko_patch_review_workflow_with_options",
+        "call_tools",
+        "check_and_fold",
+        "collect_raw_ids_from_pv_item",
+        "deterministic_blame_fallback",
+        "enrichment_kind",
+        "extract_bug_files",
+        "find_candidate_fix_commits",
+        "find_candidates",
+        "format_commit",
+        "format_known_bug_description",
+        "get_master_sha",
+        "ground_symbols",
+        "group_stage",
+        "grouped",
+        "has_valid_proof_location",
+        "heading",
+        "is_counted_stage",
+        "is_known_stage",
+        "is_stage_exclusive_guide",
+        "keep_representatives",
+        "last_turn_tool_calls",
+        "linux_bug",
+        "linux_system_prompt",
+        "neutralize_directives",
+        "normalize_guide_name",
+        "normalize_prompt_relpath",
+        "outcome_rank",
+        "parse_commit_range_index_output",
+        "planned_stages_from",
+        "planning_stage_with_effort",
+        "prefetch_bug_locations",
+        "prefetch_candidate_fix_commits",
+        "prescreen_stage_with_effort",
+        "push_unique_prompt",
+        "record_bug_stage",
+        "record_verified_findings",
+        "refine_planned_stages_with_post_verification",
+        "renumber_facts",
+        "report_stage_with_effort",
+        "resolve_locations",
+        "resolve_official_subsystems_for_project",
+        "resolve_post_verification_stages_with_options",
+        "resolve_stage_effort",
+        "run_git_query_capped",
+        "sanitize_bug_file_path",
+        "sanitize_guide_name",
+        "sanitize_prompt_relpath",
+        "sashiko_system_prompt",
+        "series_context_placeholder",
+        "severity_rank",
+        "split_raw_ids",
+        "stage_short_label",
+        "strip_code_fence",
+        "summary_stage_with_effort",
+        "target_bytes",
+        "validate_draft",
+        "validate_explore",
+        "validate_groups",
+        "validate_locations_side",
+        "validate_note",
+        "validate_post_verification_batch_items",
+        "validate_post_verification_batch_output",
+        "validate_themes",
+        "verification_stage_with_effort",
+        "verify_commit_is_ancestor",
+        "with_series_context",
+        "worktree_path"
+      ]
+    }
+  }
+}
