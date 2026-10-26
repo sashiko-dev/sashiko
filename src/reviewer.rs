@@ -535,12 +535,30 @@ impl Reviewer {
                 .get_completed_reviews_for_release(patchset.id)
                 .await?,
         );
+        let patch_statuses = ctx.db.get_patch_statuses_for_patchset(patchset.id).await?;
 
         let total_parts = patchset.total_parts.unwrap_or(diffs.len() as u32) as usize;
         let mut series_summary: Option<String> = None;
         let mut items = Vec::new();
 
-        if let Some(cover_review) = reviews
+        let cover_status = patch_statuses.get(&0).map(String::as_str).unwrap_or("");
+        let cover_failed = matches!(
+            cover_status,
+            "Failed" | "FailedToApply" | "In Review" | "Pending" | "Cancelled"
+        );
+        if cover_failed {
+            items.push(crate::forge::PatchReviewSummaryItem {
+                part_index: 0,
+                total_parts,
+                commit_id: None,
+                subject: patchset
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| "Series / PR Review".to_string()),
+                inline_review: None,
+                failed: true,
+            });
+        } else if let Some(cover_review) = reviews
             .iter()
             .find(|r| r.patch_id.is_none() || r.index == 0)
         {
@@ -560,6 +578,7 @@ impl Reviewer {
                     .clone()
                     .unwrap_or_else(|| "Series / PR Review".to_string()),
                 inline_review,
+                failed: false,
             });
         }
 
@@ -568,7 +587,8 @@ impl Reviewer {
                 .iter()
                 .find(|r| r.patch_id == Some(*patch_id) || r.index == *idx);
             if *idx == 0 {
-                if series_summary.is_none()
+                if !cover_failed
+                    && series_summary.is_none()
                     && let Some(r) = matching_review
                     && !r.summary.trim().is_empty()
                 {
@@ -576,20 +596,59 @@ impl Reviewer {
                 }
                 continue;
             }
+            let patch_status = patch_statuses
+                .get(patch_id)
+                .map(String::as_str)
+                .unwrap_or("");
+            let patch_failed = matches!(
+                patch_status,
+                "Failed" | "Failed To Apply" | "FailedToApply" | "error" | "Cancelled"
+            );
+            let failed = patch_failed
+                || (matching_review.is_none() && !matches!(patch_status, "Skipped" | "Reviewed"));
             let is_sha = msg_id.len() == 40 && msg_id.chars().all(|c| c.is_ascii_hexdigit());
-            let inline_review = matching_review
-                .map(|r| r.inline_review.clone())
-                .filter(|s| {
-                    let t = s.trim();
-                    !t.is_empty() && t != "No issues found."
-                });
+            let inline_review = if failed {
+                None
+            } else {
+                matching_review
+                    .map(|r| r.inline_review.clone())
+                    .filter(|s| {
+                        let t = s.trim();
+                        !t.is_empty() && t != "No issues found."
+                    })
+            };
             items.push(crate::forge::PatchReviewSummaryItem {
                 part_index: *idx as usize,
                 total_parts,
                 commit_id: if is_sha { Some(msg_id.clone()) } else { None },
                 subject: subj.clone(),
                 inline_review,
+                failed,
             });
+        }
+
+        if !items.iter().any(|p| p.failed)
+            && ctx.db.get_patchset_status(patchset.id).await?.as_deref()
+                == Some(ReviewStatus::Failed.as_str())
+        {
+            if let Some(cover_item) = items.iter_mut().find(|p| p.part_index == 0) {
+                cover_item.failed = true;
+            } else {
+                items.insert(
+                    0,
+                    crate::forge::PatchReviewSummaryItem {
+                        part_index: 0,
+                        total_parts,
+                        commit_id: None,
+                        subject: patchset
+                            .subject
+                            .clone()
+                            .unwrap_or_else(|| "Series / PR Review".to_string()),
+                        inline_review: None,
+                        failed: true,
+                    },
+                );
+            }
         }
 
         let domain = if ctx.settings.project.domain.is_empty() {
@@ -1461,25 +1520,22 @@ impl Reviewer {
                 .await
                 {
                     Ok(true) => {
-                        if review_success {
-                            if let Err(e) =
-                                Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await
-                            {
-                                error!(
-                                    "Failed to queue forge PR comment for patchset {}: {}",
-                                    patchset_id, e
-                                );
-                            }
+                        if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await
+                        {
+                            error!(
+                                "Failed to queue forge PR comment for patchset {}: {}",
+                                patchset_id, e
+                            );
+                        }
 
-                            if patchset.embargo_until.is_some()
-                                && let Err(e) =
-                                    Self::release_patchset_results(&ctx, &patchset).await
-                            {
-                                error!(
-                                    "Failed to release clean patchset {} immediately: {}",
-                                    patchset_id, e
-                                );
-                            }
+                        if review_success
+                            && patchset.embargo_until.is_some()
+                            && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
+                        {
+                            error!(
+                                "Failed to release clean patchset {} immediately: {}",
+                                patchset_id, e
+                            );
                         }
                     }
                     Ok(false) => {
@@ -7816,6 +7872,231 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert!(!outbox.body.contains("STALE_SERIES_SUMMARY"));
         assert!(!outbox.body.contains("STALE_COVER_INLINE_FINDING"));
         assert!(!outbox.body.contains("STALE_PATCH_INLINE_FINDING"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_forge_pr_comment_handles_partial_failure_and_skipped_patches() -> Result<()>
+    {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.forge.post_mode = crate::settings::ForgePostMode::Live;
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let sha1 = "1111111111111111111111111111111111111111";
+        let sha2 = "2222222222222222222222222222222222222222";
+        let sha3 = "3333333333333333333333333333333333333333";
+
+        let thread_id = db
+            .create_thread("mr-733-base..head", "#733: PR", 1000)
+            .await?;
+        for (sha, subj) in [
+            (sha1, "commit 1 with finding"),
+            (sha2, "commit 2 failed"),
+            (sha3, "commit 3 skipped"),
+        ] {
+            db.create_message(
+                sha, thread_id, None, "Author", subj, 1000, "Body", "", "", None, None,
+            )
+            .await?;
+        }
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "mr-733-base..head",
+                "#733: PR",
+                "Author",
+                1000,
+                3,
+                3,
+                "",
+                "",
+                None,
+                3,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET mr_url = ?, mr_number = ?, slug = ? WHERE id = ?",
+                libsql::params![
+                    "https://github.com/sashiko-dev/sashiko/pull/733",
+                    733i64,
+                    "sashiko-733",
+                    ps_id,
+                ],
+            )
+            .await?;
+
+        let p1 = db
+            .create_patch(ps_id, sha1, 1, "diff --git a/a b/a\n")
+            .await?;
+        let p2 = db
+            .create_patch(ps_id, sha2, 2, "diff --git a/b b/b\n")
+            .await?;
+        let p3 = db
+            .create_patch(ps_id, sha3, 3, "diff --git a/c b/c\n")
+            .await?;
+
+        let r1 = db
+            .create_review(ps_id, Some(p1), "gemini", "test-model", None, None)
+            .await?;
+        db.complete_review(
+            r1,
+            ReviewStatus::Reviewed.as_str(),
+            "Found 1 issue",
+            Some("Commit 1 summary"),
+            None,
+            Some("Severity: HIGH\nMissing validation on webhook URL."),
+            None,
+        )
+        .await?;
+        db.update_patch_status(p1, "Reviewed").await?;
+        db.update_patch_status(p2, "Failed").await?;
+        // Simulate an ignore_files skip recorded in reviews with a non-terminal
+        // patches.status ('Pending') still present on the patch row.
+        db.update_patch_status(p3, "Pending").await?;
+        let r3 = db
+            .create_review(ps_id, Some(p3), "gemini", "test-model", None, None)
+            .await?;
+        db.complete_review(
+            r3,
+            ReviewStatus::Skipped.as_str(),
+            "Skipped: touches only ignored files",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        let patchsets = db.get_pending_patchsets(10).await?;
+        let patchset = patchsets.into_iter().find(|p| p.id == ps_id).unwrap();
+        let diffs = db.get_patch_diffs(ps_id).await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(crate::baseline::BaselineRegistry::new(
+                Path::new("."),
+                None,
+            )?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+            worker_overrides: WorkerSubprocessOverrides::default(),
+        };
+
+        db.update_patchset_status(ps_id, ReviewStatus::Failed.as_str())
+            .await?;
+        Reviewer::queue_forge_pr_comment(&ctx, &patchset, &diffs).await?;
+
+        let claimed = db
+            .lock_pending_forge_outbox()
+            .await?
+            .expect("partial-failure PR review must queue forge outbox comment");
+        assert!(crate::forge::is_incomplete_pr_review_comment(&claimed.body));
+        assert!(
+            claimed
+                .body
+                .contains("1 of 3 commits failed to complete review (`2/3`)."),
+            "Skipped commit 3/3 must not be counted as failed: {}",
+            claimed.body
+        );
+        assert!(claimed.body.contains("Missing validation on webhook URL."));
+        db.mark_forge_outbox_sent(claimed.id).await?;
+
+        // Simulate retrying commit 2 cleanly while the series cover review (0/N)
+        // fails: the comment must still carry the incomplete-review banner.
+        let r2 = db
+            .create_review(ps_id, Some(p2), "gemini", "test-model", None, None)
+            .await?;
+        db.complete_review(
+            r2,
+            ReviewStatus::Reviewed.as_str(),
+            "Clean",
+            None,
+            None,
+            Some("No issues found."),
+            None,
+        )
+        .await?;
+        db.update_patch_status(p2, "Reviewed").await?;
+        let r0_fail = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await?;
+        db.complete_review(
+            r0_fail,
+            ReviewStatus::Failed.as_str(),
+            "Cover review failed",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        db.update_patchset_status(ps_id, ReviewStatus::Failed.as_str())
+            .await?;
+        Reviewer::queue_forge_pr_comment(&ctx, &patchset, &diffs).await?;
+
+        let r0_ok = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await?;
+        db.complete_review(
+            r0_ok,
+            ReviewStatus::Reviewed.as_str(),
+            "Series summary complete",
+            Some("Overall series looks good aside from commit 1."),
+            None,
+            Some("No issues found."),
+            None,
+        )
+        .await?;
+        db.update_patchset_status(ps_id, ReviewStatus::Reviewed.as_str())
+            .await?;
+
+        Reviewer::queue_forge_pr_comment(&ctx, &patchset, &diffs).await?;
+        let upgraded = db
+            .lock_pending_forge_outbox()
+            .await?
+            .expect("completed re-run should upgrade prior incomplete outbox entry");
+        assert!(!crate::forge::is_incomplete_pr_review_comment(
+            &upgraded.body
+        ));
+        assert!(upgraded.body.contains("Missing validation on webhook URL."));
+        db.set_forge_outbox_retry_at(upgraded.id, 0, "transient HTTP 502")
+            .await?;
+
+        // If the patchset is cancelled while an outbox entry is Pending and then
+        // rerun, the Cancelled outbox row must not block the rerun from queueing
+        // a new PR review comment.
+        db.update_patchset_status(ps_id, ReviewStatus::Pending.as_str())
+            .await?;
+        assert!(db.cancel_patchset(ps_id, true).await?);
+        db.rerun_patchset(ps_id).await?;
+        // Simulate commit 2 failing on a rerun even though r2 ('Reviewed') exists.
+        db.update_patch_status(p2, "Failed").await?;
+        db.update_patchset_status(ps_id, ReviewStatus::Failed.as_str())
+            .await?;
+        Reviewer::queue_forge_pr_comment(&ctx, &patchset, &diffs).await?;
+        let rerun_claimed = db
+            .lock_pending_forge_outbox()
+            .await?
+            .expect("rerun after cancel must queue forge outbox comment");
+        assert!(crate::forge::is_incomplete_pr_review_comment(
+            &rerun_claimed.body
+        ));
 
         Ok(())
     }

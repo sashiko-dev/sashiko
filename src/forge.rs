@@ -571,6 +571,19 @@ pub struct PatchReviewSummaryItem {
     pub commit_id: Option<String>,
     pub subject: String,
     pub inline_review: Option<String>,
+    pub failed: bool,
+}
+
+/// Banner prefix emitted in forge PR comments when one or more commits failed
+/// to complete review.
+pub const INCOMPLETE_REVIEW_MARKER: &str = "⚠ **Review incomplete**";
+
+/// Return true when `body` was produced by `compose_pr_review_comment` for an
+/// incomplete review (banner immediately following the `### Sashiko review` header).
+pub fn is_incomplete_pr_review_comment(body: &str) -> bool {
+    body.split_once("\n\n").is_some_and(|(header, rest)| {
+        header.starts_with("### Sashiko review") && rest.starts_with(INCOMPLETE_REVIEW_MARKER)
+    })
 }
 
 /// Maximum byte length of a GitHub issue/PR comment body (GitHub's hard limit
@@ -578,8 +591,9 @@ pub struct PatchReviewSummaryItem {
 const MAX_GITHUB_COMMENT_BYTES: usize = 60_000;
 
 /// Compose the markdown comment posted to a pull request thread when a review
-/// completes. Always produces a comment: clean pull requests receive a short
-/// confirmation with a link to the full review trace.
+/// finishes. Clean pull requests receive a short confirmation; partially or
+/// wholly failed pull requests receive an explicit incomplete-review banner
+/// alongside any findings discovered in completed commits.
 pub fn compose_pr_review_comment(
     version: Option<u32>,
     total_commits: usize,
@@ -604,6 +618,9 @@ pub fn compose_pr_review_comment(
         format!("{} commits", total_commits)
     };
 
+    let failed_patches: Vec<&PatchReviewSummaryItem> =
+        patches.iter().filter(|p| p.failed).collect();
+
     let patches_with_findings: Vec<&PatchReviewSummaryItem> = patches
         .iter()
         .filter(|p| {
@@ -614,7 +631,7 @@ pub fn compose_pr_review_comment(
         })
         .collect();
 
-    if patches_with_findings.is_empty() {
+    if failed_patches.is_empty() && patches_with_findings.is_empty() {
         return format!(
             "{header}\n\n✓ **No issues found** across {commit_word}.\n\n[Full review log on {link_host}]({target_url})\n"
         );
@@ -623,6 +640,40 @@ pub fn compose_pr_review_comment(
     let mut out = String::with_capacity(2048);
     out.push_str(&header);
     out.push_str("\n\n");
+
+    if !failed_patches.is_empty() {
+        let failed_commits: Vec<&PatchReviewSummaryItem> = failed_patches
+            .iter()
+            .copied()
+            .filter(|p| p.part_index > 0)
+            .collect();
+        let cover_failed = failed_patches.iter().any(|p| p.part_index == 0);
+        if !failed_commits.is_empty() {
+            let failed_count = failed_commits.len();
+            let listed: Vec<String> = failed_commits
+                .iter()
+                .take(5)
+                .map(|p| format!("`{}/{}`", p.part_index, p.total_parts))
+                .collect();
+            let listed_str = if failed_count > 5 {
+                format!("{}, +{} more", listed.join(", "), failed_count - 5)
+            } else {
+                listed.join(", ")
+            };
+            let suffix = if cover_failed {
+                " and series summary review failed"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "{INCOMPLETE_REVIEW_MARKER} — {failed_count} of {commit_word} failed to complete review ({listed_str}){suffix}.\n\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "{INCOMPLETE_REVIEW_MARKER} — series summary review failed to complete.\n\n"
+            ));
+        }
+    }
 
     if let Some(summary) = series_summary.map(str::trim).filter(|s| !s.is_empty()) {
         out.push_str("<details>\n<summary>Series summary</summary>\n\n");
@@ -1566,6 +1617,7 @@ mod tests {
                 commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
                 subject: "first clean patch".to_string(),
                 inline_review: None,
+                failed: false,
             },
             PatchReviewSummaryItem {
                 part_index: 2,
@@ -1573,6 +1625,7 @@ mod tests {
                 commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
                 subject: "second clean patch".to_string(),
                 inline_review: Some("No issues found.".to_string()),
+                failed: false,
             },
         ];
         let body = compose_pr_review_comment(
@@ -1584,6 +1637,7 @@ mod tests {
         );
         assert!(body.starts_with("### Sashiko review\n\n"));
         assert!(body.contains("✓ **No issues found** across 2 commits."));
+        assert!(!is_incomplete_pr_review_comment(&body));
         assert!(
             body.contains(
                 "[Full review log on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def)"
@@ -1600,6 +1654,7 @@ mod tests {
                 commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
                 subject: "clean commit".to_string(),
                 inline_review: None,
+                failed: false,
             },
             PatchReviewSummaryItem {
                 part_index: 2,
@@ -1607,6 +1662,7 @@ mod tests {
                 commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
                 subject: "commit with bug".to_string(),
                 inline_review: Some("Severity: HIGH\nMissing check on input buffer.".to_string()),
+                failed: false,
             },
         ];
         let body = compose_pr_review_comment(
@@ -1621,6 +1677,7 @@ mod tests {
         assert!(!body.contains("clean commit"));
         assert!(body.contains("#### Commit 2/2 — `fedcba09` commit with bug"));
         assert!(body.contains("Severity: HIGH\nMissing check on input buffer."));
+        assert!(!is_incomplete_pr_review_comment(&body));
         assert!(
             body.contains(
                 "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-v3)"
@@ -1639,6 +1696,7 @@ mod tests {
                 inline_review: Some(
                     "Severity: MEDIUM\nPR description claims a metrics endpoint is added, but no endpoint is registered.".to_string(),
                 ),
+                failed: false,
             },
             PatchReviewSummaryItem {
                 part_index: 1,
@@ -1646,6 +1704,7 @@ mod tests {
                 commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
                 subject: "clean commit".to_string(),
                 inline_review: Some("No issues found.".to_string()),
+                failed: false,
             },
         ];
         let body = compose_pr_review_comment(
@@ -1659,6 +1718,143 @@ mod tests {
         assert!(!body.contains("No issues found"));
         assert!(body.contains("#### Series / PR Review\n\nSeverity: MEDIUM\nPR description claims a metrics endpoint is added"));
         assert!(!body.contains("clean commit"));
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_partial_failure_without_findings() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 3,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "first clean patch".to_string(),
+                inline_review: None,
+                failed: false,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 3,
+                commit_id: Some("abcdef1234567890abcdef1234567890abcdef12".to_string()),
+                subject: "failed commit".to_string(),
+                inline_review: None,
+                failed: true,
+            },
+            PatchReviewSummaryItem {
+                part_index: 3,
+                total_parts: 3,
+                commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
+                subject: "third clean patch".to_string(),
+                inline_review: Some("No issues found.".to_string()),
+                failed: false,
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(1),
+            3,
+            None,
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+        );
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(!body.contains("No issues found"));
+        assert!(body.contains(
+            "⚠ **Review incomplete** — 1 of 3 commits failed to complete review (`2/3`)."
+        ));
+        assert!(
+            body.contains(
+                "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/sashiko-733)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_partial_failure_preserves_findings() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 3,
+                commit_id: Some("1111111122222222333333334444444455555555".to_string()),
+                subject: "timed out commit".to_string(),
+                inline_review: None,
+                failed: true,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 3,
+                commit_id: Some("aaaaaaaa22222222333333334444444455555555".to_string()),
+                subject: "commit with real bug".to_string(),
+                inline_review: Some("Severity: MEDIUM\nUnbounded retry loop.".to_string()),
+                failed: false,
+            },
+            PatchReviewSummaryItem {
+                part_index: 3,
+                total_parts: 3,
+                commit_id: Some("bbbbbbbb22222222333333334444444455555555".to_string()),
+                subject: "clean commit".to_string(),
+                inline_review: None,
+                failed: false,
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(2),
+            3,
+            Some("Series overview."),
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+        );
+        assert!(body.starts_with("### Sashiko review — v2\n\n"));
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(body.contains(
+            "⚠ **Review incomplete** — 1 of 3 commits failed to complete review (`1/3`)."
+        ));
+        assert!(body.contains("<details>\n<summary>Series summary</summary>"));
+        assert!(body.contains("#### Commit 2/3 — `aaaaaaaa` commit with real bug"));
+        assert!(body.contains("Severity: MEDIUM\nUnbounded retry loop."));
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_many_failures_and_self_quote() {
+        let many_failed: Vec<PatchReviewSummaryItem> = (1..=7)
+            .map(|idx| PatchReviewSummaryItem {
+                part_index: idx,
+                total_parts: 7,
+                commit_id: None,
+                subject: format!("patch {idx}"),
+                inline_review: None,
+                failed: true,
+            })
+            .collect();
+        let body = compose_pr_review_comment(
+            None,
+            7,
+            None,
+            &many_failed,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-700",
+        );
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(body.contains(
+            "7 of 7 commits failed to complete review (`1/7`, `2/7`, `3/7`, `4/7`, `5/7`, +2 more)."
+        ));
+
+        // A completed review whose finding quotes INCOMPLETE_REVIEW_MARKER must not
+        // be misclassified as an incomplete review comment.
+        let completed_quoting_marker = compose_pr_review_comment(
+            None,
+            1,
+            None,
+            &[PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 1,
+                commit_id: None,
+                subject: "forge: tweak banner".to_string(),
+                inline_review: Some(format!(
+                    "Check usage of `{INCOMPLETE_REVIEW_MARKER}` in src/forge.rs."
+                )),
+                failed: false,
+            }],
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-701",
+        );
+        assert!(!is_incomplete_pr_review_comment(&completed_quoting_marker));
     }
 
     #[test]

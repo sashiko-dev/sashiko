@@ -1530,7 +1530,8 @@ impl Database {
 
     /// Checks whether outbox writes remain permitted for this handle (including
     /// immediately after the owning worker transitions `patchsets.status` from
-    /// `'In Review'` to `'Reviewed'`, before `release_patchset_claim` runs).
+    /// `'In Review'` to `'Reviewed'` or `'Failed'`, before `release_patchset_claim`
+    /// runs).
     async fn is_patchset_claim_active_for_outbox(
         &self,
         expected_patchset_id: Option<i64>,
@@ -1545,7 +1546,7 @@ impl Database {
                     "SELECT 1 FROM patchsets ps
                      JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
                      WHERE ps.id = ?
-                       AND ps.status IN ('In Review', 'Reviewed')
+                       AND ps.status IN ('In Review', 'Reviewed', 'Failed')
                        AND CAST(m.value AS INTEGER) = ?",
                     libsql::params![claim.patchset_id, claim.generation],
                 )
@@ -10237,11 +10238,11 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number
              FROM patchsets p
-             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             WHERE p.status IN ('Reviewed', 'Failed') AND p.embargo_until IS NOT NULL
              AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
              AND (
                  p.embargo_until <= ?
-                 OR ({CLEAN_PATCHSET_PREDICATE})
+                 OR (p.status = 'Reviewed' AND ({CLEAN_PATCHSET_PREDICATE}))
              )
              ORDER BY CASE WHEN p.embargo_until <= ? THEN 0 ELSE 1 END, p.date ASC LIMIT ?"
         );
@@ -10405,9 +10406,9 @@ impl Database {
     pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
         let sql = format!(
             "UPDATE patchsets AS p SET embargo_release_started_at = ?
-             WHERE p.id = ? AND p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             WHERE p.id = ? AND p.status IN ('Reviewed', 'Failed') AND p.embargo_until IS NOT NULL
                AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
-               AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
+               AND (p.embargo_until <= ? OR (p.status = 'Reviewed' AND ({CLEAN_PATCHSET_PREDICATE})))"
         );
         let updated = self
             .execute(&sql, libsql::params![now, id, now - 600, now])
@@ -10720,6 +10721,56 @@ impl Database {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn get_patch_statuses_for_patchset(
+        &self,
+        patchset_id: i64,
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id,
+                        CASE
+                            WHEN p.status IN ('Failed', 'Failed To Apply', 'FailedToApply', 'error', 'Cancelled') THEN p.status
+                            WHEN (
+                                SELECT r.status FROM reviews r
+                                WHERE r.patchset_id = p.patchset_id AND r.patch_id = p.id
+                                ORDER BY r.id DESC LIMIT 1
+                            ) IN ('Failed', 'FailedToApply', 'Cancelled', 'In Review') THEN 'Failed'
+                            WHEN p.status = 'Skipped' OR EXISTS (
+                                SELECT 1 FROM reviews r
+                                WHERE r.patchset_id = p.patchset_id AND r.patch_id = p.id AND r.status = 'Skipped'
+                            ) THEN 'Skipped'
+                            WHEN p.status = 'Reviewed' OR EXISTS (
+                                SELECT 1 FROM reviews r
+                                WHERE r.patchset_id = p.patchset_id AND r.patch_id = p.id AND r.status = 'Reviewed'
+                            ) THEN 'Reviewed'
+                            WHEN COALESCE(p.status, '') != '' THEN p.status
+                            ELSE ''
+                        END
+                 FROM patches p
+                 WHERE p.patchset_id = ?
+                 UNION ALL
+                 SELECT 0,
+                        COALESCE(
+                            (SELECT r.status FROM reviews r
+                             WHERE r.patchset_id = ? AND r.patch_id IS NULL
+                             ORDER BY r.id DESC LIMIT 1),
+                            ''
+                        )",
+                libsql::params![patchset_id, patchset_id],
+            )
+            .await?;
+        let mut statuses = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let patch_id: i64 = row.get(0)?;
+            let status: String = row.get(1)?;
+            if patch_id != 0 || !status.is_empty() {
+                statuses.insert(patch_id, status);
+            }
+        }
+        Ok(statuses)
     }
 
     pub async fn get_patchset_status(&self, id: i64) -> Result<Option<String>> {
@@ -12552,6 +12603,15 @@ impl Database {
             )
             .await?;
 
+        tx_db
+            .execute(
+                "DELETE FROM forge_outbox
+                  WHERE patchset_id = ?
+                    AND status IN ('Pending', 'Embargoed', 'Failed', 'Cancelled', 'Disabled', 'Dry-Run')",
+                libsql::params![id],
+            )
+            .await?;
+
         // 5. Record the high-water review ID before deleting failed,
         // cancelled, or interrupted ('In Review') review rows so SQLite never
         // recycles the deleted rowid on the next INSERT INTO reviews.
@@ -13797,7 +13857,9 @@ impl Database {
         target_url: &str,
         status: &str,
     ) -> Result<()> {
-        if !self
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db
             .is_patchset_claim_active_for_outbox(Some(patchset_id))
             .await?
         {
@@ -13807,7 +13869,7 @@ impl Database {
             );
             return Ok(());
         }
-        if self.get_patchset_status(patchset_id).await?.as_deref()
+        if tx_db.get_patchset_status(patchset_id).await?.as_deref()
             == Some(ReviewStatus::Cancelled.as_str())
         {
             info!(
@@ -13817,8 +13879,7 @@ impl Database {
             return Ok(());
         }
 
-        let mut newer_rows = self
-            .conn
+        let mut newer_rows = tx
             .query(
                 "SELECT 1 FROM patchsets
                  WHERE mr_number = ?
@@ -13840,15 +13901,76 @@ impl Database {
             );
             return Ok(());
         }
+        drop(newer_rows);
 
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT 1 FROM forge_outbox WHERE patchset_id = ?",
-                libsql::params![patchset_id],
-            )
-            .await?;
-        if rows.next().await?.is_some() {
+        let existing: Option<(i64, String, String)> = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status, body FROM forge_outbox WHERE patchset_id = ?",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                Some((row.get(0)?, row.get(1)?, row.get(2)?))
+            } else {
+                None
+            }
+        };
+
+        if let Some((existing_id, existing_status, existing_body)) = existing {
+            let existing_is_incomplete =
+                crate::forge::is_incomplete_pr_review_comment(&existing_body);
+            let new_is_incomplete = crate::forge::is_incomplete_pr_review_comment(body);
+            let is_cancelled = existing_status == "Cancelled";
+            let is_unsent = !matches!(existing_status.as_str(), "Sent" | "Sending" | "Cancelled");
+            let should_upgrade = is_cancelled
+                || (existing_is_incomplete
+                    && (!new_is_incomplete || (is_unsent && existing_body != body)));
+
+            if should_upgrade {
+                let next_id: i64 = {
+                    let mut id_rows = tx
+                        .query("SELECT COALESCE(MAX(id), 0) + 1 FROM forge_outbox", ())
+                        .await?;
+                    id_rows
+                        .next()
+                        .await?
+                        .map(|r| r.get::<i64>(0))
+                        .transpose()?
+                        .unwrap_or(existing_id + 1)
+                        .max(existing_id + 1)
+                };
+                let created_at = chrono::Utc::now().timestamp();
+                info!(
+                    "Replacing incomplete forge outbox entry {} with {} for patchset_id {} (prior status: {}).",
+                    existing_id, next_id, patchset_id, existing_status
+                );
+                tx.execute(
+                    "DELETE FROM forge_outbox WHERE id = ?",
+                    libsql::params![existing_id],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO forge_outbox (id, patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        next_id,
+                        patchset_id,
+                        provider,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        body,
+                        target_url,
+                        status,
+                        created_at,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(());
+            }
+            tx.commit().await?;
             info!(
                 "Forge outbox entry already exists for patchset_id {}, skipping duplicate.",
                 patchset_id
@@ -13857,22 +13979,23 @@ impl Database {
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.execute(
-                "INSERT INTO forge_outbox (patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    patchset_id,
-                    provider,
-                    repo,
-                    pr_number,
-                    head_sha,
-                    body,
-                    target_url,
-                    status,
-                    created_at,
-                ],
-            )
-            .await?;
+        tx.execute(
+            "INSERT INTO forge_outbox (patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                patchset_id,
+                provider,
+                repo,
+                pr_number,
+                head_sha,
+                body,
+                target_url,
+                status,
+                created_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -23913,6 +24036,162 @@ mod tests {
 
         db.mark_forge_outbox_sent(retried.id).await.unwrap();
         assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_forge_outbox_upgrades_incomplete_review_to_completed() {
+        let db = setup_db().await;
+
+        let ps_id = db
+            .create_fetching_patchset(
+                "mr-733-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #733",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/733"),
+                Some("Fix workflow retry"),
+                Some(733),
+                Some("sashiko-733"),
+            )
+            .await
+            .unwrap();
+
+        let incomplete_v1 = format!(
+            "### Sashiko review\n\n{} — 2 of 3 commits failed to complete review (`2/3`, `3/3`).\n",
+            crate::forge::INCOMPLETE_REVIEW_MARKER
+        );
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            733,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            &incomplete_v1,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        // While still unsent (Pending/Embargoed/Dry-Run), a partial re-run that
+        // discovers new findings updates the unsent incomplete row in place.
+        let incomplete_v2 = format!(
+            "### Sashiko review\n\n{} — 1 of 3 commits failed to complete review (`3/3`).\n\n#### Commit 2/3 — bug\n\nSeverity: HIGH\n",
+            crate::forge::INCOMPLETE_REVIEW_MARKER
+        );
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            733,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            &incomplete_v2,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        // Claim the incomplete row so it is in status = 'Sending' (in flight).
+        let in_flight = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("should claim updated incomplete row");
+        assert_eq!(in_flight.body, incomplete_v2);
+
+        // Upgrading to a completed review while the prior incomplete row is in
+        // flight ('Sending') replaces it with a fresh row ID so the worker's
+        // completion of the stale body cannot clobber the completed review.
+        let completed_body = "### Sashiko review\n\n✓ **No issues found** across 3 commits.\n";
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            733,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            completed_body,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        // Stale worker finishing the old row (whether Sent or retry) is a no-op.
+        db.mark_forge_outbox_sent(in_flight.id).await.unwrap();
+        db.set_forge_outbox_retry_at(in_flight.id, 9_999_999_999, "stale 502")
+            .await
+            .unwrap();
+
+        let upgraded = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("upgraded completed review should remain claimable");
+        assert!(upgraded.id > in_flight.id);
+        assert_eq!(upgraded.retry_count, 0);
+        assert_eq!(upgraded.body, completed_body);
+        db.mark_forge_outbox_sent(upgraded.id).await.unwrap();
+
+        // Also verify embargoed Failed patchsets hold while embargo_until > now
+        // and release once embargo_until <= now.
+        let now = chrono::Utc::now().timestamp();
+        let emb_ps = db
+            .create_fetching_patchset(
+                "mr-734-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #734",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/734"),
+                Some("Embargoed partial failure"),
+                Some(734),
+                Some("sashiko-734"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(emb_ps, "Failed").await.unwrap();
+        db.set_patchset_embargo_until(emb_ps, now + 3600)
+            .await
+            .unwrap();
+        db.insert_forge_outbox(
+            emb_ps,
+            "github",
+            "sashiko-dev/sashiko",
+            734,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            &incomplete_v2,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-734",
+            "Embargoed",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !db.get_releasable_embargoed_patchsets(now, 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.id == emb_ps)
+        );
+        assert!(
+            !db.claim_patchset_embargo_release(emb_ps, now)
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            db.get_releasable_embargoed_patchsets(now + 3601, 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.id == emb_ps)
+        );
+        assert!(
+            db.claim_patchset_embargo_release(emb_ps, now + 3601)
+                .await
+                .unwrap()
+        );
+        assert_eq!(db.release_embargoed_forge_outbox(emb_ps).await.unwrap(), 1);
     }
 
     #[tokio::test]
