@@ -1016,7 +1016,7 @@ pub async fn refresh_remote(
     // 1. Validate repo_path to prevent git from traversing up to parent repos
     if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
         return Err(anyhow::anyhow!(
-            "{} is not a valid git repository. Did you forget to initialize submodules?",
+            "{} is not a valid git repository. Run `sashiko repo sync` to clone it.",
             repo_path.display()
         ));
     }

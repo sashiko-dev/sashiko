@@ -767,6 +767,15 @@ async fn run_daemon(
         return Err(reason.into());
     }
 
+    // The daemon never clones its tree. Without one, MAINTAINERS indexing
+    // only warns and the first sign of trouble is a patch that fails to
+    // apply, so a missing tree is refused here with the command that fixes it.
+    let repository_path = std::path::PathBuf::from(&settings.git.repository_path);
+    if let Err(reason) = sashiko::repo_sync::check_daemon_tree(&repository_path, project).await {
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
+    }
+
     if let Err(reason) = settings.validate_sign_in_delivery() {
         error!("Refusing to start: {}", reason);
         return Err(reason.into());

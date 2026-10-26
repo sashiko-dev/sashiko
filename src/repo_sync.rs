@@ -117,6 +117,38 @@ pub async fn sync(path: &Path, upstream: Upstream) -> Result<SyncOutcome> {
     }
 }
 
+/// Checks that `path` holds a tree a daemon reviewing `project` can start
+/// against, and says how to get one when it does not.
+///
+/// An `origin` that does not point at the project's upstream is only
+/// reported: a fork or a mirror is a legitimate tree to review against, but a
+/// daemon pointed at another project's tree is worth a line in the log.
+pub async fn check_daemon_tree(path: &Path, project: ProjectId) -> Result<(), String> {
+    let state = inspect(path).await.map_err(|e| e.to_string())?;
+    if !matches!(state, TreeState::Repository(_)) {
+        return Err(format!(
+            "[git] repository_path {:?} is not a git repository; run `sashiko repo sync` \
+             to clone the {project} tree there",
+            path.display().to_string()
+        ));
+    }
+    let expected = project.upstream().url;
+    match origin_url(path).await {
+        Some(url) if url != expected => warn!(
+            "The {project} tree at {} fetches origin from {}, not from {}",
+            path.display(),
+            crate::utils::redact_secret(&url),
+            expected
+        ),
+        Some(_) => {}
+        None => warn!(
+            "The {project} tree at {} has no origin remote",
+            path.display()
+        ),
+    }
+    Ok(())
+}
+
 /// Classifies what is at `path`.
 ///
 /// Git is always pointed at the candidate git directory explicitly. Run in a
@@ -712,5 +744,41 @@ mod tests {
             std::fs::read_to_string(tree.join("precious")).unwrap(),
             "keep me"
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_daemon_tree_does_not_mistake_a_parent_repository() {
+        // An empty third_party/<project> inside a checkout must not pass as a
+        // tree because git finds the checkout above it.
+        let root = TempDir::new().unwrap();
+        let up = upstream_repo(root.path()).await;
+        let nested = up.join("third_party/linux");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let error = check_daemon_tree(&nested, ProjectId::Linux)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("sashiko repo sync"), "{error}");
+        assert!(error.contains("linux"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_check_daemon_tree_accepts_a_repository() {
+        let root = TempDir::new().unwrap();
+        let up = upstream_repo(root.path()).await;
+
+        check_daemon_tree(&up, ProjectId::Sashiko).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_check_daemon_tree_rejects_a_missing_path() {
+        let root = TempDir::new().unwrap();
+
+        let error = check_daemon_tree(&root.path().join("absent"), ProjectId::Linux)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("is not a git repository"), "{error}");
     }
 }
