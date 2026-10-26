@@ -10138,6 +10138,8 @@ impl Database {
             return Ok(());
         }
 
+        // Repository names can contain underscores, which LIKE would treat
+        // as wildcards. Match literal paths while retaining ASCII case folding.
         let mut newer_rows = self
             .conn
             .query(
@@ -10146,9 +10148,9 @@ impl Database {
                    AND id > ?
                    AND mr_url IS NOT NULL
                    AND (
-                       mr_url LIKE '%/' || ? || '/pull/%'
-                       OR mr_url LIKE '%/' || ? || '/-/merge_requests/%'
-                       OR mr_url LIKE '%/' || ? || '/merge_requests/%'
+                       instr(lower(mr_url), '/' || lower(?) || '/pull/') > 0
+                       OR instr(lower(mr_url), '/' || lower(?) || '/-/merge_requests/') > 0
+                       OR instr(lower(mr_url), '/' || lower(?) || '/merge_requests/') > 0
                    )
                  LIMIT 1",
                 libsql::params![pr_number, patchset_id, repo, repo, repo],
@@ -10216,9 +10218,9 @@ impl Database {
                          AND ps2.id > forge_outbox.patchset_id
                          AND ps2.mr_url IS NOT NULL
                          AND (
-                             ps2.mr_url LIKE '%/' || forge_outbox.repo || '/pull/%'
-                             OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/-/merge_requests/%'
-                             OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/merge_requests/%'
+                             instr(lower(ps2.mr_url), '/' || lower(forge_outbox.repo) || '/pull/') > 0
+                             OR instr(lower(ps2.mr_url), '/' || lower(forge_outbox.repo) || '/-/merge_requests/') > 0
+                             OR instr(lower(ps2.mr_url), '/' || lower(forge_outbox.repo) || '/merge_requests/') > 0
                          )
                    )
                )",
@@ -20214,6 +20216,167 @@ mod tests {
 
         db.mark_forge_outbox_sent(retried.id).await.unwrap();
         assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+    }
+
+    const FORGE_REPOSITORY_MATCH_CASES: [(&str, &str, &str, &str); 3] = [
+        (
+            "github",
+            "Org/Repo_Name",
+            "https://github.com/Org/Repo_Name/pull/515",
+            "https://github.com/org/repoXname/pull/515",
+        ),
+        (
+            "gitlab",
+            "Group/Sub_Group/Repo",
+            "https://gitlab.com/Group/Sub_Group/Repo/-/merge_requests/515",
+            "https://gitlab.com/group/subXgroup/repo/-/merge_requests/515",
+        ),
+        (
+            "gitlab",
+            "Group/Sub_Group/Repo",
+            "https://gitlab.com/Group/Sub_Group/Repo/merge_requests/515",
+            "https://gitlab.com/group/subXgroup/repo/merge_requests/515",
+        ),
+    ];
+
+    async fn forge_matching_patchset(db: &Database, message_id: &str, mr_url: &str) -> i64 {
+        let id = db
+            .create_fetching_patchset(
+                message_id,
+                "[PR #515] Repository matching",
+                None,
+                None,
+                Some(mr_url),
+                Some("Repository matching"),
+                Some(515),
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(id, "Reviewed").await.unwrap();
+        id
+    }
+
+    async fn queue_forge_matching_comment(
+        db: &Database,
+        patchset_id: i64,
+        provider: &str,
+        repo: &str,
+        status: &str,
+    ) {
+        db.insert_forge_outbox(
+            patchset_id,
+            provider,
+            repo,
+            515,
+            None,
+            "Repository-specific review",
+            "https://sashiko.example.org/#/patchset/repository-matching",
+            status,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forge_repository_matching_keeps_unrelated_insertions() {
+        for (provider, repo, mr_url, unrelated_url) in FORGE_REPOSITORY_MATCH_CASES {
+            let db = setup_db().await;
+            let original = forge_matching_patchset(&db, "original@example.org", mr_url).await;
+            forge_matching_patchset(&db, "unrelated@example.org", unrelated_url).await;
+
+            queue_forge_matching_comment(&db, original, provider, repo, "Pending").await;
+
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT repo, status FROM forge_outbox WHERE patchset_id = ?",
+                    libsql::params![original],
+                )
+                .await
+                .unwrap();
+            let row =
+                rows.next().await.unwrap().unwrap_or_else(|| {
+                    panic!("{repo}: an unrelated repository suppressed insertion")
+                });
+            assert_eq!(row.get::<String>(0).unwrap(), repo);
+            assert_eq!(row.get::<String>(1).unwrap(), "Pending");
+        }
+    }
+
+    #[tokio::test]
+    async fn forge_repository_matching_keeps_unrelated_deliveries() {
+        for (provider, repo, mr_url, unrelated_url) in FORGE_REPOSITORY_MATCH_CASES {
+            for status in ["Pending", "Embargoed"] {
+                let db = setup_db().await;
+                let original = forge_matching_patchset(&db, "original@example.org", mr_url).await;
+                queue_forge_matching_comment(&db, original, provider, repo, status).await;
+                forge_matching_patchset(&db, "unrelated@example.org", unrelated_url).await;
+
+                if status == "Embargoed" {
+                    assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+                    assert_eq!(
+                        db.release_embargoed_forge_outbox(original).await.unwrap(),
+                        1,
+                        "{repo}: an unrelated repository cancelled the embargoed comment"
+                    );
+                }
+                let claimed = db
+                    .lock_pending_forge_outbox()
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!("{repo}: an unrelated repository cancelled delivery")
+                    });
+                assert_eq!(claimed.patchset_id, original);
+                assert_eq!(claimed.repo, repo);
+                assert_eq!(claimed.status, "Sending");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forge_repository_matching_preserves_case_insensitive_supersession() {
+        for (provider, repo, mr_url, _) in FORGE_REPOSITORY_MATCH_CASES {
+            for queue_before_update in [false, true] {
+                let db = setup_db().await;
+                let original = forge_matching_patchset(&db, "original@example.org", mr_url).await;
+                if queue_before_update {
+                    queue_forge_matching_comment(&db, original, provider, repo, "Pending").await;
+                }
+                // The existing SQL comparison folds ASCII case. Reconciliation
+                // compares slugs literally, so it does not pre-cancel this row
+                // and mask the outbox claim's supersession check.
+                forge_matching_patchset(&db, "newer@example.org", &mr_url.to_ascii_lowercase())
+                    .await;
+                if !queue_before_update {
+                    queue_forge_matching_comment(&db, original, provider, repo, "Pending").await;
+                }
+
+                assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+                let mut rows = db
+                    .conn
+                    .query(
+                        "SELECT status FROM forge_outbox WHERE patchset_id = ?",
+                        libsql::params![original],
+                    )
+                    .await
+                    .unwrap();
+                if queue_before_update {
+                    assert_eq!(
+                        rows.next()
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .get::<String>(0)
+                            .unwrap(),
+                        "Cancelled"
+                    );
+                } else {
+                    assert!(rows.next().await.unwrap().is_none());
+                }
+            }
+        }
     }
 
     #[tokio::test]
