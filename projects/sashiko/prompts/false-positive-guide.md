@@ -27,17 +27,24 @@ order, `needless_borrow`, missing `#[derive]`, redundant clones, or anything
 else clippy emits on Rust source files.
 
 Note: `make lint` does NOT check commit messages. Commit message defects —
-such as missing or cryptic/nickname `Signed-off-by` trailers, missing
+such as missing or cryptic/nickname `Signed-off-by` trailers, forbidden
+`Assisted-by:` / LLM attribution or AI `Co-authored-by:` trailers, missing or
+malformed `Fixes: <12-char sha> ("<subject>")` trailers on commits that fix an
+identifiable bug introduced prior to `Baseline SHA`, missing
 explanation of *what* and *why* on non-trivial code changes, genuinely
 unwrapped prose lines exceeding ~85 characters, backticks quoting code/symbols
 in the commit message, or internal metadata tags (`TAG=`, `CONV=`) — are valid
 findings and must NOT be dismissed as linter issues. However, do NOT nitpick
 commit message lines that are 73-80 characters long or lines that exceed the
 margin for reasonable reasons (quoting code, compiler/log output, URLs, or file
-paths), and do NOT demand additional rationale for trivial or self-explanatory
+paths), do NOT demand additional rationale for trivial or self-explanatory
 commits (such as adding a mailing list to track, adding an email policy entry
 or subsystem git remote, simple configuration/deployment updates, or typo fixes)
-where a brief one-sentence description is already self-sufficient.
+where a brief one-sentence description is already self-sufficient, and do NOT
+demand a `Fixes:` trailer on new features, refactorings, documentation/prompt/config
+updates, or commits where `git_blame`/`git_log` does not identify a specific
+bug-introducing commit prior to `Baseline SHA` (and never ask for `Fixes:`
+pointing to another commit in the same unmerged series).
 
 - Bad: "Consider using `iter()` instead of `into_iter()` here."
 - Bad: "This `clone()` looks unnecessary."

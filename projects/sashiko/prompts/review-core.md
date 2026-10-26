@@ -131,6 +131,24 @@ Every commit message must meet Sashiko's repository standards:
 - **Real-Name Signed-off-by (DCO):** Every commit must include a
   `Signed-off-by: Full Name <email>` trailer with the author's real human name
   (not a cryptic nickname, single-word handle, username, or AI/bot placeholder).
+- **No `Assisted-by:` or LLM Attribution Trailers:** Commit messages must
+  **never** include `Assisted-by: LLM` (or any `Assisted-by:`, `Generated-by:`,
+  `AI-assisted-by:`, or AI/bot `Co-authored-by:` trailer naming an LLM or coding
+  assistant). It does not matter what tools were used to author the change: the
+  human who signs off with `Signed-off-by:` holds full responsibility and must
+  not share or delegate that responsibility to an LLM.
+- **`Fixes:` Trailer on Bug Fixes:** When a commit repairs a defect introduced
+  by an identifiable earlier commit already in repository history (prior to
+  `Baseline SHA`), it must include a Linux-style `Fixes: <12-char sha> ("<subject>")`
+  trailer in the trailer block immediately before `Signed-off-by:` (plus
+  `Fixes: <project>-<uuid>` when fixing a tracked Sashiko bug). Verify with
+  `git_blame` or `git_log` before reporting a missing `Fixes:` trailer, and use
+  `git_show` to verify any existing `Fixes:` commit SHA (at least 12 hex
+  characters) and quoted subject. Do **not** demand `Fixes:` on new features,
+  refactorings, documentation/prompt/config additions, or commits where no
+  specific introducing commit prior to `Baseline SHA` can be identified with
+  confidence, and **never** ask for a `Fixes:` trailer pointing to an unmerged
+  commit in the same patch series or pull request.
 - **Clear Description (When Non-Trivial):** Non-trivial code, architectural, or
   behavior changes must explain both *what* the change does and *why* it is
   necessary (motivation/rationale), rather than having an empty body or merely
@@ -181,8 +199,10 @@ Evaluate every change for fundamental engineering soundness:
   closed enums, Cargo dependency/feature issues, or compiler/clippy lints. If
   you think a patch fails to compile, you have misread the code or missed a
   definition, re-export, macro, or trait impl — do NOT report it. However,
-  *commit message* defects (missing/nickname SOB, missing rationale on
-  non-trivial code changes, unwrapped prose lines > 85 chars, backticks in
-  commit message) are NOT caught by `cargo fmt` and MUST be reported.
+  *commit message* defects (missing/nickname SOB, forbidden `Assisted-by:` / LLM
+  attribution trailers, missing or malformed `Fixes:` trailers on identifiable
+  bug fixes, missing rationale on non-trivial code changes, unwrapped prose
+  lines > 85 chars, backticks in commit message) are NOT caught by `cargo fmt`
+  and MUST be reported.
 - **Prefer one proven finding to three speculative ones.** Every false positive
   spends the author's trust.

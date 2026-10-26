@@ -21,7 +21,9 @@ Follow these commit guidelines:
 
 - **Atomic commits:** Each commit should implement one consistent, self-sufficient change that compiles and passes all tests on its own.
 - **Line length:** Hard-wrap commit message titles and bodies at 72 characters.
-- **Plain text:** Do not use markdown backticks to quote symbols, functions, or file names in commit messages, and only include standard git trailers (such as `Signed-off-by`).
+- **Plain text:** Do not use markdown backticks to quote symbols, functions, or file names in commit messages, and only include standard git trailers (`Signed-off-by`, `Fixes`, human `Co-authored-by`, `Reviewed-by`, `Acked-by`, `Tested-by`, `Reported-by`, `Link`).
+- **`Fixes:` trailers for bug fixes:** When a commit repairs a defect introduced by an identifiable earlier commit on `main`, include a Linux-style `Fixes:` trailer immediately before `Signed-off-by:` (`Fixes: <12-char sha> ("<subject>")`, generated with `git log -1 --format='Fixes: %h ("%s")' --abbrev=12 <sha>`). Identify the introducing commit with `git blame` or `git log -S`; if it cannot be identified with confidence, omit the trailer rather than guessing. If the defect is also tracked as a Sashiko bug, add `Fixes: <project>-<uuid>` on a separate line.
+- **No `Assisted-by:` or LLM attribution trailers:** Never add `Assisted-by: LLM` (or `Generated-by:`, `AI-assisted-by:`, or AI/LLM `Co-authored-by:` trailers). What tools or models were used does not matter: the person who puts their `Signed-off-by:` signature on the commit holds full responsibility for the change and must not share or delegate that responsibility to an LLM.
 
 ## Local Verification (`make check-pr`)
 

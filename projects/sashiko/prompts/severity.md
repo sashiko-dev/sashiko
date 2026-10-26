@@ -107,10 +107,13 @@ auditable.
     - Resource leaks on rare error paths that clear on restart, or non-fatal
       error-handling omissions (`let _ = ...` where failure should be logged or
       propagated).
-    - Commit hygiene and test gaps: missing `Signed-off-by`, missing commit
-      rationale on non-trivial code changes (note: self-explanatory config,
-      deployment, mailing-list, or email-policy additions do not need extra
-      rationale), or missing unit test coverage for new behavior.
+    - Commit hygiene and test gaps: missing `Signed-off-by`, forbidden
+      `Assisted-by:` or AI/LLM attribution/co-authorship trailers (which
+      improperly share or delegate DCO sign-off responsibility to an LLM),
+      missing commit rationale on non-trivial code changes (note:
+      self-explanatory config, deployment, mailing-list, or email-policy
+      additions do not need extra rationale), or missing unit test coverage for
+      new behavior.
 
 ## Low
 
@@ -127,10 +130,13 @@ auditable.
       auxiliary outbox or metadata row in a terminal state that causes no
       external side effect).
     - Dead outputs, unused fields, confusing naming, stale comments, or typos.
-    - Commit message formatting violations: genuinely unwrapped prose lines
-      exceeding ~85 characters (do not flag 73-80 char lines or reasonable
-      exceptions like quoted code, URLs, or paths), backticks quoting code or
-      symbols in the commit message, or internal metadata tags (`TAG=`, `CONV=`).
+    - Commit message formatting and metadata violations: missing or malformed
+      `Fixes: <12-char sha> ("<subject>")` trailers on bug fixes where the
+      introducing commit prior to `Baseline SHA` is clearly identifiable via
+      `git_blame`/`git_log`, genuinely unwrapped prose lines exceeding ~85
+      characters (do not flag 73-80 char lines or reasonable exceptions like
+      quoted code, URLs, or paths), backticks quoting code or symbols in the
+      commit message, or internal metadata tags (`TAG=`, `CONV=`).
 
 > Build/compilation errors (syntax, missing imports, unresolved symbols/types,
 > type mismatches, borrow-checker/lifetime errors, missing trait bounds, or
@@ -138,7 +144,8 @@ auditable.
 > ordering, and anything `cargo check`, `cargo test`, `cargo fmt`, or `cargo
 > clippy` reports on source files are not findings at all. They are verified
 > deterministically before a human ever sees them — never vibe-guess build bugs.
-> However, commit message issues (missing real-name `Signed-off-by`, missing
-> description of what/why on non-trivial changes, unwrapped prose lines > 85
-> chars, backticks in commit message) are NOT checked by `cargo fmt` and MUST
-> be reported.
+> However, commit message issues (missing real-name `Signed-off-by`, forbidden
+> `Assisted-by:` / LLM trailers, missing or malformed `Fixes:` trailers on
+> identifiable bug fixes, missing description of what/why on non-trivial
+> changes, unwrapped prose lines > 85 chars, backticks in commit message) are
+> NOT checked by `cargo fmt` and MUST be reported.
