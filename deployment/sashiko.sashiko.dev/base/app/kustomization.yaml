@@ -3,5 +3,4 @@ kind: Kustomization
 
 resources:
   - sashiko-self-k8s.yaml
-  - repo-setup.yaml
   - management-tools.yaml

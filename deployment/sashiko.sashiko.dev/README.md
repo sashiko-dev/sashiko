@@ -22,7 +22,6 @@ deliberate differences:
 | Path | Contents |
 | --- | --- |
 | `base/app/sashiko-self-k8s.yaml` | Namespace, service account, PVC, Deployment |
-| `base/app/repo-setup.yaml` | Entrypoint that clones the Sashiko repository |
 | `base/app/management-tools.yaml` | Data manager pod and nightly backup CronJob |
 | `base/routing/` | Service, BackendConfig, ManagedCertificate, Ingress, maintenance page |
 | `app/`, `routing/`, `maintenance/` | Overlays that are applied |
