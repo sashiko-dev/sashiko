@@ -8,7 +8,7 @@
 
 Sashiko is a self-contained, agentic Linux kernel code review system. It uses kernel-specific prompts and a multi-stage verification protocol to review proposed changes locally from your git checkout or automatically from mailing lists (`lore.kernel.org`) and git forges.
 
-- **Kernel Maintainers:** See the [Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md) for configuring mailing list tracking, subsystem prompts, and email policies.
+- **Kernel Maintainers:** See the [Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md) for configuring mailing list tracking, maintainer notes, and email policies.
 - **Mailing List:** Join [`sashiko@lists.linux.dev`](https://lore.kernel.org/sashiko) for announcements, feedback, and discussions (automated review replies use `sashiko-reviews@lists.linux.dev`).
 - **Community & Press:** Read what kernel maintainers and the media say in [Sashiko in the Press](PRESS.md).
 
@@ -66,7 +66,7 @@ As with any LLM-based tool, Sashiko's output is probabilistic and may vary acros
 
 ### Multi-Stage Review Pipeline
 
-Sashiko evaluates patches through specialized parallel analysis stages followed by sequential consolidation stages, combined with code notes generated and verified from the kernel source, maintainer notes on each subsystem's preferences and policies, and review procedures that descend from Chris Mason's [review-prompts](https://github.com/masoncl/review-prompts).
+Sashiko evaluates patches through specialized parallel analysis stages followed by sequential consolidation stages, guided by a first-party three-layer prompt architecture: automatic code notes generated and verified directly against the kernel source tree, human-curated maintainer notes for each subsystem's preferences and policies, and universal review procedures.
 
 **Analysis stages** (run in parallel; `goal`, `implementation`, and `execution-flow` always run, while the planning stage selects the rest unless overridden via `--stages`):
 
@@ -87,7 +87,7 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 
 ## Documentation
 
-- **[Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md)** — mailing list tracking, subsystem prompts, baseline detection, and email delivery options.
+- **[Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md)** — mailing list tracking, maintainer notes, baseline detection, and email delivery options.
 - **[Sashiko in the Press](PRESS.md)** — quotes from Linux kernel maintainers on LKML and press coverage.
 - **[LLM Provider Configuration](docs/llm-providers.md)** — setup instructions for Gemini, Claude, OpenAI, Bedrock, Vertex AI, and CLI providers.
 - **[Running the Daemon (Server Mode)](docs/daemon.md)** — building from source, monitoring mailing lists (NNTP) and forges, Web UI, `sashiko-cli`, and server ACL security.
@@ -96,6 +96,10 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 - **[Forge Setup Guide](docs/FORGE_SETUP.md)** *(Experimental)* — webhook integration for [GitHub](docs/GITHUB_SETUP.md), [GitLab](docs/GITLAB_SETUP.md), and [Webhook Security](docs/WEBHOOK_SECURITY.md).
 - **[Benchmarking Guide](docs/benchmarking.md)** — evaluating review accuracy against historical bugs.
 - **[Contributing Guide](CONTRIBUTING.md)** — DCO sign-off, local verification (`make check-pr`), and the Sashiko-for-Sashiko review workflow.
+
+## Acknowledgments
+
+Special thanks to Chris Mason, whose [review-prompts](https://github.com/masoncl/review-prompts) project powered Sashiko's initial launch and shaped our early review workflow. While Sashiko has since replaced `review-prompts` with its own code notes and maintainer notes, the project owes a great deal to that foundation.
 
 ## License
 

@@ -20,12 +20,3 @@ prompt bundle under the `kernel/` namespace.
 These prompts carry review procedures and judgment, not knowledge about the
 code: what the code does and must preserve comes from the code notes, which
 are generated from the source and verified against it.
-
-## Origin
-
-`severity.md` is Sashiko's own. `false-positive-guide.md`,
-`inline-template.md`, `callstack.md`, `locking.md` and `pointer-guards.md`
-descend from Chris Mason's
-[review-prompts](https://github.com/masoncl/review-prompts) (commit
-d048f8742f6740c38833adf02e87901412d771ca) with Sashiko's changes on top;
-`LICENSE.review-prompts` is its license.
