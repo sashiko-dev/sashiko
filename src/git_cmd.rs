@@ -31,6 +31,10 @@
 //! Every git command in this crate is built here so that the directory handed
 //! to the constructor, and nothing inherited from the outside, decides which
 //! repository is touched.
+//!
+//! The same holds for the language git speaks. Callers match on its messages,
+//! such as "already exists" from `git remote add`, and a translated message
+//! never matches, so every command runs in the C locale.
 
 use std::path::Path;
 
@@ -55,13 +59,14 @@ const INHERITED_LOCATION_VARS: [&str; 11] = [
 ];
 
 /// Builds a git command of the given type with the inherited location
-/// variables removed, optionally anchored to a directory.
+/// variables removed and the C locale set, optionally anchored to a directory.
 macro_rules! git_command {
     ($command:ty, $directory:expr) => {{
         let mut command = <$command>::new("git");
         for variable in INHERITED_LOCATION_VARS {
             command.env_remove(variable);
         }
+        command.env("LC_ALL", "C");
         if let Some(directory) = $directory {
             command.current_dir(directory);
         }
@@ -152,6 +157,23 @@ mod tests {
         }
         assert_eq!(command.as_std().get_current_dir(), None);
         assert!(command.get_kill_on_drop());
+    }
+
+    /// Messages that callers match on have to come out untranslated.
+    #[test]
+    fn test_every_command_runs_in_the_c_locale() {
+        fn locale<'a, I>(mut envs: I) -> Option<&'a OsStr>
+        where
+            I: Iterator<Item = (&'a OsStr, Option<&'a OsStr>)>,
+        {
+            envs.find(|(name, _)| *name == "LC_ALL")
+                .and_then(|(_, value)| value)
+        }
+
+        let c = Some(OsStr::new("C"));
+        assert_eq!(locale(in_dir("/tmp").get_envs()), c);
+        assert_eq!(locale(in_dir_async("/tmp").as_std().get_envs()), c);
+        assert_eq!(locale(detached_async().as_std().get_envs()), c);
     }
 
     fn resolved_git_dir(command: &mut std::process::Command) -> PathBuf {

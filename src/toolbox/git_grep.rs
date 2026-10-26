@@ -38,11 +38,11 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             "type": "object",
             "properties": {
                 "revision": { "type": "string", "description": "Git commit SHA or reference to search at." },
-                "pattern": { "type": "string", "description": "Regex or literal pattern to search." },
+                "pattern": { "type": "string", "description": "Pattern to search, or a literal string if is_literal is true. Only POSIX extended regular expressions (ERE) are supported." },
                 "path": { "type": "string", "description": "Relative paths or pathspecs to restrict search (optional). Highly recommended to scope to the modified subsystem directory (e.g. 'net/mptcp/') to avoid extremely expensive tree-wide searches." },
                 "context_lines": { "type": "integer", "description": "Context lines to show. Default: 0." },
                 "count_only": { "type": "boolean", "description": "If true, returns file names and match counts only. Recommended for cheap broad searches." },
-                "is_literal": { "type": "boolean", "description": "If true, treats pattern as literal fixed string rather than PCRE regex." }
+                "is_literal": { "type": "boolean", "description": "If true, treats pattern as literal fixed string rather than POSIX extended regex." }
             },
             "required": ["revision", "pattern"]
         })
@@ -97,7 +97,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         if is_literal {
             cmd.arg("-F");
         } else {
-            cmd.arg("-P");
+            cmd.arg("-E");
         }
 
         cmd.arg("-e").arg(pattern).arg(revision);

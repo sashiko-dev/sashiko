@@ -195,3 +195,35 @@ async fn revision_prefetch_isolation_and_edge_cases() {
     fs::remove_file(path.join("helper:impl.c")).unwrap();
     assert_eq!(fixture.context().await, expected, "missing working files");
 }
+
+#[tokio::test]
+async fn macros_and_tab_separated_definitions_are_found() {
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path();
+    git(path, &["init", "-q"]);
+    git(path, &["config", "user.name", "Test"]);
+    git(path, &["config", "user.email", "test@example.com"]);
+    fs::write(path.join("defs.h"), "#define\tSCALE(x)\t((x) * 3)\n").unwrap();
+    fs::write(
+        path.join("twice.c"),
+        "static\tint\ttwice(int v)\n{\n\treturn v * 2;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        path.join("driver.c"),
+        "int consume(int v)\n{\n\treturn v;\n}\n",
+    )
+    .unwrap();
+    commit(path);
+    fs::write(
+        path.join("driver.c"),
+        "int consume(int v)\n{\n\treturn SCALE(v) + twice(v);\n}\n",
+    )
+    .unwrap();
+    let target = commit(path);
+    let diff = git(path, &["show", "--format=", &target]);
+
+    let context = prefetch_context(path, &target, &diff).await.unwrap();
+    assert!(context.contains("((x) * 3)"), "{context}");
+    assert!(context.contains("return v * 2;"), "{context}");
+}
