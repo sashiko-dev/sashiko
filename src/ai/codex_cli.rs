@@ -20,12 +20,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
+use super::cli_process::collect_cli_output;
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, cache_identity_with,
 };
@@ -36,9 +36,13 @@ pub struct CodexCliProvider {
     pub effort: Option<String>,
 }
 
-#[async_trait]
-impl AiProvider for CodexCliProvider {
-    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+impl CodexCliProvider {
+    pub(super) async fn generate_content_with_binary(
+        &self,
+        request: AiRequest,
+        binary: &std::ffi::OsStr,
+        call_timeout: Duration,
+    ) -> Result<AiResponse> {
         let prompt = build_prompt(&request);
 
         debug!("codex-cli prompt length: {} chars", prompt.len());
@@ -64,7 +68,7 @@ impl AiProvider for CodexCliProvider {
             args.push(format!("model_reasoning_effort={effort}"));
         }
 
-        let mut child = Command::new("codex")
+        let child = Command::new(binary)
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -73,12 +77,7 @@ impl AiProvider for CodexCliProvider {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn codex CLI: {}. Is it installed?", e))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.flush().await?;
-        }
-
-        let output = timeout(Duration::from_secs(600), child.wait_with_output())
+        let output = timeout(call_timeout, collect_cli_output(child, &prompt))
             .await
             .map_err(|_| anyhow::anyhow!("codex CLI timed out after 10 minutes"))?
             .map_err(|e| anyhow::anyhow!("codex CLI wait error: {}", e))?;
@@ -155,6 +154,18 @@ impl AiProvider for CodexCliProvider {
         }
 
         parse_inner_response(&response_text, usage)
+    }
+}
+
+#[async_trait]
+impl AiProvider for CodexCliProvider {
+    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        self.generate_content_with_binary(
+            request,
+            std::ffi::OsStr::new("codex"),
+            Duration::from_secs(600),
+        )
+        .await
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {

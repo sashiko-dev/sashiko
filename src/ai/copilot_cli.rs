@@ -35,6 +35,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
+use super::cli_process::collect_cli_output;
 use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities};
 
 pub struct CopilotCliProvider {
@@ -57,9 +58,13 @@ pub fn build_copilot_args(model: &str) -> Vec<String> {
     ]
 }
 
-#[async_trait]
-impl AiProvider for CopilotCliProvider {
-    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+impl CopilotCliProvider {
+    pub(super) async fn generate_content_with_binary(
+        &self,
+        request: AiRequest,
+        binary: &std::ffi::OsStr,
+        call_timeout: Duration,
+    ) -> Result<AiResponse> {
         let prompt = build_prompt(&request);
 
         debug!("copilot-cli prompt length: {} chars", prompt.len());
@@ -69,7 +74,7 @@ impl AiProvider for CopilotCliProvider {
         // prompts (subsystem guides + diff + tool definitions) routinely
         // exceed that and cause spawn() to fail with E2BIG. Stdin has no such
         // limit and the timing is equivalent in copilot's non-interactive mode.
-        let mut child = Command::new("copilot")
+        let child = Command::new(binary)
             .args(build_copilot_args(&self.model))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -78,18 +83,7 @@ impl AiProvider for CopilotCliProvider {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn copilot CLI: {}. Is it installed?", e))?;
 
-        // Write the prompt to copilot's stdin and close the pipe so it
-        // proceeds to non-interactive (--print-like) mode.
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .map_err(|e| anyhow::anyhow!("copilot CLI stdin write failed: {}", e))?;
-            drop(stdin);
-        }
-
-        let output = timeout(Duration::from_secs(600), child.wait_with_output())
+        let output = timeout(call_timeout, collect_cli_output(child, &prompt))
             .await
             .map_err(|_| anyhow::anyhow!("copilot CLI timed out after 10 minutes"))?
             .map_err(|e| anyhow::anyhow!("copilot CLI wait error: {}", e))?;
@@ -103,6 +97,18 @@ impl AiProvider for CopilotCliProvider {
         }
 
         parse_jsonl_events(&raw)
+    }
+}
+
+#[async_trait]
+impl AiProvider for CopilotCliProvider {
+    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        self.generate_content_with_binary(
+            request,
+            std::ffi::OsStr::new("copilot"),
+            Duration::from_secs(600),
+        )
+        .await
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {

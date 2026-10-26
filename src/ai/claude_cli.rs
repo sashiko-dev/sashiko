@@ -31,11 +31,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use super::cli_process::collect_cli_output;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall, cache_identity_with,
@@ -200,7 +200,8 @@ impl ClaudeCliProvider {
         // Bound both prompt transfer and output collection by the same deadline.
         let output = timeout(call_timeout, collect_cli_output(child, &prompt))
             .await
-            .map_err(|_| ClaudeCliError::Timeout)??;
+            .map_err(|_| ClaudeCliError::Timeout)?
+            .map_err(|error| ClaudeCliError::Wait(error.to_string()))?;
 
         let stderr = log_and_redact_stderr("claude-cli", &output.stderr);
         let raw = String::from_utf8_lossy(&output.stdout);
@@ -248,29 +249,6 @@ impl AiProvider for ClaudeCliProvider {
             ],
         )
     }
-}
-
-async fn collect_cli_output(
-    mut child: tokio::process::Child,
-    prompt: &str,
-) -> Result<std::process::Output, ClaudeCliError> {
-    let stdin = child.stdin.take();
-    let write_prompt = async move {
-        if let Some(mut stdin) = stdin {
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.flush().await?;
-        }
-        Ok::<(), std::io::Error>(())
-    };
-    // Drain output while feeding stdin; the CLI may emit startup errors first.
-    let (written, output) = tokio::join!(write_prompt, child.wait_with_output());
-    let output = output.map_err(|error| ClaudeCliError::Wait(error.to_string()))?;
-    // Preserve CLI diagnostics on failure, even when it closed stdin early.
-    if output.status.success() {
-        written
-            .map_err(|error| ClaudeCliError::Wait(format!("failed to write prompt: {error}")))?;
-    }
-    Ok(output)
 }
 
 fn parse_cli_output(raw: &str) -> Result<Value, ClaudeCliError> {

@@ -862,6 +862,7 @@ pub mod bedrock;
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;
+mod cli_process;
 pub mod codex_cli;
 pub mod concurrency_limited_provider;
 pub mod copilot_cli;
