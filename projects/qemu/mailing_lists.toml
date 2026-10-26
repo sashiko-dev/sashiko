@@ -1,0 +1,33 @@
+[defaults]
+# Whether lists in this file are tracked and ingested via NNTP by default.
+track = true
+
+# Who from the original patch receives the review email:
+# - "author": the patch author (From: header -> To:)
+# - "list": this block's mailing list address (-> To:/Cc:)
+# - "recipients": all individual (non-mailing-list) To:/Cc: recipients on the patch
+reply_to = []
+
+# When a review finds no issues, who receives the positive review email:
+# - "none": do not send positive review emails (default)
+# - "author": send positive review only to the patch author (To: author, no list/CCs)
+# - "all": send positive review to the full resolved recipient set
+positive_review = "none"
+
+# If true, completely mutes (suppresses) outbound emails for this scope.
+mute_all = false
+
+# Static email addresses that always receive a copy (CC'd).
+cc = []
+
+# Hours to hold reviews with findings before sending (0 = immediate).
+embargo_hours = 0
+
+# Author email addresses whose submissions are ignored and never reviewed.
+ignored_emails = []
+
+# --- Tracked for Web UI only (no outbound emails) ---
+
+["qemu-devel@nongnu.org"]
+
+["qemu-riscv@nongnu.org"]

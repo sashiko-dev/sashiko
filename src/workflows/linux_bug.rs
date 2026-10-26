@@ -183,6 +183,12 @@ impl LlmSession for VerifySession<'_> {
                 Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
                 CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
             ),
+            ProjectId::Qemu => format!(
+                "Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references strictly on this current date.\n\n\
+                You are an expert QEMU maintainer and system emulator engineer. Your task is to rigorously verify a candidate QEMU defect or vulnerability against the top-of-trunk of the QEMU master tree.\n\
+                Use available tools (git_read_files, git_grep, git_blame, git_log, git_show, git_diff) to inspect the mainline codebase, verify call chains, and confirm whether this defect exists.\n\n\
+                CRITICAL VALIDATION FILTER: You must assess if the bug is genuine. Do not give the code the benefit of the doubt. To mark an issue as a false positive (is_false_positive=true), you must find concrete proof in the local codebase that the described conditions are impossible, unreachable, or already safely handled. If you cannot prove it is false, verify the code locations and provide your step-by-step reasoning in verification_reasoning."
+            ),
         }
     }
 
@@ -280,6 +286,42 @@ Return ONLY a valid JSON object matching this schema:
                 locations = loc_str,
                 prefetch_block = prefetch_block,
             ),
+            ProjectId::Qemu => format!(
+                "{stage_heading}
+
+Candidate Defect to Verify:
+Title: {title}
+Subsystem: {subsystem}
+{files_str}Description:
+{description}
+Locations:
+{locations}
+{prefetch_block}
+Task:
+1. Verify the problem against the mainline code shown above and top-of-trunk of the QEMU master tree (commit `{master_sha}`). IMPORTANT: Use this exact `{master_sha}` SHA in any tool calls instead of `HEAD` or `master` to check the actual top-of-trunk.
+2. Scope your verification to the relevant device models and subsystem files. Do not wander across unrelated devices or files.
+3. Determine if the issue is a genuine, reachable defect in the codebase.
+4. If the defect is hallucinated, or a false positive that you can prove based on the code is impossible or safely handled, set \"is_false_positive\": true, provide concrete proof in \"refutation_evidence\", and summarize in \"verification_reasoning\".
+5. If it is a confirmed bug, set \"is_false_positive\": false, \"refutation_evidence\": null, provide your step-by-step proof in \"verification_reasoning\", carry forward and refine the verified code locations in \"relevant_code_locations\", and optionally suggest an \"impact_severity\" (\"Low\", \"Medium\", \"High\", \"Critical\", or \"Unknown\").
+
+EFFICIENCY LIMIT REQUIREMENT: Limit your investigation to the core defect. Do not trace unneeded macro definitions or unrelated history. You have a strict limit on tool calls; be extremely efficient instead of wandering the history.
+
+Return ONLY a valid JSON object matching this schema:
+{{
+  \"verification_reasoning\": \"1. Call chain... 2. Condition...\",
+  \"is_false_positive\": false,
+  \"refutation_evidence\": null,
+  \"impact_severity\": \"High\",
+  \"relevant_code_locations\": [ {{\"file\": \"hw/net/virtio-net.c\", \"function_or_symbol\": \"function_name\", \"line\": 123}} ]
+}}",
+                stage_heading = BugStage::Verification.heading(),
+                master_sha = self.master_sha,
+                title = self.title,
+                subsystem = self.subsystem,
+                description = self.description,
+                locations = loc_str,
+                prefetch_block = prefetch_block,
+            ),
         }
     }
 
@@ -357,6 +399,15 @@ impl LlmSession for NormalizeSession<'_> {
                 Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
                 - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
                 - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional component commit prefix used in GCC (e.g. 'tree-optimization:', 'c++:', 'target:', 'middle-end:', 'rtl-optimization:', 'fortran:', 'ipa:', 'libstdc++:', 'c:').",
+                master_sha = self.master_sha
+            ),
+            ProjectId::Qemu => format!(
+                "You are an expert QEMU maintainer and technical editor. Your role is to normalize a candidate QEMU defect into canonical form.\n\
+                You must standardize the defect's title, describe the technical substance, and identify the verified affected source files and symbols.\n\
+                The target codebase is the QEMU repository at top-of-trunk commit `{master_sha}`.\n\
+                Use available tools (git_read_files, git_log, git_grep) to inspect the codebase at `{master_sha}`. Specifically:\n\
+                - Use git_read_files with revision: \"{master_sha}\" or git_grep to inspect source code and identify affected files and symbols.\n\
+                - Use git_log with range: \"{master_sha}\" on affected files to observe the conventional subsystem commit prefix used by QEMU maintainers (e.g. 'virtio-net:', 'hw/arm:', 'target/riscv:', 'migration:', 'qapi:', 'block:').",
                 master_sha = self.master_sha
             ),
         }
@@ -470,6 +521,42 @@ Return ONLY a valid JSON object matching this schema:
   \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
   \"affected_source_files\": [\"gcc/tree-ssa-phiopt.cc\"],
   \"affected_symbols\": [\"fold_stmt\"]
+}}",
+                stage_heading = BugStage::Normalization.heading(),
+                problem = self.problem,
+                reasoning = self.reasoning,
+                locations = self.locations,
+                hint = hint_section,
+                master_sha = self.master_sha
+            ),
+            ProjectId::Qemu => format!(
+                "{stage_heading}
+
+Candidate Bug Details:
+Original Problem: {problem}
+Reasoning: {reasoning}
+Reported Locations:
+{locations}
+{hint}
+Target Mainline Commit: {master_sha}
+
+Task:
+1. Determine the conventional subsystem commit prefix for this defect (e.g. 'virtio', 'virtio-net', 'hw/arm', 'target/riscv', 'migration', 'qapi', 'block'). Use git_log on the affected file(s) at revision '{master_sha}' to observe the standard commit prefix used by QEMU maintainers.
+2. Formulate a canonical title matching QEMU patch conventions: '<subsystem_prefix>: <defect or broken invariant in function_name()>' (strict limit of under 80 characters, NO backticks, NO markdown).
+   - CRITICAL: This is a bug report title describing an existing defect, NOT a patch or commit title. Do NOT use patch/fix action verbs like 'fix', 'resolve', 'prevent', 'avoid', or 'handle'. State the defect directly (e.g. 'virtio-net: out-of-bounds read in virtio_net_handle_rsc()', NEVER 'virtio-net: fix out-of-bounds read in virtio_net_handle_rsc()').
+3. Provide a detailed, structured canonical description:
+   - Trigger / Preconditions: Specific conditions, inputs, or guest-triggerable states required to trigger the defect (e.g. a specific register write, descriptor or config-space access).
+   - Call Chain / Execution Path: Detail the complete chain of events/calls leading up to the problem.
+   - Failure Mechanism: Detail the exact root cause and how the fault or state corruption occurs.
+   - Impact: Consequence of the failure (e.g. out-of-bounds host read/write, memory leak on the unrealize path, abort, incorrect guest-visible behavior).
+4. Verify and list the affected source files and symbols in the mainline tree at commit '{master_sha}'.
+
+Return ONLY a valid JSON object matching this schema:
+{{
+  \"canonical_title\": \"virtio-net: out-of-bounds read in virtio_net_handle_rsc()\",
+  \"canonical_description\": \"Trigger / Preconditions: ...\\nFailure Mechanism: ...\\nImpact: ...\",
+  \"affected_source_files\": [\"hw/net/virtio-net.c\"],
+  \"affected_symbols\": [\"virtio_net_handle_rsc\"]
 }}",
                 stage_heading = BugStage::Normalization.heading(),
                 problem = self.problem,
@@ -603,6 +690,15 @@ pub fn extract_directory_subsystems_for_project(
                     continue;
                 }
             }
+            ProjectId::Qemu => {
+                if parts.len() >= 2 {
+                    format!("{}/{}", parts[0], parts[1])
+                } else if !parts.is_empty() {
+                    parts[0].to_string()
+                } else {
+                    continue;
+                }
+            }
         };
         if !subs.contains(&sub) {
             subs.push(sub);
@@ -613,6 +709,7 @@ pub fn extract_directory_subsystems_for_project(
             ProjectId::Linux => vec!["kernel".to_string()],
             ProjectId::Sashiko => vec!["sashiko".to_string()],
             ProjectId::Gcc => vec!["gcc".to_string()],
+            ProjectId::Qemu => vec!["qemu".to_string()],
         }
     } else {
         subs
@@ -876,6 +973,12 @@ impl LlmSession for DedupSession<'_> {
         IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
         Output raw JSON only."
                 .to_string(),
+            ProjectId::Qemu => "You are an expert QEMU maintainer responsible for defect tracking and deduplication.\n\
+        You will compare a newly verified QEMU bug against a list of known QEMU bugs in the codebase.\n\
+        Determine if the newly verified bug is an identical duplicate (describing the same root cause in the same code path/function) of one of the candidate bugs.\n\
+        IMPORTANT: Bugs that have the same root cause but different consequences should be considered a duplicate and be merged. Rule of thumb: if fixing one issue will resolve the other issue, it's the same bug.\n\
+        Output raw JSON only."
+                .to_string(),
         }
     }
 
@@ -927,6 +1030,7 @@ impl LlmSession for DedupSession<'_> {
             ProjectId::Linux => "Newly Verified Linux Kernel Bug:",
             ProjectId::Sashiko => "Newly Verified Sashiko Bug:",
             ProjectId::Gcc => "Newly Verified GCC Bug:",
+            ProjectId::Qemu => "Newly Verified QEMU Bug:",
         };
 
         format!(
@@ -1023,6 +1127,9 @@ impl LlmSession for TracingSession<'_> {
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
             ProjectId::Gcc => "You are an expert GCC compiler maintainer. Your task is to determine the exact commit that introduced a verified GCC defect.\n\
+        Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
+        EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
+            ProjectId::Qemu => "You are an expert QEMU maintainer. Your task is to determine the exact commit that introduced a verified QEMU defect.\n\
         Use available tools (git_blame, git_log, git_diff, git_show, git_read_files) to inspect history backwards and confirm which commit actually introduced the buggy logic rather than just refactoring lines.\n\
         EFFICIENCY LIMIT REQUIREMENT: You have a strict limit on tool calls; be extremely efficient instead of wandering the history.".to_string(),
         }
@@ -1126,6 +1233,7 @@ impl LlmSession for SeveritySession<'_> {
             ProjectId::Linux => "the Linux kernel",
             ProjectId::Sashiko => "Sashiko",
             ProjectId::Gcc => "GCC",
+            ProjectId::Qemu => "QEMU",
         };
         format!(
             "{}\n\nAssess the severity and impact of a verified defect in {} following the severity definitions and calibration guidance above.\n\
@@ -1140,6 +1248,7 @@ impl LlmSession for SeveritySession<'_> {
             ProjectId::Linux => "Verified Linux Kernel Defect:",
             ProjectId::Sashiko => "Verified Sashiko Defect:",
             ProjectId::Gcc => "Verified GCC Defect:",
+            ProjectId::Qemu => "Verified QEMU Defect:",
         };
         format!(
             "{stage_heading}
@@ -1417,6 +1526,21 @@ unresolvable AB-BA deadlock.
 - Output Format:
   100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
                 .to_string(),
+            ProjectId::Qemu => r#"You are an expert QEMU maintainer drafting a concise, standalone technical defect description for a verified bug in the QEMU C codebase.
+
+# PRINCIPLES & STRUCTURE
+- Maintainer Voice: Write for an experienced system emulation engineer. Do NOT explain generic QEMU mechanics (what the QOM property system is, what a MemoryRegion, a bottom half or an iothread is). Focus strictly on the broken contract or invariant in this device model or subsystem.
+- Zero Boilerplate: Do NOT include greetings, conversational preamble, or section headers ("Defect Report:", "Description:", or the bug title). Start immediately with the technical description.
+- Scope Boundary: Describe ONLY the defect, root cause, and technical impact. Do NOT suggest how to resolve the issue or write a patch.
+- Narrative Flow (1 to 2 cohesive paragraphs):
+  1. Opening Sentence: State what goes wrong, in which function and file/subsystem, and under what guest-triggerable condition.
+  2. Failure Mechanics: Trace the precise cause-and-effect chain (guest-triggered register or DMA access -> missing bounds/alignment check / faulty state transition / race against teardown -> failure).
+  3. Concrete Consequence: State the direct impact (e.g. out-of-bounds host read or write, leak on the unrealize path, abort, incorrect guest-visible behavior).
+- Code Presentation:
+  Include a concise code snippet (`// <filepath>:<start_line>-<end_line>`) starting at column 0 with `< ... >` omission markers when localized code proves the defect.
+- Output Format:
+  100% plain text: no markdown code fences (```), no quote marks ('>'), and no backticks (`). Use func() format for function names. Hard-wrap prose lines at 75 characters per line."#
+                .to_string(),
         }
     }
 
@@ -1444,6 +1568,7 @@ unresolvable AB-BA deadlock.
             ProjectId::Linux => "Linux Kernel Defect Details:",
             ProjectId::Sashiko => "Sashiko Defect Details:",
             ProjectId::Gcc => "GCC Defect Details:",
+            ProjectId::Qemu => "QEMU Defect Details:",
         };
 
         format!(
@@ -1557,6 +1682,11 @@ pub fn infer_project_from_bug_or_tool(
         || tool.is_some_and(|t| t.starts_with("sashiko:gcc"))
     {
         ProjectId::Gcc
+    } else if default_project == ProjectId::Qemu
+        || bugid.is_some_and(|id| id.starts_with("qemu-"))
+        || tool.is_some_and(|t| t.starts_with("sashiko:qemu"))
+    {
+        ProjectId::Qemu
     } else if bugid.is_some_and(|id| id.starts_with("linux-"))
         || tool.is_some_and(|t| t.starts_with("sashiko:linux"))
     {
@@ -1610,6 +1740,7 @@ pub async fn process_issue_for_project(
         ProjectId::Linux => "sashiko:linux_patch_review",
         ProjectId::Sashiko => "sashiko:sashiko_patch_review",
         ProjectId::Gcc => "sashiko:gcc_patch_review",
+        ProjectId::Qemu => "sashiko:qemu_patch_review",
     };
     let reviewer_db;
     let db = if db.has_bug_actor() && db.bug_model().is_some() {
@@ -2315,6 +2446,7 @@ pub async fn process_issue_worker_for_project(
         ProjectId::Linux => "Linux kernel",
         ProjectId::Sashiko => "Sashiko",
         ProjectId::Gcc => "GCC",
+        ProjectId::Qemu => "QEMU",
     };
     info!(
         "Processing candidate {} issue: '{}' in subsystems '{:?}'",
@@ -2335,6 +2467,7 @@ pub async fn process_issue_worker_for_project(
             ProjectId::Linux => "sashiko:linux_bug".to_string(),
             ProjectId::Sashiko => "sashiko:sashiko_bug".to_string(),
             ProjectId::Gcc => "sashiko:gcc_bug".to_string(),
+            ProjectId::Qemu => "sashiko:qemu_bug".to_string(),
         }
     };
     let attributed_db =
@@ -3372,6 +3505,13 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 Output raw JSON only."
                     .to_string()
             }
+            ProjectId::Qemu => {
+                "You are an expert QEMU maintainer and system emulation engineer auditing whether a previously verified QEMU bug has been fixed on the upstream QEMU master branch.\n\
+                Do NOT give commits the benefit of the doubt: only mark a bug as \"fixed\" if you can point to a specific upstream commit that genuinely resolves the root cause of the defect or removes the vulnerable code path.\n\
+                If commits in the range only refactor, move lines, rename symbols, or modify unrelated functions while the defect remains triggerable, you MUST report \"still_present\".\n\
+                Output raw JSON only."
+                    .to_string()
+            }
         }
     }
 
@@ -3428,6 +3568,11 @@ impl LlmSession for VerifyUpstreamFixSession<'_> {
                 "Current Upstream Trunk SHA",
                 "Open GCC Bug",
                 "upstream GCC trunk",
+            ),
+            ProjectId::Qemu => (
+                "Current Upstream Master SHA",
+                "Open QEMU Bug",
+                "the upstream QEMU master branch",
             ),
         };
 
@@ -3690,6 +3835,7 @@ pub async fn check_bug_fixed_upstream_with_candidates(
         ProjectId::Linux => "sashiko:linux_bug:fix_check",
         ProjectId::Sashiko => "sashiko:sashiko_bug:fix_check",
         ProjectId::Gcc => "sashiko:gcc_bug:fix_check",
+        ProjectId::Qemu => "sashiko:qemu_bug:fix_check",
     };
 
     if candidates.is_empty() {
@@ -3851,6 +3997,54 @@ mod tests {
                 context_window_size: 8192,
             }
         }
+    }
+
+    #[test]
+    fn test_infer_project_from_bug_or_tool() {
+        // Explicit bugid/tool prefixes always win over a mismatched default.
+        for bugid in [None, Some("linux-1"), Some("other")] {
+            assert_eq!(
+                infer_project_from_bug_or_tool(
+                    bugid,
+                    Some("sashiko:sashiko_bug"),
+                    ProjectId::Linux
+                ),
+                ProjectId::Sashiko
+            );
+            assert_eq!(
+                infer_project_from_bug_or_tool(bugid, Some("sashiko:qemu_bug"), ProjectId::Linux),
+                ProjectId::Qemu
+            );
+        }
+        assert_eq!(
+            infer_project_from_bug_or_tool(Some("qemu-1"), None, ProjectId::Linux),
+            ProjectId::Qemu
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(
+                Some("linux-1"),
+                Some("sashiko:linux_bug"),
+                ProjectId::Sashiko
+            ),
+            ProjectId::Sashiko
+        );
+        // The instance's own project wins when the hints say nothing.
+        assert_eq!(
+            infer_project_from_bug_or_tool(None, None, ProjectId::Sashiko),
+            ProjectId::Sashiko
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(None, None, ProjectId::Qemu),
+            ProjectId::Qemu
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(Some("other"), Some("web"), ProjectId::Qemu),
+            ProjectId::Qemu
+        );
+        assert_eq!(
+            infer_project_from_bug_or_tool(None, None, ProjectId::Linux),
+            ProjectId::Linux
+        );
     }
 
     #[tokio::test]

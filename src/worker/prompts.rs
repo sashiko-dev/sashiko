@@ -60,6 +60,9 @@ use crate::workflows::gcc_patch_review::{
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, build_linux_patch_review_workflow_with_effort, linux_system_prompt,
 };
+use crate::workflows::qemu_patch_review::{
+    build_qemu_patch_review_workflow_with_effort, qemu_system_prompt,
+};
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_effort, sashiko_system_prompt,
 };
@@ -412,7 +415,7 @@ impl Worker {
         };
 
         let follow_up_series_context = match self.project {
-            ProjectId::Linux | ProjectId::Gcc => build_follow_up_series_context(
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu => build_follow_up_series_context(
                 self.series_range.as_deref(),
                 &patchset,
                 &target_commit_sha,
@@ -482,6 +485,7 @@ impl Worker {
                 ProjectId::Linux => linux_system_prompt(true),
                 ProjectId::Sashiko => sashiko_system_prompt(true),
                 ProjectId::Gcc => gcc_system_prompt(true),
+                ProjectId::Qemu => qemu_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
@@ -506,6 +510,11 @@ impl Worker {
                 self.effort,
             ),
             ProjectId::Gcc => build_gcc_patch_review_workflow_with_effort(
+                self.max_interactions,
+                self.temperature,
+                self.effort,
+            ),
+            ProjectId::Qemu => build_qemu_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,

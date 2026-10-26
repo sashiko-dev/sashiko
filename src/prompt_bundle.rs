@@ -72,12 +72,22 @@ pub fn gcc_severity_guide() -> &'static str {
         .expect("gcc/severity.md must exist in prompt bundle")
 }
 
+/// Returns the compiled-in content of `qemu/severity.md`.
+pub fn qemu_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "qemu/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("qemu/severity.md must exist in prompt bundle")
+}
+
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
         ProjectId::Linux => kernel_severity_guide(),
         ProjectId::Sashiko => sashiko_severity_guide(),
         ProjectId::Gcc => gcc_severity_guide(),
+        ProjectId::Qemu => qemu_severity_guide(),
     }
 }
 
@@ -251,6 +261,23 @@ mod tests {
             assert!(
                 PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
                 "missing GCC framing file in bundle: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_qemu_prompt_bundle_integrity() {
+        let required_framing = [
+            "qemu/review-core.md",
+            "qemu/severity.md",
+            "qemu/false-positive-guide.md",
+            "qemu/report-template.md",
+            "qemu/maintainers/general.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing QEMU framing file in bundle: {path}"
             );
         }
     }

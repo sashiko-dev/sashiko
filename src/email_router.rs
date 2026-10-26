@@ -20,6 +20,8 @@ pub const KNOWN_MAILING_LIST_DOMAINS: &[&str] = &[
     "lists.01.org",
     "lists.xenproject.org",
     "lists.ozlabs.org",
+    "nongnu.org",
+    "lists.nongnu.org",
 ];
 
 /// Known public mailing-list addresses hosted on shared project domains (such as

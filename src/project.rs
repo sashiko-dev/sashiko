@@ -40,6 +40,7 @@ pub enum ProjectId {
     Linux,
     Sashiko,
     Gcc,
+    Qemu,
 }
 
 impl ProjectId {
@@ -50,6 +51,7 @@ impl ProjectId {
             ProjectId::Linux => "linux",
             ProjectId::Sashiko => "sashiko",
             ProjectId::Gcc => "gcc",
+            ProjectId::Qemu => "qemu",
         }
     }
 
@@ -59,6 +61,7 @@ impl ProjectId {
             ProjectId::Linux => "Linux",
             ProjectId::Sashiko => "Sashiko",
             ProjectId::Gcc => "GCC",
+            ProjectId::Qemu => "QEMU",
         }
     }
 
@@ -76,6 +79,7 @@ impl ProjectId {
             ProjectId::Linux => "kernel",
             ProjectId::Sashiko => "sashiko",
             ProjectId::Gcc => "gcc",
+            ProjectId::Qemu => "qemu",
         }
     }
 
@@ -86,7 +90,7 @@ impl ProjectId {
     pub fn uses_maintainers(self) -> bool {
         match self {
             ProjectId::Linux => true,
-            ProjectId::Sashiko | ProjectId::Gcc => false,
+            ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => false,
         }
     }
 
@@ -97,6 +101,7 @@ impl ProjectId {
             ProjectId::Linux => "projects/linux/mailing_lists.toml",
             ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
             ProjectId::Gcc => "projects/gcc/mailing_lists.toml",
+            ProjectId::Qemu => "projects/qemu/mailing_lists.toml",
         }
     }
 
@@ -119,6 +124,10 @@ impl ProjectId {
             ProjectId::Gcc => Upstream {
                 url: "git://gcc.gnu.org/git/gcc.git",
                 seed: Seed::Mirror("https://github.com/gnutools/gcc.git"),
+            },
+            ProjectId::Qemu => Upstream {
+                url: "https://gitlab.com/qemu-project/qemu.git",
+                seed: Seed::None,
             },
         }
     }
@@ -164,6 +173,7 @@ impl FromStr for ProjectId {
             "linux" => Ok(ProjectId::Linux),
             "sashiko" => Ok(ProjectId::Sashiko),
             "gcc" => Ok(ProjectId::Gcc),
+            "qemu" => Ok(ProjectId::Qemu),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -197,7 +207,12 @@ impl ProjectId {
     /// Every project, for error messages and for tests that must cover them
     /// all. Adding a variant without adding it here fails the exhaustiveness
     /// test below.
-    pub const ALL: &'static [ProjectId] = &[ProjectId::Linux, ProjectId::Sashiko, ProjectId::Gcc];
+    pub const ALL: &'static [ProjectId] = &[
+        ProjectId::Linux,
+        ProjectId::Sashiko,
+        ProjectId::Gcc,
+        ProjectId::Qemu,
+    ];
 }
 
 #[cfg(test)]
@@ -228,10 +243,10 @@ mod tests {
         // checked against a match the compiler forces to stay exhaustive.
         for project in ProjectId::ALL {
             match project {
-                ProjectId::Linux | ProjectId::Sashiko | ProjectId::Gcc => {}
+                ProjectId::Linux | ProjectId::Sashiko | ProjectId::Gcc | ProjectId::Qemu => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 3);
+        assert_eq!(ProjectId::ALL.len(), 4);
     }
 
     #[test]
@@ -247,6 +262,7 @@ mod tests {
         assert_eq!(ProjectId::Linux.display_name(), "Linux");
         assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
         assert_eq!(ProjectId::Gcc.display_name(), "GCC");
+        assert_eq!(ProjectId::Qemu.display_name(), "QEMU");
     }
 
     #[test]
@@ -275,6 +291,7 @@ mod tests {
     fn test_parsing_is_forgiving_about_case_and_padding() {
         assert_eq!(ProjectId::from_str("Linux"), Ok(ProjectId::Linux));
         assert_eq!(ProjectId::from_str("  SASHIKO "), Ok(ProjectId::Sashiko));
+        assert_eq!(ProjectId::from_str("QEMU"), Ok(ProjectId::Qemu));
     }
 
     #[test]
@@ -302,6 +319,7 @@ mod tests {
         // "simplification" to as_str() from silently pointing at nothing.
         assert_eq!(ProjectId::Linux.prompt_dir(), "kernel");
         assert_eq!(ProjectId::Sashiko.prompt_dir(), "sashiko");
+        assert_eq!(ProjectId::Qemu.prompt_dir(), "qemu");
     }
 
     #[test]

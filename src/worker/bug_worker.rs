@@ -127,6 +127,7 @@ impl BugWorker {
             crate::project::ProjectId::Linux => "sashiko:linux_bug",
             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
             crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
+            crate::project::ProjectId::Qemu => "sashiko:qemu_bug",
         };
         self.db = Arc::new(self.db.with_bug_actor("system", bug_tool, None));
         self
@@ -235,6 +236,7 @@ impl BugWorker {
             let mut untouched_linux = Vec::new();
             let mut untouched_sashiko = Vec::new();
             let mut untouched_gcc = Vec::new();
+            let mut untouched_qemu = Vec::new();
             let mut skipped_ids = Vec::new();
 
             for bug in chunk {
@@ -257,6 +259,7 @@ impl BugWorker {
                             crate::project::ProjectId::Linux => untouched_linux.push(bug),
                             crate::project::ProjectId::Sashiko => untouched_sashiko.push(bug),
                             crate::project::ProjectId::Gcc => untouched_gcc.push(bug),
+                            crate::project::ProjectId::Qemu => untouched_qemu.push(bug),
                         }
                     }
                     FixCheckClassification::NeedsLlm(candidates) => {
@@ -271,6 +274,7 @@ impl BugWorker {
                     &untouched_linux,
                     &untouched_sashiko,
                     &untouched_gcc,
+                    &untouched_qemu,
                     &skipped_ids,
                 )
                 .await;
@@ -410,6 +414,7 @@ impl BugWorker {
         untouched_linux: &[crate::db::Bug],
         untouched_sashiko: &[crate::db::Bug],
         untouched_gcc: &[crate::db::Bug],
+        untouched_qemu: &[crate::db::Bug],
         skipped_ids: &[i64],
     ) -> usize {
         let mut advanced = 0usize;
@@ -447,6 +452,18 @@ impl BugWorker {
             {
                 Ok(n) => advanced += n,
                 Err(e) => warn!("Failed to batch-advance untouched GCC bugs: {}", e),
+            }
+        }
+        if !untouched_qemu.is_empty() {
+            let db = self
+                .db
+                .with_bug_actor("sashiko", "sashiko:qemu_bug:fix_check", None);
+            match db
+                .advance_open_bugs_without_llm_batch(untouched_qemu, mainline_sha)
+                .await
+            {
+                Ok(n) => advanced += n,
+                Err(e) => warn!("Failed to batch-advance untouched QEMU bugs: {}", e),
             }
         }
         if !skipped_ids.is_empty()
@@ -647,6 +664,7 @@ impl BugWorker {
                             crate::project::ProjectId::Linux => "sashiko:linux_bug",
                             crate::project::ProjectId::Sashiko => "sashiko:sashiko_bug",
                             crate::project::ProjectId::Gcc => "sashiko:gcc_bug",
+                            crate::project::ProjectId::Qemu => "sashiko:qemu_bug",
                         };
                         let actor = if !bug.reporter.is_empty() {
                             bug.reporter.as_str()

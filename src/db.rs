@@ -3798,9 +3798,9 @@ impl Database {
                       ) AS model,
                       COALESCE(
                           NULLIF(NULLIF(trim(e.tool), ''), 'sashiko'),
-                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = f.id LIMIT 1),
-                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = f.id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1),
                           NULLIF(trim(e.tool), '')
                       ) AS tool
                FROM family f
@@ -3854,9 +3854,9 @@ impl Database {
                         (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
                     ) AS model,
                     COALESCE(
-                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.id LIMIT 1),
-                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.id LIMIT 1),
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
                     ) AS tool
                  FROM bugs b WHERE b.id = ?1",
                 libsql::params![bug_id, self.bug_tool.as_str()],
@@ -4395,7 +4395,7 @@ impl Database {
                         attempt_count = attempt_count + 1,
                         updated_at = ?3,
                         audit_author = 'system',
-                        audit_tool = CASE WHEN ?5 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?5 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' ELSE 'sashiko:linux_bug' END,
+                        audit_tool = CASE WHEN ?5 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?5 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' WHEN ?5 LIKE 'sashiko:qemu%' OR bugid LIKE 'qemu-%' OR audit_tool LIKE 'sashiko:qemu%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE id = (
                       SELECT id FROM bugs
@@ -4483,7 +4483,7 @@ impl Database {
                         lease_expires_at = NULL,
                         updated_at = ?1,
                         audit_author = 'system',
-                        audit_tool = CASE WHEN ?3 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?3 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' ELSE 'sashiko:linux_bug' END,
+                        audit_tool = CASE WHEN ?3 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?3 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' WHEN ?3 LIKE 'sashiko:qemu%' OR bugid LIKE 'qemu-%' OR audit_tool LIKE 'sashiko:qemu%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE attempt_count >= ?2
                     AND (pipeline_state IN ('pending', 'failed')
@@ -4525,7 +4525,7 @@ impl Database {
                         lease_expires_at = NULL,
                         updated_at = ?1,
                         audit_author = 'system',
-                        audit_tool = CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?2 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' ELSE 'sashiko:linux_bug' END,
+                        audit_tool = CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?2 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' WHEN ?2 LIKE 'sashiko:qemu%' OR bugid LIKE 'qemu-%' OR audit_tool LIKE 'sashiko:qemu%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE pipeline_state = 'running'
                     AND (lease_expires_at IS NULL OR lease_expires_at < ?1)",
@@ -15155,6 +15155,67 @@ mod tests {
             .await?;
         let gcc_audit: String = gcc_rows.next().await?.unwrap().get(0)?;
         assert_eq!(gcc_audit, "sashiko:gcc_bug");
+
+        // Verify a qemu-* bug gets sashiko:qemu_patch_review and
+        // sashiko:qemu_bug attribution.
+        let qemu_bug = NewBug {
+            bugid: "qemu-fallback-test".to_string(),
+            title: "QEMU fallback test".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 4000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_path_prefix("hw/net")],
+        };
+        let qemu_bug_id = db
+            .create_bug_with_enrichment(
+                &qemu_bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: String::new(),
+                    model: None,
+                    created_at: 4000,
+                    content: Some("qemu candidate".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, qemu_bug_id, true).await?;
+
+        let qemu_summaries = db.bug_discovery_summaries(&[qemu_bug_id]).await?;
+        assert_eq!(
+            qemu_summaries[&qemu_bug_id]["tools"],
+            json!(["sashiko:qemu_patch_review"])
+        );
+        let qemu_resolved = db.resolve_bug_model_and_tool(qemu_bug_id).await?;
+        assert_eq!(
+            qemu_resolved,
+            Some((
+                Some("sashiko-model".to_string()),
+                Some("sashiko:qemu_patch_review".to_string()),
+            ))
+        );
+        let claimed_qemu = db
+            .claim_pending_bug("worker-1", 60, 2)
+            .await?
+            .expect("expected pending qemu bug to be claimed");
+        assert_eq!(claimed_qemu.id, qemu_bug_id);
+        let mut qemu_rows = db
+            .conn
+            .query(
+                "SELECT audit_tool FROM bugs WHERE id = ?",
+                libsql::params![qemu_bug_id],
+            )
+            .await?;
+        let qemu_audit: String = qemu_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(qemu_audit, "sashiko:qemu_bug");
 
         Ok(())
     }

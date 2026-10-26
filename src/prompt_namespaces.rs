@@ -25,5 +25,9 @@
 /// under `linux/`, where nothing reads them. A `projects/` directory missing
 /// here is bundled under its own name. A test in `project.rs` keeps this
 /// table in step with `ProjectId::prompt_dir()`.
-pub const PROJECT_PROMPT_NAMESPACES: &[(&str, &str)] =
-    &[("linux", "kernel"), ("sashiko", "sashiko"), ("gcc", "gcc")];
+pub const PROJECT_PROMPT_NAMESPACES: &[(&str, &str)] = &[
+    ("linux", "kernel"),
+    ("sashiko", "sashiko"),
+    ("gcc", "gcc"),
+    ("qemu", "qemu"),
+];
