@@ -1,7 +1,7 @@
 # Sashiko Development and CI Tasks
 
 .PHONY: help build fmt lint lint-local lint-local-cache test clean
-.PHONY: check-pr check-all sob check-db-invariants
+.PHONY: check-pr check-all sob check-db-invariants repo
 
 # Default target
 .DEFAULT_GOAL := help
@@ -26,6 +26,7 @@ help:
 	@echo ""
 	@echo "  Utilities:"
 	@echo "    sob                 - Check Signed-off-by tags (RANGE=HEAD~1..HEAD)"
+	@echo "    repo                - Clone or update the reviewed tree (PROJECT=linux)"
 
 # ── Development ──────────────────────────────────────────
 
@@ -98,6 +99,11 @@ check-all: sob lint lint-local lint-local-cache test check-db-invariants
 # Check Signed-off-by tags (default: HEAD~1..HEAD)
 sob:
 	@./scripts/check-sob.sh "$(RANGE)"
+
+# Clone or update the upstream tree a project reviews (default: linux)
+PROJECT ?= linux
+repo:
+	@./scripts/setup-repo.sh "$(PROJECT)"
 
 # Run lightweight database invariant checks
 check-db-invariants:
