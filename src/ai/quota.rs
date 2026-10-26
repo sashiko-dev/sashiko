@@ -67,7 +67,9 @@ impl QuotaManager {
 
     pub async fn report_success(&self) {
         let mut guard = self.blocked_until.lock().await;
-        if guard.is_some() {
+        // An older request can succeed while another call's quota window
+        // is still active. Its success must not admit new requests early.
+        if guard.is_some_and(|until| until <= Instant::now()) {
             *guard = None;
             info!("AI request succeeded, resetting quota backoff.");
         }
@@ -90,5 +92,38 @@ impl QuotaManager {
             "Quota exhausted! Blocking all LLM requests for {:.2}s",
             retry_after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn success_preserves_active_quota_cooldown() {
+        let quota = QuotaManager::new();
+        quota.report_quota_error(Duration::from_secs(60)).await;
+        quota.report_success().await;
+
+        let wait = quota.wait_for_access();
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+    }
+
+    #[tokio::test]
+    async fn success_leaves_access_open_without_an_active_cooldown() {
+        for deadline in [None, Some(Instant::now() - Duration::from_secs(1))] {
+            let quota = QuotaManager::new();
+            *quota.blocked_until.lock().await = deadline;
+            quota.report_success().await;
+
+            assert!(quota.blocked_until.lock().await.is_none());
+            let wait = quota.wait_for_access();
+            tokio::pin!(wait);
+            assert_eq!(
+                futures::poll!(wait.as_mut()),
+                std::task::Poll::Ready(Duration::ZERO)
+            );
+        }
     }
 }

@@ -379,9 +379,9 @@ any call blocks every concurrent call until the window expires.
   `d51623027d93` — "the quota system blindly trusts whatever duration
   comes from the remote") and only *extends* an existing block, never
   shortens it.
-- `report_success` clears `blocked_until` (`909e03e1962f` — without it
-  the whole pool stayed blocked after the provider recovered). A diff
-  that adds a success path bypassing `report_success` reintroduces that.
+- `report_success` clears an elapsed `blocked_until` deadline. A request
+  already in flight when another call receives a 429 can still succeed;
+  that older success must not release the active account-wide window.
 
 `BackoffProvider` treats the two retryable classes differently, and this
 distinction is the point of the file:

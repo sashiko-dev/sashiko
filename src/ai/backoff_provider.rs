@@ -322,6 +322,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn success_preserves_another_requests_quota_cooldown() {
+        struct InFlightProvider {
+            release_a: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+            requests: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl AiProvider for InFlightProvider {
+            async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+                let name = request.context_tag.unwrap();
+                self.requests.lock().unwrap().push(name.clone());
+                match name.as_str() {
+                    "A" => {
+                        let release = self.release_a.lock().await.take().unwrap();
+                        release.await.unwrap();
+                    }
+                    "B" => return Err(GeminiError::QuotaExceeded(Duration::from_secs(60)).into()),
+                    "C" => {}
+                    _ => panic!("unexpected request {name}"),
+                }
+                // C completes immediately if dispatched. A pending C therefore
+                // proves it is waiting at the quota gate, not inside this fake.
+                Ok(AiResponse {
+                    content: Some(name),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "in-flight-mock".into(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let (release_a, wait_a) = tokio::sync::oneshot::channel();
+        let inner = Arc::new(InFlightProvider {
+            release_a: tokio::sync::Mutex::new(Some(wait_a)),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider = BackoffProvider::new(inner.clone(), Arc::new(QuotaManager::new()), None);
+        let request = |name: &str| AiRequest {
+            context_tag: Some(name.to_string()),
+            ..dummy_request()
+        };
+        let a = provider.generate_content(request("A"));
+        let b = provider.generate_content(request("B"));
+        tokio::pin!(a, b);
+
+        assert!(futures::poll!(a.as_mut()).is_pending());
+        assert!(futures::poll!(b.as_mut()).is_pending());
+        assert_eq!(*inner.requests.lock().unwrap(), vec!["A", "B"]);
+
+        release_a.send(()).unwrap();
+        assert_eq!(a.await.unwrap().content.as_deref(), Some("A"));
+
+        let c = provider.generate_content(request("C"));
+        tokio::pin!(c);
+        assert!(futures::poll!(c.as_mut()).is_pending());
+        assert_eq!(*inner.requests.lock().unwrap(), vec!["A", "B"]);
+    }
+
+    #[tokio::test]
     async fn transient_backs_off_then_succeeds() {
         let m = mock(Behaviour::Transient, 3, Duration::ZERO);
         let resp = fast(m.clone())
