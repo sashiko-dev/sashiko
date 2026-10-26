@@ -15,46 +15,6 @@ sent that should not have been, review output that is wrong or silently empty,
 secrets escaping into logs or prompts, a database that loses work, and model
 spend that runs away. Calibrate against `severity.md` accordingly.
 
-## Architecture map
-
-Ingestion, in the order a change travels:
-
-| Module | Responsibility |
-|---|---|
-| `src/ingestor.rs` | Mailing-list ingestion: lore mirroring and NNTP |
-| `src/nntp.rs` | NNTP protocol |
-| `src/fetcher.rs` | Git-based ingestion: fetches a `base..head` range and emits one event per commit |
-| `src/forge.rs` | Webhook parsing and signature verification for GitHub and GitLab |
-| `src/patch.rs` | Patch parsing |
-| `src/api.rs` | HTTP API, including `/api/submit` and `/api/webhook/{provider}` |
-
-Review, the core loop:
-
-| Module | Responsibility |
-|---|---|
-| `src/reviewer.rs` | Daemon-side orchestration: picks work, prepares a worktree, spawns a worker subprocess, persists the result, queues notifications |
-| `src/local_review.rs` | The worker side and the `sashiko review` local path |
-| `src/worker/prompts.rs` | Builds the workflow state and runs the engine |
-| `src/workflow/` | The generic, project-agnostic stage engine |
-| `src/workflows/` | The actual pipelines, per project |
-| `src/notes/` | Maintainer notes (`maintainers/*.md`), code notes engine (`notes/`), and deterministic per-patch note selection |
-| `src/toolbox/` | The tools a stage can call: git grep, log, show, blame, read files, read prompt |
-| `src/ai/` | Provider abstraction, sessions, token budget, truncation, backoff, caching |
-| `src/baseline.rs` | Baseline commit detection |
-| `src/git_ops.rs` | Worktrees, clones, fetches, repository maintenance |
-
-Output and state:
-
-| Module | Responsibility |
-|---|---|
-| `src/db.rs` | All persistence |
-| `src/migrations/` | Schema migrations |
-| `src/email_policy.rs`, `src/email_router.rs` | Who gets told, and whether |
-| `src/worker/email.rs`, `src/worker/patchwork.rs` | Outbox delivery workers |
-| `src/settings.rs` | Configuration |
-| `src/auth.rs`, `src/access.rs` | Identity and capabilities |
-| `src/project.rs` | Which codebase this instance reviews |
-
 ## Core Priorities (Checked on Every Change)
 
 Every review must evaluate the change against this strict priority order:
@@ -94,7 +54,7 @@ authentication is a security boundary.
 Do not demand benchmark data, measurements, or manual test procedures for ordinary
 code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
 Sashiko's own self-review prompts (`projects/sashiko/prompts/`, `sashiko_patch_review.rs`),
-nor for subsystem maintainer notes (`projects/linux/prompts/maintainers/*.md`) that
+nor for subsystem maintainer notes (`projects/*/prompts/maintainers/*.md`) that
 record a subsystem's subjective coding preferences, conventions, or narrowly-scoped
 policies, nor for generated code-notes snapshots (`projects/*/prompts/notes/<set>/`),
 nor for post-triage maintenance tasks (such as periodic upstream fix checks on
@@ -117,7 +77,7 @@ ground-truth corpora of known positive bugs (`BenchmarkEntry` in
 `projects/*/benchmarks/`. Flag Linux review-quality changes that provide no
 validation evidence in the commit message or risk silent regressions in detection
 rate or precision (including over-broad suppression bullets or overly generic
-`paths`/`symbols` triggers in `projects/linux/prompts/maintainers/*.md`) as
+`paths`/`symbols` triggers in `projects/*/prompts/maintainers/*.md`) as
 **High** severity.
 
 **6. Zero Regressions and No Silent Failures.**
@@ -155,7 +115,7 @@ Every commit message must meet Sashiko's repository standards:
   repeating a complex diff. However, trivial or self-explanatory commits — such
   as adding a mailing list to track, configuring an email policy or subsystem
   git remote, adding or updating a subsystem's maintainer note in
-  `projects/linux/prompts/maintainers/*.md`, simple configuration/deployment
+  `projects/*/prompts/maintainers/*.md`, simple configuration/deployment
   updates, or typo fixes — are completely self-sufficient with a brief
   one-sentence description and must NOT be flagged for lacking additional
   rationale.
@@ -185,10 +145,11 @@ Evaluate every change for fundamental engineering soundness:
   operating systems. Never report Windows or non-Unix portability concerns (such as
   `tokio::signal::unix`, `rustix`, `/dev/ptmx`, `libc`, or POSIX signals/paths) as
   issues.
-- **Verify against concrete code, not assumptions.** Read the subsystem guide
-  for the area the diff touches and check every invariant. Do not give code the
-  benefit of the doubt: if a check is removed or weakened, verify the caller
-  with tools rather than assuming safety.
+- **Verify against concrete code, not assumptions.** Check the `<maintainer_notes>`
+  and `<code_notes>` for the area the diff touches and verify every invariant
+  against the repository source. Do not give code the benefit of the doubt: if a
+  check is removed or weakened, verify the caller with tools rather than
+  assuming safety.
 - **Never vibe-guess or report build, compilation, or linter bugs.** Whether
   Rust code compiles, type-checks, borrow-checks, and passes lints is verified
   deterministically (`cargo check`, `cargo test`, `cargo clippy`, `cargo fmt`).

@@ -185,7 +185,7 @@ mod tests {
             "sashiko/false-positive-guide.md",
             "sashiko/prompt-injection.md",
             "sashiko/github-summary-template.md",
-            "sashiko/subsystem/subsystem.md",
+            "sashiko/maintainers/general.md",
         ];
         for path in required_framing {
             assert!(
@@ -193,8 +193,6 @@ mod tests {
                 "missing framing file in bundle: {path}"
             );
         }
-
-        assert_index_guides_bundled("sashiko");
     }
 
     #[test]
@@ -212,57 +210,6 @@ mod tests {
             assert!(
                 PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
                 "missing file in bundle: {path}"
-            );
-        }
-    }
-
-    /// Asserts every guide named in `<project>/subsystem/subsystem.md` is in
-    /// the bundle, under subsystem/ or patterns/.
-    fn assert_index_guides_bundled(project: &str) {
-        let index_path = format!("{project}/subsystem/subsystem.md");
-        let subsystem_index = PROMPT_BUNDLE_FILES
-            .iter()
-            .find(|(p, _)| *p == index_path)
-            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
-            .unwrap_or_else(|| panic!("{index_path} must be valid UTF-8"));
-
-        let mut referenced_guides = Vec::new();
-        for line in subsystem_index.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('|') && trimmed.ends_with('|') {
-                let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
-                // Markdown table row: ["", "Component/Pattern", "Triggers", "File", ""]
-                if cols.len() >= 4 {
-                    let file_col = cols[cols.len() - 2];
-                    if file_col.ends_with(".md") && !file_col.contains(' ') {
-                        referenced_guides.push(file_col);
-                    }
-                }
-            } else if trimmed.starts_with('-')
-                && let Some(start) = trimmed.find('(')
-                && let Some(end) = trimmed[start + 1..].find(')')
-            {
-                let candidate = trimmed[start + 1..start + 1 + end].trim();
-                if candidate.ends_with(".md") && !candidate.contains(' ') {
-                    referenced_guides.push(candidate);
-                }
-            }
-        }
-
-        assert!(
-            !referenced_guides.is_empty(),
-            "should parse referenced guides from subsystem.md"
-        );
-
-        for guide in referenced_guides {
-            let in_subsystem = format!("{project}/subsystem/{guide}");
-            let in_patterns = format!("{project}/patterns/{guide}");
-            let found = PROMPT_BUNDLE_FILES
-                .iter()
-                .any(|(p, _)| *p == in_subsystem || *p == in_patterns);
-            assert!(
-                found,
-                "guide {guide} referenced in {index_path} not found in bundle under subsystem/ or patterns/"
             );
         }
     }

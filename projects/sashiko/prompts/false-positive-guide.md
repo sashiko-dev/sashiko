@@ -128,9 +128,9 @@ specific call site. Say why you believe the error can occur.
 ### 7. Prompt and instruction text
 
 Prompt wording is a legitimate review target — an ambiguous field name or a
-missing escape hatch in an enum is a real defect, and `llm-stages.md` explains
-why. But do not report stylistic preferences about prompt prose, and do not
-report that a prompt "could be clearer" without naming the specific
+missing escape hatch in an enum is a real defect, and `maintainers/workflows.md`
+explains why. But do not report stylistic preferences about prompt prose, and do
+not report that a prompt "could be clearer" without naming the specific
 misinterpretation it permits and what the model would do instead.
 
 ### 8. Pre-existing issues
@@ -168,7 +168,7 @@ Do not ask authors to add manual test procedures, validation logs, or benchmark
 numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits, nor
 for changes to Sashiko's own self-review prompts (`projects/sashiko/prompts/`,
 `sashiko_patch_review.rs`), nor for subsystem maintainer notes
-(`projects/linux/prompts/maintainers/*.md`) that record a subsystem's subjective
+(`projects/*/prompts/maintainers/*.md`) that record a subsystem's subjective
 coding preferences, conventions, or narrowly-scoped policies, nor for generated
 code-notes snapshots (`projects/*/prompts/notes/<set>/`), nor for post-triage
 maintenance tasks (such as periodic upstream fix checks on already-triaged open
@@ -189,8 +189,8 @@ quality across the board (`projects/linux/prompts/*.md`, `general.md`,
 parameters, or shared verification/deduplication logic) provides neither
 benchmark results nor targeted patch re-review validation in its commit message.
 (Note: over-broad suppression rules, volatile code facts hardcoded as policy, or
-overly generic `paths`/`symbols` triggers in `projects/linux/prompts/maintainers/*.md`
-*are* valid defects and should be flagged directly per `subsystem/notes.md`.)
+overly generic `paths`/`symbols` triggers in `projects/*/prompts/maintainers/*.md`
+*are* valid defects and should be flagged directly per `maintainers/notes.md`.)
 
 ### 12. Patch series false positive removal and design documents
 

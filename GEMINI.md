@@ -32,7 +32,7 @@ Use `make` to run common development tasks:
 ## 2. Self-Review (Sashiko for Sashiko)
 Sashiko reviews changes to its own repository using the `--project sashiko` profile in a two-stage development loop:
 - **Workflow & Prompts:** Defined by `src/workflows/sashiko_patch_review.rs` and first-party prompt guides under `projects/sashiko/prompts/` (distinct from the Linux review prompts in `projects/linux/prompts/`).
-- **Scope:** Audits Sashiko-specific invariants across subsystems (`projects/sashiko/prompts/subsystem/*.md`) and cross-cutting patterns (`projects/sashiko/prompts/patterns/*.md`), including UX, SQLite migrations and query scaling, email delivery safety, untrusted input boundaries, Tokio/async discipline, and commit message hygiene. Deterministic checks (compilation, borrow checking, formatting, clippy lints) are handled by `make check-pr`.
+- **Scope:** Audits Sashiko-specific invariants using review procedures (`projects/sashiko/prompts/*.md`), maintainer notes (`projects/sashiko/prompts/maintainers/*.md`), and source-verified code notes (`projects/sashiko/prompts/notes/`), including UX, SQLite migrations and query scaling, email delivery safety, untrusted input boundaries, Tokio/async discipline, and commit message hygiene. Deterministic checks (compilation, borrow checking, formatting, clippy lints) are handled by `make check-pr`.
 - **Stage 1 — Local Agentic Loop:** After `make check-pr` passes, run `sashiko review --project sashiko --agent <commit>` (or `cargo run --bin sashiko -- review --project sashiko --agent <commit>`) locally before opening or updating a PR so the review returns concise, machine-friendly JSON output without interactive prompts or redundant formatting stages. Fix any valid findings, amend or commit, and re-verify until both `make check-pr` and the local self-review pass cleanly.
 - **Stage 2 — Upstream GitHub PR Review:** When a PR is opened or updated on GitHub, the upstream Sashiko instance (`sashiko.sashiko.dev`) automatically reviews the PR and posts findings as PR comments (`sashiko-bot`; read them with `gh pr view <num> --json comments,reviews`). PR authors and agents are **required to act on every finding**:
   1. **Valid finding:** Fix the defect in code, re-run `make check-pr` and local self-review, push the updated branch, and reply on the PR confirming the resolution.
@@ -85,7 +85,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 
 ## Configuration, Prompts & Docs
 - `Settings.toml` & `projects/linux/mailing_lists.toml`: Main application and per-mailing-list tracking/delivery policy configuration.
-- `projects/sashiko/prompts/`: First-party review prompts, subsystem invariants, and pattern guides for reviewing Sashiko itself (`--project sashiko`).
+- `projects/sashiko/prompts/`: First-party review prompts for reviewing Sashiko itself (`--project sashiko`): review procedures (`*.md`), maintainer notes (`maintainers/`), and code notes (`notes/`).
 - `projects/linux/prompts/`: The Linux review prompts (bundled as `kernel/`): review procedures, maintainer notes (`maintainers/`) and code notes (`notes/`); its `README.md` describes the layout.
 - `static/`: Web UI assets (`static/index.html`, images).
 - `docs/`: User and operator documentation (`configuration.md`, `daemon.md`, `sashiko-cli.md`, `llm-providers.md`, `benchmarking.md`, forge setup guides).

@@ -25,11 +25,11 @@ use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
     StagePolicy, ToolScope, Workflow,
 };
-use crate::workflows::guard::{normalize_guide_name, normalize_stage_name, sanitize_guide_name};
+use crate::workflows::guard::{normalize_guide_name, normalize_stage_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PlanningOutput, PostVerificationOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER,
-    StageConcernsOutput, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
+    PlanningOutput, PostVerificationOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
+    VerificationOutput, append_stage_dismissed_concerns_with_prompts,
     append_stage_items_with_prompts, apply_planning_stage_output,
     apply_post_verification_stage_output, apply_verification_stage_output,
     batch_hard_cases_by_severity, build_stage_efforts_schema, collect_stage_prompts,
@@ -65,9 +65,9 @@ TOOL USAGE: When you need to gather information using tools, actively batch para
 If tool output is truncated ('truncated': true), page only if directly relevant to your active concerns.
 
 <global_review_guidelines>
-The following documents contain the official Sashiko architecture rules, component invariants, and cross-cutting Rust/async guidelines that you MUST adhere to during your review. Use these as the absolute source of truth for identifying anti-patterns and violations.
+The following documents and any accompanying <maintainer_notes> blocks contain the official Sashiko architecture rules, component policies, and cross-cutting Rust/async guidelines that you MUST adhere to during your review. Any accompanying <code_notes> blocks provide reference background notes generated from a fixed codebase snapshot to help you understand surrounding component contracts, callers, and known invariants. However, <code_notes> are NOT a source of truth for the patch under review—that snapshot may be stale or may already incorporate the target commit's own buggy code. The repository source code at Target Commit SHA (and Baseline SHA) is always authoritative: actively check modified functions, structs, locks, lifecycle transitions, and API calls against the invariants described in <maintainer_notes> and <code_notes>, but NEVER use a <code_notes> entry to justify, excuse, or dismiss a suspected defect in the patch under review.
 @includes
-</global_review_guidelines>{{{{code_notes}}}}
+</global_review_guidelines>{{{{maintainer_notes}}}}{{{{code_notes}}}}
 
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
@@ -85,6 +85,9 @@ Target Commit:
         s.baseline_sha.clone()
     })
     .with_var("code_notes", |s: &SashikoPatchReviewState| s.code_notes.clone())
+    .with_var("maintainer_notes", |s: &SashikoPatchReviewState| {
+        s.maintainer_notes.clone()
+    })
     .with_var("target_commit_diff", |s: &SashikoPatchReviewState| {
         s.target_commit_diff.clone()
     })
@@ -141,8 +144,8 @@ You are a principal engineer evaluating the high-level intent, architectural sou
   2. No Unrelated Changes (Single Responsibility): Does the commit contain unrelated changes, drive-by edits, or mixed concerns? It must NOT — each commit must implement one consistent, self-sufficient change. Flag commits that bundle unrelated changes that should be split into separate commits.
   3. Problem Validity & Worth: Is the problem real and worth solving? Flag over-engineered solutions to hypothetical or non-existent problems, or changes whose complexity outweighs their benefit.
   4. Solution Optimality & Alternatives: Is the chosen solution the best engineering approach, or are there obviously simpler, safer, or more idiomatic alternatives? If a clearly superior alternative exists, raise a concern explaining why.
-- Benchmark Backing for Linux Review-Quality Changes (HIGH Severity): Do NOT demand benchmark data, measurements, or manual test procedures in commit messages for ordinary code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to Sashiko's own self-review prompts (`projects/sashiko/prompts/`, `sashiko_patch_review.rs`), nor for subsystem maintainer notes (`projects/linux/prompts/maintainers/*.md`) that record subjective subsystem coding preferences, conventions, or narrowly-scoped policies, nor for generated code-notes snapshots (`projects/*/prompts/notes/<set>/`), nor for structural lineage/provenance ID bookkeeping (`source_ids`, `review_map`) or telemetry plumbing that preserves bug-detection heuristics, nor for post-triage maintenance tasks (such as periodic upstream fix checks on already-triaged open bugs) or filtering pre-existing issues out of patch review reports that are not exercised by the patch-review or initial bug-discovery benchmark suites (`projects/*/benchmarks/`). Furthermore, NEVER report that a prompt or workflow commit failed to modify or add files in `projects/*/benchmarks/` (`projects/*/benchmarks/*.json` are static ground-truth corpora of known positive bugs and do not store negative/false-positive test cases). However, if a change can meaningfully affect overall Linux AI patch-review or initial bug-discovery quality across the board (such as global procedure guides `projects/linux/prompts/*.md` or `general.md`, `linux_patch_review.rs` bug-detection or classification heuristics, `linux_bug.rs` discovery/verification/deduplication stages, generic workflow graph structure, model parameters, or shared verification/deduplication rules), its commit message MUST include validation evidence (either benchmark evaluation results or, for targeted false-positive prompt refinements, local re-review results on the affected Linux patches/series). Only if such a Linux review-quality change provides neither benchmark results nor targeted patch re-review results in the commit message, flag it as a High severity issue.
-- Maintainer Notes Audit (`projects/*/prompts/maintainers/*.md`): When a commit adds or modifies a maintainer note, verify that (a) its `paths` and `symbols` front-matter triggers are scoped specifically to that subsystem (never using `"*"` outside `general.md` or generic C tokens/prefixes like `"dev*"`, `"err"`, `"lock*"` that match unrelated patches), (b) its bullets state human maintainer policies/preferences rather than hardcoding volatile C/Rust implementation facts that belong in generated code notes, and (c) any "do not report / ignore" rule is narrowly scoped to the benign pattern so it does not blanket-suppress real kernel bugs (such as `CONFIG_*`-gated conditional-compilation errors, races, or resource leaks).
+- Benchmark Backing for Linux Review-Quality Changes (HIGH Severity): Do NOT demand benchmark data, measurements, or manual test procedures in commit messages for ordinary code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to Sashiko's own self-review prompts (`projects/sashiko/prompts/`, `sashiko_patch_review.rs`), nor for subsystem maintainer notes (`projects/*/prompts/maintainers/*.md`) that record subjective subsystem coding preferences, conventions, or narrowly-scoped policies, nor for generated code-notes snapshots (`projects/*/prompts/notes/<set>/`), nor for structural lineage/provenance ID bookkeeping (`source_ids`, `review_map`) or telemetry plumbing that preserves bug-detection heuristics, nor for post-triage maintenance tasks (such as periodic upstream fix checks on already-triaged open bugs) or filtering pre-existing issues out of patch review reports that are not exercised by the patch-review or initial bug-discovery benchmark suites (`projects/*/benchmarks/`). Furthermore, NEVER report that a prompt or workflow commit failed to modify or add files in `projects/*/benchmarks/` (`projects/*/benchmarks/*.json` are static ground-truth corpora of known positive bugs and do not store negative/false-positive test cases). However, if a change can meaningfully affect overall Linux AI patch-review or initial bug-discovery quality across the board (such as global procedure guides `projects/linux/prompts/*.md` or `general.md`, `linux_patch_review.rs` bug-detection or classification heuristics, `linux_bug.rs` discovery/verification/deduplication stages, generic workflow graph structure, model parameters, or shared verification/deduplication rules), its commit message MUST include validation evidence (either benchmark evaluation results or, for targeted false-positive prompt refinements, local re-review results on the affected Linux patches/series). Only if such a Linux review-quality change provides neither benchmark results nor targeted patch re-review results in the commit message, flag it as a High severity issue.
+- Maintainer Notes Audit (`projects/*/prompts/maintainers/*.md`): When a commit adds or modifies a maintainer note, verify that (a) its `paths` and `symbols` front-matter triggers are scoped specifically to that subsystem (never using `"*"` outside `general.md` or generic C tokens/prefixes like `"dev*"`, `"err"`, `"lock*"` that match unrelated patches), (b) its bullets state human maintainer policies/preferences rather than hardcoding volatile C/Rust implementation facts that belong in generated code notes, and (c) any "do not report / ignore" rule is narrowly scoped to the benign pattern so it does not blanket-suppress real bugs (such as `CONFIG_*`-gated conditional-compilation errors, races, or resource leaks).
 - Unix-Only Target Environment: Sashiko exclusively targets Linux/Unix environments. NEVER report non-Unix or Windows compilation/portability issues (such as `tokio::signal::unix`, `rustix`, `/dev/ptmx`, `libc`, or POSIX signals/paths) as concerns.
 - Never Vibe-Guess Build or Compilation Bugs: Build verification (`cargo check`, `cargo test`, `cargo clippy`) is deterministic. NEVER report alleged build failures, syntax errors, missing imports (`use`), unresolved symbols/types/methods/macros, type mismatches, missing trait bounds, borrow-checker/lifetime errors, or Cargo build issues.
 - Global UX & Regressions: If the change can affect the user experience globally (CLI ergonomics, review output clarity/false-positive rate, progress display, or web UI/API behavior), apply maximum scrutiny and reject regressions.
@@ -150,7 +153,7 @@ You are a principal engineer evaluating the high-level intent, architectural sou
 - Commit Message Audit (Mandatory): Inspect the commit message header, body, and trailers in the patch:
   1. Signed-off-by with Real Name & No LLM Attribution Trailers: Verify a `Signed-off-by: Real Name <email>` trailer is present and uses a real human name (first and last name), NOT a single-word handle, cryptic nickname, username, or AI/bot placeholder. Also verify that NO `Assisted-by:` trailer (e.g. `Assisted-by: LLM`) or AI/LLM attribution or co-authorship trailer (`Generated-by:`, `AI-assisted-by:`, or `Co-authored-by:` naming an LLM/bot) appears as a trailer on the commit: what tools were used does not matter, and the person signing off holds full responsibility and must never share or delegate that responsibility to an LLM.
   2. Fixes Trailer on Bug Fixes: When the commit repairs a defect introduced by an earlier commit already in repository history (prior to `Baseline SHA`), use `git_blame` or `git_log` to check whether the introducing commit can be identified with confidence; if so, flag a missing `Fixes: <12-char sha> ("<subject>")` trailer (placed in the trailer block immediately before `Signed-off-by:`). When a `Fixes:` commit trailer is present, verify with `git_show` that the SHA has at least 12 hex characters, resolves to an ancestor prior to `Baseline SHA` (never an unmerged commit in the same series), and matches the commit's exact subject (`Fixes: <project>-<uuid>` is also valid for tracked Sashiko bugs). Do NOT demand `Fixes:` on new features, refactorings, prompt/documentation/config updates, or when no specific introducing commit can be identified with confidence.
-  3. Substantive Description (When Non-Trivial): For non-trivial code, architectural, or behavior changes, verify the commit body clearly explains both *what* changed and *why* it is needed (rationale/motivation). Flag missing bodies on non-trivial commits or descriptions that merely parrot a complex diff without explaining why. However, for trivial or self-explanatory commits — such as adding a mailing list to track, adding a subsystem email policy or git remote, adding or updating a subsystem's maintainer note in `projects/linux/prompts/maintainers/*.md`, simple configuration/deployment updates, or typo/comment fixes — a brief one-sentence description is completely self-sufficient; do NOT demand additional rationale explaining why a mailing list, subsystem note, or config entry is being added.
+  3. Substantive Description (When Non-Trivial): For non-trivial code, architectural, or behavior changes, verify the commit body clearly explains both *what* changed and *why* it is needed (rationale/motivation). Flag missing bodies on non-trivial commits or descriptions that merely parrot a complex diff without explaining why. However, for trivial or self-explanatory commits — such as adding a mailing list to track, adding a subsystem email policy or git remote, adding or updating a subsystem's maintainer note in `projects/*/prompts/maintainers/*.md`, simple configuration/deployment updates, or typo/comment fixes — a brief one-sentence description is completely self-sufficient; do NOT demand additional rationale explaining why a mailing list, subsystem note, or config entry is being added.
   4. Commit Message Formatting: Flag backticks (`) used to quote code/functions/variables/filenames in the commit message or internal metadata tags (such as `TAG=` or `CONV=`). For line length, do NOT nitpick minor overruns (e.g. 73-80 characters) and allow reasonable exceptions (such as quoting code, compiler/log output, URLs, or file paths); only flag genuinely unwrapped prose lines that exceed ~85 characters."#;
 
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# Verify implementation against intent
@@ -291,7 +294,7 @@ const STAGE_POST_VERIFICATION_INSTRUCTION: &str = r#"# Per-finding post-verifica
 You are the lead reviewer performing deep, tool-assisted codebase verification of a speculative or contested candidate issue (`hard_cases`) identified during initial verification.
 For each candidate in `hard_cases`, use the available Git and file tools (`git_read_files`, `git_grep`, `git_diff`, `git_show`, `git_blame`) to answer each candidate's `verification_question` and inspect the actual code in the worktree.
 1. Dismiss in `dismissed_concerns` any candidate that alleges a build, compilation, syntax, type-checking, borrow-checker, lifetime, missing-import, unresolved-symbol, missing-trait-bound, or linter error (carry forward the candidate's target `file`, `function_or_symbol`, and `code_snippet` in `locations`).
-2. Dismiss in `dismissed_concerns` any candidate claiming that a prompt or workflow commit failed to add or modify test cases in `projects/*/benchmarks/`, demanding benchmark runs for subsystem maintainer preference additions in `projects/linux/prompts/maintainers/*.md` or generated `projects/*/prompts/notes/` snapshots, claiming that local patch re-review results in the commit message are insufficient for targeted false-positive prompt refinements in `projects/linux/prompts/`, demanding additional commit-message rationale for trivial or self-explanatory commits (such as adding a mailing list to track, configuring an email policy or git remote, adding or updating a subsystem's maintainer note in `projects/linux/prompts/maintainers/*.md`, simple deployment/config updates, or typo fixes) where the intent is already clear, or demanding a `Fixes:` trailer on new features, refactorings, prompt/docs/config updates, commits where `git_blame`/`git_log` does not identify a specific bug-introducing commit prior to `Baseline SHA`, or referencing an unmerged commit within the same series (in `locations`, carry forward the candidate's target location or quote the relevant commit message / diff line with `"file"` and `"function_or_symbol"` set to the target path/symbol or `"commit_message"`).
+2. Dismiss in `dismissed_concerns` any candidate claiming that a prompt or workflow commit failed to add or modify test cases in `projects/*/benchmarks/`, demanding benchmark runs for subsystem maintainer preference additions in `projects/*/prompts/maintainers/*.md` or generated `projects/*/prompts/notes/` snapshots, claiming that local patch re-review results in the commit message are insufficient for targeted false-positive prompt refinements in `projects/linux/prompts/`, demanding additional commit-message rationale for trivial or self-explanatory commits (such as adding a mailing list to track, configuring an email policy or git remote, adding or updating a subsystem's maintainer note in `projects/*/prompts/maintainers/*.md`, simple deployment/config updates, or typo fixes) where the intent is already clear, or demanding a `Fixes:` trailer on new features, refactorings, prompt/docs/config updates, commits where `git_blame`/`git_log` does not identify a specific bug-introducing commit prior to `Baseline SHA`, or referencing an unmerged commit within the same series (in `locations`, carry forward the candidate's target location or quote the relevant commit message / diff line with `"file"` and `"function_or_symbol"` set to the target path/symbol or `"commit_message"`).
 3. **SYMMETRICAL PROOF BAR & ALL-CALLERS VERIFICATION:** For all other candidates, both `concern_arguments` and `dismissal_arguments` are untrusted hypotheses. Only dismiss a code-behavior candidate in `dismissed_concerns` if concrete, verifiable code in the repository proves the exact failure mechanism, branch, caller, and configuration cannot occur across ALL callers, entry points, and modes. Citing a single caller (such as only the CLI path or one HTTP handler) does NOT disprove a panic, race, missing validation, or state leak in a helper function unless `git_grep` across all callers (including CLI, daemon, worker, HTTP API, and webhook paths) proves every caller upholds the invariant. Do NOT give code the benefit of the doubt.
 4. **LOCAL BOUNDARY & ASYMMETRY RULE:** Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems or parallel execution will safely mask or prevent the issue, or by rationalizing an unpaired claim/cleanup call, swallowed error, or overwritten state as a "harmless no-op" or "intentional behavior", unless you can point to specific code in the repository that concretely proves the failure mode is structurally impossible.
 5. **PROMOTING SPECULATIVE DISMISSALS:** When `"signal_reason"` is `"speculative_dismissal"`, a previous analyst spotted the candidate bug described in `concern_arguments` and dismissed it using `dismissal_arguments`. Inspect the actual code with tools: if the dismissal's assumption is false or incomplete (for example: another caller does NOT uphold the invariant; the caller does NOT clean up the worktree or database state on error or cancellation; the cited lock or transaction does NOT serialize against concurrent access; an init/claim call lacks its matching cleanup/release call; or an unintended state mutation affects downstream consumers), you MUST report the bug as a verified finding in `findings`.
@@ -426,7 +429,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "execution-flow",
         short: "Execution Flow",
         instruction: STAGE_EXECUTION_FLOW_INSTRUCTION,
-        guides: &["patterns/error-handling.md"],
+        guides: &[],
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
@@ -435,7 +438,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "concurrency",
         short: "Concurrency & Async",
         instruction: STAGE_CONCURRENCY_INSTRUCTION,
-        guides: &["patterns/rust-async.md", "patterns/concurrency.md"],
+        guides: &[],
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
@@ -444,7 +447,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "persistence",
         short: "DB & Persistence",
         instruction: STAGE_PERSISTENCE_INSTRUCTION,
-        guides: &["subsystem/db-migrations.md"],
+        guides: &[],
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
@@ -453,11 +456,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "llm-pipeline",
         short: "LLM Pipeline",
         instruction: STAGE_LLM_PIPELINE_INSTRUCTION,
-        guides: &[
-            "subsystem/workflow-engine.md",
-            "subsystem/llm-stages.md",
-            "subsystem/ai-providers.md",
-        ],
+        guides: &[],
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
@@ -466,12 +465,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "security",
         short: "Security Audit",
         instruction: STAGE_SECURITY_INSTRUCTION,
-        guides: &[
-            "prompt-injection.md",
-            "subsystem/toolbox.md",
-            "subsystem/api-auth.md",
-            "subsystem/forge.md",
-        ],
+        guides: &["prompt-injection.md"],
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
@@ -480,7 +474,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         name: "interfaces-compat",
         short: "Interfaces & Compat",
         instruction: STAGE_INTERFACES_COMPAT_INSTRUCTION,
-        guides: &["subsystem/settings.md", "subsystem/email-policy.md"],
+        guides: &[],
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
@@ -824,58 +818,6 @@ fn format_summary_feedback(violation: &str) -> String {
 // ---------------------------------------------------------------------------
 // Stage Builders
 // ---------------------------------------------------------------------------
-
-pub fn prescreen_stage() -> Stage<SashikoPatchReviewState, PrescreenOutput> {
-    prescreen_stage_with_effort(0.0, None)
-}
-
-pub fn prescreen_stage_with_effort(
-    temperature: f32,
-    effort: Option<crate::ai::EffortMode>,
-) -> Stage<SashikoPatchReviewState, PrescreenOutput> {
-    Stage::builder("pre-screen")
-        .system_prompt(PromptTemplate::<SashikoPatchReviewState>::new(
-            "You are an AI assistant preparing a Sashiko codebase patch review.\nReview the provided Patch and select all potentially relevant component and pattern guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"workflow-engine.md\", \"rust-async.md\"]}\n```",
-        ))
-        .user_prompt(
-            PromptTemplate::<SashikoPatchReviewState>::new(
-                "<subsystem_guide_index>\n@include(\"subsystem/subsystem.md\")\n</subsystem_guide_index>\n\n<patch>\n{{target_commit_diff}}\n</patch>",
-            )
-            .with_var("target_commit_diff", |s: &SashikoPatchReviewState| {
-                s.target_commit_diff.clone()
-            })
-            .include_file("subsystem/subsystem.md"),
-        )
-        .output_format(OutputFormat::json_with_schema(json!({
-            "type": "object",
-            "properties": {
-                "selected_prompts": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                }
-            },
-            "required": ["selected_prompts"]
-        })))
-        .policy(StagePolicy {
-            tools: ToolScope::None,
-            max_turns: 1,
-            temperature,
-            reasoning_effort: effort.map(crate::ai::EffortMode::lightweight_stage_effort),
-            ..Default::default()
-        })
-        .skip_if(|s| s.manual_stages.is_some())
-        .reduce(|state, out: PrescreenOutput| {
-            let prompts: Vec<String> = out
-                .selected_prompts
-                .into_iter()
-                .map(|name| normalize_guide_name(&name).to_string())
-                .filter(|name| !is_stage_exclusive_guide(name))
-                .filter(|name| sanitize_guide_name(name))
-                .collect();
-            state.selected_guides = prompts;
-        })
-        .build()
-}
 
 pub fn validate_sashiko_planning_output_with_effort(
     out: &PlanningOutput,
@@ -1462,7 +1404,6 @@ pub fn build_sashiko_patch_review_workflow_with_effort(
     effort: Option<crate::ai::EffortMode>,
 ) -> Workflow<SashikoPatchReviewState> {
     Workflow::builder("sashiko_patch_review")
-        .stage(prescreen_stage_with_effort(temperature, effort))
         .dynamic_parallel(
             planning_stage_with_effort(temperature, effort),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
@@ -1494,8 +1435,7 @@ pub fn build_sashiko_cover_review_workflow_with_effort(
     effort: Option<crate::ai::EffortMode>,
 ) -> Workflow<SashikoPatchReviewState> {
     Workflow::builder("sashiko_cover_review")
-        .dynamic_parallel(
-            prescreen_stage_with_effort(temperature, effort),
+        .resolve_parallel(
             move |state| resolve_cover_analysis_stages_with_options(state, max_turns, temperature),
             ParallelPolicy::BestEffort,
         )
@@ -1655,19 +1595,28 @@ mod tests {
     fn test_build_sashiko_patch_review_workflow() {
         let wf = build_sashiko_patch_review_workflow();
         assert_eq!(wf.name, "sashiko_patch_review");
-        assert_eq!(wf.steps.len(), 5);
-        assert_eq!(
-            prescreen_stage_with_effort(1.0, None).policy.temperature,
-            1.0
-        );
+        assert_eq!(wf.steps.len(), 4);
         assert_eq!(
             planning_stage_with_effort(1.0, None).policy.temperature,
             1.0
         );
     }
 
+    #[test]
+    fn test_sashiko_maintainer_notes_render_before_code_notes() {
+        let rendered = sashiko_system_prompt(true).render_for_log(&SashikoPatchReviewState {
+            maintainer_notes: "\n\n<maintainer_notes>M</maintainer_notes>".to_string(),
+            code_notes: "\n\n<code_notes>C</code_notes>".to_string(),
+            ..Default::default()
+        });
+        let m = rendered.find("<maintainer_notes>M").unwrap();
+        let c = rendered.find("<code_notes>C").unwrap();
+        let guidelines = rendered.find("</global_review_guidelines>").unwrap();
+        assert!(guidelines < m && m < c);
+    }
+
     #[tokio::test]
-    async fn test_workflow_forwards_temperature_to_prescreen_and_planning() {
+    async fn test_workflow_forwards_temperature_to_planning() {
         struct RecordingProvider {
             temperatures: std::sync::Mutex<Vec<Option<f32>>>,
         }
@@ -1679,14 +1628,7 @@ mod tests {
                 request: crate::ai::AiRequest,
             ) -> anyhow::Result<crate::ai::AiResponse> {
                 self.temperatures.lock().unwrap().push(request.temperature);
-                let user_msg = request
-                    .messages
-                    .first()
-                    .and_then(|m| m.content.as_deref())
-                    .unwrap_or_default();
-                let body = if user_msg.contains("<subsystem_guide_index>") {
-                    r#"{"selected_prompts": []}"#
-                } else if request.response_format.is_some() {
+                let body = if request.response_format.is_some() {
                     r#"{"relevant_stages": []}"#
                 } else {
                     r#"{"concerns": [], "dismissed_concerns": []}"#
@@ -1733,11 +1675,11 @@ mod tests {
             .unwrap();
 
         let recorded = provider.temperatures.lock().unwrap().clone();
-        // pre-screen + planning + 3 core analysis stages (goal, implementation, execution-flow) + summary
-        assert_eq!(recorded.len(), 6);
+        // planning + 3 core analysis stages (goal, implementation, execution-flow) + summary
+        assert_eq!(recorded.len(), 5);
         assert!(
             recorded.iter().all(|&t| t == Some(1.0)),
-            "expected all stages including pre-screen and planning to receive temperature 1.0, got {recorded:?}"
+            "expected all stages including planning to receive temperature 1.0, got {recorded:?}"
         );
     }
 
@@ -1821,6 +1763,7 @@ mod tests {
         std::fs::create_dir_all(&prompts_dir).unwrap();
         std::fs::write(prompts_dir.join("false-positive-guide.md"), "").unwrap();
         std::fs::write(prompts_dir.join("severity.md"), "").unwrap();
+        std::fs::write(prompts_dir.join("prompt-injection.md"), "").unwrap();
 
         let provider = std::sync::Arc::new(MockVerificationProvider);
         let tools = std::sync::Arc::new(crate::toolbox::ToolBox::new(
@@ -1836,9 +1779,9 @@ mod tests {
 
         let mut state = SashikoPatchReviewState {
             all_concerns: vec![json!({
-                "stage": "persistence",
-                "stages": ["persistence"],
-                "prompts": ["subsystem/db-migrations.md"],
+                "stage": "security",
+                "stages": ["security"],
+                "prompts": ["prompt-injection.md"],
                 "description": "candidate"
             })],
             ..Default::default()
@@ -1846,7 +1789,7 @@ mod tests {
 
         let stage = verification_stage(1, 0.0);
         let rendered_ver_log = stage.user_prompt.render_for_log(&state);
-        assert!(rendered_ver_log.contains("@subsystem/db-migrations.md"));
+        assert!(rendered_ver_log.contains("@prompt-injection.md"));
         stage.execute(&env, &mut state, None).await.unwrap();
 
         assert_eq!(state.findings.len(), 1);
@@ -1854,24 +1797,18 @@ mod tests {
             state.findings[0]["problem"],
             "api: newly introduced panic on empty header"
         );
-        assert_eq!(state.findings[0]["stage"], "persistence");
-        assert_eq!(state.findings[0]["stages"], json!(["persistence"]));
-        assert_eq!(
-            state.findings[0]["prompts"],
-            json!(["subsystem/db-migrations.md"])
-        );
+        assert_eq!(state.findings[0]["stage"], "security");
+        assert_eq!(state.findings[0]["stages"], json!(["security"]));
+        assert_eq!(state.findings[0]["prompts"], json!(["prompt-injection.md"]));
         assert_eq!(state.concerns.len(), 1);
         assert_eq!(
             state.concerns[0]["description"],
             "db: pre-existing missing index on patches table"
         );
         assert_eq!(state.concerns[0]["preexisting"], true);
-        assert_eq!(state.concerns[0]["stage"], "persistence");
-        assert_eq!(state.concerns[0]["stages"], json!(["persistence"]));
-        assert_eq!(
-            state.concerns[0]["prompts"],
-            json!(["subsystem/db-migrations.md"])
-        );
+        assert_eq!(state.concerns[0]["stage"], "security");
+        assert_eq!(state.concerns[0]["stages"], json!(["security"]));
+        assert_eq!(state.concerns[0]["prompts"], json!(["prompt-injection.md"]));
 
         // When report_preexisting is true, the verified pre-existing finding is also retained in findings,
         // and state.concerns appends without clearing earlier items.

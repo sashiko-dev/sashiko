@@ -43,7 +43,7 @@ If you are modifying Linux kernel review prompts (`projects/linux/prompts/`) or 
 
 Sashiko reviews changes to its own repository using the `--project sashiko` profile, driven by first-party prompt guides under [`projects/sashiko/prompts/`](projects/sashiko/prompts/README.md) and the workflow in [`src/workflows/sashiko_patch_review.rs`](src/workflows/sashiko_patch_review.rs).
 
-While deterministic checks (compilation, borrow checking, formatting, clippy lints) are enforced by `make check-pr`, Sashiko-for-Sashiko audits semantic and architectural invariants across subsystems (`projects/sashiko/prompts/subsystem/*.md`) and cross-cutting patterns (`projects/sashiko/prompts/patterns/*.md`), including:
+While deterministic checks (compilation, borrow checking, formatting, clippy lints) are enforced by `make check-pr`, Sashiko-for-Sashiko audits semantic and architectural invariants using review procedures (`projects/sashiko/prompts/*.md`), maintainer notes (`projects/sashiko/prompts/maintainers/*.md`), and source-verified code notes (`projects/sashiko/prompts/notes/`), including:
 
 - User experience and CLI/UI consistency
 - SQLite schema migrations and query scaling
