@@ -2,30 +2,93 @@
 # See designs/DESIGN_CODE_NOTES_ENGINE.md, section 3.
 
 [units]
-source = "directories"
-roots = ["src"]
-depth = 1
-# Each top-level file is a module of its own (src/db.rs is unit src/db).
-shallow_files = "per_module"
+source = "component_map"
+
+[units.components]
+"workflow-engine" = ["src/workflow/"]
+"workflows" = ["src/workflows/"]
+"notes" = ["src/notes/"]
+"ai" = ["src/ai/"]
+"toolbox" = ["src/toolbox/"]
+"db" = ["src/db.rs", "src/migrations/"]
+"api-server" = [
+    "src/server.rs",
+    "src/api.rs",
+    "src/auth.rs",
+    "src/access.rs",
+]
+"ingestion-forge" = [
+    "src/ingestor.rs",
+    "src/nntp.rs",
+    "src/mbox.rs",
+    "src/patch.rs",
+    "src/fetcher.rs",
+    "src/forge.rs",
+    "src/backfill.rs",
+]
+"email-delivery" = [
+    "src/email_policy.rs",
+    "src/email_router.rs",
+    "src/patchwork.rs",
+    "src/worker/email.rs",
+    "src/worker/patchwork.rs",
+    "src/worker/forge.rs",
+]
+"review-runtime" = [
+    "src/reviewer.rs",
+    "src/local_review.rs",
+    "src/worker/",
+    "src/benchmark.rs",
+]
+"git-baseline" = [
+    "src/git_cmd.rs",
+    "src/git_ops.rs",
+    "src/git_ops/",
+    "src/baseline.rs",
+    "src/prerequisites.rs",
+    "src/maintainers.rs",
+    "src/repo_sync.rs",
+]
+"cli-config" = [
+    "build.rs",
+    "src/main.rs",
+    "src/lib.rs",
+    "src/bin/",
+    "src/settings.rs",
+    "src/project.rs",
+    "src/prompt_bundle.rs",
+    "src/prompt_fingerprint.rs",
+    "src/prompt_namespaces.rs",
+    "src/events.rs",
+    "src/logging.rs",
+    "src/metrics.rs",
+    "src/compression.rs",
+    "src/utils.rs",
+    "src/test_support.rs",
+]
+
+[languages]
+skip = [
+    "docs/",
+    "designs/",
+    "projects/",
+    "static/",
+    "tests/",
+    "scripts/",
+]
 
 [languages.globs]
-rust = ["src/**.rs"]
+rust = ["src/**.rs", "build.rs"]
 other = ["src/migrations/**.sql"]
 
 [agenda]
-# Hand-written, project-agnostic starting agenda for the Sashiko pilot.
-modules = ["universal", "lang/rust"]
+modules = ["universal", "lang/rust", "domain/sashiko"]
+
+[history]
+fix_patterns = ["^Fixes: [0-9a-f]{8,}", "^fix(\\([^)]+\\))?:"]
+introducer_pattern = "^Fixes: ([0-9a-f]{8,})"
+max_cases = 60
 
 [limits]
 component_lines = 15000
 unit_note_bytes = 16384
-
-[history]
-# Sashiko has few Fixes: trailers; most fixes say so in the subject.
-fix_patterns = [
-    "^Fixes: [0-9a-f]{8,}",
-    "^[^ :]+(\\(.*\\))?: (fix|avoid|prevent|correct)",
-    "^fix(\\(.*\\))?:",
-]
-max_cases = 60
-introducer_pattern = "^Fixes: ([0-9a-f]{8,})"
