@@ -8297,9 +8297,29 @@ impl Database {
         Ok(())
     }
 
+    fn mr_urls_share_repo(mr_url_a: Option<&str>, mr_url_b: Option<&str>) -> bool {
+        let repo_a = mr_url_a.and_then(crate::forge::extract_owner_repo_from_mr_url);
+        let repo_b = mr_url_b.and_then(crate::forge::extract_owner_repo_from_mr_url);
+        match (repo_a.as_deref(), repo_b.as_deref()) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => mr_url_a == mr_url_b,
+            _ => false,
+        }
+    }
+
     pub async fn get_mr_version_for_commit_range(
         &self,
         mr_number: i64,
+        root_msg_id: &str,
+    ) -> Result<u32> {
+        self.get_mr_version_for_commit_range_in_repo(mr_number, None, root_msg_id)
+            .await
+    }
+
+    pub async fn get_mr_version_for_commit_range_in_repo(
+        &self,
+        mr_number: i64,
+        mr_url: Option<&str>,
         root_msg_id: &str,
     ) -> Result<u32> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
@@ -8307,14 +8327,18 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id, subject, version FROM patchsets WHERE cover_letter_message_id = ?",
+                    "SELECT id, subject, version, mr_url FROM patchsets WHERE cover_letter_message_id = ?",
                     libsql::params![clid.clone()],
                 )
                 .await?;
-            if let Some(row) = rows.next().await? {
+            while let Some(row) = rows.next().await? {
                 let existing_id: i64 = row.get(0)?;
                 let existing_subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
                 let stored_ver: Option<u32> = row.get(2)?;
+                let row_mr_url: Option<String> = row.get(3)?;
+                if mr_url.is_some() && !Self::mr_urls_share_repo(mr_url, row_mr_url.as_deref()) {
+                    continue;
+                }
                 if let Some(v) = stored_ver
                     .filter(|&v| v > 0)
                     .or_else(|| {
@@ -8328,35 +8352,45 @@ impl Database {
                 {
                     return Ok(v);
                 }
+                let scope_url = mr_url.or(row_mr_url.as_deref());
                 let mut count_rows = self
                     .conn
                     .query(
-                        "SELECT COUNT(*) FROM patchsets WHERE mr_number = ? AND id < ?",
+                        "SELECT mr_url FROM patchsets WHERE mr_number = ? AND id < ?",
                         libsql::params![mr_number, existing_id],
                     )
                     .await?;
-                let older_count: i64 = if let Some(crow) = count_rows.next().await? {
-                    crow.get(0)?
-                } else {
-                    0
-                };
-                return Ok((older_count + 1) as u32);
+                let mut older_count: u32 = 0;
+                while let Some(crow) = count_rows.next().await? {
+                    let older_mr_url: Option<String> = crow.get(0)?;
+                    if scope_url
+                        .is_none_or(|u| Self::mr_urls_share_repo(Some(u), older_mr_url.as_deref()))
+                    {
+                        older_count += 1;
+                    }
+                }
+                return Ok(older_count + 1);
             }
         }
 
         let mut rows = self
             .conn
             .query(
-                "SELECT COUNT(*) FROM patchsets WHERE mr_number = ?",
+                "SELECT COALESCE(version, 1), mr_url FROM patchsets WHERE mr_number = ?",
                 libsql::params![mr_number],
             )
             .await?;
-        let count: i64 = if let Some(row) = rows.next().await? {
-            row.get(0)?
-        } else {
-            0
-        };
-        Ok((count + 1) as u32)
+        let mut max_ver: i64 = 0;
+        let mut count: i64 = 0;
+        while let Some(row) = rows.next().await? {
+            let ver: i64 = row.get(0)?;
+            let row_mr_url: Option<String> = row.get(1)?;
+            if mr_url.is_none_or(|u| Self::mr_urls_share_repo(Some(u), row_mr_url.as_deref())) {
+                max_ver = max_ver.max(ver);
+                count += 1;
+            }
+        }
+        Ok((max_ver.max(count) + 1) as u32)
     }
 
     async fn rotate_mr_slug(&self, slug: &str, exclude_id: Option<i64>) -> Result<()> {
@@ -13054,6 +13088,149 @@ impl Database {
         let tx = self.begin_immediate_transaction().await?;
         let tx_db = self.with_connection((*tx).clone());
 
+        // If a prior revision with the same commit range was superseded by a
+        // newer PR push in the same repository (e.g. force-push A -> B -> A),
+        // archive its cover_letter_message_id on its existing thread and remove
+        // the unprefixed placeholder message row before allocating the thread
+        // for this re-push, so the new [vN] patchset gets a distinct thread_id
+        // and clean message row without losing the superseded revision's body.
+        if let Some(num) = mr_number {
+            for clid in &clid_candidates {
+                let mut candidates_in_repo = Vec::new();
+                {
+                    let mut rows = tx_db
+                        .conn
+                        .query(
+                            "SELECT ps.id, ps.thread_id, ps.mr_url
+                             FROM patchsets ps
+                             WHERE ps.cover_letter_message_id = ?",
+                            libsql::params![clid.clone()],
+                        )
+                        .await?;
+                    while let Some(row) = rows.next().await? {
+                        let old_id: i64 = row.get(0)?;
+                        let old_thread_id: Option<i64> = row.get(1)?;
+                        let ps_mr_url: Option<String> = row.get(2)?;
+                        if (mr_url.is_some() || ps_mr_url.is_some())
+                            && !Self::mr_urls_share_repo(mr_url, ps_mr_url.as_deref())
+                        {
+                            continue;
+                        }
+                        candidates_in_repo.push((old_id, old_thread_id, ps_mr_url));
+                    }
+                }
+                for (old_id, old_thread_id, ps_mr_url) in candidates_in_repo {
+                    let scope_url = mr_url.or(ps_mr_url.as_deref());
+                    let mut newer_rows = tx_db
+                        .conn
+                        .query(
+                            "SELECT mr_url FROM patchsets WHERE mr_number = ? AND id > ?",
+                            libsql::params![num, old_id],
+                        )
+                        .await?;
+                    let mut superseded_in_same_repo = false;
+                    while let Some(nrow) = newer_rows.next().await? {
+                        let newer_mr_url: Option<String> = nrow.get(0)?;
+                        if scope_url.is_none_or(|u| {
+                            Self::mr_urls_share_repo(Some(u), newer_mr_url.as_deref())
+                        }) {
+                            superseded_in_same_repo = true;
+                            break;
+                        }
+                    }
+                    drop(newer_rows);
+                    if superseded_in_same_repo {
+                        let archived_clid = format!("superseded-{old_id}-{clid}");
+                        let copied = tx_db
+                            .execute(
+                                "INSERT INTO messages (message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients)
+                                 SELECT ?1, COALESCE(?2, thread_id), in_reply_to, author, subject, date, body, to_recipients, cc_recipients
+                                 FROM messages WHERE message_id = ?3
+                                 ON CONFLICT(message_id) DO UPDATE SET
+                                     thread_id = excluded.thread_id,
+                                     in_reply_to = excluded.in_reply_to,
+                                     author = excluded.author,
+                                     subject = excluded.subject,
+                                     date = excluded.date,
+                                     body = excluded.body,
+                                     to_recipients = excluded.to_recipients,
+                                     cc_recipients = excluded.cc_recipients",
+                                libsql::params![archived_clid.clone(), old_thread_id, clid.clone()],
+                            )
+                            .await?;
+                        if copied == 0 {
+                            tx_db
+                                .ensure_thread_for_message_in_tx(&archived_clid, now)
+                                .await?;
+                        }
+                        tx_db
+                            .execute(
+                                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                                libsql::params![archived_clid.clone(), old_id],
+                            )
+                            .await?;
+                        if let Some(tid) = old_thread_id {
+                            tx_db
+                                .execute(
+                                    "UPDATE threads SET root_message_id = ? WHERE id = ? AND root_message_id = ?",
+                                    libsql::params![archived_clid.clone(), tid, clid.clone()],
+                                )
+                                .await?;
+                            tx_db
+                                .execute(
+                                    "UPDATE messages SET in_reply_to = ? WHERE thread_id = ? AND in_reply_to = ?",
+                                    libsql::params![archived_clid.clone(), tid, clid.clone()],
+                                )
+                                .await?;
+                        }
+                        tx_db
+                            .execute(
+                                "INSERT OR IGNORE INTO messages_subsystems (message_id, subsystem_id)
+                                 SELECT m_new.id, ms.subsystem_id
+                                 FROM messages_subsystems ms
+                                 JOIN messages m_old ON m_old.id = ms.message_id
+                                 JOIN messages m_new ON m_new.message_id = ?1
+                                 WHERE m_old.message_id = ?2",
+                                libsql::params![archived_clid, clid.clone()],
+                            )
+                            .await?;
+                        tx_db
+                            .execute(
+                                "DELETE FROM messages_subsystems
+                                 WHERE message_id IN (
+                                     SELECT id FROM messages
+                                     WHERE message_id = ?1
+                                       AND NOT EXISTS (SELECT 1 FROM patchsets WHERE cover_letter_message_id = ?1)
+                                       AND NOT EXISTS (SELECT 1 FROM patches WHERE message_id = ?1)
+                                 )",
+                                libsql::params![clid.clone()],
+                            )
+                            .await?;
+                        tx_db
+                            .execute(
+                                "DELETE FROM messages
+                                 WHERE message_id = ?
+                                   AND NOT EXISTS (SELECT 1 FROM patchsets WHERE cover_letter_message_id = ?)
+                                   AND NOT EXISTS (SELECT 1 FROM patches WHERE message_id = ?)",
+                                libsql::params![clid.clone(), clid.clone(), clid.clone()],
+                            )
+                            .await?;
+                        tx_db
+                            .execute(
+                                "DELETE FROM fetch_queue
+                                 WHERE status IN ('Done', 'Failed', 'Cancelled')
+                                   AND article_id IN (
+                                       TRIM(?, '<>'),
+                                       REPLACE(TRIM(?, '<>'), '@sashiko.local', '')
+                                   )",
+                                libsql::params![clid.clone(), clid.clone()],
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+
         // Ensure a placeholder thread and message exist under the immediate
         // write lock to satisfy Foreign Key constraints without racing against
         // concurrent thread deduplication.
@@ -13064,7 +13241,7 @@ impl Database {
         let mr_ver = if let Some(num) = mr_number {
             Some(
                 tx_db
-                    .get_mr_version_for_commit_range(num, root_msg_id)
+                    .get_mr_version_for_commit_range_in_repo(num, mr_url, root_msg_id)
                     .await?,
             )
         } else {
@@ -13087,17 +13264,24 @@ impl Database {
                 let mut rows = tx_db
                     .conn
                     .query(
-                        "SELECT id, status FROM patchsets WHERE cover_letter_message_id = ?",
+                        "SELECT id, status, mr_url FROM patchsets WHERE cover_letter_message_id = ?",
                         libsql::params![clid.clone()],
                     )
                     .await?;
-                if let Some(row) = rows.next().await? {
+                let mut matched = None;
+                while let Some(row) = rows.next().await? {
                     let id: i64 = row.get(0)?;
                     let status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
-                    Some((id, status))
-                } else {
-                    None
+                    let row_mr_url: Option<String> = row.get(2)?;
+                    if (mr_url.is_some() || row_mr_url.is_some())
+                        && !Self::mr_urls_share_repo(mr_url, row_mr_url.as_deref())
+                    {
+                        continue;
+                    }
+                    matched = Some((id, status));
+                    break;
                 }
+                matched
             };
 
             if let Some((id, status)) = existing {
@@ -14635,6 +14819,144 @@ impl Database {
             )
             .await?;
         Ok(count)
+    }
+
+    pub async fn bootstrap_or_get_forge_poll_watermark(&self, repo: &str, now: i64) -> Result<i64> {
+        let key = format!("forge_github_poll_watermark:{repo}");
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT value FROM meta WHERE key = ?",
+                libsql::params![key.clone()],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let val: String = row.get(0)?;
+            if let Ok(parsed) = val.trim().parse::<i64>() {
+                return Ok(parsed);
+            }
+        }
+        drop(rows);
+
+        let mut ps_rows = self
+            .conn
+            .query("SELECT 1 FROM patchsets LIMIT 1", ())
+            .await?;
+        let has_existing_patchsets = ps_rows.next().await?.is_some();
+        drop(ps_rows);
+
+        let initial = if has_existing_patchsets {
+            now.saturating_sub(86_400)
+        } else {
+            now.saturating_sub(300)
+        };
+        self.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![key, initial.to_string()],
+        )
+        .await?;
+        Ok(initial)
+    }
+
+    pub async fn set_forge_poll_watermark(&self, repo: &str, ts: i64) -> Result<()> {
+        let key = format!("forge_github_poll_watermark:{repo}");
+        self.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![key, ts.to_string()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Return true if `(repo, mr_number, head_sha)` has already been ingested
+    /// (in any terminal or in-progress review state, or `Fetching` backed by a
+    /// `Pending`, `Fetching`, or `Done` `fetch_queue` row). Returns false when
+    /// the revision has never been seen, only exists as an unbacked/interrupted
+    /// fetch placeholder, or was superseded by a newer PR push (`A -> B -> A`).
+    pub async fn has_forge_pr_head_ingested(
+        &self,
+        repo: &str,
+        mr_number: i64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT ps.status,
+                        ps.failed_reason,
+                        ps.mr_url,
+                        ps.cover_letter_message_id,
+                        EXISTS (
+                            SELECT 1 FROM fetch_queue fq
+                            WHERE fq.status IN ('Pending', 'Fetching', 'Done')
+                              AND fq.article_id IN (
+                                  TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
+                                  REPLACE(
+                                      TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
+                                      '@sashiko.local',
+                                      ''
+                                  )
+                              )
+                        ) AS has_active_fetch
+                 FROM patchsets ps
+                 WHERE ps.mr_number = ?
+                 ORDER BY ps.id DESC
+                 LIMIT 200",
+                libsql::params![mr_number],
+            )
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            let status: String = row.get::<Option<String>>(0)?.unwrap_or_default();
+            let failed_reason: Option<String> = row.get(1)?;
+            let mr_url: Option<String> = row.get(2)?;
+            let clid: String = row.get::<Option<String>>(3)?.unwrap_or_default();
+            let has_active_fetch: i64 = row.get(4)?;
+
+            let Some(ref row_mr_url) = mr_url else {
+                continue;
+            };
+            let Some(row_repo) = crate::forge::extract_owner_repo_from_mr_url(row_mr_url) else {
+                continue;
+            };
+            if !row_repo.eq_ignore_ascii_case(repo) {
+                continue;
+            }
+
+            let trimmed = clid.trim_matches(|c| c == '<' || c == '>');
+            let clean_clid = trimmed.strip_suffix("@sashiko.local").unwrap_or(trimmed);
+            let row_head_sha = clean_clid
+                .rsplit_once("..")
+                .map(|(_, h)| h.trim_start_matches('.'));
+            if !row_head_sha.is_some_and(|h| h.eq_ignore_ascii_case(head_sha)) {
+                // A newer revision with a different head SHA was ingested more
+                // recently than any remaining rows, so `head_sha` is either
+                // unseen or a re-push (`A -> B -> A`) that supersedes it.
+                return Ok(false);
+            }
+
+            if status == "Fetching" {
+                return Ok(has_active_fetch != 0);
+            }
+            if status == "Failed"
+                && matches!(
+                    failed_reason.as_deref(),
+                    Some(
+                        "Interrupted before fetch completed"
+                            | "Failed to store PR description body"
+                            | "Failed to verify placeholder patchset status"
+                            | "Failed to enqueue fetch request"
+                    )
+                )
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     /// Insert a patchwork notification email into the email outbox.
@@ -31374,5 +31696,320 @@ mod tests {
             patch_statuses.get(&p2_id).map(String::as_str),
             Some("Reviewed")
         );
+    }
+
+    #[tokio::test]
+    async fn test_forge_poll_watermark_and_head_sha_deduplication() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // Empty DB bootstraps with a 5-minute lookback.
+        let wm_empty = db
+            .bootstrap_or_get_forge_poll_watermark("sashiko-dev/sashiko", 10_000)
+            .await
+            .unwrap();
+        assert_eq!(wm_empty, 9_700);
+
+        // Subsequent calls return the persisted value.
+        assert_eq!(
+            db.bootstrap_or_get_forge_poll_watermark("sashiko-dev/sashiko", 20_000)
+                .await
+                .unwrap(),
+            9_700
+        );
+        db.set_forge_poll_watermark("sashiko-dev/sashiko", 12_345)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.bootstrap_or_get_forge_poll_watermark("sashiko-dev/sashiko", 20_000)
+                .await
+                .unwrap(),
+            12_345
+        );
+
+        let head1 = "2222222222222222222222222222222222222222";
+        let head2 = "3333333333333333333333333333333333333333";
+        let range1 = format!("1111111111111111111111111111111111111111..{head1}");
+
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Unbacked Fetching placeholder is NOT considered ingested until backed by fetch_queue.
+        let ps_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range1}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Once backed by fetch_queue, it is considered active/ingested.
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            &range1,
+            Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+            Some("Test PR"),
+            Some(500),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Different repo with same PR number and head_sha is not matched.
+        assert!(
+            !db.has_forge_pr_head_ingested("other-org/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // During the handoff window when fetch_queue is marked Done before
+        // PatchSubmitted events transition the patchset out of Fetching,
+        // has_forge_pr_head_ingested still returns true.
+        let locked = db.lock_pending_fetch_queue().await.unwrap().unwrap();
+        db.mark_fetch_queue_done(locked.id, locked.locked_at)
+            .await
+            .unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Once fetch completes and patchset is Reviewed (or Failed during review),
+        // it remains deduplicated even if main advances (different base_sha, same head_sha).
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head2)
+                .await
+                .unwrap()
+        );
+
+        // Review-time failure is NOT re-ingested by the poller, whereas
+        // 'Interrupted before fetch completed' and 'Failed to enqueue fetch request'
+        // ARE eligible for recovery.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Review workflow failed' WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        for recoverable_reason in [
+            "Interrupted before fetch completed",
+            "Failed to verify placeholder patchset status",
+            "Failed to enqueue fetch request",
+        ] {
+            db.conn
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE id = ?",
+                    libsql::params![recoverable_reason, ps_id],
+                )
+                .await
+                .unwrap();
+            assert!(
+                !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                    .await
+                    .unwrap(),
+                "reason {recoverable_reason} should be recoverable"
+            );
+        }
+
+        // Force-pushing head1 -> head2 -> head1 supersedes ps_id (head1), so
+        // re-pushing head1 is not blocked by the superseded row even if ps_id
+        // was already Reviewed, preserves its archived cover letter body and
+        // messages_subsystems links, and clears v1's stale Done fetch_queue row.
+        db.update_message_body(&format!("mr-500-{range1}@sashiko.local"), "v1 description")
+            .await
+            .unwrap();
+        let sub_id = db.ensure_subsystem("core", "all").await.unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO messages_subsystems (message_id, subsystem_id)
+                 SELECT id, ? FROM messages WHERE message_id = ?",
+                libsql::params![sub_id, format!("mr-500-{range1}@sashiko.local")],
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        let range2 = format!("1111111111111111111111111111111111111111..{head2}");
+        let ps2_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range2}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+        let ps3_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range1}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap(),
+            "stale Done fetch_queue row from v1 must be cleared so an unbacked v3 Fetching placeholder is recoverable"
+        );
+        db.update_message_body(&format!("mr-500-{range1}@sashiko.local"), "v3 description")
+            .await
+            .unwrap();
+        assert!(ps3_id > ps2_id);
+        assert_eq!(
+            db.get_patchset_status(ps2_id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        assert_eq!(
+            db.get_patchset_status(ps3_id).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+        assert_eq!(
+            db.get_message_body(&format!("superseded-{ps_id}-mr-500-{range1}@sashiko.local"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("v1 description")
+        );
+        assert_eq!(
+            db.get_message_body(&format!("mr-500-{range1}@sashiko.local"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("v3 description")
+        );
+        let mut tid_rows = db
+            .conn
+            .query(
+                "SELECT id, thread_id FROM patchsets WHERE id IN (?, ?) ORDER BY id ASC",
+                libsql::params![ps_id, ps3_id],
+            )
+            .await
+            .unwrap();
+        let tid_v1: i64 = tid_rows.next().await.unwrap().unwrap().get(1).unwrap();
+        let tid_v3: i64 = tid_rows.next().await.unwrap().unwrap().get(1).unwrap();
+        drop(tid_rows);
+        assert_ne!(
+            tid_v1, tid_v3,
+            "re-pushed revision after A -> B -> A must get a distinct thread_id"
+        );
+
+        // If the newest row (ps3_id) fails with a recoverable reason after A -> B -> A,
+        // has_forge_pr_head_ingested must return false rather than matching the older
+        // Reviewed ps_id row.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed' WHERE id = ?",
+                libsql::params![ps3_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Cross-repository isolation: another repo with PR #500 gets [v1] without
+        // inflating version numbers or falsely superseding sashiko-dev/sashiko PR #500.
+        let other_range =
+            "4444444444444444444444444444444444444444..5555555555555555555555555555555555555555";
+        let other_repo_ps_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{other_range}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/other-org/sashiko/pull/500"),
+                Some("Fork PR"),
+                Some(500),
+                Some("other-sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(other_repo_ps_id > ps3_id);
+        assert_eq!(
+            db.get_mr_version_for_commit_range_in_repo(
+                500,
+                Some("https://github.com/other-org/sashiko/pull/500"),
+                &format!("mr-500-{other_range}@sashiko.local"),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        // Re-fetching sashiko-dev/sashiko PR #500 reuses ps3_id instead of treating
+        // other_repo_ps_id (id > ps3_id) as a superseding revision.
+        let ps3_retry_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range1}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ps3_retry_id, ps3_id);
+
+        // Non-empty DB bootstraps a new repo's watermark with a 24h (86400s) lookback.
+        let wm_non_empty = db
+            .bootstrap_or_get_forge_poll_watermark("torvalds/linux", 100_000)
+            .await
+            .unwrap();
+        assert_eq!(wm_non_empty, 13_600);
     }
 }

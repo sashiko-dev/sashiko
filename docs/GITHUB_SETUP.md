@@ -266,9 +266,16 @@ port = 8080       # Custom port
 
 Then update webhook URL: `http://your-server:8080/api/webhook/github`
 
-### Multiple Repositories
+### Multiple Repositories and Automatic Reconciliation
 
-Sashiko can handle webhooks from multiple repositories. Simply add the same webhook configuration to each repository you want to monitor.
+Sashiko reconciles open GitHub pull requests via the Pulls REST API on startup and every `poll_interval_secs` seconds (default `120`) in addition to receiving real-time `pull_request` webhooks, so pull requests opened or updated while the server was restarting are automatically caught up. When `forge.repos` is unset, Sashiko auto-detects the GitHub `"owner/repo"` slug from the `origin` remote of `git.repository_path`. To monitor multiple repositories, list them under `[forge]` in `Settings.toml` (or via `SASHIKO__FORGE__REPOS="owner/repo1,owner/repo2"`):
+
+```toml
+[forge]
+enabled = true
+repos = ["sashiko-dev/sashiko", "owner/another-repo"]
+poll_interval_secs = 120
+```
 
 **Note:** All repositories must be accessible from the git repository configured in `Settings.toml` or Sashiko will fail to fetch the commits.
 

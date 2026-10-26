@@ -1412,20 +1412,39 @@ async fn run_daemon(
         })
     };
 
-    let forge_handle = if settings.forge.enabled {
-        let forge_worker = Arc::new(sashiko::worker::forge::ForgeWorker::new(
-            db.clone(),
-            settings.forge.clone(),
-            settings.review.max_retries,
-        ));
-        Some(spawn_supervised_worker("ForgeWorker", move || {
-            let worker = Arc::clone(&forge_worker);
+    let (forge_handle, forge_poller_handle) = if settings.forge.enabled {
+        let forge_worker = Arc::new(
+            sashiko::worker::forge::ForgeWorker::new(
+                db.clone(),
+                settings.forge.clone(),
+                settings.review.max_retries,
+            )
+            .with_poller(
+                fetch_tx.clone(),
+                std::path::PathBuf::from(&settings.git.repository_path),
+            ),
+        );
+        let outbox_worker = Arc::clone(&forge_worker);
+        let outbox_handle = spawn_supervised_worker("ForgeWorker", move || {
+            let worker = Arc::clone(&outbox_worker);
             async move {
                 worker.run().await;
             }
-        }))
+        });
+        let poller_handle = if settings.forge.poll_interval_secs > 0 {
+            Some(spawn_supervised_worker("ForgePoller", move || {
+                let worker = Arc::clone(&forge_worker);
+                async move {
+                    worker.run_poller().await;
+                }
+            }))
+        } else {
+            info!("Forge PR poller disabled via settings (forge.poll_interval_secs = 0).");
+            None
+        };
+        (Some(outbox_handle), poller_handle)
     } else {
-        None
+        (None, None)
     };
 
     let bug_worker_handle = if settings.linux_bug.enabled {
@@ -1599,6 +1618,9 @@ async fn run_daemon(
     }
     patchwork_handle.abort();
     if let Some(h) = forge_handle {
+        h.abort();
+    }
+    if let Some(h) = forge_poller_handle {
         h.abort();
     }
     if let Some(h) = bug_worker_handle {
@@ -3839,7 +3861,7 @@ async fn process_parsed_article(
             && let (Some(title), Some(number)) = (&mr_title, &mr_number)
         {
             let mr_ver = worker_db
-                .get_mr_version_for_commit_range(*number, &root_msg_id)
+                .get_mr_version_for_commit_range_in_repo(*number, mr_url.as_deref(), &root_msg_id)
                 .await
                 .unwrap_or(1);
             (

@@ -2400,7 +2400,49 @@ async fn forge_webhook(
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
 
-    let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
+    ingest_forge_pull_request(&state.db, &state.fetch_sender, forge.name(), metadata)
+        .await
+        .map_err(|e| {
+            error!("{}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "accepted",
+        "message": format!("{} {} queued for review", forge.name(), action)
+    })))
+}
+
+/// Persist a forge pull/merge request placeholder and enqueue its git fetch in
+/// `fetch_queue`. Returns `Ok(true)` when a fetch was queued, or `Ok(false)`
+/// when skipped (Dependabot author or revision already in an active/completed
+/// review state).
+pub async fn ingest_forge_pull_request(
+    db: &Database,
+    fetch_sender: &mpsc::Sender<FetchRequest>,
+    forge_name: &str,
+    metadata: crate::forge::ForgeMetadata,
+) -> Result<bool, String> {
+    if let Some(ref author) = metadata.author
+        && crate::forge::is_dependabot_author(author)
+    {
+        info!(
+            "{} PR #{} by {} is from Dependabot, skipping review",
+            forge_name,
+            metadata.pr_number,
+            crate::forge::loggable(author)
+        );
+        return Ok(false);
+    }
+
+    if crate::fetcher::url_has_embedded_credentials(metadata.repo_url.as_deref()) {
+        return Err(format!(
+            "Rejected {} PR #{} with credentialed repository URL",
+            forge_name, metadata.pr_number
+        ));
+    }
+
+    let default_subject = format!("{} #{}", forge_name, metadata.pr_number);
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
 
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
@@ -2411,28 +2453,10 @@ async fn forge_webhook(
         format!("{}-{}", repo, metadata.pr_number)
     });
 
-    // Written whenever the forge sent a body, empty included: a description
-    // the author cleared must not leave the previous text behind for the
-    // series review to read.
-    if let Some(ref pr_body) = metadata.pr_body {
-        state
-            .db
-            .update_message_body(&placeholder_id, pr_body.trim())
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to store PR description body for {}: {}",
-                    placeholder_id, e
-                );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?;
-    }
-
-    let ps_id = state
-        .db
+    let ps_id = db
         .create_fetching_patchset(
             &placeholder_id,
-            &format!("Fetching {} PR/MR: {}", forge.name(), subject),
+            &format!("Fetching {} PR/MR: {}", forge_name, subject),
             None,
             None,
             metadata.pr_url.as_deref(),
@@ -2441,62 +2465,72 @@ async fn forge_webhook(
             slug.as_deref(),
         )
         .await
-        .map_err(|e| {
-            error!("Failed to create placeholder patchset: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
+        .map_err(|e| format!("Failed to create placeholder patchset: {}", e))?;
 
-    let should_enqueue = match state.db.get_patchset_status(ps_id).await {
+    let should_enqueue = match db.get_patchset_status(ps_id).await {
         Ok(Some(status)) => status == "Fetching",
         Ok(None) => false,
         Err(e) => {
-            error!("Failed to inspect placeholder patchset status: {}", e);
             fail_fetching_patchset_logged(
-                &state.db,
+                db,
                 &placeholder_id,
                 "Failed to verify placeholder patchset status",
             )
             .await;
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(format!(
+                "Failed to inspect placeholder patchset status: {}",
+                e
+            ));
         }
     };
 
-    if should_enqueue {
-        if let Err(e) = state
-            .db
-            .enqueue_fetch_request(
-                metadata.repo_url.as_deref(),
-                &commit_range,
-                metadata.pr_url.as_deref(),
-                metadata.pr_title.as_deref(),
-                Some(metadata.pr_number),
-            )
-            .await
-        {
-            error!("Failed to persist fetch request in fetch_queue: {}", e);
-            fail_fetching_patchset_logged(
-                &state.db,
-                &placeholder_id,
-                "Failed to enqueue fetch request",
-            )
-            .await;
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        }
-
-        let req = FetchRequest {
-            repo_url: metadata.repo_url,
-            commit_hash: commit_range,
-            mr_url: metadata.pr_url,
-            mr_title: metadata.pr_title,
-            mr_number: Some(metadata.pr_number),
-        };
-        let _ = state.fetch_sender.try_send(req);
+    if !should_enqueue {
+        return Ok(false);
     }
 
-    Ok(Json(serde_json::json!({
-        "status": "accepted",
-        "message": format!("{} {} queued for review", forge.name(), action)
-    })))
+    // Written after create_fetching_patchset archives any superseded revision
+    // sharing placeholder_id, and whenever the forge sent a body (empty
+    // included) so a cleared description does not leave stale text behind.
+    if let Some(ref pr_body) = metadata.pr_body
+        && let Err(e) = db
+            .update_message_body(&placeholder_id, pr_body.trim())
+            .await
+    {
+        fail_fetching_patchset_logged(db, &placeholder_id, "Failed to store PR description body")
+            .await;
+        return Err(format!(
+            "Failed to store PR description body for {}: {}",
+            placeholder_id, e
+        ));
+    }
+
+    if let Err(e) = db
+        .enqueue_fetch_request(
+            metadata.repo_url.as_deref(),
+            &commit_range,
+            metadata.pr_url.as_deref(),
+            metadata.pr_title.as_deref(),
+            Some(metadata.pr_number),
+        )
+        .await
+    {
+        fail_fetching_patchset_logged(db, &placeholder_id, "Failed to enqueue fetch request").await;
+        return Err(format!(
+            "Failed to persist fetch request in fetch_queue: {}",
+            e
+        ));
+    }
+
+    let req = FetchRequest {
+        repo_url: metadata.repo_url,
+        commit_hash: commit_range,
+        mr_url: metadata.pr_url,
+        mr_title: metadata.pr_title,
+        mr_number: Some(metadata.pr_number),
+    };
+    let _ = fetch_sender.try_send(req);
+
+    Ok(true)
 }
 
 async fn list_bugs(

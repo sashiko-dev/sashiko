@@ -22,6 +22,14 @@ enabled = false
 # See docs/WEBHOOK_SECURITY.md for full setup guide.
 # webhook_secret = ""
 
+# GitHub repositories ("owner/repo") to reconcile via periodic Pulls REST API
+# polling (or set SASHIKO__FORGE__REPOS="owner/repo1,owner/repo2"). When unset
+# and forge.enabled = true, auto-detects the GitHub repository from the origin
+# remote of git.repository_path.
+# repos = ["sashiko-dev/sashiko"]
+# Interval in seconds between periodic GitHub PR reconciliation passes (0 = disabled).
+# poll_interval_secs = 120
+
 [subsystems]
 # Regex map: email address pattern -> subsystem name
 # mapping = [

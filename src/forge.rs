@@ -563,6 +563,256 @@ pub fn extract_owner_repo_from_mr_url(url: &str) -> Option<String> {
     }
 }
 
+fn is_valid_github_repo_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && seg.len() <= 100
+        && seg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Normalize a GitHub repository identifier (`"owner/repo"`, HTTPS clone/PR URL,
+/// or SSH `git@github.com:owner/repo.git` URL) into a canonical `"owner/repo"`
+/// slug. Returns `None` if the input names a non-GitHub host or contains path
+/// traversal / invalid segment characters.
+pub fn normalize_github_repo_slug(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw_path = if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        std::borrow::Cow::Borrowed(path)
+    } else if trimmed.contains("://") {
+        let parsed = url::Url::parse(trimmed).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https" | "ssh") {
+            return None;
+        }
+        if !parsed.username().is_empty() && parsed.scheme() != "ssh" {
+            return None;
+        }
+        if parsed.password().is_some() {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        std::borrow::Cow::Owned(parsed.path().to_string())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+
+    let without_pull = raw_path
+        .split_once("/pull/")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(raw_path.as_ref());
+    let cleaned = without_pull.trim_matches('/').trim_end_matches(".git");
+    let mut parts = cleaned.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !is_valid_github_repo_segment(owner) || !is_valid_github_repo_segment(repo) {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Inspect the `origin` remote of `repo_path` and return its normalized GitHub
+/// `"owner/repo"` slug when `origin` points to `github.com`.
+pub async fn detect_github_repo_from_git_dir(repo_path: &std::path::Path) -> Option<String> {
+    let mut cmd = crate::git_cmd::in_dir_async(repo_path);
+    cmd.args([
+        "-c",
+        "safe.bareRepository=all",
+        "remote",
+        "get-url",
+        "origin",
+    ]);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    normalize_github_repo_slug(&url)
+}
+
+/// Open pull request metadata returned by the GitHub Pulls REST API.
+#[derive(Debug, Clone)]
+pub struct GitHubPolledPullRequest {
+    pub metadata: ForgeMetadata,
+    pub updated_at: i64,
+}
+
+/// One page of open pull requests returned by the GitHub Pulls REST API.
+#[derive(Debug, Clone)]
+pub struct GitHubPullsPage {
+    pub items: Vec<GitHubPolledPullRequest>,
+    pub raw_count: usize,
+    pub skipped_count: usize,
+}
+
+/// Fetch one page of open pull requests from GitHub's Pulls REST API sorted by
+/// `updated` descending. Malformed items are logged and skipped rather than
+/// aborting the entire repository poll.
+pub async fn list_github_open_pull_requests(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    token: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<GitHubPullsPage, String> {
+    let repo = normalize_github_repo_slug(repo)
+        .ok_or_else(|| format!("invalid GitHub repository slug: {}", loggable(repo)))?;
+    let per_page = per_page.clamp(1, 100);
+    let page = page.max(1);
+    let url = format!(
+        "{}/repos/{}/pulls?state=open&sort=updated&direction=desc&per_page={}&page={}",
+        api_base.trim_end_matches('/'),
+        repo,
+        per_page,
+        page
+    );
+
+    let mut req = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sashiko")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {}", tok));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("GitHub pulls GET failed for {}: {}", repo, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let redacted = crate::utils::redact_secret(&text);
+        return Err(format!(
+            "GitHub pulls API returned {} for {}: {}",
+            status, repo, redacted
+        ));
+    }
+
+    let items: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
+        format!(
+            "invalid JSON array from GitHub pulls endpoint for {} ({}): {}",
+            repo, status, e
+        )
+    })?;
+
+    let raw_count = items.len();
+    let mut skipped_count = 0usize;
+    let mut out = Vec::with_capacity(raw_count);
+    for pr in items {
+        let Some(pr_number) = pr["number"].as_i64().filter(|&n| n > 0) else {
+            tracing::warn!("Skipping GitHub PR item with invalid number in {}", repo);
+            skipped_count += 1;
+            continue;
+        };
+        let Some(head_sha) = pr["head"]["sha"]
+            .as_str()
+            .filter(|s| is_valid_git_sha(s))
+            .map(str::to_string)
+        else {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with invalid head.sha",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        };
+        let Some(base_sha) = pr["base"]["sha"]
+            .as_str()
+            .filter(|s| is_valid_git_sha(s))
+            .map(str::to_string)
+        else {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with invalid base.sha",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        };
+        let Some(updated_at) = pr["updated_at"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp())
+        else {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with missing or invalid updated_at",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        };
+
+        let clone_url = pr["base"]["repo"]["clone_url"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("https://github.com/{}.git", repo));
+        if !is_safe_repo_url(&clone_url)
+            || crate::fetcher::url_has_embedded_credentials(Some(&clone_url))
+        {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with unsafe clone_url",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        }
+
+        let pr_title = pr["title"].as_str().map(str::to_string);
+        let pr_body = pr
+            .get("body")
+            .map(|b| truncate_pr_body(b.as_str().unwrap_or("")));
+        let pr_url = pr["html_url"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| Some(format!("https://github.com/{}/pull/{}", repo, pr_number)));
+        let author = pr["user"]["login"].as_str().map(str::to_string);
+
+        out.push(GitHubPolledPullRequest {
+            metadata: ForgeMetadata {
+                repo_url: Some(clone_url),
+                base_sha,
+                head_sha,
+                pr_number,
+                pr_title,
+                pr_body,
+                pr_url,
+                author,
+            },
+            updated_at,
+        });
+    }
+
+    Ok(GitHubPullsPage {
+        items: out,
+        raw_count,
+        skipped_count,
+    })
+}
+
 /// Summary and findings for one commit in a pull request series.
 #[derive(Debug, Clone)]
 pub struct PatchReviewSummaryItem {
@@ -1924,5 +2174,77 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
         let (_action, metadata) = forge.parse_payload(&body).expect("valid payload");
         assert_eq!(metadata.author.as_deref(), Some("dependabot[bot]"));
         assert!(metadata.author.as_deref().is_some_and(is_dependabot_author));
+    }
+
+    #[test]
+    fn test_normalize_github_repo_slug() {
+        assert_eq!(
+            normalize_github_repo_slug("sashiko-dev/sashiko"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug(" https://github.com/sashiko-dev/sashiko.git "),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug("https://github.com/sashiko-dev/sashiko/pull/735"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug("git@github.com:sashiko-dev/sashiko.git"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug("ssh://git@github.com/sashiko-dev/sashiko.git"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+
+        for invalid in [
+            "",
+            "sashiko-dev",
+            "sashiko-dev/sashiko/extra",
+            "../sashiko",
+            "sashiko-dev/..",
+            "https://gitlab.com/sashiko-dev/sashiko.git",
+            "git@gitlab.com:sashiko-dev/sashiko.git",
+            "https://user:pass@github.com/sashiko-dev/sashiko.git",
+            "sashiko-dev/sashiko?foo=bar",
+        ] {
+            assert_eq!(
+                normalize_github_repo_slug(invalid),
+                None,
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detect_github_repo_from_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = crate::git_cmd::in_dir_async(dir.path())
+            .args(["init", "--bare"])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(detect_github_repo_from_git_dir(dir.path()).await, None);
+
+        let status = crate::git_cmd::in_dir_async(dir.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sashiko-dev/sashiko.git",
+            ])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(
+            detect_github_repo_from_git_dir(dir.path()).await,
+            Some("sashiko-dev/sashiko".to_string())
+        );
     }
 }

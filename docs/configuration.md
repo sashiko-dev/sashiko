@@ -44,15 +44,22 @@ Optional. Describes the project this configuration is for.
 
 ### `[forge]`
 
-Optional. Controls forge (GitHub/GitLab) webhook integration.
+Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment posting, and periodic GitHub Pulls REST API reconciliation.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable forge webhook endpoint. |
+| `enabled` | bool | `false` | Enable forge webhook endpoint, outbox worker, and periodic PR poller. |
 | `disable_nntp` | bool | `true` | Disable NNTP ingestion when forge is enabled. |
 | `provider` | string | -- | Forge provider: `"github"` or `"gitlab"`. |
 | `webhook_secret` | string | -- | Webhook signing token or shared secret for authenticating incoming requests. When configured, requests are authenticated via signature verification, which is the only way a forge can authenticate. See the [Webhook Security Guide](WEBHOOK_SECURITY.md). |
-| `api_token` | string | -- | Forge API token (for future API-based features). |
+| `api_token` | string | -- | Forge personal access token or API token used when GitHub App credentials are not configured. |
+| `post_mode` | string | `"off"` | Controls PR review comment delivery: `"off"` (disabled), `"dry_run"` (persisted in `forge_outbox` without sending), or `"live"` (posted to GitHub). |
+| `app_id` | integer | -- | GitHub App ID used to mint short-lived installation tokens for posting PR review comments and polling open pull requests. |
+| `installation_id` | integer | -- | GitHub App installation ID for exchanging App JWTs for installation tokens. |
+| `app_private_key` | string | -- | Inline PEM-encoded RSA private key for the GitHub App (prefer `app_private_key_path` or `SASHIKO__FORGE__APP_PRIVATE_KEY`). |
+| `app_private_key_path` | string | -- | Path to the PEM-encoded RSA private key file for the GitHub App. |
+| `repos` | string or list | `[]` | GitHub `"owner/repo"` repositories to reconcile periodically via the Pulls REST API (accepts a TOML array or a comma-separated string via `SASHIKO__FORGE__REPOS`). When empty and `forge.enabled = true`, auto-detects the GitHub repository from the `origin` remote of `git.repository_path`. |
+| `poll_interval_secs` | integer | `120` | Interval in seconds between periodic GitHub Pulls REST API reconciliation passes (`0` disables polling while keeping webhook ingestion active). |
 
 > **Security:** When `Settings.toml` contains secrets, restrict file
 > permissions: `chmod 600 Settings.toml`.

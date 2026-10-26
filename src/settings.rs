@@ -117,6 +117,22 @@ pub struct ForgeSettings {
     pub app_private_key: Option<String>,
     #[serde(default)]
     pub app_private_key_path: Option<String>,
+    /// GitHub `"owner/repo"` repositories to reconcile periodically via the
+    /// Pulls REST API. Accepts either a TOML array or a comma-separated string
+    /// via `SASHIKO__FORGE__REPOS`. When empty and `forge.enabled = true`,
+    /// auto-detects the GitHub repository from the `origin` remote of
+    /// `git.repository_path`.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub repos: Vec<String>,
+    /// Interval in seconds between periodic GitHub Pulls REST API
+    /// reconciliation passes (`0` disables polling while keeping webhook
+    /// ingestion active).
+    #[serde(default = "default_forge_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_forge_poll_interval_secs() -> u64 {
+    120
 }
 
 fn default_true() -> bool {
@@ -1349,6 +1365,8 @@ fn default_forge() -> ForgeSettings {
         installation_id: None,
         app_private_key: None,
         app_private_key_path: None,
+        repos: Vec::new(),
+        poll_interval_secs: default_forge_poll_interval_secs(),
     }
 }
 
@@ -2173,5 +2191,37 @@ mod tests {
 
         settings.ai.model = "gemini-3.1-pro-preview".to_string();
         assert_eq!(settings.effective_effort(), None);
+    }
+
+    #[test]
+    fn test_forge_repos_and_poll_interval_deserialization() {
+        let def = default_forge();
+        assert!(!def.enabled);
+        assert!(def.repos.is_empty());
+        assert_eq!(def.poll_interval_secs, 120);
+
+        let from_toml: ForgeSettings = toml::from_str(
+            "enabled = true\nrepos = [\"sashiko-dev/sashiko\", \"torvalds/linux\"]\npoll_interval_secs = 60\n",
+        )
+        .unwrap();
+        assert!(from_toml.enabled);
+        assert_eq!(
+            from_toml.repos,
+            vec!["sashiko-dev/sashiko", "torvalds/linux"]
+        );
+        assert_eq!(from_toml.poll_interval_secs, 60);
+
+        let from_env_str: ForgeSettings = serde_json::from_str(
+            r#"{"enabled": true, "repos": "sashiko-dev/sashiko, torvalds/linux , "}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            from_env_str.repos,
+            vec!["sashiko-dev/sashiko", "torvalds/linux"]
+        );
+        assert_eq!(from_env_str.poll_interval_secs, 120);
+
+        let empty_env: ForgeSettings = serde_json::from_str(r#"{"repos": ""}"#).unwrap();
+        assert!(empty_env.repos.is_empty());
     }
 }
