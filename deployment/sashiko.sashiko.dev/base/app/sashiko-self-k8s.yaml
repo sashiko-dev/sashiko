@@ -56,10 +56,10 @@ spec:
       containers:
         - name: sashiko
           image: us-docker.pkg.dev/GCP_PROJECT_ID/sashiko-repository/sashiko:next
-          # The image entrypoint provisions the Linux kernel tree, which this
-          # instance never reviews. This entrypoint provisions the Sashiko
-          # repository instead and then execs the same binary.
-          command: ["/bin/bash", "/usr/local/bin/sashiko-self-entrypoint.sh"]
+          # The image entrypoint provisions the tree of whichever project
+          # SASHIKO__PROJECT__KIND names, here the Sashiko repository, and
+          # then execs the binary.
+          command: ["/bin/bash", "/usr/local/bin/docker-entrypoint.sh"]
           args: ["--debug"]
           imagePullPolicy: Always
           resources:
@@ -119,10 +119,6 @@ spec:
               value: "sashiko.sashiko.dev"
             - name: SASHIKO__DATABASE__URL
               value: "/data/db/sashiko-self.db"
-            # Read by the entrypoint, not by the binary: it names the tree to
-            # clone into SASHIKO__GIT__REPOSITORY_PATH.
-            - name: SASHIKO_SELF_REPOSITORY_URL
-              value: "https://github.com/sashiko-dev/sashiko.git"
             - name: SASHIKO__GIT__REPOSITORY_PATH
               value: "/app/third_party/sashiko"
             - name: SASHIKO__REVIEW__WORKTREE_DIR
@@ -233,9 +229,6 @@ spec:
             - name: sashiko-self-storage
               mountPath: /app/third_party/sashiko
               subPath: sashiko-repo
-            - name: entrypoint
-              mountPath: /usr/local/bin/sashiko-self-entrypoint.sh
-              subPath: sashiko-self-entrypoint.sh
             - name: worktrees
               mountPath: /mnt/worktrees
             - name: tmp-volume
@@ -250,7 +243,3 @@ spec:
           emptyDir: {}
         - name: tmp-volume
           emptyDir: {}
-        - name: entrypoint
-          configMap:
-            name: sashiko-self-entrypoint
-            defaultMode: 0755
