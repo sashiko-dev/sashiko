@@ -94,6 +94,51 @@ impl ProjectId {
             ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
         }
     }
+
+    /// Where this project's code comes from: the tree `sashiko repo sync`
+    /// clones and the daemon reviews patches against.
+    pub fn upstream(self) -> Upstream {
+        match self {
+            ProjectId::Linux => Upstream {
+                url: "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+                // Several GB, served from a CDN: a clone that starts from it
+                // takes only the last few days of history from the git server.
+                seed: Seed::Bundle(
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/clone.bundle",
+                ),
+            },
+            ProjectId::Sashiko => Upstream {
+                url: "https://github.com/sashiko-dev/sashiko.git",
+                seed: Seed::None,
+            },
+        }
+    }
+}
+
+/// The repository a project's tree is cloned from and kept up to date with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Upstream {
+    /// Where `origin` points and every fetch comes from.
+    pub url: &'static str,
+    /// A faster source for the initial clone.
+    pub seed: Seed,
+}
+
+/// A faster source for a project's initial clone than its upstream.
+///
+/// A seed only ever saves time: a clone whose seed fails is retried from the
+/// upstream alone, so a seed going stale or away degrades a first clone to a
+/// slow one rather than to a failed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seed {
+    /// The upstream alone.
+    None,
+    /// A git bundle downloaded before the clone talks to the upstream, which
+    /// then sends only what the bundle lacks.
+    Bundle(&'static str),
+    /// A mirror cloned first. `origin` is then pointed at the upstream and
+    /// fetched, so only the difference comes from it.
+    Mirror(&'static str),
 }
 
 impl fmt::Display for ProjectId {
@@ -191,6 +236,28 @@ mod tests {
     fn test_display_name() {
         assert_eq!(ProjectId::Linux.display_name(), "Linux");
         assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
+    }
+
+    #[test]
+    fn test_upstreams_use_network_protocols_git_allows() {
+        // repo sync clones and fetches under GIT_PROTOCOL_RESTRICTIONS, and
+        // a seed is fetched over the network too; anything but these schemes
+        // would be refused there rather than here.
+        let allowed = |url: &str| url.starts_with("https://") || url.starts_with("git://");
+        for project in ProjectId::ALL {
+            let upstream = project.upstream();
+            assert!(allowed(upstream.url), "{project}: {}", upstream.url);
+            match upstream.seed {
+                Seed::None => {}
+                Seed::Bundle(url) | Seed::Mirror(url) => {
+                    assert!(allowed(url), "{project} seed: {url}");
+                    assert_ne!(
+                        url, upstream.url,
+                        "{project}: a seed must not be the upstream"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
