@@ -18,11 +18,21 @@ See also:
 ### 1. Clone the repository
 
 ```bash
-git clone --recursive https://github.com/sashiko-dev/sashiko.git
+git clone https://github.com/sashiko-dev/sashiko.git
 cd sashiko
 ```
 
-*Note: The `--recursive` flag initializes the `third_party/linux` reference kernel submodule and prompt submodules.*
+Then fetch the reference kernel tree the daemon applies and reviews
+patches against:
+
+```bash
+make repo
+```
+
+This clones Linus's tree with full history (several GB) into
+`third_party/linux`; run it again later to fetch new commits. The daemon
+reads the tree from `[git] repository_path`, so any existing kernel clone
+works too: point that setting at it instead of cloning another copy.
 
 ### 2. Configure
 
@@ -31,6 +41,21 @@ Copy the example configuration and set your LLM API key:
 ```bash
 cp docs/examples/Settings.example.toml Settings.toml
 export LLM_API_KEY="your-api-key-here"
+```
+
+The example targets local review and lacks the three settings the daemon
+refuses to start without. Add them, putting `worktree_dir` into the
+example's existing `[review]` table:
+
+```toml
+[database]
+url = "sashiko.db"
+
+[git]
+repository_path = "third_party/linux"
+
+[review]
+worktree_dir = "review_trees"
 ```
 
 For a full reference of every setting, see the [Configuration Reference](configuration.md). The default `Settings.toml` includes sections for:
