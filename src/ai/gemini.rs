@@ -1205,6 +1205,13 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
                 "Gemini candidate blocked (finish reason: {})",
                 finish_reason
             ));
+        } else if finish_reason == "MALFORMED_FUNCTION_CALL"
+            || finish_reason == "UNEXPECTED_TOOL_CALL"
+        {
+            return Err(anyhow::anyhow!(
+                "Gemini candidate failed tool call (finish reason: {})",
+                finish_reason
+            ));
         } else if finish_reason != "STOP"
             && finish_reason != "MAX_TOKENS"
             && finish_reason != "CONTINUATION"
@@ -2954,5 +2961,31 @@ mod tests {
             None,
             "duplicate continuation token must stop the loop"
         );
+    }
+
+    #[test]
+    fn test_translate_ai_response_rejects_malformed_and_unexpected_tool_calls() {
+        for reason in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"] {
+            let resp = GenerateContentResponse {
+                candidates: Some(vec![Candidate {
+                    content: Content::default(),
+                    finish_reason: Some(reason.to_string()),
+                    continuation_token: None,
+                }]),
+                prompt_feedback: None,
+                usage_metadata: None,
+            };
+            let err = translate_ai_response(resp)
+                .expect_err("failed tool call finish reason must surface as Err");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(reason),
+                "error message {msg:?} must preserve finish reason {reason}"
+            );
+            assert!(
+                !msg.contains("blocked"),
+                "tool-call failure error {msg:?} must not trigger recitation/block handling"
+            );
+        }
     }
 }

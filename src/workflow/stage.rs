@@ -475,9 +475,18 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
         }
     }
 
-    fn handle_provider_error(&mut self, error: &anyhow::Error, _attempt: usize) -> ErrorAction {
+    fn handle_provider_error(
+        &mut self,
+        error: &anyhow::Error,
+        _attempt: usize,
+        has_active_tools: bool,
+    ) -> ErrorAction {
         let err_str = error.to_string();
-        if err_str.contains("RECITATION") || err_str.contains("blocked") {
+        if crate::ai::session::is_malformed_tool_call_error(&err_str) {
+            ErrorAction::RetryWithFeedback(crate::ai::session::malformed_tool_call_feedback(
+                has_active_tools,
+            ))
+        } else if err_str.contains("RECITATION") || err_str.contains("blocked") {
             match &self.stage.policy.recitation_policy {
                 RecitationPolicy::Fail => ErrorAction::Fail,
                 RecitationPolicy::RetryWithReminder(reminder) => {
@@ -1070,5 +1079,115 @@ mod tests {
         let mut state = String::new();
         (stage.reducer)(&mut state, "ok".to_string());
         assert_eq!(state, "plain:ok");
+    }
+
+    struct MalformedToolCallThenTextProvider {
+        seen: Mutex<Vec<AiRequest>>,
+        reply: String,
+    }
+
+    #[async_trait]
+    impl AiProvider for MalformedToolCallThenTextProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(request);
+            if seen.len() == 1 {
+                anyhow::bail!(
+                    "Gemini candidate failed tool call (finish reason: MALFORMED_FUNCTION_CALL)"
+                );
+            }
+            Ok(AiResponse {
+                content: Some(self.reply.clone()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_malformed_function_call_retries_with_no_tools_feedback_and_keeps_validator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MalformedToolCallThenTextProvider {
+            seen: Mutex::new(Vec::new()),
+            reply: "Valid plain-text summary without backticks.".to_string(),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("summary")
+            .user_prompt(PromptTemplate::new("summarize patch"))
+            .output_format(OutputFormat::text_with_validator(
+                |text, _| {
+                    if text.contains('`') || text.trim().is_empty() {
+                        Err("invalid summary".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |v| v.to_string(),
+            ))
+            .policy(StagePolicy {
+                tools: ToolScope::None,
+                max_turns: 1,
+                recitation_policy: RecitationPolicy::FallbackToFreeForm {
+                    reminder: "recitation reminder".to_string(),
+                },
+                ..Default::default()
+            })
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("tool-free stage must recover from MALFORMED_FUNCTION_CALL");
+
+        {
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            let retry_msg = seen[1]
+                .messages
+                .last()
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or("");
+            assert!(
+                retry_msg.contains("No tools are available in this stage"),
+                "expected no-tools feedback, got {retry_msg:?}"
+            );
+        }
+
+        // Verify recitation_fallback_active was NOT enabled by MALFORMED_FUNCTION_CALL:
+        // an invalid response containing backticks must still be rejected by the validator.
+        let bad_provider = Arc::new(MalformedToolCallThenTextProvider {
+            seen: Mutex::new(Vec::new()),
+            reply: "Invalid `backtick` summary".to_string(),
+        });
+        let bad_env = WorkflowEnv {
+            provider: bad_provider,
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+        assert!(
+            stage
+                .execute_isolated(&bad_env, &EmptyState, None)
+                .await
+                .is_err(),
+            "output validator must remain active after MALFORMED_FUNCTION_CALL retry"
+        );
     }
 }

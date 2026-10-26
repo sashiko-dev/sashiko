@@ -2005,10 +2005,17 @@ impl LlmSession for BenchmarkEvalSession {
 
     fn handle_provider_error(
         &mut self,
-        _error: &anyhow::Error,
+        error: &anyhow::Error,
         _attempt: usize,
+        has_active_tools: bool,
     ) -> crate::ai::ErrorAction {
-        crate::ai::ErrorAction::Fail
+        if crate::ai::session::is_malformed_tool_call_error(&error.to_string()) {
+            crate::ai::ErrorAction::RetryWithFeedback(
+                crate::ai::session::malformed_tool_call_feedback(has_active_tools),
+            )
+        } else {
+            crate::ai::ErrorAction::Fail
+        }
     }
 }
 

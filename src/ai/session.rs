@@ -142,10 +142,19 @@ pub trait LlmSession: Send {
     /// Validates the final response content.
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError>;
 
-    /// Hook to handle provider errors (e.g. safety blocks, rate limits).
-    fn handle_provider_error(&mut self, error: &anyhow::Error, _attempt: usize) -> ErrorAction {
+    /// Hook to handle provider errors (e.g. safety blocks, malformed tool calls).
+    /// `has_active_tools` reflects whether tool declarations were active on the
+    /// failed request (false when tools are disabled or stripped on the final turn).
+    fn handle_provider_error(
+        &mut self,
+        error: &anyhow::Error,
+        _attempt: usize,
+        has_active_tools: bool,
+    ) -> ErrorAction {
         let err_str = error.to_string();
-        if err_str.contains("RECITATION") || err_str.contains("blocked") {
+        if is_malformed_tool_call_error(&err_str) {
+            ErrorAction::RetryWithFeedback(malformed_tool_call_feedback(has_active_tools))
+        } else if err_str.contains("RECITATION") || err_str.contains("blocked") {
             ErrorAction::RetryWithFeedback(
                 "IMPORTANT: Your previous response was blocked by a recitation filter. \
                  Please do NOT copy large blocks of code verbatim in your response. \
@@ -155,6 +164,23 @@ pub trait LlmSession: Send {
         } else {
             ErrorAction::Fail
         }
+    }
+}
+
+pub(crate) fn is_malformed_tool_call_error(err_str: &str) -> bool {
+    err_str.contains("MALFORMED_FUNCTION_CALL") || err_str.contains("UNEXPECTED_TOOL_CALL")
+}
+
+pub(crate) fn malformed_tool_call_feedback(has_tools: bool) -> String {
+    if has_tools {
+        "IMPORTANT: Your previous tool call was malformed or unexpected and could not be executed. \
+         Either respond directly in the required output format without calling tools, or emit a \
+         valid tool call matching one of the declared tool schemas."
+            .to_string()
+    } else {
+        "IMPORTANT: No tools are available in this stage. Do NOT attempt to call any tools; \
+         respond directly in the required output format using only the provided context."
+            .to_string()
     }
 }
 
@@ -244,6 +270,7 @@ impl<'a> SessionRunner<'a> {
         let mut rejected: Vec<AiRequest> = Vec::new();
         let mut transient_retries: usize = 0;
         let mut provider_error_retries = 0;
+        let mut pushed_final_turn_prompt = false;
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
@@ -282,7 +309,8 @@ impl<'a> SessionRunner<'a> {
             }
 
             let is_final_turn = turns == self.max_turns;
-            if is_final_turn && turns > 1 {
+            if is_final_turn && turns > 1 && !pushed_final_turn_prompt {
+                pushed_final_turn_prompt = true;
                 let final_prompt = AiMessage {
                     role: AiRole::User,
                     content: Some(
@@ -342,10 +370,18 @@ impl<'a> SessionRunner<'a> {
                         continue;
                     }
                     AiErrorClass::Fatal => {
-                        match session.handle_provider_error(&e, provider_error_retries) {
+                        let has_active_tools = sent.tools.as_ref().is_some_and(|t| !t.is_empty());
+                        match session.handle_provider_error(
+                            &e,
+                            provider_error_retries,
+                            has_active_tools,
+                        ) {
                             ErrorAction::RetryWithFeedback(feedback) => {
                                 provider_error_retries = provider_error_retries.saturating_add(1);
                                 if provider_error_retries > self.max_provider_error_retries {
+                                    for request in &rejected {
+                                        self.provider.forget(request).await;
+                                    }
                                     return Err(make_failure(
                                         format!(
                                             "Session failed after {} provider error retries. Last error: {}",
@@ -371,6 +407,9 @@ impl<'a> SessionRunner<'a> {
                                 continue;
                             }
                             ErrorAction::Fail => {
+                                for request in &rejected {
+                                    self.provider.forget(request).await;
+                                }
                                 let message = e.to_string();
                                 return Err(e.context(SessionFailure {
                                     message,
@@ -707,5 +746,121 @@ mod tests {
                     .contains("TURN BUDGET EXHAUSTED")
         });
         assert!(exhausted_msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_recovers_from_unexpected_tool_call_on_final_turn_without_duplicate_budget_prompt()
+     {
+        struct FinalTurnMalformedProvider {
+            calls: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl AiProvider for FinalTurnMalformedProvider {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                match *calls {
+                    1 => Ok(AiResponse {
+                        content: None,
+                        thought: None,
+                        thought_signature: None,
+                        tool_calls: Some(vec![ToolCall {
+                            id: "call_1".to_string(),
+                            function_name: "ok_tool".to_string(),
+                            arguments: serde_json::json!({}),
+                            thought_signature: None,
+                        }]),
+                        usage: None,
+                        truncated: false,
+                    }),
+                    2 => anyhow::bail!(
+                        "Gemini candidate failed tool call (finish reason: UNEXPECTED_TOOL_CALL)"
+                    ),
+                    _ => Ok(AiResponse {
+                        content: Some("Recovered final verdict".to_string()),
+                        thought: None,
+                        thought_signature: None,
+                        tool_calls: None,
+                        usage: None,
+                        truncated: false,
+                    }),
+                }
+            }
+
+            fn get_capabilities(&self) -> super::super::ProviderCapabilities {
+                super::super::ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 100_000,
+                }
+            }
+        }
+
+        let provider = FinalTurnMalformedProvider {
+            calls: std::sync::Mutex::new(0),
+        };
+        let runner = SessionRunner::new(&provider).with_max_turns(2);
+
+        struct ToolEnabledSession;
+        #[async_trait]
+        impl LlmSession for ToolEnabledSession {
+            type Output = String;
+
+            fn system_prompt(&self) -> String {
+                "sys".to_string()
+            }
+
+            fn initial_user_prompt(&self) -> String {
+                "user".to_string()
+            }
+
+            fn tools(&self) -> Option<Vec<AiTool>> {
+                Some(vec![AiTool {
+                    name: "ok_tool".to_string(),
+                    description: "ok".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }])
+            }
+
+            async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+                Ok(serde_json::json!({"result": "success"}))
+            }
+
+            fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+                Ok(response.content.clone().unwrap_or_default())
+            }
+        }
+
+        let mut session = ToolEnabledSession;
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "Recovered final verdict");
+
+        let exhausted_count = res
+            .history
+            .iter()
+            .filter(|m| {
+                m.role == AiRole::User
+                    && m.content
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("TURN BUDGET EXHAUSTED")
+            })
+            .count();
+        assert_eq!(
+            exhausted_count, 1,
+            "final-turn retry must not duplicate TURN BUDGET EXHAUSTED prompt"
+        );
+        let feedback_has_no_tools = res.history.iter().any(|m| {
+            m.role == AiRole::User
+                && m.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("No tools are available in this stage")
+        });
+        assert!(
+            feedback_has_no_tools,
+            "final-turn retry after tools are stripped must instruct model not to call tools"
+        );
     }
 }
