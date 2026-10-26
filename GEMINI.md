@@ -94,11 +94,11 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 
 **CRITICAL RULE:** Never run the full (`benchmark.json`) or small (`benchmark_small.json`) benchmarks without an explicit human request.
 
-See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Available suites in `benchmarks/`:
+See `docs/benchmarking.md` for full setup and CLI options (`sashiko benchmark <path>` or `cargo run --bin sashiko -- benchmark <path>`). Available suites in `projects/linux/benchmarks/`:
 - `benchmark.json` (999 entries, full suite)
 - `benchmark_small.json` (99 entries, standard suite)
 - `benchmark_tiny.json` (9 entries, quick iteration)
-- `benchmark_smoke.json` (3 entries, smoke test)
+- `benchmark_missed.json` (upstream fixes for bugs missed by Sashiko after public launch)
 - `benchmark_preexisting.json` (known Linux bugs for testing the pre-existing bug pipeline)
 
 # LLM Workflow Design

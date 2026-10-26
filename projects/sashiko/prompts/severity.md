@@ -87,8 +87,9 @@ auditable.
       review quality, detection rate, or false-positive rate across the board
       (e.g. Linux prompts in `projects/linux/prompts/`, stage instructions,
       workflow graph, planner logic, or verification/deduplication rules). Note:
-      `benchmarks/*.json` are static positive-bug suites and are never modified
-      by prompt or workflow commits; do not flag a missing diff in `benchmarks/`.
+      `projects/*/benchmarks/*.json` are static positive-bug suites and are never
+      modified by prompt or workflow commits; do not flag a missing diff in
+      `projects/*/benchmarks/`.
 
 ## Medium
 

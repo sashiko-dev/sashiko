@@ -5212,8 +5212,11 @@ mod tests {
 
     #[test]
     fn test_cli_benchmark() {
-        let positional =
-            Cli::parse_from(["sashiko", "benchmark", "benchmarks/benchmark_smoke.json"]);
+        let positional = Cli::parse_from([
+            "sashiko",
+            "benchmark",
+            "projects/linux/benchmarks/benchmark_tiny.json",
+        ]);
         match &positional.command {
             Some(Commands::Benchmark {
                 file,
@@ -5224,7 +5227,7 @@ mod tests {
             }) => {
                 assert_eq!(
                     file.as_deref(),
-                    Some(Path::new("benchmarks/benchmark_smoke.json"))
+                    Some(Path::new("projects/linux/benchmarks/benchmark_tiny.json"))
                 );
                 assert!(file_flag.is_none());
                 assert!(!analyze_only);
@@ -5237,7 +5240,7 @@ mod tests {
             "sashiko",
             "benchmark",
             "--file",
-            "benchmarks/benchmark_tiny.json",
+            "projects/linux/benchmarks/benchmark_small.json",
             "--analyze-only",
             "--concurrency",
             "4",
@@ -5264,7 +5267,7 @@ mod tests {
                 assert!(file.is_none());
                 assert_eq!(
                     file_flag.as_deref(),
-                    Some(Path::new("benchmarks/benchmark_tiny.json"))
+                    Some(Path::new("projects/linux/benchmarks/benchmark_small.json"))
                 );
                 assert!(analyze_only);
                 assert_eq!(concurrency, Some(4));

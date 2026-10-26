@@ -15,6 +15,7 @@ exclude = [
     "llama.cpp/",
     "archives/",
     "benchmarks/runs/",
+    "projects/*/benchmarks/",
     "review_trees/",
     "deployment/",
     "designs/",

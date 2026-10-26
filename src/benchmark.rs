@@ -2564,7 +2564,7 @@ mod tests {
     #[test]
     fn test_prepare_benchmark_run_paths_creates_run_dir_with_sha_and_date() -> Result<()> {
         let temp = tempdir()?;
-        let bench_file = Path::new("benchmarks/benchmark_tiny.json");
+        let bench_file = Path::new("projects/linux/benchmarks/benchmark_tiny.json");
         let paths = prepare_benchmark_run_paths(
             temp.path(),
             bench_file,
@@ -2602,7 +2602,7 @@ mod tests {
         // Verify analyze_only fails cleanly when no prior run exists for a suite.
         let missing_err = prepare_benchmark_run_paths(
             temp.path(),
-            Path::new("benchmarks/nonexistent_suite.json"),
+            Path::new("projects/linux/benchmarks/nonexistent_suite.json"),
             "20261019-160000",
             "715294a276ef",
             None,

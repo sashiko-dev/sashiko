@@ -11,28 +11,27 @@ ground-truth descriptions.
 
 - `Settings.toml` (or `~/.config/sashiko.toml`) with a configured LLM provider
   and git repository path
-- A benchmark JSON file (several are provided in `benchmarks/`)
+- A benchmark JSON file (Linux suites are provided in `projects/linux/benchmarks/`)
 
 ## Quick start
 
 ```bash
 # Run a benchmark suite (creates an isolated database and run directory automatically)
-sashiko benchmark benchmarks/benchmark_smoke.json
+sashiko benchmark projects/linux/benchmarks/benchmark_tiny.json
 
 # Or via cargo
-cargo run --bin sashiko -- benchmark benchmarks/benchmark_smoke.json
+cargo run --bin sashiko -- benchmark projects/linux/benchmarks/benchmark_tiny.json
 ```
 
 ## Benchmark files
 
 | File | Description |
 |------|-------------|
-| `benchmarks/benchmark_smoke.json` | CI smoke test set (3 entries). |
-| `benchmarks/benchmark_tiny.json` | Minimal set for quick iteration (9 entries). |
-| `benchmarks/benchmark_small.json` | Standard set for development iteration (99 entries). |
-| `benchmarks/benchmark.json` | Full benchmark suite (999 entries). |
-| `benchmarks/benchmark_missed.json` | Upstream fixes for bugs missed by Sashiko after public launch. |
-| `benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
+| `projects/linux/benchmarks/benchmark_tiny.json` | Minimal set for quick iteration (9 entries). |
+| `projects/linux/benchmarks/benchmark_small.json` | Standard set for development iteration (99 entries). |
+| `projects/linux/benchmarks/benchmark.json` | Full benchmark suite (999 entries). |
+| `projects/linux/benchmarks/benchmark_missed.json` | Upstream fixes for bugs missed by Sashiko after public launch. |
+| `projects/linux/benchmarks/benchmark_preexisting.json` | Tests detection of pre-existing bugs. |
 
 Each file contains entries with a `Commit` hash, an optional `Fixed-by`
 reference, an optional `Subsystem`, and a `problem_description` that the AI
@@ -91,8 +90,8 @@ To re-score a previous benchmark run without re-running ingestion or reviews:
 
 ```bash
 # Automatically discovers the most recent preserved database for this suite
-sashiko benchmark benchmarks/benchmark_small.json --analyze-only
+sashiko benchmark projects/linux/benchmarks/benchmark_small.json --analyze-only
 
 # Or specify an explicit database file
-sashiko benchmark benchmarks/benchmark_small.json --analyze-only --db benchmarks/runs/<run>/sashiko-<ts>-<sha>.db
+sashiko benchmark projects/linux/benchmarks/benchmark_small.json --analyze-only --db benchmarks/runs/<run>/sashiko-<ts>-<sha>.db
 ```

@@ -162,7 +162,7 @@ Sashiko exclusively targets Linux/Unix operating systems. Never report Windows
 or non-Unix portability issues (such as `tokio::signal::unix`, `rustix`,
 `/dev/ptmx`, `libc`, POSIX paths, or Unix signals) as findings.
 
-### 11. Unnecessary demands for validation or `benchmarks/` file diffs
+### 11. Unnecessary demands for validation or benchmark corpus file diffs
 
 Do not ask authors to add manual test procedures, validation logs, or benchmark
 numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits, nor
@@ -174,9 +174,9 @@ code-notes snapshots (`projects/*/prompts/notes/<set>/`), nor for post-triage
 maintenance tasks (such as periodic upstream fix checks on already-triaged open
 bugs) or filtering pre-existing issues out of patch review reports that are not
 exercised by the patch-review or initial bug-discovery benchmark suites
-(`benchmarks/`).
+(`projects/*/benchmarks/`).
 Furthermore, **never** report that a prompt or workflow commit failed to add or
-modify test cases in the `benchmarks/` directory: `benchmarks/*.json` are static
+modify test cases in `projects/*/benchmarks/`: `projects/*/benchmarks/*.json` are static
 ground-truth datasets of known positive kernel bugs (`BenchmarkEntry` in
 `src/benchmark.rs`) and do not support negative/false-positive test cases or
 per-commit test additions. For targeted false-positive refinements in

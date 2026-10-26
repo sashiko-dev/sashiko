@@ -102,7 +102,7 @@ already-triaged open bugs), cross-bug database deduplication against previously
 stored bugs (`DedupSession`, `BUG_DEDUP_LOCK`, `list_all_bugs_for_vector_search`),
 or filtering pre-existing issues out of patch review reports that are not
 exercised by the clean-database patch-review or initial bug-discovery benchmark
-suites (`benchmarks/`). However, any change that can meaningfully
+suites (`projects/*/benchmarks/`). However, any change that can meaningfully
 affect overall Linux AI patch-review or initial bug-discovery quality across the
 board — such as global Linux patch-review or initial bug-discovery stage
 instructions (`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph
@@ -110,11 +110,11 @@ structure, model parameters, shared verification/deduplication logic, or broad
 cross-subsystem Linux prompt changes (`projects/linux/prompts/*.md`, `general.md`) —
 must include validation evidence in the commit message (either benchmark suite
 evaluation results or, for targeted false-positive prompt refinements, local
-re-review results on the affected Linux patches/series). Note that the JSON files in `benchmarks/` are static
+re-review results on the affected Linux patches/series). Note that the JSON files in `projects/*/benchmarks/` are static
 ground-truth corpora of known positive bugs (`BenchmarkEntry` in
 `src/benchmark.rs`) and do not store negative/false-positive test cases;
-**never** demand that a prompt or workflow commit modify or add files in the
-`benchmarks/` directory. Flag Linux review-quality changes that provide no
+**never** demand that a prompt or workflow commit modify or add files in
+`projects/*/benchmarks/`. Flag Linux review-quality changes that provide no
 validation evidence in the commit message or risk silent regressions in detection
 rate or precision (including over-broad suppression bullets or overly generic
 `paths`/`symbols` triggers in `projects/linux/prompts/maintainers/*.md`) as

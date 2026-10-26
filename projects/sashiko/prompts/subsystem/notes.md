@@ -74,7 +74,7 @@ bugs:
   subsystem preference, convention, or narrowly-scoped policy is a **policy
   configuration change** (analogous to `projects/linux/mailing_lists.toml`),
   not a global bug-detection heuristic change.
-- Do **not** demand benchmark suite runs (`benchmarks/*.json`) or multi-paragraph
+- Do **not** demand benchmark suite runs (`projects/*/benchmarks/*.json`) or multi-paragraph
   commit-message essays when a commit adds or updates subsystem maintainer
   preferences in `projects/linux/prompts/maintainers/*.md` and its intent is
   self-explanatory. Only require re-review or benchmark validation when a prompt
