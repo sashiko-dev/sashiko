@@ -308,11 +308,15 @@ Generate the plain-text inline review report following the exact formatting rule
 - Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
 - Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
 
+const SUMMARY_SYSTEM_PROMPT: &str = r#"You are a principal Rust and distributed systems engineer maintaining Sashiko, an automated AI patch review system.
+Your task in this stage is to write a concise plain-text summary of the proposed change based strictly on the patch or series context provided below.
+No repository exploration or Git tools are available in this stage. Do not attempt to invoke tools; derive the summary solely from the provided context."#;
+
 const STAGE_SUMMARY_INSTRUCTION: &str = r#"# Summarize the proposed change
 
 Provide a concise plain-text summary explaining what this commit/change does and why.
 - Start with 1-2 sentences describing the core change and its rationale.
-- User-Visible Effect Rule: If this commit has any user-visible effect (for example: adding or changing a cmdline option/subcommand/output, adding or changing a configuration setting, changing the format of generated emails or GitHub PR comments, changing REST API responses, or altering Web UI display), you MUST explicitly describe that user-visible effect and provide a concrete 'Before:' and 'After:' example showing how it looked or worked before vs. how it will look or work for a user after this change:
+- User-Visible Effect Rule: Judge user-visible impact strictly from the provided commit message and diff. If they show a concrete user-visible effect (for example: adding or changing a cmdline option/subcommand/output, adding or changing a configuration setting, changing the format of generated emails or GitHub PR comments, changing REST API responses, or altering Web UI display), explicitly describe that user-visible effect and provide a concrete 'Before:' and 'After:' example showing how it looked or worked before vs. how it will look or work for a user after this change:
 
 Before:
   <how it was or looked for a user before>
@@ -320,7 +324,7 @@ Before:
 After:
   <how it will look or work for a user after>
 
-- If the change is strictly internal with no user-visible effect (e.g. internal refactoring, unit test additions, or internal prompt tuning without output format changes), omit the 'Before:' / 'After:' section and keep the summary to 1-2 sentences.
+- If the change is strictly internal or no user-visible effect is evident from the provided commit message and diff alone (e.g. internal refactoring, helper/plumbing changes, unit test additions, or internal prompt tuning without output format changes), omit the 'Before:' / 'After:' section and keep the summary to 1-2 sentences rather than guessing.
 - Use strictly plain text: no markdown, no backticks, no markdown headings ('#'), and no bullet points.
 - Wrap prose lines at 78 characters or fewer (keep indented 'Before:' and 'After:' example lines concise as well, though long CLI commands, URLs, or output lines may exceed 78 characters when necessary).
 - Summarize the change itself (do not list review findings or issues here)."#;
@@ -328,8 +332,8 @@ After:
 const STAGE_SERIES_SUMMARY_INSTRUCTION: &str = r#"# Summarize the proposed patch series or pull request
 
 Provide a concise plain-text summary explaining what this patch series / pull request does as a whole and why.
-- Start with 1-2 sentences describing the overarching goal, architectural changes, and rationale across the series (`1/N .. N/N`).
-- User-Visible Effect Rule: If this series has any user-visible effect (for example: adding or changing a cmdline option/subcommand/output, adding or changing a configuration setting, changing the format of generated emails or GitHub PR comments, changing REST API responses, or altering Web UI display), you MUST explicitly describe that user-visible effect and provide a concrete 'Before:' and 'After:' example showing how it looked or worked before vs. how it will look or work for a user after this series:
+- Start with 1-2 sentences describing the overarching goal, architectural changes, and rationale across the series (1/N .. N/N).
+- User-Visible Effect Rule: Judge user-visible impact strictly from the provided series context. If it shows a concrete user-visible effect (for example: adding or changing a cmdline option/subcommand/output, adding or changing a configuration setting, changing the format of generated emails or GitHub PR comments, changing REST API responses, or altering Web UI display), explicitly describe that user-visible effect and provide a concrete 'Before:' and 'After:' example showing how it looked or worked before vs. how it will look or work for a user after this series:
 
 Before:
   <how it was or looked for a user before>
@@ -337,7 +341,7 @@ Before:
 After:
   <how it will look or work for a user after>
 
-- If the series is strictly internal with no user-visible effect, omit the 'Before:' / 'After:' section and keep the summary to 1-2 sentences.
+- If the series is strictly internal or no user-visible effect is evident from the provided series context alone, omit the 'Before:' / 'After:' section and keep the summary to 1-2 sentences rather than guessing.
 - Use strictly plain text: no markdown, no backticks, no markdown headings ('#'), and no bullet points.
 - Wrap prose lines at 78 characters or fewer (keep indented 'Before:' and 'After:' example lines concise as well, though long CLI commands, URLs, or output lines may exceed 78 characters when necessary).
 - Summarize the series itself (do not list review findings or issues here)."#;
@@ -1355,6 +1359,15 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
         .build()
 }
 
+fn sashiko_summary_system_prompt() -> PromptTemplate<SashikoPatchReviewState> {
+    PromptTemplate::new(format!(
+        "{SUMMARY_SYSTEM_PROMPT}\n\n=== Target Commit / Patch ===\n{{{{target_commit_diff}}}}"
+    ))
+    .with_var("target_commit_diff", |s: &SashikoPatchReviewState| {
+        s.target_commit_diff.clone()
+    })
+}
+
 pub fn summary_stage(max_turns: usize, temperature: f32) -> Stage<SashikoPatchReviewState, String> {
     summary_stage_with_effort(max_turns, temperature, None)
 }
@@ -1365,7 +1378,7 @@ pub fn summary_stage_with_effort(
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<SashikoPatchReviewState, String> {
     Stage::builder(SUMMARY.name)
-        .system_prompt(sashiko_system_prompt(true))
+        .system_prompt(sashiko_summary_system_prompt())
         .user_prompt(PromptTemplate::<SashikoPatchReviewState>::new(
             STAGE_SUMMARY_INSTRUCTION,
         ))
@@ -1405,7 +1418,7 @@ pub fn series_summary_stage_with_effort(
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<SashikoPatchReviewState, String> {
     Stage::builder(SUMMARY.name)
-        .system_prompt(sashiko_system_prompt(true))
+        .system_prompt(sashiko_summary_system_prompt())
         .user_prompt(PromptTemplate::<SashikoPatchReviewState>::new(
             STAGE_SERIES_SUMMARY_INSTRUCTION,
         ))
@@ -1644,11 +1657,61 @@ mod tests {
         assert!(STAGE_SUMMARY_INSTRUCTION.contains("Before:"));
         assert!(STAGE_SUMMARY_INSTRUCTION.contains("After:"));
         assert!(!STAGE_SUMMARY_INSTRUCTION.contains('`'));
+        assert!(!SUMMARY_SYSTEM_PROMPT.contains('`'));
         assert!(validate_summary_format("   ", &state).is_err());
         assert!(validate_summary_format("Uses `backticks` in summary.", &state).is_err());
         assert!(validate_summary_format("Summary: prefixed summary.", &state).is_err());
         assert!(validate_summary_format("# Top-level heading in summary", &state).is_err());
         assert!(validate_summary_format(&long_line, &state).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_summary_stage_uses_tool_free_prompt_with_target_diff() {
+        let prompts_dir = std::path::Path::new("projects/sashiko/prompts");
+        let state = SashikoPatchReviewState {
+            target_commit_diff: "commit abc123\n+pub fn new_helper() {}".to_string(),
+            prefetched_context: "fn caller() {}".to_string(),
+            prefetch_failed: false,
+            selected_guides: vec!["workflow-engine.md".to_string()],
+            ..Default::default()
+        };
+        for stage in [summary_stage(1, 0.2), series_summary_stage(1, 0.2)] {
+            assert!(matches!(stage.policy.tools, ToolScope::None));
+            assert_eq!(stage.policy.max_turns, 1);
+
+            let sys = stage
+                .system_prompt
+                .as_ref()
+                .expect("summary stage must define a system prompt")
+                .render_for_model(&state, prompts_dir)
+                .await
+                .unwrap();
+            let user = stage
+                .user_prompt
+                .render_for_model(&state, prompts_dir)
+                .await
+                .unwrap();
+
+            assert!(
+                sys.contains("commit abc123\n+pub fn new_helper() {}"),
+                "summary stage system prompt must include target_commit_diff"
+            );
+            assert!(
+                !user.contains("commit abc123"),
+                "summary stage user prompt must not duplicate target_commit_diff"
+            );
+            for forbidden in [
+                "TOOL USAGE:",
+                "git_read_files",
+                "git_grep",
+                "MUST use available tools",
+            ] {
+                assert!(
+                    !sys.contains(forbidden) && !user.contains(forbidden),
+                    "tool-free summary stage prompt must not contain tool directive {forbidden:?}"
+                );
+            }
+        }
     }
 
     #[test]
