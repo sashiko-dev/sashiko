@@ -67,15 +67,17 @@ spec:
           # as a 502 to every caller. These probes turn that state into a
           # restart.
           #
-          # Startup is allowed ten minutes because a schema migration on the
-          # production database runs before the listener opens.
+          # Startup is allowed an hour. A restart only fetches the kernel tree
+          # and migrates the schema, which takes minutes at most, but the
+          # first boot on an empty volume clones the kernel from its bundle
+          # (several GB) before the listener opens.
           startupProbe:
             httpGet:
               path: /health
               port: 8080
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 60
+            failureThreshold: 360
           readinessProbe:
             httpGet:
               path: /health
