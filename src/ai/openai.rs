@@ -53,6 +53,15 @@ pub struct OpenAiMessage {
     pub tool_calls: Option<Vec<OpenAiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Chain of thought of a reasoning model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// The name OpenRouter and newer vLLM releases use for the chain of
+    /// thought, read when reasoning_content is absent. A separate field
+    /// rather than a serde alias, which would reject a response carrying
+    /// both names as a duplicate field. Never sent.
+    #[serde(default, skip_serializing)]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -425,6 +434,8 @@ fn translate_ai_request(
             content: Some(system_text),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
         });
     }
 
@@ -436,6 +447,8 @@ fn translate_ai_request(
                     content: msg.content,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
                 });
             }
             AiRole::User => {
@@ -444,6 +457,8 @@ fn translate_ai_request(
                     content: msg.content,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
                 });
             }
             AiRole::Assistant => {
@@ -463,6 +478,8 @@ fn translate_ai_request(
                             .collect()
                     }),
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
                 });
             }
             AiRole::Tool => {
@@ -471,6 +488,8 @@ fn translate_ai_request(
                     content: msg.content,
                     tool_calls: None,
                     tool_call_id: msg.tool_call_id,
+                    reasoning_content: None,
+                    reasoning: None,
                 });
             }
         }
@@ -518,6 +537,8 @@ fn translate_ai_request(
                 content: Some("Respond in JSON format.".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
+                reasoning: None,
             });
         }
     }
@@ -549,6 +570,10 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         .ok_or_else(|| anyhow::anyhow!("No choices in response"))?;
 
     let content = choice.message.content;
+    let thought = [choice.message.reasoning_content, choice.message.reasoning]
+        .into_iter()
+        .flatten()
+        .find(|t| !t.is_empty());
     let tool_calls = choice.message.tool_calls.map(|tc| {
         tc.into_iter()
             .map(|t| {
@@ -599,7 +624,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
 
     Ok(AiResponse {
         content,
-        thought: None,
+        thought,
         thought_signature: None,
         tool_calls,
         usage,
@@ -829,6 +854,43 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "test_tool");
         assert_eq!(tool_calls[0].function.arguments, r#"{"arg1":"val1"}"#);
         assert_eq!(tool_calls[0].tool_type, "function");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_reasoning_fields() -> Result<()> {
+        let thought_of = |message: Value| -> Result<Option<String>> {
+            let resp: OpenAiResponse = serde_json::from_value(json!({
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "stop"
+                }]
+            }))?;
+            Ok(translate_ai_response(resp)?.thought)
+        };
+
+        let base = json!({"role": "assistant", "content": "{}"});
+        assert_eq!(thought_of(base.clone())?, None);
+
+        let mut msg = base.clone();
+        msg["reasoning_content"] = json!("Hmm.");
+        assert_eq!(thought_of(msg)?.as_deref(), Some("Hmm."));
+
+        let mut msg = base.clone();
+        msg["reasoning"] = json!("Fallback.");
+        assert_eq!(thought_of(msg.clone())?.as_deref(), Some("Fallback."));
+
+        msg["reasoning_content"] = json!("Preferred.");
+        assert_eq!(thought_of(msg.clone())?.as_deref(), Some("Preferred."));
+
+        msg["reasoning_content"] = json!("");
+        assert_eq!(thought_of(msg)?.as_deref(), Some("Fallback."));
+
+        let mut msg = base.clone();
+        msg["reasoning_content"] = json!("");
+        assert_eq!(thought_of(msg)?, None);
 
         Ok(())
     }
@@ -1124,6 +1186,8 @@ mod tests {
                     content: Some("Hello!".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
                 },
                 finish_reason: "stop".to_string(),
             }],
@@ -1159,6 +1223,8 @@ mod tests {
                     content: Some("Hello!".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
                 },
                 finish_reason: "stop".to_string(),
             }],
@@ -1254,6 +1320,8 @@ mod tests {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
                 },
                 finish_reason: "tool_calls".to_string(),
             }],
