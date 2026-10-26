@@ -243,7 +243,7 @@ SASHIKO__SERVER__ACL__ADMINS="first@example.org,second@example.org"
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `repository_path` | string | -- | Path to the kernel git repository used for patch application and context. |
+| `repository_path` | string | -- | Path to the git repository of the project under review, used for patch application and context. The daemon refuses to start unless it is a git repository; `sashiko repo sync` clones or refreshes it. |
 
 #### `[[git.custom_remotes]]`
 

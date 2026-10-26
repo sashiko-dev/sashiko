@@ -51,7 +51,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 # Project Map
 
 ## Core Application (`src/`)
-- `main.rs`: Application entry point (`sashiko` server daemon, `sashiko init`, `sashiko review`, `sashiko benchmark`).
+- `main.rs`: Application entry point (`sashiko` server daemon, `sashiko init`, `sashiko review`, `sashiko repo sync`, `sashiko benchmark`).
 - `bin/`: CLI binary (`sashiko-cli.rs`).
 - `lib.rs`: Shared library root and `ReviewStatus` types.
 - `benchmark.rs`: Built-in benchmark runner, per-run database/artifact preservation, and structured AI judge telemetry (`#[cfg(feature = "server")]`).
@@ -66,6 +66,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `reviewer.rs`: Patchset review worker orchestration.
 - `local_review.rs`: Local review execution (`sashiko review`).
 - `git_cmd.rs` & `git_ops.rs`: Safe git process spawning and repository operations.
+- `repo_sync.rs`: Provisioning of the tree a daemon reviews (`sashiko repo sync`) and the daemon's startup check for it.
 - `patch.rs`, `baseline.rs`, `prerequisites.rs`: Patch parsing, baseline detection, and prerequisite series resolution.
 - `forge.rs`: Webhook integration and review posting for external forges (GitHub, GitLab).
 - `email_router.rs` & `email_policy.rs`: Outbound email routing and policy enforcement.

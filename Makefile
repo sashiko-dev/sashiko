@@ -100,10 +100,12 @@ check-all: sob lint lint-local lint-local-cache test check-db-invariants
 sob:
 	@./scripts/check-sob.sh "$(RANGE)"
 
-# Clone or update the upstream tree a project reviews (default: linux)
+# Clone or update the upstream tree a project reviews (default: linux).
+# The explicit path keeps each project's tree in its own directory, whatever
+# repository_path the local Settings.toml names.
 PROJECT ?= linux
 repo:
-	@./scripts/setup-repo.sh "$(PROJECT)"
+	@cargo run -q --bin sashiko -- --project "$(PROJECT)" repo sync --path "third_party/$(PROJECT)"
 
 # Run lightweight database invariant checks
 check-db-invariants:

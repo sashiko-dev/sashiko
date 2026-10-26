@@ -22,17 +22,23 @@ git clone https://github.com/sashiko-dev/sashiko.git
 cd sashiko
 ```
 
-Then fetch the reference kernel tree the daemon applies and reviews
-patches against:
+Then fetch the tree the daemon applies and reviews patches against:
 
 ```bash
-make repo
+make repo                   # Linux, into third_party/linux
+make repo PROJECT=sashiko   # another project, into third_party/<project>
 ```
 
-This clones Linus's tree with full history (several GB) into
-`third_party/linux`; run it again later to fetch new commits. The daemon
-reads the tree from `[git] repository_path`, so any existing kernel clone
-works too: point that setting at it instead of cloning another copy.
+`make repo` runs `sashiko repo sync`, which clones the project's upstream
+with full history (several GB for Linux) when the directory is missing and
+fetches new commits when it is not; run it again whenever you like. With an
+installed binary, run `sashiko [--project <project>] repo sync` directly: it
+syncs the directory `[git] repository_path` names, else
+`third_party/<project>`, or `--path <dir>`.
+
+The daemon reads the tree from `[git] repository_path` and refuses to start
+when that is not a git repository, so any existing clone works too: point the
+setting at it instead of cloning another copy.
 
 ### 2. Configure
 
