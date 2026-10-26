@@ -180,6 +180,7 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
 | `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
 | `effort` | string | -- | Reasoning effort, sent as the `reasoning_effort` request field and omitted entirely when unset. The valid set belongs to the model rather than to the API: `"none"` is legal, and is what a gpt-5.6 chat completion carrying function tools requires, while gpt-5.4-pro takes only `"medium"` and `"high"`. A level the model rejects comes back as a 400, which is fatal. Applies to both `provider = "openai"` and `provider = "openai-compatible"`; a compatible endpoint that does not implement the field may reject the request, so leave it unset there. |
+| `send_reasoning_content` | bool | `false` | Send the chain of thought a reasoning model returned (as `reasoning_content` or `reasoning`) back as `reasoning_content` on later assistant turns. Thinking models such as DeepSeek and Kimi reject a tool-call follow-up without it; an endpoint that does not know the field may reject the request. |
 
 #### `[ai.kiro_cli]`
 

@@ -14,3 +14,8 @@ max_tokens = 2048
 # an endpoint that spends reasoning tokens from that same cap returns an empty
 # reply once thinking exhausts it, which the run reports as truncated output.
 # effort = "medium"
+
+# Send a thinking model's reasoning back as reasoning_content on later
+# assistant turns. DeepSeek and Kimi reject a tool-call follow-up without
+# it; leave it off for endpoints that reject unknown message fields.
+# send_reasoning_content = true

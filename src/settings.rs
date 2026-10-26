@@ -474,6 +474,13 @@ pub struct OpenAiCompatSettings {
     /// not implement it needs.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Send a reasoning model's chain of thought back as `reasoning_content`
+    /// on later assistant turns. Thinking models such as DeepSeek and Kimi
+    /// reject a tool-call follow-up without it; an endpoint that does not
+    /// know the field may reject every multi-turn request with it, hence
+    /// off by default.
+    #[serde(default)]
+    pub send_reasoning_content: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

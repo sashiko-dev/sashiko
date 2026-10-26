@@ -700,7 +700,12 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 max_tokens,
                 ai.api_timeout_secs,
                 effort,
-            )?;
+            )?
+            .with_reasoning_content(
+                ai.openai_compat
+                    .as_ref()
+                    .is_some_and(|c| c.send_reasoning_content),
+            );
 
             Ok(Arc::new(provider))
         }

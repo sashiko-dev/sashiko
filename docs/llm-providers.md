@@ -527,3 +527,14 @@ legal, and is what a gpt-5.6 chat completion carrying function tools
 requires; gpt-5.4-pro rejects `"low"` and takes only `"medium"` and
 `"high"`. The value is passed through as configured, so a level the
 model does not accept fails every request with a 400.
+
+Reasoning models that return their chain of thought as
+`reasoning_content` (DeepSeek, Moonshot/Kimi, z.ai) or `reasoning`
+(OpenRouter, newer vLLM) have it kept in the conversation. Set
+`send_reasoning_content = true` in `[ai.openai_compat]` to send it back
+as `reasoning_content` on each later assistant turn, which thinking
+models such as DeepSeek and Kimi require across tool calls. It is off by
+default because an endpoint that does not know the field may reject the
+request. OpenRouter's structured `reasoning_details` are not read, so
+encrypted reasoning from OpenAI and Gemini models routed through it is
+lost between turns.
